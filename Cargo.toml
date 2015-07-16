@@ -1,0 +1,4 @@
+[package]
+name = "yxorp"
+version = "0.1.0"
+authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
