@@ -1,10 +1,10 @@
 [package]
 name = "yxorp"
 version = "0.1.0"
-authors = ["Geoffroy Couprie <contact@geoffroycouprie.com>"]
+authors = ["Clément Delafargue <clement@delafargue.name>", "Geoffroy Couprie <geo.couprie@gmail.com>"]
 
 [dependencies]
 nom = "~0.3.1"
-mio = "~0.4.0"
 slab = "*"
 time = "*"
+mio = "~0.4.0"
