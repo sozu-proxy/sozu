@@ -377,3 +377,55 @@ pub fn start_listener(address: &str) -> (Sender<Message>,thread::JoinHandle<()>)
   (t2, jg)
 }
 
+#[cfg(test)]
+mod tests {
+
+  use std::net::{TcpListener, TcpStream};
+  use std::io::{Read,Write};
+  use std::{thread,str};
+
+  #[allow(unused_mut, unused_must_use, unused_variables)]
+  fn start_server() {
+    let listener = TcpListener::bind("127.0.0.1:1234").unwrap();
+    fn handle_client(stream: &mut TcpStream, id: u8) {
+      let mut buf = [0; 128];
+      while let Ok(sz) = stream.read(&mut buf[..]) {
+        if sz > 0 {
+          //println!("[{}] {:?}", id, str::from_utf8(&buf[..sz]));
+          stream.write(&buf[..sz]);
+        }
+      }
+    }
+
+    let mut count = 0;
+    thread::spawn(move|| {
+      for conn in listener.incoming() {
+        match conn {
+          Ok(mut stream) => {
+            thread::spawn(move|| {
+              //println!("got a new client: {}", count);
+              handle_client(&mut stream, count)
+            });
+          }
+          Err(e) => { println!("connection failed"); }
+        }
+      }
+    });
+  }
+
+  #[allow(unused_mut, unused_must_use, unused_variables)]
+  #[test]
+  fn hello() {
+    start_server();
+    let mut s1 = TcpStream::connect("127.0.0.1:1234").unwrap();
+    let mut s2 = TcpStream::connect("127.0.0.1:1234").unwrap();
+    s1.write(&b"hello"[..]);
+    s2.write(&b"pouet pouet"[..]);
+
+    let mut res = [0; 128];
+    let sz2 = s2.read(&mut res[..]).unwrap();
+    assert_eq!(&res[..sz2], &b"pouet pouet"[..]);
+    let sz1 = s1.read(&mut res[..]).unwrap();
+    assert_eq!(&res[..sz1], &b"hello"[..]);
+  }
+}
