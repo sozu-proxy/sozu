@@ -50,7 +50,7 @@ impl Client {
   fn writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
     //println!("in writable()");
     if let Some(mut buf) = self.back_buf.take() {
-      println!("in writable 2");
+      //println!("in writable 2");
 
       match self.sock.try_write_buf(&mut buf) {
         Ok(None) => {
@@ -78,7 +78,7 @@ impl Client {
   }
 
   fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
-    println!("in readable()");
+    //println!("in readable()");
     let mut buf = self.front_mut_buf.take().unwrap();
 
     match self.sock.try_read_buf(&mut buf) {
@@ -106,7 +106,7 @@ impl Client {
   fn back_writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
     //println!("in writable()");
     if let Some(mut buf) = self.front_buf.take() {
-      println!("in writable 2");
+      //println!("in writable 2");
 
       match self.sock.try_write_buf(&mut buf) {
         Ok(None) => {
@@ -117,7 +117,7 @@ impl Client {
         }
         Ok(Some(r)) => {
           //FIXME what happens if not everything was written?
-          println!("BACK CONN[{:?}]:  wrote {} bytes", self.backend_token.unwrap(), r);
+          println!("BACK  CONN[{:?}]: wrote {} bytes", self.backend_token.unwrap(), r);
 
           self.front_mut_buf = Some(buf.flip());
 
@@ -141,7 +141,7 @@ impl Client {
         panic!("We just got readable, but were unable to read from the socket?");
       }
       Ok(Some(r)) => {
-        println!("BACK CONN[{:?}]:  read {} bytes", self.backend_token.unwrap(), r);
+        println!("BACK  CONN[{:?}]: read {} bytes", self.backend_token.unwrap(), r);
         self.back_interest.remove(EventSet::readable());
         self.front_interest.insert(EventSet::writable());
         // prepare to provide this to writable
@@ -727,7 +727,6 @@ mod tests {
     let mut s1 = TcpStream::connect("127.0.0.1:1234").unwrap();
     let mut s3 = TcpStream::connect("127.0.0.1:1234").unwrap();
     thread::sleep_ms(300);
-    s3.shutdown(Shutdown::Both);
     let mut s2 = TcpStream::connect("127.0.0.1:1234").unwrap();
     s1.write(&b"hello"[..]);
     println!("s1 sent");
@@ -736,22 +735,22 @@ mod tests {
     thread::sleep_ms(500);
 
     let mut res = [0; 128];
+    s1.write(&b"coucou"[..]);
     let mut sz1 = s1.read(&mut res[..]).unwrap();
     println!("s1 received {:?}", str::from_utf8(&res[..sz1]));
     assert_eq!(&res[..sz1], &b"hello"[..]);
+    s3.shutdown(Shutdown::Both);
     let sz2 = s2.read(&mut res[..]).unwrap();
     println!("s2 received {:?}", str::from_utf8(&res[..sz2]));
     assert_eq!(&res[..sz2], &b"pouet pouet"[..]);
 
-    //s1.shutdown(Shutdown::Both);
-    //s2.shutdown(Shutdown::Both);
 
     thread::sleep_ms(200);
-    s1.write(&b"coucou"[..]);
     thread::sleep_ms(200);
     sz1 = s1.read(&mut res[..]).unwrap();
-    println!("s1 received {:?}", str::from_utf8(&res[..sz1]));
-    assert!(false);
+    println!("s1 received again({}): {:?}", sz1, str::from_utf8(&res[..sz1]));
+    assert_eq!(&res[..sz1], &b"coucou"[..]);
+    //assert!(false);
   }
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
