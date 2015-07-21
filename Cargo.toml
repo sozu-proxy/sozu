@@ -5,4 +5,5 @@ authors = ["Geoffroy Couprie <contact@geoffroycouprie.com>"]
 
 [dependencies]
 nom = "~0.3.1"
-mio = "~0.3.0"
+mio = "~0.4.0"
+slab = "*"

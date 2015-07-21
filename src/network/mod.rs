@@ -7,9 +7,202 @@ use std::collections::HashMap;
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
 use std::error::Error;
+use mio::util::Slab;
+use std::net::SocketAddr;
+use std::str::FromStr;
 
 const SERVER: Token = Token(0);
 
+struct Client {
+  sock: TcpStream,
+  buf: Option<ByteBuf>,
+  mut_buf: Option<MutByteBuf>,
+  token: Option<Token>,
+  interest: EventSet
+}
+
+impl Client {
+  fn new(sock: TcpStream) -> Client {
+    Client {
+      sock: sock,
+      buf: None,
+      mut_buf: Some(ByteBuf::mut_with_capacity(2048)),
+      token: None,
+      interest: EventSet::all()
+    }
+  }
+
+  pub fn set_token(&mut self, token: Token) {
+    self.token = Some(token);
+  }
+
+  fn writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+    //println!("in writable()");
+    if let Some(mut buf) = self.buf.take() {
+      println!("in writable 2");
+
+      match self.sock.try_write_buf(&mut buf) {
+        Ok(None) => {
+          println!("client flushing buf; WOULDBLOCK");
+
+          self.buf = Some(buf);
+          self.interest.insert(EventSet::writable());
+        }
+        Ok(Some(r)) => {
+          println!("CONN : we wrote {} bytes!", r);
+
+          self.mut_buf = Some(buf.flip());
+
+          self.interest.insert(EventSet::readable());
+          self.interest.remove(EventSet::writable());
+        }
+        Err(e) =>  println!("not implemented; client err={:?}", e),
+      }
+      event_loop.reregister(&self.sock, self.token.unwrap(), self.interest, PollOpt::edge() | PollOpt::oneshot());
+    }
+    Ok(())
+  }
+
+  fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+    //println!("in readable()");
+    let mut buf = self.mut_buf.take().unwrap();
+
+    match self.sock.try_read_buf(&mut buf) {
+      Ok(None) => {
+        panic!("We just got readable, but were unable to read from the socket?");
+      }
+      Ok(Some(r)) => {
+        println!("CONN : we read {} bytes!", r);
+        self.interest.remove(EventSet::readable());
+        self.interest.insert(EventSet::writable());
+        // prepare to provide this to writable
+        self.buf = Some(buf.flip());
+      }
+      Err(e) => {
+        println!("not implemented; client err={:?}", e);
+        self.interest.remove(EventSet::readable());
+      }
+
+    };
+
+    event_loop.reregister(&self.sock, self.token.unwrap(), self.interest, PollOpt::edge())
+  }
+}
+
+pub struct Server {
+  servers: Slab<TcpListener>,
+  clients: Slab<Client>
+}
+
+impl Server {
+  fn new() -> Server {
+    Server {
+      servers: Slab::new_starting_at(Token(0), 128),
+      clients: Slab::new_starting_at(Token(128), 128)
+    }
+  }
+
+  pub fn add_server(&mut self, srv: TcpListener, event_loop: &mut EventLoop<Server>) {
+    let tok = self.servers.insert(srv)
+            .ok().expect("could not add listener to slab");
+    //event_loop.register_opt(&self.servers[tok], tok, EventSet::all(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+    event_loop.register_opt(&self.servers[tok], tok, EventSet::readable(), PollOpt::level()).unwrap();
+    //event_loop.register(&self.servers[tok], tok).unwrap();
+    println!("added server {:?}", tok);
+  }
+
+  pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
+    let accepted = self.servers[token].accept();
+    if let Ok(Some(sock)) = accepted {
+      let tok = self.clients.insert(Client::new(sock))
+              .ok().expect("could not add client to slab");
+      &self.clients[tok].set_token(tok);
+      event_loop.register_opt(&self.clients[tok].sock, tok, EventSet::all(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+      println!("accepted client {:?}", tok);
+    } else {
+      println!("could not accept connection: {:?}", accepted);
+    }
+  }
+}
+
+impl Handler for Server {
+  type Timeout = usize;
+  type Message = ();
+
+  fn ready(&mut self, event_loop: &mut EventLoop<Server>, token: Token, events: EventSet) {
+    println!("{:?} got events: {:?}", token, events);
+    if events.is_readable() {
+      //println!("{:?} is readable", token);
+      if token.as_usize() < 128 {
+        self.accept(event_loop, token)
+      } else {
+        if self.clients.contains(token) {
+          self.clients[token].readable(event_loop);
+        } else {
+          println!("client {:?} was removed", token);
+        }
+      }
+      //match token {
+      //  SERVER => self.server.accept(event_loop).unwrap(),
+      //  i => self.server.conn_readable(event_loop, i).unwrap()
+     // }
+    }
+
+    if events.is_writable() {
+      //println!("{:?} is writable", token);
+      if token.as_usize() < 128 {
+        println!("received writable for listener {:?}, this should not happen", token);
+      } else {
+        if self.clients.contains(token) {
+          self.clients[token].writable(event_loop);
+        } else {
+          println!("client {:?} was removed", token);
+        }
+      }
+      //match token {
+      //  SERVER => panic!("received writable for token 0"),
+        //CLIENT => self.client.writable(event_loop).unwrap(),
+      //  _ => self.server.conn_writable(event_loop, token).unwrap()
+      //};
+    }
+
+    if events.is_hup() {
+      if token.as_usize() < 128 {
+        println!("should not happen: server {:?} closed", token);
+      } else {
+        if self.clients.contains(token) {
+          println!("removing client {:?}", token);
+          {
+            let sock = &mut self.clients[token].sock;
+            event_loop.deregister(sock);
+          }
+          self.clients.remove(token);
+        } else {
+          println!("client {:?} was removed", token);
+        }
+      }
+    }
+  }
+}
+
+pub fn start() {
+  let mut event_loop = EventLoop::new().unwrap();
+
+  let addr: SocketAddr = FromStr::from_str("127.0.0.1:1234").unwrap();
+  let listener = TcpListener::bind(&addr).unwrap();
+
+  println!("listen for connections");
+  //event_loop.register_opt(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+  let mut s = Server::new();
+  s.add_server(listener, &mut event_loop);
+  thread::spawn(move|| {
+    println!("starting event loop");
+    event_loop.run(&mut s).unwrap();
+    println!("ending event loop");
+  });
+}
+
+/*
 pub struct NetworkState {
   pub socket: NonBlock<TcpStream>,
   pub state:  ClientState,
@@ -189,6 +382,12 @@ pub enum ClientErr {
 
 pub type ClientResult = Result<usize, ClientErr>;
 
+struct Server {
+  sock: TcpListener,
+  conns: Slab<mioco::IOHandle>,
+  pub clients:     HashMap<usize, Client>,
+}
+
 pub struct TcpHandler<Client: NetworkClient> {
   pub listener:    NonBlock<TcpListener>,
   //pub storage_tx : mpsc::Sender<storage::Request>,
@@ -354,12 +553,16 @@ impl<Client:NetworkClient> Handler for TcpHandler<Client> {
     println!("interrupted");
   }
 }
+*/
 
-pub fn start_listener(address: &str) -> (Sender<Message>,thread::JoinHandle<()>)  {
-  let mut event_loop:EventLoop<TcpHandler<Client>> = EventLoop::new().unwrap();
-  let t2 = event_loop.channel();
+
+//pub fn start_listener(address: &str) -> (Sender<Message>,thread::JoinHandle<()>)  {
+pub fn start_listener(address: &str) -> (u8,thread::JoinHandle<()>)  {
+ // let mut event_loop:EventLoop<TcpHandler<Client>> = EventLoop::new().unwrap();
+  //let t2 = event_loop.channel();
+  let s = String::new() + address.clone();
   let jg = thread::spawn(move || {
-    let listener = NonBlock::new(TcpListener::bind("127.0.0.1:9092").unwrap());
+/*    let listener = NonBlock::new(TcpListener::bind(&s[..]).unwrap());
     event_loop.register(&listener, SERVER).unwrap();
     //let t = storage(&event_loop.channel(), "pouet");
 
@@ -371,18 +574,50 @@ pub fn start_listener(address: &str) -> (Sender<Message>,thread::JoinHandle<()>)
       clients: HashMap::new(),
       available_tokens: Vec::new()
     }).unwrap();
-
+*/
   });
 
-  (t2, jg)
+  (1, jg)
 }
+
 
 #[cfg(test)]
 mod tests {
-
-  use std::net::{TcpListener, TcpStream};
+  use super::*;
+  use std::net::{TcpListener, TcpStream, Shutdown};
   use std::io::{Read,Write};
   use std::{thread,str};
+
+  #[test]
+  fn mi() {
+    start();
+    thread::sleep_ms(300);
+
+    let mut s1 = TcpStream::connect("127.0.0.1:1234").unwrap();
+    //s3.shutdown(Shutdown::Both);
+    thread::sleep_ms(300);
+    let mut s2 = TcpStream::connect("127.0.0.1:1234").unwrap();
+    s1.write(&b"hello"[..]);
+    println!("s1 sent");
+    s2.write(&b"pouet pouet"[..]);
+    println!("s2 sent");
+    thread::sleep_ms(500);
+
+    //let mut s3 = TcpStream::connect("127.0.0.1:1234").unwrap();
+    let mut res = [0; 128];
+    let sz1 = s1.read(&mut res[..]).unwrap();
+    println!("s1 received {:?}", str::from_utf8(&res[..sz1]));
+    assert_eq!(&res[..sz1], &b"hello"[..]);
+    let sz2 = s2.read(&mut res[..]).unwrap();
+    println!("s2 received {:?}", str::from_utf8(&res[..sz2]));
+    assert_eq!(&res[..sz2], &b"pouet pouet"[..]);
+
+    //s1.shutdown(Shutdown::Both);
+    //s2.shutdown(Shutdown::Both);
+
+    thread::sleep_ms(500);
+    assert!(false);
+  }
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server() {
@@ -413,12 +648,14 @@ mod tests {
     });
   }
 
+/*
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn hello() {
+    start_listener("127.0.0.1:5678");
     start_server();
-    let mut s1 = TcpStream::connect("127.0.0.1:1234").unwrap();
-    let mut s2 = TcpStream::connect("127.0.0.1:1234").unwrap();
+    let mut s1 = TcpStream::connect("127.0.0.1:5678").unwrap();
+    let mut s2 = TcpStream::connect("127.0.0.1:5678").unwrap();
     s1.write(&b"hello"[..]);
     s2.write(&b"pouet pouet"[..]);
 
@@ -428,4 +665,5 @@ mod tests {
     let sz1 = s1.read(&mut res[..]).unwrap();
     assert_eq!(&res[..sz1], &b"hello"[..]);
   }
+*/
 }
