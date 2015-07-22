@@ -79,7 +79,6 @@ impl Client {
   }
 
   fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
-    //println!("in readable()");
     let mut buf = self.front_mut_buf.take().unwrap();
     //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
 
@@ -106,7 +105,6 @@ impl Client {
   }
 
   fn back_writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
-    //println!("in writable()");
     if let Some(mut buf) = self.front_buf.take() {
       //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
 
@@ -125,6 +123,7 @@ impl Client {
 
           self.front_interest.insert(EventSet::readable());
           self.back_interest.remove(EventSet::writable());
+          self.back_interest.insert(EventSet::readable());
         }
         Err(e) =>  println!("not implemented; client err={:?}", e),
       }
@@ -135,7 +134,6 @@ impl Client {
   }
 
   fn back_readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
-    //println!("in readable()");
     let mut buf = self.back_mut_buf.take().unwrap();
     //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
 
@@ -221,8 +219,8 @@ impl Server {
       let backend_tok = self.backend.insert(tok).ok().expect("could not add backend to slab");
       &self.clients[tok].set_tokens(tok, backend_tok);
 
-      event_loop.register_opt(&self.clients[tok].sock, tok, EventSet::all(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-      event_loop.register_opt(&self.clients[tok].backend, backend_tok, EventSet::all(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+      event_loop.register_opt(&self.clients[tok].sock, tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+      event_loop.register_opt(&self.clients[tok].backend, backend_tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
       println!("accepted client {:?}", tok);
     } else {
       println!("could not accept connection: {:?}", accepted);
