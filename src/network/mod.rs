@@ -162,6 +162,7 @@ impl Client {
 
 pub struct Backend {
   sock:          TcpListener,
+  token:         Option<Token>,
   front_address: SocketAddr,
   back_address:  SocketAddr
 }
@@ -181,13 +182,26 @@ impl Server {
     }
   }
 
-  pub fn add_server(&mut self, front: &SocketAddr, back: &SocketAddr, event_loop: &mut EventLoop<Server>) {
+  pub fn add_server(&mut self, front: &SocketAddr, back: &SocketAddr, event_loop: &mut EventLoop<Server>) -> Option<Token> {
     let listener = TcpListener::bind(front).unwrap();
-    let back = Backend { sock: listener, front_address: front.clone(), back_address: back.clone() };
+    let back = Backend { sock: listener, token: None, front_address: front.clone(), back_address: back.clone() };
     let tok = self.servers.insert(back)
             .ok().expect("could not add listener to slab");
+    self.servers[tok].token = Some(tok);
     event_loop.register_opt(&self.servers[tok].sock, tok, EventSet::readable(), PollOpt::level()).unwrap();
     println!("added server {:?}", tok);
+    Some(tok)
+  }
+
+
+  //FIXME: this does not close existing connections, is that what we want?
+  pub fn remove_server(&mut self, tok: Token, event_loop: &mut EventLoop<Server>) {
+    println!("removing server {:?}", tok);
+    if self.servers.contains(tok) {
+      event_loop.deregister(&self.servers[tok].sock);
+      self.servers.remove(tok);
+      //self.servers[tok].sock.shutdown(Shutdown::Both);
+    }
   }
 
   pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
