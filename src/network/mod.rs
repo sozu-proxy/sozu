@@ -493,11 +493,11 @@ mod tests {
     let listener = TcpListener::bind("127.0.0.1:5678").unwrap();
     fn handle_client(stream: &mut TcpStream, id: u8) {
       let mut buf = [0; 128];
-      let response = b"COIN COIN";
+      let response = b" END";
       while let Ok(sz) = stream.read(&mut buf[..]) {
         if sz > 0 {
           println!("[{}] {:?}", id, str::from_utf8(&buf[..sz]));
-          //stream.write(&buf[..sz]);
+          stream.write(&buf[..sz]);
           thread::sleep_ms(200);
           stream.write(&response[..]);
         }
