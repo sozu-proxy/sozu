@@ -160,8 +160,14 @@ impl Client {
   }
 }
 
+pub struct Backend {
+  sock:          TcpListener,
+  front_address: SocketAddr,
+  back_address:  SocketAddr
+}
+
 pub struct Server {
-  servers: Slab<TcpListener>,
+  servers: Slab<Backend>,
   clients: Slab<Client>,
   backend: Slab<Token>
 }
@@ -175,20 +181,19 @@ impl Server {
     }
   }
 
-  pub fn add_server(&mut self, srv: TcpListener, event_loop: &mut EventLoop<Server>) {
-    let tok = self.servers.insert(srv)
+  pub fn add_server(&mut self, front: &SocketAddr, back: &SocketAddr, event_loop: &mut EventLoop<Server>) {
+    let listener = TcpListener::bind(front).unwrap();
+    let back = Backend { sock: listener, front_address: front.clone(), back_address: back.clone() };
+    let tok = self.servers.insert(back)
             .ok().expect("could not add listener to slab");
-    //event_loop.register_opt(&self.servers[tok], tok, EventSet::all(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-    event_loop.register_opt(&self.servers[tok], tok, EventSet::readable(), PollOpt::level()).unwrap();
-    //event_loop.register(&self.servers[tok], tok).unwrap();
+    event_loop.register_opt(&self.servers[tok].sock, tok, EventSet::readable(), PollOpt::level()).unwrap();
     println!("added server {:?}", tok);
   }
 
   pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-    let accepted = self.servers[token].accept();
+    let accepted = self.servers[token].sock.accept();
     if let Ok(Some(sock)) = accepted {
-      let addr: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
-      let mut backend = TcpStream::connect(&addr).unwrap();
+      let mut backend = TcpStream::connect(&self.servers[token].back_address).unwrap();
 
       let tok = self.clients.insert(Client::new(sock, backend))
               .ok().expect("could not add client to slab");
@@ -319,13 +324,20 @@ impl Handler for Server {
 pub fn start() {
   let mut event_loop = EventLoop::new().unwrap();
 
-  let addr: SocketAddr = FromStr::from_str("127.0.0.1:1234").unwrap();
-  let listener = TcpListener::bind(&addr).unwrap();
 
   println!("listen for connections");
   //event_loop.register_opt(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
   let mut s = Server::new();
-  s.add_server(listener, &mut event_loop);
+  {
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1234").unwrap();
+    let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
+    s.add_server(&front, &back, &mut event_loop);
+  }
+  {
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1235").unwrap();
+    let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
+    s.add_server(&front, &back, &mut event_loop);
+  }
   thread::spawn(move|| {
     println!("starting event loop");
     event_loop.run(&mut s).unwrap();
