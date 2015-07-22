@@ -7,3 +7,4 @@ authors = ["Geoffroy Couprie <contact@geoffroycouprie.com>"]
 nom = "~0.3.1"
 mio = "~0.4.0"
 slab = "*"
+time = "*"

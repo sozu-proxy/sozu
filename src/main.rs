@@ -1,5 +1,6 @@
 #[macro_use] extern crate nom;
 extern crate mio;
+extern crate time;
 
 mod network;
 

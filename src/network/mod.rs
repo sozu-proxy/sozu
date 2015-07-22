@@ -10,6 +10,7 @@ use std::error::Error;
 use mio::util::Slab;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use time::precise_time_s;
 
 const SERVER: Token = Token(0);
 
@@ -83,7 +84,7 @@ impl Client {
 
     match self.sock.try_read_buf(&mut buf) {
       Ok(None) => {
-        panic!("We just got readable, but were unable to read from the socket?");
+        println!("We just got readable, but were unable to read from the socket?");
       }
       Ok(Some(r)) => {
         println!("FRONT CONN[{:?}]: read {} bytes", self.token.unwrap(), r);
@@ -138,7 +139,7 @@ impl Client {
 
     match self.sock.try_read_buf(&mut buf) {
       Ok(None) => {
-        panic!("We just got readable, but were unable to read from the socket?");
+        println!("We just got readable, but were unable to read from the socket?");
       }
       Ok(Some(r)) => {
         println!("BACK  CONN[{:?}]: read {} bytes", self.backend_token.unwrap(), r);
@@ -363,6 +364,8 @@ mod tests {
   use std::net::{TcpListener, TcpStream, Shutdown};
   use std::io::{Read,Write};
   use std::{thread,str};
+  use std::sync::mpsc;
+  use time;
 
   #[test]
   fn mi() {
@@ -398,6 +401,58 @@ mod tests {
     assert_eq!(&res[..sz1], &b"coucou"[..]);
     //assert!(false);
   }
+
+  /*
+  #[test]
+  fn concurrent() {
+    let thread_nb = 127;
+
+    thread::spawn(|| { start_server(); });
+    start();
+    thread::sleep_ms(300);
+
+    let (tx, rx) = mpsc::channel();
+
+    let begin = time::precise_time_s();
+    for i in 0..thread_nb {
+      let id = i;
+      let tx = tx.clone();
+      thread::Builder::new().name(id.to_string()).spawn(move || {
+        let s = format!("[{}] Hello world!\n", id);
+        let v: Vec<u8> = s.bytes().collect();
+        if let Ok(mut conn) = TcpStream::connect("127.0.0.1:1234") {
+          let mut res = [0; 128];
+          for j in 0..1000 {
+            conn.write(&v[..]);
+
+            if j % 5 == 0 {
+              if let Ok(sz) = conn.read(&mut res[..]) {
+                //println!("[{}] received({}): {:?}", id, sz, str::from_utf8(&res[..sz]));
+              } else {
+                println!("failed reading");
+                tx.send(());
+                return;
+              }
+            }
+          }
+          tx.send(());
+          return;
+        } else {
+          println!("failed connecting");
+          tx.send(());
+          return;
+        }
+      });
+    }
+    //thread::sleep_ms(5000);
+    for i in 0..thread_nb {
+      rx.recv();
+    }
+    let end = time::precise_time_s();
+    println!("executed in {} seconds", end - begin);
+    //assert!(false);
+  }
+  */
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server() {
