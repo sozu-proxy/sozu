@@ -51,7 +51,7 @@ impl Client {
   fn writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
     //println!("in writable()");
     if let Some(mut buf) = self.back_buf.take() {
-      //println!("in writable 2");
+      //println!("in writable 2: back_buf contains {} bytes", buf.remaining());
 
       match self.sock.try_write_buf(&mut buf) {
         Ok(None) => {
@@ -62,7 +62,7 @@ impl Client {
         }
         Ok(Some(r)) => {
           //FIXME what happens if not everything was written?
-          println!("FRONT CONN[{:?}]: wrote {} bytes", self.token.unwrap(), r);
+          println!("FRONT [{}<-{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
 
           self.back_mut_buf = Some(buf.flip());
 
@@ -81,13 +81,14 @@ impl Client {
   fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
     //println!("in readable()");
     let mut buf = self.front_mut_buf.take().unwrap();
+    //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
 
     match self.sock.try_read_buf(&mut buf) {
       Ok(None) => {
         println!("We just got readable, but were unable to read from the socket?");
       }
       Ok(Some(r)) => {
-        println!("FRONT CONN[{:?}]: read {} bytes", self.token.unwrap(), r);
+        println!("FRONT [{}->{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
         self.front_interest.remove(EventSet::readable());
         self.back_interest.insert(EventSet::writable());
         // prepare to provide this to writable
@@ -107,7 +108,7 @@ impl Client {
   fn back_writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
     //println!("in writable()");
     if let Some(mut buf) = self.front_buf.take() {
-      //println!("in writable 2");
+      //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
 
       match self.sock.try_write_buf(&mut buf) {
         Ok(None) => {
@@ -118,7 +119,7 @@ impl Client {
         }
         Ok(Some(r)) => {
           //FIXME what happens if not everything was written?
-          println!("BACK  CONN[{:?}]: wrote {} bytes", self.backend_token.unwrap(), r);
+          println!("BACK  [{}->{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
 
           self.front_mut_buf = Some(buf.flip());
 
@@ -136,13 +137,14 @@ impl Client {
   fn back_readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
     //println!("in readable()");
     let mut buf = self.back_mut_buf.take().unwrap();
+    //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
 
     match self.sock.try_read_buf(&mut buf) {
       Ok(None) => {
         println!("We just got readable, but were unable to read from the socket?");
       }
       Ok(Some(r)) => {
-        println!("BACK  CONN[{:?}]: read {} bytes", self.backend_token.unwrap(), r);
+        println!("BACK  [{}<-{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
         self.back_interest.remove(EventSet::readable());
         self.front_interest.insert(EventSet::writable());
         // prepare to provide this to writable
