@@ -110,7 +110,7 @@ impl Client {
     if let Some(mut buf) = self.front_buf.take() {
       //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
 
-      match self.sock.try_write_buf(&mut buf) {
+      match self.backend.try_write_buf(&mut buf) {
         Ok(None) => {
           println!("client flushing buf; WOULDBLOCK");
 
@@ -139,7 +139,7 @@ impl Client {
     let mut buf = self.back_mut_buf.take().unwrap();
     //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
 
-    match self.sock.try_read_buf(&mut buf) {
+    match self.backend.try_read_buf(&mut buf) {
       Ok(None) => {
         println!("We just got readable, but were unable to read from the socket?");
       }
