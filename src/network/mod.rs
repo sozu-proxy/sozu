@@ -464,6 +464,7 @@ mod tests {
         if sz > 0 {
           println!("[{}] {:?}", id, str::from_utf8(&buf[..sz]));
           //stream.write(&buf[..sz]);
+          thread::sleep_ms(200);
           stream.write(&response[..]);
         }
       }
