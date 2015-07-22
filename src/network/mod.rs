@@ -421,18 +421,18 @@ mod tests {
     s1.write(&b"coucou"[..]);
     let mut sz1 = s1.read(&mut res[..]).unwrap();
     println!("s1 received {:?}", str::from_utf8(&res[..sz1]));
-    assert_eq!(&res[..sz1], &b"hello"[..]);
+    assert_eq!(&res[..sz1], &b"hello END"[..]);
     s3.shutdown(Shutdown::Both);
     let sz2 = s2.read(&mut res[..]).unwrap();
     println!("s2 received {:?}", str::from_utf8(&res[..sz2]));
-    assert_eq!(&res[..sz2], &b"pouet pouet"[..]);
+    assert_eq!(&res[..sz2], &b"pouet pouet END"[..]);
 
 
     thread::sleep_ms(200);
     thread::sleep_ms(200);
     sz1 = s1.read(&mut res[..]).unwrap();
     println!("s1 received again({}): {:?}", sz1, str::from_utf8(&res[..sz1]));
-    assert_eq!(&res[..sz1], &b"coucou"[..]);
+    assert_eq!(&res[..sz1], &b"coucou END"[..]);
     //assert!(false);
   }
 
