@@ -168,17 +168,21 @@ pub struct Backend {
 }
 
 pub struct Server {
-  servers: Slab<Backend>,
-  clients: Slab<Client>,
-  backend: Slab<Token>
+  servers:         Slab<Backend>,
+  clients:         Slab<Client>,
+  backend:         Slab<Token>,
+  max_listeners:   usize,
+  max_connections: usize
 }
 
 impl Server {
-  fn new() -> Server {
+  fn new(max_listeners: usize, max_connections: usize) -> Server {
     Server {
-      servers: Slab::new_starting_at(Token(0), 128),
-      clients: Slab::new_starting_at(Token(128), 128),
-      backend: Slab::new_starting_at(Token(256), 128)
+      servers:         Slab::new_starting_at(Token(0), max_listeners),
+      clients:         Slab::new_starting_at(Token(max_listeners), max_connections),
+      backend:         Slab::new_starting_at(Token(max_listeners+max_connections), max_connections),
+      max_listeners:   max_listeners,
+      max_connections: max_connections
     }
   }
 
@@ -232,15 +236,15 @@ impl Handler for Server {
     //println!("{:?} got events: {:?}", token, events);
     if events.is_readable() {
       //println!("{:?} is readable", token);
-      if token.as_usize() < 128 {
+      if token.as_usize() < self.max_listeners {
         self.accept(event_loop, token)
-      } else if token.as_usize() < 256 {
+      } else if token.as_usize() < self.max_listeners + self.max_connections {
         if self.clients.contains(token) {
           self.clients[token].readable(event_loop);
         } else {
           println!("client {:?} was removed", token);
         }
-      } else if token.as_usize() >= 256 {
+      } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
         if self.backend.contains(token) {
           let tok = self.backend[token];
           if self.clients.contains(tok) {
@@ -260,15 +264,15 @@ impl Handler for Server {
 
     if events.is_writable() {
       //println!("{:?} is writable", token);
-      if token.as_usize() < 128 {
+      if token.as_usize() < self.max_listeners {
         println!("received writable for listener {:?}, this should not happen", token);
-      } else  if token.as_usize() < 256 {
+      } else  if token.as_usize() < self.max_listeners + self.max_connections {
         if self.clients.contains(token) {
           self.clients[token].writable(event_loop);
         } else {
           println!("client {:?} was removed", token);
         }
-      } else if token.as_usize() >= 256 {
+      } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
         if self.backend.contains(token) {
           let tok = self.backend[token];
           if self.clients.contains(tok) {
@@ -288,9 +292,9 @@ impl Handler for Server {
     }
 
     if events.is_hup() {
-      if token.as_usize() < 128 {
+      if token.as_usize() < self.max_listeners {
         println!("should not happen: server {:?} closed", token);
-      } else if token.as_usize() < 256 {
+      } else if token.as_usize() < self.max_listeners + self.max_connections {
         if self.clients.contains(token) {
           println!("removing client {:?}", token);
           let back_tok = self.clients[token].backend_token.unwrap();
@@ -309,7 +313,7 @@ impl Handler for Server {
         } else {
           println!("client {:?} was removed", token);
         }
-      } else if token.as_usize() >= 256 {
+      } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
         if self.backend.contains(token) {
           let tok = self.backend[token];
           if self.clients.contains(tok) {
@@ -345,7 +349,7 @@ pub fn start() {
 
   println!("listen for connections");
   //event_loop.register_opt(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-  let mut s = Server::new();
+  let mut s = Server::new(10, 500);
   {
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1234").unwrap();
     let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
