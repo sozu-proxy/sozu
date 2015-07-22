@@ -297,10 +297,12 @@ impl Handler for Server {
           {
             let sock        = &mut self.clients[token].sock;
             event_loop.deregister(sock);
+            sock.shutdown(Shutdown::Both);
           };
           {
             let backend     = &mut self.clients[token].backend;
             event_loop.deregister(backend);
+            backend.shutdown(Shutdown::Both);
           }
           self.clients.remove(token);
           self.backend.remove(back_tok);
@@ -315,10 +317,12 @@ impl Handler for Server {
             {
               let sock        = &mut self.clients[tok].sock;
               event_loop.deregister(sock);
+              sock.shutdown(Shutdown::Both);
             }
             {
               let backend     = &mut self.clients[tok].backend;
               event_loop.deregister(backend);
+              backend.shutdown(Shutdown::Both);
             }
             self.clients.remove(tok);
             self.backend.remove(token);
