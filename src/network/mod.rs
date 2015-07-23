@@ -16,7 +16,8 @@ const SERVER: Token = Token(0);
 
 #[derive(Debug)]
 pub enum Message {
-  Number(u32)
+  AddServer(String,String),
+  RemoveServer(usize)
 }
 
 struct Client {
@@ -215,6 +216,7 @@ impl Server {
     if self.servers.contains(tok) {
       event_loop.deregister(&self.servers[tok].sock);
       self.servers.remove(tok);
+      println!("removed server {:?}", tok);
       //self.servers[tok].sock.shutdown(Shutdown::Both);
     }
   }
@@ -252,11 +254,13 @@ impl Handler for Server {
   type Message = Message;
 
   fn ready(&mut self, event_loop: &mut EventLoop<Server>, token: Token, events: EventSet) {
-    //println!("{:?} got events: {:?}", token, events);
+    println!("{:?} got events: {:?}", token, events);
     if events.is_readable() {
       //println!("{:?} is readable", token);
       if token.as_usize() < self.max_listeners {
-        self.accept(event_loop, token)
+        if self.servers.contains(token) {
+          self.accept(event_loop, token)
+        }
       } else if token.as_usize() < self.max_listeners + self.max_connections {
         if self.clients.contains(token) {
           self.clients[token].readable(event_loop);
@@ -361,8 +365,20 @@ impl Handler for Server {
     }
   }
 
-  fn notify(&mut self, _reactor: &mut EventLoop<Self>, message: Message) {
+  fn notify(&mut self, event_loop: &mut EventLoop<Self>, message: Message) {
     println!("notified: {:?}", message);
+    match message {
+      Message::AddServer(front, back) => {
+        if let (Ok(front_address), Ok(back_address)) = (
+          FromStr::from_str(&front), FromStr::from_str(&back)
+        ) {
+          self.add_server(&front_address, &back_address, event_loop);
+        }
+      },
+      Message::RemoveServer(id)       => {
+        self.remove_server(Token(id), event_loop);
+      }
+    }
   }
 
   fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {
