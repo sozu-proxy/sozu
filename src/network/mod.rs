@@ -16,7 +16,7 @@ const SERVER: Token = Token(0);
 
 #[derive(Debug)]
 pub enum Message {
-
+  Number(u32)
 }
 
 struct Client {
@@ -359,6 +359,18 @@ impl Handler for Server {
 
       }
     }
+  }
+
+  fn notify(&mut self, _reactor: &mut EventLoop<Self>, message: Message) {
+    println!("notified: {:?}", message);
+  }
+
+  fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {
+    println!("timeout");
+  }
+
+  fn interrupted(&mut self, event_loop: &mut EventLoop<Self>) {
+    println!("interrupted");
   }
 }
 
