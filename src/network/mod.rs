@@ -1,5 +1,5 @@
 use std::thread::{self,Thread,Builder};
-use std::sync::mpsc::{channel,Receiver};
+use std::sync::mpsc::{self,channel,Receiver};
 use mio::tcp::*;
 use mio::*;
 use mio::buf::{ByteBuf,MutByteBuf};
@@ -15,9 +15,15 @@ use time::precise_time_s;
 const SERVER: Token = Token(0);
 
 #[derive(Debug)]
-pub enum Message {
+pub enum ServerOrder {
   AddServer(String,String),
   RemoveServer(usize)
+}
+
+#[derive(Debug)]
+pub enum ServerMessage {
+  AddedServer(String, String, usize),
+  RemovedServer(usize)
 }
 
 struct Client {
@@ -178,17 +184,19 @@ pub struct Server {
   clients:         Slab<Client>,
   backend:         Slab<Token>,
   max_listeners:   usize,
-  max_connections: usize
+  max_connections: usize,
+  tx:              mpsc::Sender<ServerMessage>
 }
 
 impl Server {
-  fn new(max_listeners: usize, max_connections: usize) -> Server {
+  fn new(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> Server {
     Server {
       servers:         Slab::new_starting_at(Token(0), max_listeners),
       clients:         Slab::new_starting_at(Token(max_listeners), max_connections),
       backend:         Slab::new_starting_at(Token(max_listeners+max_connections), max_connections),
       max_listeners:   max_listeners,
-      max_connections: max_connections
+      max_connections: max_connections,
+      tx:              tx
     }
   }
 
@@ -211,13 +219,16 @@ impl Server {
 
 
   //FIXME: this does not close existing connections, is that what we want?
-  pub fn remove_server(&mut self, tok: Token, event_loop: &mut EventLoop<Server>) {
+  pub fn remove_server(&mut self, tok: Token, event_loop: &mut EventLoop<Server>) -> Option<Token>{
     println!("removing server {:?}", tok);
     if self.servers.contains(tok) {
       event_loop.deregister(&self.servers[tok].sock);
       self.servers.remove(tok);
       println!("removed server {:?}", tok);
       //self.servers[tok].sock.shutdown(Shutdown::Both);
+      Some(tok)
+    } else {
+      None
     }
   }
 
@@ -251,7 +262,7 @@ impl Server {
 
 impl Handler for Server {
   type Timeout = usize;
-  type Message = Message;
+  type Message = ServerOrder;
 
   fn ready(&mut self, event_loop: &mut EventLoop<Server>, token: Token, events: EventSet) {
     println!("{:?} got events: {:?}", token, events);
@@ -365,18 +376,22 @@ impl Handler for Server {
     }
   }
 
-  fn notify(&mut self, event_loop: &mut EventLoop<Self>, message: Message) {
+  fn notify(&mut self, event_loop: &mut EventLoop<Self>, message: Self::Message) {
     println!("notified: {:?}", message);
     match message {
-      Message::AddServer(front, back) => {
+      ServerOrder::AddServer(front, back) => {
         if let (Ok(front_address), Ok(back_address)) = (
           FromStr::from_str(&front), FromStr::from_str(&back)
         ) {
-          self.add_server(&front_address, &back_address, event_loop);
+          if let Some(token) = self.add_server(&front_address, &back_address, event_loop) {
+            self.tx.send(ServerMessage::AddedServer(front, back, token.as_usize()));
+          }
         }
       },
-      Message::RemoveServer(id)       => {
-        self.remove_server(Token(id), event_loop);
+      ServerOrder::RemoveServer(id)       => {
+        if let Some(token) = self.remove_server(Token(id), event_loop) {
+          self.tx.send(ServerMessage::RemovedServer(token.as_usize()));
+        }
       }
     }
   }
@@ -396,7 +411,8 @@ pub fn start() {
 
   println!("listen for connections");
   //event_loop.register_opt(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-  let mut s = Server::new(10, 500);
+  let (tx,rx) = channel::<ServerMessage>();
+  let mut s = Server::new(10, 500, tx);
   {
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1234").unwrap();
     let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
@@ -414,10 +430,10 @@ pub fn start() {
   });
 }
 
-pub fn start_listener(max_listeners: usize, max_connections: usize) -> (Sender<Message>,thread::JoinHandle<()>)  {
+pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ServerOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
-  let mut server = Server::new(max_listeners, max_connections);
+  let mut server = Server::new(max_listeners, max_connections, tx);
 
   let join_guard = thread::spawn(move|| {
     println!("starting event loop");
