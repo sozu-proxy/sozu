@@ -12,6 +12,8 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use time::precise_time_s;
 
+mod splice;
+
 const SERVER: Token = Token(0);
 
 #[derive(Debug)]

@@ -1,6 +1,7 @@
 #[macro_use] extern crate nom;
 extern crate mio;
 extern crate time;
+extern crate libc;
 
 mod network;
 mod parser;
