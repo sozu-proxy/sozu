@@ -385,7 +385,7 @@ pub fn start() {
 pub fn start_listener(address: &str) -> (u8,thread::JoinHandle<()>)  {
  // let mut event_loop:EventLoop<TcpHandler<Client>> = EventLoop::new().unwrap();
   //let t2 = event_loop.channel();
-  let s = String::new() + address.clone();
+  //let s = String::new() + address.clone();
   let jg = thread::spawn(move || {
 /*    let listener = NonBlock::new(TcpListener::bind(&s[..]).unwrap());
     event_loop.register(&listener, SERVER).unwrap();
@@ -412,9 +412,8 @@ mod tests {
   use std::net::{TcpListener, TcpStream, Shutdown};
   use std::io::{Read,Write};
   use std::{thread,str};
-  use std::sync::mpsc;
-  use time;
 
+  #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn mi() {
     thread::spawn(|| { start_server(); });
@@ -451,8 +450,11 @@ mod tests {
   }
 
   /*
+  #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn concurrent() {
+  use std::sync::mpsc;
+  use time;
     let thread_nb = 127;
 
     thread::spawn(|| { start_server(); });
