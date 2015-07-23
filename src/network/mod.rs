@@ -187,14 +187,20 @@ impl Server {
   }
 
   pub fn add_server(&mut self, front: &SocketAddr, back: &SocketAddr, event_loop: &mut EventLoop<Server>) -> Option<Token> {
-    let listener = TcpListener::bind(front).unwrap();
-    let back = Backend { sock: listener, token: None, front_address: front.clone(), back_address: back.clone() };
-    let tok = self.servers.insert(back)
-            .ok().expect("could not add listener to slab");
-    self.servers[tok].token = Some(tok);
-    event_loop.register_opt(&self.servers[tok].sock, tok, EventSet::readable(), PollOpt::level()).unwrap();
-    println!("added server {:?}", tok);
-    Some(tok)
+    if let Ok(listener) = TcpListener::bind(front) {
+      let back = Backend { sock: listener, token: None, front_address: front.clone(), back_address: back.clone() };
+      if let Ok(tok) = self.servers.insert(back) {
+        self.servers[tok].token = Some(tok);
+        event_loop.register_opt(&self.servers[tok].sock, tok, EventSet::readable(), PollOpt::level()).unwrap();
+        println!("added server {:?}", tok);
+        Some(tok)
+      } else {
+        println!("could not add listener to slab");
+        None
+      }
+    } else {
+      None
+    }
   }
 
 
@@ -211,17 +217,25 @@ impl Server {
   pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
     let accepted = self.servers[token].sock.accept();
     if let Ok(Some(sock)) = accepted {
-      let mut backend = TcpStream::connect(&self.servers[token].back_address).unwrap();
+      if let Ok(mut backend) = TcpStream::connect(&self.servers[token].back_address) {
 
-      let tok = self.clients.insert(Client::new(sock, backend))
-              .ok().expect("could not add client to slab");
+        if let Ok(tok) = self.clients.insert(Client::new(sock, backend)) {
 
-      let backend_tok = self.backend.insert(tok).ok().expect("could not add backend to slab");
-      &self.clients[tok].set_tokens(tok, backend_tok);
+          if let Ok(backend_tok) = self.backend.insert(tok) {
+            &self.clients[tok].set_tokens(tok, backend_tok);
 
-      event_loop.register_opt(&self.clients[tok].sock, tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-      event_loop.register_opt(&self.clients[tok].backend, backend_tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-      println!("accepted client {:?}", tok);
+            event_loop.register_opt(&self.clients[tok].sock, tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+            event_loop.register_opt(&self.clients[tok].backend, backend_tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+            println!("accepted client {:?}", tok);
+          } else {
+            println!("could not add backend to slab");
+          }
+        } else {
+          println!("could not add client to slab");
+        }
+      } else {
+        println!("could not connect to backend");
+      }
     } else {
       println!("could not accept connection: {:?}", accepted);
     }
