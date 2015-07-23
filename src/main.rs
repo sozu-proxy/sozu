@@ -6,7 +6,7 @@ mod network;
 mod parser;
 
 fn main() {
-  let (tx, jg) = network::start_listener("hello");
+  let (tx, jg) = network::start_listener(10, 500);
   println!("rustyXORP");
   jg.join();
 }

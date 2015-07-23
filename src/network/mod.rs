@@ -14,6 +14,11 @@ use time::precise_time_s;
 
 const SERVER: Token = Token(0);
 
+#[derive(Debug)]
+pub enum Message {
+
+}
+
 struct Client {
   sock:           TcpStream,
   backend:        TcpStream,
@@ -244,7 +249,7 @@ impl Server {
 
 impl Handler for Server {
   type Timeout = usize;
-  type Message = ();
+  type Message = Message;
 
   fn ready(&mut self, event_loop: &mut EventLoop<Server>, token: Token, events: EventSet) {
     //println!("{:?} got events: {:?}", token, events);
@@ -381,28 +386,18 @@ pub fn start() {
   });
 }
 
-//pub fn start_listener(address: &str) -> (Sender<Message>,thread::JoinHandle<()>)  {
-pub fn start_listener(address: &str) -> (u8,thread::JoinHandle<()>)  {
- // let mut event_loop:EventLoop<TcpHandler<Client>> = EventLoop::new().unwrap();
-  //let t2 = event_loop.channel();
-  //let s = String::new() + address.clone();
-  let jg = thread::spawn(move || {
-/*    let listener = NonBlock::new(TcpListener::bind(&s[..]).unwrap());
-    event_loop.register(&listener, SERVER).unwrap();
-    //let t = storage(&event_loop.channel(), "pouet");
+pub fn start_listener(max_listeners: usize, max_connections: usize) -> (Sender<Message>,thread::JoinHandle<()>)  {
+  let mut event_loop = EventLoop::new().unwrap();
+  let channel = event_loop.channel();
+  let mut server = Server::new(max_listeners, max_connections);
 
-    event_loop.run(&mut TcpHandler {
-      listener: listener,
-      //storage_tx: t,
-      counter: 0,
-      token_index: 1, // 0 is the server socket
-      clients: HashMap::new(),
-      available_tokens: Vec::new()
-    }).unwrap();
-*/
+  let join_guard = thread::spawn(move|| {
+    println!("starting event loop");
+    event_loop.run(&mut server).unwrap();
+    println!("ending event loop");
   });
 
-  (1, jg)
+  (channel, join_guard)
 }
 
 
