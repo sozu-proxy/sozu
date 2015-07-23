@@ -62,7 +62,7 @@ impl Client {
         }
         Ok(Some(r)) => {
           //FIXME what happens if not everything was written?
-          println!("FRONT [{}<-{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+          //println!("FRONT [{}<-{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
 
           self.back_mut_buf = Some(buf.flip());
 
@@ -87,7 +87,7 @@ impl Client {
         println!("We just got readable, but were unable to read from the socket?");
       }
       Ok(Some(r)) => {
-        println!("FRONT [{}->{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+        //println!("FRONT [{}->{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
         self.front_interest.remove(EventSet::readable());
         self.back_interest.insert(EventSet::writable());
         // prepare to provide this to writable
@@ -117,7 +117,7 @@ impl Client {
         }
         Ok(Some(r)) => {
           //FIXME what happens if not everything was written?
-          println!("BACK  [{}->{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+          //println!("BACK  [{}->{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
 
           self.front_mut_buf = Some(buf.flip());
 
@@ -142,7 +142,7 @@ impl Client {
         println!("We just got readable, but were unable to read from the socket?");
       }
       Ok(Some(r)) => {
-        println!("BACK  [{}<-{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+        //println!("BACK  [{}<-{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
         self.back_interest.remove(EventSet::readable());
         self.front_interest.insert(EventSet::writable());
         // prepare to provide this to writable
