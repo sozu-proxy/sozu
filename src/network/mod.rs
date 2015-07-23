@@ -17,13 +17,15 @@ const SERVER: Token = Token(0);
 #[derive(Debug)]
 pub enum ServerOrder {
   AddServer(String,String),
-  RemoveServer(usize)
+  RemoveServer(usize),
+  Stop
 }
 
 #[derive(Debug)]
 pub enum ServerMessage {
   AddedServer(String, String, usize),
-  RemovedServer(usize)
+  RemovedServer(usize),
+  Stopped
 }
 
 struct Client {
@@ -392,6 +394,9 @@ impl Handler for Server {
         if let Some(token) = self.remove_server(Token(id), event_loop) {
           self.tx.send(ServerMessage::RemovedServer(token.as_usize()));
         }
+      },
+      ServerOrder::Stop                   => {
+        event_loop.shutdown();
       }
     }
   }
@@ -433,12 +438,14 @@ pub fn start() {
 pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ServerOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
+  let notify_tx = tx.clone();
   let mut server = Server::new(max_listeners, max_connections, tx);
 
   let join_guard = thread::spawn(move|| {
     println!("starting event loop");
     event_loop.run(&mut server).unwrap();
     println!("ending event loop");
+    notify_tx.send(ServerMessage::Stopped);
   });
 
   (channel, join_guard)

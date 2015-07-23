@@ -16,7 +16,10 @@ fn main() {
   tx.send(network::ServerOrder::AddServer("127.0.0.1:1234".to_string(), "127.0.0.1:5678".to_string()));
   thread::sleep_ms(200);
   println!("server said: {:?}", receiver.recv());
-  tx.send(network::ServerOrder::RemoveServer(0));
-  //jg.join();
+  //tx.send(network::ServerOrder::RemoveServer(0));
+  tx.send(network::ServerOrder::Stop);
+  println!("server said: {:?}", receiver.recv());
+  jg.join();
+  println!("good bye");
 }
 
