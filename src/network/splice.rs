@@ -1,5 +1,9 @@
 use libc::{c_int,c_uint,size_t};
 use libc::types::os::arch::posix88::{off_t,ssize_t};
+use std::net::TcpStream;
+use std::io::Error;
+use std::ptr;
+use std::os::unix::io::AsRawFd;
 
 extern {
   //ssize_t splice(int fd_in, loff_t *off_in, int fd_out,
@@ -8,6 +12,47 @@ extern {
 
   //int pipe2(int pipefd[2], int flags);
   pub fn pipe2(pipefd: *mut c_int, flags: c_int) -> c_int;
+}
+
+pub type Pipe = [c_int ; 2];
+
+pub fn create_pipe() -> Option<Pipe> {
+  let mut p: Pipe = [0; 2];
+  unsafe {
+    if pipe2(p.as_mut_ptr(), 0) == 0 {
+      Some(p)
+    } else {
+      None
+    }
+  }
+}
+
+pub fn splice_in(stream: &TcpStream, pipe: Pipe) -> Option<usize> {
+  unsafe {
+    let res = splice(stream.as_raw_fd(), ptr::null(), pipe[1], ptr::null(), 2048, 0);
+    if res == -1 {
+      println!("err transferring from tcp({}) to pipe({}) | err: {:?}", stream.as_raw_fd(), pipe[1],
+          Error::last_os_error().kind());
+      None
+    } else {
+      println!("transferred {} bytes from tcp({}) to pipe({})", res, stream.as_raw_fd(), pipe[1]);
+      Some(res as usize)
+    }
+  }
+}
+
+pub fn splice_out(pipe: Pipe, stream: &TcpStream) -> Option<usize> {
+  unsafe {
+    let res = splice(pipe[0], ptr::null(), stream.as_raw_fd(), ptr::null(), 2048, 0);
+    if res == -1 {
+      println!("err transferring from pipe({}) to tcp{}) | err: {:?}", pipe[0], stream.as_raw_fd(),
+          Error::last_os_error().kind());
+      None
+    } else {
+      println!("transferred {} bytes from pipe({}) to tcp({})", res, pipe[0], stream.as_raw_fd());
+      Some(res as usize)
+    }
+  }
 }
 
 #[cfg(test)]
@@ -66,7 +111,7 @@ mod tests {
     });
   }
 
-  #[allow(unused_mut, unused_must_use, unused_variables)]
+#[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server2() {
     let listener = TcpListener::bind("127.0.0.1:2121").unwrap();
 
@@ -75,35 +120,16 @@ mod tests {
       let response = b" END";
       unsafe {
 
-        let mut pipefd_in = [0 as c_int; 2];
-        let mut pipefd_out = [0 as c_int; 2];
-        let res = pipe2(pipefd_in.as_mut_ptr(), 0);
-        println!("pipe2 in returned {}", res);
-        let res = pipe2(pipefd_out.as_mut_ptr(), 0);
-        println!("pipe2 out returned {}", res);
-        thread::sleep_ms(200);
-        //pub fn splice(fd_in: c_int, off_in: *mut off_t, fd_out: c_int, off_out: *mut off_t, len: size_t, flags: c_uint)  -> ssize_t;
-        let mut res = splice(stream.as_raw_fd(), ptr::null(), pipefd_in[1], ptr::null(), 2048, 0);
-        println!("transferred {} bytes from front({}) to pipe_in({}) | err: {:?}", stream.as_raw_fd(), pipefd_in[1],
-          res, Error::last_os_error().kind());
-        res = splice(pipefd_in[0], ptr::null(), backend.as_raw_fd(), ptr::null(), 2048, 0);
-        println!("transferred {} bytes from pipe_in  to back", res);
-        res = splice(backend.as_raw_fd(), ptr::null(), pipefd_out[1], ptr::null(), 2048, 0);
-        println!("transferred {} bytes from back to pipe_out", res);
-        res = splice(pipefd_out[0], ptr::null(), stream.as_raw_fd(), ptr::null(), 2048, 0);
-        println!("transferred {} bytes from pipe_out to front", res);
-      }
-      /*while let Ok(sz) = stream.read(&mut buf[..]) {
-        if sz > 0 {
-          //println!("[{}] {:?}", id, str::from_utf8(&buf[..sz]));
-          backend.write(&buf[..sz]);
-          //thread::sleep_ms(200);
-          let mut buf2 = [0; 128];
-          if let Ok(sz2) = backend.read(&mut buf2[..]) {
-            stream.write(&buf2[..sz2]);
-          }
+        if let (Some(pipe_in), Some(pipe_out)) = (create_pipe(), create_pipe()) {
+
+          thread::sleep_ms(200);
+          println!("{:?}", splice_in(stream, pipe_in));
+          println!("{:?}", splice_out(pipe_in, backend));
+          println!("{:?}", splice_in(backend, pipe_out));
+          println!("{:?}", splice_out(pipe_out, stream));
+
         }
-      }*/
+      }
     }
 
     let mut count = 0;
@@ -111,10 +137,10 @@ mod tests {
       for conn in listener.incoming() {
         match conn {
           Ok(mut stream) => {
-            thread::spawn(move|| {
-              let mut backend  = TcpStream::connect("127.0.0.1:4242").unwrap();
-              println!("got a new client: {}", count);
-              handle_client(&mut stream, &mut backend, count)
+          thread::spawn(move|| {
+            let mut backend  = TcpStream::connect("127.0.0.1:4242").unwrap();
+            println!("got a new client: {}", count);
+            handle_client(&mut stream, &mut backend, count)
             });
           }
           Err(e) => { println!("connection failed"); }
