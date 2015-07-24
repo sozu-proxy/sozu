@@ -9,3 +9,7 @@ slab = "*"
 time = "*"
 mio = "~0.4.0"
 libc = "*"
+
+[features]
+default = []
+splice  = []

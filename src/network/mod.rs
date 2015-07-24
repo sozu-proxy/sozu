@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use time::precise_time_s;
 
+#[cfg(feature = "splice")]
 mod splice;
 
 const SERVER: Token = Token(0);
@@ -30,6 +31,7 @@ pub enum ServerMessage {
   Stopped
 }
 
+#[cfg(not(feature = "splice"))]
 struct Client {
   sock:           TcpStream,
   backend:        TcpStream,
@@ -43,9 +45,22 @@ struct Client {
   front_interest: EventSet
 }
 
+#[cfg(feature = "splice")]
+struct Client {
+  sock:           TcpStream,
+  backend:        TcpStream,
+  pipe_in:        splice::Pipe,
+  pipe_out:       splice::Pipe,
+  token:          Option<Token>,
+  backend_token:  Option<Token>,
+  back_interest:  EventSet,
+  front_interest: EventSet
+}
+
+#[cfg(not(feature = "splice"))]
 impl Client {
-  fn new(sock: TcpStream, backend: TcpStream) -> Client {
-    Client {
+  fn new(sock: TcpStream, backend: TcpStream) -> Option<Client> {
+    Some(Client {
       sock:           sock,
       backend:        backend,
       front_buf:      None,
@@ -56,7 +71,7 @@ impl Client {
       backend_token:  None,
       back_interest:  EventSet::all(),
       front_interest: EventSet::all()
-    }
+    })
   }
 
   pub fn set_tokens(&mut self, token: Token, backend: Token) {
@@ -176,6 +191,114 @@ impl Client {
   }
 }
 
+#[cfg(feature = "splice")]
+impl Client {
+  fn new(sock: TcpStream, backend: TcpStream) -> Option<Client> {
+    if let (Some(pipe_in), Some(pipe_out)) = (splice::create_pipe(), splice::create_pipe()) {
+      Some(Client {
+        sock:           sock,
+        backend:        backend,
+        pipe_in:        pipe_in,
+        pipe_out:       pipe_out,
+        token:          None,
+        backend_token:  None,
+        back_interest:  EventSet::all(),
+        front_interest: EventSet::all()
+      })
+    } else {
+      None
+    }
+  }
+
+  pub fn set_tokens(&mut self, token: Token, backend: Token) {
+    self.token         = Some(token);
+    self.backend_token = Some(backend);
+  }
+
+  fn writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+    //println!("in writable()");
+    match splice::splice_out(self.pipe_out, &self.sock) {
+      None => {
+        //println!("client flushing buf; WOULDBLOCK");
+
+        self.front_interest.insert(EventSet::writable());
+      }
+      Some(r) => {
+        //FIXME what happens if not everything was written?
+        //println!("FRONT [{}<-{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+
+        //self.front_interest.insert(EventSet::readable());
+        self.front_interest.remove(EventSet::writable());
+        self.back_interest.insert(EventSet::readable());
+      }
+    }
+    event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+    Ok(())
+  }
+
+  fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+    //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
+
+    match splice::splice_in(&self.sock, self.pipe_in) {
+      None => {
+        println!("We just got readable, but were unable to read from the socket?");
+      }
+      Some(r) => {
+        //println!("FRONT [{}->{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+        self.front_interest.remove(EventSet::readable());
+        self.back_interest.insert(EventSet::writable());
+      }
+    };
+
+    event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+    Ok(())
+  }
+
+  fn back_writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+    //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
+
+    match splice::splice_out(self.pipe_in, &self.backend) {
+      None => {
+        //println!("client flushing buf; WOULDBLOCK");
+
+        self.back_interest.insert(EventSet::writable());
+      }
+      Some(r) => {
+        //FIXME what happens if not everything was written?
+        //println!("BACK  [{}->{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+
+        self.front_interest.insert(EventSet::readable());
+        self.back_interest.remove(EventSet::writable());
+        self.back_interest.insert(EventSet::readable());
+      }
+    }
+    event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+    Ok(())
+  }
+
+  fn back_readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+    //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
+
+    match splice::splice_in(&self.backend, self.pipe_out) {
+      None => {
+        println!("We just got readable, but were unable to read from the socket?");
+      }
+      Some(r) => {
+        //println!("BACK  [{}<-{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+        self.back_interest.remove(EventSet::readable());
+        self.front_interest.insert(EventSet::writable());
+      }
+    };
+
+    event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+    Ok(())
+  }
+}
+
 pub struct Backend {
   sock:          TcpListener,
   token:         Option<Token>,
@@ -240,20 +363,23 @@ impl Server {
     let accepted = self.servers[token].sock.accept();
     if let Ok(Some(sock)) = accepted {
       if let Ok(mut backend) = TcpStream::connect(&self.servers[token].back_address) {
+        if let Some(client) = Client::new(sock, backend) {
+          if let Ok(tok) = self.clients.insert(client) {
 
-        if let Ok(tok) = self.clients.insert(Client::new(sock, backend)) {
+            if let Ok(backend_tok) = self.backend.insert(tok) {
+              &self.clients[tok].set_tokens(tok, backend_tok);
 
-          if let Ok(backend_tok) = self.backend.insert(tok) {
-            &self.clients[tok].set_tokens(tok, backend_tok);
-
-            event_loop.register_opt(&self.clients[tok].sock, tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-            event_loop.register_opt(&self.clients[tok].backend, backend_tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-            println!("accepted client {:?}", tok);
+              event_loop.register_opt(&self.clients[tok].sock, tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+              event_loop.register_opt(&self.clients[tok].backend, backend_tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+              println!("accepted client {:?}", tok);
+            } else {
+              println!("could not add backend to slab");
+            }
           } else {
-            println!("could not add backend to slab");
+            println!("could not add client to slab");
           }
         } else {
-          println!("could not add client to slab");
+          println!("could not create a client");
         }
       } else {
         println!("could not connect to backend");
@@ -269,7 +395,7 @@ impl Handler for Server {
   type Message = ServerOrder;
 
   fn ready(&mut self, event_loop: &mut EventLoop<Server>, token: Token, events: EventSet) {
-    println!("{:?} got events: {:?}", token, events);
+    //println!("{:?} got events: {:?}", token, events);
     if events.is_readable() {
       //println!("{:?} is readable", token);
       if token.as_usize() < self.max_listeners {

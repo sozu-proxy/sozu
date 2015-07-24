@@ -1,10 +1,11 @@
 use libc::{c_int,c_uint,size_t};
 use libc::types::os::arch::posix88::{off_t,ssize_t};
-use std::net::TcpStream;
-use std::io::Error;
+use mio::tcp::TcpStream;
+use std::io::{Error,ErrorKind};
 use std::ptr;
 use std::os::unix::io::AsRawFd;
 
+const SPLICE_F_NONBLOCK: c_uint = 2;
 extern {
   //ssize_t splice(int fd_in, loff_t *off_in, int fd_out,
   //                      loff_t *off_out, size_t len, unsigned int flags);
@@ -27,29 +28,33 @@ pub fn create_pipe() -> Option<Pipe> {
   }
 }
 
-pub fn splice_in(stream: &TcpStream, pipe: Pipe) -> Option<usize> {
+pub fn splice_in(stream: &AsRawFd, pipe: Pipe) -> Option<usize> {
   unsafe {
-    let res = splice(stream.as_raw_fd(), ptr::null(), pipe[1], ptr::null(), 2048, 0);
+    let res = splice(stream.as_raw_fd(), ptr::null(), pipe[1], ptr::null(), 2048, SPLICE_F_NONBLOCK);
     if res == -1 {
-      println!("err transferring from tcp({}) to pipe({}) | err: {:?}", stream.as_raw_fd(), pipe[1],
-          Error::last_os_error().kind());
+      let err = Error::last_os_error().kind();
+      if err != ErrorKind::WouldBlock {
+        println!("err transferring from tcp({}) to pipe({}): {:?}", stream.as_raw_fd(), pipe[1], err);
+      }
       None
     } else {
-      println!("transferred {} bytes from tcp({}) to pipe({})", res, stream.as_raw_fd(), pipe[1]);
+      //println!("transferred {} bytes from tcp({}) to pipe({})", res, stream.as_raw_fd(), pipe[1]);
       Some(res as usize)
     }
   }
 }
 
-pub fn splice_out(pipe: Pipe, stream: &TcpStream) -> Option<usize> {
+pub fn splice_out(pipe: Pipe, stream: &AsRawFd) -> Option<usize> {
   unsafe {
-    let res = splice(pipe[0], ptr::null(), stream.as_raw_fd(), ptr::null(), 2048, 0);
+    let res = splice(pipe[0], ptr::null(), stream.as_raw_fd(), ptr::null(), 2048, SPLICE_F_NONBLOCK);
     if res == -1 {
-      println!("err transferring from pipe({}) to tcp{}) | err: {:?}", pipe[0], stream.as_raw_fd(),
-          Error::last_os_error().kind());
+      let err = Error::last_os_error().kind();
+      if err != ErrorKind::WouldBlock {
+        println!("err transferring from pipe({}) to tcp({}): {:?}", pipe[0], stream.as_raw_fd(), err);
+      }
       None
     } else {
-      println!("transferred {} bytes from pipe({}) to tcp({})", res, pipe[0], stream.as_raw_fd());
+      //println!("transferred {} bytes from pipe({}) to tcp({})", res, pipe[0], stream.as_raw_fd());
       Some(res as usize)
     }
   }
@@ -63,8 +68,10 @@ mod tests {
   use std::thread;
   use std::io::{Read,Write,Error};
   use std::str;
-  use std::os::unix::io::AsRawFd;
+  use std::os::unix::io::{AsRawFd,FromRawFd};
   use std::ptr;
+  use std::net::SocketAddr;
+  use std::str::FromStr;
 
   #[test]
   fn zerocopy() {
@@ -138,7 +145,8 @@ mod tests {
         match conn {
           Ok(mut stream) => {
           thread::spawn(move|| {
-            let mut backend  = TcpStream::connect("127.0.0.1:4242").unwrap();
+            let addr: SocketAddr = FromStr::from_str("127.0.0.1:4242").unwrap();
+            let mut backend  = TcpStream::connect(&addr).unwrap();
             println!("got a new client: {}", count);
             handle_client(&mut stream, &mut backend, count)
             });
