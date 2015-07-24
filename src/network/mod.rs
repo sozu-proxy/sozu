@@ -51,6 +51,8 @@ struct Client {
   backend:        TcpStream,
   pipe_in:        splice::Pipe,
   pipe_out:       splice::Pipe,
+  data_in:        bool,
+  data_out:       bool,
   token:          Option<Token>,
   backend_token:  Option<Token>,
   back_interest:  EventSet,
@@ -200,6 +202,8 @@ impl Client {
         backend:        backend,
         pipe_in:        pipe_in,
         pipe_out:       pipe_out,
+        data_in:        false,
+        data_out:       false,
         token:          None,
         backend_token:  None,
         back_interest:  EventSet::all(),
@@ -217,23 +221,26 @@ impl Client {
 
   fn writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
     //println!("in writable()");
-    match splice::splice_out(self.pipe_out, &self.sock) {
-      None => {
-        //println!("client flushing buf; WOULDBLOCK");
+    if self.data_out {
+      match splice::splice_out(self.pipe_out, &self.sock) {
+        None => {
+          //println!("client flushing buf; WOULDBLOCK");
 
-        self.front_interest.insert(EventSet::writable());
-      }
-      Some(r) => {
-        //FIXME what happens if not everything was written?
-        //println!("FRONT [{}<-{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+          self.front_interest.insert(EventSet::writable());
+        }
+        Some(r) => {
+          //FIXME what happens if not everything was written?
+          //println!("FRONT [{}<-{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
 
-        //self.front_interest.insert(EventSet::readable());
-        self.front_interest.remove(EventSet::writable());
-        self.back_interest.insert(EventSet::readable());
+          //self.front_interest.insert(EventSet::readable());
+          self.front_interest.remove(EventSet::writable());
+          self.back_interest.insert(EventSet::readable());
+          self.data_out = false;
+        }
       }
+      event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+      event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
-    event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     Ok(())
   }
 
@@ -248,6 +255,7 @@ impl Client {
         //println!("FRONT [{}->{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
         self.front_interest.remove(EventSet::readable());
         self.back_interest.insert(EventSet::writable());
+        self.data_in = true;
       }
     };
 
@@ -259,23 +267,26 @@ impl Client {
   fn back_writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
     //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
 
-    match splice::splice_out(self.pipe_in, &self.backend) {
-      None => {
-        //println!("client flushing buf; WOULDBLOCK");
+    if self.data_in {
+      match splice::splice_out(self.pipe_in, &self.backend) {
+        None => {
+          //println!("client flushing buf; WOULDBLOCK");
 
-        self.back_interest.insert(EventSet::writable());
-      }
-      Some(r) => {
-        //FIXME what happens if not everything was written?
-        //println!("BACK  [{}->{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+          self.back_interest.insert(EventSet::writable());
+        }
+        Some(r) => {
+          //FIXME what happens if not everything was written?
+          //println!("BACK  [{}->{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
 
-        self.front_interest.insert(EventSet::readable());
-        self.back_interest.remove(EventSet::writable());
-        self.back_interest.insert(EventSet::readable());
+          self.front_interest.insert(EventSet::readable());
+          self.back_interest.remove(EventSet::writable());
+          self.back_interest.insert(EventSet::readable());
+          self.data_in = false;
+        }
       }
+      event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+      event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
-    event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     Ok(())
   }
 
@@ -290,6 +301,7 @@ impl Client {
         //println!("BACK  [{}<-{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
         self.back_interest.remove(EventSet::readable());
         self.front_interest.insert(EventSet::writable());
+        self.data_out = true;
       }
     };
 
@@ -627,8 +639,8 @@ mod tests {
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn concurrent() {
-  use std::sync::mpsc;
-  use time;
+    use std::sync::mpsc;
+    use time;
     let thread_nb = 127;
 
     thread::spawn(|| { start_server(); });
@@ -646,7 +658,7 @@ mod tests {
         let v: Vec<u8> = s.bytes().collect();
         if let Ok(mut conn) = TcpStream::connect("127.0.0.1:1234") {
           let mut res = [0; 128];
-          for j in 0..1000 {
+          for j in 0..10000 {
             conn.write(&v[..]);
 
             if j % 5 == 0 {
@@ -674,7 +686,7 @@ mod tests {
     }
     let end = time::precise_time_s();
     println!("executed in {} seconds", end - begin);
-    //assert!(false);
+    assert!(false);
   }
   */
 
@@ -686,9 +698,9 @@ mod tests {
       let response = b" END";
       while let Ok(sz) = stream.read(&mut buf[..]) {
         if sz > 0 {
-          println!("[{}] {:?}", id, str::from_utf8(&buf[..sz]));
+          //println!("[{}] {:?}", id, str::from_utf8(&buf[..sz]));
           stream.write(&buf[..sz]);
-          thread::sleep_ms(200);
+          thread::sleep_ms(20);
           stream.write(&response[..]);
         }
       }
