@@ -3,6 +3,7 @@ extern crate mio;
 extern crate time;
 extern crate libc;
 
+mod bus;
 mod network;
 mod parser;
 
