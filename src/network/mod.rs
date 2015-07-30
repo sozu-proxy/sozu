@@ -42,7 +42,9 @@ struct Client {
   token:          Option<Token>,
   backend_token:  Option<Token>,
   back_interest:  EventSet,
-  front_interest: EventSet
+  front_interest: EventSet,
+  rx_count:       usize,
+  tx_count:       usize
 }
 
 #[cfg(feature = "splice")]
@@ -56,7 +58,9 @@ struct Client {
   token:          Option<Token>,
   backend_token:  Option<Token>,
   back_interest:  EventSet,
-  front_interest: EventSet
+  front_interest: EventSet,
+  rx_count:       usize,
+  tx_count:       usize
 }
 
 #[cfg(not(feature = "splice"))]
@@ -72,7 +76,9 @@ impl Client {
       token:          None,
       backend_token:  None,
       back_interest:  EventSet::all(),
-      front_interest: EventSet::all()
+      front_interest: EventSet::all(),
+      rx_count:       0,
+      tx_count:       0
     })
   }
 
@@ -98,6 +104,7 @@ impl Client {
           //println!("FRONT [{}<-{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
 
           self.back_mut_buf = Some(buf.flip());
+          self.tx_count = self.tx_count + r;
 
           //self.front_interest.insert(EventSet::readable());
           self.front_interest.remove(EventSet::writable());
@@ -123,6 +130,7 @@ impl Client {
         //println!("FRONT [{}->{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
         self.front_interest.remove(EventSet::readable());
         self.back_interest.insert(EventSet::writable());
+        self.rx_count = self.rx_count + r;
         // prepare to provide this to writable
         self.front_buf = Some(buf.flip());
       }
@@ -207,7 +215,9 @@ impl Client {
         token:          None,
         backend_token:  None,
         back_interest:  EventSet::all(),
-        front_interest: EventSet::all()
+        front_interest: EventSet::all(),
+        tx_count:       0,
+        rx_count:       0
       })
     } else {
       None
@@ -236,6 +246,7 @@ impl Client {
           self.front_interest.remove(EventSet::writable());
           self.back_interest.insert(EventSet::readable());
           self.data_out = false;
+          self.tx_count = self.tx_count + r;
         }
       }
       event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
@@ -256,6 +267,7 @@ impl Client {
         self.front_interest.remove(EventSet::readable());
         self.back_interest.insert(EventSet::writable());
         self.data_in = true;
+        self.rx_count = self.rx_count + r;
       }
     };
 
