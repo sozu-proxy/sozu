@@ -13,7 +13,10 @@ use std::sync::mpsc::{channel};
 use std::thread;
 
 fn main() {
-  network::amqp::init_rabbitmq();
+  let bus_tx = bus::start_bus();
+
+  network::amqp::init_rabbitmq(bus_tx);
+
   let (sender, receiver) = channel::<network::ServerMessage>();
   let (tx, jg) = network::start_listener(10, 500, sender);
   println!("rustyXORP");
