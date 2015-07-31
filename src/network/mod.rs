@@ -12,6 +12,8 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use time::precise_time_s;
 
+pub mod amqp;
+
 #[cfg(feature = "splice")]
 mod splice;
 

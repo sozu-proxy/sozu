@@ -2,6 +2,8 @@
 extern crate mio;
 extern crate time;
 extern crate libc;
+extern crate amqp;
+extern crate env_logger;
 
 mod bus;
 mod network;
@@ -11,6 +13,7 @@ use std::sync::mpsc::{channel};
 use std::thread;
 
 fn main() {
+  network::amqp::init_rabbitmq();
   let (sender, receiver) = channel::<network::ServerMessage>();
   let (tx, jg) = network::start_listener(10, 500, sender);
   println!("rustyXORP");
