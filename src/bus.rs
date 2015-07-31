@@ -3,15 +3,40 @@ use std::sync::mpsc::{self,channel,Sender,Receiver};
 use std::collections::HashMap;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
+pub struct Acl {
+    app_id: String,
+    hostname: String,
+    path_begin: String
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash)]
+pub struct Instance {
+    app_id: String,
+    ip_address: String,
+    port: u16
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash)]
+pub enum Command {
+    AddAcl(Acl),
+    RemoveAcl(Acl),
+    AddInstance(Instance),
+    RemoveInstance(Instance)
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub enum Tag {
-  Msg
+    AddAcl,
+    RemoveAcl,
+    AddInstance,
+    RemoveInstance
 }
 
 #[derive(Clone)]
 pub enum Message {
   Subscribe(Tag, Sender<Message>),
   SubscribeOk,
-  Msg(String)
+  Msg(Tag, Command)
 }
 
 pub fn start_bus() -> Sender<Message> {
@@ -49,13 +74,13 @@ impl Bus {
         println!("SUBSCRIBED");
         return true;
       },
-      &Ok(Message::Msg(ref s)) => {
+      &Ok(Message::Msg(ref t, ref c)) => {
         println!("GOT MSG");
-        if let &Some(v) = &self.senders.get(&Tag::Msg) {
+        if let &Some(v) = &self.senders.get(&t) {
           println!("GOT MSG 2");
           for tx in v {
             println!("GOT MSG 3");
-            tx.send(Message::Msg(s.clone()));
+            tx.send(Message::Msg(t.clone(), c.clone()));
           }
         }
         return true;
@@ -94,16 +119,24 @@ fn bus_test() {
 
   let (tx2,rx2) = channel();
   println!("AA");
-  tx.send(Message::Subscribe(Tag::Msg, tx2));
+  tx.send(Message::Subscribe(Tag::AddAcl, tx2));
   println!("BB");
 
   if let Ok(Message::SubscribeOk) = rx2.recv() {
     println!("successfully subscribed");
-    let test = String::new() + "test";
-    tx.send(Message::Msg(test.clone()));
+    let tag = Tag::AddAcl;
+    let command = Command::AddAcl(
+      Acl {
+        app_id: String::new() + "app_e74eb0d4-e01a-4a09-af46-7ecab7157d32",
+        hostname: String::new() + "cltdl.fr",
+        path_begin: String::new() + ""
+      }
+    );
+    tx.send(Message::Msg(tag.clone(), command.clone()));
 
-    if let Ok(Message::Msg(s)) = rx2.recv() {
-      assert_eq!(s, test);
+    if let Ok(Message::Msg(t, c)) = rx2.recv() {
+      assert_eq!(t, tag);
+      assert_eq!(c, command);
     } else {
       assert!(false);
     }
