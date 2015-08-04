@@ -2,35 +2,7 @@ use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Sender,Receiver};
 use std::collections::HashMap;
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash)]
-pub struct Acl {
-    app_id: String,
-    hostname: String,
-    path_begin: String
-}
-
-#[derive(Debug,Clone,PartialEq,Eq,Hash)]
-pub struct Instance {
-    app_id: String,
-    ip_address: String,
-    port: u16
-}
-
-#[derive(Debug,Clone,PartialEq,Eq,Hash)]
-pub enum Command {
-    AddAcl(Acl),
-    RemoveAcl(Acl),
-    AddInstance(Instance),
-    RemoveInstance(Instance)
-}
-
-#[derive(Debug,Clone,PartialEq,Eq,Hash)]
-pub enum Tag {
-    AddAcl,
-    RemoveAcl,
-    AddInstance,
-    RemoveInstance
-}
+use messages::{Acl, Command, Tag};
 
 #[derive(Clone)]
 pub enum Message {

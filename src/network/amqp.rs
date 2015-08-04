@@ -9,29 +9,15 @@ use amqp::basic::Basic;
 use amqp::channel::Channel;
 use std::default::Default;
 
-use std::sync::mpsc::{Sender};
-use bus::{Acl, Command, Message, Tag};
+use rustc_serialize::json;
 
+use std::sync::mpsc::{Sender};
+use bus::Message;
+use messages::{Acl, Command, Tag};
 
 pub fn init_rabbitmq(bus_tx: Sender<Message>) {
-    let consumer_function = |channel: &mut Channel, deliver: protocol::basic::Deliver, headers: protocol::basic::BasicProperties, body: Vec<u8>| {
-        println!("Got a delivery:");
-        println!("Deliver info: {:?}", deliver);
-        println!("Content headers: {:?}", headers);
-        println!("Content body: {:?}", body);
-        println!("Content body(as string): {:?}", String::from_utf8(body));
-        channel.basic_ack(deliver.delivery_tag, false);
-        bus_tx.send(Message::Msg(
-            Tag::AddAcl,
-            Command::AddAcl(Acl {
-                app_id: String::new() + "app_e74eb0d4-e01a-4a09-af46-7ecab7157d32",
-                hostname: String::new() + "cltdl.fr",
-                path_begin: String::new() + ""
-            })
-        ));
-    };
-
     env_logger::init().unwrap();
+
     let connection_uri = &env::var("AMQP_URI").ok().expect("No RabbitMQ connection provided");
     let mut session = Session::open_url(connection_uri).ok().expect("Can't create session");
     println!("Openned session");
@@ -43,12 +29,22 @@ pub fn init_rabbitmq(bus_tx: Sender<Message>) {
 
     println!("Queue declare: {:?}", queue_declare);
     channel.basic_prefetch(10);
-    println!("Declaring consumer...");
-    let consumer_name = channel.basic_consume(consumer_function, queue_name, "", false, false, false, false, table::new());
+    println!("Declaring get iterator...");
 
-    println!("Starting consumer {:?}", consumer_name);
-    channel.start_consuming();
+    loop {
+      let get_results = channel.basic_get(queue_name, true);
 
-    channel.close(200, "Bye".to_string());
-    session.close(200, "Good Bye".to_string());
+      for m in get_results {
+          let payload: Result<Command, &str> =
+              String::from_utf8(m.body).map_err(|_| "Invalid payload data")
+              .and_then(|s| json::decode(&s).map_err(|_| "Invalid payload structure"));
+
+          match payload {
+            Ok(command) => {
+                bus_tx.send(Message::Msg(command.get_type().clone(), command.clone()));
+            }
+            Err(e) => println!("{}", e)
+          }
+      }
+    }
 }

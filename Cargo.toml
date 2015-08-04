@@ -11,6 +11,7 @@ mio = "~0.4.0"
 libc = "*"
 log = "0.3"
 env_logger = "0.3"
+rustc-serialize = "0.3.15"
 
 [dependencies.amqp]
 git = "https://github.com/Antti/rust-amqp"

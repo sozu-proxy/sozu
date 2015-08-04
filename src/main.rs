@@ -4,18 +4,33 @@ extern crate time;
 extern crate libc;
 extern crate amqp;
 extern crate env_logger;
+extern crate rustc_serialize;
 
 mod bus;
 mod network;
 mod parser;
+mod messages;
 
 use std::sync::mpsc::{channel};
 use std::thread;
 
+use messages::Tag;
+use bus::Message;
+
 fn main() {
   let bus_tx = bus::start_bus();
 
-  network::amqp::init_rabbitmq(bus_tx);
+  let (add_acl_input,add_acl_listener) = channel();
+  bus_tx.send(Message::Subscribe(Tag::AddAcl, add_acl_input));
+  if let Ok(Message::SubscribeOk) = add_acl_listener.recv() {
+    println!("Subscribed to ADD_ACL commands");
+    network::amqp::init_rabbitmq(bus_tx);
+
+    if let Ok(Message::Msg(t, c)) = add_acl_listener.recv() {
+        println!("Got ADD_ACL command");
+        println!("{:?}", c);
+    }
+  }
 
   let (sender, receiver) = channel::<network::ServerMessage>();
   let (tx, jg) = network::start_listener(10, 500, sender);
