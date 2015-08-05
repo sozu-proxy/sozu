@@ -21,14 +21,14 @@ fn main() {
   let bus_tx = bus::start_bus();
 
   let (http_proxy_conf_input,http_proxy_conf_listener) = channel();
-  bus_tx.send(Message::Subscribe(Topic::HttpProxyConfig, http_proxy_conf_input));
+  let _ = bus_tx.send(Message::Subscribe(Topic::HttpProxyConfig, http_proxy_conf_input));
   if let Ok(Message::SubscribeOk) = http_proxy_conf_listener.recv() {
     println!("Subscribed to http_proxy_conf commands");
 
     network::amqp::init_rabbitmq(bus_tx);
     println!("Subscribed to http_proxy_conf commands");
     let res = http_proxy_conf_listener.recv();
-    res.map(|x| x.display());
+    let _ = res.map(|x| x.display());
 
     println!("yolo");
     //if let Ok(Message::Msg(t, c)) = res {
@@ -41,13 +41,13 @@ fn main() {
   let (tx, jg) = network::start_listener(10, 500, sender);
   println!("rustyXORP");
 
-  tx.send(network::ServerOrder::AddServer("127.0.0.1:1234".to_string(), "127.0.0.1:5678".to_string()));
+  let _ = tx.send(network::ServerOrder::AddServer("127.0.0.1:1234".to_string(), "127.0.0.1:5678".to_string()));
   thread::sleep_ms(200);
   println!("server said: {:?}", receiver.recv());
   //tx.send(network::ServerOrder::RemoveServer(0));
-  tx.send(network::ServerOrder::Stop);
+  let _ = tx.send(network::ServerOrder::Stop);
   println!("server said: {:?}", receiver.recv());
-  jg.join();
+  let _ = jg.join();
   println!("good bye");
 }
 

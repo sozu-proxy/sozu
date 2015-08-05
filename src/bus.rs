@@ -1,8 +1,8 @@
-use std::thread::{self,Thread,Builder};
-use std::sync::mpsc::{self,channel,Sender,Receiver};
+use std::thread::{self};
+use std::sync::mpsc::{channel,Sender,Receiver};
 use std::collections::HashMap;
 
-use messages::{Command, Topic, HttpFront};
+use messages::{Command, Topic};
 
 #[derive(Clone)]
 pub enum Message {
@@ -68,7 +68,8 @@ impl Bus {
             println!("GOT MSG 2");
             for tx in v {
               println!("GOT MSG 3");
-              let r = tx.send(Message::Msg(c.clone()));
+              // ToDo use result?
+              let _ = tx.send(Message::Msg(c.clone()));
               println!("{:?}", c);
             }
           }
@@ -90,45 +91,54 @@ impl Bus {
   fn subscribe(&mut self, t: &Topic, tx: &Sender<Message>) {
     println!("X");
     if ! &self.senders.contains_key(t) {
-      let mut v = Vec::new();
+      let v = Vec::new();
       let t2 = t.clone();
       &self.senders.insert(t2, v);
       println!("Y");
     }
     if let Some(ref mut v) = self.senders.get_mut(t) {
       v.push(tx.clone());
-      tx.send(Message::SubscribeOk);
+      // ToDo use result?
+      let _ = tx.send(Message::SubscribeOk);
       println!("Z");
     }
   }
 }
 
-#[test]
-fn bus_test() {
-  let tx = start_bus();
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use messages::{Command,HttpFront,Topic};
+  use std::sync::mpsc::{channel};
 
-  let (tx2,rx2) = channel();
-  println!("AA");
-  tx.send(Message::Subscribe(Topic::HttpProxyConfig, tx2));
-  println!("BB");
+  #[test]
+  fn bus_test() {
+    let tx = start_bus();
 
-  if let Ok(Message::SubscribeOk) = rx2.recv() {
-    println!("successfully subscribed");
-    let command = Command::AddHttpFront(
-      HttpFront {
-        app_id: String::new() + "app_e74eb0d4-e01a-4a09-af46-7ecab7157d32",
-        hostname: String::new() + "cltdl.fr",
-        path_begin: String::new() + ""
+    let (tx2,rx2) = channel();
+    println!("AA");
+    let _ = tx.send(Message::Subscribe(Topic::HttpProxyConfig, tx2));
+    println!("BB");
+
+    if let Ok(Message::SubscribeOk) = rx2.recv() {
+      println!("successfully subscribed");
+      let command = Command::AddHttpFront(
+        HttpFront {
+          app_id: String::new() + "app_e74eb0d4-e01a-4a09-af46-7ecab7157d32",
+          hostname: String::new() + "cltdl.fr",
+          path_begin: String::new() + ""
+        }
+      );
+      let _ = tx.send(Message::Msg(command.clone()));
+
+      if let Ok(Message::Msg(c)) = rx2.recv() {
+        assert_eq!(c, command);
+      } else {
+        assert!(false);
       }
-    );
-    tx.send(Message::Msg(command.clone()));
-
-    if let Ok(Message::Msg(c)) = rx2.recv() {
-      assert_eq!(c, command);
     } else {
       assert!(false);
     }
-  } else {
-    assert!(false);
   }
 }
+

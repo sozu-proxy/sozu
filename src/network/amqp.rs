@@ -1,20 +1,16 @@
 use env_logger;
 use std::env;
 
-use amqp::session::Options;
 use amqp::session::Session;
-use amqp::protocol;
 use amqp::table;
 use amqp::basic::Basic;
-use amqp::channel::Channel;
-use std::default::Default;
 
 use rustc_serialize::json;
 
 use std::thread;
 use std::sync::mpsc::{Sender};
 use bus::Message;
-use messages::{Command, Topic};
+use messages::Command;
 
 pub fn init_rabbitmq(bus_tx: Sender<Message>) {
     env_logger::init().unwrap();

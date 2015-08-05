@@ -1,3 +1,5 @@
+#![allow(dead_code, unused_must_use, unused_variables, unused_imports)]
+
 use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
 use mio::tcp::*;
@@ -11,6 +13,8 @@ use mio::util::Slab;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use time::precise_time_s;
+
+use messages::{TcpFront,Instance};
 
 pub mod amqp;
 
@@ -388,7 +392,7 @@ impl Server {
   pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
     let accepted = self.servers[token].sock.accept();
     if let Ok(Some(sock)) = accepted {
-      if let Ok(mut backend) = TcpStream::connect(&self.servers[token].back_address) {
+      if let Ok(backend) = TcpStream::connect(&self.servers[token].back_address) {
         if let Some(client) = Client::new(sock, backend) {
           if let Ok(tok) = self.clients.insert(client) {
 

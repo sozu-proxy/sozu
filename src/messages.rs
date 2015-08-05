@@ -1,6 +1,5 @@
-use std::vec;
 
-use rustc_serialize::{json, Decodable, Decoder};
+use rustc_serialize::{Decodable, Decoder};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct HttpFront {
@@ -51,24 +50,24 @@ impl Command {
 impl Decodable for Command {
   fn decode<D: Decoder>(decoder: &mut D) -> Result<Command, D::Error> {
     decoder.read_struct("root", 0, |decoder| {
-      let commandType: String = try!(decoder.read_struct_field("type", 0, |decoder| Decodable::decode(decoder)));
+      let command_type: String = try!(decoder.read_struct_field("type", 0, |decoder| Decodable::decode(decoder)));
 
-      if &commandType == "ADD_HTTP_FRONT" {
+      if &command_type == "ADD_HTTP_FRONT" {
         let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
         Ok(Command::AddHttpFront(acl))
-      } else if &commandType == "REMOVE_HTTP_FRONT" {
+      } else if &command_type == "REMOVE_HTTP_FRONT" {
         let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
         Ok(Command::RemoveHttpFront(acl))
-      } else if &commandType == "ADD_TCP_FRONT" {
+      } else if &command_type == "ADD_TCP_FRONT" {
         let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
         Ok(Command::AddTcpFront(acl))
-      } else if &commandType == "REMOVE_TCP_FRONT" {
+      } else if &command_type == "REMOVE_TCP_FRONT" {
         let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
         Ok(Command::RemoveTcpFront(acl))
-      } else if &commandType == "ADD_INSTANCE" {
+      } else if &command_type == "ADD_INSTANCE" {
         let instance = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
         Ok(Command::AddInstance(instance))
-      } else if &commandType == "REMOVE_INSTANCE" {
+      } else if &command_type == "REMOVE_INSTANCE" {
         let instance = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
         Ok(Command::RemoveInstance(instance))
       } else {
@@ -78,57 +77,64 @@ impl Decodable for Command {
   }
 }
 
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub enum Topic {
     HttpProxyConfig,
     TcpProxyConfig
 }
 
-#[test]
-fn add_acl_test() {
-  let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}}"#;
-  let command: Command = json::decode(raw_json).unwrap();
-  println!("{:?}", command);
-  assert!(command == Command::AddHttpFront(HttpFront{
-    app_id: String::from("xxx"),
-    hostname: String::from("yyy"),
-    path_begin: String::from("xxx")
-  }));
-}
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use rustc_serialize::json;
 
-#[test]
-fn remove_acl_test() {
-  let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}}"#;
-  let command: Command = json::decode(raw_json).unwrap();
-  println!("{:?}", command);
-  assert!(command == Command::RemoveHttpFront(HttpFront{
-    app_id: String::from("xxx"),
-    hostname: String::from("yyy"),
-    path_begin: String::from("xxx")
-  }));
-}
+  #[test]
+  fn add_acl_test() {
+    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}}"#;
+    let command: Command = json::decode(raw_json).unwrap();
+    println!("{:?}", command);
+    assert!(command == Command::AddHttpFront(HttpFront{
+      app_id: String::from("xxx"),
+      hostname: String::from("yyy"),
+      path_begin: String::from("xxx")
+    }));
+  }
+
+  #[test]
+  fn remove_acl_test() {
+    let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}}"#;
+    let command: Command = json::decode(raw_json).unwrap();
+    println!("{:?}", command);
+    assert!(command == Command::RemoveHttpFront(HttpFront{
+      app_id: String::from("xxx"),
+      hostname: String::from("yyy"),
+      path_begin: String::from("xxx")
+    }));
+  }
 
 
-#[test]
-fn add_instance_test() {
-  let raw_json = r#"{"type": "ADD_INSTANCE", "data": {"app_id": "xxx", "ip_address": "yyy", "port": 8080}}"#;
-  let command: Command = json::decode(raw_json).unwrap();
-  println!("{:?}", command);
-  assert!(command == Command::AddInstance(Instance{
-    app_id: String::from("xxx"),
-    ip_address: String::from("yyy"),
-    port: 8080
-  }));
-}
+  #[test]
+  fn add_instance_test() {
+    let raw_json = r#"{"type": "ADD_INSTANCE", "data": {"app_id": "xxx", "ip_address": "yyy", "port": 8080}}"#;
+    let command: Command = json::decode(raw_json).unwrap();
+    println!("{:?}", command);
+    assert!(command == Command::AddInstance(Instance{
+      app_id: String::from("xxx"),
+      ip_address: String::from("yyy"),
+      port: 8080
+    }));
+  }
 
-#[test]
-fn remove_instance_test() {
-  let raw_json = r#"{"type": "REMOVE_INSTANCE", "data": {"app_id": "xxx", "ip_address": "yyy", "port": 8080}}"#;
-  let command: Command = json::decode(raw_json).unwrap();
-  println!("{:?}", command);
-  assert!(command == Command::RemoveInstance(Instance{
-    app_id: String::from("xxx"),
-    ip_address: String::from("yyy"),
-    port: 8080
-  }));
+  #[test]
+  fn remove_instance_test() {
+    let raw_json = r#"{"type": "REMOVE_INSTANCE", "data": {"app_id": "xxx", "ip_address": "yyy", "port": 8080}}"#;
+    let command: Command = json::decode(raw_json).unwrap();
+    println!("{:?}", command);
+    assert!(command == Command::RemoveInstance(Instance{
+      app_id: String::from("xxx"),
+      ip_address: String::from("yyy"),
+      port: 8080
+    }));
+  }
 }
