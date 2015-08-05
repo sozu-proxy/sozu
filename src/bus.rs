@@ -11,6 +11,19 @@ pub enum Message {
   Msg(Tag, Command)
 }
 
+impl Message {
+  pub fn display(&self) {
+      match self {
+        &Message::Subscribe(_, _) => println!("Subscribe"),
+        &Message::SubscribeOk => println!("SubscribeOk"),
+        &Message::Msg(ref t, ref c) => {
+          println!("{:?}", t);
+          println!("{:?}", c)
+        }
+      }
+  }
+}
+
 pub fn start_bus() -> Sender<Message> {
   let (tx,rx) = channel::<Message>();
 
