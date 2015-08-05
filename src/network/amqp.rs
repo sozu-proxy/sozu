@@ -11,6 +11,7 @@ use std::default::Default;
 
 use rustc_serialize::json;
 
+use std::thread;
 use std::sync::mpsc::{Sender};
 use bus::Message;
 use messages::{Acl, Command, Tag};
@@ -31,20 +32,22 @@ pub fn init_rabbitmq(bus_tx: Sender<Message>) {
     channel.basic_prefetch(10);
     println!("Declaring get iterator...");
 
-    loop {
-      let get_results = channel.basic_get(queue_name, true);
+    thread::spawn(move || {
+      loop {
+        let get_results = channel.basic_get(queue_name, true);
 
-      for m in get_results {
-          let payload: Result<Command, &str> =
-              String::from_utf8(m.body).map_err(|_| "Invalid payload data")
-              .and_then(|s| json::decode(&s).map_err(|_| "Invalid payload structure"));
+        for m in get_results {
+            let payload: Result<Command, &str> =
+                String::from_utf8(m.body).map_err(|_| "Invalid payload data")
+                .and_then(|s| json::decode(&s).map_err(|_| "Invalid payload structure"));
 
-          match payload {
-            Ok(command) => {
-                bus_tx.send(Message::Msg(command.get_type().clone(), command.clone()));
+            match payload {
+              Ok(command) => {
+                  bus_tx.send(Message::Msg(command.get_type().clone(), command.clone()));
+              }
+              Err(e) => println!("{}", e)
             }
-            Err(e) => println!("{}", e)
-          }
+        }
       }
-    }
+    });
 }

@@ -65,7 +65,8 @@ impl Bus {
           println!("GOT MSG 2");
           for tx in v {
             println!("GOT MSG 3");
-            tx.send(Message::Msg(t.clone(), c.clone()));
+            let r = tx.send(Message::Msg(t.clone(), c.clone()));
+            println!("{:?}", c);
           }
         }
         return true;

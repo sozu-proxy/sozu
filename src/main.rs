@@ -24,12 +24,17 @@ fn main() {
   bus_tx.send(Message::Subscribe(Tag::AddAcl, add_acl_input));
   if let Ok(Message::SubscribeOk) = add_acl_listener.recv() {
     println!("Subscribed to ADD_ACL commands");
-    network::amqp::init_rabbitmq(bus_tx);
 
-    if let Ok(Message::Msg(t, c)) = add_acl_listener.recv() {
-        println!("Got ADD_ACL command");
-        println!("{:?}", c);
-    }
+    network::amqp::init_rabbitmq(bus_tx);
+    println!("Subscribed to ADD_ACL commands");
+    let res = add_acl_listener.recv();
+    res.map(|x| x.display());
+
+    println!("yolo");
+    //if let Ok(Message::Msg(t, c)) = res {
+    //    println!("Got ADD_ACL command");
+    //    println!("{:?}", c);
+    //}
   }
 
   let (sender, receiver) = channel::<network::ServerMessage>();
