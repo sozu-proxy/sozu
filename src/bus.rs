@@ -2,13 +2,13 @@ use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Sender,Receiver};
 use std::collections::HashMap;
 
-use messages::{Acl, Command, Tag};
+use messages::{Command, Topic, HttpFront};
 
 #[derive(Clone)]
 pub enum Message {
-  Subscribe(Tag, Sender<Message>),
+  Subscribe(Topic, Sender<Message>),
   SubscribeOk,
-  Msg(Tag, Command)
+  Msg(Command)
 }
 
 impl Message {
@@ -16,8 +16,8 @@ impl Message {
       match self {
         &Message::Subscribe(_, _) => println!("Subscribe"),
         &Message::SubscribeOk => println!("SubscribeOk"),
-        &Message::Msg(ref t, ref c) => {
-          println!("{:?}", t);
+        &Message::Msg(ref c) => {
+          println!("{:?}", c.get_topics());
           println!("{:?}", c)
         }
       }
@@ -40,7 +40,7 @@ pub fn start_bus() -> Sender<Message> {
 
 struct Bus {
   rx: Receiver<Message>,
-  senders: HashMap<Tag, Vec<Sender<Message>>>
+  senders: HashMap<Topic, Vec<Sender<Message>>>
 }
 
 impl Bus {
@@ -59,14 +59,18 @@ impl Bus {
         println!("SUBSCRIBED");
         return true;
       },
-      &Ok(Message::Msg(ref t, ref c)) => {
+      &Ok(Message::Msg(ref c)) => {
         println!("GOT MSG");
-        if let &Some(v) = &self.senders.get(&t) {
-          println!("GOT MSG 2");
-          for tx in v {
-            println!("GOT MSG 3");
-            let r = tx.send(Message::Msg(t.clone(), c.clone()));
-            println!("{:?}", c);
+        let topics = c.get_topics();
+
+        for t in topics {
+          if let &Some(v) = &self.senders.get(&t) {
+            println!("GOT MSG 2");
+            for tx in v {
+              println!("GOT MSG 3");
+              let r = tx.send(Message::Msg(c.clone()));
+              println!("{:?}", c);
+            }
           }
         }
         return true;
@@ -83,7 +87,7 @@ impl Bus {
     }
   }
 
-  fn subscribe(&mut self, t: &Tag, tx: &Sender<Message>) {
+  fn subscribe(&mut self, t: &Topic, tx: &Sender<Message>) {
     println!("X");
     if ! &self.senders.contains_key(t) {
       let mut v = Vec::new();
@@ -105,23 +109,21 @@ fn bus_test() {
 
   let (tx2,rx2) = channel();
   println!("AA");
-  tx.send(Message::Subscribe(Tag::AddAcl, tx2));
+  tx.send(Message::Subscribe(Topic::HttpProxyConfig, tx2));
   println!("BB");
 
   if let Ok(Message::SubscribeOk) = rx2.recv() {
     println!("successfully subscribed");
-    let tag = Tag::AddAcl;
-    let command = Command::AddAcl(
-      Acl {
+    let command = Command::AddHttpFront(
+      HttpFront {
         app_id: String::new() + "app_e74eb0d4-e01a-4a09-af46-7ecab7157d32",
         hostname: String::new() + "cltdl.fr",
         path_begin: String::new() + ""
       }
     );
-    tx.send(Message::Msg(tag.clone(), command.clone()));
+    tx.send(Message::Msg(command.clone()));
 
-    if let Ok(Message::Msg(t, c)) = rx2.recv() {
-      assert_eq!(t, tag);
+    if let Ok(Message::Msg(c)) = rx2.recv() {
       assert_eq!(c, command);
     } else {
       assert!(false);

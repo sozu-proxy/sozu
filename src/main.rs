@@ -14,20 +14,20 @@ mod messages;
 use std::sync::mpsc::{channel};
 use std::thread;
 
-use messages::Tag;
+use messages::Topic;
 use bus::Message;
 
 fn main() {
   let bus_tx = bus::start_bus();
 
-  let (add_acl_input,add_acl_listener) = channel();
-  bus_tx.send(Message::Subscribe(Tag::AddAcl, add_acl_input));
-  if let Ok(Message::SubscribeOk) = add_acl_listener.recv() {
-    println!("Subscribed to ADD_ACL commands");
+  let (http_proxy_conf_input,http_proxy_conf_listener) = channel();
+  bus_tx.send(Message::Subscribe(Topic::HttpProxyConfig, http_proxy_conf_input));
+  if let Ok(Message::SubscribeOk) = http_proxy_conf_listener.recv() {
+    println!("Subscribed to http_proxy_conf commands");
 
     network::amqp::init_rabbitmq(bus_tx);
-    println!("Subscribed to ADD_ACL commands");
-    let res = add_acl_listener.recv();
+    println!("Subscribed to http_proxy_conf commands");
+    let res = http_proxy_conf_listener.recv();
     res.map(|x| x.display());
 
     println!("yolo");

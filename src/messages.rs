@@ -1,11 +1,20 @@
+use std::vec;
+
 use rustc_serialize::{json, Decodable, Decoder};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
-pub struct Acl {
+pub struct HttpFront {
     pub app_id: String,
     pub hostname: String,
     pub path_begin: String
 }
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+pub struct TcpFront {
+    pub app_id: String,
+    pub port: u16
+}
+
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable,RustcEncodable)]
 pub struct Instance {
@@ -16,19 +25,25 @@ pub struct Instance {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcEncodable)]
 pub enum Command {
-    AddAcl(Acl),
-    RemoveAcl(Acl),
+    AddHttpFront(HttpFront),
+    RemoveHttpFront(HttpFront),
+
+    AddTcpFront(TcpFront),
+    RemoveTcpFront(TcpFront),
+
     AddInstance(Instance),
     RemoveInstance(Instance)
 }
 
 impl Command {
-  pub fn get_type(&self) -> Tag {
+  pub fn get_topics(&self) -> Vec<Topic> {
     match self {
-      &Command::AddAcl(_) => Tag::AddAcl,
-      &Command::RemoveAcl(_) => Tag::RemoveAcl,
-      &Command::AddInstance(_) => Tag::AddInstance,
-      &Command::RemoveInstance(_) => Tag::RemoveInstance
+      &Command::AddHttpFront(_)    => vec![Topic::HttpProxyConfig],
+      &Command::RemoveHttpFront(_) => vec![Topic::HttpProxyConfig],
+      &Command::AddTcpFront(_)     => vec![Topic::HttpProxyConfig],
+      &Command::RemoveTcpFront(_)  => vec![Topic::HttpProxyConfig],
+      &Command::AddInstance(_)     => vec![Topic::HttpProxyConfig, Topic::TcpProxyConfig],
+      &Command::RemoveInstance(_)  => vec![Topic::HttpProxyConfig, Topic::TcpProxyConfig]
     }
   }
 }
@@ -38,12 +53,18 @@ impl Decodable for Command {
     decoder.read_struct("root", 0, |decoder| {
       let commandType: String = try!(decoder.read_struct_field("type", 0, |decoder| Decodable::decode(decoder)));
 
-      if &commandType == "ADD_ACL" {
+      if &commandType == "ADD_HTTP_FRONT" {
         let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
-        Ok(Command::AddAcl(acl))
-      } else if &commandType == "REMOVE_ACL" {
+        Ok(Command::AddHttpFront(acl))
+      } else if &commandType == "REMOVE_HTTP_FRONT" {
         let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
-        Ok(Command::RemoveAcl(acl))
+        Ok(Command::RemoveHttpFront(acl))
+      } else if &commandType == "ADD_TCP_FRONT" {
+        let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
+        Ok(Command::AddTcpFront(acl))
+      } else if &commandType == "REMOVE_TCP_FRONT" {
+        let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
+        Ok(Command::RemoveTcpFront(acl))
       } else if &commandType == "ADD_INSTANCE" {
         let instance = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
         Ok(Command::AddInstance(instance))
@@ -58,19 +79,17 @@ impl Decodable for Command {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
-pub enum Tag {
-    AddAcl,
-    RemoveAcl,
-    AddInstance,
-    RemoveInstance
+pub enum Topic {
+    HttpProxyConfig,
+    TcpProxyConfig
 }
 
 #[test]
 fn add_acl_test() {
-  let raw_json = r#"{"type": "ADD_ACL", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}}"#;
+  let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}}"#;
   let command: Command = json::decode(raw_json).unwrap();
   println!("{:?}", command);
-  assert!(command == Command::AddAcl(Acl{
+  assert!(command == Command::AddHttpFront(HttpFront{
     app_id: String::from("xxx"),
     hostname: String::from("yyy"),
     path_begin: String::from("xxx")
@@ -79,10 +98,10 @@ fn add_acl_test() {
 
 #[test]
 fn remove_acl_test() {
-  let raw_json = r#"{"type": "REMOVE_ACL", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}}"#;
+  let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}}"#;
   let command: Command = json::decode(raw_json).unwrap();
   println!("{:?}", command);
-  assert!(command == Command::RemoveAcl(Acl{
+  assert!(command == Command::RemoveHttpFront(HttpFront{
     app_id: String::from("xxx"),
     hostname: String::from("yyy"),
     path_begin: String::from("xxx")

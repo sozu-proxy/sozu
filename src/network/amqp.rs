@@ -14,7 +14,7 @@ use rustc_serialize::json;
 use std::thread;
 use std::sync::mpsc::{Sender};
 use bus::Message;
-use messages::{Acl, Command, Tag};
+use messages::{Command, Topic};
 
 pub fn init_rabbitmq(bus_tx: Sender<Message>) {
     env_logger::init().unwrap();
@@ -43,7 +43,7 @@ pub fn init_rabbitmq(bus_tx: Sender<Message>) {
 
             match payload {
               Ok(command) => {
-                  bus_tx.send(Message::Msg(command.get_type().clone(), command.clone()));
+                  bus_tx.send(Message::Msg(command.clone()));
               }
               Err(e) => println!("{}", e)
             }
