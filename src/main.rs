@@ -14,7 +14,7 @@ mod messages;
 use std::sync::mpsc::{channel};
 use std::thread;
 
-use messages::Topic;
+use messages::{Command, Instance, TcpFront, Topic};
 use bus::Message;
 
 fn main() {
@@ -41,11 +41,18 @@ fn main() {
   let (tx, jg) = network::start_listener(10, 500, sender);
   println!("rustyXORP");
 
-  let _ = tx.send(network::ServerOrder::AddServer("127.0.0.1:1234".to_string(), "127.0.0.1:5678".to_string()));
+  let _ = tx.send(network::TcpProxyOrder::Command(Command::AddTcpFront(TcpFront { app_id: String::from("yolo"), port: 8080 })));
   thread::sleep_ms(200);
   println!("server said: {:?}", receiver.recv());
-  //tx.send(network::ServerOrder::RemoveServer(0));
-  let _ = tx.send(network::ServerOrder::Stop);
+
+  let _ = tx.send(network::TcpProxyOrder::Command(Command::AddInstance(Instance { app_id: String::from("yolo"), port: 9090, ip_address: String::from("127.0.0.1") })));
+  thread::sleep_ms(200);
+  println!("server said: {:?}", receiver.recv());
+
+
+  thread::sleep_ms(20000);
+  let _ = tx.send(network::TcpProxyOrder::Stop);
+  thread::sleep_ms(200);
   println!("server said: {:?}", receiver.recv());
   let _ = jg.join();
   println!("good bye");

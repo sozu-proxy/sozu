@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use time::precise_time_s;
 
-use messages::{TcpFront,Instance};
+use messages::{TcpFront,Command,Instance};
 
 pub mod amqp;
 
@@ -24,16 +24,17 @@ mod splice;
 const SERVER: Token = Token(0);
 
 #[derive(Debug)]
-pub enum ServerOrder {
-  AddServer(String,String),
-  RemoveServer(usize),
+pub enum TcpProxyOrder {
+  Command(Command),
   Stop
 }
 
 #[derive(Debug)]
 pub enum ServerMessage {
-  AddedServer(String, String, usize),
-  RemovedServer(usize),
+  AddedTcpFront,
+  RemovedTcpFront,
+  AddedInstance,
+  RemovedInstance,
   Stopped
 }
 
@@ -329,15 +330,18 @@ impl Client {
   }
 }
 
-pub struct Backend {
-  sock:          TcpListener,
-  token:         Option<Token>,
-  front_address: SocketAddr,
-  back_address:  SocketAddr
+pub struct ApplicationListener {
+  app_id:         String,
+  sock:           TcpListener,
+  token:          Option<Token>,
+  front_address:  SocketAddr,
+  back_addresses: Vec<SocketAddr>
 }
 
 pub struct Server {
-  servers:         Slab<Backend>,
+  fronts:          HashMap<String, Token>,
+  instances:       HashMap<String, Vec<SocketAddr>>,
+  listeners:       Slab<ApplicationListener>,
   clients:         Slab<Client>,
   backend:         Slab<Token>,
   max_listeners:   usize,
@@ -348,7 +352,9 @@ pub struct Server {
 impl Server {
   fn new(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> Server {
     Server {
-      servers:         Slab::new_starting_at(Token(0), max_listeners),
+      fronts:          HashMap::new(),
+      instances:       HashMap::new(),
+      listeners:    Slab::new_starting_at(Token(0), max_listeners),
       clients:         Slab::new_starting_at(Token(max_listeners), max_connections),
       backend:         Slab::new_starting_at(Token(max_listeners+max_connections), max_connections),
       max_listeners:   max_listeners,
@@ -357,16 +363,55 @@ impl Server {
     }
   }
 
-  pub fn add_server(&mut self, front: &SocketAddr, back: &SocketAddr, event_loop: &mut EventLoop<Server>) -> Option<Token> {
+  pub fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<Server>) -> Option<Token> {
+    let addr_string = String::from("127.0.0.1:") + &port.to_string();
+    let front = &addr_string.parse().unwrap();
+
     if let Ok(listener) = TcpListener::bind(front) {
-      let back = Backend { sock: listener, token: None, front_address: front.clone(), back_address: back.clone() };
-      if let Ok(tok) = self.servers.insert(back) {
-        self.servers[tok].token = Some(tok);
-        event_loop.register_opt(&self.servers[tok].sock, tok, EventSet::readable(), PollOpt::level()).unwrap();
-        println!("added server {:?}", tok);
+      let addresses = if let Some(ads) = self.instances.get(app_id) {
+        ads.clone()
+      } else {
+        Vec::new()
+      };
+
+      let al = ApplicationListener {
+        app_id:         String::from(app_id),
+        sock:           listener,
+        token:          None,
+        front_address:  *front,
+        back_addresses: addresses
+      };
+
+      if let Ok(tok) = self.listeners.insert(al) {
+        self.listeners[tok].token = Some(tok);
+        self.fronts.insert(String::from(app_id), tok);
+        event_loop.register_opt(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level()).unwrap();
+        println!("registered listener for app {} on port {}", app_id, port);
         Some(tok)
       } else {
-        println!("could not add listener to slab");
+        println!("could not register listener for app {} on port {}", app_id, port);
+        None
+      }
+
+    } else {
+      println!("could not declare listener for app {} on port {}", app_id, port);
+      None
+    }
+  }
+
+  pub fn remove_tcp_front(&mut self, app_id: String, event_loop: &mut EventLoop<Server>) -> Option<Token>{
+    println!("removing tcp_front {:?}", app_id);
+    // ToDo
+    // Removes all listeners for the given app_id
+    // an app can't have two listeners. Is this a problem?
+    if let Some(&tok) = self.fronts.get(&app_id) {
+      if self.listeners.contains(tok) {
+        event_loop.deregister(&self.listeners[tok].sock);
+        self.listeners.remove(tok);
+        println!("removed server {:?}", tok);
+        //self.listeners[tok].sock.shutdown(Shutdown::Both);
+        Some(tok)
+      } else {
         None
       }
     } else {
@@ -374,62 +419,84 @@ impl Server {
     }
   }
 
+  pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<Server>) -> Option<Token> {
+    // ToDo add the address to self.instances
 
-  //FIXME: this does not close existing connections, is that what we want?
-  pub fn remove_server(&mut self, tok: Token, event_loop: &mut EventLoop<Server>) -> Option<Token>{
-    println!("removing server {:?}", tok);
-    if self.servers.contains(tok) {
-      event_loop.deregister(&self.servers[tok].sock);
-      self.servers.remove(tok);
-      println!("removed server {:?}", tok);
-      //self.servers[tok].sock.shutdown(Shutdown::Both);
+    if let Some(&tok) = self.fronts.get(app_id) {
+      let application_listener = &mut self.listeners[tok];
+
+      application_listener.back_addresses.push(*instance_address);
       Some(tok)
     } else {
+      println!("No front for this instance");
       None
     }
   }
 
+  pub fn remove_instance(&mut self, tok: Token, event_loop: &mut EventLoop<Server>) -> Option<Token>{
+      // ToDo
+      None
+  }
+
   pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-    let accepted = self.servers[token].sock.accept();
-    if let Ok(Some(sock)) = accepted {
-      if let Ok(backend) = TcpStream::connect(&self.servers[token].back_address) {
-        if let Some(client) = Client::new(sock, backend) {
-          if let Ok(tok) = self.clients.insert(client) {
-
-            if let Ok(backend_tok) = self.backend.insert(tok) {
-              &self.clients[tok].set_tokens(tok, backend_tok);
-
-              event_loop.register_opt(&self.clients[tok].sock, tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-              event_loop.register_opt(&self.clients[tok].backend, backend_tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-              println!("accepted client {:?}", tok);
+    let application_listener = &self.listeners[token];
+    // ToDo round robin (random or least_used)
+    if let Some(backend_addr) = application_listener.back_addresses.get(0) {
+      let accepted = application_listener.sock.accept();
+      if let Ok(Some(sock)) = accepted {
+        if let Ok(instance) = TcpStream::connect(backend_addr) {
+          if let Some(client) = Client::new(sock, instance) {
+            if let Ok(tok) = self.clients.insert(client) {
+              if let Ok(backend_tok) = self.backend.insert(tok) {
+                &self.clients[tok].set_tokens(tok, backend_tok);
+                event_loop.register_opt(&self.clients[tok].sock, tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                event_loop.register_opt(&self.clients[tok].backend, backend_tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+              } else {
+                println!("could not add backend to slab");
+              }
             } else {
-              println!("could not add backend to slab");
+              println!("could not add client to slab");
             }
           } else {
-            println!("could not add client to slab");
+            println!("could not create a client");
           }
         } else {
-          println!("could not create a client");
+          println!("could not connect to instance");
         }
       } else {
-        println!("could not connect to backend");
+        println!("could not accept connection: {:?}", accepted);
       }
     } else {
-      println!("could not accept connection: {:?}", accepted);
+      println!("No instance listening for app {}, dropping", application_listener.app_id);
     }
   }
+
+
+  //FIXME: this does not close existing connections, is that what we want?
+  //pub fn remove_server(&mut self, tok: Token, event_loop: &mut EventLoop<Server>) -> Option<Token>{
+  //  println!("removing server {:?}", tok);
+  //  if self.servers.contains(tok) {
+  //    event_loop.deregister(&self.servers[tok].sock);
+  //    self.servers.remove(tok);
+  //    println!("removed server {:?}", tok);
+  //    //self.servers[tok].sock.shutdown(Shutdown::Both);
+  //    Some(tok)
+  //  } else {
+  //    None
+  //  }
+  //}
 }
 
 impl Handler for Server {
   type Timeout = usize;
-  type Message = ServerOrder;
+  type Message = TcpProxyOrder;
 
   fn ready(&mut self, event_loop: &mut EventLoop<Server>, token: Token, events: EventSet) {
     //println!("{:?} got events: {:?}", token, events);
     if events.is_readable() {
       //println!("{:?} is readable", token);
       if token.as_usize() < self.max_listeners {
-        if self.servers.contains(token) {
+        if self.listeners.contains(token) {
           self.accept(event_loop, token)
         }
       } else if token.as_usize() < self.max_listeners + self.max_connections {
@@ -539,22 +606,29 @@ impl Handler for Server {
   fn notify(&mut self, event_loop: &mut EventLoop<Self>, message: Self::Message) {
     println!("notified: {:?}", message);
     match message {
-      ServerOrder::AddServer(front, back) => {
-        if let (Ok(front_address), Ok(back_address)) = (
-          FromStr::from_str(&front), FromStr::from_str(&back)
-        ) {
-          if let Some(token) = self.add_server(&front_address, &back_address, event_loop) {
-            self.tx.send(ServerMessage::AddedServer(front, back, token.as_usize()));
-          }
+      TcpProxyOrder::Command(Command::AddTcpFront(front)) => {
+        println!("{:?}", front);
+        if let Some(token) = self.add_tcp_front(front.port, &front.app_id, event_loop) {
+          self.tx.send(ServerMessage::AddedTcpFront);
+        } else {
+          println!("Couldn't add tcp front");
         }
       },
-      ServerOrder::RemoveServer(id)       => {
-        if let Some(token) = self.remove_server(Token(id), event_loop) {
-          self.tx.send(ServerMessage::RemovedServer(token.as_usize()));
+      TcpProxyOrder::Command(Command::AddInstance(instance)) => {
+        println!("{:?}", instance);
+        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+        let addr = &addr_string.parse().unwrap();
+        if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
+          self.tx.send(ServerMessage::AddedInstance);
+        } else {
+          println!("Couldn't add tcp front");
         }
       },
-      ServerOrder::Stop                   => {
+      TcpProxyOrder::Stop                   => {
         event_loop.shutdown();
+      },
+      _ => {
+        println!("unsupported message, ignoring");
       }
     }
   }
@@ -577,14 +651,14 @@ pub fn start() {
   let (tx,rx) = channel::<ServerMessage>();
   let mut s = Server::new(10, 500, tx);
   {
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1234").unwrap();
     let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
-    s.add_server(&front, &back, &mut event_loop);
+    s.add_tcp_front(1234, "yolo", &mut event_loop);
+    s.add_instance("yolo", &back, &mut event_loop);
   }
   {
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1235").unwrap();
     let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
-    s.add_server(&front, &back, &mut event_loop);
+    s.add_tcp_front(1235, "yolo", &mut event_loop);
+    s.add_instance("yolo", &back, &mut event_loop);
   }
   thread::spawn(move|| {
     println!("starting event loop");
@@ -593,7 +667,7 @@ pub fn start() {
   });
 }
 
-pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ServerOrder>,thread::JoinHandle<()>)  {
+pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<TcpProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
