@@ -420,7 +420,13 @@ impl Server {
   }
 
   pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<Server>) -> Option<Token> {
-    // ToDo add the address to self.instances
+    if let Some(addrs) = self.instances.get_mut(app_id) {
+        addrs.push(*instance_address);
+    }
+
+    if self.instances.get(app_id).is_none() {
+      self.instances.insert(String::from(app_id), vec![*instance_address]);
+    }
 
     if let Some(&tok) = self.fronts.get(app_id) {
       let application_listener = &mut self.listeners[tok];
