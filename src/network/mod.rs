@@ -439,7 +439,7 @@ impl Server {
     }
   }
 
-  pub fn remove_instance(&mut self, tok: Token, event_loop: &mut EventLoop<Server>) -> Option<Token>{
+  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<Server>) -> Option<Token>{
       // ToDo
       None
   }
@@ -620,12 +620,27 @@ impl Handler for Server {
           println!("Couldn't add tcp front");
         }
       },
+      TcpProxyOrder::Command(Command::RemoveTcpFront(front)) => {
+        println!("{:?}", front);
+        let _ = self.remove_tcp_front(front.app_id, event_loop);
+        self.tx.send(ServerMessage::RemovedTcpFront);
+      },
       TcpProxyOrder::Command(Command::AddInstance(instance)) => {
         println!("{:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
           self.tx.send(ServerMessage::AddedInstance);
+        } else {
+          println!("Couldn't add tcp front");
+        }
+      },
+      TcpProxyOrder::Command(Command::RemoveInstance(instance)) => {
+        println!("{:?}", instance);
+        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+        let addr = &addr_string.parse().unwrap();
+        if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
+          self.tx.send(ServerMessage::RemovedInstance);
         } else {
           println!("Couldn't add tcp front");
         }
