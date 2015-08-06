@@ -19,41 +19,27 @@ use bus::Message;
 
 fn main() {
   let bus_tx = bus::start_bus();
+  let (sender, receiver) = channel::<network::ServerMessage>();
+  let (tx, jg) = network::start_listener(10, 500, sender);
+
 
   let (http_proxy_conf_input,http_proxy_conf_listener) = channel();
-  let _ = bus_tx.send(Message::Subscribe(Topic::HttpProxyConfig, http_proxy_conf_input));
+  let _ = bus_tx.send(Message::Subscribe(Topic::TcpProxyConfig, http_proxy_conf_input));
   if let Ok(Message::SubscribeOk) = http_proxy_conf_listener.recv() {
     println!("Subscribed to http_proxy_conf commands");
 
     network::amqp::init_rabbitmq(bus_tx);
     println!("Subscribed to http_proxy_conf commands");
-    let res = http_proxy_conf_listener.recv();
-    let _ = res.map(|x| x.display());
 
-    println!("yolo");
-    //if let Ok(Message::Msg(t, c)) = res {
-    //    println!("Got ADD_ACL command");
-    //    println!("{:?}", c);
-    //}
+    thread::spawn(move || {
+      loop {
+        if let Ok(Message::Msg(command)) = http_proxy_conf_listener.recv() {
+          tx.send(network::TcpProxyOrder::Command(command));
+        }
+      }
+    });
   }
 
-  let (sender, receiver) = channel::<network::ServerMessage>();
-  let (tx, jg) = network::start_listener(10, 500, sender);
-  println!("rustyXORP");
-
-  let _ = tx.send(network::TcpProxyOrder::Command(Command::AddTcpFront(TcpFront { app_id: String::from("yolo"), port: 8080 })));
-  thread::sleep_ms(200);
-  println!("server said: {:?}", receiver.recv());
-
-  let _ = tx.send(network::TcpProxyOrder::Command(Command::AddInstance(Instance { app_id: String::from("yolo"), port: 9090, ip_address: String::from("127.0.0.1") })));
-  thread::sleep_ms(200);
-  println!("server said: {:?}", receiver.recv());
-
-
-  thread::sleep_ms(20000);
-  let _ = tx.send(network::TcpProxyOrder::Stop);
-  thread::sleep_ms(200);
-  println!("server said: {:?}", receiver.recv());
   let _ = jg.join();
   println!("good bye");
 }
