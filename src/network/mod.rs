@@ -447,9 +447,9 @@ impl Server {
   pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
     let application_listener = &self.listeners[token];
     // ToDo round robin (random or least_used)
-    if let Some(backend_addr) = application_listener.back_addresses.get(0) {
-      let accepted = application_listener.sock.accept();
-      if let Ok(Some(sock)) = accepted {
+    let accepted = application_listener.sock.accept();
+    if let Ok(Some(sock)) = accepted {
+      if let Some(backend_addr) = application_listener.back_addresses.get(0) {
         if let Ok(instance) = TcpStream::connect(backend_addr) {
           if let Some(client) = Client::new(sock, instance) {
             if let Ok(tok) = self.clients.insert(client) {
@@ -470,10 +470,11 @@ impl Server {
           println!("could not connect to instance");
         }
       } else {
-        println!("could not accept connection: {:?}", accepted);
+        println!("No instance listening for app {}, dropping", application_listener.app_id);
+        sock.shutdown(Shutdown::Both);
       }
     } else {
-      println!("No instance listening for app {}, dropping", application_listener.app_id);
+      println!("could not accept connection: {:?}", accepted);
     }
   }
 
