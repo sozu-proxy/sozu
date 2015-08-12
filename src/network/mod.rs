@@ -21,8 +21,6 @@ pub mod amqp;
 #[cfg(feature = "splice")]
 mod splice;
 
-const SERVER: Token = Token(0);
-
 #[derive(Debug)]
 pub enum TcpProxyOrder {
   Command(Command),
