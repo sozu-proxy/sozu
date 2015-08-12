@@ -17,6 +17,7 @@ use time::precise_time_s;
 use messages::{TcpFront,Command,Instance};
 
 pub mod amqp;
+pub mod http;
 
 #[cfg(feature = "splice")]
 mod splice;

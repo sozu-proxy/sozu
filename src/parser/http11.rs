@@ -41,6 +41,12 @@ pub struct RequestLine<'a> {
     pub version: [&'a [u8];2]
 }
 
+pub struct RRequestLine {
+    pub method: String,
+    pub uri: String,
+    pub version: String
+}
+
 named!(pub http_version<[&[u8];2]>,
        chain!(
         tag!("HTTP/") ~
