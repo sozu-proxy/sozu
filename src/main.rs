@@ -14,12 +14,12 @@ mod messages;
 use std::sync::mpsc::{channel};
 use std::thread;
 
-use messages::{Command, Instance, TcpFront, Topic};
+use messages::Topic;
 use bus::Message;
 
 fn main() {
   let bus_tx = bus::start_bus();
-  let (sender, receiver) = channel::<network::ServerMessage>();
+  let (sender, _) = channel::<network::ServerMessage>();
   let (tx, jg) = network::start_listener(10, 500, sender);
 
 
@@ -34,7 +34,7 @@ fn main() {
     thread::spawn(move || {
       loop {
         if let Ok(Message::Msg(command)) = http_proxy_conf_listener.recv() {
-          tx.send(network::TcpProxyOrder::Command(command));
+          let _ = tx.send(network::TcpProxyOrder::Command(command));
         }
       }
     });

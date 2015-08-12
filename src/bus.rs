@@ -12,6 +12,7 @@ pub enum Message {
 }
 
 impl Message {
+  #[allow(dead_code)]
   pub fn display(&self) {
       match self {
         &Message::Subscribe(_, _) => println!("Subscribe"),
