@@ -7,6 +7,8 @@ use nom::Err::*;
 
 use nom::{digit,is_alphanumeric};
 
+use std::str;
+
 // Primitives
 fn is_token_char(i: u8) -> bool {
   is_alphanumeric(i) ||
@@ -41,10 +43,37 @@ pub struct RequestLine<'a> {
     pub version: [&'a [u8];2]
 }
 
+#[derive(PartialEq,Debug,Clone)]
 pub struct RRequestLine {
     pub method: String,
     pub uri: String,
     pub version: String
+}
+
+impl RRequestLine {
+  pub fn fromRequestLine(r: RequestLine) -> Option<RRequestLine> {
+    if let Ok(method) = str::from_utf8(r.method) {
+      if let Ok(uri) = str::from_utf8(r.uri) {
+        if let Ok(version1) = str::from_utf8(r.version[0]) {
+          if let Ok(version2) = str::from_utf8(r.version[1]) {
+            Some(RRequestLine {
+              method:  String::from(method),
+              uri:     String::from(uri),
+              version: String::from(version1) + version2
+            })
+          } else {
+            None
+          }
+        } else {
+          None
+        }
+      } else {
+        None
+      }
+    } else {
+      None
+    }
+  }
 }
 
 named!(pub http_version<[&[u8];2]>,
@@ -95,6 +124,8 @@ named!(pub message_header<RequestHeader>,
          }
        )
 );
+
+named!(pub headers< Vec<RequestHeader> >, many0!(message_header));
 
 #[derive(PartialEq,Debug)]
 pub struct RequestHead<'a> {

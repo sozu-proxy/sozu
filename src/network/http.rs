@@ -3,28 +3,30 @@
 use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
 use mio::tcp::*;
+use std::io::{self,Read,ErrorKind};
 use mio::*;
 use mio::buf::{ByteBuf,MutByteBuf};
 use std::collections::HashMap;
-use std::io::{self,Read,ErrorKind};
-use nom::HexDisplay;
+use nom::{HexDisplay,IResult};
 use std::error::Error;
 use mio::util::Slab;
 use std::net::SocketAddr;
-use std::str::FromStr;
+use std::str::{FromStr, from_utf8};
 use time::precise_time_s;
 
-use parser::http11::{RRequestLine};
+use parser::http11::{RRequestLine,RequestHeader,request_line,headers};
 
 use messages::Command;
 
 pub type Host = String;
 
+#[derive(Debug,Clone)]
 pub enum ErrorState {
   InvalidHttp,
   MissingHost
 }
 
+#[derive(Debug,Clone)]
 pub enum LengthInformation {
   Length(usize),
   Chunked,
@@ -32,11 +34,12 @@ pub enum LengthInformation {
 }
 
 type BackendToken = Token;
+#[derive(Debug,Clone)]
 pub enum HttpState {
   Initial,
   Error(ErrorState),
-  HasRequestLine(RRequestLine),
-  HasHost(RRequestLine, Host),
+  HasRequestLine(usize, RRequestLine),
+  HasHost(usize, RRequestLine, Host),
   HeadersParsed(RRequestLine, Host, LengthInformation),
   Proxying(RRequestLine, Host, LengthInformation, BackendToken)
 }
@@ -60,7 +63,8 @@ pub enum ServerMessage {
 
 struct Client {
   sock:           TcpStream,
-  http_state:      HttpState,
+  backend:        Option<TcpStream>,
+  http_state:     HttpState,
   front_buf:      Option<ByteBuf>,
   front_mut_buf:  Option<MutByteBuf>,
   back_buf:       Option<ByteBuf>,
@@ -77,7 +81,8 @@ impl Client {
   fn new(sock: TcpStream) -> Option<Client> {
     Some(Client {
       sock:           sock,
-      http_state:      HttpState::Initial,
+      backend:        None,
+      http_state:     HttpState::Initial,
       front_buf:      None,
       front_mut_buf:  Some(ByteBuf::mut_with_capacity(2048)),
       back_buf:       None,
@@ -91,6 +96,10 @@ impl Client {
     })
   }
 
+  pub fn set_front_token(&mut self, token: Token) {
+    self.token         = Some(token);
+  }
+
   pub fn set_tokens(&mut self, token: Token, backend: Token) {
     self.token         = Some(token);
     self.backend_token = Some(backend);
@@ -98,6 +107,61 @@ impl Client {
 
   pub fn close(&self) {
     // ToDo close sockets and remove from slabs
+  }
+
+  fn parse_headers(state: &HttpState, buf: &MutByteBuf) -> HttpState {
+    match state {
+      &HttpState::Initial => {
+        println!("buf: {}", buf.bytes().to_hex(8));
+        match request_line(buf.bytes()) {
+          IResult::Error(e) => {
+            println!("error: {:?}", e);
+            HttpState::Error(ErrorState::InvalidHttp)
+          },
+          IResult::Incomplete(_) => {
+            state.clone()
+          },
+          IResult::Done(i, r)    => {
+            if let Some(rl) = RRequestLine::fromRequestLine(r) {
+              let s = HttpState::HasRequestLine(buf.bytes().offset(i), rl);
+              println!("now in state: {:?}", s);
+              Client::parse_headers(&s, buf)
+            } else {
+              HttpState::Error(ErrorState::InvalidHttp)
+            }
+          }
+        }
+      },
+      &HttpState::HasRequestLine(pos, ref rl) => {
+        println!("parsing headers from:\n{}", (&buf.bytes()[pos..]).to_hex(8));
+        match headers(&buf.bytes()[pos..]) {
+          IResult::Error(e) => {
+            println!("error: {:?}", e);
+            HttpState::Error(ErrorState::InvalidHttp)
+          },
+          IResult::Incomplete(_) => {
+            state.clone()
+          },
+          IResult::Done(i, v)    => {
+            println!("got headers: {:?}", v);
+            for header in v.iter() {
+              if from_utf8(header.name) == Ok("Host") {
+                if let Ok(host) = from_utf8(header.value) {
+                  return HttpState::HasHost(buf.bytes().offset(i), rl.clone(), String::from(host));
+                } else {
+                  return HttpState::Error(ErrorState::InvalidHttp);
+                }
+              }
+            }
+            HttpState::HasRequestLine(buf.bytes().offset(i), rl.clone())
+         }
+        }
+      },
+      //HasHost(usize,RRequestLine, Host),
+      _ => {
+        panic!("unimplemented state: {:?}", state);
+      }
+    }
   }
 
   // Forward content to client
@@ -136,37 +200,64 @@ impl Client {
     */
   }
 
+  fn is_proxying(&self) -> bool {
+    if let HttpState::HasHost(_, _, _) = self.http_state {
+      true
+    } else {
+      false
+    }
+  }
+
+  fn flip_front_buf(&mut self, buf: MutByteBuf, event_loop: &mut EventLoop<Server>) {
+    self.front_interest.remove(EventSet::readable());
+    self.back_interest.insert(EventSet::writable());
+    // prepare to provide this to writable
+    self.front_buf = Some(buf.flip());
+    //event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+  }
 
   // Read content from the client
   fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
-    Ok(())
-    // ToDo
-    /*
-    let mut buf = self.front_mut_buf.take().unwrap();
+    println!("in readable()");
     //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
 
-    match self.sock.try_read_buf(&mut buf) {
-      Ok(None) => {
-        println!("We just got readable, but were unable to read from the socket?");
+    let mut buf = self.front_mut_buf.take().unwrap();
+    self.sock.try_read_buf(&mut buf).map(|res| {
+      if let Some(r) = res {
+        println!("FRONT [{:?}]: read {} bytes", self.token, r);
+        if self.is_proxying() {
+          //println!("FRONT [{}->{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+          self.flip_front_buf(buf, event_loop);
+          self.rx_count = self.rx_count + r;
+        } else {
+          let state = Client::parse_headers(&self.http_state, &buf);
+          if let HttpState::Error(_) = state {
+            self.front_mut_buf = Some(buf);
+            self.close();
+            self.http_state = state;
+            return;
+          }
+          self.http_state = state;
+          println!("new state: {:?}", self.http_state);
+          if self.is_proxying() {
+            self.rx_count = buf.remaining();
+            self.flip_front_buf(buf, event_loop);
+            println!("is now proxying, front buf flipped");
+          //if let HttpState::HasHost(i, ref rl, ref host) = self.http_state {
+          //  self.rx_count = buf.remaining();
+          //  self.flip_front_buf(buf, event_loop);
+          } else {
+            self.front_mut_buf = Some(buf);
+            println!("TOKEN: {:?}", self.token);
+            self.front_interest.insert(EventSet::readable());
+            event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+            println!("AAA");
+          }
+        }
       }
-      Ok(Some(r)) => {
-        //println!("FRONT [{}->{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
-        self.front_interest.remove(EventSet::readable());
-        self.back_interest.insert(EventSet::writable());
-        self.rx_count = self.rx_count + r;
-        // prepare to provide this to writable
-        self.front_buf = Some(buf.flip());
-      }
-      Err(e) => {
-        println!("not implemented; client err={:?}", e);
-        //self.front_interest.remove(EventSet::readable());
-      }
-    };
-
-    event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+    });
     Ok(())
-    */
   }
 
   // Forward content to application
@@ -356,6 +447,7 @@ impl Server {
       if let Some(client) = Client::new(frontend_sock) {
         if let Ok(client_token) = self.clients.insert(client) {
             event_loop.register_opt(&self.clients[client_token].sock, client_token, EventSet::readable(), PollOpt::edge()).unwrap();
+            self.clients[client_token].set_front_token(client_token);
         } else {
           println!("could not add client to slab");
         }
@@ -373,7 +465,7 @@ impl Handler for Server {
   type Message = HttpProxyOrder;
 
   fn ready(&mut self, event_loop: &mut EventLoop<Server>, token: Token, events: EventSet) {
-    //println!("{:?} got events: {:?}", token, events);
+    println!("{:?} got events: {:?}", token, events);
     if events.is_readable() {
       //println!("{:?} is readable", token);
       if token == Token(0) {
@@ -516,12 +608,34 @@ impl Handler for Server {
 
 pub fn start() {
   // ToDo temporary
-  //let mut event_loop = EventLoop::new().unwrap();
+  let mut event_loop = EventLoop::new().unwrap();
+
+  let (tx,rx) = channel::<ServerMessage>();
+  let channel = event_loop.channel();
+  let notify_tx = tx.clone();
+  let front: SocketAddr = FromStr::from_str("127.0.0.1:8080").unwrap();
+
+  let tcp_listener = TcpListener::bind(&front).unwrap();
+  let listener = ApplicationListener {
+    sock:           tcp_listener,
+    token:          Token(0),
+    front_address:  front
+  };
+
+  event_loop.register_opt(&listener.sock, listener.token, EventSet::readable(), PollOpt::edge()).unwrap();
+
+  let mut server = Server::new(listener, 500, tx);
+
+  let join_guard = thread::spawn(move|| {
+    println!("starting event loop");
+    event_loop.run(&mut server).unwrap();
+    println!("ending event loop");
+    notify_tx.send(ServerMessage::Stopped);
+  });
 
 
   //println!("listen for connections");
   //event_loop.register_opt(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-  let (tx,rx) = channel::<ServerMessage>();
   //let mut s = Server::new(10, 500, tx);
   //{
   //  let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
@@ -564,4 +678,57 @@ pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: 
   });
 
   (channel, join_guard)
+}
+
+#[cfg(test)]
+mod tests {
+  extern crate hyper;
+  use super::*;
+  use std::net::{TcpListener, TcpStream, Shutdown};
+  use std::io::{Read,Write};
+  use std::{thread,str};
+  use self::hyper::Client;
+  use self::hyper::header::Connection;
+
+  #[allow(unused_mut, unused_must_use, unused_variables)]
+  #[test]
+  fn mi() {
+    thread::spawn(|| { start_server(); });
+    start();
+    thread::sleep_ms(300);
+
+    let mut client = Client::new();
+
+    // Creating an outgoing request.
+    let mut res = client.get("http://localhost:8080/")
+        // set a header
+        .header(Connection::close())
+        // let 'er go!
+        .send().unwrap();
+
+    // Read the Response.
+    let mut body = String::new();
+    res.read_to_string(&mut body).unwrap();
+
+    println!("Response: {}", body);
+
+    thread::sleep_ms(500);
+    assert!(false);
+  }
+
+  use self::hyper::server::Request;
+  use self::hyper::server::Response;
+  use self::hyper::net::Fresh;
+
+  fn hello(_: Request, res: Response<Fresh>) {
+      res.send(b"Hello World!").unwrap();
+  }
+
+  #[allow(unused_mut, unused_must_use, unused_variables)]
+  fn start_server() {
+    thread::spawn(move|| {
+      hyper::Server::http("127.0.0.1:5678").unwrap().handle(hello);
+    });
+  }
+
 }
