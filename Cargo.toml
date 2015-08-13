@@ -16,6 +16,9 @@ rustc-serialize = "0.3.15"
 [dependencies.amqp]
 git = "https://github.com/Antti/rust-amqp"
 
+[dev-dependencies]
+hyper = "*"
+
 [features]
 default = []
 splice  = []
