@@ -48,14 +48,26 @@ pub enum HttpState {
 impl HttpState {
   pub fn get_host(&self) -> Option<String> {
     match self {
-      &HttpState::HasHost(_,_, ref host) => Some(host.clone()),
+      &HttpState::HasHost(_,_, ref host) |
+      &HttpState::Proxying(_, ref host)=> Some(host.clone()),
       _ => None
     }
   }
 
   pub fn get_uri(&self) -> Option<String> {
     match self {
-      &HttpState::HasRequestLine(_, ref rl) | &HttpState::HasHost(_, ref rl,_) => Some(rl.uri.clone()),
+      &HttpState::HasRequestLine(_, ref rl) |
+      &HttpState::HasHost(_, ref rl,_)      |
+      &HttpState::Proxying(ref rl, _)         => Some(rl.uri.clone()),
+      _ => None
+    }
+  }
+
+  pub fn get_request_line(&self) -> Option<String> {
+    match self {
+      &HttpState::HasRequestLine(_, ref rl) |
+      &HttpState::HasHost(_, ref rl,_)      |
+      &HttpState::Proxying(ref rl, _)         => Some(rl.clone()),
       _ => None
     }
   }
