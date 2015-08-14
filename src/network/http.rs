@@ -45,6 +45,21 @@ pub enum HttpState {
   //Proxying(RRequestLine, Host, LengthInformation, BackendToken)
 }
 
+impl HttpState {
+  pub fn get_host(&self) -> Option<String> {
+    match self {
+      &HttpState::HasHost(_,_, ref host) => Some(host.clone()),
+      _ => None
+    }
+  }
+
+  pub fn get_uri(&self) -> Option<String> {
+    match self {
+      &HttpState::HasRequestLine(_, ref rl) | &HttpState::HasHost(_, ref rl,_) => Some(rl.uri.clone()),
+      _ => None
+    }
+  }
+}
 
 #[derive(Debug)]
 pub enum HttpProxyOrder {
@@ -454,6 +469,10 @@ impl Server {
   //    None
   //}
 
+  pub fn backend_from_request(&self, host: &String, uri: &String) -> Option<SocketAddr> {
+    FromStr::from_str("127.0.0.1:5678").ok()
+  }
+
   pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
     let application_listener = &self.listener;
     let accepted = application_listener.sock.accept();
@@ -473,6 +492,30 @@ impl Server {
       println!("could not accept connection: {:?}", accepted);
     }
   }
+
+  pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
+    let host = self.clients[token].http_state.get_host().unwrap();
+    let uri  = self.clients[token].http_state.get_uri().unwrap();
+    if let Some(back) = self.backend_from_request(&uri, &host) {
+      if let Ok(socket) = TcpStream::connect(&back) {
+        if let Ok(backend_token) = self.backend.insert(token) {
+          //println!("backend connected and stored");
+          self.clients[token].backend       = Some(socket);
+          self.clients[token].backend_token = Some(backend_token);
+          //event_loop.register_opt(&self.clients[token].backend.unwrap(), backend_token, EventSet::readable(), PollOpt::edge()).unwrap();
+          if let Some(ref sock) = self.clients[token].backend {
+            event_loop.register_opt(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
+          }
+        } else {
+          self.close_client(event_loop, token);
+        }
+      } else {
+        self.close_client(event_loop, token);
+      }
+    } else {
+      self.close_client(event_loop, token);
+    }
+  }
 }
 
 impl Handler for Server {
@@ -488,38 +531,12 @@ impl Handler for Server {
       } else if token.as_usize() < self.max_listeners + self.max_connections {
         if self.clients.contains(token) {
           self.clients[token].readable(event_loop);
+
           if let HttpState::HasHost(_,_,_) = self.clients[token].http_state {
-            //println!("connecting to backend");
-            let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
-            if let Ok(socket) = TcpStream::connect(&back) {
-              if let Ok(backend_token) = self.backend.insert(token) {
-                //println!("backend connected and stored");
-                self.clients[token].backend       = Some(socket);
-                self.clients[token].backend_token = Some(backend_token);
-                //event_loop.register_opt(&self.clients[token].backend.unwrap(), backend_token, EventSet::readable(), PollOpt::edge()).unwrap();
-                if let Some(ref sock) = self.clients[token].backend {
-                  event_loop.register_opt(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
-                }
-              }
-            }
+            self.connect_to_backend(event_loop, token);
           }
           if let HttpState::Error(_) = self.clients[token].http_state {
             self.close_client(event_loop, token);
-            /*self.clients[token].sock.shutdown(Shutdown::Both);
-            event_loop.deregister(self.clients[token].sock);
-            if let Some(ref sock) = self.clients[token].backend {
-              sock.shutdown(Shutdown::Both);
-              event_loop.deregister(sock);
-            }
-
-            event_loop.deregister(sock);
-            if let Some(backend_token) = self.clients[token].backend_token {
-              if self.backend.contains(backend_token) {
-                self.backend.remove(backend_token):
-              }
-            }
-            self.clients.remove(token):
-            */
           }
         } else {
           println!("client {:?} was removed", token);
