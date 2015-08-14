@@ -63,7 +63,7 @@ impl HttpState {
     }
   }
 
-  pub fn get_request_line(&self) -> Option<String> {
+  pub fn get_request_line(&self) -> Option<RRequestLine> {
     match self {
       &HttpState::HasRequestLine(_, ref rl) |
       &HttpState::HasHost(_, ref rl,_)      |
@@ -229,8 +229,15 @@ impl Client {
     Ok(())
   }
 
-  fn is_proxying(&self) -> bool {
+  fn has_host(&self) -> bool {
     if let HttpState::HasHost(_, _, _) = self.http_state {
+      true
+    } else {
+      false
+    }
+  }
+  fn is_proxying(&self) -> bool {
+    if let HttpState::Proxying(_, _) = self.http_state {
       true
     } else {
       false
@@ -271,7 +278,7 @@ impl Client {
           }
           self.http_state = state;
           //println!("new state: {:?}", self.http_state);
-          if self.is_proxying() {
+          if self.has_host() {
             self.rx_count = buf.remaining();
             self.flip_front_buf(buf, event_loop);
             //println!("is now proxying, front buf flipped");
@@ -518,6 +525,8 @@ impl Server {
           if let Some(ref sock) = self.clients[token].backend {
             event_loop.register_opt(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
           }
+          let rl = self.clients[token].http_state.get_request_line().unwrap();
+          self.clients[token].http_state = HttpState::Proxying(rl, host);
         } else {
           self.close_client(event_loop, token);
         }
