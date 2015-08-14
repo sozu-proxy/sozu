@@ -553,10 +553,6 @@ impl Handler for Server {
           println!("backend {:?} was removed", token);
         }
       }
-      //match token {
-      //  SERVER => self.server.accept(event_loop).unwrap(),
-      //  i => self.server.conn_readable(event_loop, i).unwrap()
-     // }
     }
 
     if events.is_writable() {
@@ -581,11 +577,6 @@ impl Handler for Server {
           println!("backend {:?} was removed", token);
         }
       }
-      //match token {
-      //  SERVER => panic!("received writable for token 0"),
-        //CLIENT => self.client.writable(event_loop).unwrap(),
-      //  _ => self.server.conn_writable(event_loop, token).unwrap()
-      //};
     }
 
     if events.is_hup() {
