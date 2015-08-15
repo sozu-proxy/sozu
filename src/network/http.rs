@@ -410,7 +410,7 @@ impl Server {
     self.clients.remove(token);
   }
 
-  pub fn add_http_front(&mut self, http_front: HttpFront, event_loop: &mut EventLoop<Server>) -> Option<Token> {
+  pub fn add_http_front(&mut self, http_front: HttpFront, event_loop: &mut EventLoop<Server>) {
     let front2 = http_front.clone();
     let front3 = http_front.clone();
     if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
@@ -420,17 +420,16 @@ impl Server {
     if self.fronts.get(&http_front.hostname).is_none() {
       self.fronts.insert(http_front.hostname, vec![front3]);
     }
-
-    None
   }
 
-  pub fn remove_http_front(&mut self, front: HttpFront, event_loop: &mut EventLoop<Server>) -> Option<Token>{
+  pub fn remove_http_front(&mut self, front: HttpFront, event_loop: &mut EventLoop<Server>) {
     println!("removing http_front {:?}", front);
-    // ToDo
-    None
+    if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
+      fronts.retain(|f| f != &front);
+    }
   }
 
-  pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<Server>) -> Option<Token> {
+  pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<Server>) {
     if let Some(addrs) = self.instances.get_mut(app_id) {
         addrs.push(*instance_address);
     }
@@ -438,13 +437,14 @@ impl Server {
     if self.instances.get(app_id).is_none() {
       self.instances.insert(String::from(app_id), vec![*instance_address]);
     }
-
-    None
   }
 
-  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<Server>) -> Option<Token>{
-      // ToDo
-      None
+  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<Server>) {
+      if let Some(instances) = self.instances.get_mut(app_id) {
+        instances.retain(|addr| addr != instance_address);
+      } else {
+        println!("Instance was already removed");
+      }
   }
 
   pub fn backend_from_request(&self, host: &String, uri: &String) -> Option<SocketAddr> {
