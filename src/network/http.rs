@@ -13,6 +13,7 @@ use mio::util::Slab;
 use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
 use time::precise_time_s;
+use rand::random;
 
 use parser::http11::{RRequestLine,RequestHeader,request_line,headers};
 
@@ -456,7 +457,9 @@ impl Server {
         // ToDo round-robin on instances
         println!("Choosing an instance from {:?}", self.instances.get(&http_front.app_id));
         if let Some(app_instances) = self.instances.get(&http_front.app_id) {
-          app_instances.get(0).map(|& addr| addr)
+          let rnd = random::<usize>();
+          let idx = rnd % app_instances.len();
+          app_instances.get(idx).map(|& addr| addr)
         } else {
           None
         }

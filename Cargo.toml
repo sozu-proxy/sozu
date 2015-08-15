@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["Clément Delafargue <clement@delafargue.name>", "Geoffroy Couprie <geo.couprie@gmail.com>"]
 
 [dependencies]
+rand = "*"
 nom = "~0.3.1"
 slab = "*"
 time = "*"

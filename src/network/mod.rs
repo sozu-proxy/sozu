@@ -13,6 +13,7 @@ use mio::util::Slab;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use time::precise_time_s;
+use rand::random;
 
 use messages::{TcpFront,Command,Instance};
 
@@ -450,7 +451,9 @@ impl Server {
     // ToDo round robin (random or least_used)
     let accepted = application_listener.sock.accept();
     if let Ok(Some(sock)) = accepted {
-      if let Some(backend_addr) = application_listener.back_addresses.get(0) {
+      let rnd = random::<usize>();
+      let idx = rnd % application_listener.back_addresses.len();
+      if let Some(backend_addr) = application_listener.back_addresses.get(idx) {
         if let Ok(instance) = TcpStream::connect(backend_addr) {
           if let Some(client) = Client::new(sock, instance) {
             if let Ok(tok) = self.clients.insert(client) {
