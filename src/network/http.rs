@@ -491,7 +491,7 @@ impl Server {
   pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
     let host = self.clients[token].http_state.get_host().unwrap();
     let uri  = self.clients[token].http_state.get_uri().unwrap();
-    if let Some(back) = self.backend_from_request(&uri, &host) {
+    if let Some(back) = self.backend_from_request(&host, &uri) {
       if let Ok(socket) = TcpStream::connect(&back) {
         if let Ok(backend_token) = self.backend.insert(token) {
           //println!("backend connected and stored");
