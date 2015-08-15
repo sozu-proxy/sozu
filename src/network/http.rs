@@ -16,7 +16,7 @@ use time::precise_time_s;
 
 use parser::http11::{RRequestLine,RequestHeader,request_line,headers};
 
-use messages::Command;
+use messages::{Command,HttpFront};
 
 pub type Host = String;
 
@@ -372,6 +372,7 @@ type ClientToken = Token;
 pub struct Server {
   instances:       HashMap<String, Vec<SocketAddr>>,
   listener:        ApplicationListener,
+  fronts:          HashMap<String, Vec<HttpFront>>,
   clients:         Slab<Client>,
   backend:         Slab<ClientToken>,
   max_listeners:   usize,
@@ -384,6 +385,7 @@ impl Server {
     Server {
       instances:       HashMap::new(),
       listener:        listener,
+      fronts:          HashMap::new(),
       clients:         Slab::new_starting_at(Token(1), max_connections),
       backend:         Slab::new_starting_at(Token(1 + max_connections), max_connections),
       max_listeners:   1,
@@ -407,89 +409,63 @@ impl Server {
     }
     self.clients.remove(token);
   }
-  //pub fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<Server>) -> Option<Token> {
-  //  let addr_string = String::from("127.0.0.1:") + &port.to_string();
-  //  let front = &addr_string.parse().unwrap();
 
-  //  if let Ok(listener) = TcpListener::bind(front) {
-  //    let addresses = if let Some(ads) = self.instances.get(app_id) {
-  //      ads.clone()
-  //    } else {
-  //      Vec::new()
-  //    };
+  pub fn add_http_front(&mut self, http_front: HttpFront, event_loop: &mut EventLoop<Server>) -> Option<Token> {
+    let front2 = http_front.clone();
+    let front3 = http_front.clone();
+    if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
+        fronts.push(front2);
+    }
 
-  //    let al = ApplicationListener {
-  //      app_id:         String::from(app_id),
-  //      sock:           listener,
-  //      token:          None,
-  //      front_address:  *front,
-  //      back_addresses: addresses
-  //    };
+    if self.fronts.get(&http_front.hostname).is_none() {
+      self.fronts.insert(http_front.hostname, vec![front3]);
+    }
 
-  //    if let Ok(tok) = self.listeners.insert(al) {
-  //      self.listeners[tok].token = Some(tok);
-  //      self.fronts.insert(String::from(app_id), tok);
-  //      event_loop.register_opt(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level()).unwrap();
-  //      println!("registered listener for app {} on port {}", app_id, port);
-  //      Some(tok)
-  //    } else {
-  //      println!("could not register listener for app {} on port {}", app_id, port);
-  //      None
-  //    }
+    None
+  }
 
-  //  } else {
-  //    println!("could not declare listener for app {} on port {}", app_id, port);
-  //    None
-  //  }
-  //}
+  pub fn remove_http_front(&mut self, front: HttpFront, event_loop: &mut EventLoop<Server>) -> Option<Token>{
+    println!("removing http_front {:?}", front);
+    // ToDo
+    None
+  }
 
-  //pub fn remove_tcp_front(&mut self, app_id: String, event_loop: &mut EventLoop<Server>) -> Option<Token>{
-  //  println!("removing tcp_front {:?}", app_id);
-  //  // ToDo
-  //  // Removes all listeners for the given app_id
-  //  // an app can't have two listeners. Is this a problem?
-  //  if let Some(&tok) = self.fronts.get(&app_id) {
-  //    if self.listeners.contains(tok) {
-  //      event_loop.deregister(&self.listeners[tok].sock);
-  //      self.listeners.remove(tok);
-  //      println!("removed server {:?}", tok);
-  //      //self.listeners[tok].sock.shutdown(Shutdown::Both);
-  //      Some(tok)
-  //    } else {
-  //      None
-  //    }
-  //  } else {
-  //    None
-  //  }
-  //}
+  pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<Server>) -> Option<Token> {
+    if let Some(addrs) = self.instances.get_mut(app_id) {
+        addrs.push(*instance_address);
+    }
 
-  //pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<Server>) -> Option<Token> {
-  //  if let Some(addrs) = self.instances.get_mut(app_id) {
-  //      addrs.push(*instance_address);
-  //  }
+    if self.instances.get(app_id).is_none() {
+      self.instances.insert(String::from(app_id), vec![*instance_address]);
+    }
 
-  //  if self.instances.get(app_id).is_none() {
-  //    self.instances.insert(String::from(app_id), vec![*instance_address]);
-  //  }
+    None
+  }
 
-  //  if let Some(&tok) = self.fronts.get(app_id) {
-  //    let application_listener = &mut self.listeners[tok];
-
-  //    application_listener.back_addresses.push(*instance_address);
-  //    Some(tok)
-  //  } else {
-  //    println!("No front for this instance");
-  //    None
-  //  }
-  //}
-
-  //pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<Server>) -> Option<Token>{
-  //    // ToDo
-  //    None
-  //}
+  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<Server>) -> Option<Token>{
+      // ToDo
+      None
+  }
 
   pub fn backend_from_request(&self, host: &String, uri: &String) -> Option<SocketAddr> {
-    FromStr::from_str("127.0.0.1:5678").ok()
+    println!("Getting a backend for {}", host);
+    if let Some(http_fronts) = self.fronts.get(host) {
+      // ToDo get the front with the most specific matching path_begin
+      println!("Choosing a front from {:?}", http_fronts);
+      if let Some(http_front) = http_fronts.get(0) {
+        // ToDo round-robin on instances
+        println!("Choosing an instance from {:?}", self.instances.get(&http_front.app_id));
+        if let Some(app_instances) = self.instances.get(&http_front.app_id) {
+          app_instances.get(0).map(|& addr| addr)
+        } else {
+          None
+        }
+      } else {
+        None
+      }
+    } else {
+      None
+    }
   }
 
   pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
@@ -629,52 +605,44 @@ impl Handler for Server {
 
       }
     }
+    println!("end_hup");
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<Self>, message: Self::Message) {
   // ToDo temporary
-  //  println!("notified: {:?}", message);
-  //  match message {
-  //    TcpProxyOrder::Command(Command::AddTcpFront(front)) => {
-  //      println!("{:?}", front);
-  //      if let Some(token) = self.add_tcp_front(front.port, &front.app_id, event_loop) {
-  //        self.tx.send(ServerMessage::AddedTcpFront);
-  //      } else {
-  //        println!("Couldn't add tcp front");
-  //      }
-  //    },
-  //    TcpProxyOrder::Command(Command::RemoveTcpFront(front)) => {
-  //      println!("{:?}", front);
-  //      let _ = self.remove_tcp_front(front.app_id, event_loop);
-  //      self.tx.send(ServerMessage::RemovedTcpFront);
-  //    },
-  //    TcpProxyOrder::Command(Command::AddInstance(instance)) => {
-  //      println!("{:?}", instance);
-  //      let addr_string = instance.ip_address + ":" + &instance.port.to_string();
-  //      let addr = &addr_string.parse().unwrap();
-  //      if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
-  //        self.tx.send(ServerMessage::AddedInstance);
-  //      } else {
-  //        println!("Couldn't add tcp front");
-  //      }
-  //    },
-  //    TcpProxyOrder::Command(Command::RemoveInstance(instance)) => {
-  //      println!("{:?}", instance);
-  //      let addr_string = instance.ip_address + ":" + &instance.port.to_string();
-  //      let addr = &addr_string.parse().unwrap();
-  //      if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
-  //        self.tx.send(ServerMessage::RemovedInstance);
-  //      } else {
-  //        println!("Couldn't add tcp front");
-  //      }
-  //    },
-  //    TcpProxyOrder::Stop                   => {
-  //      event_loop.shutdown();
-  //    },
-  //    _ => {
-  //      println!("unsupported message, ignoring");
-  //    }
-  //  }
+    println!("notified: {:?}", message);
+    match message {
+      HttpProxyOrder::Command(Command::AddHttpFront(front)) => {
+        println!("{:?}", front);
+          self.add_http_front(front, event_loop);
+          self.tx.send(ServerMessage::AddedHttpFront);
+      },
+      HttpProxyOrder::Command(Command::RemoveHttpFront(front)) => {
+        println!("{:?}", front);
+        self.remove_http_front(front, event_loop);
+        self.tx.send(ServerMessage::RemovedHttpFront);
+      },
+      HttpProxyOrder::Command(Command::AddInstance(instance)) => {
+        println!("{:?}", instance);
+        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+        let addr = &addr_string.parse().unwrap();
+        self.add_instance(&instance.app_id, addr, event_loop);
+        self.tx.send(ServerMessage::AddedInstance);
+      },
+      HttpProxyOrder::Command(Command::RemoveInstance(instance)) => {
+        println!("{:?}", instance);
+        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+        let addr = &addr_string.parse().unwrap();
+        self.remove_instance(&instance.app_id, addr, event_loop);
+        self.tx.send(ServerMessage::RemovedInstance);
+      },
+      HttpProxyOrder::Stop                   => {
+        event_loop.shutdown();
+      },
+      _ => {
+        println!("unsupported message, ignoring");
+      }
+    }
   }
 
   fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {

@@ -19,12 +19,12 @@ use bus::Message;
 
 fn main() {
   let bus_tx = bus::start_bus();
-  let (sender, receiver) = channel::<network::ServerMessage>();
-  let (tx, jg) = network::start_listener(10, 500, sender);
+  let (sender, receiver) = channel::<network::http::ServerMessage>();
+  let (tx, jg) = network::http::start_listener("127.0.0.1:8080".parse().unwrap(), 10, 500, sender);
 
 
   let (http_proxy_conf_input,http_proxy_conf_listener) = channel();
-  let _ = bus_tx.send(Message::Subscribe(Topic::TcpProxyConfig, http_proxy_conf_input));
+  let _ = bus_tx.send(Message::Subscribe(Topic::HttpProxyConfig, http_proxy_conf_input));
   if let Ok(Message::SubscribeOk) = http_proxy_conf_listener.recv() {
     println!("Subscribed to http_proxy_conf commands");
 
@@ -34,7 +34,7 @@ fn main() {
     thread::spawn(move || {
       loop {
         if let Ok(Message::Msg(command)) = http_proxy_conf_listener.recv() {
-          tx.send(network::TcpProxyOrder::Command(command));
+          tx.send(network::http::HttpProxyOrder::Command(command));
         }
       }
     });
