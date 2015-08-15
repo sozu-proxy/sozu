@@ -531,8 +531,7 @@ impl Handler for Server {
 
           if let HttpState::HasHost(_,_,_) = self.clients[token].http_state {
             self.connect_to_backend(event_loop, token);
-          }
-          if let HttpState::Error(_) = self.clients[token].http_state {
+          } else if let HttpState::Error(_) = self.clients[token].http_state {
             self.close_client(event_loop, token);
           }
         } else {
