@@ -259,7 +259,7 @@ impl Client {
 
   // Read content from the client
   fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
-    println!("in readable()");
+    //println!("in readable()");
     //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
 
     let mut buf = self.front_mut_buf.take().unwrap();
@@ -525,6 +525,7 @@ impl Handler for Server {
   fn ready(&mut self, event_loop: &mut EventLoop<Server>, token: Token, events: EventSet) {
     //println!("{:?} got events: {:?}", token, events);
     if events.is_readable() {
+      println!("REA({})", token.as_usize());
       //println!("{:?} is readable", token);
       if token == Token(0) {
         self.accept(event_loop, token)
@@ -556,6 +557,7 @@ impl Handler for Server {
 
     if events.is_writable() {
       //println!("{:?} is writable", token);
+      println!("WRI({})", token.as_usize());
       if token.as_usize() < self.max_listeners {
         println!("received writable for listener {:?}, this should not happen", token);
       } else  if token.as_usize() < self.max_listeners + self.max_connections {
@@ -579,6 +581,7 @@ impl Handler for Server {
     }
 
     if events.is_hup() {
+      println!("HUP({})", token.as_usize());
       if token == Token(0) {
         println!("should not happen: server {:?} closed", token);
       } else if token.as_usize() < self.max_listeners + self.max_connections {
@@ -749,7 +752,7 @@ mod tests {
     thread::spawn(|| { start_server(); });
     let front: SocketAddr = FromStr::from_str("127.0.0.1:8080").unwrap();
     let (tx,rx) = channel::<ServerMessage>();
-    let (sender, jg) = start_listener(front, 100, 100, tx.clone());
+    let (sender, jg) = start_listener(front, 10, 10, tx.clone());
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:8080"), path_begin: String::from("/") };
     sender.send(HttpProxyOrder::Command(Command::AddHttpFront(front)));
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 5678 };
@@ -779,7 +782,7 @@ mod tests {
 
     thread::sleep_ms(300);
     assert_eq!(&body, &"Hello World!"[..]);
-    assert!(false);
+    //assert!(false);
   }
 
   use self::hyper::server::Request;
