@@ -356,7 +356,7 @@ impl Server {
     Server {
       fronts:          HashMap::new(),
       instances:       HashMap::new(),
-      listeners:    Slab::new_starting_at(Token(0), max_listeners),
+      listeners:       Slab::new_starting_at(Token(0), max_listeners),
       clients:         Slab::new_starting_at(Token(max_listeners), max_connections),
       backend:         Slab::new_starting_at(Token(max_listeners+max_connections), max_connections),
       max_listeners:   max_listeners,

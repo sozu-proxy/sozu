@@ -604,10 +604,9 @@ impl Handler for Server {
 
           println!("backend {:?} was already removed", token);
         }
-
       }
+      println!("end_hup");
     }
-    println!("end_hup");
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<Self>, message: Self::Message) {
@@ -615,24 +614,24 @@ impl Handler for Server {
     println!("notified: {:?}", message);
     match message {
       HttpProxyOrder::Command(Command::AddHttpFront(front)) => {
-        println!("{:?}", front);
+        println!("add front {:?}", front);
           self.add_http_front(front, event_loop);
           self.tx.send(ServerMessage::AddedHttpFront);
       },
       HttpProxyOrder::Command(Command::RemoveHttpFront(front)) => {
-        println!("{:?}", front);
+        println!("remove front {:?}", front);
         self.remove_http_front(front, event_loop);
         self.tx.send(ServerMessage::RemovedHttpFront);
       },
       HttpProxyOrder::Command(Command::AddInstance(instance)) => {
-        println!("{:?}", instance);
+        println!("add instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         self.add_instance(&instance.app_id, addr, event_loop);
         self.tx.send(ServerMessage::AddedInstance);
       },
       HttpProxyOrder::Command(Command::RemoveInstance(instance)) => {
-        println!("{:?}", instance);
+        println!("remove instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         self.remove_instance(&instance.app_id, addr, event_loop);
@@ -737,32 +736,50 @@ mod tests {
   use std::net::{TcpListener, TcpStream, Shutdown};
   use std::io::{Read,Write};
   use std::{thread,str};
+  use std::sync::mpsc::channel;
+  use std::net::SocketAddr;
+  use std::str::FromStr;
   use self::hyper::Client;
   use self::hyper::header::Connection;
+  use messages::{Command,HttpFront,Instance};
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn mi() {
     thread::spawn(|| { start_server(); });
-    start();
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:8080").unwrap();
+    let (tx,rx) = channel::<ServerMessage>();
+    let (sender, jg) = start_listener(front, 100, 100, tx.clone());
+    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:8080"), path_begin: String::from("/") };
+    sender.send(HttpProxyOrder::Command(Command::AddHttpFront(front)));
+    let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 5678 };
+    sender.send(HttpProxyOrder::Command(Command::AddInstance(instance)));
+    println!("test received: {:?}", rx.recv());
+    println!("test received: {:?}", rx.recv());
     thread::sleep_ms(300);
 
     let mut client = Client::new();
     // Creating an outgoing request.
-    let mut res = client.get("http://localhost:8080/")
+    println!("client request");
+    let mut r = client.get("http://localhost:8080/")
       // set a header
       .header(Connection::close())
       // let 'er go!
-      .send().unwrap();
+      .send();
+     println!("client request sent: {:?}", r);
+     let mut res = r.unwrap();
 
     // Read the Response.
+    println!("read response");
     let mut body = String::new();
-    res.read_to_string(&mut body).unwrap();
+    let r = res.read_to_string(&mut body);
+    println!("res: {:?}", r);
 
     println!("Response: {}", body);
 
     thread::sleep_ms(300);
     assert_eq!(&body, &"Hello World!"[..]);
+    assert!(false);
   }
 
   use self::hyper::server::Request;
@@ -770,7 +787,9 @@ mod tests {
   use self::hyper::net::Fresh;
 
   fn hello(_: Request, res: Response<Fresh>) {
-      res.send(b"Hello World!").unwrap();
+    println!("backend web server got request");
+    res.send(b"Hello World!").unwrap();
+    println!("backend web server sent response");
   }
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
