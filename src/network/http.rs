@@ -175,7 +175,7 @@ impl Client {
             state.clone()
           },
           IResult::Done(i, r)    => {
-            if let Some(rl) = RRequestLine::fromRequestLine(r) {
+            if let Some(rl) = RRequestLine::from_request_line(r) {
               let s = HttpState::HasRequestLine(buf.bytes().offset(i), rl);
               //println!("now in state: {:?}", s);
               Client::parse_headers(&s, buf)

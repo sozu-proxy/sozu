@@ -51,7 +51,7 @@ pub struct RRequestLine {
 }
 
 impl RRequestLine {
-  pub fn fromRequestLine(r: RequestLine) -> Option<RRequestLine> {
+  pub fn from_request_line(r: RequestLine) -> Option<RRequestLine> {
     if let Ok(method) = str::from_utf8(r.method) {
       if let Ok(uri) = str::from_utf8(r.uri) {
         if let Ok(version1) = str::from_utf8(r.version[0]) {
