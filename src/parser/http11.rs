@@ -14,12 +14,12 @@ fn is_token_char(i: u8) -> bool {
   is_alphanumeric(i) ||
   b"!#$%&'*+-.^_`|~".contains(&i)
 }
-named!(pub token, filter!(is_token_char));
+named!(pub token, take_while!(is_token_char));
 
 fn is_ws(i: u8) -> bool {
   i == ' ' as u8 && i == '\t' as u8
 }
-named!(pub repeated_ws, filter!(is_ws));
+named!(pub repeated_ws, take_while!(is_ws));
 named!(pub obsolete_ws, chain!(repeated_ws?, || { &b" "[..] }));
 
 named!(pub sp, tag!(" "));
@@ -32,8 +32,8 @@ fn is_vchar_or_ws(i: u8) -> bool {
   is_vchar(i) || is_ws(i)
 }
 
-named!(pub vchar_1, filter!(is_vchar));
-named!(pub vchar_ws_1, filter!(is_vchar_or_ws));
+named!(pub vchar_1, take_while!(is_vchar));
+named!(pub vchar_ws_1, take_while!(is_vchar_or_ws));
 
 
 #[derive(PartialEq,Debug)]
