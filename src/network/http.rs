@@ -58,28 +58,28 @@ pub enum ConnectionStatus {
 
 impl HttpState {
   pub fn get_host(&self) -> Option<String> {
-    match self {
-      &HttpState::HasHost(_,_, ref host) |
-      &HttpState::Proxying(_, ref host)=> Some(host.clone()),
-      _ => None
+    match *self {
+      HttpState::HasHost(_,_, ref host) |
+      HttpState::Proxying(_, ref host)    => Some(host.clone()),
+      _                                   => None
     }
   }
 
   pub fn get_uri(&self) -> Option<String> {
-    match self {
-      &HttpState::HasRequestLine(_, ref rl) |
-      &HttpState::HasHost(_, ref rl,_)      |
-      &HttpState::Proxying(ref rl, _)         => Some(rl.uri.clone()),
-      _ => None
+    match *self {
+      HttpState::HasRequestLine(_, ref rl) |
+      HttpState::HasHost(_, ref rl,_)      |
+      HttpState::Proxying(ref rl, _)         => Some(rl.uri.clone()),
+      _                                      => None
     }
   }
 
   pub fn get_request_line(&self) -> Option<RRequestLine> {
-    match self {
-      &HttpState::HasRequestLine(_, ref rl) |
-      &HttpState::HasHost(_, ref rl,_)      |
-      &HttpState::Proxying(ref rl, _)         => Some(rl.clone()),
-      _ => None
+    match *self {
+      HttpState::HasRequestLine(_, ref rl) |
+      HttpState::HasHost(_, ref rl,_)      |
+      HttpState::Proxying(ref rl, _)         => Some(rl.clone()),
+      _                                      => None
     }
   }
 }
@@ -163,8 +163,8 @@ impl Client {
   }
 
   fn parse_headers(state: &HttpState, buf: &MutByteBuf) -> HttpState {
-    match state {
-      &HttpState::Initial => {
+    match *state {
+      HttpState::Initial => {
         //println!("buf: {}", buf.bytes().to_hex(8));
         match request_line(buf.bytes()) {
           IResult::Error(e) => {
@@ -185,7 +185,7 @@ impl Client {
           }
         }
       },
-      &HttpState::HasRequestLine(pos, ref rl) => {
+      HttpState::HasRequestLine(pos, ref rl) => {
         //println!("parsing headers from:\n{}", (&buf.bytes()[pos..]).to_hex(8));
         match headers(&buf.bytes()[pos..]) {
           IResult::Error(e) => {
@@ -197,7 +197,7 @@ impl Client {
           },
           IResult::Done(i, v)    => {
             //println!("got headers: {:?}", v);
-            for header in v.iter() {
+            for header in &v {
               if from_utf8(header.name) == Ok("Host") {
                 if let Ok(host) = from_utf8(header.value) {
                   return HttpState::HasHost(buf.bytes().offset(i), rl.clone(), String::from(host));
@@ -492,7 +492,7 @@ impl Server {
       }
   }
 
-  pub fn backend_from_request(&self, host: &String, uri: &String) -> Option<SocketAddr> {
+  pub fn backend_from_request(&self, host: &str, uri: &str) -> Option<SocketAddr> {
     println!("Getting a backend for {}", host);
     if let Some(http_fronts) = self.fronts.get(host) {
       // ToDo get the front with the most specific matching path_begin
