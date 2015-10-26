@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
-use nom::{IResult};
+use nom::{HexDisplay,IResult};
 use nom::IResult::*;
 use nom::Err::*;
 
@@ -146,6 +146,115 @@ named!(pub request_head<RequestHead>,
        )
 );
 
+pub type Host = String;
+
+#[derive(Debug,Clone)]
+pub enum ErrorState {
+  InvalidHttp,
+  MissingHost
+}
+
+#[derive(Debug,Clone)]
+pub enum LengthInformation {
+  Length(usize),
+  Chunked,
+  Compressed
+}
+
+#[derive(Debug,Clone)]
+pub enum HttpState {
+  Initial,
+  Error(ErrorState),
+  HasRequestLine(usize, RRequestLine),
+  HasHost(usize, RRequestLine, Host),
+  HeadersParsed(RRequestLine, Host, LengthInformation),
+  Proxying(RRequestLine, Host)
+  //Proxying(RRequestLine, Host, LengthInformation, BackendToken)
+}
+
+impl HttpState {
+  pub fn get_host(&self) -> Option<String> {
+    match *self {
+      HttpState::HasHost(_,_, ref host) |
+      HttpState::Proxying(_, ref host)    => Some(host.clone()),
+      _                                   => None
+    }
+  }
+
+  pub fn get_uri(&self) -> Option<String> {
+    match *self {
+      HttpState::HasRequestLine(_, ref rl) |
+      HttpState::HasHost(_, ref rl,_)      |
+      HttpState::Proxying(ref rl, _)         => Some(rl.uri.clone()),
+      _                                      => None
+    }
+  }
+
+  pub fn get_request_line(&self) -> Option<RRequestLine> {
+    match *self {
+      HttpState::HasRequestLine(_, ref rl) |
+      HttpState::HasHost(_, ref rl,_)      |
+      HttpState::Proxying(ref rl, _)         => Some(rl.clone()),
+      _                                      => None
+    }
+  }
+}
+
+pub fn parse_headers(state: &HttpState, buf: &[u8]) -> HttpState {
+  match *state {
+    HttpState::Initial => {
+      //println!("buf: {}", buf.to_hex(8));
+      match request_line(buf) {
+        IResult::Error(_) => {
+          //println!("error: {:?}", e);
+          HttpState::Error(ErrorState::InvalidHttp)
+        },
+        IResult::Incomplete(_) => {
+          state.clone()
+        },
+        IResult::Done(i, r)    => {
+          if let Some(rl) = RRequestLine::from_request_line(r) {
+            let s = HttpState::HasRequestLine(buf.offset(i), rl);
+            //println!("now in state: {:?}", s);
+            parse_headers(&s, buf)
+          } else {
+            HttpState::Error(ErrorState::InvalidHttp)
+          }
+        }
+      }
+    },
+    HttpState::HasRequestLine(pos, ref rl) => {
+      //println!("parsing headers from:\n{}", (&buf[pos..]).to_hex(8));
+      match headers(&buf[pos..]) {
+        IResult::Error(_) => {
+          //println!("error: {:?}", e);
+          HttpState::Error(ErrorState::InvalidHttp)
+        },
+        IResult::Incomplete(_) => {
+          state.clone()
+        },
+        IResult::Done(i, v)    => {
+          //println!("got headers: {:?}", v);
+          for header in &v {
+            if str::from_utf8(header.name) == Ok("Host") {
+              if let Ok(host) = str::from_utf8(header.value) {
+                return HttpState::HasHost(buf.offset(i), rl.clone(), String::from(host));
+              } else {
+                return HttpState::Error(ErrorState::InvalidHttp);
+              }
+            }
+          }
+          HttpState::HasRequestLine(buf.offset(i), rl.clone())
+       }
+      }
+    },
+    //HasHost(usize,RRequestLine, Host),
+    _ => {
+      println!("unimplemented state: {:?}", state);
+      HttpState::Error(ErrorState::InvalidHttp)
+    }
+  }
+}
 
 #[cfg(test)]
 mod tests {

@@ -7,7 +7,6 @@ use std::io::{self,Read,ErrorKind};
 use mio::*;
 use mio::buf::{ByteBuf,MutByteBuf};
 use std::collections::HashMap;
-use nom::{HexDisplay,IResult};
 use std::error::Error;
 use mio::util::Slab;
 use std::net::SocketAddr;
@@ -15,37 +14,12 @@ use std::str::{FromStr, from_utf8};
 use time::precise_time_s;
 use rand::random;
 
-use parser::http11::{RRequestLine,RequestHeader,request_line,headers};
+//use parser::http11::{RRequestLine,RequestHeader,request_line,headers};
+use parser::http11::{HttpState,parse_headers};
 
 use messages::{Command,HttpFront};
 
-pub type Host = String;
-
-#[derive(Debug,Clone)]
-pub enum ErrorState {
-  InvalidHttp,
-  MissingHost
-}
-
-#[derive(Debug,Clone)]
-pub enum LengthInformation {
-  Length(usize),
-  Chunked,
-  Compressed
-}
-
 type BackendToken = Token;
-#[derive(Debug,Clone)]
-pub enum HttpState {
-  Initial,
-  Error(ErrorState),
-  HasRequestLine(usize, RRequestLine),
-  HasHost(usize, RRequestLine, Host),
-  HeadersParsed(RRequestLine, Host, LengthInformation),
-  Proxying(RRequestLine, Host)
-  //Proxying(RRequestLine, Host, LengthInformation, BackendToken)
-}
-
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub enum ConnectionStatus {
   Initial,
@@ -54,34 +28,6 @@ pub enum ConnectionStatus {
   ClientClosed,
   ServerClosed,
   Closed
-}
-
-impl HttpState {
-  pub fn get_host(&self) -> Option<String> {
-    match *self {
-      HttpState::HasHost(_,_, ref host) |
-      HttpState::Proxying(_, ref host)    => Some(host.clone()),
-      _                                   => None
-    }
-  }
-
-  pub fn get_uri(&self) -> Option<String> {
-    match *self {
-      HttpState::HasRequestLine(_, ref rl) |
-      HttpState::HasHost(_, ref rl,_)      |
-      HttpState::Proxying(ref rl, _)         => Some(rl.uri.clone()),
-      _                                      => None
-    }
-  }
-
-  pub fn get_request_line(&self) -> Option<RRequestLine> {
-    match *self {
-      HttpState::HasRequestLine(_, ref rl) |
-      HttpState::HasHost(_, ref rl,_)      |
-      HttpState::Proxying(ref rl, _)         => Some(rl.clone()),
-      _                                      => None
-    }
-  }
 }
 
 #[derive(Debug)]
@@ -160,61 +106,6 @@ impl Client {
   }
 
   pub fn close(&self) {
-  }
-
-  fn parse_headers(state: &HttpState, buf: &MutByteBuf) -> HttpState {
-    match *state {
-      HttpState::Initial => {
-        //println!("buf: {}", buf.bytes().to_hex(8));
-        match request_line(buf.bytes()) {
-          IResult::Error(e) => {
-            //println!("error: {:?}", e);
-            HttpState::Error(ErrorState::InvalidHttp)
-          },
-          IResult::Incomplete(_) => {
-            state.clone()
-          },
-          IResult::Done(i, r)    => {
-            if let Some(rl) = RRequestLine::from_request_line(r) {
-              let s = HttpState::HasRequestLine(buf.bytes().offset(i), rl);
-              //println!("now in state: {:?}", s);
-              Client::parse_headers(&s, buf)
-            } else {
-              HttpState::Error(ErrorState::InvalidHttp)
-            }
-          }
-        }
-      },
-      HttpState::HasRequestLine(pos, ref rl) => {
-        //println!("parsing headers from:\n{}", (&buf.bytes()[pos..]).to_hex(8));
-        match headers(&buf.bytes()[pos..]) {
-          IResult::Error(e) => {
-            //println!("error: {:?}", e);
-            HttpState::Error(ErrorState::InvalidHttp)
-          },
-          IResult::Incomplete(_) => {
-            state.clone()
-          },
-          IResult::Done(i, v)    => {
-            //println!("got headers: {:?}", v);
-            for header in &v {
-              if from_utf8(header.name) == Ok("Host") {
-                if let Ok(host) = from_utf8(header.value) {
-                  return HttpState::HasHost(buf.bytes().offset(i), rl.clone(), String::from(host));
-                } else {
-                  return HttpState::Error(ErrorState::InvalidHttp);
-                }
-              }
-            }
-            HttpState::HasRequestLine(buf.bytes().offset(i), rl.clone())
-         }
-        }
-      },
-      //HasHost(usize,RRequestLine, Host),
-      _ => {
-        panic!("unimplemented state: {:?}", state);
-      }
-    }
   }
 
   // Forward content to client
@@ -299,7 +190,7 @@ impl Client {
             self.flip_front_buf(buf, event_loop);
             self.rx_count = self.rx_count + r;
           } else {
-            let state = Client::parse_headers(&self.http_state, &buf);
+            let state = parse_headers(&self.http_state, &buf.bytes());
             if let HttpState::Error(_) = state {
               self.front_mut_buf = Some(buf);
               self.http_state = state;
