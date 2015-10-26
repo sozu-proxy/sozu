@@ -34,6 +34,16 @@ pub enum ServerMessage {
   Stopped
 }
 
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub enum ConnectionStatus {
+  Initial,
+  ClientConnected,
+  Connected,
+  ClientClosed,
+  ServerClosed,
+  Closed
+}
+
 #[cfg(not(feature = "splice"))]
 struct Client {
   sock:           TcpStream,
@@ -46,6 +56,7 @@ struct Client {
   backend_token:  Option<Token>,
   back_interest:  EventSet,
   front_interest: EventSet,
+  status:         ConnectionStatus,
   rx_count:       usize,
   tx_count:       usize
 }
@@ -62,6 +73,7 @@ struct Client {
   backend_token:  Option<Token>,
   back_interest:  EventSet,
   front_interest: EventSet,
+  status:         ConnectionStatus,
   rx_count:       usize,
   tx_count:       usize
 }
@@ -80,6 +92,7 @@ impl Client {
       backend_token:  None,
       back_interest:  EventSet::all(),
       front_interest: EventSet::all(),
+      status:         ConnectionStatus::Initial,
       rx_count:       0,
       tx_count:       0
     })
@@ -219,6 +232,7 @@ impl Client {
         backend_token:  None,
         back_interest:  EventSet::all(),
         front_interest: EventSet::all(),
+        status:         ConnectionStatus::Initial,
         tx_count:       0,
         rx_count:       0
       })
@@ -453,6 +467,7 @@ impl Server {
             if let Ok(tok) = self.clients.insert(client) {
               if let Ok(backend_tok) = self.backend.insert(tok) {
                 &self.clients[tok].set_tokens(tok, backend_tok);
+                self.clients[tok].status = ConnectionStatus::Connected;
                 event_loop.register_opt(&self.clients[tok].sock, tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
                 event_loop.register_opt(&self.clients[tok].backend, backend_tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
               } else {
@@ -562,20 +577,26 @@ impl Handler for Server {
         println!("should not happen: server {:?} closed", token);
       } else if token.as_usize() < self.max_listeners + self.max_connections {
         if self.clients.contains(token) {
-          println!("removing client {:?}", token);
-          let back_tok = self.clients[token].backend_token.unwrap();
-          {
-            let sock        = &mut self.clients[token].sock;
-            event_loop.deregister(sock);
-            sock.shutdown(Shutdown::Both);
-          };
-          {
-            let backend     = &mut self.clients[token].backend;
-            event_loop.deregister(backend);
-            backend.shutdown(Shutdown::Both);
-          }
-          self.clients.remove(token);
-          self.backend.remove(back_tok);
+          if self.clients[token].status == ConnectionStatus::ServerClosed ||
+            self.clients[token].status == ConnectionStatus::ClientConnected {
+              println!("removing client {:?}", token);
+              let back_tok = self.clients[token].backend_token.unwrap();
+              {
+                let sock        = &mut self.clients[token].sock;
+                event_loop.deregister(sock);
+                sock.shutdown(Shutdown::Both);
+              };
+              {
+                let backend     = &mut self.clients[token].backend;
+                event_loop.deregister(backend);
+                backend.shutdown(Shutdown::Both);
+              }
+              self.clients.remove(token);
+              self.backend.remove(back_tok);
+              self.clients[token].status = ConnectionStatus::Closed;
+            } else {
+              self.clients[token].status = ConnectionStatus::ClientClosed;
+            }
         } else {
           println!("client {:?} was removed", token);
         }
@@ -583,24 +604,28 @@ impl Handler for Server {
         if self.backend.contains(token) {
           let tok = self.backend[token];
           if self.clients.contains(tok) {
-            println!("removing client {:?}", tok);
-            {
-              let sock        = &mut self.clients[tok].sock;
-              event_loop.deregister(sock);
-              sock.shutdown(Shutdown::Both);
+            if self.clients[tok].status == ConnectionStatus::ClientClosed {
+              println!("removing client {:?}", tok);
+              {
+                let sock        = &mut self.clients[tok].sock;
+                event_loop.deregister(sock);
+                sock.shutdown(Shutdown::Both);
+              }
+              {
+                let backend     = &mut self.clients[tok].backend;
+                event_loop.deregister(backend);
+                backend.shutdown(Shutdown::Both);
+              }
+              self.clients.remove(tok);
+              self.backend.remove(token);
+              self.clients[token].status = ConnectionStatus::Closed;
+            } else {
+              self.clients[token].status = ConnectionStatus::ServerClosed;
             }
-            {
-              let backend     = &mut self.clients[tok].backend;
-              event_loop.deregister(backend);
-              backend.shutdown(Shutdown::Both);
-            }
-            self.clients.remove(tok);
-            self.backend.remove(token);
           } else {
             println!("client {:?} was removed", token);
           }
         } else {
-
           println!("backend {:?} was removed", token);
         }
 
