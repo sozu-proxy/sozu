@@ -624,7 +624,7 @@ impl Handler for Server {
               self.close_client(event_loop, tok);
               println!("removed");
             } else {
-              self.clients[tok].status = ConnectionStatus::ClientClosed;
+              self.clients[tok].status = ConnectionStatus::ServerClosed;
             }
             //self.clients[tok].close();
           } else {
