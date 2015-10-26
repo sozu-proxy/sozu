@@ -46,6 +46,16 @@ pub enum HttpState {
   //Proxying(RRequestLine, Host, LengthInformation, BackendToken)
 }
 
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub enum ConnectionStatus {
+  Initial,
+  ClientConnected,
+  Connected,
+  ClientClosed,
+  ServerClosed,
+  Closed
+}
+
 impl HttpState {
   pub fn get_host(&self) -> Option<String> {
     match self {
@@ -102,8 +112,9 @@ struct Client {
   backend_token:  Option<Token>,
   back_interest:  EventSet,
   front_interest: EventSet,
+  status:         ConnectionStatus,
   rx_count:       usize,
-  tx_count:       usize
+  tx_count:       usize,
 }
 
 impl Client {
@@ -120,8 +131,9 @@ impl Client {
       backend_token:  None,
       back_interest:  EventSet::all(),
       front_interest: EventSet::all(),
+      status:         ConnectionStatus::Initial,
       rx_count:       0,
-      tx_count:       0
+      tx_count:       0,
     })
   }
 
@@ -480,6 +492,7 @@ impl Server {
         if let Ok(client_token) = self.clients.insert(client) {
             event_loop.register_opt(&self.clients[client_token].sock, client_token, EventSet::readable(), PollOpt::edge()).unwrap();
             self.clients[client_token].set_front_token(client_token);
+            self.clients[client_token].status = ConnectionStatus::ClientConnected;
         } else {
           println!("could not add client to slab");
         }
@@ -501,6 +514,7 @@ impl Server {
           self.clients[token].backend       = Some(socket);
           self.clients[token].backend_token = Some(backend_token);
           //event_loop.register_opt(&self.clients[token].backend.unwrap(), backend_token, EventSet::readable(), PollOpt::edge()).unwrap();
+          self.clients[token].status = ConnectionStatus::Connected;
           if let Some(ref sock) = self.clients[token].backend {
             event_loop.register_opt(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
           }
@@ -586,9 +600,15 @@ impl Handler for Server {
         println!("should not happen: server {:?} closed", token);
       } else if token.as_usize() < self.max_listeners + self.max_connections {
         if self.clients.contains(token) {
-          println!("removing client {:?}", token);
-          self.close_client(event_loop, token);
-          println!("removed");
+          println!("client {:?} got hup", token.as_usize());
+          if  self.clients[token].status == ConnectionStatus::ServerClosed ||
+              self.clients[token].status == ConnectionStatus::ClientConnected { // the server never answered, the client closed
+            self.clients[token].status = ConnectionStatus::Closed;
+            self.close_client(event_loop, token);
+            println!("removed");
+          } else {
+            self.clients[token].status = ConnectionStatus::ClientClosed;
+          }
           //self.clients[token].close();
         } else {
           println!("client {:?} was already removed", token);
@@ -597,8 +617,15 @@ impl Handler for Server {
         if self.backend.contains(token) {
           let tok = self.backend[token];
           if self.clients.contains(tok) {
-            println!("removing client {:?}", tok);
-            self.close_client(event_loop, tok);
+            println!("server {} got hup (for client {})", token.as_usize(), tok.as_usize());
+            println!("removing server {:?}", token);
+            if self.clients[tok].status == ConnectionStatus::ClientClosed {
+              self.clients[tok].status = ConnectionStatus::Closed;
+              self.close_client(event_loop, tok);
+              println!("removed");
+            } else {
+              self.clients[tok].status = ConnectionStatus::ClientClosed;
+            }
             //self.clients[tok].close();
           } else {
             println!("client {:?} was already removed", token);
