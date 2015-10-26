@@ -1,6 +1,7 @@
 use std::thread::{self};
 use std::sync::mpsc::{channel,Sender,Receiver};
 use std::collections::HashMap;
+use std::fmt;
 
 use messages::{Command, Topic};
 
@@ -11,14 +12,14 @@ pub enum Message {
   Msg(Command)
 }
 
-impl Message {
-  pub fn display(&self) {
+impl fmt::Display for Message {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
       match *self {
-        Message::Subscribe(_, _) => println!("Subscribe"),
-        Message::SubscribeOk     => println!("SubscribeOk"),
+        Message::Subscribe(_, _) => write!(f, "Subscribe"),
+        Message::SubscribeOk     => write!(f, "SubscribeOk"),
         Message::Msg(ref c)      => {
-          println!("{:?}", c.get_topics());
-          println!("{:?}", c)
+          (write!(f, "{:?}", c.get_topics())).and(
+            write!(f, "{:?}", c))
         }
       }
   }
