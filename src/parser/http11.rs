@@ -22,7 +22,7 @@ fn is_ws(i: u8) -> bool {
 named!(pub repeated_ws, take_while!(is_ws));
 named!(pub obsolete_ws, chain!(repeated_ws?, || { &b" "[..] }));
 
-named!(pub sp, tag!(" "));
+named!(pub sp<char>, char!(' '));
 named!(pub crlf, tag!("\r\n"));
 
 fn is_vchar(i: u8) -> bool {
@@ -150,7 +150,6 @@ named!(pub request_head<RequestHead>,
 #[cfg(test)]
 mod tests {
   use super::*;
-  use nom::*;
   use nom::IResult::*;
 
   #[test]
