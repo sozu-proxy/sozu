@@ -150,6 +150,15 @@ impl Client {
     self.backend_token = Some(backend);
   }
 
+  pub fn tokens(&self) -> Option<(Token,Token)> {
+    if let Some(front) = self.token {
+      if let Some(back) = self.backend_token {
+        return Some((front, back))
+      }
+    }
+    None
+  }
+
   pub fn close(&self) {
   }
 
@@ -223,7 +232,9 @@ impl Client {
         }
         Ok(Some(r)) => {
           //FIXME what happens if not everything was written?
-          //println!("FRONT [{}<-{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+          //if let Some((front,back)) = self.tokens() {
+          //  println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
+          //}
 
           self.back_mut_buf = Some(buf.flip());
           self.tx_count = self.tx_count + r;
@@ -235,10 +246,12 @@ impl Client {
         Err(e) =>  println!("not implemented; client err={:?}", e),
       }
     }
-    if let Some(ref sock) = self.backend {
-      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge()).unwrap();
+    if let Some((frontend_token,backend_token)) = self.tokens() {
+      if let Some(ref sock) = self.backend {
+        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge()).unwrap();
+      }
+      event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     Ok(())
   }
 
@@ -262,11 +275,12 @@ impl Client {
     self.back_interest.insert(EventSet::writable());
     // prepare to provide this to writable
     self.front_buf = Some(buf.flip());
-    if let Some(ref sock) = self.backend {
-      event_loop.reregister(sock, self.backend_token.unwrap(), EventSet::readable(), PollOpt::edge()).unwrap();
+    if let Some((frontend_token,backend_token)) = self.tokens() {
+      if let Some(ref sock) = self.backend {
+        event_loop.reregister(sock, backend_token, EventSet::readable(), PollOpt::edge()).unwrap();
+      }
+      event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
-    //event_loop.reregister(&self.backend.unwrap(), self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
   }
 
   // Read content from the client
@@ -279,7 +293,9 @@ impl Client {
         if let Some(r) = res {
           println!("FRONT [{:?}]: read {} bytes", self.token, r);
           if self.is_proxying() {
-            //println!("FRONT [{}->{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+            //if let Some((front,back)) = self.tokens() {
+            //  println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+            //}
             self.flip_front_buf(buf, event_loop);
             self.rx_count = self.rx_count + r;
           } else {
@@ -298,7 +314,9 @@ impl Client {
             } else {
               self.front_mut_buf = Some(buf);
               self.front_interest.insert(EventSet::readable());
-              event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+              if let Some(frontend_token) = self.token {
+                event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+              }
             }
           }
         }
@@ -324,7 +342,9 @@ impl Client {
           }
           Ok(Some(r)) => {
             //FIXME what happens if not everything was written?
-            //println!("BACK  [{}->{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+            //if let Some((front,back)) = self.tokens() {
+            //  println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+            //}
 
             self.front_mut_buf = Some(buf.flip());
 
@@ -339,10 +359,12 @@ impl Client {
       println!("BACK [{:?}]: front_buf unavailable", self.token);
     }
 
-    if let Some(ref sock) = self.backend {
-      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge()).unwrap();
+    if let Some((frontend_token,backend_token)) = self.tokens() {
+      if let Some(ref sock) = self.backend {
+        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge()).unwrap();
+      }
+      event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     Ok(())
   }
 
@@ -357,7 +379,9 @@ impl Client {
             println!("We just got readable, but were unable to read from the socket?");
           }
           Ok(Some(r)) => {
-            //println!("BACK  [{}<-{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+            //if let Some((front,back)) = self.tokens() {
+            //  println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+            //}
             self.back_interest.remove(EventSet::readable());
             self.front_interest.insert(EventSet::writable());
             // prepare to provide this to writable
@@ -371,10 +395,12 @@ impl Client {
       }
     }
 
-    if let Some(ref sock) = self.backend {
-      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge()).unwrap();
+    if let Some((frontend_token,backend_token)) = self.tokens() {
+      if let Some(ref sock) = self.backend {
+        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge()).unwrap();
+      }
+      event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     Ok(())
   }
 }
@@ -511,30 +537,28 @@ impl Server {
   }
 
   pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-    let host = self.clients[token].http_state.get_host().unwrap();
-    let uri  = self.clients[token].http_state.get_uri().unwrap();
-    if let Some(back) = self.backend_from_request(&host, &uri) {
-      if let Ok(socket) = TcpStream::connect(&back) {
-        if let Ok(backend_token) = self.backend.insert(token) {
-          //println!("backend connected and stored");
-          self.clients[token].backend       = Some(socket);
-          self.clients[token].backend_token = Some(backend_token);
-          //event_loop.register_opt(&self.clients[token].backend.unwrap(), backend_token, EventSet::readable(), PollOpt::edge()).unwrap();
-          self.clients[token].status = ConnectionStatus::Connected;
-          if let Some(ref sock) = self.clients[token].backend {
-            event_loop.register_opt(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
+    if let (Some(host), Some(uri)) = (self.clients[token].http_state.get_host(), self.clients[token].http_state.get_uri()) {
+      if let Some(back) = self.backend_from_request(&host, &uri) {
+        if let Ok(socket) = TcpStream::connect(&back) {
+          if let Ok(backend_token) = self.backend.insert(token) {
+            //println!("backend connected and stored");
+            self.clients[token].backend       = Some(socket);
+            self.clients[token].backend_token = Some(backend_token);
+            self.clients[token].status        = ConnectionStatus::Connected;
+
+            if let Some(ref sock) = self.clients[token].backend {
+              event_loop.register_opt(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
+            }
+            //FIXME: maybe not the right place to change state
+            if let Some(rl) = self.clients[token].http_state.get_request_line() {
+              self.clients[token].http_state = HttpState::Proxying(rl, host);
+            }
+            return;
           }
-          let rl = self.clients[token].http_state.get_request_line().unwrap();
-          self.clients[token].http_state = HttpState::Proxying(rl, host);
-        } else {
-          self.close_client(event_loop, token);
         }
-      } else {
-        self.close_client(event_loop, token);
       }
-    } else {
-      self.close_client(event_loop, token);
     }
+    self.close_client(event_loop, token);
   }
 }
 
@@ -662,16 +686,20 @@ impl Handler for Server {
       HttpProxyOrder::Command(Command::AddInstance(instance)) => {
         println!("add instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
-        let addr = &addr_string.parse().unwrap();
-        self.add_instance(&instance.app_id, addr, event_loop);
-        self.tx.send(ServerMessage::AddedInstance);
+        let parsed:Option<SocketAddr> = addr_string.parse().ok();
+        if let Some(addr) = parsed {
+          self.add_instance(&instance.app_id, &addr, event_loop);
+          self.tx.send(ServerMessage::AddedInstance);
+        }
       },
       HttpProxyOrder::Command(Command::RemoveInstance(instance)) => {
         println!("remove instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
-        let addr = &addr_string.parse().unwrap();
-        self.remove_instance(&instance.app_id, addr, event_loop);
-        self.tx.send(ServerMessage::RemovedInstance);
+        let parsed:Option<SocketAddr> = addr_string.parse().ok();
+        if let Some(addr) = parsed {
+          self.remove_instance(&instance.app_id, &addr, event_loop);
+          self.tx.send(ServerMessage::RemovedInstance);
+        }
       },
       HttpProxyOrder::Stop                   => {
         event_loop.shutdown();
