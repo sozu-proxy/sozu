@@ -783,12 +783,12 @@ mod tests {
   #[test]
   fn mi() {
     thread::spawn(|| { start_server(); });
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:8080").unwrap();
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").unwrap();
     let (tx,rx) = channel::<ServerMessage>();
     let (sender, jg) = start_listener(front, 10, 10, tx.clone());
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:8080"), path_begin: String::from("/") };
+    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
     sender.send(HttpProxyOrder::Command(Command::AddHttpFront(front)));
-    let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 5678 };
+    let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
     sender.send(HttpProxyOrder::Command(Command::AddInstance(instance)));
     println!("test received: {:?}", rx.recv());
     println!("test received: {:?}", rx.recv());
@@ -797,25 +797,28 @@ mod tests {
     let mut client = Client::new();
     // Creating an outgoing request.
     println!("client request");
-    let mut r = client.get("http://localhost:8080/")
+    let mut r = client.get("http://localhost:1024/")
       // set a header
       .header(Connection::close())
       // let 'er go!
       .send();
-     println!("client request sent: {:?}", r);
-     let mut res = r.unwrap();
+    println!("client request sent: {:?}", r);
+    match r {
+      Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
+      Ok(mut res) => {
+        // Read the Response.
+        println!("read response");
+        let mut body = String::new();
+        let r = res.read_to_string(&mut body);
+        println!("res: {:?}", r);
 
-    // Read the Response.
-    println!("read response");
-    let mut body = String::new();
-    let r = res.read_to_string(&mut body);
-    println!("res: {:?}", r);
+        println!("Response: {}", body);
 
-    println!("Response: {}", body);
-
-    thread::sleep_ms(300);
-    assert_eq!(&body, &"Hello World!"[..]);
-    //assert!(false);
+        //thread::sleep_ms(300);
+        assert_eq!(&body, &"Hello World!"[..]);
+        //assert!(false);
+      }
+    }
   }
 
   use self::hyper::server::Request;
@@ -831,7 +834,7 @@ mod tests {
   #[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server() {
     thread::spawn(move|| {
-      hyper::Server::http("127.0.0.1:5678").unwrap().handle(hello);
+      hyper::Server::http("127.0.0.1:1025").unwrap().handle(hello);
     });
   }
 
