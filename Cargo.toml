@@ -13,12 +13,13 @@ libc = "*"
 log = "0.3"
 env_logger = "0.3"
 rustc-serialize = "0.3.15"
+openssl = "~0.7.0"
 
 [dependencies.amqp]
-git = "https://github.com/Antti/rust-amqp"
+git = "https://github.com/Geal/rust-amqp"
 
-[dev-dependencies]
-hyper = "*"
+[dev-dependencies.tiny_http]
+version = "0.4"
 
 [features]
 default = []

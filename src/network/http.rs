@@ -686,7 +686,7 @@ pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: 
 
 #[cfg(test)]
 mod tests {
-  extern crate hyper;
+  extern crate tiny_http;
   use super::*;
   use std::net::{TcpListener, TcpStream, Shutdown};
   use std::io::{Read,Write};
@@ -694,8 +694,7 @@ mod tests {
   use std::sync::mpsc::channel;
   use std::net::SocketAddr;
   use std::str::FromStr;
-  use self::hyper::Client;
-  use self::hyper::header::Connection;
+  use std::time::Duration;
   use messages::{Command,HttpFront,Instance};
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
@@ -713,48 +712,51 @@ mod tests {
     println!("test received: {:?}", rx.recv());
     thread::sleep_ms(300);
 
-    let mut client = Client::new();
-    // Creating an outgoing request.
-    println!("client request");
-    let mut r = client.get("http://localhost:1024/")
-      // set a header
-      .header(Connection::close())
-      // let 'er go!
-      .send();
-    println!("client request sent: {:?}", r);
+    let mut client = TcpStream::connect(("127.0.0.1", 1024)).unwrap();
+    // 5 seconds of timeout
+    client.set_read_timeout(Some(Duration::new(5,0)));
+    thread::sleep_ms(100);
+    let mut w  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\nConnection: Close\r\n\r\n"[..]);
+    println!("http client write: {:?}", w);
+    let mut buffer = [0;4096];
+    thread::sleep_ms(500);
+    let mut r = client.read(&mut buffer[..]);
+    println!("http client read: {:?}", r);
     match r {
       Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
-      Ok(mut res) => {
+      Ok(sz) => {
         // Read the Response.
         println!("read response");
-        let mut body = String::new();
-        let r = res.read_to_string(&mut body);
-        println!("res: {:?}", r);
 
-        println!("Response: {}", body);
+        println!("Response: {}", str::from_utf8(&buffer[..]).unwrap());
 
         //thread::sleep_ms(300);
-        assert_eq!(&body, &"Hello World!"[..]);
+        //assert_eq!(&body, &"Hello World!"[..]);
+        assert_eq!(sz, 154);
         //assert!(false);
       }
     }
   }
 
-  use self::hyper::server::Request;
-  use self::hyper::server::Response;
-  use self::hyper::net::Fresh;
-
-  fn hello(_: Request, res: Response<Fresh>) {
-    println!("backend web server got request");
-    res.send(b"Hello World!").unwrap();
-    println!("backend web server sent response");
-  }
+  use self::tiny_http::{ServerBuilder, Response};
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server() {
     thread::spawn(move|| {
-      hyper::Server::http("127.0.0.1:1025").unwrap().handle(hello);
+      let server = ServerBuilder::new().with_port(1025).build().unwrap();
+      println!("starting web server");
+
+      for request in server.incoming_requests() {
+        println!("backend web server got request -> method: {:?}, url: {:?}, headers: {:?}",
+          request.method(),
+          request.url(),
+          request.headers()
+        );
+
+        let response = Response::from_string("hello world");
+        request.respond(response);
+        println!("backend web server sent response");
+      }
     });
   }
-
 }
