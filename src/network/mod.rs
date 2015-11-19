@@ -2,6 +2,8 @@
 
 pub mod amqp;
 pub mod http;
+pub mod tls;
+
 
 #[cfg(feature = "splice")]
 mod splice;
