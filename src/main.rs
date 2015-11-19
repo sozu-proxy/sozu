@@ -6,6 +6,7 @@ extern crate amqp;
 extern crate env_logger;
 extern crate rustc_serialize;
 extern crate rand;
+extern crate openssl;
 
 mod bus;
 mod network;
