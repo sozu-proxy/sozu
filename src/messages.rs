@@ -36,13 +36,13 @@ pub enum Command {
 
 impl Command {
   pub fn get_topics(&self) -> Vec<Topic> {
-    match self {
-      &Command::AddHttpFront(_)    => vec![Topic::HttpProxyConfig                       ],
-      &Command::RemoveHttpFront(_) => vec![Topic::HttpProxyConfig                       ],
-      &Command::AddTcpFront(_)     => vec![Topic::TcpProxyConfig                        ],
-      &Command::RemoveTcpFront(_)  => vec![Topic::TcpProxyConfig                        ],
-      &Command::AddInstance(_)     => vec![Topic::HttpProxyConfig, Topic::TcpProxyConfig],
-      &Command::RemoveInstance(_)  => vec![Topic::HttpProxyConfig, Topic::TcpProxyConfig]
+    match *self {
+      Command::AddHttpFront(_)    => vec![Topic::HttpProxyConfig                       ],
+      Command::RemoveHttpFront(_) => vec![Topic::HttpProxyConfig                       ],
+      Command::AddTcpFront(_)     => vec![Topic::TcpProxyConfig                        ],
+      Command::RemoveTcpFront(_)  => vec![Topic::TcpProxyConfig                        ],
+      Command::AddInstance(_)     => vec![Topic::HttpProxyConfig, Topic::TcpProxyConfig],
+      Command::RemoveInstance(_)  => vec![Topic::HttpProxyConfig, Topic::TcpProxyConfig]
     }
   }
 }

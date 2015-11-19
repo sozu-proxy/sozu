@@ -1,9 +1,7 @@
 use env_logger;
 use std::env;
 
-use amqp::session::Session;
-use amqp::table;
-use amqp::basic::Basic;
+use amqp::{Session,Table,Basic};
 
 use rustc_serialize::json;
 
@@ -22,7 +20,7 @@ pub fn init_rabbitmq(bus_tx: Sender<Message>) {
     println!("Openned channel: {:?}", channel.id);
 
     let queue_name = "test_queue";
-    let queue_declare = channel.queue_declare(queue_name, false, true, false, false, false, table::new());
+    let queue_declare = channel.queue_declare(queue_name, false, true, false, false, false, Table::new());
 
     println!("Queue declare: {:?}", queue_declare);
     channel.basic_prefetch(10);

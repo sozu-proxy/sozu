@@ -4,7 +4,8 @@ version = "0.1.0"
 authors = ["Clément Delafargue <clement@delafargue.name>", "Geoffroy Couprie <geo.couprie@gmail.com>"]
 
 [dependencies]
-nom = "~0.3.1"
+rand = "*"
+nom = "~1.0.0"
 slab = "*"
 time = "*"
 mio = "~0.4.0"
@@ -14,7 +15,14 @@ env_logger = "0.3"
 rustc-serialize = "0.3.15"
 
 [dependencies.amqp]
-git = "https://github.com/Antti/rust-amqp"
+git = "https://github.com/Geal/rust-amqp"
+
+[dev-dependencies.tiny_http]
+version = "0.4"
+
+[dependencies.openssl]
+version = "~0.7.0"
+features = ["tlsv1_2", "tlsv1_1"]
 
 [features]
 default = []

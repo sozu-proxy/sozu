@@ -1,6 +1,7 @@
 use std::thread::{self};
 use std::sync::mpsc::{channel,Sender,Receiver};
 use std::collections::HashMap;
+use std::fmt;
 
 use messages::{Command, Topic};
 
@@ -11,15 +12,14 @@ pub enum Message {
   Msg(Command)
 }
 
-impl Message {
-  #[allow(dead_code)]
-  pub fn display(&self) {
-      match self {
-        &Message::Subscribe(_, _) => println!("Subscribe"),
-        &Message::SubscribeOk => println!("SubscribeOk"),
-        &Message::Msg(ref c) => {
-          println!("{:?}", c.get_topics());
-          println!("{:?}", c)
+impl fmt::Display for Message {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+      match *self {
+        Message::Subscribe(_, _) => write!(f, "Subscribe"),
+        Message::SubscribeOk     => write!(f, "SubscribeOk"),
+        Message::Msg(ref c)      => {
+          (write!(f, "{:?}", c.get_topics())).and(
+            write!(f, "{:?}", c))
         }
       }
   }
@@ -54,13 +54,13 @@ impl Bus {
   }
 
   fn handle_message(&mut self) -> bool {
-    match &self.rx.recv() {
-      &Ok(Message::Subscribe(ref tag, ref tx)) => {
+    match self.rx.recv() {
+      Ok(Message::Subscribe(ref tag, ref tx)) => {
         self.subscribe(tag, tx);
         println!("SUBSCRIBED");
-        return true;
+        true
       },
-      &Ok(Message::Msg(ref c)) => {
+      Ok(Message::Msg(ref c)) => {
         println!("GOT MSG");
         let topics = c.get_topics();
 
@@ -75,16 +75,16 @@ impl Bus {
             }
           }
         }
-        return true;
+        true
       },
-      &Err(_) => {
+      Err(_) => {
         println!("the bus's channel is closed, exiting");
-        return false;
+        false
       }
-      &Ok(_) => {
+      Ok(_) => {
         println!("invalid message");
         // FIXME: maybe we should not stop if there's an invalid message
-        return false;
+        false
       }
     }
   }
