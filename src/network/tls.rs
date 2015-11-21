@@ -13,7 +13,7 @@ use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
 use time::precise_time_s;
 use rand::random;
-use openssl::ssl::{SslContext, SslMethod, Ssl, NonblockingSslStream};
+use openssl::ssl::{SslContext, SslMethod, Ssl, NonblockingSslStream, ServerNameCallback, ServerNameCallbackData};
 use openssl::ssl::error::NonblockingSslError;
 use openssl::x509::X509FileType;
 
@@ -352,11 +352,29 @@ pub struct Server {
   tx:              mpsc::Sender<ServerMessage>
 }
 
+const s: &'static str = "pouet";
+
 impl Server {
   fn new(listener: ApplicationListener, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> Server {
-    let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
+    //let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
+    let mut context = SslContext::new(SslMethod::Sslv3).unwrap();
     context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
     context.set_private_key_file("assets/key.pem", X509FileType::PEM);
+
+    fn servername_callback(ssl: &mut Ssl, ad: &mut i32) -> i32 {
+      println!("GOT SERVER NAME: {:?}", ssl.get_servername());
+      0
+    }
+    context.set_servername_callback(Some(servername_callback as ServerNameCallback));
+
+    /*
+    fn servername_callback_s(ssl: &mut Ssl, ad: &mut i32, data: &&str) -> i32 {
+      println!("got data: {}", *data);
+      println!("GOT SERVER NAME: {:?}", ssl.get_servername());
+      0
+    }
+    context.set_servername_callback_with_data(servername_callback_s as ServerNameCallbackData<&str>, s);
+    */
 
     Server {
       instances:       HashMap::new(),
