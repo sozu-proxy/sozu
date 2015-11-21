@@ -53,9 +53,7 @@ struct Client {
   http_state:     HttpState,
   stream:         NonblockingSslStream<TcpStream>,
   front_buf:      Option<MutByteBuf>,
-  //front_mut_buf:  Option<MutByteBuf>,
-  back_buf:       Option<ByteBuf>,
-  back_mut_buf:   Option<MutByteBuf>,
+  back_buf:       Option<MutByteBuf>,
   token:          Option<Token>,
   backend_token:  Option<Token>,
   back_interest:  EventSet,
@@ -72,10 +70,7 @@ impl Client {
       http_state:     HttpState::Initial,
       stream:         stream,
       front_buf:      Some(ByteBuf::mut_with_capacity(2048)),
-      //front_buf:      None,
-      //front_mut_buf:  Some(ByteBuf::mut_with_capacity(2048)),
-      back_buf:       None,
-      back_mut_buf:   Some(ByteBuf::mut_with_capacity(2048)),
+      back_buf:       Some(ByteBuf::mut_with_capacity(2048)),
       token:          None,
       backend_token:  None,
       back_interest:  EventSet::all(),
@@ -116,15 +111,16 @@ impl Client {
     //println!("in writable()");
     if let Some(mut buf) = self.back_buf.take() {
       //println!("in writable 2: back_buf contains {} bytes", buf.remaining());
-      println!("writable back_buf({}): {}", buf.remaining(), from_utf8((&buf as &Buf).bytes()).unwrap());
-      if self.status == ConnectionStatus::ServerClosed && buf.remaining() == 0 {
+      let mut b = buf.flip();
+      println!("writable back_buf({}): {}", b.remaining(), from_utf8((&b as &Buf).bytes()).unwrap());
+      if self.status == ConnectionStatus::ServerClosed && b.remaining() == 0 {
         return Ok(());
       }
 
       //let mut b:MutByteBuf = buf.flip();
       //let sl:&mut[u8] = b.mut_bytes();
       //match self.sock.try_write_buf(&mut buf) {
-      match self.stream.write((&buf as &Buf).bytes()) {
+      match self.stream.write((&b as &Buf).bytes()) {
         /*Ok(None) => {
           println!("client flushing buf; WOULDBLOCK");
 
@@ -136,9 +132,9 @@ impl Client {
           //if let Some((front,back)) = self.tokens() {
           //  println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
           //}
-          buf.advance(r);
+          b.advance(r);
 
-          self.back_mut_buf = Some(buf.flip());
+          self.back_buf = Some(b.flip());
           self.tx_count = self.tx_count + r;
 
           //self.front_interest.insert(EventSet::readable());
@@ -300,7 +296,7 @@ impl Client {
 
   // Read content from application
   fn back_readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
-    if let Some(mut buf) = self.back_mut_buf.take() {
+    if let Some(mut buf) = self.back_buf.take() {
       //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
 
       if let Some(ref mut sock) = self.backend {
@@ -315,7 +311,7 @@ impl Client {
             self.back_interest.remove(EventSet::readable());
             self.front_interest.insert(EventSet::writable());
             // prepare to provide this to writable
-            self.back_buf = Some(buf.flip());
+            self.back_buf = Some(buf);
           }
           Err(e) => {
             println!("not implemented; client err={:?}", e);
