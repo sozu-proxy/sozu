@@ -113,7 +113,7 @@ impl Client {
       //println!("in writable 2: back_buf contains {} bytes", buf.remaining());
       let mut b = buf.flip();
       println!("writable back_buf({}): {}", b.remaining(), from_utf8((&b as &Buf).bytes()).unwrap());
-      if self.status == ConnectionStatus::ServerClosed && b.remaining() == 0 {
+      if self.status == ConnectionStatus::ServerClosed || b.remaining() == 0 {
         return Ok(());
       }
 
