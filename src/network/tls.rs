@@ -356,8 +356,8 @@ const s: &'static str = "pouet";
 
 impl Server {
   fn new(listener: ApplicationListener, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> Server {
-    //let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
-    let mut context = SslContext::new(SslMethod::Sslv3).unwrap();
+    let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
+    //let mut context = SslContext::new(SslMethod::Sslv3).unwrap();
     context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
     context.set_private_key_file("assets/key.pem", X509FileType::PEM);
 
