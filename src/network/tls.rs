@@ -113,7 +113,9 @@ impl Client {
       //println!("in writable 2: back_buf contains {} bytes", buf.remaining());
       let mut b = buf.flip();
       println!("writable back_buf({}): {}", b.remaining(), from_utf8((&b as &Buf).bytes()).unwrap());
-      if self.status == ConnectionStatus::ServerClosed || b.remaining() == 0 {
+      //if self.status == ConnectionStatus::ServerClosed && b.remaining() == 0 {
+      if b.remaining() == 0 {
+        self.back_buf = Some(b.flip());
         return Ok(());
       }
 
@@ -134,7 +136,6 @@ impl Client {
           //}
           b.advance(r);
 
-          self.back_buf = Some(b.flip());
           self.tx_count = self.tx_count + r;
 
           //self.front_interest.insert(EventSet::readable());
@@ -153,6 +154,7 @@ impl Client {
           panic!("not implemented; client err={:?}", e);
         }
       }
+      self.back_buf = Some(b.flip());
     }
     if let Some((frontend_token,backend_token)) = self.tokens() {
       if let Some(ref sock) = self.backend {
@@ -310,8 +312,6 @@ impl Client {
             //}
             self.back_interest.remove(EventSet::readable());
             self.front_interest.insert(EventSet::writable());
-            // prepare to provide this to writable
-            self.back_buf = Some(buf);
           }
           Err(e) => {
             println!("not implemented; client err={:?}", e);
@@ -319,6 +319,7 @@ impl Client {
           }
         };
       }
+      self.back_buf = Some(buf);
     }
 
     if let Some((frontend_token,backend_token)) = self.tokens() {
