@@ -48,10 +48,8 @@ pub enum ConnectionStatus {
 struct Client {
   sock:           TcpStream,
   backend:        TcpStream,
-  front_buf:      Option<ByteBuf>,
-  front_mut_buf:  Option<MutByteBuf>,
-  back_buf:       Option<ByteBuf>,
-  back_mut_buf:   Option<MutByteBuf>,
+  front_buf:      Option<MutByteBuf>,
+  back_buf:       Option<MutByteBuf>,
   token:          Option<Token>,
   backend_token:  Option<Token>,
   back_interest:  EventSet,
@@ -84,10 +82,8 @@ impl Client {
     Some(Client {
       sock:           sock,
       backend:        backend,
-      front_buf:      None,
-      front_mut_buf:  Some(ByteBuf::mut_with_capacity(2048)),
-      back_buf:       None,
-      back_mut_buf:   Some(ByteBuf::mut_with_capacity(2048)),
+      front_buf:      Some(ByteBuf::mut_with_capacity(2048)),
+      back_buf:       Some(ByteBuf::mut_with_capacity(2048)),
       token:          None,
       backend_token:  None,
       back_interest:  EventSet::all(),
@@ -108,18 +104,17 @@ impl Client {
     if let Some(mut buf) = self.back_buf.take() {
       //println!("in writable 2: back_buf contains {} bytes", buf.remaining());
 
-      match self.sock.try_write_buf(&mut buf) {
+      let mut b = buf.flip();
+      match self.sock.try_write_buf(&mut b) {
         Ok(None) => {
           println!("client flushing buf; WOULDBLOCK");
 
-          self.back_buf = Some(buf);
           self.front_interest.insert(EventSet::writable());
         }
         Ok(Some(r)) => {
           //FIXME what happens if not everything was written?
           //println!("FRONT [{}<-{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
 
-          self.back_mut_buf = Some(buf.flip());
           self.tx_count = self.tx_count + r;
 
           //self.front_interest.insert(EventSet::readable());
@@ -128,6 +123,7 @@ impl Client {
         }
         Err(e) =>  println!("not implemented; client err={:?}", e),
       }
+      self.back_buf = Some(b.flip());
     }
     event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
     event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
@@ -135,7 +131,7 @@ impl Client {
   }
 
   fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
-    let mut buf = self.front_mut_buf.take().unwrap();
+    let mut buf = self.front_buf.take().unwrap();
     //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
 
     match self.sock.try_read_buf(&mut buf) {
@@ -148,13 +144,13 @@ impl Client {
         self.back_interest.insert(EventSet::writable());
         self.rx_count = self.rx_count + r;
         // prepare to provide this to writable
-        self.front_buf = Some(buf.flip());
       }
       Err(e) => {
         println!("not implemented; client err={:?}", e);
         //self.front_interest.remove(EventSet::readable());
       }
     };
+    self.front_buf = Some(buf);
 
     event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
     event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
@@ -165,18 +161,16 @@ impl Client {
     if let Some(mut buf) = self.front_buf.take() {
       //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
 
-      match self.backend.try_write_buf(&mut buf) {
+      let mut b = buf.flip();
+      match self.backend.try_write_buf(&mut b) {
         Ok(None) => {
           println!("client flushing buf; WOULDBLOCK");
 
-          self.front_buf = Some(buf);
           self.back_interest.insert(EventSet::writable());
         }
         Ok(Some(r)) => {
           //FIXME what happens if not everything was written?
           //println!("BACK  [{}->{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
-
-          self.front_mut_buf = Some(buf.flip());
 
           self.front_interest.insert(EventSet::readable());
           self.back_interest.remove(EventSet::writable());
@@ -184,6 +178,7 @@ impl Client {
         }
         Err(e) =>  println!("not implemented; client err={:?}", e),
       }
+      self.front_buf = Some(b.flip());
     }
     event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
     event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
@@ -191,7 +186,7 @@ impl Client {
   }
 
   fn back_readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
-    let mut buf = self.back_mut_buf.take().unwrap();
+    let mut buf = self.back_buf.take().unwrap();
     //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
 
     match self.backend.try_read_buf(&mut buf) {
@@ -203,13 +198,13 @@ impl Client {
         self.back_interest.remove(EventSet::readable());
         self.front_interest.insert(EventSet::writable());
         // prepare to provide this to writable
-        self.back_buf = Some(buf.flip());
       }
       Err(e) => {
         println!("not implemented; client err={:?}", e);
         //self.interest.remove(EventSet::readable());
       }
     };
+    self.back_buf = Some(buf);
 
     event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
     event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
