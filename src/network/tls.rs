@@ -5,7 +5,8 @@ use std::sync::mpsc::{self,channel,Receiver};
 use mio::tcp::*;
 use std::io::{self,Read,ErrorKind};
 use mio::*;
-use mio::buf::{ByteBuf,MutByteBuf};
+use bytes::{Buf,ByteBuf,MutByteBuf};
+use bytes::buf::MutBuf;
 use std::collections::HashMap;
 use std::error::Error;
 use mio::util::Slab;
@@ -187,7 +188,7 @@ impl Client {
 
     if let Some(mut buf) = self.front_buf.take() {
       //let mut sl: &mut[u8] = buf.mut_bytes();
-      match self.stream.read(buf.mut_bytes()) {
+      match self.stream.read(unsafe { buf.mut_bytes() }) {
         /*Ok(None) => {
           println!("client flushing buf; WOULDBLOCK");
 
@@ -196,7 +197,7 @@ impl Client {
         },*/
         Ok(r) => {
           println!("FRONT [{:?}]: read {} bytes", self.token, r);
-          buf.advance(r);
+          unsafe { buf.advance(r) };
           if self.is_proxying() {
             //if let Some((front,back)) = self.tokens() {
             //  println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
@@ -470,13 +471,13 @@ impl Server {
     let application_listener = &self.listener;
     let accepted = application_listener.sock.accept();
 
-    if let Ok(Some(frontend_sock)) = accepted {
+    if let Ok(Some((frontend_sock, _))) = accepted {
       if let Ok(ssl) = Ssl::new(&self.context) {
         //if let Ok(ssl_sock) = frontend_sock.try_clone() {
           if let Ok(stream) = NonblockingSslStream::accept(ssl, frontend_sock) {
             if let Some(client) = Client::new(stream) {
               if let Ok(client_token) = self.clients.insert(client) {
-                event_loop.register_opt(self.clients[client_token].stream.get_ref(), client_token, EventSet::readable(), PollOpt::edge()).unwrap();
+                event_loop.register(self.clients[client_token].stream.get_ref(), client_token, EventSet::readable(), PollOpt::edge()).unwrap();
                 self.clients[client_token].set_front_token(client_token);
                 self.clients[client_token].status = ConnectionStatus::ClientConnected;
               } else {
@@ -510,7 +511,7 @@ impl Server {
             self.clients[token].status        = ConnectionStatus::Connected;
 
             if let Some(ref sock) = self.clients[token].backend {
-              event_loop.register_opt(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
+              event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
             }
             //FIXME: maybe not the right place to change state
             if let Some(rl) = self.clients[token].http_state.get_request_line() {
@@ -698,7 +699,7 @@ pub fn start() {
     front_address:  front
   };
 
-  event_loop.register_opt(&listener.sock, listener.token, EventSet::readable(), PollOpt::edge()).unwrap();
+  event_loop.register(&listener.sock, listener.token, EventSet::readable(), PollOpt::edge()).unwrap();
 
   let mut server = Server::new(listener, 500, tx);
 
@@ -711,7 +712,7 @@ pub fn start() {
 
 
   //println!("listen for connections");
-  //event_loop.register_opt(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+  //event_loop.register(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
   //let mut s = Server::new(10, 500, tx);
   //{
   //  let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
@@ -742,7 +743,7 @@ pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: 
     front_address:  front
   };
 
-  event_loop.register_opt(&listener.sock, listener.token, EventSet::readable(), PollOpt::edge()).unwrap();
+  event_loop.register(&listener.sock, listener.token, EventSet::readable(), PollOpt::edge()).unwrap();
 
   let mut server = Server::new(listener, max_connections, tx);
 

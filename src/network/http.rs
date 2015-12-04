@@ -5,7 +5,8 @@ use std::sync::mpsc::{self,channel,Receiver};
 use mio::tcp::*;
 use std::io::{self,Read,ErrorKind};
 use mio::*;
-use mio::buf::{ByteBuf,MutByteBuf};
+use bytes::{ByteBuf,MutByteBuf};
+use bytes::buf::MutBuf;
 use std::collections::HashMap;
 use std::error::Error;
 use mio::util::Slab;
@@ -407,10 +408,10 @@ impl Server {
     let application_listener = &self.listener;
     let accepted = application_listener.sock.accept();
 
-    if let Ok(Some(frontend_sock)) = accepted {
+    if let Ok(Some((frontend_sock, _))) = accepted {
       if let Some(client) = Client::new(frontend_sock) {
         if let Ok(client_token) = self.clients.insert(client) {
-            event_loop.register_opt(&self.clients[client_token].sock, client_token, EventSet::readable(), PollOpt::edge()).unwrap();
+            event_loop.register(&self.clients[client_token].sock, client_token, EventSet::readable(), PollOpt::edge()).unwrap();
             self.clients[client_token].set_front_token(client_token);
             self.clients[client_token].status = ConnectionStatus::ClientConnected;
         } else {
@@ -435,7 +436,7 @@ impl Server {
             self.clients[token].status        = ConnectionStatus::Connected;
 
             if let Some(ref sock) = self.clients[token].backend {
-              event_loop.register_opt(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
+              event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
             }
             //FIXME: maybe not the right place to change state
             if let Some(rl) = self.clients[token].http_state.get_request_line() {
@@ -623,7 +624,7 @@ pub fn start() {
     front_address:  front
   };
 
-  event_loop.register_opt(&listener.sock, listener.token, EventSet::readable(), PollOpt::edge()).unwrap();
+  event_loop.register(&listener.sock, listener.token, EventSet::readable(), PollOpt::edge()).unwrap();
 
   let mut server = Server::new(listener, 500, tx);
 
@@ -636,7 +637,7 @@ pub fn start() {
 
 
   //println!("listen for connections");
-  //event_loop.register_opt(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+  //event_loop.register(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
   //let mut s = Server::new(10, 500, tx);
   //{
   //  let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
@@ -667,7 +668,7 @@ pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: 
     front_address:  front
   };
 
-  event_loop.register_opt(&listener.sock, listener.token, EventSet::readable(), PollOpt::edge()).unwrap();
+  event_loop.register(&listener.sock, listener.token, EventSet::readable(), PollOpt::edge()).unwrap();
 
   let mut server = Server::new(listener, max_connections, tx);
 

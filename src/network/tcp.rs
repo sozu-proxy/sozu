@@ -4,7 +4,7 @@ use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
 use mio::tcp::*;
 use mio::*;
-use mio::buf::{ByteBuf,MutByteBuf};
+use bytes::{ByteBuf,MutByteBuf};
 use std::collections::HashMap;
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
@@ -390,7 +390,7 @@ impl Server {
       if let Ok(tok) = self.listeners.insert(al) {
         self.listeners[tok].token = Some(tok);
         self.fronts.insert(String::from(app_id), tok);
-        event_loop.register_opt(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level()).unwrap();
+        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level()).unwrap();
         println!("registered listener for app {} on port {}", app_id, port);
         Some(tok)
       } else {
@@ -453,7 +453,7 @@ impl Server {
     let application_listener = &self.listeners[token];
     // ToDo round robin (random or least_used)
     let accepted = application_listener.sock.accept();
-    if let Ok(Some(sock)) = accepted {
+    if let Ok(Some((sock, _))) = accepted {
       let rnd = random::<usize>();
       let idx = rnd % application_listener.back_addresses.len();
       if let Some(backend_addr) = application_listener.back_addresses.get(idx) {
@@ -463,8 +463,8 @@ impl Server {
               if let Ok(backend_tok) = self.backend.insert(tok) {
                 &self.clients[tok].set_tokens(tok, backend_tok);
                 self.clients[tok].status = ConnectionStatus::Connected;
-                event_loop.register_opt(&self.clients[tok].sock, tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-                event_loop.register_opt(&self.clients[tok].backend, backend_tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                event_loop.register(&self.clients[tok].sock, tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+                event_loop.register(&self.clients[tok].backend, backend_tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
               } else {
                 println!("could not add backend to slab");
               }
@@ -687,7 +687,7 @@ pub fn start() {
 
 
   println!("listen for connections");
-  //event_loop.register_opt(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+  //event_loop.register(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
   let (tx,rx) = channel::<ServerMessage>();
   let mut s = Server::new(10, 500, tx);
   {
