@@ -110,7 +110,7 @@ impl Client {
   // Forward content to client
   fn writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
     //println!("in writable()");
-    if let Some(mut buf) = self.back_buf.take() {
+    if let Some(buf) = self.back_buf.take() {
       //println!("in writable 2: back_buf contains {} bytes", buf.remaining());
       let mut b = buf.flip();
       println!("writable back_buf({}): {}", b.remaining(), from_utf8((&b as &Buf).bytes()).unwrap());
@@ -259,7 +259,7 @@ impl Client {
 
   // Forward content to application
   fn back_writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
-    if let Some(mut buf) = self.front_buf.take() {
+    if let Some(buf) = self.front_buf.take() {
       //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
 
       let mut b = buf.flip();
