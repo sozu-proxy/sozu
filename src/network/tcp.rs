@@ -515,20 +515,21 @@ impl Server {
     }
   }
 
-
-  //FIXME: this does not close existing connections, is that what we want?
-  //pub fn remove_server(&mut self, tok: Token, event_loop: &mut EventLoop<Server>) -> Option<Token>{
-  //  println!("removing server {:?}", tok);
-  //  if self.servers.contains(tok) {
-  //    event_loop.deregister(&self.servers[tok].sock);
-  //    self.servers.remove(tok);
-  //    println!("removed server {:?}", tok);
-  //    //self.servers[tok].sock.shutdown(Shutdown::Both);
-  //    Some(tok)
-  //  } else {
-  //    None
-  //  }
-  //}
+  pub fn get_client_token(&self, token: Token) -> Option<Token> {
+    if token == Token(0) {
+      None
+    } else if token.as_usize() < self.max_listeners + self.max_connections && self.clients.contains(token) {
+      Some(token)
+    } else if token.as_usize() < self.max_listeners + 2 * self.max_connections && self.backend.contains(token) {
+      if self.clients.contains(self.backend[token]) {
+        Some(self.backend[token])
+      } else {
+        None
+      }
+    } else {
+      None
+    }
+  }
 }
 
 impl Handler for Server {
@@ -550,21 +551,10 @@ impl Handler for Server {
           println!("client {:?} was removed", token);
         }
       } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
-        if self.backend.contains(token) {
-          let tok = self.backend[token];
-          if self.clients.contains(tok) {
-            self.clients[tok].back_readable(event_loop);
-          } else {
-            println!("client {:?} was removed", token);
-          }
-        } else {
-          println!("backend {:?} was removed", token);
+        if let Some(tok) = self.get_client_token(token) {
+          self.clients[tok].back_readable(event_loop);
         }
       }
-      //match token {
-      //  SERVER => self.server.accept(event_loop).unwrap(),
-      //  i => self.server.conn_readable(event_loop, i).unwrap()
-     // }
     }
 
     if events.is_writable() {
@@ -578,22 +568,10 @@ impl Handler for Server {
           println!("client {:?} was removed", token);
         }
       } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
-        if self.backend.contains(token) {
-          let tok = self.backend[token];
-          if self.clients.contains(tok) {
-            self.clients[tok].back_writable(event_loop);
-          } else {
-            println!("client {:?} was removed", token);
-          }
-        } else {
-          println!("backend {:?} was removed", token);
+        if let Some(tok) = self.get_client_token(token) {
+          self.clients[tok].back_writable(event_loop);
         }
       }
-      //match token {
-      //  SERVER => panic!("received writable for token 0"),
-        //CLIENT => self.client.writable(event_loop).unwrap(),
-      //  _ => self.server.conn_writable(event_loop, token).unwrap()
-      //};
     }
 
     if events.is_hup() {
@@ -608,19 +586,11 @@ impl Handler for Server {
           println!("client {:?} was removed", token);
         }
       } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
-        if self.backend.contains(token) {
-          let tok = self.backend[token];
-          if self.clients.contains(tok) {
-            if self.clients[tok].front_hup() == ClientResult::CloseClient {
-              self.close_client(event_loop, tok);
-            }
-          } else {
-            println!("client {:?} was removed", token);
+        if let Some(tok) = self.get_client_token(token) {
+          if self.clients[tok].front_hup() == ClientResult::CloseClient {
+            self.close_client(event_loop, tok);
           }
-        } else {
-          println!("backend {:?} was removed", token);
         }
-
       }
     }
   }

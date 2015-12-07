@@ -536,6 +536,22 @@ impl Server {
     }
     self.close_client(event_loop, token);
   }
+
+  pub fn get_client_token(&self, token: Token) -> Option<Token> {
+    if token == Token(0) {
+      None
+    } else if token.as_usize() < self.max_listeners + self.max_connections && self.clients.contains(token) {
+      Some(token)
+    } else if token.as_usize() < self.max_listeners + 2 * self.max_connections && self.backend.contains(token) {
+      if self.clients.contains(self.backend[token]) {
+        Some(self.backend[token])
+      } else {
+        None
+      }
+    } else {
+      None
+    }
+  }
 }
 
 impl Handler for Server {
@@ -562,15 +578,8 @@ impl Handler for Server {
           println!("client {:?} was removed", token);
         }
       } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
-        if self.backend.contains(token) {
-          let tok = self.backend[token];
-          if self.clients.contains(tok) {
-            self.clients[tok].back_readable(event_loop);
-          } else {
-            println!("client {:?} was removed", token);
-          }
-        } else {
-          println!("backend {:?} was removed", token);
+        if let Some(tok) = self.get_client_token(token) {
+          self.clients[tok].back_readable(event_loop);
         }
       }
     }
@@ -587,15 +596,8 @@ impl Handler for Server {
           println!("client {:?} was removed", token);
         }
       } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
-        if self.backend.contains(token) {
-          let tok = self.backend[token];
-          if self.clients.contains(tok) {
-            self.clients[tok].back_writable(event_loop);
-          } else {
-            println!("client {:?} was removed", token);
-          }
-        } else {
-          println!("backend {:?} was removed", token);
+        if let Some(tok) = self.get_client_token(token) {
+          self.clients[tok].back_writable(event_loop);
         }
       }
     }
@@ -616,21 +618,12 @@ impl Handler for Server {
           println!("client {:?} was already removed", token);
         }
       } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
-        if self.backend.contains(token) {
-          let tok = self.backend[token];
-          if self.clients.contains(tok) {
-            println!("server {} got hup (for client {})", token.as_usize(), tok.as_usize());
-            println!("removing server {:?}", token);
-            if self.clients[tok].back_hup() == ClientResult::CloseClient {
-              self.close_client(event_loop, tok);
-            }
-            //self.clients[tok].close();
-          } else {
-            println!("client {:?} was already removed", token);
+        if let Some(tok) = self.get_client_token(token) {
+          println!("server {} got hup (for client {})", token.as_usize(), tok.as_usize());
+          println!("removing server {:?}", token);
+          if self.clients[tok].back_hup() == ClientResult::CloseClient {
+            self.close_client(event_loop, tok);
           }
-        } else {
-
-          println!("backend {:?} was already removed", token);
         }
       }
       println!("end_hup");
