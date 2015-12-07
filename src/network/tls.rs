@@ -19,7 +19,7 @@ use openssl::ssl::error::NonblockingSslError;
 use openssl::x509::X509FileType;
 
 use parser::http11::{HttpState,parse_headers};
-use network::ServerMessage;
+use network::{ClientResult,ServerMessage};
 use messages::{Command,HttpFront};
 
 type BackendToken = Token;
@@ -321,6 +321,28 @@ impl Client {
     }
     Ok(())
   }
+
+  fn front_hup(&mut self) -> ClientResult {
+    if  self.status == ConnectionStatus::ServerClosed ||
+        self.status == ConnectionStatus::ClientConnected { // the server never answered, the client closed
+      self.status = ConnectionStatus::Closed;
+      ClientResult::CloseClient
+    } else {
+      self.status = ConnectionStatus::ClientClosed;
+      ClientResult::Continue
+    }
+
+  }
+
+  fn back_hup(&mut self) -> ClientResult {
+    if self.status == ConnectionStatus::ClientClosed {
+      self.status = ConnectionStatus::Closed;
+      ClientResult::CloseClient
+    } else {
+      self.status = ConnectionStatus::ServerClosed;
+      ClientResult::Continue
+    }
+  }
 }
 
 
@@ -585,13 +607,9 @@ impl Handler for Server {
       } else if token.as_usize() < self.max_listeners + self.max_connections {
         if self.clients.contains(token) {
           println!("client {:?} got hup", token.as_usize());
-          if  self.clients[token].status == ConnectionStatus::ServerClosed ||
-              self.clients[token].status == ConnectionStatus::ClientConnected { // the server never answered, the client closed
-            self.clients[token].status = ConnectionStatus::Closed;
+          println!("client {:?} got hup", token.as_usize());
+          if self.clients[token].front_hup() == ClientResult::CloseClient {
             self.close_client(event_loop, token);
-            println!("removed");
-          } else {
-            self.clients[token].status = ConnectionStatus::ClientClosed;
           }
           //self.clients[token].close();
         } else {
@@ -603,12 +621,8 @@ impl Handler for Server {
           if self.clients.contains(tok) {
             println!("server {} got hup (for client {})", token.as_usize(), tok.as_usize());
             println!("removing server {:?}", token);
-            if self.clients[tok].status == ConnectionStatus::ClientClosed {
-              self.clients[tok].status = ConnectionStatus::Closed;
+            if self.clients[tok].back_hup() == ClientResult::CloseClient {
               self.close_client(event_loop, tok);
-              println!("removed");
-            } else {
-              self.clients[tok].status = ConnectionStatus::ServerClosed;
             }
             //self.clients[tok].close();
           } else {

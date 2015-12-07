@@ -20,3 +20,8 @@ pub enum ServerMessage {
   Stopped
 }
 
+#[derive(Debug,PartialEq,Eq)]
+pub enum ClientResult {
+  CloseClient,
+  Continue
+}
