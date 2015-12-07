@@ -98,7 +98,7 @@ impl Client {
   }
 
   // Forward content to client
-  fn writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+  fn writable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult {
     //println!("in writable()");
     if let Some(buf) = self.back_buf.take() {
       //println!("in writable 2: back_buf contains {} bytes", buf.remaining());
@@ -107,7 +107,7 @@ impl Client {
       //if self.status == ConnectionStatus::ServerClosed && b.remaining() == 0 {
       if b.remaining() == 0 {
         self.back_buf = Some(b.flip());
-        return Ok(());
+        return ClientResult::Continue;
       }
 
       //let mut b:MutByteBuf = buf.flip();
@@ -153,7 +153,8 @@ impl Client {
       }
       event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
-    Ok(())
+
+    ClientResult::Continue
   }
 
   fn has_host(&self) -> bool {
@@ -172,7 +173,7 @@ impl Client {
   }
 
   // Read content from the client
-  fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+  fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult {
     //println!("in readable()");
     //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
 
@@ -205,7 +206,8 @@ impl Client {
             let state = parse_headers(&self.http_state, &buf.bytes());
             if let HttpState::Error(_) = state {
               self.http_state = state;
-              panic!(" HTTP parsing error");
+              println!("HTTP parsing error");
+              return ClientResult::CloseClient;
             }
             self.http_state = state;
             //println!("new state: {:?}", self.http_state);
@@ -220,6 +222,12 @@ impl Client {
                 event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
               }
               //println!("is now proxying, front buf flipped");
+              self.front_buf = Some(buf);
+              if let Some(frontend_token) = self.token {
+                event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+              }
+              return ClientResult::ConnectBackend;
+
             } else {
               self.front_interest.insert(EventSet::readable());
             }
@@ -244,11 +252,11 @@ impl Client {
     if let Some(frontend_token) = self.token {
       event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
-    Ok(())
+    ClientResult::Continue
   }
 
   // Forward content to application
-  fn back_writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+  fn back_writable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult {
     if let Some(buf) = self.front_buf.take() {
       //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
 
@@ -284,11 +292,11 @@ impl Client {
       }
       event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
-    Ok(())
+    ClientResult::Continue
   }
 
   // Read content from application
-  fn back_readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+  fn back_readable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult {
     if let Some(mut buf) = self.back_buf.take() {
       //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
 
@@ -319,7 +327,7 @@ impl Client {
       }
       event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
-    Ok(())
+    ClientResult::Continue
   }
 
   fn front_hup(&mut self) -> ClientResult {
@@ -552,6 +560,14 @@ impl Server {
       None
     }
   }
+
+  pub fn interpret_client_order(&mut self, event_loop: &mut EventLoop<Server>, token: Token, order: ClientResult) {
+    match order {
+      ClientResult::CloseClient    => self.close_client(event_loop, token),
+      ClientResult::ConnectBackend => self.connect_to_backend(event_loop, token),
+      ClientResult::Continue       => {}
+    }
+  }
 }
 
 impl Handler for Server {
@@ -567,13 +583,8 @@ impl Handler for Server {
         self.accept(event_loop, token)
       } else if token.as_usize() < self.max_listeners + self.max_connections {
         if self.clients.contains(token) {
-          self.clients[token].readable(event_loop);
-
-          if let HttpState::HasHost(_,_,_) = self.clients[token].http_state {
-            self.connect_to_backend(event_loop, token);
-          } else if let HttpState::Error(_) = self.clients[token].http_state {
-            self.close_client(event_loop, token);
-          }
+          let order = self.clients[token].readable(event_loop);
+          self.interpret_client_order(event_loop, token, order);
         } else {
           println!("client {:?} was removed", token);
         }

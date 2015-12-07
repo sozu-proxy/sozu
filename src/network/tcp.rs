@@ -91,7 +91,7 @@ impl Client {
     self.backend_token = Some(backend);
   }
 
-  fn writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+  fn writable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult {
     //println!("in writable()");
     if let Some(buf) = self.back_buf.take() {
       //println!("in writable 2: back_buf contains {} bytes", buf.remaining());
@@ -119,10 +119,10 @@ impl Client {
     }
     event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
     event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    Ok(())
+    ClientResult::Continue
   }
 
-  fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+  fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult {
     let mut buf = self.front_buf.take().unwrap();
     //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
 
@@ -146,10 +146,10 @@ impl Client {
 
     event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
     event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    Ok(())
+    ClientResult::Continue
   }
 
-  fn back_writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+  fn back_writable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult {
     if let Some(buf) = self.front_buf.take() {
       //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
 
@@ -174,10 +174,10 @@ impl Client {
     }
     event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
     event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    Ok(())
+    ClientResult::Continue
   }
 
-  fn back_readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+  fn back_readable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult {
     let mut buf = self.back_buf.take().unwrap();
     //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
 
@@ -200,7 +200,7 @@ impl Client {
 
     event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
     event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    Ok(())
+    ClientResult::Continue
   }
 
   fn front_hup(&mut self) -> ClientResult {
