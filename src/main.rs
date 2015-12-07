@@ -21,7 +21,7 @@ use bus::Message;
 
 fn main() {
   let bus_tx = bus::start_bus();
-  let (sender, _) = channel::<network::http::ServerMessage>();
+  let (sender, _) = channel::<network::ServerMessage>();
   let (tx, jg) = network::http::start_listener("127.0.0.1:8080".parse().unwrap(), 10, 500, sender);
 
   let (http_proxy_conf_input,http_proxy_conf_listener) = channel();
@@ -43,7 +43,7 @@ fn main() {
     });
   }*/
 
-  let (sender2, _) = channel::<network::tls::ServerMessage>();
+  let (sender2, _) = channel::<network::ServerMessage>();
   let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 10, 500, sender2);
   let front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8443"), path_begin: String::from("/") };
   tx2.send(network::tls::HttpProxyOrder::Command(messages::Command::AddHttpFront(front)));

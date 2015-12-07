@@ -19,7 +19,7 @@ use openssl::ssl::error::NonblockingSslError;
 use openssl::x509::X509FileType;
 
 use parser::http11::{HttpState,parse_headers};
-
+use network::ServerMessage;
 use messages::{Command,HttpFront};
 
 type BackendToken = Token;
@@ -38,16 +38,6 @@ pub enum HttpProxyOrder {
   Command(Command),
   Stop
 }
-
-#[derive(Debug)]
-pub enum ServerMessage {
-  AddedHttpFront,
-  RemovedHttpFront,
-  AddedInstance,
-  RemovedInstance,
-  Stopped
-}
-
 
 struct Client {
   backend:        Option<TcpStream>,
@@ -640,12 +630,12 @@ impl Handler for Server {
       HttpProxyOrder::Command(Command::AddHttpFront(front)) => {
         println!("add front {:?}", front);
           self.add_http_front(front, event_loop);
-          self.tx.send(ServerMessage::AddedHttpFront);
+          self.tx.send(ServerMessage::AddedFront);
       },
       HttpProxyOrder::Command(Command::RemoveHttpFront(front)) => {
         println!("remove front {:?}", front);
         self.remove_http_front(front, event_loop);
-        self.tx.send(ServerMessage::RemovedHttpFront);
+        self.tx.send(ServerMessage::RemovedFront);
       },
       HttpProxyOrder::Command(Command::AddInstance(instance)) => {
         println!("add instance {:?}", instance);

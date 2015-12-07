@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use time::precise_time_s;
 use rand::random;
+use network::ServerMessage;
 
 use messages::{TcpFront,Command,Instance};
 
@@ -23,15 +24,6 @@ const SERVER: Token = Token(0);
 pub enum TcpProxyOrder {
   Command(Command),
   Stop
-}
-
-#[derive(Debug)]
-pub enum ServerMessage {
-  AddedTcpFront,
-  RemovedTcpFront,
-  AddedInstance,
-  RemovedInstance,
-  Stopped
 }
 
 #[derive(Debug,Clone,PartialEq,Eq)]
@@ -634,7 +626,7 @@ impl Handler for Server {
       TcpProxyOrder::Command(Command::AddTcpFront(front)) => {
         println!("{:?}", front);
         if let Some(token) = self.add_tcp_front(front.port, &front.app_id, event_loop) {
-          self.tx.send(ServerMessage::AddedTcpFront);
+          self.tx.send(ServerMessage::AddedFront);
         } else {
           println!("Couldn't add tcp front");
         }
@@ -642,7 +634,7 @@ impl Handler for Server {
       TcpProxyOrder::Command(Command::RemoveTcpFront(front)) => {
         println!("{:?}", front);
         let _ = self.remove_tcp_front(front.app_id, event_loop);
-        self.tx.send(ServerMessage::RemovedTcpFront);
+        self.tx.send(ServerMessage::RemovedFront);
       },
       TcpProxyOrder::Command(Command::AddInstance(instance)) => {
         println!("{:?}", instance);

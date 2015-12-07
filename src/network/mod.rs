@@ -8,5 +8,15 @@ pub mod tls;
 mod splice;
 
 pub mod tcp;
+//pub mod proxy;
 
+
+#[derive(Debug)]
+pub enum ServerMessage {
+  AddedFront,
+  RemovedFront,
+  AddedInstance,
+  RemovedInstance,
+  Stopped
+}
 

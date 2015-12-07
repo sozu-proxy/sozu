@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
 use time::precise_time_s;
 use rand::random;
+use network::ServerMessage;
 
 //use parser::http11::{RRequestLine,RequestHeader,request_line,headers};
 use parser::http11::{HttpState,parse_headers};
@@ -36,16 +37,6 @@ pub enum HttpProxyOrder {
   Command(Command),
   Stop
 }
-
-#[derive(Debug)]
-pub enum ServerMessage {
-  AddedHttpFront,
-  RemovedHttpFront,
-  AddedInstance,
-  RemovedInstance,
-  Stopped
-}
-
 
 struct Client {
   sock:           TcpStream,
@@ -565,12 +556,12 @@ impl Handler for Server {
       HttpProxyOrder::Command(Command::AddHttpFront(front)) => {
         println!("add front {:?}", front);
           self.add_http_front(front, event_loop);
-          self.tx.send(ServerMessage::AddedHttpFront);
+          self.tx.send(ServerMessage::AddedFront);
       },
       HttpProxyOrder::Command(Command::RemoveHttpFront(front)) => {
         println!("remove front {:?}", front);
         self.remove_http_front(front, event_loop);
-        self.tx.send(ServerMessage::RemovedHttpFront);
+        self.tx.send(ServerMessage::RemovedFront);
       },
       HttpProxyOrder::Command(Command::AddInstance(instance)) => {
         println!("add instance {:?}", instance);
@@ -694,6 +685,7 @@ mod tests {
   use std::str::FromStr;
   use std::time::Duration;
   use messages::{Command,HttpFront,Instance};
+  use network::ServerMessage;
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
