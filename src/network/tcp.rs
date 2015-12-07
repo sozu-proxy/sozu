@@ -357,46 +357,15 @@ pub struct ApplicationListener {
   back_addresses: Vec<SocketAddr>
 }
 
-pub struct Server {
-  fronts:          HashMap<String, Token>,
-  instances:       HashMap<String, Vec<SocketAddr>>,
-  listeners:       Slab<ApplicationListener>,
-  clients:         Slab<Client>,
-  backend:         Slab<Token>,
-  max_listeners:   usize,
-  max_connections: usize,
-  tx:              mpsc::Sender<ServerMessage>
+type ClientToken = Token;
+
+pub struct ServerConfiguration {
+  fronts:    HashMap<String, Token>,
+  instances: HashMap<String, Vec<SocketAddr>>,
+  listeners: Slab<ApplicationListener>
 }
 
-impl Server {
-  fn new(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> Server {
-    Server {
-      fronts:          HashMap::new(),
-      instances:       HashMap::new(),
-      listeners:       Slab::new_starting_at(Token(0), max_listeners),
-      clients:         Slab::new_starting_at(Token(max_listeners), max_connections),
-      backend:         Slab::new_starting_at(Token(max_listeners+max_connections), max_connections),
-      max_listeners:   max_listeners,
-      max_connections: max_connections,
-      tx:              tx
-    }
-  }
-
-
-  pub fn close_client(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-    self.clients[token].sock.shutdown(Shutdown::Both);
-    event_loop.deregister(&self.clients[token].sock);
-    self.clients[token].backend.shutdown(Shutdown::Both);
-    event_loop.deregister(&self.clients[token].backend);
-
-    if let Some(backend_token) = self.clients[token].backend_token {
-      if self.backend.contains(backend_token) {
-        self.backend.remove(backend_token);
-      }
-    }
-    self.clients.remove(token);
-  }
-
+impl ServerConfiguration {
   pub fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<Server>) -> Option<Token> {
     let addr_string = String::from("127.0.0.1:") + &port.to_string();
     let front = &addr_string.parse().unwrap();
@@ -477,9 +446,50 @@ impl Server {
       // ToDo
       None
   }
+}
+
+pub struct Server {
+  configuration:   ServerConfiguration,
+  clients:         Slab<Client>,
+  backend:         Slab<ClientToken>,
+  max_listeners:   usize,
+  max_connections: usize,
+  tx:              mpsc::Sender<ServerMessage>
+}
+
+impl Server {
+  fn new(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> Server {
+    Server {
+      configuration: ServerConfiguration {
+        fronts:    HashMap::new(),
+        instances: HashMap::new(),
+        listeners: Slab::new_starting_at(Token(0), max_listeners)
+      },
+      clients:         Slab::new_starting_at(Token(max_listeners), max_connections),
+      backend:         Slab::new_starting_at(Token(max_listeners+max_connections), max_connections),
+      max_listeners:   max_listeners,
+      max_connections: max_connections,
+      tx:              tx
+    }
+  }
+
+
+  pub fn close_client(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
+    self.clients[token].sock.shutdown(Shutdown::Both);
+    event_loop.deregister(&self.clients[token].sock);
+    self.clients[token].backend.shutdown(Shutdown::Both);
+    event_loop.deregister(&self.clients[token].backend);
+
+    if let Some(backend_token) = self.clients[token].backend_token {
+      if self.backend.contains(backend_token) {
+        self.backend.remove(backend_token);
+      }
+    }
+    self.clients.remove(token);
+  }
 
   pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-    let application_listener = &self.listeners[token];
+    let application_listener = &self.configuration.listeners[token];
     // ToDo round robin (random or least_used)
     let accepted = application_listener.sock.accept();
     if let Ok(Some((sock, _))) = accepted {
@@ -541,7 +551,7 @@ impl Handler for Server {
     if events.is_readable() {
       //println!("{:?} is readable", token);
       if token.as_usize() < self.max_listeners {
-        if self.listeners.contains(token) {
+        if self.configuration.listeners.contains(token) {
           self.accept(event_loop, token)
         }
       } else if token.as_usize() < self.max_listeners + self.max_connections {
@@ -600,7 +610,7 @@ impl Handler for Server {
     match message {
       TcpProxyOrder::Command(Command::AddTcpFront(front)) => {
         println!("{:?}", front);
-        if let Some(token) = self.add_tcp_front(front.port, &front.app_id, event_loop) {
+        if let Some(token) = self.configuration.add_tcp_front(front.port, &front.app_id, event_loop) {
           self.tx.send(ServerMessage::AddedFront);
         } else {
           println!("Couldn't add tcp front");
@@ -608,14 +618,14 @@ impl Handler for Server {
       },
       TcpProxyOrder::Command(Command::RemoveTcpFront(front)) => {
         println!("{:?}", front);
-        let _ = self.remove_tcp_front(front.app_id, event_loop);
+        let _ = self.configuration.remove_tcp_front(front.app_id, event_loop);
         self.tx.send(ServerMessage::RemovedFront);
       },
       TcpProxyOrder::Command(Command::AddInstance(instance)) => {
         println!("{:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
-        if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
+        if let Some(token) = self.configuration.add_instance(&instance.app_id, addr, event_loop) {
           self.tx.send(ServerMessage::AddedInstance);
         } else {
           println!("Couldn't add tcp front");
@@ -625,7 +635,7 @@ impl Handler for Server {
         println!("{:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
-        if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
+        if let Some(token) = self.configuration.remove_instance(&instance.app_id, addr, event_loop) {
           self.tx.send(ServerMessage::RemovedInstance);
         } else {
           println!("Couldn't add tcp front");
@@ -659,13 +669,13 @@ pub fn start() {
   let mut s = Server::new(10, 500, tx);
   {
     let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
-    s.add_tcp_front(1234, "yolo", &mut event_loop);
-    s.add_instance("yolo", &back, &mut event_loop);
+    s.configuration.add_tcp_front(1234, "yolo", &mut event_loop);
+    s.configuration.add_instance("yolo", &back, &mut event_loop);
   }
   {
     let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
-    s.add_tcp_front(1235, "yolo", &mut event_loop);
-    s.add_instance("yolo", &back, &mut event_loop);
+    s.configuration.add_tcp_front(1235, "yolo", &mut event_loop);
+    s.configuration.add_instance("yolo", &back, &mut event_loop);
   }
   thread::spawn(move|| {
     println!("starting event loop");

@@ -362,71 +362,14 @@ pub struct ApplicationListener {
 
 type ClientToken = Token;
 
-pub struct Server {
-  instances:       HashMap<String, Vec<SocketAddr>>,
-  listener:        ApplicationListener,
-  fronts:          HashMap<String, Vec<HttpFront>>,
-  clients:         Slab<Client>,
-  backend:         Slab<ClientToken>,
-  context:         SslContext,
-  max_listeners:   usize,
-  max_connections: usize,
-  tx:              mpsc::Sender<ServerMessage>
+pub struct ServerConfiguration {
+  instances: HashMap<String, Vec<SocketAddr>>,
+  listener:  ApplicationListener,
+  fronts:    HashMap<String, Vec<HttpFront>>,
+  context:   SslContext
 }
 
-const s: &'static str = "pouet";
-
-impl Server {
-  fn new(listener: ApplicationListener, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> Server {
-    let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
-    //let mut context = SslContext::new(SslMethod::Sslv3).unwrap();
-    context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
-    context.set_private_key_file("assets/key.pem", X509FileType::PEM);
-
-    fn servername_callback(ssl: &mut Ssl, ad: &mut i32) -> i32 {
-      println!("GOT SERVER NAME: {:?}", ssl.get_servername());
-      0
-    }
-    context.set_servername_callback(Some(servername_callback as ServerNameCallback));
-
-    /*
-    fn servername_callback_s(ssl: &mut Ssl, ad: &mut i32, data: &&str) -> i32 {
-      println!("got data: {}", *data);
-      println!("GOT SERVER NAME: {:?}", ssl.get_servername());
-      0
-    }
-    context.set_servername_callback_with_data(servername_callback_s as ServerNameCallbackData<&str>, s);
-    */
-
-    Server {
-      instances:       HashMap::new(),
-      listener:        listener,
-      fronts:          HashMap::new(),
-      clients:         Slab::new_starting_at(Token(1), max_connections),
-      backend:         Slab::new_starting_at(Token(1 + max_connections), max_connections),
-      context:         context,
-      max_listeners:   1,
-      max_connections: max_connections,
-      tx:              tx
-    }
-  }
-
-  pub fn close_client(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-    self.clients[token].stream.get_ref().shutdown(Shutdown::Both);
-    event_loop.deregister(self.clients[token].stream.get_ref());
-    if let Some(ref sock) = self.clients[token].backend {
-      sock.shutdown(Shutdown::Both);
-      event_loop.deregister(sock);
-    }
-
-    if let Some(backend_token) = self.clients[token].backend_token {
-      if self.backend.contains(backend_token) {
-        self.backend.remove(backend_token);
-      }
-    }
-    self.clients.remove(token);
-  }
-
+impl ServerConfiguration {
   pub fn add_http_front(&mut self, http_front: HttpFront, event_loop: &mut EventLoop<Server>) {
     let front2 = http_front.clone();
     let front3 = http_front.clone();
@@ -486,13 +429,78 @@ impl Server {
       None
     }
   }
+}
+
+pub struct Server {
+  configuration:   ServerConfiguration,
+  clients:         Slab<Client>,
+  backend:         Slab<ClientToken>,
+  max_listeners:   usize,
+  max_connections: usize,
+  tx:              mpsc::Sender<ServerMessage>
+}
+
+const s: &'static str = "pouet";
+
+impl Server {
+  fn new(listener: ApplicationListener, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> Server {
+    let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
+    //let mut context = SslContext::new(SslMethod::Sslv3).unwrap();
+    context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
+    context.set_private_key_file("assets/key.pem", X509FileType::PEM);
+
+    fn servername_callback(ssl: &mut Ssl, ad: &mut i32) -> i32 {
+      println!("GOT SERVER NAME: {:?}", ssl.get_servername());
+      0
+    }
+    context.set_servername_callback(Some(servername_callback as ServerNameCallback));
+
+    /*
+    fn servername_callback_s(ssl: &mut Ssl, ad: &mut i32, data: &&str) -> i32 {
+      println!("got data: {}", *data);
+      println!("GOT SERVER NAME: {:?}", ssl.get_servername());
+      0
+    }
+    context.set_servername_callback_with_data(servername_callback_s as ServerNameCallbackData<&str>, s);
+    */
+
+    Server {
+      configuration: ServerConfiguration {
+        instances: HashMap::new(),
+        listener:  listener,
+        fronts:    HashMap::new(),
+        context:   context
+      },
+      clients:         Slab::new_starting_at(Token(1), max_connections),
+      backend:         Slab::new_starting_at(Token(1 + max_connections), max_connections),
+      max_listeners:   1,
+      max_connections: max_connections,
+      tx:              tx
+    }
+  }
+
+  pub fn close_client(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
+    self.clients[token].stream.get_ref().shutdown(Shutdown::Both);
+    event_loop.deregister(self.clients[token].stream.get_ref());
+    if let Some(ref sock) = self.clients[token].backend {
+      sock.shutdown(Shutdown::Both);
+      event_loop.deregister(sock);
+    }
+
+    if let Some(backend_token) = self.clients[token].backend_token {
+      if self.backend.contains(backend_token) {
+        self.backend.remove(backend_token);
+      }
+    }
+    self.clients.remove(token);
+  }
 
   pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-    let application_listener = &self.listener;
+    let application_listener = &self.configuration.listener;
     let accepted = application_listener.sock.accept();
 
     if let Ok(Some((frontend_sock, _))) = accepted {
-      if let Ok(ssl) = Ssl::new(&self.context) {
+      if let Ok(ssl) = Ssl::new(&self.configuration.context) {
         //if let Ok(ssl_sock) = frontend_sock.try_clone() {
           if let Ok(stream) = NonblockingSslStream::accept(ssl, frontend_sock) {
             if let Some(client) = Client::new(stream) {
@@ -522,7 +530,7 @@ impl Server {
 
   pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
     if let (Some(host), Some(uri)) = (self.clients[token].http_state.get_host(), self.clients[token].http_state.get_uri()) {
-      if let Some(back) = self.backend_from_request(&host, &uri) {
+      if let Some(back) = self.configuration.backend_from_request(&host, &uri) {
         if let Ok(socket) = TcpStream::connect(&back) {
           if let Ok(backend_token) = self.backend.insert(token) {
             //println!("backend connected and stored");
@@ -647,12 +655,12 @@ impl Handler for Server {
     match message {
       HttpProxyOrder::Command(Command::AddHttpFront(front)) => {
         println!("add front {:?}", front);
-          self.add_http_front(front, event_loop);
+          self.configuration.add_http_front(front, event_loop);
           self.tx.send(ServerMessage::AddedFront);
       },
       HttpProxyOrder::Command(Command::RemoveHttpFront(front)) => {
         println!("remove front {:?}", front);
-        self.remove_http_front(front, event_loop);
+        self.configuration.remove_http_front(front, event_loop);
         self.tx.send(ServerMessage::RemovedFront);
       },
       HttpProxyOrder::Command(Command::AddInstance(instance)) => {
@@ -660,7 +668,7 @@ impl Handler for Server {
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
-          self.add_instance(&instance.app_id, &addr, event_loop);
+          self.configuration.add_instance(&instance.app_id, &addr, event_loop);
           self.tx.send(ServerMessage::AddedInstance);
         }
       },
@@ -669,7 +677,7 @@ impl Handler for Server {
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
-          self.remove_instance(&instance.app_id, &addr, event_loop);
+          self.configuration.remove_instance(&instance.app_id, &addr, event_loop);
           self.tx.send(ServerMessage::RemovedInstance);
         }
       },
