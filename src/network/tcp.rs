@@ -39,7 +39,7 @@ pub enum ConnectionStatus {
 #[cfg(not(feature = "splice"))]
 struct Client {
   sock:           TcpStream,
-  backend:        TcpStream,
+  backend:        Option<TcpStream>,
   front_buf:      Option<MutByteBuf>,
   back_buf:       Option<MutByteBuf>,
   token:          Option<Token>,
@@ -54,7 +54,7 @@ struct Client {
 #[cfg(feature = "splice")]
 struct Client {
   sock:           TcpStream,
-  backend:        TcpStream,
+  backend:        Option<TcpStream>,
   pipe_in:        splice::Pipe,
   pipe_out:       splice::Pipe,
   data_in:        bool,
@@ -70,20 +70,28 @@ struct Client {
 
 #[cfg(not(feature = "splice"))]
 impl Client {
-  fn new(sock: TcpStream, backend: TcpStream) -> Option<Client> {
+  fn new(sock: TcpStream) -> Option<Client> {
     Some(Client {
       sock:           sock,
-      backend:        backend,
+      backend:        None,
       front_buf:      Some(ByteBuf::mut_with_capacity(2048)),
       back_buf:       Some(ByteBuf::mut_with_capacity(2048)),
       token:          None,
       backend_token:  None,
       back_interest:  EventSet::all(),
       front_interest: EventSet::all(),
-      status:         ConnectionStatus::Initial,
+      status:         ConnectionStatus::Connected,
       rx_count:       0,
       tx_count:       0
     })
+  }
+
+  pub fn set_front_token(&mut self, token: Token) {
+    self.token         = Some(token); 
+  }
+
+  pub fn set_back_token(&mut self, token: Token) {
+    self.backend_token = Some(token);
   }
 
   pub fn set_tokens(&mut self, token: Token, backend: Token) {
@@ -117,7 +125,9 @@ impl Client {
       }
       self.back_buf = Some(b.flip());
     }
-    event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    if let Some(ref sock) = self.backend {
+      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    }
     event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     ClientResult::Continue
   }
@@ -144,7 +154,9 @@ impl Client {
     };
     self.front_buf = Some(buf);
 
-    event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    if let Some(ref sock) = self.backend {
+      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    }
     event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     ClientResult::Continue
   }
@@ -154,25 +166,29 @@ impl Client {
       //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
 
       let mut b = buf.flip();
-      match self.backend.try_write_buf(&mut b) {
-        Ok(None) => {
-          println!("client flushing buf; WOULDBLOCK");
+      if let Some(ref mut sock) = self.backend {
+        match sock.try_write_buf(&mut b) {
+          Ok(None) => {
+            println!("client flushing buf; WOULDBLOCK");
 
-          self.back_interest.insert(EventSet::writable());
-        }
-        Ok(Some(r)) => {
-          //FIXME what happens if not everything was written?
-          //println!("BACK  [{}->{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+            self.back_interest.insert(EventSet::writable());
+          }
+          Ok(Some(r)) => {
+            //FIXME what happens if not everything was written?
+            //println!("BACK  [{}->{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
 
-          self.front_interest.insert(EventSet::readable());
-          self.back_interest.remove(EventSet::writable());
-          self.back_interest.insert(EventSet::readable());
+            self.front_interest.insert(EventSet::readable());
+            self.back_interest.remove(EventSet::writable());
+            self.back_interest.insert(EventSet::readable());
+          }
+          Err(e) =>  println!("not implemented; client err={:?}", e),
         }
-        Err(e) =>  println!("not implemented; client err={:?}", e),
       }
       self.front_buf = Some(b.flip());
     }
-    event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    if let Some(ref sock) = self.backend {
+      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    }
     event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     ClientResult::Continue
   }
@@ -181,24 +197,28 @@ impl Client {
     let mut buf = self.back_buf.take().unwrap();
     //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
 
-    match self.backend.try_read_buf(&mut buf) {
-      Ok(None) => {
-        println!("We just got readable, but were unable to read from the socket?");
-      }
-      Ok(Some(r)) => {
-        //println!("BACK  [{}<-{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
-        self.back_interest.remove(EventSet::readable());
-        self.front_interest.insert(EventSet::writable());
-        // prepare to provide this to writable
-      }
-      Err(e) => {
-        println!("not implemented; client err={:?}", e);
-        //self.interest.remove(EventSet::readable());
-      }
-    };
+    if let Some(ref mut sock) = self.backend {
+      match sock.try_read_buf(&mut buf) {
+        Ok(None) => {
+          println!("We just got readable, but were unable to read from the socket?");
+        }
+        Ok(Some(r)) => {
+          //println!("BACK  [{}<-{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+          self.back_interest.remove(EventSet::readable());
+          self.front_interest.insert(EventSet::writable());
+          // prepare to provide this to writable
+        }
+        Err(e) => {
+          println!("not implemented; client err={:?}", e);
+          //self.interest.remove(EventSet::readable());
+        }
+      };
+    }
     self.back_buf = Some(buf);
 
-    event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    if let Some(ref sock) = self.backend {
+      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    }
     event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     ClientResult::Continue
   }
@@ -477,8 +497,10 @@ impl Server {
   pub fn close_client(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
     self.clients[token].sock.shutdown(Shutdown::Both);
     event_loop.deregister(&self.clients[token].sock);
-    self.clients[token].backend.shutdown(Shutdown::Both);
-    event_loop.deregister(&self.clients[token].backend);
+    if let Some(ref sock) = self.clients[token].backend {
+      sock.shutdown(Shutdown::Both);
+      event_loop.deregister(sock);
+    }
 
     if let Some(backend_token) = self.clients[token].backend_token {
       if self.backend.contains(backend_token) {
@@ -489,40 +511,42 @@ impl Server {
   }
 
   pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-    let application_listener = &self.configuration.listeners[token];
-    // ToDo round robin (random or least_used)
-    let accepted = application_listener.sock.accept();
-    if let Ok(Some((sock, _))) = accepted {
-      let rnd = random::<usize>();
-      let idx = rnd % application_listener.back_addresses.len();
-      if let Some(backend_addr) = application_listener.back_addresses.get(idx) {
-        if let Ok(instance) = TcpStream::connect(backend_addr) {
-          if let Some(client) = Client::new(sock, instance) {
-            if let Ok(tok) = self.clients.insert(client) {
-              if let Ok(backend_tok) = self.backend.insert(tok) {
-                &self.clients[tok].set_tokens(tok, backend_tok);
-                self.clients[tok].status = ConnectionStatus::Connected;
-                event_loop.register(&self.clients[tok].sock, tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-                event_loop.register(&self.clients[tok].backend, backend_tok, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-              } else {
-                println!("could not add backend to slab");
-              }
-            } else {
-              println!("could not add client to slab");
-            }
-          } else {
-            println!("could not create a client");
-          }
+    let accepted = self.configuration.listeners[token].sock.accept();
+
+    if let Ok(Some((frontend_sock, _))) = accepted {
+      if let Some(client) = Client::new(frontend_sock) {
+        if let Ok(client_token) = self.clients.insert(client) {
+          event_loop.register(&self.clients[client_token].sock, client_token, EventSet::readable(), PollOpt::edge()).unwrap();
+          &self.clients[client_token].set_front_token(client_token);
+          self.connect_to_backend(event_loop, token, client_token);
         } else {
-          println!("could not connect to instance");
+          println!("could not add client to slab");
         }
       } else {
-        println!("No instance listening for app {}, dropping", application_listener.app_id);
-        sock.shutdown(Shutdown::Both);
+        println!("could not create a client");
       }
     } else {
       println!("could not accept connection: {:?}", accepted);
     }
+  }
+
+  pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Server>, accept_token: Token, token: Token) {
+    let rnd = random::<usize>();
+    let idx = rnd % self.configuration.listeners[accept_token].back_addresses.len();
+    if let Some(backend_addr) = self.configuration.listeners[accept_token].back_addresses.get(idx) {
+      if let Ok(socket) = TcpStream::connect(backend_addr) {
+        if let Ok(backend_token) = self.backend.insert(token) {
+          self.clients[token].backend       = Some(socket);
+          self.clients[token].backend_token = Some(backend_token);
+
+          if let Some(ref sock) = self.clients[token].backend {
+            event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
+          }
+          return;
+        }
+      }
+    }
+    self.close_client(event_loop, token);
   }
 
   pub fn get_client_token(&self, token: Token) -> Option<Token> {

@@ -429,6 +429,19 @@ impl ServerConfiguration {
       None
     }
   }
+
+  pub fn connect_to_backend(&mut self, client: &mut Client) -> Option<TcpStream> {
+    if let (Some(host), Some(rl)) = (client.http_state.get_host(), client.http_state.get_request_line()) {
+      if let Some(back) = self.backend_from_request(&host, &rl.uri) {
+        if let Ok(socket) = TcpStream::connect(&back) {
+          client.http_state = HttpState::Proxying(rl, host);
+          client.status     = ConnectionStatus::Connected;
+          return Some(socket);
+        }
+      }
+    }
+    None
+  }
 }
 
 pub struct Server {
@@ -529,25 +542,16 @@ impl Server {
   }
 
   pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-    if let (Some(host), Some(uri)) = (self.clients[token].http_state.get_host(), self.clients[token].http_state.get_uri()) {
-      if let Some(back) = self.configuration.backend_from_request(&host, &uri) {
-        if let Ok(socket) = TcpStream::connect(&back) {
-          if let Ok(backend_token) = self.backend.insert(token) {
-            //println!("backend connected and stored");
-            self.clients[token].backend       = Some(socket);
-            self.clients[token].backend_token = Some(backend_token);
-            self.clients[token].status        = ConnectionStatus::Connected;
+    if let Some(socket) = self.configuration.connect_to_backend(&mut self.clients[token]) {
+      if let Ok(backend_token) = self.backend.insert(token) {
+        //println!("backend connected and stored");
+        self.clients[token].backend       = Some(socket);
+        self.clients[token].backend_token = Some(backend_token);
 
-            if let Some(ref sock) = self.clients[token].backend {
-              event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
-            }
-            //FIXME: maybe not the right place to change state
-            if let Some(rl) = self.clients[token].http_state.get_request_line() {
-              self.clients[token].http_state = HttpState::Proxying(rl, host);
-            }
-            return;
-          }
+        if let Some(ref sock) = self.clients[token].backend {
+          event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
         }
+        return;
       }
     }
     self.close_client(event_loop, token);
