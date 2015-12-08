@@ -384,6 +384,16 @@ impl ServerConfiguration {
     }
   }
 
+  pub fn accept(&mut self, token: Token) -> Option<Client> {
+    let accepted = self.listener.sock.accept();
+
+    if let Ok(Some((frontend_sock, _))) = accepted {
+      Client::new(frontend_sock)
+    } else {
+      None
+    }
+  }
+
   pub fn connect_to_backend(&mut self, client: &mut Client) -> Option<TcpStream> {
     if let (Some(host), Some(rl)) = (client.http_state.get_host(), client.http_state.get_request_line()) {
       if let Some(back) = self.backend_from_request(&host, &rl.uri) {
@@ -440,22 +450,15 @@ impl Server {
   }
 
   pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-    let application_listener = &self.configuration.listener;
-    let accepted = application_listener.sock.accept();
-
-    if let Ok(Some((frontend_sock, _))) = accepted {
-      if let Some(client) = Client::new(frontend_sock) {
-        if let Ok(client_token) = self.clients.insert(client) {
-          event_loop.register(&self.clients[client_token].sock, client_token, EventSet::readable(), PollOpt::edge()).unwrap();
-          self.clients[client_token].set_front_token(client_token);
-        } else {
-          println!("could not add client to slab");
-        }
+    if let Some(client) = self.configuration.accept(token) {
+      if let Ok(client_token) = self.clients.insert(client) {
+        event_loop.register(&self.clients[client_token].sock, client_token, EventSet::readable(), PollOpt::edge()).unwrap();
+        self.clients[client_token].set_front_token(client_token);
       } else {
-        println!("could not create a client");
+        println!("could not add client to slab");
       }
     } else {
-      println!("could not accept connection: {:?}", accepted);
+      println!("could not create a client");
     }
   }
 
