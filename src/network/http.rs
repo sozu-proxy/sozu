@@ -721,7 +721,7 @@ mod tests {
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").unwrap();
     let (tx,rx) = channel::<ServerMessage>();
     let (sender, jg) = start_listener(front, 10, 10, tx.clone());
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
+    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/"), port: 1024 };
     sender.send(HttpProxyOrder::Command(Command::AddHttpFront(front)));
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
     sender.send(HttpProxyOrder::Command(Command::AddInstance(instance)));

@@ -127,7 +127,8 @@ mod tests {
         HttpFront {
           app_id: String::new() + "app_e74eb0d4-e01a-4a09-af46-7ecab7157d32",
           hostname: String::new() + "cltdl.fr",
-          path_begin: String::new() + ""
+          path_begin: String::new() + "",
+          port: 8080
         }
       );
       let _ = tx.send(Message::Msg(command.clone()));

@@ -45,7 +45,7 @@ fn main() {
 
   let (sender2, _) = channel::<network::ServerMessage>();
   let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 10, 500, sender2);
-  let front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8443"), path_begin: String::from("/") };
+  let front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8443"), path_begin: String::from("/"), port: 8443 };
   tx2.send(network::tls::HttpProxyOrder::Command(messages::Command::AddHttpFront(front)));
   let instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
   tx2.send(network::tls::HttpProxyOrder::Command(messages::Command::AddInstance(instance)));

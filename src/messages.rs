@@ -5,7 +5,8 @@ use rustc_serialize::{Decodable, Decoder};
 pub struct HttpFront {
     pub app_id: String,
     pub hostname: String,
-    pub path_begin: String
+    pub path_begin: String,
+    pub port: u16
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
@@ -91,25 +92,27 @@ mod tests {
 
   #[test]
   fn add_acl_test() {
-    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}}"#;
+    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}}"#;
     let command: Command = json::decode(raw_json).unwrap();
     println!("{:?}", command);
     assert!(command == Command::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
-      path_begin: String::from("xxx")
+      path_begin: String::from("xxx"),
+      port: 4242
     }));
   }
 
   #[test]
   fn remove_acl_test() {
-    let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}}"#;
+    let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}}"#;
     let command: Command = json::decode(raw_json).unwrap();
     println!("{:?}", command);
     assert!(command == Command::RemoveHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
-      path_begin: String::from("xxx")
+      path_begin: String::from("xxx"),
+      port: 4242
     }));
   }
 
