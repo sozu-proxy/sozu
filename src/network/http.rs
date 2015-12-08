@@ -418,13 +418,15 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn accept(&mut self, token: Token) -> Option<Client> {
+  pub fn accept(&mut self, token: Token) -> Option<(Client, bool)> {
     println!("configuration accept({:?})", token);
     if self.listeners.contains(token) {
       let accepted = self.listeners[token].sock.accept();
 
       if let Ok(Some((frontend_sock, _))) = accepted {
-        return Client::new(frontend_sock);
+        if let Some(c) = Client::new(frontend_sock) {
+          return Some((c, false))
+        }
       }
     } else {
       println!("not found");
@@ -529,10 +531,13 @@ impl Server {
   }
 
   pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-    if let Some(client) = self.configuration.accept(token) {
+    if let Some((client, should_connect)) = self.configuration.accept(token) {
       if let Ok(client_token) = self.clients.insert(client) {
         event_loop.register(&self.clients[client_token].sock, client_token, EventSet::readable(), PollOpt::edge()).unwrap();
         self.clients[client_token].set_front_token(client_token);
+        if should_connect {
+          self.connect_to_backend(event_loop, client_token);
+        }
       } else {
         println!("could not add client to slab");
       }
