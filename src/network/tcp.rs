@@ -44,6 +44,7 @@ struct Client {
   back_buf:       Option<MutByteBuf>,
   token:          Option<Token>,
   backend_token:  Option<Token>,
+  accept_token:   Token,
   back_interest:  EventSet,
   front_interest: EventSet,
   status:         ConnectionStatus,
@@ -61,6 +62,7 @@ struct Client {
   data_out:       bool,
   token:          Option<Token>,
   backend_token:  Option<Token>,
+  accept_token:   Token,
   back_interest:  EventSet,
   front_interest: EventSet,
   status:         ConnectionStatus,
@@ -70,7 +72,7 @@ struct Client {
 
 #[cfg(not(feature = "splice"))]
 impl Client {
-  fn new(sock: TcpStream) -> Option<Client> {
+  fn new(sock: TcpStream, accept_token: Token) -> Option<Client> {
     Some(Client {
       sock:           sock,
       backend:        None,
@@ -78,6 +80,7 @@ impl Client {
       back_buf:       Some(ByteBuf::mut_with_capacity(2048)),
       token:          None,
       backend_token:  None,
+      accept_token:   accept_token,
       back_interest:  EventSet::all(),
       front_interest: EventSet::all(),
       status:         ConnectionStatus::Connected,
@@ -248,7 +251,7 @@ impl Client {
 
 #[cfg(feature = "splice")]
 impl Client {
-  fn new(sock: TcpStream, backend: TcpStream) -> Option<Client> {
+  fn new(sock: TcpStream, backend: TcpStream, accept_token: Token) -> Option<Client> {
     if let (Some(pipe_in), Some(pipe_out)) = (splice::create_pipe(), splice::create_pipe()) {
       Some(Client {
         sock:           sock,
@@ -259,6 +262,7 @@ impl Client {
         data_out:       false,
         token:          None,
         backend_token:  None,
+        accept_token:   accept_token,
         back_interest:  EventSet::all(),
         front_interest: EventSet::all(),
         status:         ConnectionStatus::Initial,
@@ -469,19 +473,20 @@ impl ServerConfiguration {
   }
 
   pub fn accept(&mut self, token: Token) -> Option<Client> {
-    let accepted = self.listeners[token].sock.accept();
+    if self.listeners.contains(token) {
+      let accepted = self.listeners[token].sock.accept();
 
-    if let Ok(Some((frontend_sock, _))) = accepted {
-      Client::new(frontend_sock)
-    } else {
-      None
+      if let Ok(Some((frontend_sock, _))) = accepted {
+        return Client::new(frontend_sock, token);
+      }
     }
+    None
   }
 
-  pub fn connect_to_backend(&mut self, accept_token: Token, client:&mut Client) ->Option<TcpStream> {
+  pub fn connect_to_backend(&mut self, client:&mut Client) ->Option<TcpStream> {
     let rnd = random::<usize>();
-    let idx = rnd % self.listeners[accept_token].back_addresses.len();
-    if let Some(backend_addr) = self.listeners[accept_token].back_addresses.get(idx) {
+    let idx = rnd % self.listeners[client.accept_token].back_addresses.len();
+    if let Some(backend_addr) = self.listeners[client.accept_token].back_addresses.get(idx) {
       TcpStream::connect(backend_addr).ok()
     } else {
       None
@@ -580,7 +585,7 @@ impl Server {
       if let Ok(client_token) = self.clients.insert(client) {
         event_loop.register(&self.clients[client_token].sock, client_token, EventSet::readable(), PollOpt::edge()).unwrap();
         &self.clients[client_token].set_front_token(client_token);
-        self.connect_to_backend(event_loop, token, client_token);
+        self.connect_to_backend(event_loop, client_token);
       } else {
         println!("could not add client to slab");
       }
@@ -589,8 +594,8 @@ impl Server {
     }
   }
 
-  pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Server>, accept_token: Token, token: Token) {
-    if let Some(socket) = self.configuration.connect_to_backend(accept_token, &mut self.clients[token]) {
+  pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
+    if let Some(socket) = self.configuration.connect_to_backend(&mut self.clients[token]) {
       if let Ok(backend_token) = self.backend.insert(token) {
         self.clients[token].backend       = Some(socket);
         self.clients[token].backend_token = Some(backend_token);
@@ -605,7 +610,7 @@ impl Server {
   }
 
   pub fn get_client_token(&self, token: Token) -> Option<Token> {
-    if token == Token(0) {
+    if token.as_usize() < self.max_listeners {
       None
     } else if token.as_usize() < self.max_listeners + self.max_connections && self.clients.contains(token) {
       Some(token)
@@ -619,6 +624,14 @@ impl Server {
       None
     }
   }
+
+  pub fn interpret_client_order(&mut self, event_loop: &mut EventLoop<Server>, token: Token, order: ClientResult) {
+    match order {
+      ClientResult::CloseClient    => self.close_client(event_loop, token),
+      ClientResult::ConnectBackend => self.connect_to_backend(event_loop, token),
+      ClientResult::Continue       => {}
+    }
+  }
 }
 
 impl Handler for Server {
@@ -630,12 +643,11 @@ impl Handler for Server {
     if events.is_readable() {
       //println!("{:?} is readable", token);
       if token.as_usize() < self.max_listeners {
-        if self.configuration.listeners.contains(token) {
-          self.accept(event_loop, token)
-        }
+        self.accept(event_loop, token)
       } else if token.as_usize() < self.max_listeners + self.max_connections {
         if self.clients.contains(token) {
-          self.clients[token].readable(event_loop);
+          let order = self.clients[token].readable(event_loop);
+          self.interpret_client_order(event_loop, token, order);
         } else {
           println!("client {:?} was removed", token);
         }
@@ -728,6 +740,7 @@ pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Se
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
   let mut server = Server::new(max_listeners, max_connections, tx);
+  server.configuration.add_tcp_front(8443, "yolo", &mut event_loop);
 
   let join_guard = thread::spawn(move|| {
     println!("starting event loop");

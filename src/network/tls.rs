@@ -356,7 +356,7 @@ impl Client {
 
 pub struct ApplicationListener {
   sock:           TcpListener,
-  token:          Token,
+  token:          Option<Token>,
   front_address:  SocketAddr
 }
 
@@ -364,18 +364,51 @@ type ClientToken = Token;
 
 pub struct ServerConfiguration {
   instances: HashMap<String, Vec<SocketAddr>>,
-  listener:  ApplicationListener,
+  listeners: Slab<ApplicationListener>,
   fronts:    HashMap<String, Vec<HttpFront>>,
   context:   SslContext,
   tx:        mpsc::Sender<ServerMessage>
 }
 
 impl ServerConfiguration {
+  pub fn add_tcp_front(&mut self, port: u16, event_loop: &mut EventLoop<Server>) -> Option<Token> {
+    let addr_string = String::from("127.0.0.1:") + &port.to_string();
+    let front = &addr_string.parse().unwrap();
+
+    if let Ok(listener) = TcpListener::bind(front) {
+
+      let al = ApplicationListener {
+        sock:           listener,
+        token:          None,
+        front_address:  *front,
+      };
+
+      if let Ok(tok) = self.listeners.insert(al) {
+        self.listeners[tok].token = Some(tok);
+        //self.fronts.insert(String::from(app_id), tok);
+        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level()).unwrap();
+        println!("registered listener on port {}", port);
+        Some(tok)
+      } else {
+        println!("could not register listener on port {}", port);
+        None
+      }
+
+    } else {
+      println!("could not declare listener on port {}", port);
+      None
+    }
+  }
+
   pub fn add_http_front(&mut self, http_front: HttpFront, event_loop: &mut EventLoop<Server>) {
     let front2 = http_front.clone();
     let front3 = http_front.clone();
     if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
         fronts.push(front2);
+    }
+
+    if self.listeners.iter().find(|l| l.front_address.port() == http_front.port).is_none() {
+      self.add_tcp_front(http_front.port, event_loop);
     }
 
     if self.fronts.get(&http_front.hostname).is_none() {
@@ -432,20 +465,22 @@ impl ServerConfiguration {
   }
 
   pub fn accept(&mut self, token: Token) -> Option<Client> {
-    let accepted = self.listener.sock.accept();
+    if self.listeners.contains(token) {
+      let accepted = self.listeners[token].sock.accept();
 
-    if let Ok(Some((frontend_sock, _))) = accepted {
-      if let Ok(ssl) = Ssl::new(&self.context) {
-          if let Ok(stream) = NonblockingSslStream::accept(ssl, frontend_sock) {
-            return Client::new(stream);
-          } else {
-            println!("could not create ssl stream");
-          }
+      if let Ok(Some((frontend_sock, _))) = accepted {
+        if let Ok(ssl) = Ssl::new(&self.context) {
+            if let Ok(stream) = NonblockingSslStream::accept(ssl, frontend_sock) {
+              return Client::new(stream);
+            } else {
+              println!("could not create ssl stream");
+            }
+        } else {
+          println!("could not create ssl context");
+        }
       } else {
-        println!("could not create ssl context");
+        println!("could not accept connection: {:?}", accepted);
       }
-    } else {
-      println!("could not accept connection: {:?}", accepted);
     }
     None
   }
@@ -515,7 +550,7 @@ pub struct Server {
 const s: &'static str = "pouet";
 
 impl Server {
-  fn new(listener: ApplicationListener, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> Server {
+  fn new(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> Server {
     let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
     //let mut context = SslContext::new(SslMethod::Sslv3).unwrap();
     context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
@@ -539,13 +574,13 @@ impl Server {
     Server {
       configuration: ServerConfiguration {
         instances: HashMap::new(),
-        listener:  listener,
+        listeners: Slab::new_starting_at(Token(0), max_listeners),
         fronts:    HashMap::new(),
         context:   context,
         tx:        tx
       },
-      clients:         Slab::new_starting_at(Token(1), max_connections),
-      backend:         Slab::new_starting_at(Token(1 + max_connections), max_connections),
+      clients:         Slab::new_starting_at(Token(max_listeners), max_connections),
+      backend:         Slab::new_starting_at(Token(max_listeners + max_connections), max_connections),
       max_listeners:   1,
       max_connections: max_connections,
     }
@@ -598,7 +633,7 @@ impl Server {
   }
 
   pub fn get_client_token(&self, token: Token) -> Option<Token> {
-    if token == Token(0) {
+    if token.as_usize() < self.max_listeners {
       None
     } else if token.as_usize() < self.max_listeners + self.max_connections && self.clients.contains(token) {
       Some(token)
@@ -631,7 +666,7 @@ impl Handler for Server {
     if events.is_readable() {
       println!("REA({})", token.as_usize());
       //println!("{:?} is readable", token);
-      if token == Token(0) {
+      if token.as_usize() < self.max_listeners {
         self.accept(event_loop, token)
       } else if token.as_usize() < self.max_listeners + self.max_connections {
         if self.clients.contains(token) {
@@ -713,18 +748,8 @@ pub fn start() {
   let (tx,rx) = channel::<ServerMessage>();
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
-  let front: SocketAddr = FromStr::from_str("127.0.0.1:8080").unwrap();
 
-  let tcp_listener = TcpListener::bind(&front).unwrap();
-  let listener = ApplicationListener {
-    sock:           tcp_listener,
-    token:          Token(0),
-    front_address:  front
-  };
-
-  event_loop.register(&listener.sock, listener.token, EventSet::readable(), PollOpt::edge()).unwrap();
-
-  let mut server = Server::new(listener, 500, tx);
+  let mut server = Server::new(1, 500, tx);
 
   let join_guard = thread::spawn(move|| {
     println!("starting event loop");
@@ -759,16 +784,7 @@ pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: 
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
 
-  let tcp_listener = TcpListener::bind(&front).unwrap();
-  let listener = ApplicationListener {
-    sock:           tcp_listener,
-    token:          Token(0),
-    front_address:  front
-  };
-
-  event_loop.register(&listener.sock, listener.token, EventSet::readable(), PollOpt::edge()).unwrap();
-
-  let mut server = Server::new(listener, max_connections, tx);
+  let mut server = Server::new(max_listeners, max_connections, tx);
 
   let join_guard = thread::spawn(move|| {
     println!("starting event loop");
