@@ -476,6 +476,16 @@ impl ServerConfiguration {
       None
     }
   }
+
+  pub fn connect_to_backend(&mut self, accept_token: Token, client:&mut Client) ->Option<TcpStream> {
+    let rnd = random::<usize>();
+    let idx = rnd % self.listeners[accept_token].back_addresses.len();
+    if let Some(backend_addr) = self.listeners[accept_token].back_addresses.get(idx) {
+      TcpStream::connect(backend_addr).ok()
+    } else {
+      None
+    }
+  }
 }
 
 pub struct Server {
@@ -535,19 +545,15 @@ impl Server {
   }
 
   pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Server>, accept_token: Token, token: Token) {
-    let rnd = random::<usize>();
-    let idx = rnd % self.configuration.listeners[accept_token].back_addresses.len();
-    if let Some(backend_addr) = self.configuration.listeners[accept_token].back_addresses.get(idx) {
-      if let Ok(socket) = TcpStream::connect(backend_addr) {
-        if let Ok(backend_token) = self.backend.insert(token) {
-          self.clients[token].backend       = Some(socket);
-          self.clients[token].backend_token = Some(backend_token);
+    if let Some(socket) = self.configuration.connect_to_backend(accept_token, &mut self.clients[token]) {
+      if let Ok(backend_token) = self.backend.insert(token) {
+        self.clients[token].backend       = Some(socket);
+        self.clients[token].backend_token = Some(backend_token);
 
-          if let Some(ref sock) = self.clients[token].backend {
-            event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
-          }
-          return;
+        if let Some(ref sock) = self.clients[token].backend {
+          event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
         }
+        return;
       }
     }
     self.close_client(event_loop, token);
