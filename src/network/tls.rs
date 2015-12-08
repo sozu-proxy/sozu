@@ -371,6 +371,36 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
+  pub fn new(max_listeners: usize,  tx: mpsc::Sender<ServerMessage>) -> ServerConfiguration {
+    let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
+    //let mut context = SslContext::new(SslMethod::Sslv3).unwrap();
+    context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
+    context.set_private_key_file("assets/key.pem", X509FileType::PEM);
+
+    fn servername_callback(ssl: &mut Ssl, ad: &mut i32) -> i32 {
+      println!("GOT SERVER NAME: {:?}", ssl.get_servername());
+      0
+    }
+    context.set_servername_callback(Some(servername_callback as ServerNameCallback));
+
+    /*
+    fn servername_callback_s(ssl: &mut Ssl, ad: &mut i32, data: &&str) -> i32 {
+      println!("got data: {}", *data);
+      println!("GOT SERVER NAME: {:?}", ssl.get_servername());
+      0
+    }
+    context.set_servername_callback_with_data(servername_callback_s as ServerNameCallbackData<&str>, s);
+    */
+
+    ServerConfiguration {
+      instances: HashMap::new(),
+      listeners: Slab::new_starting_at(Token(0), max_listeners),
+      fronts:    HashMap::new(),
+      context:   context,
+      tx:        tx
+    }
+  }
+
   pub fn add_tcp_front(&mut self, port: u16, event_loop: &mut EventLoop<Server>) -> Option<Token> {
     let addr_string = String::from("127.0.0.1:") + &port.to_string();
     let front = &addr_string.parse().unwrap();
@@ -553,34 +583,8 @@ const s: &'static str = "pouet";
 
 impl Server {
   fn new(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> Server {
-    let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
-    //let mut context = SslContext::new(SslMethod::Sslv3).unwrap();
-    context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
-    context.set_private_key_file("assets/key.pem", X509FileType::PEM);
-
-    fn servername_callback(ssl: &mut Ssl, ad: &mut i32) -> i32 {
-      println!("GOT SERVER NAME: {:?}", ssl.get_servername());
-      0
-    }
-    context.set_servername_callback(Some(servername_callback as ServerNameCallback));
-
-    /*
-    fn servername_callback_s(ssl: &mut Ssl, ad: &mut i32, data: &&str) -> i32 {
-      println!("got data: {}", *data);
-      println!("GOT SERVER NAME: {:?}", ssl.get_servername());
-      0
-    }
-    context.set_servername_callback_with_data(servername_callback_s as ServerNameCallbackData<&str>, s);
-    */
-
     Server {
-      configuration: ServerConfiguration {
-        instances: HashMap::new(),
-        listeners: Slab::new_starting_at(Token(0), max_listeners),
-        fronts:    HashMap::new(),
-        context:   context,
-        tx:        tx
-      },
+      configuration: ServerConfiguration::new(max_listeners, tx),
       clients:         Slab::new_starting_at(Token(max_listeners), max_connections),
       backend:         Slab::new_starting_at(Token(max_listeners + max_connections), max_connections),
       max_listeners:   1,

@@ -325,6 +325,15 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
+  pub fn new(max_listeners: usize,  tx: mpsc::Sender<ServerMessage>) -> ServerConfiguration {
+    ServerConfiguration {
+      instances: HashMap::new(),
+      listeners: Slab::new_starting_at(Token(0), max_listeners),
+      fronts:    HashMap::new(),
+      tx:        tx
+    }
+  }
+
   pub fn add_tcp_front(&mut self, port: u16, event_loop: &mut EventLoop<Server>) -> Option<Token> {
     let addr_string = String::from("127.0.0.1:") + &port.to_string();
     let front = &addr_string.parse().unwrap();
@@ -501,12 +510,7 @@ pub struct Server {
 impl Server {
   fn new(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> Server {
     Server {
-      configuration: ServerConfiguration {
-        fronts:    HashMap::new(),
-        instances: HashMap::new(),
-        listeners: Slab::new_starting_at(Token(0), max_listeners),
-        tx:        tx
-      },
+      configuration:   ServerConfiguration::new(max_listeners, tx),
       clients:         Slab::new_starting_at(Token(max_listeners), max_connections),
       backend:         Slab::new_starting_at(Token(max_listeners + max_connections), max_connections),
       max_listeners:   max_listeners,
