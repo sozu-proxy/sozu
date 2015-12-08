@@ -382,7 +382,8 @@ type ClientToken = Token;
 pub struct ServerConfiguration {
   fronts:    HashMap<String, Token>,
   instances: HashMap<String, Vec<SocketAddr>>,
-  listeners: Slab<ApplicationListener>
+  listeners: Slab<ApplicationListener>,
+  tx:              mpsc::Sender<ServerMessage>
 }
 
 impl ServerConfiguration {
@@ -486,6 +487,51 @@ impl ServerConfiguration {
       None
     }
   }
+
+  fn notify(&mut self, event_loop: &mut EventLoop<Server>, message: TcpProxyOrder) {
+    println!("notified: {:?}", message);
+    match message {
+      TcpProxyOrder::Command(Command::AddTcpFront(front)) => {
+        println!("{:?}", front);
+        if let Some(token) = self.add_tcp_front(front.port, &front.app_id, event_loop) {
+          self.tx.send(ServerMessage::AddedFront);
+        } else {
+          println!("Couldn't add tcp front");
+        }
+      },
+      TcpProxyOrder::Command(Command::RemoveTcpFront(front)) => {
+        println!("{:?}", front);
+        let _ = self.remove_tcp_front(front.app_id, event_loop);
+        self.tx.send(ServerMessage::RemovedFront);
+      },
+      TcpProxyOrder::Command(Command::AddInstance(instance)) => {
+        println!("{:?}", instance);
+        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+        let addr = &addr_string.parse().unwrap();
+        if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
+          self.tx.send(ServerMessage::AddedInstance);
+        } else {
+          println!("Couldn't add tcp front");
+        }
+      },
+      TcpProxyOrder::Command(Command::RemoveInstance(instance)) => {
+        println!("{:?}", instance);
+        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+        let addr = &addr_string.parse().unwrap();
+        if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
+          self.tx.send(ServerMessage::RemovedInstance);
+        } else {
+          println!("Couldn't add tcp front");
+        }
+      },
+      TcpProxyOrder::Stop                   => {
+        event_loop.shutdown();
+      },
+      _ => {
+        println!("unsupported message, ignoring");
+      }
+    }
+  }
 }
 
 pub struct Server {
@@ -494,7 +540,6 @@ pub struct Server {
   backend:         Slab<ClientToken>,
   max_listeners:   usize,
   max_connections: usize,
-  tx:              mpsc::Sender<ServerMessage>
 }
 
 impl Server {
@@ -503,13 +548,13 @@ impl Server {
       configuration: ServerConfiguration {
         fronts:    HashMap::new(),
         instances: HashMap::new(),
-        listeners: Slab::new_starting_at(Token(0), max_listeners)
+        listeners: Slab::new_starting_at(Token(0), max_listeners),
+        tx:        tx
       },
       clients:         Slab::new_starting_at(Token(max_listeners), max_connections),
       backend:         Slab::new_starting_at(Token(max_listeners+max_connections), max_connections),
       max_listeners:   max_listeners,
       max_connections: max_connections,
-      tx:              tx
     }
   }
 
@@ -641,47 +686,7 @@ impl Handler for Server {
 
   fn notify(&mut self, event_loop: &mut EventLoop<Self>, message: Self::Message) {
     println!("notified: {:?}", message);
-    match message {
-      TcpProxyOrder::Command(Command::AddTcpFront(front)) => {
-        println!("{:?}", front);
-        if let Some(token) = self.configuration.add_tcp_front(front.port, &front.app_id, event_loop) {
-          self.tx.send(ServerMessage::AddedFront);
-        } else {
-          println!("Couldn't add tcp front");
-        }
-      },
-      TcpProxyOrder::Command(Command::RemoveTcpFront(front)) => {
-        println!("{:?}", front);
-        let _ = self.configuration.remove_tcp_front(front.app_id, event_loop);
-        self.tx.send(ServerMessage::RemovedFront);
-      },
-      TcpProxyOrder::Command(Command::AddInstance(instance)) => {
-        println!("{:?}", instance);
-        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
-        let addr = &addr_string.parse().unwrap();
-        if let Some(token) = self.configuration.add_instance(&instance.app_id, addr, event_loop) {
-          self.tx.send(ServerMessage::AddedInstance);
-        } else {
-          println!("Couldn't add tcp front");
-        }
-      },
-      TcpProxyOrder::Command(Command::RemoveInstance(instance)) => {
-        println!("{:?}", instance);
-        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
-        let addr = &addr_string.parse().unwrap();
-        if let Some(token) = self.configuration.remove_instance(&instance.app_id, addr, event_loop) {
-          self.tx.send(ServerMessage::RemovedInstance);
-        } else {
-          println!("Couldn't add tcp front");
-        }
-      },
-      TcpProxyOrder::Stop                   => {
-        event_loop.shutdown();
-      },
-      _ => {
-        println!("unsupported message, ignoring");
-      }
-    }
+    self.configuration.notify(event_loop, message);
   }
 
   fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {

@@ -366,7 +366,8 @@ pub struct ServerConfiguration {
   instances: HashMap<String, Vec<SocketAddr>>,
   listener:  ApplicationListener,
   fronts:    HashMap<String, Vec<HttpFront>>,
-  context:   SslContext
+  context:   SslContext,
+  tx:        mpsc::Sender<ServerMessage>
 }
 
 impl ServerConfiguration {
@@ -461,6 +462,46 @@ impl ServerConfiguration {
     }
     None
   }
+
+  fn notify(&mut self, event_loop: &mut EventLoop<Server>, message: HttpProxyOrder) {
+    println!("notified: {:?}", message);
+    match message {
+      HttpProxyOrder::Command(Command::AddHttpFront(front)) => {
+        println!("add front {:?}", front);
+          self.add_http_front(front, event_loop);
+          self.tx.send(ServerMessage::AddedFront);
+      },
+      HttpProxyOrder::Command(Command::RemoveHttpFront(front)) => {
+        println!("remove front {:?}", front);
+        self.remove_http_front(front, event_loop);
+        self.tx.send(ServerMessage::RemovedFront);
+      },
+      HttpProxyOrder::Command(Command::AddInstance(instance)) => {
+        println!("add instance {:?}", instance);
+        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+        let parsed:Option<SocketAddr> = addr_string.parse().ok();
+        if let Some(addr) = parsed {
+          self.add_instance(&instance.app_id, &addr, event_loop);
+          self.tx.send(ServerMessage::AddedInstance);
+        }
+      },
+      HttpProxyOrder::Command(Command::RemoveInstance(instance)) => {
+        println!("remove instance {:?}", instance);
+        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+        let parsed:Option<SocketAddr> = addr_string.parse().ok();
+        if let Some(addr) = parsed {
+          self.remove_instance(&instance.app_id, &addr, event_loop);
+          self.tx.send(ServerMessage::RemovedInstance);
+        }
+      },
+      HttpProxyOrder::Stop                   => {
+        event_loop.shutdown();
+      },
+      _ => {
+        println!("unsupported message, ignoring");
+      }
+    }
+  }
 }
 
 pub struct Server {
@@ -469,7 +510,6 @@ pub struct Server {
   backend:         Slab<ClientToken>,
   max_listeners:   usize,
   max_connections: usize,
-  tx:              mpsc::Sender<ServerMessage>
 }
 
 const s: &'static str = "pouet";
@@ -501,13 +541,13 @@ impl Server {
         instances: HashMap::new(),
         listener:  listener,
         fronts:    HashMap::new(),
-        context:   context
+        context:   context,
+        tx:        tx
       },
       clients:         Slab::new_starting_at(Token(1), max_connections),
       backend:         Slab::new_starting_at(Token(1 + max_connections), max_connections),
       max_listeners:   1,
       max_connections: max_connections,
-      tx:              tx
     }
   }
 
@@ -654,44 +694,7 @@ impl Handler for Server {
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<Self>, message: Self::Message) {
-  // ToDo temporary
-    println!("notified: {:?}", message);
-    match message {
-      HttpProxyOrder::Command(Command::AddHttpFront(front)) => {
-        println!("add front {:?}", front);
-          self.configuration.add_http_front(front, event_loop);
-          self.tx.send(ServerMessage::AddedFront);
-      },
-      HttpProxyOrder::Command(Command::RemoveHttpFront(front)) => {
-        println!("remove front {:?}", front);
-        self.configuration.remove_http_front(front, event_loop);
-        self.tx.send(ServerMessage::RemovedFront);
-      },
-      HttpProxyOrder::Command(Command::AddInstance(instance)) => {
-        println!("add instance {:?}", instance);
-        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
-        let parsed:Option<SocketAddr> = addr_string.parse().ok();
-        if let Some(addr) = parsed {
-          self.configuration.add_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send(ServerMessage::AddedInstance);
-        }
-      },
-      HttpProxyOrder::Command(Command::RemoveInstance(instance)) => {
-        println!("remove instance {:?}", instance);
-        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
-        let parsed:Option<SocketAddr> = addr_string.parse().ok();
-        if let Some(addr) = parsed {
-          self.configuration.remove_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send(ServerMessage::RemovedInstance);
-        }
-      },
-      HttpProxyOrder::Stop                   => {
-        event_loop.shutdown();
-      },
-      _ => {
-        println!("unsupported message, ignoring");
-      }
-    }
+    self.configuration.notify(event_loop, message);
   }
 
   fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {
