@@ -202,18 +202,19 @@ impl HttpState {
   }
 }
 
+pub fn default_response<O>(state: &HttpState, res: IResult<&[u8], O>) -> HttpState {
+  match res {
+    IResult::Error(_)      => HttpState::Error(ErrorState::InvalidHttp),
+    IResult::Incomplete(_) => state.clone(),
+    _                      => unreachable!()
+  }
+}
+
 pub fn parse_headers(state: &HttpState, buf: &[u8]) -> HttpState {
   match *state {
     HttpState::Initial => {
       //println!("buf: {}", buf.to_hex(8));
       match request_line(buf) {
-        IResult::Error(_) => {
-          //println!("error: {:?}", e);
-          HttpState::Error(ErrorState::InvalidHttp)
-        },
-        IResult::Incomplete(_) => {
-          state.clone()
-        },
         IResult::Done(i, r)    => {
           if let Some(rl) = RRequestLine::from_request_line(r) {
             let s = HttpState::HasRequestLine(buf.offset(i), rl);
@@ -222,19 +223,13 @@ pub fn parse_headers(state: &HttpState, buf: &[u8]) -> HttpState {
           } else {
             HttpState::Error(ErrorState::InvalidHttp)
           }
-        }
+        },
+        res => default_response(state, res)
       }
     },
     HttpState::HasRequestLine(pos, ref rl) => {
       //println!("parsing headers from:\n{}", (&buf[pos..]).to_hex(8));
       match headers(&buf[pos..]) {
-        IResult::Error(_) => {
-          //println!("error: {:?}", e);
-          HttpState::Error(ErrorState::InvalidHttp)
-        },
-        IResult::Incomplete(_) => {
-          state.clone()
-        },
         IResult::Done(i, v)    => {
           //println!("got headers: {:?}", v);
           let mut length_info:Option<LengthInformation> = None;
@@ -270,7 +265,8 @@ pub fn parse_headers(state: &HttpState, buf: &[u8]) -> HttpState {
           } else {
             HttpState::HasRequestLine(buf.offset(i), rl.clone())
           }
-        }
+        },
+        res => default_response(state, res)
       }
     },
     //HasHost(usize,RRequestLine, Host),
