@@ -293,7 +293,8 @@ impl ProxyClient<TlsServer> for Client {
           println!("writable WantWrite");
         },
         Err(e) => {
-          panic!("not implemented; client err={:?}", e);
+          println!("not implemented; client err={:?}", e);
+          return ClientResult::CloseClient;
         }
       }
       self.front_buf = Some(buf);
