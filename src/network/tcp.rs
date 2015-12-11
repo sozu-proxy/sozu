@@ -15,6 +15,7 @@ use std::str::FromStr;
 use time::precise_time_s;
 use rand::random;
 use network::{ClientResult,ServerMessage};
+use network::proxy::{Server,ProxyClient,ProxyConfiguration};
 
 use messages::{TcpFront,Command,Instance};
 
@@ -89,164 +90,6 @@ impl Client {
     })
   }
 
-  pub fn set_front_token(&mut self, token: Token) {
-    self.token         = Some(token); 
-  }
-
-  pub fn set_back_token(&mut self, token: Token) {
-    self.backend_token = Some(token);
-  }
-
-  pub fn set_tokens(&mut self, token: Token, backend: Token) {
-    self.token         = Some(token);
-    self.backend_token = Some(backend);
-  }
-
-  fn writable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult {
-    //println!("in writable()");
-    if let Some(buf) = self.back_buf.take() {
-      //println!("in writable 2: back_buf contains {} bytes", buf.remaining());
-
-      let mut b = buf.flip();
-      match self.sock.try_write_buf(&mut b) {
-        Ok(None) => {
-          println!("client flushing buf; WOULDBLOCK");
-
-          self.front_interest.insert(EventSet::writable());
-        }
-        Ok(Some(r)) => {
-          //FIXME what happens if not everything was written?
-          //println!("FRONT [{}<-{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
-
-          self.tx_count = self.tx_count + r;
-
-          //self.front_interest.insert(EventSet::readable());
-          self.front_interest.remove(EventSet::writable());
-          self.back_interest.insert(EventSet::readable());
-        }
-        Err(e) =>  println!("not implemented; client err={:?}", e),
-      }
-      self.back_buf = Some(b.flip());
-    }
-    if let Some(ref sock) = self.backend {
-      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    ClientResult::Continue
-  }
-
-  fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult {
-    let mut buf = self.front_buf.take().unwrap();
-    //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
-
-    match self.sock.try_read_buf(&mut buf) {
-      Ok(None) => {
-        println!("We just got readable, but were unable to read from the socket?");
-      }
-      Ok(Some(r)) => {
-        //println!("FRONT [{}->{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
-        self.front_interest.remove(EventSet::readable());
-        self.back_interest.insert(EventSet::writable());
-        self.rx_count = self.rx_count + r;
-        // prepare to provide this to writable
-      }
-      Err(e) => {
-        println!("not implemented; client err={:?}", e);
-        //self.front_interest.remove(EventSet::readable());
-      }
-    };
-    self.front_buf = Some(buf);
-
-    if let Some(ref sock) = self.backend {
-      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    ClientResult::Continue
-  }
-
-  fn back_writable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult {
-    if let Some(buf) = self.front_buf.take() {
-      //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
-
-      let mut b = buf.flip();
-      if let Some(ref mut sock) = self.backend {
-        match sock.try_write_buf(&mut b) {
-          Ok(None) => {
-            println!("client flushing buf; WOULDBLOCK");
-
-            self.back_interest.insert(EventSet::writable());
-          }
-          Ok(Some(r)) => {
-            //FIXME what happens if not everything was written?
-            //println!("BACK  [{}->{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
-
-            self.front_interest.insert(EventSet::readable());
-            self.back_interest.remove(EventSet::writable());
-            self.back_interest.insert(EventSet::readable());
-          }
-          Err(e) =>  println!("not implemented; client err={:?}", e),
-        }
-      }
-      self.front_buf = Some(b.flip());
-    }
-    if let Some(ref sock) = self.backend {
-      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    ClientResult::Continue
-  }
-
-  fn back_readable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult {
-    let mut buf = self.back_buf.take().unwrap();
-    //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
-
-    if let Some(ref mut sock) = self.backend {
-      match sock.try_read_buf(&mut buf) {
-        Ok(None) => {
-          println!("We just got readable, but were unable to read from the socket?");
-        }
-        Ok(Some(r)) => {
-          //println!("BACK  [{}<-{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
-          self.back_interest.remove(EventSet::readable());
-          self.front_interest.insert(EventSet::writable());
-          // prepare to provide this to writable
-        }
-        Err(e) => {
-          println!("not implemented; client err={:?}", e);
-          //self.interest.remove(EventSet::readable());
-        }
-      };
-    }
-    self.back_buf = Some(buf);
-
-    if let Some(ref sock) = self.backend {
-      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    ClientResult::Continue
-  }
-
-  fn front_hup(&mut self) -> ClientResult {
-    if  self.status == ConnectionStatus::ServerClosed ||
-        self.status == ConnectionStatus::ClientConnected { // the server never answered, the client closed
-      self.status = ConnectionStatus::Closed;
-      ClientResult::CloseClient
-    } else {
-      self.status = ConnectionStatus::ClientClosed;
-      ClientResult::Continue
-    }
-
-  }
-
-  fn back_hup(&mut self) -> ClientResult {
-    if self.status == ConnectionStatus::ClientClosed {
-      self.status = ConnectionStatus::Closed;
-      ClientResult::CloseClient
-    } else {
-      self.status = ConnectionStatus::ServerClosed;
-      ClientResult::Continue
-    }
-  }
 }
 
 #[cfg(feature = "splice")]
@@ -279,7 +122,7 @@ impl Client {
     self.backend_token = Some(backend);
   }
 
-  fn writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+  fn writable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> io::Result<()> {
     //println!("in writable()");
     if self.data_out {
       match splice::splice_out(self.pipe_out, &self.sock) {
@@ -305,7 +148,7 @@ impl Client {
     Ok(())
   }
 
-  fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+  fn readable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> io::Result<()> {
     //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
 
     match splice::splice_in(&self.sock, self.pipe_in) {
@@ -326,7 +169,7 @@ impl Client {
     Ok(())
   }
 
-  fn back_writable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+  fn back_writable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> io::Result<()> {
     //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
 
     if self.data_in {
@@ -352,7 +195,7 @@ impl Client {
     Ok(())
   }
 
-  fn back_readable(&mut self, event_loop: &mut EventLoop<Server>) -> io::Result<()> {
+  fn back_readable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> io::Result<()> {
     //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
 
     match splice::splice_in(&self.backend, self.pipe_out) {
@@ -370,6 +213,187 @@ impl Client {
     event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
     event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     Ok(())
+  }
+}
+
+impl ProxyClient<TcpServer> for Client {
+  fn front_socket(&self) -> &TcpStream {
+    &self.sock
+  }
+
+  fn back_socket(&self)  -> Option<&TcpStream> {
+    self.backend.as_ref()
+  }
+
+  fn front_token(&self)  -> Option<Token> {
+    self.token
+  }
+
+  fn back_token(&self)   -> Option<Token> {
+    self.backend_token
+  }
+
+  fn set_back_socket(&mut self, socket: TcpStream) {
+    self.backend         = Some(socket);
+  }
+
+  fn set_front_token(&mut self, token: Token) {
+    self.token         = Some(token); 
+  }
+
+  fn set_back_token(&mut self, token: Token) {
+    self.backend_token = Some(token);
+  }
+
+  fn set_tokens(&mut self, token: Token, backend: Token) {
+    self.token         = Some(token);
+    self.backend_token = Some(backend);
+  }
+
+  fn front_hup(&mut self) -> ClientResult {
+    if  self.status == ConnectionStatus::ServerClosed ||
+        self.status == ConnectionStatus::ClientConnected { // the server never answered, the client closed
+      self.status = ConnectionStatus::Closed;
+      ClientResult::CloseClient
+    } else {
+      self.status = ConnectionStatus::ClientClosed;
+      ClientResult::Continue
+    }
+
+  }
+
+  fn back_hup(&mut self) -> ClientResult {
+    if self.status == ConnectionStatus::ClientClosed {
+      self.status = ConnectionStatus::Closed;
+      ClientResult::CloseClient
+    } else {
+      self.status = ConnectionStatus::ServerClosed;
+      ClientResult::Continue
+    }
+  }
+
+  fn writable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> ClientResult {
+    //println!("in writable()");
+    if let Some(buf) = self.back_buf.take() {
+      //println!("in writable 2: back_buf contains {} bytes", buf.remaining());
+
+      let mut b = buf.flip();
+      match self.sock.try_write_buf(&mut b) {
+        Ok(None) => {
+          println!("client flushing buf; WOULDBLOCK");
+
+          self.front_interest.insert(EventSet::writable());
+        }
+        Ok(Some(r)) => {
+          //FIXME what happens if not everything was written?
+          //println!("FRONT [{}<-{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+
+          self.tx_count = self.tx_count + r;
+
+          //self.front_interest.insert(EventSet::readable());
+          self.front_interest.remove(EventSet::writable());
+          self.back_interest.insert(EventSet::readable());
+        }
+        Err(e) =>  println!("not implemented; client err={:?}", e),
+      }
+      self.back_buf = Some(b.flip());
+    }
+    if let Some(ref sock) = self.backend {
+      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    }
+    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+    ClientResult::Continue
+  }
+
+  fn readable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> ClientResult {
+    let mut buf = self.front_buf.take().unwrap();
+    //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
+
+    match self.sock.try_read_buf(&mut buf) {
+      Ok(None) => {
+        println!("We just got readable, but were unable to read from the socket?");
+      }
+      Ok(Some(r)) => {
+        //println!("FRONT [{}->{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+        self.front_interest.remove(EventSet::readable());
+        self.back_interest.insert(EventSet::writable());
+        self.rx_count = self.rx_count + r;
+        // prepare to provide this to writable
+      }
+      Err(e) => {
+        println!("not implemented; client err={:?}", e);
+        //self.front_interest.remove(EventSet::readable());
+      }
+    };
+    self.front_buf = Some(buf);
+
+    if let Some(ref sock) = self.backend {
+      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    }
+    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+    ClientResult::Continue
+  }
+
+  fn back_writable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> ClientResult {
+    if let Some(buf) = self.front_buf.take() {
+      //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
+
+      let mut b = buf.flip();
+      if let Some(ref mut sock) = self.backend {
+        match sock.try_write_buf(&mut b) {
+          Ok(None) => {
+            println!("client flushing buf; WOULDBLOCK");
+
+            self.back_interest.insert(EventSet::writable());
+          }
+          Ok(Some(r)) => {
+            //FIXME what happens if not everything was written?
+            //println!("BACK  [{}->{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+
+            self.front_interest.insert(EventSet::readable());
+            self.back_interest.remove(EventSet::writable());
+            self.back_interest.insert(EventSet::readable());
+          }
+          Err(e) =>  println!("not implemented; client err={:?}", e),
+        }
+      }
+      self.front_buf = Some(b.flip());
+    }
+    if let Some(ref sock) = self.backend {
+      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    }
+    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+    ClientResult::Continue
+  }
+
+  fn back_readable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> ClientResult {
+    let mut buf = self.back_buf.take().unwrap();
+    //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
+
+    if let Some(ref mut sock) = self.backend {
+      match sock.try_read_buf(&mut buf) {
+        Ok(None) => {
+          println!("We just got readable, but were unable to read from the socket?");
+        }
+        Ok(Some(r)) => {
+          //println!("BACK  [{}<-{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+          self.back_interest.remove(EventSet::readable());
+          self.front_interest.insert(EventSet::writable());
+          // prepare to provide this to writable
+        }
+        Err(e) => {
+          println!("not implemented; client err={:?}", e);
+          //self.interest.remove(EventSet::readable());
+        }
+      };
+    }
+    self.back_buf = Some(buf);
+
+    if let Some(ref sock) = self.backend {
+      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+    }
+    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+    ClientResult::Continue
   }
 }
 
@@ -400,7 +424,55 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<Server>) -> Option<Token> {
+  pub fn remove_tcp_front(&mut self, app_id: String, event_loop: &mut EventLoop<TcpServer>) -> Option<Token>{
+    println!("removing tcp_front {:?}", app_id);
+    // ToDo
+    // Removes all listeners for the given app_id
+    // an app can't have two listeners. Is this a problem?
+    if let Some(&tok) = self.fronts.get(&app_id) {
+      if self.listeners.contains(tok) {
+        event_loop.deregister(&self.listeners[tok].sock);
+        self.listeners.remove(tok);
+        println!("removed server {:?}", tok);
+        //self.listeners[tok].sock.shutdown(Shutdown::Both);
+        Some(tok)
+      } else {
+        None
+      }
+    } else {
+      None
+    }
+  }
+
+  pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<TcpServer>) -> Option<Token> {
+    if let Some(addrs) = self.instances.get_mut(app_id) {
+        addrs.push(*instance_address);
+    }
+
+    if self.instances.get(app_id).is_none() {
+      self.instances.insert(String::from(app_id), vec![*instance_address]);
+    }
+
+    if let Some(&tok) = self.fronts.get(app_id) {
+      let application_listener = &mut self.listeners[tok];
+
+      application_listener.back_addresses.push(*instance_address);
+      Some(tok)
+    } else {
+      println!("No front for this instance");
+      None
+    }
+  }
+
+  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<TcpServer>) -> Option<Token>{
+      // ToDo
+      None
+  }
+
+}
+
+impl ProxyConfiguration<TcpServer, Client,TcpProxyOrder> for ServerConfiguration {
+  fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<TcpServer>) -> Option<Token> {
     let addr_string = String::from("127.0.0.1:") + &port.to_string();
     let front = &addr_string.parse().unwrap();
 
@@ -436,65 +508,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn remove_tcp_front(&mut self, app_id: String, event_loop: &mut EventLoop<Server>) -> Option<Token>{
-    println!("removing tcp_front {:?}", app_id);
-    // ToDo
-    // Removes all listeners for the given app_id
-    // an app can't have two listeners. Is this a problem?
-    if let Some(&tok) = self.fronts.get(&app_id) {
-      if self.listeners.contains(tok) {
-        event_loop.deregister(&self.listeners[tok].sock);
-        self.listeners.remove(tok);
-        println!("removed server {:?}", tok);
-        //self.listeners[tok].sock.shutdown(Shutdown::Both);
-        Some(tok)
-      } else {
-        None
-      }
-    } else {
-      None
-    }
-  }
-
-  pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<Server>) -> Option<Token> {
-    if let Some(addrs) = self.instances.get_mut(app_id) {
-        addrs.push(*instance_address);
-    }
-
-    if self.instances.get(app_id).is_none() {
-      self.instances.insert(String::from(app_id), vec![*instance_address]);
-    }
-
-    if let Some(&tok) = self.fronts.get(app_id) {
-      let application_listener = &mut self.listeners[tok];
-
-      application_listener.back_addresses.push(*instance_address);
-      Some(tok)
-    } else {
-      println!("No front for this instance");
-      None
-    }
-  }
-
-  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<Server>) -> Option<Token>{
-      // ToDo
-      None
-  }
-
-  pub fn accept(&mut self, token: Token) -> Option<(Client, bool)> {
-    if self.listeners.contains(token) {
-      let accepted = self.listeners[token].sock.accept();
-
-      if let Ok(Some((frontend_sock, _))) = accepted {
-        if let Some(c) = Client::new(frontend_sock, token) {
-          return Some((c, true));
-        }
-      }
-    }
-    None
-  }
-
-  pub fn connect_to_backend(&mut self, client:&mut Client) ->Option<TcpStream> {
+  fn connect_to_backend(&mut self, client:&mut Client) ->Option<TcpStream> {
     let rnd = random::<usize>();
     let idx = rnd % self.listeners[client.accept_token].back_addresses.len();
     if let Some(backend_addr) = self.listeners[client.accept_token].back_addresses.get(idx) {
@@ -504,7 +518,7 @@ impl ServerConfiguration {
     }
   }
 
-  fn notify(&mut self, event_loop: &mut EventLoop<Server>, message: TcpProxyOrder) {
+  fn notify(&mut self, event_loop: &mut EventLoop<TcpServer>, message: TcpProxyOrder) {
     println!("notified: {:?}", message);
     match message {
       TcpProxyOrder::Command(Command::AddTcpFront(front)) => {
@@ -548,175 +562,23 @@ impl ServerConfiguration {
       }
     }
   }
+
+  fn accept(&mut self, token: Token) -> Option<(Client, bool)> {
+    if self.listeners.contains(token) {
+      let accepted = self.listeners[token].sock.accept();
+
+      if let Ok(Some((frontend_sock, _))) = accepted {
+        if let Some(c) = Client::new(frontend_sock, token) {
+          return Some((c, true));
+        }
+      }
+    }
+    None
+  }
+
 }
 
-pub struct Server {
-  configuration:   ServerConfiguration,
-  clients:         Slab<Client>,
-  backend:         Slab<ClientToken>,
-  max_listeners:   usize,
-  max_connections: usize,
-}
-
-impl Server {
-  fn new(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> Server {
-    Server {
-      configuration:   ServerConfiguration::new(max_listeners, tx),
-      clients:         Slab::new_starting_at(Token(max_listeners), max_connections),
-      backend:         Slab::new_starting_at(Token(max_listeners+max_connections), max_connections),
-      max_listeners:   max_listeners,
-      max_connections: max_connections,
-    }
-  }
-
-
-  pub fn close_client(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-    self.clients[token].sock.shutdown(Shutdown::Both);
-    event_loop.deregister(&self.clients[token].sock);
-    if let Some(ref sock) = self.clients[token].backend {
-      sock.shutdown(Shutdown::Both);
-      event_loop.deregister(sock);
-    }
-
-    if let Some(backend_token) = self.clients[token].backend_token {
-      if self.backend.contains(backend_token) {
-        self.backend.remove(backend_token);
-      }
-    }
-    self.clients.remove(token);
-  }
-
-  pub fn accept(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-    if let Some((client, should_connect)) = self.configuration.accept(token) {
-      if let Ok(client_token) = self.clients.insert(client) {
-        event_loop.register(&self.clients[client_token].sock, client_token, EventSet::readable(), PollOpt::edge()).unwrap();
-        &self.clients[client_token].set_front_token(client_token);
-        if should_connect {
-          self.connect_to_backend(event_loop, client_token);
-        }
-      } else {
-        println!("could not add client to slab");
-      }
-    } else {
-      println!("could not create a client");
-    }
-  }
-
-  pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Server>, token: Token) {
-    if let Some(socket) = self.configuration.connect_to_backend(&mut self.clients[token]) {
-      if let Ok(backend_token) = self.backend.insert(token) {
-        self.clients[token].backend       = Some(socket);
-        self.clients[token].backend_token = Some(backend_token);
-
-        if let Some(ref sock) = self.clients[token].backend {
-          event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
-        }
-        return;
-      }
-    }
-    self.close_client(event_loop, token);
-  }
-
-  pub fn get_client_token(&self, token: Token) -> Option<Token> {
-    if token.as_usize() < self.max_listeners {
-      None
-    } else if token.as_usize() < self.max_listeners + self.max_connections && self.clients.contains(token) {
-      Some(token)
-    } else if token.as_usize() < self.max_listeners + 2 * self.max_connections && self.backend.contains(token) {
-      if self.clients.contains(self.backend[token]) {
-        Some(self.backend[token])
-      } else {
-        None
-      }
-    } else {
-      None
-    }
-  }
-
-  pub fn interpret_client_order(&mut self, event_loop: &mut EventLoop<Server>, token: Token, order: ClientResult) {
-    match order {
-      ClientResult::CloseClient    => self.close_client(event_loop, token),
-      ClientResult::ConnectBackend => self.connect_to_backend(event_loop, token),
-      ClientResult::Continue       => {}
-    }
-  }
-}
-
-impl Handler for Server {
-  type Timeout = usize;
-  type Message = TcpProxyOrder;
-
-  fn ready(&mut self, event_loop: &mut EventLoop<Server>, token: Token, events: EventSet) {
-    //println!("{:?} got events: {:?}", token, events);
-    if events.is_readable() {
-      //println!("{:?} is readable", token);
-      if token.as_usize() < self.max_listeners {
-        self.accept(event_loop, token)
-      } else if token.as_usize() < self.max_listeners + self.max_connections {
-        if self.clients.contains(token) {
-          let order = self.clients[token].readable(event_loop);
-          self.interpret_client_order(event_loop, token, order);
-        } else {
-          println!("client {:?} was removed", token);
-        }
-      } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
-        if let Some(tok) = self.get_client_token(token) {
-          self.clients[tok].back_readable(event_loop);
-        }
-      }
-    }
-
-    if events.is_writable() {
-      //println!("{:?} is writable", token);
-      if token.as_usize() < self.max_listeners {
-        println!("received writable for listener {:?}, this should not happen", token);
-      } else  if token.as_usize() < self.max_listeners + self.max_connections {
-        if self.clients.contains(token) {
-          self.clients[token].writable(event_loop);
-        } else {
-          println!("client {:?} was removed", token);
-        }
-      } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
-        if let Some(tok) = self.get_client_token(token) {
-          self.clients[tok].back_writable(event_loop);
-        }
-      }
-    }
-
-    if events.is_hup() {
-      if token.as_usize() < self.max_listeners {
-        println!("should not happen: server {:?} closed", token);
-      } else if token.as_usize() < self.max_listeners + self.max_connections {
-        if self.clients.contains(token) {
-          if self.clients[token].front_hup() == ClientResult::CloseClient {
-            self.close_client(event_loop, token);
-          }
-        } else {
-          println!("client {:?} was removed", token);
-        }
-      } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
-        if let Some(tok) = self.get_client_token(token) {
-          if self.clients[tok].front_hup() == ClientResult::CloseClient {
-            self.close_client(event_loop, tok);
-          }
-        }
-      }
-    }
-  }
-
-  fn notify(&mut self, event_loop: &mut EventLoop<Self>, message: Self::Message) {
-    println!("notified: {:?}", message);
-    self.configuration.notify(event_loop, message);
-  }
-
-  fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {
-    println!("timeout");
-  }
-
-  fn interrupted(&mut self, event_loop: &mut EventLoop<Self>) {
-    println!("interrupted");
-  }
-}
+pub type TcpServer = Server<ServerConfiguration,Client,TcpProxyOrder>;
 
 pub fn start() {
   let mut event_loop = EventLoop::new().unwrap();
@@ -725,16 +587,17 @@ pub fn start() {
   println!("listen for connections");
   //event_loop.register(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
   let (tx,rx) = channel::<ServerMessage>();
-  let mut s = Server::new(10, 500, tx);
+  let configuration = ServerConfiguration::new(10, tx);
+  let mut s = TcpServer::new(10, 500, configuration);
   {
     let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
-    s.configuration.add_tcp_front(1234, "yolo", &mut event_loop);
-    s.configuration.add_instance("yolo", &back, &mut event_loop);
+    s.configuration().add_tcp_front(1234, "yolo", &mut event_loop);
+    s.configuration().add_instance("yolo", &back, &mut event_loop);
   }
   {
     let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
-    s.configuration.add_tcp_front(1235, "yolo", &mut event_loop);
-    s.configuration.add_instance("yolo", &back, &mut event_loop);
+    s.configuration().add_tcp_front(1235, "yolo", &mut event_loop);
+    s.configuration().add_instance("yolo", &back, &mut event_loop);
   }
   thread::spawn(move|| {
     println!("starting event loop");
@@ -747,8 +610,9 @@ pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Se
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
-  let mut server = Server::new(max_listeners, max_connections, tx);
-  server.configuration.add_tcp_front(8443, "yolo", &mut event_loop);
+  let configuration = ServerConfiguration::new(max_listeners, tx);
+  let mut server = TcpServer::new(max_listeners, max_connections, configuration);
+  server.configuration().add_tcp_front(8443, "yolo", &mut event_loop);
 
   let join_guard = thread::spawn(move|| {
     println!("starting event loop");

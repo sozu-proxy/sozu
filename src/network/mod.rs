@@ -8,7 +8,7 @@ pub mod tls;
 mod splice;
 
 pub mod tcp;
-//pub mod proxy;
+pub mod proxy;
 
 
 #[derive(Debug)]
