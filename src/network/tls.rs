@@ -166,7 +166,7 @@ impl ProxyClient<TlsServer> for Client {
     if let Some(buf) = self.back_buf.take() {
       //println!("in writable 2: back_buf contains {} bytes", buf.remaining());
       let mut b = buf.flip();
-      println!("writable back_buf({}): {}", b.remaining(), from_utf8((&b as &Buf).bytes()).unwrap());
+      //println!("writable back_buf({}): {}", b.remaining(), from_utf8((&b as &Buf).bytes()).unwrap());
       //if self.status == ConnectionStatus::ServerClosed && b.remaining() == 0 {
       if b.remaining() == 0 {
         self.back_buf = Some(b.flip());
@@ -234,6 +234,9 @@ impl ProxyClient<TlsServer> for Client {
           self.back_buf = Some(buf);
           self.front_interest.insert(EventSet::writable());
         },*/
+        Ok(0) => {
+          self.front_interest.insert(EventSet::readable());
+        },
         Ok(r) => {
           println!("FRONT [{:?}]: read {} bytes", self.token, r);
           unsafe { buf.advance(r) };
@@ -468,16 +471,14 @@ impl ServerConfiguration {
   }
 
   pub fn backend_from_request(&self, host: &str, uri: &str) -> Option<SocketAddr> {
-    println!("Getting a backend for {}", host);
     if let Some(http_fronts) = self.fronts.get(host) {
       // ToDo get the front with the most specific matching path_begin
-      println!("Choosing a front from {:?}", http_fronts);
       if let Some(http_front) = http_fronts.get(0) {
         // ToDo round-robin on instances
-        println!("Choosing an instance from {:?}", self.instances.get(&http_front.app_id));
         if let Some(app_instances) = self.instances.get(&http_front.app_id) {
           let rnd = random::<usize>();
           let idx = rnd % app_instances.len();
+          println!("Connecting {} -> {:?}", host, app_instances.get(idx));
           app_instances.get(idx).map(|& addr| addr)
         } else {
           None

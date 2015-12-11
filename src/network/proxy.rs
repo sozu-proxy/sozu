@@ -208,7 +208,6 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Ms
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<Self>, message: Self::Message) {
-    println!("notified: {:?}", message);
     self.configuration.notify(event_loop, message);
   }
 

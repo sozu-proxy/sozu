@@ -519,7 +519,6 @@ impl ProxyConfiguration<TcpServer, Client,TcpProxyOrder> for ServerConfiguration
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<TcpServer>, message: TcpProxyOrder) {
-    println!("notified: {:?}", message);
     match message {
       TcpProxyOrder::Command(Command::AddTcpFront(front)) => {
         println!("{:?}", front);

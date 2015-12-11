@@ -176,7 +176,7 @@ impl ProxyClient<HttpServer> for Client {
 
     if let Some(mut buf) = self.front_buf.take() {
       match self.sock.try_read_buf(&mut buf) {
-        Ok(None) => {
+        Ok(None) | Ok(Some(0)) => {
           self.front_interest.insert(EventSet::readable());
         },
         Ok(Some(r)) => {
@@ -402,16 +402,14 @@ impl ServerConfiguration {
   }
 
   pub fn backend_from_request(&self, host: &str, uri: &str) -> Option<SocketAddr> {
-    println!("Getting a backend for {}", host);
     if let Some(http_fronts) = self.fronts.get(host) {
       // ToDo get the front with the most specific matching path_begin
-      println!("Choosing a front from {:?}", http_fronts);
       if let Some(http_front) = http_fronts.get(0) {
         // ToDo round-robin on instances
-        println!("Choosing an instance from {:?}", self.instances.get(&http_front.app_id));
         if let Some(app_instances) = self.instances.get(&http_front.app_id) {
           let rnd = random::<usize>();
           let idx = rnd % app_instances.len();
+          println!("Connecting {} -> {:?}", host, app_instances.get(idx));
           app_instances.get(idx).map(|& addr| addr)
         } else {
           None
@@ -442,7 +440,7 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
       if let Ok(tok) = self.listeners.insert(al) {
         self.listeners[tok].token = Some(tok);
         //self.fronts.insert(String::from(app_id), tok);
-        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level()).unwrap();
+        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::edge()).unwrap();
         println!("registered listener({}) on port {}", tok.as_usize(), port);
         Some(tok)
       } else {
