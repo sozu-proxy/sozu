@@ -167,6 +167,8 @@ pub enum HttpState {
   Error(ErrorState),
   HasRequestLine(usize, RRequestLine),
   HasHost(usize, RRequestLine, Host),
+  HasLength(usize, RRequestLine, LengthInformation),
+  HasHostAndLength(usize, RRequestLine, Host, LengthInformation),
   HeadersParsed(RRequestLine, Host, LengthInformation),
   Proxying(RRequestLine, Host)
   //Proxying(RRequestLine, Host, LengthInformation, BackendToken)
@@ -235,17 +237,40 @@ pub fn parse_headers(state: &HttpState, buf: &[u8]) -> HttpState {
         },
         IResult::Done(i, v)    => {
           //println!("got headers: {:?}", v);
+          let mut length_info:Option<LengthInformation> = None;
           for header in &v {
-            if str::from_utf8(header.name) == Ok("Host") {
-              if let Ok(host) = str::from_utf8(header.value) {
-                return HttpState::HasHost(buf.offset(i), rl.clone(), String::from(host));
-              } else {
-                return HttpState::Error(ErrorState::InvalidHttp);
+            match str::from_utf8(header.name) {
+              Ok("Host") => {
+                if let Ok(host) = str::from_utf8(header.value) {
+                  if let Some(length) = length_info {
+                    return HttpState::HasHostAndLength(buf.offset(i), rl.clone(), String::from(host), length);
+                  } else {
+                    return HttpState::HasHost(buf.offset(i), rl.clone(), String::from(host));
+                  }
+                } else {
+                  return HttpState::Error(ErrorState::InvalidHttp);
+                }
+              },
+              Ok("Content-Length") => {
+                if let Ok(l) = str::from_utf8(header.value) {
+                  match l.parse() {
+                    Ok(length) => length_info = Some(LengthInformation::Length(length)),
+                    Err(_)     => return HttpState::Error(ErrorState::InvalidHttp)
+                  }
+                } else {
+                  return HttpState::Error(ErrorState::InvalidHttp);
+                }
               }
+              _ => {}
             }
           }
-          HttpState::HasRequestLine(buf.offset(i), rl.clone())
-       }
+
+          if let Some(length) = length_info {
+            HttpState::HasLength(buf.offset(i), rl.clone(), length)
+          } else {
+            HttpState::HasRequestLine(buf.offset(i), rl.clone())
+          }
+        }
       }
     },
     //HasHost(usize,RRequestLine, Host),
@@ -313,6 +338,45 @@ mod tests {
           RequestHeader {
             name: b"Accept",
             value: b"*/*"
+          }
+        )
+      };
+
+      assert_eq!(result, Done(&b""[..], expected))
+  }
+
+  #[test]
+  fn content_length_test() {
+      let input =
+          b"GET /index.html HTTP/1.1\r\n\
+            Host: localhost:8888\r\n\
+            User-Agent: curl/7.43.0\r\n\
+            Accept: */*\r\n\
+            Content-Length: 200\r\n\
+            \r\n";
+      let result = request_head(input);
+      let expected = RequestHead {
+        request_line: RequestLine {
+        method: b"GET",
+        uri: b"/index.html",
+        version: [b"1", b"1"]
+      },
+        headers: vec!(
+          RequestHeader {
+            name: b"Host",
+            value: b"localhost:8888"
+          },
+          RequestHeader {
+            name: b"User-Agent",
+            value: b"curl/7.43.0"
+          },
+          RequestHeader {
+            name: b"Accept",
+            value: b"*/*"
+          },
+          RequestHeader {
+            name: b"Content-Length",
+            value: b"200"
           }
         )
       };
