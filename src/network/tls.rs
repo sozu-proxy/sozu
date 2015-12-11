@@ -198,11 +198,11 @@ impl ProxyClient<TlsServer> for Client {
         },
         Err(NonblockingSslError::WantRead) => {
           self.front_interest.insert(EventSet::readable());
-          println!("writable WantRead");
+          //println!("writable WantRead");
         },
         Err(NonblockingSslError::WantWrite) => {
           self.front_interest.insert(EventSet::writable());
-          println!("writable WantWrite");
+          //println!("writable WantWrite");
         }
         Err(e) => {
           panic!("not implemented; client err={:?}", e);
@@ -286,14 +286,14 @@ impl ProxyClient<TlsServer> for Client {
         },
         Err(NonblockingSslError::WantRead) => {
           self.front_interest.insert(EventSet::readable());
-          println!("writable WantRead");
+          //println!("writable WantRead");
         },
         Err(NonblockingSslError::WantWrite) => {
           self.front_interest.insert(EventSet::writable());
-          println!("writable WantWrite");
+          //println!("writable WantWrite");
         },
         Err(e) => {
-          println!("not implemented; client err={:?}", e);
+          println!("TLS client err={:?}", e);
           return ClientResult::CloseClient;
         }
       }
