@@ -105,7 +105,7 @@ impl Client {
     self.back_interest.insert(EventSet::writable());
     if let Some((frontend_token,backend_token)) = self.tokens() {
       if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, EventSet::readable(), PollOpt::edge()).unwrap();
+        event_loop.reregister(sock, backend_token, EventSet::readable(), PollOpt::edge());
       }
       event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
@@ -250,7 +250,7 @@ impl ProxyClient<HttpServer> for Client {
     }
     if let Some((frontend_token,backend_token)) = self.tokens() {
       if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge()).unwrap();
+        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge());
       }
       event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
@@ -290,7 +290,7 @@ impl ProxyClient<HttpServer> for Client {
 
     if let Some((frontend_token,backend_token)) = self.tokens() {
       if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge()).unwrap();
+        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge());
       }
       event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
@@ -326,7 +326,7 @@ impl ProxyClient<HttpServer> for Client {
 
     if let Some((frontend_token,backend_token)) = self.tokens() {
       if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge()).unwrap();
+        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge());
       }
       event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
@@ -440,7 +440,7 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
       if let Ok(tok) = self.listeners.insert(al) {
         self.listeners[tok].token = Some(tok);
         //self.fronts.insert(String::from(app_id), tok);
-        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::edge()).unwrap();
+        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::edge());
         println!("registered listener({}) on port {}", tok.as_usize(), port);
         Some(tok)
       } else {

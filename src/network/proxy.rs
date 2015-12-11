@@ -92,7 +92,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Me
   pub fn accept(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
     if let Some((client, should_connect)) = self.configuration.accept(token) {
       if let Ok(client_token) = self.clients.insert(client) {
-        event_loop.register(self.clients[client_token].front_socket(), client_token, EventSet::readable(), PollOpt::edge()).unwrap();
+        event_loop.register(self.clients[client_token].front_socket(), client_token, EventSet::readable(), PollOpt::edge());
         &self.clients[client_token].set_front_token(client_token);
         if should_connect {
           self.connect_to_backend(event_loop, client_token);
@@ -112,7 +112,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Me
         self.clients[token].set_back_token(backend_token);
 
         if let Some(sock) = self.clients[token].back_socket() {
-          event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge()).unwrap();
+          event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge());
         }
         return;
       }

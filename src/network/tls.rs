@@ -213,7 +213,7 @@ impl ProxyClient<TlsServer> for Client {
     }
     if let Some((frontend_token,backend_token)) = self.tokens() {
       if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge()).unwrap();
+        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge());
       }
       event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
@@ -249,7 +249,7 @@ impl ProxyClient<TlsServer> for Client {
             self.back_interest.insert(EventSet::writable());
             if let Some((frontend_token,backend_token)) = self.tokens() {
               if let Some(ref sock) = self.backend {
-                event_loop.reregister(sock, backend_token, EventSet::readable(), PollOpt::edge()).unwrap();
+                event_loop.reregister(sock, backend_token, EventSet::readable(), PollOpt::edge());
               }
               event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
             }
@@ -269,7 +269,7 @@ impl ProxyClient<TlsServer> for Client {
               self.back_interest.insert(EventSet::writable());
               if let Some((frontend_token,backend_token)) = self.tokens() {
                 if let Some(ref sock) = self.backend {
-                  event_loop.reregister(sock, backend_token, EventSet::readable(), PollOpt::edge()).unwrap();
+                  event_loop.reregister(sock, backend_token, EventSet::readable(), PollOpt::edge());
                 }
                 event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
               }
@@ -341,7 +341,7 @@ impl ProxyClient<TlsServer> for Client {
 
     if let Some((frontend_token,backend_token)) = self.tokens() {
       if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge()).unwrap();
+        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge());
       }
       event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
@@ -376,7 +376,7 @@ impl ProxyClient<TlsServer> for Client {
 
     if let Some((frontend_token,backend_token)) = self.tokens() {
       if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge()).unwrap();
+        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge());
       }
       event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
@@ -511,7 +511,7 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
       if let Ok(tok) = self.listeners.insert(al) {
         self.listeners[tok].token = Some(tok);
         //self.fronts.insert(String::from(app_id), tok);
-        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level()).unwrap();
+        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
         println!("registered listener on port {}", port);
         Some(tok)
       } else {

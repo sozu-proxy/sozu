@@ -494,7 +494,7 @@ impl ProxyConfiguration<TcpServer, Client,TcpProxyOrder> for ServerConfiguration
       if let Ok(tok) = self.listeners.insert(al) {
         self.listeners[tok].token = Some(tok);
         self.fronts.insert(String::from(app_id), tok);
-        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level()).unwrap();
+        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
         println!("registered listener for app {} on port {}", app_id, port);
         Some(tok)
       } else {
