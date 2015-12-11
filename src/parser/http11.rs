@@ -146,6 +146,64 @@ named!(pub request_head<RequestHead>,
        )
 );
 
+#[derive(PartialEq,Debug)]
+pub enum TransferEncoding {
+  Chunked,
+  Compress,
+  Deflate,
+  Gzip,
+  Identity,
+  Unknown
+}
+
+#[derive(PartialEq,Debug)]
+pub enum Field<T> {
+  Value(T),
+  None,
+  Error
+}
+impl<'a> RequestHeader<'a> {
+  pub fn host(&self) -> Field<String> {
+    if self.name == b"Host" {
+      if let Some(s) = str::from_utf8(self.value).map(|s| String::from(s)).ok() {
+        Field::Value(s)
+      } else {
+        Field::Error
+      }
+    } else {
+      Field::None
+    }
+  }
+
+  pub fn content_length(&self) -> Field<usize> {
+    if self.name == b"Content-Length" {
+      if let Ok(l) = str::from_utf8(self.value) {
+        if let Some(length) = l.parse().ok() {
+          return Field::Value(length)
+        }
+      }
+      Field::Error
+    } else {
+      Field::None
+    }
+  }
+
+  pub fn transfer_encoding(&self) -> Field<TransferEncoding> {
+    if self.name == b"Transfer-Encoding" {
+      match self.value {
+        b"chunked"  => Field::Value(TransferEncoding::Chunked),
+        b"compress" => Field::Value(TransferEncoding::Compress),
+        b"deflate"  => Field::Value(TransferEncoding::Deflate),
+        b"gzip"     => Field::Value(TransferEncoding::Gzip),
+        b"identity" => Field::Value(TransferEncoding::Identity),
+        _           => Field::Value(TransferEncoding::Unknown)
+      }
+    } else {
+      Field::None
+    }
+  }
+}
+
 pub type Host = String;
 
 #[derive(Debug,Clone)]
