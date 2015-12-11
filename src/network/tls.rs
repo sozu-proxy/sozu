@@ -205,7 +205,8 @@ impl ProxyClient<TlsServer> for Client {
           //println!("writable WantWrite");
         }
         Err(e) => {
-          panic!("not implemented; client err={:?}", e);
+          println!("TLS client err={:?}", e);
+          return ClientResult::CloseClient;
         }
       }
       self.back_buf = Some(b.flip());
