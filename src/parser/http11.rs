@@ -147,7 +147,7 @@ named!(pub request_head<RequestHead>,
 );
 
 #[derive(PartialEq,Debug)]
-pub enum TransferEncoding {
+pub enum TransferEncodingValue {
   Chunked,
   Compress,
   Deflate,
@@ -157,69 +157,69 @@ pub enum TransferEncoding {
 }
 
 #[derive(PartialEq,Debug)]
-pub enum Field<T> {
+pub enum HeaderResult<T> {
   Value(T),
   None,
   Error
 }
-impl<'a> RequestHeader<'a> {
-  pub fn host(&self) -> Field<String> {
-    if self.name == b"Host" {
-      if let Some(s) = str::from_utf8(self.value).map(|s| String::from(s)).ok() {
-        Field::Value(s)
-      } else {
-        Field::Error
-      }
-    } else {
-      Field::None
-    }
-  }
 
-  pub fn content_length(&self) -> Field<usize> {
-    if self.name == b"Content-Length" {
-      if let Ok(l) = str::from_utf8(self.value) {
-        if let Some(length) = l.parse().ok() {
-          return Field::Value(length)
+impl<'a> RequestHeader<'a> {
+  pub fn value(&self) -> HeaderValue {
+    match self.name {
+      b"Host" => {
+        if let Some(s) = str::from_utf8(self.value).map(|s| String::from(s)).ok() {
+          HeaderValue::Host(s)
+        } else {
+          HeaderValue::Error
+        }
+      },
+      b"Content-Length" => {
+        if let Ok(l) = str::from_utf8(self.value) {
+          if let Some(length) = l.parse().ok() {
+             return HeaderValue::ContentLength(length)
+          }
+        }
+        HeaderValue::Error
+      },
+      b"Transfer-Encoding" => {
+        match self.value {
+          b"chunked"  => HeaderValue::Encoding(TransferEncodingValue::Chunked),
+          b"compress" => HeaderValue::Encoding(TransferEncodingValue::Compress),
+          b"deflate"  => HeaderValue::Encoding(TransferEncodingValue::Deflate),
+          b"gzip"     => HeaderValue::Encoding(TransferEncodingValue::Gzip),
+          b"identity" => HeaderValue::Encoding(TransferEncodingValue::Identity),
+          _           => HeaderValue::Encoding(TransferEncodingValue::Unknown)
         }
       }
-      Field::Error
-    } else {
-      Field::None
-    }
-  }
-
-  pub fn transfer_encoding(&self) -> Field<TransferEncoding> {
-    if self.name == b"Transfer-Encoding" {
-      match self.value {
-        b"chunked"  => Field::Value(TransferEncoding::Chunked),
-        b"compress" => Field::Value(TransferEncoding::Compress),
-        b"deflate"  => Field::Value(TransferEncoding::Deflate),
-        b"gzip"     => Field::Value(TransferEncoding::Gzip),
-        b"identity" => Field::Value(TransferEncoding::Identity),
-        _           => Field::Value(TransferEncoding::Unknown)
-      }
-    } else {
-      Field::None
+      _ => HeaderValue::Other(self.name, self.value)
     }
   }
 }
 
+pub enum HeaderValue<'a> {
+  Host(String),
+  ContentLength(usize),
+  Encoding(TransferEncodingValue),
+  Other(&'a[u8],&'a[u8]),
+  Error
+}
+
 pub type Host = String;
 
-#[derive(Debug,Clone)]
+#[derive(Debug,Clone,PartialEq)]
 pub enum ErrorState {
   InvalidHttp,
   MissingHost
 }
 
-#[derive(Debug,Clone)]
+#[derive(Debug,Clone,PartialEq)]
 pub enum LengthInformation {
   Length(usize),
   Chunked,
   Compressed
 }
 
-#[derive(Debug,Clone)]
+#[derive(Debug,Clone,PartialEq)]
 pub enum HttpState {
   Initial,
   Error(ErrorState),
@@ -268,6 +268,42 @@ pub fn default_response<O>(state: &HttpState, res: IResult<&[u8], O>) -> HttpSta
   }
 }
 
+pub fn validate_header(state: HttpState, header: &RequestHeader, consumed: usize) -> HttpState {
+  match header.value() {
+    HeaderValue::Host(host) => {
+      match state {
+        HttpState::HasRequestLine(_, rl) => HttpState::HasHost(consumed, rl, host),
+        HttpState::HasLength(_, rl, l)   => HttpState::HasHostAndLength(consumed, rl, host, l),
+        _                                => HttpState::Error(ErrorState::InvalidHttp)
+      }
+    },
+    HeaderValue::ContentLength(sz) => {
+      match state {
+        HttpState::HasRequestLine(_, rl) => HttpState::HasLength(consumed, rl, LengthInformation::Length(sz)),
+        HttpState::HasHost(_, rl, host)  => HttpState::HasHostAndLength(consumed, rl, host, LengthInformation::Length(sz)),
+        _                                => HttpState::Error(ErrorState::InvalidHttp)
+      }
+    },
+    HeaderValue::Encoding(TransferEncodingValue::Chunked) => {
+      match state {
+        HttpState::HasRequestLine(_, rl)            => HttpState::HasLength(consumed, rl, LengthInformation::Chunked),
+        HttpState::HasHost(_, rl, host)             => HttpState::HasHostAndLength(consumed, rl, host, LengthInformation::Chunked),
+        // Transfer-Encoding takes the precedence on Content-Length
+        HttpState::HasHostAndLength(_, rl, host,
+           LengthInformation::Length(_))            => HttpState::HasHostAndLength(consumed, rl, host, LengthInformation::Chunked),
+        HttpState::HasHostAndLength(_, rl, host, _) => HttpState::Error(ErrorState::InvalidHttp),
+        _                                           => HttpState::Error(ErrorState::InvalidHttp)
+      }
+    },
+
+    // FIXME: there should be an error for unsupported encoding
+    HeaderValue::Encoding(_) => HttpState::Error(ErrorState::InvalidHttp),
+    HeaderValue::Other(_,_)  => state.clone(),
+    HeaderValue::Error       => HttpState::Error(ErrorState::InvalidHttp)
+  }
+}
+
+
 pub fn parse_headers(state: &HttpState, buf: &[u8]) -> HttpState {
   match *state {
     HttpState::Initial => {
@@ -291,38 +327,15 @@ pub fn parse_headers(state: &HttpState, buf: &[u8]) -> HttpState {
         IResult::Done(i, v)    => {
           //println!("got headers: {:?}", v);
           let mut length_info:Option<LengthInformation> = None;
+          let mut current_state = state.clone();
+          //println!("initial state: {:?}", current_state);
           for header in &v {
-            match str::from_utf8(header.name) {
-              Ok("Host") => {
-                if let Ok(host) = str::from_utf8(header.value) {
-                  if let Some(length) = length_info {
-                    return HttpState::HasHostAndLength(buf.offset(i), rl.clone(), String::from(host), length);
-                  } else {
-                    return HttpState::HasHost(buf.offset(i), rl.clone(), String::from(host));
-                  }
-                } else {
-                  return HttpState::Error(ErrorState::InvalidHttp);
-                }
-              },
-              Ok("Content-Length") => {
-                if let Ok(l) = str::from_utf8(header.value) {
-                  match l.parse() {
-                    Ok(length) => length_info = Some(LengthInformation::Length(length)),
-                    Err(_)     => return HttpState::Error(ErrorState::InvalidHttp)
-                  }
-                } else {
-                  return HttpState::Error(ErrorState::InvalidHttp);
-                }
-              }
-              _ => {}
-            }
+            current_state = validate_header(current_state, header, buf.offset(i));
+            //println!("header parsing(o={}):\t[{}:{}]\t=> {:?}", buf.offset(i), str::from_utf8(header.name).unwrap(), str::from_utf8(header.value).unwrap(), current_state);
           }
 
-          if let Some(length) = length_info {
-            HttpState::HasLength(buf.offset(i), rl.clone(), length)
-          } else {
-            HttpState::HasRequestLine(buf.offset(i), rl.clone())
-          }
+        //println!("end state: {:?}", current_state);
+          current_state
         },
         res => default_response(state, res)
       }
@@ -435,6 +448,96 @@ mod tests {
         )
       };
 
-      assert_eq!(result, Done(&b""[..], expected))
+      assert_eq!(result, Done(&b""[..], expected));
+  }
+
+  #[test]
+  fn parse_state_content_length_test() {
+      let input =
+          b"GET /index.html HTTP/1.1\r\n\
+            Host: localhost:8888\r\n\
+            User-Agent: curl/7.43.0\r\n\
+            Accept: */*\r\n\
+            Content-Length: 200\r\n\
+            \r\n";
+      let initial = HttpState::Initial;
+
+      let result = parse_headers(&initial, input);
+      println!("result: {:?}", result);
+      assert_eq!(
+        result,
+        HttpState::HasHostAndLength(
+          107,
+          RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
+          String::from("localhost:8888"),
+          LengthInformation::Length(200)
+        )
+      );
+  }
+
+  #[test]
+  fn parse_state_chunked_test() {
+      let input =
+          b"GET /index.html HTTP/1.1\r\n\
+            Host: localhost:8888\r\n\
+            User-Agent: curl/7.43.0\r\n\
+            Transfer-Encoding: chunked\r\n\
+            Accept: */*\r\n\
+            \r\n";
+      let initial = HttpState::Initial;
+
+      let result = parse_headers(&initial, input);
+      println!("result: {:?}", result);
+      assert_eq!(
+        result,
+        HttpState::HasHostAndLength(
+          114,
+          RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
+          String::from("localhost:8888"),
+          LengthInformation::Chunked
+        )
+      );
+  }
+
+  #[test]
+  fn parse_state_duplicate_content_length_test() {
+      let input =
+          b"GET /index.html HTTP/1.1\r\n\
+            Host: localhost:8888\r\n\
+            User-Agent: curl/7.43.0\r\n\
+            Content-Length: 120\r\n\
+            Accept: */*\r\n\
+            Content-Length: 200\r\n\
+            \r\n";
+      let initial = HttpState::Initial;
+
+      let result = parse_headers(&initial, input);
+      println!("result: {:?}", result);
+      assert_eq!(result, HttpState::Error(ErrorState::InvalidHttp));
+  }
+
+  #[test]
+  fn parse_state_content_length_and_chunked_test() {
+      let input =
+          b"GET /index.html HTTP/1.1\r\n\
+            Host: localhost:8888\r\n\
+            User-Agent: curl/7.43.0\r\n\
+            Content-Length: 10\r\n\
+            Transfer-Encoding: chunked\r\n\
+            Accept: */*\r\n\
+            \r\n";
+      let initial = HttpState::Initial;
+
+      let result = parse_headers(&initial, input);
+      println!("result: {:?}", result);
+      assert_eq!(
+        result,
+        HttpState::HasHostAndLength(
+          134,
+          RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
+          String::from("localhost:8888"),
+          LengthInformation::Chunked
+        )
+      );
   }
 }
