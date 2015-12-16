@@ -105,19 +105,19 @@ named!(pub request_line<RequestLine>,
 );
 
 #[derive(PartialEq,Debug)]
-pub struct RequestHeader<'a> {
+pub struct Header<'a> {
     pub name: &'a [u8],
     pub value: &'a [u8]
 }
 
-named!(pub message_header<RequestHeader>,
+named!(pub message_header<Header>,
        chain!(
          name: token ~
          tag!(":") ~
          sp ~ // ToDo make it optional
          value: vchar_1 ~ // ToDo handle folding?
          crlf, || {
-           RequestHeader {
+           Header {
             name: name,
             value: value
            }
@@ -125,20 +125,20 @@ named!(pub message_header<RequestHeader>,
        )
 );
 
-named!(pub headers< Vec<RequestHeader> >, many0!(message_header));
+named!(pub headers< Vec<Header> >, many0!(message_header));
 
 #[derive(PartialEq,Debug)]
-pub struct RequestHead<'a> {
+pub struct Request<'a> {
     pub request_line: RequestLine<'a>,
-    pub headers: Vec<RequestHeader<'a>>
+    pub headers: Vec<Header<'a>>
 }
 
-named!(pub request_head<RequestHead>,
+named!(pub request_head<Request>,
        chain!(
         rl: request_line ~
         hs: many0!(message_header) ~
         crlf, || {
-          RequestHead {
+          Request {
             request_line: rl,
             headers: hs
           }
@@ -163,7 +163,7 @@ pub enum HeaderResult<T> {
   Error
 }
 
-impl<'a> RequestHeader<'a> {
+impl<'a> Header<'a> {
   pub fn value(&self) -> HeaderValue {
     match self.name {
       b"Host" => {
@@ -268,7 +268,7 @@ pub fn default_response<O>(state: &HttpState, res: IResult<&[u8], O>) -> HttpSta
   }
 }
 
-pub fn validate_header(state: HttpState, header: &RequestHeader, consumed: usize) -> HttpState {
+pub fn validate_request_header(state: HttpState, header: &Header, consumed: usize) -> HttpState {
   match header.value() {
     HeaderValue::Host(host) => {
       match state {
@@ -304,7 +304,7 @@ pub fn validate_header(state: HttpState, header: &RequestHeader, consumed: usize
 }
 
 
-pub fn parse_headers(state: &HttpState, buf: &[u8]) -> HttpState {
+pub fn parse_request(state: &HttpState, buf: &[u8]) -> HttpState {
   match *state {
     HttpState::Initial => {
       //println!("buf: {}", buf.to_hex(8));
@@ -313,7 +313,7 @@ pub fn parse_headers(state: &HttpState, buf: &[u8]) -> HttpState {
           if let Some(rl) = RRequestLine::from_request_line(r) {
             let s = HttpState::HasRequestLine(buf.offset(i), rl);
             //println!("now in state: {:?}", s);
-            parse_headers(&s, buf)
+            parse_request(&s, buf)
           } else {
             HttpState::Error(ErrorState::InvalidHttp)
           }
@@ -330,7 +330,7 @@ pub fn parse_headers(state: &HttpState, buf: &[u8]) -> HttpState {
           let mut current_state = state.clone();
           //println!("initial state: {:?}", current_state);
           for header in &v {
-            current_state = validate_header(current_state, header, buf.offset(i));
+            current_state = validate_request_header(current_state, header, buf.offset(i));
             //println!("header parsing(o={}):\t[{}:{}]\t=> {:?}", buf.offset(i), str::from_utf8(header.name).unwrap(), str::from_utf8(header.value).unwrap(), current_state);
           }
 
@@ -370,7 +370,7 @@ mod tests {
   fn header_test() {
       let input = b"Accept: */*\r\n";
       let result = message_header(input);
-      let expected = RequestHeader {
+      let expected = Header {
         name: b"Accept",
         value: b"*/*"
       };
@@ -387,22 +387,22 @@ mod tests {
             Accept: */*\r\n\
             \r\n";
       let result = request_head(input);
-      let expected = RequestHead {
+      let expected = Request {
         request_line: RequestLine {
         method: b"GET",
         uri: b"/index.html",
         version: [b"1", b"1"]
       },
         headers: vec!(
-          RequestHeader {
+          Header {
             name: b"Host",
             value: b"localhost:8888"
           },
-          RequestHeader {
+          Header {
             name: b"User-Agent",
             value: b"curl/7.43.0"
           },
-          RequestHeader {
+          Header {
             name: b"Accept",
             value: b"*/*"
           }
@@ -422,26 +422,26 @@ mod tests {
             Content-Length: 200\r\n\
             \r\n";
       let result = request_head(input);
-      let expected = RequestHead {
+      let expected = Request {
         request_line: RequestLine {
         method: b"GET",
         uri: b"/index.html",
         version: [b"1", b"1"]
       },
         headers: vec!(
-          RequestHeader {
+          Header {
             name: b"Host",
             value: b"localhost:8888"
           },
-          RequestHeader {
+          Header {
             name: b"User-Agent",
             value: b"curl/7.43.0"
           },
-          RequestHeader {
+          Header {
             name: b"Accept",
             value: b"*/*"
           },
-          RequestHeader {
+          Header {
             name: b"Content-Length",
             value: b"200"
           }
@@ -462,7 +462,7 @@ mod tests {
             \r\n";
       let initial = HttpState::Initial;
 
-      let result = parse_headers(&initial, input);
+      let result = parse_request(&initial, input);
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -486,7 +486,7 @@ mod tests {
             \r\n";
       let initial = HttpState::Initial;
 
-      let result = parse_headers(&initial, input);
+      let result = parse_request(&initial, input);
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -511,7 +511,7 @@ mod tests {
             \r\n";
       let initial = HttpState::Initial;
 
-      let result = parse_headers(&initial, input);
+      let result = parse_request(&initial, input);
       println!("result: {:?}", result);
       assert_eq!(result, HttpState::Error(ErrorState::InvalidHttp));
   }
@@ -528,7 +528,7 @@ mod tests {
             \r\n";
       let initial = HttpState::Initial;
 
-      let result = parse_headers(&initial, input);
+      let result = parse_request(&initial, input);
       println!("result: {:?}", result);
       assert_eq!(
         result,

@@ -17,7 +17,7 @@ use rand::random;
 use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 
-use parser::http11::{HttpState,parse_headers};
+use parser::http11::{HttpState,parse_request};
 
 use messages::{Command,HttpFront};
 
@@ -188,7 +188,7 @@ impl ProxyClient<HttpServer> for Client {
             self.reregister(event_loop);
             self.rx_count = self.rx_count + r;
           } else {
-            let state = parse_headers(&self.http_state, &buf.bytes());
+            let state = parse_request(&self.http_state, &buf.bytes());
             if let HttpState::Error(_) = state {
               self.http_state = state;
               self.front_buf = Some(buf);

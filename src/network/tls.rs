@@ -18,7 +18,7 @@ use openssl::ssl::{SslContext, SslMethod, Ssl, NonblockingSslStream, ServerNameC
 use openssl::ssl::error::NonblockingSslError;
 use openssl::x509::X509FileType;
 
-use parser::http11::{HttpState,parse_headers};
+use parser::http11::{HttpState,parse_request};
 use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,HttpFront};
@@ -255,7 +255,7 @@ impl ProxyClient<TlsServer> for Client {
             }
             self.rx_count = self.rx_count + r;
           } else {
-            let state = parse_headers(&self.http_state, &buf.bytes());
+            let state = parse_request(&self.http_state, &buf.bytes());
             if let HttpState::Error(_) = state {
               self.http_state = state;
               println!("HTTP parsing error");
