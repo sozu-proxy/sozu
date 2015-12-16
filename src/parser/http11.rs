@@ -125,6 +125,15 @@ named!(pub message_header<Header>,
        )
 );
 
+pub fn comma_separated_header_value(input:&[u8]) -> Option<Vec<&[u8]>> {
+  let res: IResult<&[u8], Vec<&[u8]>> = separated_list!(input, char!(','), vchar_1);
+  if let IResult::Done(_,o) = res {
+    Some(o)
+  } else {
+    None
+  }
+}
+
 named!(pub headers< Vec<Header> >, many0!(message_header));
 
 #[derive(PartialEq,Debug)]
@@ -190,6 +199,12 @@ impl<'a> Header<'a> {
           b"identity" => HeaderValue::Encoding(TransferEncodingValue::Identity),
           _           => HeaderValue::Encoding(TransferEncodingValue::Unknown)
         }
+      },
+      b"Connection" => {
+        match comma_separated_header_value(self.value) {
+          Some(tokens) => HeaderValue::Connection(tokens),
+          None         => HeaderValue::Error
+        }
       }
       _ => HeaderValue::Other(self.name, self.value)
     }
@@ -200,6 +215,7 @@ pub enum HeaderValue<'a> {
   Host(String),
   ContentLength(usize),
   Encoding(TransferEncodingValue),
+  Connection(Vec<&'a [u8]>),
   Other(&'a[u8],&'a[u8]),
   Error
 }
@@ -294,6 +310,14 @@ pub fn validate_request_header(state: HttpState, header: &Header, consumed: usiz
         HttpState::HasHostAndLength(_, rl, host, _) => HttpState::Error(ErrorState::InvalidHttp),
         _                                           => HttpState::Error(ErrorState::InvalidHttp)
       }
+    },
+    HeaderValue::Connection(headers) => {
+      state.clone()
+      /*match state {
+        HttpState::HasRequestLine(_, rl) => HttpState::HasLength(consumed, rl, LengthInformation::Length(sz)),
+        HttpState::HasHost(_, rl, host)  => HttpState::HasHostAndLength(consumed, rl, host, LengthInformation::Length(sz)),
+        _                                => HttpState::Error(ErrorState::InvalidHttp)
+      }*/
     },
 
     // FIXME: there should be an error for unsupported encoding
