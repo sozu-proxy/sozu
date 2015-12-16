@@ -12,7 +12,7 @@ dependencies = [
  "openssl 0.7.0 (git+https://github.com/Geal/rust-openssl)",
  "rand 0.3.12 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustc-serialize 0.3.16 (registry+https://github.com/rust-lang/crates.io-index)",
- "slab 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "slab 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "time 0.1.34 (registry+https://github.com/rust-lang/crates.io-index)",
  "tiny_http 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
@@ -239,7 +239,7 @@ dependencies = [
  "miow 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "net2 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
  "nix 0.4.2 (registry+https://github.com/rust-lang/crates.io-index)",
- "slab 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "slab 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "time 0.1.34 (registry+https://github.com/rust-lang/crates.io-index)",
  "winapi 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
@@ -368,7 +368,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "slab"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
