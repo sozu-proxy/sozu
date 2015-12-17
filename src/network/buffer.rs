@@ -1,5 +1,5 @@
 use std::{cmp, ptr};
-use std::io::{self,Write};
+use std::io::{self,Write,Read};
 use std::iter::repeat;
 
 pub struct Buffer {
@@ -112,6 +112,17 @@ impl Write for Buffer {
 
   fn flush(&mut self) -> io::Result<()> {
     Ok(())
+  }
+}
+
+impl Read for Buffer {
+  fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    let len = cmp::min(self.available_data(), buf.len());
+    unsafe {
+      ptr::copy((&self.memory[self.position..len]).as_ptr(), buf.as_mut_ptr(), len);
+      self.position += len;
+    }
+    Ok(len)
   }
 }
 
