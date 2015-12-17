@@ -76,20 +76,26 @@ impl Buffer {
 
   pub fn replace_slice(&mut self, data: &[u8], start: usize, length: usize) -> Option<usize> {
     let data_len = data.len();
-    if data_len > length ||
-      start + length > self.available_data() ||
-      start + data_len > self.available_data() {
+    if start + length > self.available_data() ||
+      self.position + start + data_len > self.capacity {
       return None
     }
 
     unsafe {
       let begin     = self.position + start;
       let slice_end = begin + data_len;
-      ptr::copy(data.as_ptr(), (&mut self.memory[begin..slice_end]).as_mut_ptr(), data_len);
-
+      // we reduced the data size
       if data_len < length {
+        ptr::copy(data.as_ptr(), (&mut self.memory[begin..slice_end]).as_mut_ptr(), data_len);
+
         ptr::copy((&self.memory[start+length..self.end]).as_ptr(), (&mut self.memory[slice_end..]).as_mut_ptr(), self.end - (start + length));
         self.end = self.end - (length - data_len);
+
+      // we put more data in the buffer
+      } else {
+        ptr::copy((&self.memory[start+length..self.end]).as_ptr(), (&mut self.memory[start+data_len..]).as_mut_ptr(), self.end - (start + length));
+        ptr::copy(data.as_ptr(), (&mut self.memory[begin..slice_end]).as_mut_ptr(), data_len);
+        self.end = self.end + data_len - length;
       }
     }
     Some(self.available_data())
@@ -182,6 +188,9 @@ mod tests {
     assert_eq!(b.available_space(), 3);
     assert_eq!(b.data(), &b"abXYZgh"[..]);
 
-    assert_eq!(b.replace_slice(&b"123"[..], 2, 2), None);
+    assert_eq!(b.replace_slice(&b"123"[..], 2, 2), Some(8));
+    assert_eq!(b.available_data(), 8);
+    assert_eq!(b.available_space(), 2);
+    assert_eq!(b.data(), &b"ab123Zgh"[..]);
   }
 }
