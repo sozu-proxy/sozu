@@ -19,6 +19,7 @@ use openssl::ssl::error::NonblockingSslError;
 use openssl::x509::X509FileType;
 
 use parser::http11::{HttpState,parse_request};
+use network::buffer::Buffer;
 use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,HttpFront};
@@ -44,8 +45,8 @@ struct Client {
   backend:        Option<TcpStream>,
   http_state:     HttpState,
   stream:         NonblockingSslStream<TcpStream>,
-  front_buf:      Option<MutByteBuf>,
-  back_buf:       Option<MutByteBuf>,
+  front_buf:      Option<Buffer>,
+  back_buf:       Option<Buffer>,
   token:          Option<Token>,
   backend_token:  Option<Token>,
   back_interest:  EventSet,
@@ -61,8 +62,8 @@ impl Client {
       backend:        None,
       http_state:     HttpState::Initial,
       stream:         stream,
-      front_buf:      Some(ByteBuf::mut_with_capacity(2048)),
-      back_buf:       Some(ByteBuf::mut_with_capacity(2048)),
+      front_buf:      Some(Buffer::with_capacity(2048)),
+      back_buf:       Some(Buffer::with_capacity(2048)),
       token:          None,
       backend_token:  None,
       back_interest:  EventSet::all(),
@@ -163,20 +164,19 @@ impl ProxyClient<TlsServer> for Client {
   // Forward content to client
   fn writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("in writable()");
-    if let Some(buf) = self.back_buf.take() {
+    if let Some(mut buf) = self.back_buf.take() {
       //println!("in writable 2: back_buf contains {} bytes", buf.remaining());
-      let mut b = buf.flip();
       //println!("writable back_buf({}): {}", b.remaining(), from_utf8((&b as &Buf).bytes()).unwrap());
       //if self.status == ConnectionStatus::ServerClosed && b.remaining() == 0 {
-      if b.remaining() == 0 {
-        self.back_buf = Some(b.flip());
+      if buf.available_data() == 0 {
+        self.back_buf = Some(buf);
         return ClientResult::Continue;
       }
 
       //let mut b:MutByteBuf = buf.flip();
       //let sl:&mut[u8] = b.mut_bytes();
       //match self.sock.try_write_buf(&mut buf) {
-      match self.stream.write((&b as &Buf).bytes()) {
+      match self.stream.write(buf.data()) {
         /*Ok(None) => {
           println!("client flushing buf; WOULDBLOCK");
 
@@ -188,7 +188,7 @@ impl ProxyClient<TlsServer> for Client {
           //if let Some((front,back)) = self.tokens() {
           //  println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
           //}
-          b.advance(r);
+          buf.consume(r);
 
           self.tx_count = self.tx_count + r;
 
@@ -209,7 +209,7 @@ impl ProxyClient<TlsServer> for Client {
           return ClientResult::CloseClient;
         }
       }
-      self.back_buf = Some(b.flip());
+      self.back_buf = Some(buf);
     }
     if let Some((frontend_token,backend_token)) = self.tokens() {
       if let Some(ref sock) = self.backend {
@@ -228,7 +228,7 @@ impl ProxyClient<TlsServer> for Client {
 
     if let Some(mut buf) = self.front_buf.take() {
       //let mut sl: &mut[u8] = buf.mut_bytes();
-      match self.stream.read(unsafe { buf.mut_bytes() }) {
+      match self.stream.read(unsafe { buf.space() }) {
         /*Ok(None) => {
           println!("client flushing buf; WOULDBLOCK");
 
@@ -240,7 +240,7 @@ impl ProxyClient<TlsServer> for Client {
         },
         Ok(r) => {
           println!("FRONT [{:?}]: read {} bytes", self.token, r);
-          unsafe { buf.advance(r) };
+          buf.fill(r);
           if self.is_proxying() {
             //if let Some((front,back)) = self.tokens() {
             //  println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
@@ -255,7 +255,7 @@ impl ProxyClient<TlsServer> for Client {
             }
             self.rx_count = self.rx_count + r;
           } else {
-            let state = parse_request(&self.http_state, &buf.bytes());
+            let state = parse_request(&self.http_state, &buf.data());
             if let HttpState::Error(_) = state {
               self.http_state = state;
               println!("HTTP parsing error");
@@ -264,7 +264,7 @@ impl ProxyClient<TlsServer> for Client {
             self.http_state = state;
             //println!("new state: {:?}", self.http_state);
             if self.has_host() {
-              self.rx_count = buf.remaining();
+              self.rx_count = buf.available_data();
               self.front_interest.remove(EventSet::readable());
               self.back_interest.insert(EventSet::writable());
               if let Some((frontend_token,backend_token)) = self.tokens() {
@@ -310,12 +310,11 @@ impl ProxyClient<TlsServer> for Client {
 
   // Forward content to application
   fn back_writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
-    if let Some(buf) = self.front_buf.take() {
+    if let Some(mut buf) = self.front_buf.take() {
       //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
 
-      let mut b = buf.flip();
       if let Some(ref mut sock) = self.backend {
-        match sock.try_write_buf(&mut b) {
+        match sock.try_write(&mut buf.data()) {
           Ok(None) => {
             println!("client flushing buf; WOULDBLOCK");
 
@@ -326,6 +325,7 @@ impl ProxyClient<TlsServer> for Client {
             //if let Some((front,back)) = self.tokens() {
             //  println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
             //}
+            buf.consume(r);
 
             self.front_interest.insert(EventSet::readable());
             self.back_interest.remove(EventSet::writable());
@@ -334,7 +334,7 @@ impl ProxyClient<TlsServer> for Client {
           Err(e) =>  println!("not implemented; client err={:?}", e),
         }
       }
-      self.front_buf = Some(b.flip());
+      self.front_buf = Some(buf);
     } else {
       println!("BACK [{:?}]: front_buf unavailable", self.token);
     }
@@ -354,7 +354,7 @@ impl ProxyClient<TlsServer> for Client {
       //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
 
       if let Some(ref mut sock) = self.backend {
-        match sock.try_read_buf(&mut buf) {
+        match sock.try_read(buf.space()) {
           Ok(None) => {
             println!("We just got readable, but were unable to read from the socket?");
           }
@@ -362,6 +362,7 @@ impl ProxyClient<TlsServer> for Client {
             //if let Some((front,back)) = self.tokens() {
             //  println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
             //}
+            buf.fill(r);
             self.back_interest.remove(EventSet::readable());
             self.front_interest.insert(EventSet::writable());
           }

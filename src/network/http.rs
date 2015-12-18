@@ -16,6 +16,7 @@ use time::precise_time_s;
 use rand::random;
 use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
+use network::buffer::Buffer;
 
 use parser::http11::{HttpState,parse_request};
 
@@ -42,8 +43,8 @@ struct Client {
   sock:           TcpStream,
   backend:        Option<TcpStream>,
   http_state:     HttpState,
-  front_buf:      Option<MutByteBuf>,
-  back_buf:       Option<MutByteBuf>,
+  front_buf:      Option<Buffer>,
+  back_buf:       Option<Buffer>,
   token:          Option<Token>,
   backend_token:  Option<Token>,
   back_interest:  EventSet,
@@ -59,8 +60,8 @@ impl Client {
       sock:           sock,
       backend:        None,
       http_state:     HttpState::Initial,
-      front_buf:      Some(ByteBuf::mut_with_capacity(2048)),
-      back_buf:       Some(ByteBuf::mut_with_capacity(2048)),
+      front_buf:      Some(Buffer::with_capacity(2048)),
+      back_buf:       Some(Buffer::with_capacity(2048)),
       token:          None,
       backend_token:  None,
       back_interest:  EventSet::all(),
@@ -171,24 +172,24 @@ impl ProxyClient<HttpServer> for Client {
 
   // Read content from the client
   fn readable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
-    //println!("in readable()");
-    //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
-
     if let Some(mut buf) = self.front_buf.take() {
-      match self.sock.try_read_buf(&mut buf) {
+      //println!("readable(): front_buf contains {} data, {} space", buf.available_data(), buf.available_space());
+
+      match self.sock.try_read(&mut buf.space()) {
         Ok(None) | Ok(Some(0)) => {
           self.front_interest.insert(EventSet::readable());
         },
         Ok(Some(r)) => {
-          println!("FRONT [{:?}]: read {} bytes", self.token, r);
+          //println!("FRONT [{:?}]: read {} bytes", self.token, r);
+          buf.fill(r);
           if self.is_proxying() {
-            //if let Some((front,back)) = self.tokens() {
-            //  println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-            //}
+            if let Some((front,back)) = self.tokens() {
+              //println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+            }
             self.reregister(event_loop);
             self.rx_count = self.rx_count + r;
           } else {
-            let state = parse_request(&self.http_state, &buf.bytes());
+            let state = parse_request(&self.http_state, &buf.data());
             if let HttpState::Error(_) = state {
               self.http_state = state;
               self.front_buf = Some(buf);
@@ -197,7 +198,7 @@ impl ProxyClient<HttpServer> for Client {
             self.http_state = state;
             //println!("new state: {:?}", self.http_state);
             if self.has_host() {
-              self.rx_count = buf.remaining();
+              self.rx_count = buf.available_data();
               self.reregister(event_loop);
               self.front_buf = Some(buf);
               //println!("is now proxying, front buf flipped");
@@ -222,21 +223,21 @@ impl ProxyClient<HttpServer> for Client {
   // Forward content to client
   fn writable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
     //println!("in writable()");
-    if let Some(buf) = self.back_buf.take() {
-      //println!("in writable 2: back_buf contains {} bytes", buf.remaining());
+    if let Some(mut buf) = self.back_buf.take() {
+      //println!("writable(): back_buf contains {} data, {} space", buf.available_data(), buf.available_space());
 
-      let mut b = buf.flip();
-      match self.sock.try_write_buf(&mut b) {
+      match self.sock.try_write(buf.data()) {
         Ok(None) => {
           println!("client flushing buf; WOULDBLOCK");
 
           self.front_interest.insert(EventSet::writable());
         }
         Ok(Some(r)) => {
+          buf.consume(r);
           //FIXME what happens if not everything was written?
-          //if let Some((front,back)) = self.tokens() {
-          //  println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
-          //}
+          if let Some((front,back)) = self.tokens() {
+            //println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
+          }
 
           self.tx_count = self.tx_count + r;
 
@@ -246,7 +247,7 @@ impl ProxyClient<HttpServer> for Client {
         }
         Err(e) =>  println!("not implemented; client err={:?}", e),
       }
-      self.back_buf = Some(b.flip());
+      self.back_buf = Some(buf);
     }
     if let Some((frontend_token,backend_token)) = self.tokens() {
       if let Some(ref sock) = self.backend {
@@ -259,22 +260,23 @@ impl ProxyClient<HttpServer> for Client {
 
   // Forward content to application
   fn back_writable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
-    if let Some(buf) = self.front_buf.take() {
-      //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
+    if let Some(mut buf) = self.front_buf.take() {
+      //println!("back_writable: front_buf contains {} data, {} space", buf.available_data(), buf.available_space());
 
-      let mut b = buf.flip();
+      let tokens = self.tokens();
       if let Some(ref mut sock) = self.backend {
-        match sock.try_write_buf(&mut b) {
+        match sock.try_write(buf.data()) {
           Ok(None) => {
             println!("client flushing buf; WOULDBLOCK");
 
             self.back_interest.insert(EventSet::writable());
           }
           Ok(Some(r)) => {
+            buf.consume(r);
             //FIXME what happens if not everything was written?
-            //if let Some((front,back)) = self.tokens() {
-            //  println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-            //}
+            if let Some((front,back)) = tokens {
+              //println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+            }
 
             self.front_interest.insert(EventSet::readable());
             self.back_interest.remove(EventSet::writable());
@@ -283,7 +285,7 @@ impl ProxyClient<HttpServer> for Client {
           Err(e) =>  println!("not implemented; client err={:?}", e),
         }
       }
-      self.front_buf = Some(b.flip());
+      self.front_buf = Some(buf);
     } else {
       println!("BACK [{:?}]: front_buf unavailable", self.token);
     }
@@ -300,17 +302,19 @@ impl ProxyClient<HttpServer> for Client {
   // Read content from application
   fn back_readable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
     if let Some(mut buf) = self.back_buf.take() {
-      //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
+      //println!("back_readable(): back_buf contains {} data, {} space", buf.available_data(), buf.available_space());
+      let tokens = self.tokens();
 
       if let Some(ref mut sock) = self.backend {
-        match sock.try_read_buf(&mut buf) {
+        match sock.try_read(&mut buf.space()) {
           Ok(None) => {
             println!("We just got readable, but were unable to read from the socket?");
           }
           Ok(Some(r)) => {
-            //if let Some((front,back)) = self.tokens() {
-            //  println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-            //}
+            buf.fill(r);
+            if let Some((front,back)) = tokens {
+              //println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+            }
             self.back_interest.remove(EventSet::readable());
             self.front_interest.insert(EventSet::writable());
             // prepare to provide this to writable
