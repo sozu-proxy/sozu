@@ -32,12 +32,21 @@ impl Buffer {
   pub fn consume(&mut self, count: usize) -> usize {
     let cnt        = cmp::min(count, self.available_data());
     self.position += cnt;
+    if self.position > self.capacity / 2 {
+      //println!("consume shift: pos {}, end {}", self.position, self.end);
+      self.shift();
+    }
     cnt
   }
 
   pub fn fill(&mut self, count: usize) -> usize {
     let cnt   = cmp::min(count, self.available_space());
     self.end += cnt;
+    if self.available_space() < self.available_data() + cnt {
+      //println!("fill shift: pos {}, end {}", self.position, self.end);
+      self.shift();
+    }
+
     cnt
   }
 
