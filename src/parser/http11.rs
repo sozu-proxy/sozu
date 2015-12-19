@@ -1,6 +1,8 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
+use network::buffer::Buffer;
+
 use nom::{HexDisplay,IResult};
 use nom::IResult::*;
 use nom::Err::*;
@@ -313,11 +315,6 @@ pub fn validate_request_header(state: HttpState, header: &Header, consumed: usiz
     },
     HeaderValue::Connection(headers) => {
       state.clone()
-      /*match state {
-        HttpState::HasRequestLine(_, rl) => HttpState::HasLength(consumed, rl, LengthInformation::Length(sz)),
-        HttpState::HasHost(_, rl, host)  => HttpState::HasHostAndLength(consumed, rl, host, LengthInformation::Length(sz)),
-        _                                => HttpState::Error(ErrorState::InvalidHttp)
-      }*/
     },
 
     // FIXME: there should be an error for unsupported encoding
@@ -327,16 +324,27 @@ pub fn validate_request_header(state: HttpState, header: &Header, consumed: usiz
   }
 }
 
+pub enum {
+  Advance(usize),
+  // start, length
+  Delete(usize, usize)
+}
+
+pub fn parse_header(buf: &mut Buffer, state: HttpState) -> IResult<&[u8], HttpState> {
+  match message_header(buf.data()) {
+    IResult::Incomplete(i)   => IResult::Incomplete(i),
+    IResult::Error(e)        => IResult::Error(e),
+    IResult::Done(i, header) => IResult::Done(i, validate_request_header(state, &header, buf.data().offset(i)))
+  }
+}
 
 pub fn parse_request(state: &HttpState, buf: &[u8]) -> HttpState {
   match *state {
     HttpState::Initial => {
-      //println!("buf: {}", buf.to_hex(8));
       match request_line(buf) {
         IResult::Done(i, r)    => {
           if let Some(rl) = RRequestLine::from_request_line(r) {
             let s = HttpState::HasRequestLine(buf.offset(i), rl);
-            //println!("now in state: {:?}", s);
             parse_request(&s, buf)
           } else {
             HttpState::Error(ErrorState::InvalidHttp)
@@ -346,25 +354,43 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> HttpState {
       }
     },
     HttpState::HasRequestLine(pos, ref rl) => {
-      //println!("parsing headers from:\n{}", (&buf[pos..]).to_hex(8));
       match headers(&buf[pos..]) {
         IResult::Done(i, v)    => {
-          //println!("got headers: {:?}", v);
-          let mut length_info:Option<LengthInformation> = None;
           let mut current_state = state.clone();
-          //println!("initial state: {:?}", current_state);
           for header in &v {
             current_state = validate_request_header(current_state, header, buf.offset(i));
-            //println!("header parsing(o={}):\t[{}:{}]\t=> {:?}", buf.offset(i), str::from_utf8(header.name).unwrap(), str::from_utf8(header.value).unwrap(), current_state);
           }
 
-        //println!("end state: {:?}", current_state);
           current_state
         },
         res => default_response(state, res)
       }
     },
-    //HasHost(usize,RRequestLine, Host),
+    _ => {
+      println!("unimplemented state: {:?}", state);
+      HttpState::Error(ErrorState::InvalidHttp)
+    }
+  }
+}
+
+pub fn handle_request(state: &HttpState, buf: &mut Buffer) -> HttpState {
+  match *state {
+    HttpState::Initial => {
+      match request_line(buf.data()) {
+        IResult::Done(i, r)    => {
+          if let Some(rl) = RRequestLine::from_request_line(r) {
+            let s = HttpState::HasRequestLine(buf.data().offset(i), rl);
+            parse_request(&s, i)
+          } else {
+            HttpState::Error(ErrorState::InvalidHttp)
+          }
+        },
+        res => default_response(state, res)
+      }
+    },
+    HttpState::HasRequestLine(pos, ref rl) => {
+      HttpState::Error(ErrorState::InvalidHttp)
+    },
     _ => {
       println!("unimplemented state: {:?}", state);
       HttpState::Error(ErrorState::InvalidHttp)
@@ -376,6 +402,7 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> HttpState {
 mod tests {
   use super::*;
   use nom::IResult::*;
+  use network::buffer::Buffer;
 
   #[test]
   fn request_line_test() {
@@ -563,5 +590,28 @@ mod tests {
           LengthInformation::Chunked
         )
       );
+  }
+
+  use std::str::from_utf8;
+  use std::io::Write;
+
+  #[test]
+  fn handle_request_line_test() {
+     let input =
+          b"GET /index.html HTTP/1.1\r\n\
+            Host: localhost:8888\r\n\
+            User-Agent: curl/7.43.0\r\n\
+            Accept: */*\r\n\
+            Content-Length: 8\r\n\
+            \r\nabcdefgj";
+      let mut buf = Buffer::with_capacity(2048);
+      buf.write(&input[..]);
+      let start_state = HttpState::Initial;
+
+      let next_state = handle_request(&start_state, &mut buf);
+
+      println!("next state: {:?}", next_state);
+      println!("remaining: {}", from_utf8(buf.data()).unwrap());
+      assert!(false);
   }
 }
