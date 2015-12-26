@@ -34,6 +34,10 @@ fn is_vchar_or_ws(i: u8) -> bool {
   is_vchar(i) || is_ws(i)
 }
 
+fn is_header_value_char(i: u8) -> bool {
+  i >= 32 && i <= 126
+}
+
 named!(pub vchar_1, take_while!(is_vchar));
 named!(pub vchar_ws_1, take_while!(is_vchar_or_ws));
 
@@ -117,7 +121,7 @@ named!(pub message_header<Header>,
          name: token ~
          tag!(":") ~
          sp ~ // ToDo make it optional
-         value: vchar_1 ~ // ToDo handle folding?
+         value: take_while!(is_header_value_char) ~ // ToDo handle folding?
          crlf, || {
            Header {
             name: name,
@@ -136,7 +140,7 @@ pub fn comma_separated_header_value(input:&[u8]) -> Option<Vec<&[u8]>> {
   }
 }
 
-named!(pub headers< Vec<Header> >, many0!(message_header));
+named!(pub headers< Vec<Header> >, terminated!(many0!(message_header), opt!(crlf)));
 
 #[derive(PartialEq,Debug)]
 pub struct Request<'a> {
@@ -500,6 +504,21 @@ mod tests {
       };
 
       assert_eq!(result, Done(&b""[..], expected));
+  }
+
+  use std::str;
+  #[test]
+  fn header_user_agent() {
+      let input = b"User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:44.0) Gecko/20100101 Firefox/44.0\r\n";
+
+      let result = message_header(input);
+      assert_eq!(
+        result,
+        Done(&b""[..], Header {
+          name: b"User-Agent",
+          value: b"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:44.0) Gecko/20100101 Firefox/44.0"
+        })
+      );
   }
 
   #[test]
