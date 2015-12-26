@@ -18,7 +18,7 @@ use openssl::ssl::{SslContext, SslMethod, Ssl, NonblockingSslStream, ServerNameC
 use openssl::ssl::error::NonblockingSslError;
 use openssl::x509::X509FileType;
 
-use parser::http11::{HttpState,parse_request};
+use parser::http11::{HttpState,parse_until_stop};
 use network::buffer::Buffer;
 use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
@@ -43,7 +43,7 @@ pub enum HttpProxyOrder {
 
 struct Client {
   backend:        Option<TcpStream>,
-  http_state:     HttpState,
+  http_state:     (usize, HttpState),
   stream:         NonblockingSslStream<TcpStream>,
   front_buf:      Option<Buffer>,
   back_buf:       Option<Buffer>,
@@ -60,7 +60,7 @@ impl Client {
   fn new(stream: NonblockingSslStream<TcpStream>) -> Option<Client> {
     Some(Client {
       backend:        None,
-      http_state:     HttpState::Initial,
+      http_state:     (0, HttpState::Initial),
       stream:         stream,
       front_buf:      Some(Buffer::with_capacity(12000)),
       back_buf:       Some(Buffer::with_capacity(12000)),
@@ -88,14 +88,14 @@ impl Client {
 
 
   fn has_host(&self) -> bool {
-    if let HttpState::HasHost(_, _, _) = self.http_state {
+    if let HttpState::HasHost(_, _) = self.http_state.1 {
       true
     } else {
       false
     }
   }
   fn is_proxying(&self) -> bool {
-    if let HttpState::Proxying(_, _) = self.http_state {
+    if let HttpState::Proxying(_, _) = self.http_state.1 {
       true
     } else {
       false
@@ -255,13 +255,16 @@ impl ProxyClient<TlsServer> for Client {
             }
             self.rx_count = self.rx_count + r;
           } else {
-            let state = parse_request(&self.http_state, &buf.data());
-            if let HttpState::Error(_) = state {
-              self.http_state = state;
+            let mut position = self.http_state.0;
+            let (mv, new_state) = parse_until_stop(&self.http_state.1, &buf.data()[position..]);
+            println!("parse_until_stop returned ({:?}, {:?})", mv, new_state);
+            if let HttpState::Error(_) = new_state {
+              self.http_state = (position, new_state);
               println!("HTTP parsing error");
               return ClientResult::CloseClient;
             }
-            self.http_state = state;
+            position += mv;
+            self.http_state = (position, new_state);
             //println!("new state: {:?}", self.http_state);
             if self.has_host() {
               self.rx_count = buf.available_data();
@@ -550,10 +553,10 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
   }
 
   fn connect_to_backend(&mut self, client: &mut Client) -> Option<TcpStream> {
-    if let (Some(host), Some(rl)) = (client.http_state.get_host(), client.http_state.get_request_line()) {
+    if let (Some(host), Some(rl)) = (client.http_state.1.get_host(), client.http_state.1.get_request_line()) {
       if let Some(back) = self.backend_from_request(&host, &rl.uri) {
         if let Ok(socket) = TcpStream::connect(&back) {
-          client.http_state = HttpState::Proxying(rl, host);
+          client.http_state = (client.http_state.0, HttpState::Proxying(rl, host));
           client.status     = ConnectionStatus::Connected;
           return Some(socket);
         }
