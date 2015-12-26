@@ -360,20 +360,8 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
         res => default_response(state, res)
       }
     },
-    HttpState::HasRequestLine(ref rl) | HttpState::HasHost(ref rl, _) => {
-      match headers(buf) {
-        IResult::Done(i, v)    => {
-          let mut current_state = state.clone();
-          for header in &v {
-            current_state = validate_request_header(current_state, header);
-          }
-
-          (BufferMove::Advance(buf.offset(i)),current_state)
-        },
-        res => default_response(state, res)
-      }
-    },
-    HttpState::HasHostAndLength(ref rl, _, _) => {
+    HttpState::HasRequestLine(ref rl) | HttpState::HasHost(ref rl, _) |
+      HttpState::HasHostAndLength(ref rl, _, _) => {
       match headers(buf) {
         IResult::Done(i, v)    => {
           let mut current_state = state.clone();
