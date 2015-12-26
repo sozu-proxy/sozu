@@ -255,16 +255,12 @@ impl ProxyClient<TlsServer> for Client {
             }
             self.rx_count = self.rx_count + r;
           } else {
-            let mut position = self.http_state.0;
-            let (mv, new_state) = parse_until_stop(&self.http_state.1, &buf.data()[position..]);
-            println!("parse_until_stop returned ({:?}, {:?})", mv, new_state);
-            if let HttpState::Error(_) = new_state {
-              self.http_state = (position, new_state);
+            self.http_state = parse_until_stop(&self.http_state.1, &mut buf, self.http_state.0);
+            println!("parse_until_stop returned {:?}", self.http_state);
+            if let HttpState::Error(_) = self.http_state.1 {
               println!("HTTP parsing error");
               return ClientResult::CloseClient;
             }
-            position += mv;
-            self.http_state = (position, new_state);
             //println!("new state: {:?}", self.http_state);
             if self.has_host() {
               self.rx_count = buf.available_data();

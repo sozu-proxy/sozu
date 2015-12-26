@@ -393,13 +393,13 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
   }
 }
 
-pub fn parse_until_stop(state: &HttpState, buf: &[u8]) -> (usize, HttpState) {
+pub fn parse_until_stop(state: &HttpState, buf: &mut Buffer, start_position: usize) -> (usize, HttpState) {
   let mut current_state = state.clone();
-  let mut position = 0usize;
+  let mut position = start_position;
   loop {
     println!("pos[{}]: {:?}", position, current_state);
-    let (mv, new_state) = parse_request(&current_state, &buf[position..]);
-    println!("mv: {:?}", mv);
+    let (mv, new_state) = parse_request(&current_state, &buf.data()[position..]);
+    println!("mv: {:?}, new state: {:?}", mv, new_state);
     current_state = new_state;
     if let BufferMove::Advance(sz) = mv {
       assert!(sz != 0, "buffer move should not be 0");
@@ -418,6 +418,8 @@ mod tests {
   use nom::HexDisplay;
   use nom::Err::*;
   use network::buffer::Buffer;
+  use std::str;
+  use std::io::Write;
 
 
   #[test]
@@ -518,7 +520,6 @@ mod tests {
       assert_eq!(result, Done(&b""[..], expected));
   }
 
-  use std::str;
   #[test]
   fn header_user_agent() {
       let input = b"User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:44.0) Gecko/20100101 Firefox/44.0\r\n";
@@ -543,9 +544,11 @@ mod tests {
             Content-Length: 200\r\n\
             \r\n";
       let initial = HttpState::Initial;
+      let mut buf = Buffer::with_capacity(2048);
+      buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_until_stop(&initial, input);
+      let result = parse_until_stop(&initial, &mut buf, 0);
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -558,6 +561,33 @@ mod tests {
   }
 
   #[test]
+  fn parse_state_content_length_partial() {
+      let input =
+          b"GET /index.html HTTP/1.1\r\n\
+            Host: localhost:8888\r\n\
+            User-Agent: curl/7.43.0\r\n\
+            Accept: */*\r\n\
+            Content-Length: 200\r\n\
+            \r\n";
+      let initial = HttpState::HasRequestLine(RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11")});
+      let mut buf = Buffer::with_capacity(2048);
+      buf.write(&input[..]);
+
+      //let result = parse_request(&initial, input);
+      let result = parse_until_stop(&initial, &mut buf, 26);
+      println!("result: {:?}", result);
+      assert_eq!(
+        result,
+        (109, HttpState::HasHostAndLength(
+          RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
+          String::from("localhost:8888"),
+          LengthInformation::Length(200)
+        ))
+      );
+  }
+
+
+  #[test]
   fn parse_state_chunked_test() {
       let input =
           b"GET /index.html HTTP/1.1\r\n\
@@ -567,9 +597,11 @@ mod tests {
             Accept: */*\r\n\
             \r\n";
       let initial = HttpState::Initial;
+      let mut buf = Buffer::with_capacity(2048);
+      buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_until_stop(&initial, input);
+      let result = parse_until_stop(&initial, &mut buf, 0);
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -592,8 +624,10 @@ mod tests {
             Content-Length: 200\r\n\
             \r\n";
       let initial = HttpState::Initial;
+      let mut buf = Buffer::with_capacity(2048);
+      buf.write(&input[..]);
 
-      let result = parse_until_stop(&initial, input);
+      let result = parse_until_stop(&initial, &mut buf, 0);
       println!("result: {:?}", result);
       assert_eq!(result, (130, HttpState::Error(ErrorState::InvalidHttp)));
   }
@@ -609,9 +643,11 @@ mod tests {
             Accept: */*\r\n\
             \r\n";
       let initial = HttpState::Initial;
+      let mut buf = Buffer::with_capacity(2048);
+      buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_until_stop(&initial, input);
+      let result = parse_until_stop(&initial, &mut buf, 0);
       println!("result: {:?}", result);
       assert_eq!(
         result,
