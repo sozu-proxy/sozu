@@ -214,7 +214,13 @@ impl ProxyClient<HttpServer> for Client {
             }
           }
         }
-        Err(e) =>  println!("not implemented; client err={:?}", e),
+        Err(e) => match e.kind() {
+          ErrorKind::BrokenPipe => {
+            println!("broken pipe reading from the client");
+            return ClientResult::CloseClient;
+          },
+          _ => println!("not implemented; client err={:?}", e),
+        }
       }
       self.front_buf = Some(buf);
     } else {
@@ -248,7 +254,13 @@ impl ProxyClient<HttpServer> for Client {
           self.front_interest.remove(EventSet::writable());
           self.back_interest.insert(EventSet::readable());
         }
-        Err(e) =>  println!("not implemented; client err={:?}", e),
+        Err(e) => match e.kind() {
+          ErrorKind::BrokenPipe => {
+            println!("broken pipe writing to the client");
+            return ClientResult::CloseClient;
+          },
+          _ => println!("not implemented; client err={:?}", e),
+        }
       }
       self.back_buf = Some(buf);
     }
@@ -285,7 +297,13 @@ impl ProxyClient<HttpServer> for Client {
             self.back_interest.remove(EventSet::writable());
             self.back_interest.insert(EventSet::readable());
           }
-          Err(e) =>  println!("not implemented; client err={:?}", e),
+          Err(e) => match e.kind() {
+            ErrorKind::BrokenPipe => {
+              println!("broken pipe writing to the backend");
+              return ClientResult::CloseClient;
+            },
+            _ => println!("not implemented; client err={:?}", e),
+          }
         }
       }
       self.front_buf = Some(buf);
@@ -322,9 +340,12 @@ impl ProxyClient<HttpServer> for Client {
             self.front_interest.insert(EventSet::writable());
             // prepare to provide this to writable
           }
-          Err(e) => {
-            println!("not implemented; client err={:?}", e);
-            //self.interest.remove(EventSet::readable());
+          Err(e) => match e.kind() {
+            ErrorKind::BrokenPipe => {
+              println!("broken pipe reading from the backend");
+              return ClientResult::CloseClient;
+            },
+            _ => println!("not implemented; client err={:?}", e),
           }
         };
       }
