@@ -18,7 +18,7 @@ use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use network::buffer::Buffer;
 
-use parser::http11::{RequestState,HttpState,parse_until_stop,BufferMove};
+use parser::http11::{RequestState,parse_until_stop,BufferMove};
 use nom::HexDisplay;
 
 use messages::{Command,HttpFront};
@@ -179,7 +179,7 @@ impl ProxyClient<HttpServer> for Client {
             self.http_state = parse_until_stop(&self.http_state, &mut buf);
             println!("parse_until_stop returned {:?}", self.http_state);
             //println!("data is now:\n{}", buf.data().to_hex(8));
-            if let HttpState::Error(_) = self.http_state.state {
+            if self.http_state.is_error() {
               self.front_buf = Some(buf);
               return ClientResult::CloseClient;
             }

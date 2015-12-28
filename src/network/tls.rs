@@ -239,7 +239,7 @@ impl ProxyClient<TlsServer> for Client {
           } else {
             self.http_state = parse_until_stop(&self.http_state, &mut buf);
             println!("parse_until_stop returned {:?}", self.http_state);
-            if let HttpState::Error(_) = self.http_state.state {
+            if self.http_state.is_error() {
               println!("HTTP parsing error");
               return ClientResult::CloseClient;
             }

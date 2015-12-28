@@ -332,6 +332,14 @@ impl RequestState {
     self.state.has_host()
   }
 
+  pub fn is_error(&self) -> bool {
+    if let HttpState::Error(_) = self.state {
+      true
+    } else {
+      false
+    }
+  }
+
   pub fn is_proxying(&self) -> bool {
     self.state.is_proxying()
   }
