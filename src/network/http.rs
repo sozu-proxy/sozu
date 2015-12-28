@@ -44,6 +44,7 @@ struct Client {
   sock:           TcpStream,
   backend:        Option<TcpStream>,
   http_state:     (usize, HttpState),
+  should_copy:    Option<usize>,
   front_buf:      Option<Buffer>,
   back_buf:       Option<Buffer>,
   token:          Option<Token>,
@@ -61,6 +62,7 @@ impl Client {
       sock:           sock,
       backend:        None,
       http_state:     (0, HttpState::Initial),
+      should_copy:    None,
       front_buf:      Some(Buffer::with_capacity(12000)),
       back_buf:       Some(Buffer::with_capacity(12000)),
       token:          None,
@@ -182,7 +184,6 @@ impl ProxyClient<HttpServer> for Client {
         Ok(Some(r)) => {
           //println!("FRONT [{:?}]: read {} bytes", self.token, r);
           buf.fill(r);
-          println!("READ {} bytes, data is now:\n{}", r, buf.data().to_hex(8));
           if self.is_proxying() {
             if let Some((front,back)) = self.tokens() {
               //println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
@@ -192,10 +193,13 @@ impl ProxyClient<HttpServer> for Client {
           } else {
             self.http_state = parse_until_stop(&self.http_state.1, &mut buf, self.http_state.0);
             println!("parse_until_stop returned {:?}", self.http_state);
-            println!("data is now:\n{}", buf.data().to_hex(8));
+            //println!("data is now:\n{}", buf.data().to_hex(8));
             if let HttpState::Error(_) = self.http_state.1 {
               self.front_buf = Some(buf);
               return ClientResult::CloseClient;
+            }
+            if self.is_proxying() {
+              self.should_copy = self.http_state.1.should_copy(self.http_state.0);
             }
             //println!("new state: {:?}", self.http_state);
             if self.has_host() {
@@ -276,12 +280,11 @@ impl ProxyClient<HttpServer> for Client {
     if let Some(mut buf) = self.front_buf.take() {
       //println!("back_writable: front_buf contains {} data, {} space", buf.available_data(), buf.available_space());
 
-      let should_copy = self.http_state.1.should_copy(self.http_state.0);
-      println!("WRITABLE, should copy? {:?}", should_copy);
-      println!("data:\n{}", buf.data().to_hex(8));
+      println!("WRITABLE, should copy? {:?}", self.should_copy);
+      //println!("data:\n{}", buf.data().to_hex(8));
       let tokens = self.tokens();
       if let Some(ref mut sock) = self.backend {
-        match sock.try_write(&(buf.data())[..should_copy.unwrap_or(0)]) {
+        match sock.try_write(&(buf.data())[..self.should_copy.unwrap_or(0)]) {
           Ok(None) => {
             println!("client flushing buf; WOULDBLOCK");
 
@@ -289,7 +292,14 @@ impl ProxyClient<HttpServer> for Client {
           }
           Ok(Some(r)) => {
             buf.consume(r);
-            self.http_state.0 = self.http_state.0 - r;
+            //self.http_state.0 = self.http_state.0 - r;
+            if let Some(sz) = self.should_copy {
+              if sz == r {
+                self.should_copy = None;
+              } else {
+                self.should_copy = Some(sz - r);
+              }
+            }
             //FIXME what happens if not everything was written?
             if let Some((front,back)) = tokens {
               println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
