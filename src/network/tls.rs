@@ -223,7 +223,7 @@ impl ProxyClient<TlsServer> for Client {
         Ok(r) => {
           println!("FRONT [{:?}]: read {} bytes", self.token, r);
           buf.fill(r);
-          if self.http_state.state.is_proxying() {
+          if self.http_state.is_proxying() {
             //if let Some((front,back)) = self.tokens() {
             //  println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
             //}
@@ -244,7 +244,7 @@ impl ProxyClient<TlsServer> for Client {
               return ClientResult::CloseClient;
             }
             //println!("new state: {:?}", self.http_state);
-            if self.http_state.state.has_host() {
+            if self.http_state.has_host() {
               self.rx_count = buf.available_data();
               self.front_interest.remove(EventSet::readable());
               self.back_interest.insert(EventSet::writable());
@@ -531,7 +531,7 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
   }
 
   fn connect_to_backend(&mut self, client: &mut Client) -> Option<TcpStream> {
-    if let (Some(host), Some(rl)) = (client.http_state.state.get_host(), client.http_state.state.get_request_line()) {
+    if let (Some(host), Some(rl)) = (client.http_state.get_host(), client.http_state.get_request_line()) {
       if let Some(back) = self.backend_from_request(&host, &rl.uri) {
         if let Ok(socket) = TcpStream::connect(&back) {
           client.http_state = RequestState {

@@ -169,7 +169,7 @@ impl ProxyClient<HttpServer> for Client {
         Ok(Some(r)) => {
           //println!("FRONT [{:?}]: read {} bytes", self.token, r);
           buf.fill(r);
-          if self.http_state.state.is_proxying() {
+          if self.http_state.is_proxying() {
             if let Some((front,back)) = self.tokens() {
               //println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
             }
@@ -183,11 +183,11 @@ impl ProxyClient<HttpServer> for Client {
               self.front_buf = Some(buf);
               return ClientResult::CloseClient;
             }
-            if self.http_state.state.is_proxying() {
-              self.should_copy = self.http_state.state.should_copy(self.http_state.position);
+            if self.http_state.is_proxying() {
+              self.should_copy = self.http_state.should_copy();
             }
             //println!("new state: {:?}", self.http_state);
-            if self.http_state.state.has_host() {
+            if self.http_state.has_host() {
               self.rx_count = buf.available_data();
               self.reregister(event_loop);
               self.front_buf = Some(buf);
@@ -480,7 +480,7 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
   }
 
   fn connect_to_backend(&mut self, client: &mut Client) -> Option<TcpStream> {
-    if let (Some(host), Some(rl)) = (client.http_state.state.get_host(), client.http_state.state.get_request_line()) {
+    if let (Some(host), Some(rl)) = (client.http_state.get_host(), client.http_state.get_request_line()) {
       if let Some(back) = self.backend_from_request(&host, &rl.uri) {
         if let Ok(socket) = TcpStream::connect(&back) {
           client.status     = ConnectionStatus::Connected;
