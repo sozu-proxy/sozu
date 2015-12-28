@@ -85,24 +85,6 @@ impl Client {
 
   pub fn close(&self) {
   }
-
-
-  fn has_host(&self) -> bool {
-    if let HttpState::HasHost(_, _) = self.http_state.1 {
-      true
-    } else {
-      false
-    }
-  }
-  fn is_proxying(&self) -> bool {
-    if let HttpState::Proxying(_, _) = self.http_state.1 {
-      true
-    } else {
-      false
-    }
-  }
-
-
 }
 
 impl ProxyClient<TlsServer> for Client {
@@ -241,7 +223,7 @@ impl ProxyClient<TlsServer> for Client {
         Ok(r) => {
           println!("FRONT [{:?}]: read {} bytes", self.token, r);
           buf.fill(r);
-          if self.is_proxying() {
+          if self.http_state.1.is_proxying() {
             //if let Some((front,back)) = self.tokens() {
             //  println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
             //}
@@ -262,7 +244,7 @@ impl ProxyClient<TlsServer> for Client {
               return ClientResult::CloseClient;
             }
             //println!("new state: {:?}", self.http_state);
-            if self.has_host() {
+            if self.http_state.1.has_host() {
               self.rx_count = buf.available_data();
               self.front_interest.remove(EventSet::readable());
               self.back_interest.insert(EventSet::writable());

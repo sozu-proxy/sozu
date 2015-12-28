@@ -256,6 +256,23 @@ pub enum HttpState {
 }
 
 impl HttpState {
+  pub fn has_host(&self) -> bool {
+    match *self {
+      HttpState::HasHost(_, _)            |
+      HttpState::Request(_, _)            |
+      HttpState::RequestWithBody(_, _, _) |
+      HttpState::Proxying(_, _)           => true,
+      _                                   => false
+    }
+  }
+
+  pub fn is_proxying(&self) -> bool {
+    match *self {
+      HttpState::Request(_,_) | HttpState::RequestWithBody(_,_,_) => true,
+      _                                                           => false
+    }
+  }
+
   pub fn get_host(&self) -> Option<String> {
     match *self {
       HttpState::HasHost(_, ref host)            |

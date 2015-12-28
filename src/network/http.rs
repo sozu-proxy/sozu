@@ -88,21 +88,6 @@ impl Client {
   pub fn close(&self) {
   }
 
-
-  fn has_host(&self) -> bool {
-    match self.http_state.1 {
-      HttpState::HasHost(_,_) | HttpState::HasHostAndLength(_,_,_) |
-      HttpState::Request(_,_) | HttpState::RequestWithBody(_,_,_) => true,
-      _ => false
-    }
-  }
-  fn is_proxying(&self) -> bool {
-    match self.http_state.1 {
-      HttpState::Request(_,_) | HttpState::RequestWithBody(_,_,_) => true,
-      _ => false
-    }
-  }
-
   fn reregister(&mut self, event_loop: &mut EventLoop<HttpServer>) {
     self.front_interest.remove(EventSet::readable());
     self.back_interest.insert(EventSet::writable());
@@ -184,7 +169,7 @@ impl ProxyClient<HttpServer> for Client {
         Ok(Some(r)) => {
           //println!("FRONT [{:?}]: read {} bytes", self.token, r);
           buf.fill(r);
-          if self.is_proxying() {
+          if self.http_state.1.is_proxying() {
             if let Some((front,back)) = self.tokens() {
               //println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
             }
@@ -198,11 +183,11 @@ impl ProxyClient<HttpServer> for Client {
               self.front_buf = Some(buf);
               return ClientResult::CloseClient;
             }
-            if self.is_proxying() {
+            if self.http_state.1.is_proxying() {
               self.should_copy = self.http_state.1.should_copy(self.http_state.0);
             }
             //println!("new state: {:?}", self.http_state);
-            if self.has_host() {
+            if self.http_state.1.has_host() {
               self.rx_count = buf.available_data();
               self.reregister(event_loop);
               self.front_buf = Some(buf);
