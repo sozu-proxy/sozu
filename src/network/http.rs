@@ -18,7 +18,7 @@ use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use network::buffer::Buffer;
 
-use parser::http11::{HttpState,parse_until_stop,BufferMove};
+use parser::http11::{RequestState,HttpState,parse_until_stop,BufferMove};
 use nom::HexDisplay;
 
 use messages::{Command,HttpFront};
@@ -43,7 +43,7 @@ pub enum HttpProxyOrder {
 struct Client {
   sock:           TcpStream,
   backend:        Option<TcpStream>,
-  http_state:     (usize, HttpState),
+  http_state:     RequestState,
   should_copy:    Option<usize>,
   front_buf:      Option<Buffer>,
   back_buf:       Option<Buffer>,
@@ -61,7 +61,7 @@ impl Client {
     Some(Client {
       sock:           sock,
       backend:        None,
-      http_state:     (0, HttpState::Initial),
+      http_state:     RequestState::new(),
       should_copy:    None,
       front_buf:      Some(Buffer::with_capacity(12000)),
       back_buf:       Some(Buffer::with_capacity(12000)),
@@ -169,7 +169,7 @@ impl ProxyClient<HttpServer> for Client {
         Ok(Some(r)) => {
           //println!("FRONT [{:?}]: read {} bytes", self.token, r);
           buf.fill(r);
-          if self.http_state.1.is_proxying() {
+          if self.http_state.state.is_proxying() {
             if let Some((front,back)) = self.tokens() {
               //println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
             }
@@ -179,15 +179,15 @@ impl ProxyClient<HttpServer> for Client {
             self.http_state = parse_until_stop(&self.http_state, &mut buf);
             println!("parse_until_stop returned {:?}", self.http_state);
             //println!("data is now:\n{}", buf.data().to_hex(8));
-            if let HttpState::Error(_) = self.http_state.1 {
+            if let HttpState::Error(_) = self.http_state.state {
               self.front_buf = Some(buf);
               return ClientResult::CloseClient;
             }
-            if self.http_state.1.is_proxying() {
-              self.should_copy = self.http_state.1.should_copy(self.http_state.0);
+            if self.http_state.state.is_proxying() {
+              self.should_copy = self.http_state.state.should_copy(self.http_state.position);
             }
             //println!("new state: {:?}", self.http_state);
-            if self.http_state.1.has_host() {
+            if self.http_state.state.has_host() {
               self.rx_count = buf.available_data();
               self.reregister(event_loop);
               self.front_buf = Some(buf);
@@ -480,7 +480,7 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
   }
 
   fn connect_to_backend(&mut self, client: &mut Client) -> Option<TcpStream> {
-    if let (Some(host), Some(rl)) = (client.http_state.1.get_host(), client.http_state.1.get_request_line()) {
+    if let (Some(host), Some(rl)) = (client.http_state.state.get_host(), client.http_state.state.get_request_line()) {
       if let Some(back) = self.backend_from_request(&host, &rl.uri) {
         if let Ok(socket) = TcpStream::connect(&back) {
           client.status     = ConnectionStatus::Connected;
