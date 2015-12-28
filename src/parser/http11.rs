@@ -360,18 +360,30 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
         res => default_response(state, res)
       }
     },
-    HttpState::HasRequestLine(ref rl) | HttpState::HasHost(ref rl, _) |
-      HttpState::HasHostAndLength(ref rl, _, _) => {
-      match headers(buf) {
-        IResult::Done(i, v)    => {
-          let mut current_state = state.clone();
-          for header in &v {
-            current_state = validate_request_header(current_state, header);
-          }
-
-          (BufferMove::Advance(buf.offset(i)),current_state)
+    HttpState::HasRequestLine(ref rl) | HttpState::HasHost(ref rl, _) => {
+      match message_header(buf) {
+        IResult::Done(i, header) => {
+          (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
         },
         res => default_response(state, res)
+      }
+    },
+    HttpState::HasHostAndLength(ref rl, ref h, ref l) => {
+      match message_header(buf) {
+        IResult::Done(i, header) => {
+          (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
+        },
+        IResult::Incomplete(_) => (BufferMove::None, state.clone()),
+        IResult::Error(_)      => {
+          println!("HasHostAndLength could not parse header for input:\n{}\n", buf.to_hex(8));
+          match crlf(buf) {
+            IResult::Done(i, _) => {
+              println!("headers parsed, stopping");
+              (BufferMove::Advance(buf.offset(i)), HttpState::HeadersParsed(rl.clone(), h.clone(), l.clone()))
+            },
+            res => default_response(state, res)
+          }
+        }
       }
     },
     _ => {
@@ -387,12 +399,15 @@ pub fn parse_until_stop(state: &HttpState, buf: &mut Buffer, start_position: usi
   loop {
     println!("pos[{}]: {:?}", position, current_state);
     let (mv, new_state) = parse_request(&current_state, &buf.data()[position..]);
-    println!("mv: {:?}, new state: {:?}", mv, new_state);
+    println!("input:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[position..]).to_hex(8), mv, new_state);
     current_state = new_state;
     if let BufferMove::Advance(sz) = mv {
       assert!(sz != 0, "buffer move should not be 0");
       position+=sz;
     } else {
+      break;
+    }
+    if let HttpState::HeadersParsed(_,_,_) = current_state {
       break;
     }
   }
@@ -540,7 +555,7 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        (109, HttpState::HasHostAndLength(
+        (109, HttpState::HeadersParsed(
           RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
           String::from("localhost:8888"),
           LengthInformation::Length(200)
@@ -566,7 +581,7 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        (109, HttpState::HasHostAndLength(
+        (109, HttpState::HeadersParsed(
           RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
           String::from("localhost:8888"),
           LengthInformation::Length(200)
@@ -593,7 +608,7 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        (116, HttpState::HasHostAndLength(
+        (116, HttpState::HeadersParsed(
           RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
           String::from("localhost:8888"),
           LengthInformation::Chunked
@@ -617,7 +632,7 @@ mod tests {
 
       let result = parse_until_stop(&initial, &mut buf, 0);
       println!("result: {:?}", result);
-      assert_eq!(result, (130, HttpState::Error(ErrorState::InvalidHttp)));
+      assert_eq!(result, (128, HttpState::Error(ErrorState::InvalidHttp)));
   }
 
   #[test]
@@ -639,7 +654,7 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        (136, HttpState::HasHostAndLength(
+        (136, HttpState::HeadersParsed(
           RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
           String::from("localhost:8888"),
           LengthInformation::Chunked
