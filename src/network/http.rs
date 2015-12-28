@@ -87,10 +87,10 @@ impl Client {
 
 
   fn has_host(&self) -> bool {
-    if let HttpState::HasHost(_, _) = self.http_state.1 {
-      true
-    } else {
-      false
+    match self.http_state.1 {
+      HttpState::HasHost(_,_) | HttpState::HasHostAndLength(_,_,_) |
+      HttpState::HeadersParsed(_,_,_) | HttpState::Proxying(_,_) => true,
+      _ => false
     }
   }
   fn is_proxying(&self) -> bool {
