@@ -316,24 +316,28 @@ impl HttpState {
 
 #[derive(Debug,PartialEq)]
 pub struct RequestState {
-  pub position: usize,
-  pub state:    HttpState
+  pub req_position: usize,
+  pub res_position: usize,
+  pub request:      HttpState,
+  pub response:     HttpState
 }
 
 impl RequestState {
   pub fn new() -> RequestState {
     RequestState {
-      position: 0,
-      state:    HttpState::Initial
+      req_position: 0,
+      res_position: 0,
+      request:  HttpState::Initial,
+      response: HttpState::Initial
     }
   }
 
   pub fn has_host(&self) -> bool {
-    self.state.has_host()
+    self.request.has_host()
   }
 
   pub fn is_error(&self) -> bool {
-    if let HttpState::Error(_) = self.state {
+    if let HttpState::Error(_) = self.request {
       true
     } else {
       false
@@ -341,23 +345,23 @@ impl RequestState {
   }
 
   pub fn is_proxying(&self) -> bool {
-    self.state.is_proxying()
+    self.request.is_proxying()
   }
 
   pub fn get_host(&self) -> Option<String> {
-    self.state.get_host()
+    self.request.get_host()
   }
 
   pub fn get_uri(&self) -> Option<String> {
-    self.state.get_uri()
+    self.request.get_uri()
   }
 
   pub fn get_request_line(&self) -> Option<RRequestLine> {
-    self.state.get_request_line()
+    self.request.get_request_line()
   }
 
   pub fn should_copy(&self) -> Option<usize> {
-    self.state.should_copy(self.position)
+    self.request.should_copy(self.req_position)
   }
 }
 
@@ -495,13 +499,14 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
 }
 
 pub fn parse_until_stop(rs: &RequestState, buf: &mut Buffer) -> RequestState {
-  let mut current_state = rs.state.clone();
-  let mut position      = rs.position;
+  let mut current_state = rs.request.clone();
+  let mut position      = rs.req_position;
   //let (mut position, mut current_state) = state;
   loop {
-    println!("pos[{}]: {:?}", position, current_state);
+    //println!("pos[{}]: {:?}", position, current_state);
     let (mv, new_state) = parse_request(&current_state, &buf.data()[position..]);
-    println!("input:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[position..]).to_hex(8), mv, new_state);
+    //println!("input:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[position..]).to_hex(8), mv, new_state);
+    //println!("mv: {:?}, new state: {:?}\n", mv, new_state);
     current_state = new_state;
     if let BufferMove::Advance(sz) = mv {
       assert!(sz != 0, "buffer move should not be 0");
@@ -516,8 +521,10 @@ pub fn parse_until_stop(rs: &RequestState, buf: &mut Buffer) -> RequestState {
     }
   }
   RequestState {
-    position: position,
-    state:    current_state
+    req_position: position,
+    res_position: rs.res_position,
+    request:  current_state,
+    response: rs.response.clone()
   }
 }
 
@@ -663,12 +670,14 @@ mod tests {
       assert_eq!(
         result,
         RequestState {
-          position: 109,
-          state: HttpState::RequestWithBody(
+          req_position: 109,
+          res_position: 0,
+          request: HttpState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             String::from("localhost:8888"),
             LengthInformation::Length(200)
-          )
+          ),
+          response: HttpState::Initial
         }
       );
   }
@@ -683,8 +692,10 @@ mod tests {
             Content-Length: 200\r\n\
             \r\n";
       let initial = RequestState {
-        position: 26,
-        state:    HttpState::HasRequestLine(RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11")})
+        req_position: 26,
+        res_position: 0,
+        request:  HttpState::HasRequestLine(RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11")}),
+        response: HttpState::Initial
       };
 
       let mut buf = Buffer::with_capacity(2048);
@@ -696,12 +707,14 @@ mod tests {
       assert_eq!(
         result,
         RequestState {
-          position: 109,
-          state:    HttpState::RequestWithBody(
+          req_position: 109,
+          res_position: 0,
+          request:    HttpState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             String::from("localhost:8888"),
             LengthInformation::Length(200)
-          )
+          ),
+          response: HttpState::Initial
         }
       );
   }
@@ -726,12 +739,14 @@ mod tests {
       assert_eq!(
         result,
         RequestState {
-          position: 116,
-          state:    HttpState::RequestWithBody(
+          req_position: 116,
+          res_position: 0,
+          request:    HttpState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             String::from("localhost:8888"),
             LengthInformation::Chunked
-          )
+          ),
+          response: HttpState::Initial
         }
       );
   }
@@ -752,7 +767,15 @@ mod tests {
 
       let result = parse_until_stop(&initial, &mut buf);
       println!("result: {:?}", result);
-      assert_eq!(result, RequestState { position: 128, state: HttpState::Error(ErrorState::InvalidHttp)});
+      assert_eq!(
+        result,
+        RequestState {
+          req_position: 128,
+          res_position: 0,
+          request: HttpState::Error(ErrorState::InvalidHttp),
+          response: HttpState::Initial
+        }
+      );
   }
 
   // if there was a content-length, the chunked transfer encoding takes precedence
@@ -776,12 +799,14 @@ mod tests {
       assert_eq!(
         result,
         RequestState {
-          position: 136,
-          state:    HttpState::RequestWithBody(
+          req_position: 136,
+          res_position: 0,
+          request:  HttpState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             String::from("localhost:8888"),
             LengthInformation::Chunked
-          )
+          ),
+          response: HttpState::Initial
         }
       );
   }
@@ -803,11 +828,13 @@ mod tests {
       assert_eq!(
         result,
         RequestState {
-          position: 59,
-          state:    HttpState::Request(
+          req_position: 59,
+          res_position: 0,
+          request:  HttpState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
             String::from("localhost:8888")
-          )
+          ),
+          response: HttpState::Initial
         }
       );
 

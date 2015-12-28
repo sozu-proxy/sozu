@@ -535,8 +535,10 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
       if let Some(back) = self.backend_from_request(&host, &rl.uri) {
         if let Ok(socket) = TcpStream::connect(&back) {
           client.http_state = RequestState {
-            position: client.http_state.position,
-            state:    HttpState::Proxying(rl, host)
+            req_position: client.http_state.req_position,
+            res_position: 0,
+            request:  HttpState::Proxying(rl, host),
+            response: HttpState::Initial
           };
           client.status     = ConnectionStatus::Connected;
           return Some(socket);
