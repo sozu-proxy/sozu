@@ -176,7 +176,7 @@ impl ProxyClient<HttpServer> for Client {
             self.reregister(event_loop);
             self.rx_count = self.rx_count + r;
           } else {
-            self.http_state = parse_until_stop(&self.http_state.1, &mut buf, self.http_state.0);
+            self.http_state = parse_until_stop(&self.http_state, &mut buf);
             println!("parse_until_stop returned {:?}", self.http_state);
             //println!("data is now:\n{}", buf.data().to_hex(8));
             if let HttpState::Error(_) = self.http_state.1 {

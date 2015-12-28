@@ -447,9 +447,10 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
   }
 }
 
-pub fn parse_until_stop(state: &HttpState, buf: &mut Buffer, start_position: usize) -> (usize, HttpState) {
-  let mut current_state = state.clone();
-  let mut position = start_position;
+pub fn parse_until_stop(state: &(usize, HttpState), buf: &mut Buffer) -> (usize, HttpState) {
+  let mut current_state = state.1.clone();
+  let mut position      = state.0;
+  //let (mut position, mut current_state) = state;
   loop {
     println!("pos[{}]: {:?}", position, current_state);
     let (mv, new_state) = parse_request(&current_state, &buf.data()[position..]);
@@ -602,12 +603,12 @@ mod tests {
             Accept: */*\r\n\
             Content-Length: 200\r\n\
             \r\n";
-      let initial = HttpState::Initial;
+      let initial = (0, HttpState::Initial);
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_until_stop(&initial, &mut buf, 0);
+      let result = parse_until_stop(&initial, &mut buf);
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -628,12 +629,12 @@ mod tests {
             Accept: */*\r\n\
             Content-Length: 200\r\n\
             \r\n";
-      let initial = HttpState::HasRequestLine(RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11")});
+      let initial = (26, HttpState::HasRequestLine(RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11")}));
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_until_stop(&initial, &mut buf, 26);
+      let result = parse_until_stop(&initial, &mut buf);
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -655,12 +656,12 @@ mod tests {
             Transfer-Encoding: chunked\r\n\
             Accept: */*\r\n\
             \r\n";
-      let initial = HttpState::Initial;
+      let initial = (0, HttpState::Initial);
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_until_stop(&initial, &mut buf, 0);
+      let result = parse_until_stop(&initial, &mut buf);
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -682,11 +683,11 @@ mod tests {
             Accept: */*\r\n\
             Content-Length: 200\r\n\
             \r\n";
-      let initial = HttpState::Initial;
+      let initial = (0, HttpState::Initial);
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
-      let result = parse_until_stop(&initial, &mut buf, 0);
+      let result = parse_until_stop(&initial, &mut buf);
       println!("result: {:?}", result);
       assert_eq!(result, (128, HttpState::Error(ErrorState::InvalidHttp)));
   }
@@ -701,12 +702,12 @@ mod tests {
             Transfer-Encoding: chunked\r\n\
             Accept: */*\r\n\
             \r\n";
-      let initial = HttpState::Initial;
+      let initial = (0, HttpState::Initial);
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_until_stop(&initial, &mut buf, 0);
+      let result = parse_until_stop(&initial, &mut buf);
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -725,12 +726,12 @@ mod tests {
             Host: localhost:8888\r\n\
             Connection: Close\r\n\
             \r\n";
-      let initial = HttpState::Initial;
+      let initial = (0, HttpState::Initial);
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_until_stop(&initial, &mut buf, 0);
+      let result = parse_until_stop(&initial, &mut buf);
       println!("result: {:?}", result);
       assert_eq!(
         result,
