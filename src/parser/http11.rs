@@ -249,7 +249,8 @@ pub enum HttpState {
   HasHost(RRequestLine, Host),
   HasLength(RRequestLine, LengthInformation),
   HasHostAndLength(RRequestLine, Host, LengthInformation),
-  HeadersParsed(RRequestLine, Host, LengthInformation),
+  Request(RRequestLine, Host),
+  RequestWithBody(RRequestLine, Host, LengthInformation),
   Proxying(RRequestLine, Host)
   //Proxying(RRequestLine, Host, LengthInformation, BackendToken)
 }
@@ -257,7 +258,9 @@ pub enum HttpState {
 impl HttpState {
   pub fn get_host(&self) -> Option<String> {
     match *self {
-      HttpState::HasHost(_, ref host) |
+      HttpState::HasHost(_, ref host)            |
+      HttpState::Request(_, ref host)            |
+      HttpState::RequestWithBody(_, ref host, _) |
       HttpState::Proxying(_, ref host)    => Some(host.clone()),
       _                                   => None
     }
@@ -265,8 +268,10 @@ impl HttpState {
 
   pub fn get_uri(&self) -> Option<String> {
     match *self {
-      HttpState::HasRequestLine(ref rl) |
-      HttpState::HasHost(ref rl,_)      |
+      HttpState::HasRequestLine(ref rl)       |
+      HttpState::HasHost(ref rl,_)            |
+      HttpState::Request(ref rl , _)          |
+      HttpState::RequestWithBody(ref rl,_, _) |
       HttpState::Proxying(ref rl, _)         => Some(rl.uri.clone()),
       _                                      => None
     }
@@ -274,10 +279,20 @@ impl HttpState {
 
   pub fn get_request_line(&self) -> Option<RRequestLine> {
     match *self {
-      HttpState::HasRequestLine(ref rl) |
-      HttpState::HasHost(ref rl,_)      |
+      HttpState::HasRequestLine(ref rl)       |
+      HttpState::HasHost(ref rl,_)            |
+      HttpState::Request(ref rl , _)          |
+      HttpState::RequestWithBody(ref rl,_, _) |
       HttpState::Proxying(ref rl, _)         => Some(rl.clone()),
       _                                      => None
+    }
+  }
+
+  pub fn should_copy(&self, position: usize) -> Option<usize> {
+    match *self {
+      HttpState::RequestWithBody(_, _, LengthInformation::Length(l)) => Some(position + l),
+      HttpState::Request(_, _)                                       => Some(position),
+      _                                                              => None
     }
   }
 }
@@ -360,12 +375,32 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
         res => default_response(state, res)
       }
     },
-    HttpState::HasRequestLine(ref rl) | HttpState::HasHost(ref rl, _) => {
+    HttpState::HasRequestLine(ref rl) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
           (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
         },
         res => default_response(state, res)
+      }
+    },
+    HttpState::HasHost(ref rl, ref h) => {
+      match message_header(buf) {
+        IResult::Done(i, header) => {
+          (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
+        },
+        IResult::Incomplete(_) => (BufferMove::None, state.clone()),
+        IResult::Error(_)      => {
+          match crlf(buf) {
+            IResult::Done(i, _) => {
+              println!("headers parsed, stopping");
+              (BufferMove::Advance(buf.offset(i)), HttpState::Request(rl.clone(), h.clone()))
+            },
+            res => {
+              println!("HasHost could not parse header for input:\n{}\n", buf.to_hex(8));
+              default_response(state, res)
+            }
+          }
+        }
       }
     },
     HttpState::HasHostAndLength(ref rl, ref h, ref l) => {
@@ -375,13 +410,15 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
         },
         IResult::Incomplete(_) => (BufferMove::None, state.clone()),
         IResult::Error(_)      => {
-          println!("HasHostAndLength could not parse header for input:\n{}\n", buf.to_hex(8));
           match crlf(buf) {
             IResult::Done(i, _) => {
               println!("headers parsed, stopping");
-              (BufferMove::Advance(buf.offset(i)), HttpState::HeadersParsed(rl.clone(), h.clone(), l.clone()))
+              (BufferMove::Advance(buf.offset(i)), HttpState::RequestWithBody(rl.clone(), h.clone(), l.clone()))
             },
-            res => default_response(state, res)
+            res => {
+              println!("HasHostAndLength could not parse header for input:\n{}\n", buf.to_hex(8));
+              default_response(state, res)
+            }
           }
         }
       }
@@ -407,8 +444,10 @@ pub fn parse_until_stop(state: &HttpState, buf: &mut Buffer, start_position: usi
     } else {
       break;
     }
-    if let HttpState::HeadersParsed(_,_,_) = current_state {
-      break;
+    match current_state {
+      HttpState::Request(_,_) | HttpState::RequestWithBody(_,_,_) |
+        HttpState::Error(_) => break,
+      _ => ()
     }
   }
   (position, current_state)
@@ -555,7 +594,7 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        (109, HttpState::HeadersParsed(
+        (109, HttpState::RequestWithBody(
           RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
           String::from("localhost:8888"),
           LengthInformation::Length(200)
@@ -581,7 +620,7 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        (109, HttpState::HeadersParsed(
+        (109, HttpState::RequestWithBody(
           RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
           String::from("localhost:8888"),
           LengthInformation::Length(200)
@@ -608,7 +647,7 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        (116, HttpState::HeadersParsed(
+        (116, HttpState::RequestWithBody(
           RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
           String::from("localhost:8888"),
           LengthInformation::Chunked
@@ -654,7 +693,7 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        (136, HttpState::HeadersParsed(
+        (136, HttpState::RequestWithBody(
           RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
           String::from("localhost:8888"),
           LengthInformation::Chunked
@@ -662,6 +701,29 @@ mod tests {
       );
   }
 
+  #[test]
+  fn parse_request_without_length() {
+      let input =
+          b"GET / HTTP/1.1\r\n\
+            Host: localhost:8888\r\n\
+            Connection: Close\r\n\
+            \r\n";
+      let initial = HttpState::Initial;
+      let mut buf = Buffer::with_capacity(2048);
+      buf.write(&input[..]);
+
+      //let result = parse_request(&initial, input);
+      let result = parse_until_stop(&initial, &mut buf, 0);
+      println!("result: {:?}", result);
+      assert_eq!(
+        result,
+        (59, HttpState::Request(
+          RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
+          String::from("localhost:8888")
+        ))
+      );
+
+  }
   /*
   use std::str::from_utf8;
   use std::io::Write;
