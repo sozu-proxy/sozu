@@ -45,8 +45,8 @@ struct Client {
   backend:        Option<TcpStream>,
   http_state:     RequestState,
   stream:         NonblockingSslStream<TcpStream>,
-  front_buf:      Option<Buffer>,
-  back_buf:       Option<Buffer>,
+  front_buf:      Buffer,
+  back_buf:       Buffer,
   token:          Option<Token>,
   backend_token:  Option<Token>,
   back_interest:  EventSet,
@@ -62,8 +62,8 @@ impl Client {
       backend:        None,
       http_state:     RequestState::new(),
       stream:         stream,
-      front_buf:      Some(Buffer::with_capacity(12000)),
-      back_buf:       Some(Buffer::with_capacity(12000)),
+      front_buf:      Buffer::with_capacity(12000),
+      back_buf:       Buffer::with_capacity(12000),
       token:          None,
       backend_token:  None,
       back_interest:  EventSet::all(),
@@ -145,53 +145,37 @@ impl ProxyClient<TlsServer> for Client {
 
   // Forward content to client
   fn writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
-    //println!("in writable()");
-    if let Some(mut buf) = self.back_buf.take() {
-      //println!("in writable 2: back_buf contains {} bytes", buf.remaining());
-      //println!("writable back_buf({}): {}", b.remaining(), from_utf8((&b as &Buf).bytes()).unwrap());
-      //if self.status == ConnectionStatus::ServerClosed && b.remaining() == 0 {
-      if buf.available_data() == 0 {
-        self.back_buf = Some(buf);
-        return ClientResult::Continue;
+    //println!("writable back_buf({}): {}", b.remaining(), from_utf8((&b as &Buf).bytes()).unwrap());
+    if self.back_buf.available_data() == 0 {
+      return ClientResult::Continue;
+    }
+
+    match self.stream.write(self.back_buf.data()) {
+      Ok(r) => {
+        //FIXME what happens if not everything was written?
+        //if let Some((front,back)) = self.tokens() {
+        //  println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
+        //}
+        self.back_buf.consume(r);
+
+        self.tx_count = self.tx_count + r;
+
+        //self.front_interest.insert(EventSet::readable());
+        self.front_interest.remove(EventSet::writable());
+        self.back_interest.insert(EventSet::readable());
+      },
+      Err(NonblockingSslError::WantRead) => {
+        self.front_interest.insert(EventSet::readable());
+        //println!("writable WantRead");
+      },
+      Err(NonblockingSslError::WantWrite) => {
+        self.front_interest.insert(EventSet::writable());
+        //println!("writable WantWrite");
       }
-
-      //let mut b:MutByteBuf = buf.flip();
-      //let sl:&mut[u8] = b.mut_bytes();
-      //match self.sock.try_write_buf(&mut buf) {
-      match self.stream.write(buf.data()) {
-        /*Ok(None) => {
-          println!("client flushing buf; WOULDBLOCK");
-
-          self.back_buf = Some(buf);
-          self.front_interest.insert(EventSet::writable());
-        },*/
-        Ok(r) => {
-          //FIXME what happens if not everything was written?
-          //if let Some((front,back)) = self.tokens() {
-          //  println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
-          //}
-          buf.consume(r);
-
-          self.tx_count = self.tx_count + r;
-
-          //self.front_interest.insert(EventSet::readable());
-          self.front_interest.remove(EventSet::writable());
-          self.back_interest.insert(EventSet::readable());
-        },
-        Err(NonblockingSslError::WantRead) => {
-          self.front_interest.insert(EventSet::readable());
-          //println!("writable WantRead");
-        },
-        Err(NonblockingSslError::WantWrite) => {
-          self.front_interest.insert(EventSet::writable());
-          //println!("writable WantWrite");
-        }
-        Err(e) => {
-          println!("TLS client err={:?}", e);
-          return ClientResult::CloseClient;
-        }
+      Err(e) => {
+        println!("TLS client err={:?}", e);
+        return ClientResult::CloseClient;
       }
-      self.back_buf = Some(buf);
     }
     if let Some((frontend_token,backend_token)) = self.tokens() {
       if let Some(ref sock) = self.backend {
@@ -206,19 +190,36 @@ impl ProxyClient<TlsServer> for Client {
   // Read content from the client
   fn readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
-
-    if let Some(mut buf) = self.front_buf.take() {
-      match self.stream.read(unsafe { buf.space() }) {
-        Ok(0) => {
-          self.front_interest.insert(EventSet::readable());
-        },
-        Ok(r) => {
-          println!("FRONT [{:?}]: read {} bytes", self.token, r);
-          buf.fill(r);
-          if self.http_state.is_proxying() {
-            //if let Some((front,back)) = self.tokens() {
-            //  println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-            //}
+    match self.stream.read(unsafe { self.front_buf.space() }) {
+      Ok(0) => {
+        self.front_interest.insert(EventSet::readable());
+      },
+      Ok(r) => {
+        println!("FRONT [{:?}]: read {} bytes", self.token, r);
+        self.front_buf.fill(r);
+        if self.http_state.is_proxying() {
+          //if let Some((front,back)) = self.tokens() {
+          //  println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+          //}
+          self.front_interest.remove(EventSet::readable());
+          self.back_interest.insert(EventSet::writable());
+          if let Some((frontend_token,backend_token)) = self.tokens() {
+            if let Some(ref sock) = self.backend {
+              event_loop.reregister(sock, backend_token, EventSet::readable(), PollOpt::edge());
+            }
+            event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+          }
+          self.rx_count = self.rx_count + r;
+        } else {
+          self.http_state = parse_until_stop(&self.http_state, &mut self.front_buf);
+          println!("parse_until_stop returned {:?}", self.http_state);
+          if self.http_state.is_error() {
+            println!("HTTP parsing error");
+            return ClientResult::CloseClient;
+          }
+          //println!("new state: {:?}", self.http_state);
+          if self.http_state.has_host() {
+            self.rx_count = self.front_buf.available_data();
             self.front_interest.remove(EventSet::readable());
             self.back_interest.insert(EventSet::writable());
             if let Some((frontend_token,backend_token)) = self.tokens() {
@@ -227,54 +228,31 @@ impl ProxyClient<TlsServer> for Client {
               }
               event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
             }
-            self.rx_count = self.rx_count + r;
-          } else {
-            self.http_state = parse_until_stop(&self.http_state, &mut buf);
-            println!("parse_until_stop returned {:?}", self.http_state);
-            if self.http_state.is_error() {
-              println!("HTTP parsing error");
-              return ClientResult::CloseClient;
+            //println!("is now proxying, front buf flipped");
+            if let Some(frontend_token) = self.token {
+              event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
             }
-            //println!("new state: {:?}", self.http_state);
-            if self.http_state.has_host() {
-              self.rx_count = buf.available_data();
-              self.front_interest.remove(EventSet::readable());
-              self.back_interest.insert(EventSet::writable());
-              if let Some((frontend_token,backend_token)) = self.tokens() {
-                if let Some(ref sock) = self.backend {
-                  event_loop.reregister(sock, backend_token, EventSet::readable(), PollOpt::edge());
-                }
-                event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-              }
-              //println!("is now proxying, front buf flipped");
-              self.front_buf = Some(buf);
-              if let Some(frontend_token) = self.token {
-                event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-              }
-              return ClientResult::ConnectBackend;
+            return ClientResult::ConnectBackend;
 
-            } else {
-              self.front_interest.insert(EventSet::readable());
-            }
+          } else {
+            self.front_interest.insert(EventSet::readable());
           }
-        },
-        Err(NonblockingSslError::WantRead) => {
-          self.front_interest.insert(EventSet::readable());
-          //println!("writable WantRead");
-        },
-        Err(NonblockingSslError::WantWrite) => {
-          self.front_interest.insert(EventSet::writable());
-          //println!("writable WantWrite");
-        },
-        Err(e) => {
-          println!("TLS client err={:?}", e);
-          return ClientResult::CloseClient;
         }
+      },
+      Err(NonblockingSslError::WantRead) => {
+        self.front_interest.insert(EventSet::readable());
+        //println!("writable WantRead");
+      },
+      Err(NonblockingSslError::WantWrite) => {
+        self.front_interest.insert(EventSet::writable());
+        //println!("writable WantWrite");
+      },
+      Err(e) => {
+        println!("TLS client err={:?}", e);
+        return ClientResult::CloseClient;
       }
-      self.front_buf = Some(buf);
-    } else {
-      println!("FRONT [{:?}]: front_mut_buf unavailable", self.token);
     }
+
     if let Some(frontend_token) = self.token {
       event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
@@ -283,33 +261,27 @@ impl ProxyClient<TlsServer> for Client {
 
   // Forward content to application
   fn back_writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
-    if let Some(mut buf) = self.front_buf.take() {
-      //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
+    //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
+    if let Some(ref mut sock) = self.backend {
+      match sock.try_write(&mut self.front_buf.data()) {
+        Ok(None) => {
+          println!("client flushing buf; WOULDBLOCK");
 
-      if let Some(ref mut sock) = self.backend {
-        match sock.try_write(&mut buf.data()) {
-          Ok(None) => {
-            println!("client flushing buf; WOULDBLOCK");
-
-            self.back_interest.insert(EventSet::writable());
-          }
-          Ok(Some(r)) => {
-            //FIXME what happens if not everything was written?
-            //if let Some((front,back)) = self.tokens() {
-            //  println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-            //}
-            buf.consume(r);
-
-            self.front_interest.insert(EventSet::readable());
-            self.back_interest.remove(EventSet::writable());
-            self.back_interest.insert(EventSet::readable());
-          }
-          Err(e) =>  println!("not implemented; client err={:?}", e),
+          self.back_interest.insert(EventSet::writable());
         }
+        Ok(Some(r)) => {
+          //FIXME what happens if not everything was written?
+          //if let Some((front,back)) = self.tokens() {
+          //  println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+          //}
+          self.front_buf.consume(r);
+
+          self.front_interest.insert(EventSet::readable());
+          self.back_interest.remove(EventSet::writable());
+          self.back_interest.insert(EventSet::readable());
+        }
+        Err(e) =>  println!("not implemented; client err={:?}", e),
       }
-      self.front_buf = Some(buf);
-    } else {
-      println!("BACK [{:?}]: front_buf unavailable", self.token);
     }
 
     if let Some((frontend_token,backend_token)) = self.tokens() {
@@ -323,29 +295,25 @@ impl ProxyClient<TlsServer> for Client {
 
   // Read content from application
   fn back_readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
-    if let Some(mut buf) = self.back_buf.take() {
-      //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
-
-      if let Some(ref mut sock) = self.backend {
-        match sock.try_read(buf.space()) {
-          Ok(None) => {
-            println!("We just got readable, but were unable to read from the socket?");
-          }
-          Ok(Some(r)) => {
-            //if let Some((front,back)) = self.tokens() {
-            //  println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-            //}
-            buf.fill(r);
-            self.back_interest.remove(EventSet::readable());
-            self.front_interest.insert(EventSet::writable());
-          }
-          Err(e) => {
-            println!("not implemented; client err={:?}", e);
-            //self.interest.remove(EventSet::readable());
-          }
-        };
-      }
-      self.back_buf = Some(buf);
+    //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
+    if let Some(ref mut sock) = self.backend {
+      match sock.try_read(self.back_buf.space()) {
+        Ok(None) => {
+          println!("We just got readable, but were unable to read from the socket?");
+        }
+        Ok(Some(r)) => {
+          //if let Some((front,back)) = self.tokens() {
+          //  println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+          //}
+          self.back_buf.fill(r);
+          self.back_interest.remove(EventSet::readable());
+          self.front_interest.insert(EventSet::writable());
+        }
+        Err(e) => {
+          println!("not implemented; client err={:?}", e);
+          //self.interest.remove(EventSet::readable());
+        }
+      };
     }
 
     if let Some((frontend_token,backend_token)) = self.tokens() {
