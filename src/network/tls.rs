@@ -205,18 +205,10 @@ impl ProxyClient<TlsServer> for Client {
 
   // Read content from the client
   fn readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
-    //println!("in readable()");
     //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
 
     if let Some(mut buf) = self.front_buf.take() {
-      //let mut sl: &mut[u8] = buf.mut_bytes();
       match self.stream.read(unsafe { buf.space() }) {
-        /*Ok(None) => {
-          println!("client flushing buf; WOULDBLOCK");
-
-          self.back_buf = Some(buf);
-          self.front_interest.insert(EventSet::writable());
-        },*/
         Ok(0) => {
           self.front_interest.insert(EventSet::readable());
         },
