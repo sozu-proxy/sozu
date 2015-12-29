@@ -1,4 +1,4 @@
-image: schickling/rust
+image: schickling/rust:master
 
 before_script:
   - echo $TOTO_VAR
