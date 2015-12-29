@@ -49,15 +49,7 @@ pub struct HttpProxy {
 
 impl HttpProxy {
   pub fn readable(&mut self) -> ClientResult {
-    if self.state.is_proxying() {
-      // REREGISTER
-      /*if let Some((front,back)) = self.tokens() {
-        //println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-      }
-      self.reregister(event_loop);
-      self.rx_count = self.rx_count + r;
-      */
-    } else {
+    if ! self.state.is_proxying() {
       self.state = parse_until_stop(&self.state, &mut self.front_buf);
       println!("parse_until_stop returned {:?}", self.state);
       if self.state.is_error() {
@@ -67,13 +59,7 @@ impl HttpProxy {
         self.should_copy = self.state.should_copy();
       }
       if self.state.has_host() {
-        //self.reregister(event_loop);
         return ClientResult::ConnectBackend;
-      } else {
-        /*self.front_interest.insert(EventSet::readable());
-        if let Some(frontend_token) = self.token {
-          event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-        }*/
       }
     }
     ClientResult::Continue
