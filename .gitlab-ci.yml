@@ -3,6 +3,10 @@ image: schickling/rust
 before_script:
   - echo $TOTO_VAR
 
+infos:
+  script:
+    - rustc -V
+
 rustbuild:
   script:
     - cargo build 
