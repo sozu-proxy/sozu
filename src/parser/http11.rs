@@ -404,11 +404,11 @@ pub fn validate_request_header(state: HttpState, header: &Header) -> HttpState {
         // Transfer-Encoding takes the precedence on Content-Length
         HttpState::HasHostAndLength(rl, host,
            LengthInformation::Length(_))         => HttpState::HasHostAndLength(rl, host, LengthInformation::Chunked),
-        HttpState::HasHostAndLength(rl, host, _) => HttpState::Error(ErrorState::InvalidHttp),
+        HttpState::HasHostAndLength(_, _, _) => HttpState::Error(ErrorState::InvalidHttp),
         _                                        => HttpState::Error(ErrorState::InvalidHttp)
       }
     },
-    HeaderValue::Connection(headers) => {
+    HeaderValue::Connection(_) => {
       state.clone()
     },
 
@@ -443,7 +443,7 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
         res => default_response(state, res)
       }
     },
-    HttpState::HasRequestLine(ref rl) => {
+    HttpState::HasRequestLine(_) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
           (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
