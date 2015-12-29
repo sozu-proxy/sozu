@@ -65,6 +65,18 @@ impl HttpProxy {
     ClientResult::Continue
   }
 
+  pub fn back_writable(&mut self, copied: usize) {
+    self.front_buf.consume(copied);
+    if let Some(sz) = self.should_copy {
+      if sz == copied {
+        self.should_copy = None;
+      } else {
+        self.should_copy = Some(sz - copied);
+      }
+    }
+
+  }
+
   pub fn to_copy(&self) -> usize {
     min(self.front_buf.available_data(), self.should_copy.unwrap_or(0))
   }
@@ -254,18 +266,12 @@ impl ProxyClient<HttpServer> for Client {
       match sock.write(&(self.http_state.front_buf.data())[..self.http_state.to_copy()]) {
         Ok(0) => {}
         Ok(r) => {
-          self.http_state.front_buf.consume(r);
-          if let Some(sz) = self.http_state.should_copy {
-            if sz == r {
-              self.http_state.should_copy = None;
-            } else {
-              self.http_state.should_copy = Some(sz - r);
-            }
-          }
           //FIXME what happens if not everything was written?
-          if let Some((front,back)) = tokens {
-            println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-          }
+          //if let Some((front,back)) = tokens {
+          //  println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+          //}
+
+          self.http_state.back_writable(r);
         }
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => {},

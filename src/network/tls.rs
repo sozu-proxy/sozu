@@ -227,7 +227,7 @@ impl ProxyClient<TlsServer> for Client {
   fn back_writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
     if let Some(ref mut sock) = self.backend {
-      match sock.write(&mut self.http_state.front_buf.data()) {
+      match sock.write(&self.http_state.front_buf.data()[..self.http_state.to_copy()]) {
         Ok(0) => {
           //println!("client flushing buf; WOULDBLOCK");
         }
@@ -236,7 +236,8 @@ impl ProxyClient<TlsServer> for Client {
           //if let Some((front,back)) = self.tokens() {
           //  println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           //}
-          self.http_state.front_buf.consume(r);
+
+          self.http_state.back_writable(r);
         }
         Err(e) =>  println!("not implemented; client err={:?}", e),
       }
