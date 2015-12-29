@@ -88,6 +88,21 @@ impl Client {
 
   pub fn close(&self) {
   }
+
+  pub fn reregister(&mut self,  event_loop: &mut EventLoop<TlsServer>) {
+    self.front_interest.insert(EventSet::readable());
+    self.front_interest.insert(EventSet::writable());
+    self.back_interest.insert(EventSet::writable());
+    self.back_interest.insert(EventSet::readable());
+    if let Some(frontend_token) = self.token {
+      event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+    }
+    if let Some(backend_token) = self.backend_token {
+      if let Some(ref sock) = self.backend {
+        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+      }
+    }
+  }
 }
 
 impl ProxyClient<TlsServer> for Client {
@@ -162,17 +177,11 @@ impl ProxyClient<TlsServer> for Client {
         self.back_buf.consume(r);
 
         self.tx_count = self.tx_count + r;
-
-        //self.front_interest.insert(EventSet::readable());
-        self.front_interest.remove(EventSet::writable());
-        self.back_interest.insert(EventSet::readable());
       },
       Err(NonblockingSslError::WantRead) => {
-        self.front_interest.insert(EventSet::readable());
         //println!("writable WantRead");
       },
       Err(NonblockingSslError::WantWrite) => {
-        self.front_interest.insert(EventSet::writable());
         //println!("writable WantWrite");
       }
       Err(e) => {
@@ -180,13 +189,8 @@ impl ProxyClient<TlsServer> for Client {
         return ClientResult::CloseClient;
       }
     }
-    if let Some((frontend_token,backend_token)) = self.tokens() {
-      if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge());
-      }
-      event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
 
+    self.reregister(event_loop);
     ClientResult::Continue
   }
 
@@ -194,9 +198,7 @@ impl ProxyClient<TlsServer> for Client {
   fn readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
     match self.stream.read(unsafe { self.http_state.front_buf.space() }) {
-      Ok(0) => {
-        self.front_interest.insert(EventSet::readable());
-      },
+      Ok(0) => {},
       Ok(r) => {
         println!("FRONT [{:?}]: read {} bytes", self.token, r);
         self.http_state.front_buf.fill(r);
@@ -206,11 +208,9 @@ impl ProxyClient<TlsServer> for Client {
         return res;
       },
       Err(NonblockingSslError::WantRead) => {
-        self.front_interest.insert(EventSet::readable());
         //println!("writable WantRead");
       },
       Err(NonblockingSslError::WantWrite) => {
-        self.front_interest.insert(EventSet::writable());
         //println!("writable WantWrite");
       },
       Err(e) => {
@@ -219,9 +219,7 @@ impl ProxyClient<TlsServer> for Client {
       }
     }
 
-    if let Some(frontend_token) = self.token {
-      event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
+    self.reregister(event_loop);
     ClientResult::Continue
   }
 
@@ -231,9 +229,7 @@ impl ProxyClient<TlsServer> for Client {
     if let Some(ref mut sock) = self.backend {
       match sock.try_write(&mut self.http_state.front_buf.data()) {
         Ok(None) => {
-          println!("client flushing buf; WOULDBLOCK");
-
-          self.back_interest.insert(EventSet::writable());
+          //println!("client flushing buf; WOULDBLOCK");
         }
         Ok(Some(r)) => {
           //FIXME what happens if not everything was written?
@@ -241,21 +237,12 @@ impl ProxyClient<TlsServer> for Client {
           //  println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           //}
           self.http_state.front_buf.consume(r);
-
-          self.front_interest.insert(EventSet::readable());
-          self.back_interest.remove(EventSet::writable());
-          self.back_interest.insert(EventSet::readable());
         }
         Err(e) =>  println!("not implemented; client err={:?}", e),
       }
     }
 
-    if let Some((frontend_token,backend_token)) = self.tokens() {
-      if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge());
-      }
-      event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
+    self.reregister(event_loop);
     ClientResult::Continue
   }
 
@@ -272,22 +259,14 @@ impl ProxyClient<TlsServer> for Client {
           //  println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           //}
           self.back_buf.fill(r);
-          self.back_interest.remove(EventSet::readable());
-          self.front_interest.insert(EventSet::writable());
         }
         Err(e) => {
           println!("not implemented; client err={:?}", e);
-          //self.interest.remove(EventSet::readable());
         }
       };
     }
 
-    if let Some((frontend_token,backend_token)) = self.tokens() {
-      if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge());
-      }
-      event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
+    self.reregister(event_loop);
     ClientResult::Continue
   }
 }

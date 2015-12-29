@@ -129,13 +129,20 @@ impl Client {
   }
 
   fn reregister(&mut self, event_loop: &mut EventLoop<HttpServer>) {
-    self.front_interest.remove(EventSet::readable());
+    self.front_interest.insert(EventSet::readable());
+    self.front_interest.insert(EventSet::writable());
+    self.back_interest.insert(EventSet::readable());
     self.back_interest.insert(EventSet::writable());
-    if let Some((frontend_token,backend_token)) = self.tokens() {
-      if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, EventSet::readable(), PollOpt::edge());
-      }
+    //println!("REREGISTER: {:?}", self.tokens());
+    if let Some(frontend_token) = self.token {
+      //println!("reregister frontend {}: {:?}", frontend_token.as_usize(), self.front_interest);
       event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+    }
+    if let Some(backend_token) = self.backend_token {
+      if let Some(ref sock) = self.backend {
+        //println!("reregister backend {}: {:?}", backend_token.as_usize(), self.back_interest);
+        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+      }
     }
   }
 
@@ -201,9 +208,7 @@ impl ProxyClient<HttpServer> for Client {
   fn readable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
     //println!("readable(): front_buf contains {} data, {} space", buf.available_data(), buf.available_space());
     match self.sock.read(&mut self.http_state.front_buf.space()) {
-      Ok(0) => {
-        self.front_interest.insert(EventSet::readable());
-      },
+      Ok(0) => {},
       Ok(r) => {
         //println!("FRONT [{:?}]: read {} bytes", self.token, r);
         self.http_state.front_buf.fill(r);
@@ -211,9 +216,7 @@ impl ProxyClient<HttpServer> for Client {
         return self.http_state.readable();
       }
       Err(e) => match e.kind() {
-        ErrorKind::WouldBlock => {
-          self.front_interest.insert(EventSet::readable());
-        }
+        ErrorKind::WouldBlock => {}
         ErrorKind::BrokenPipe => {
           println!("broken pipe reading from the client");
           return ClientResult::CloseClient;
@@ -221,16 +224,15 @@ impl ProxyClient<HttpServer> for Client {
         _ => println!("not implemented; client err={:?}", e),
       }
     }
+        self.reregister(event_loop);
     ClientResult::Continue
   }
 
   // Forward content to client
   fn writable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
-    //println!("writable(): back_buf contains {} data, {} space", buf.available_data(), buf.available_space());
+    //println!("writable(): back_buf contains {} data, {} space", self.back_buf.available_data(), self.back_buf.available_space());
     match self.sock.write(self.back_buf.data()) {
-      Ok(0) => {
-        self.front_interest.insert(EventSet::writable());
-      }
+      Ok(0) => {}
       Ok(r) => {
         self.back_buf.consume(r);
         //FIXME what happens if not everything was written?
@@ -239,14 +241,9 @@ impl ProxyClient<HttpServer> for Client {
         }
 
         self.tx_count = self.tx_count + r;
-
-        self.front_interest.remove(EventSet::writable());
-        self.back_interest.insert(EventSet::readable());
       }
       Err(e) => match e.kind() {
-        ErrorKind::WouldBlock => {
-          self.front_interest.insert(EventSet::writable());
-        }
+        ErrorKind::WouldBlock => {}
         ErrorKind::BrokenPipe => {
           println!("broken pipe writing to the client");
           return ClientResult::CloseClient;
@@ -255,12 +252,7 @@ impl ProxyClient<HttpServer> for Client {
       }
     }
 
-    if let Some((frontend_token,backend_token)) = self.tokens() {
-      if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge());
-      }
-      event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
+    self.reregister(event_loop);
     ClientResult::Continue
   }
 
@@ -271,9 +263,7 @@ impl ProxyClient<HttpServer> for Client {
     if let Some(ref mut sock) = self.backend {
       let to_copy = min(self.http_state.front_buf.available_data(), self.http_state.should_copy.unwrap_or(0));
       match sock.write(&(self.http_state.front_buf.data())[..to_copy]) {
-        Ok(0) => {
-          self.back_interest.insert(EventSet::writable());
-        }
+        Ok(0) => {}
         Ok(r) => {
           self.http_state.front_buf.consume(r);
           if let Some(sz) = self.http_state.should_copy {
@@ -287,15 +277,9 @@ impl ProxyClient<HttpServer> for Client {
           if let Some((front,back)) = tokens {
             println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           }
-
-          self.front_interest.insert(EventSet::readable());
-          self.back_interest.remove(EventSet::writable());
-          self.back_interest.insert(EventSet::readable());
         }
         Err(e) => match e.kind() {
-          ErrorKind::WouldBlock => {
-            self.back_interest.insert(EventSet::writable());
-          },
+          ErrorKind::WouldBlock => {},
           ErrorKind::BrokenPipe => {
             println!("broken pipe writing to the backend");
             return ClientResult::CloseClient;
@@ -305,38 +289,28 @@ impl ProxyClient<HttpServer> for Client {
       }
     }
 
-    if let Some((frontend_token,backend_token)) = self.tokens() {
-      if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge());
-      }
-      event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
+    self.reregister(event_loop);
     ClientResult::Continue
   }
 
   // Read content from application
   fn back_readable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
-    //println!("back_readable(): back_buf contains {} data, {} space", buf.available_data(), buf.available_space());
+    //println!("back_readable(): back_buf contains {} data, {} space", self.back_buf.available_data(), self.back_buf.available_space());
     let tokens = self.tokens();
 
     if let Some(ref mut sock) = self.backend {
       match sock.read(&mut self.back_buf.space()) {
         Ok(0) => {
           //println!("We just got readable, but were unable to read from the socket?");
-          self.back_interest.insert(EventSet::readable());
         }
         Ok(r) => {
           self.back_buf.fill(r);
           if let Some((front,back)) = tokens {
             //println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           }
-          self.back_interest.remove(EventSet::readable());
-          self.front_interest.insert(EventSet::writable());
         }
         Err(e) => match e.kind() {
-          ErrorKind::WouldBlock => {
-            self.back_interest.insert(EventSet::readable());
-          },
+          ErrorKind::WouldBlock => {},
           ErrorKind::BrokenPipe => {
             println!("broken pipe reading from the backend");
             return ClientResult::CloseClient;
@@ -346,12 +320,7 @@ impl ProxyClient<HttpServer> for Client {
       };
     }
 
-    if let Some((frontend_token,backend_token)) = self.tokens() {
-      if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge());
-      }
-      event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
+    self.reregister(event_loop);
     ClientResult::Continue
   }
 
