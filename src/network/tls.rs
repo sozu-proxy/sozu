@@ -23,6 +23,7 @@ use network::buffer::Buffer;
 use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,HttpFront};
+use network::http::HttpProxy;
 
 type BackendToken = Token;
 #[derive(Debug,Clone,PartialEq,Eq)]
@@ -43,9 +44,8 @@ pub enum HttpProxyOrder {
 
 struct Client {
   backend:        Option<TcpStream>,
-  http_state:     RequestState,
   stream:         NonblockingSslStream<TcpStream>,
-  front_buf:      Buffer,
+  http_state:     HttpProxy,
   back_buf:       Buffer,
   token:          Option<Token>,
   backend_token:  Option<Token>,
@@ -59,10 +59,13 @@ struct Client {
 impl Client {
   fn new(stream: NonblockingSslStream<TcpStream>) -> Option<Client> {
     Some(Client {
-      backend:        None,
-      http_state:     RequestState::new(),
       stream:         stream,
-      front_buf:      Buffer::with_capacity(12000),
+      backend:        None,
+      http_state:     HttpProxy {
+        state:          RequestState::new(),
+        should_copy:    None,
+        front_buf:      Buffer::with_capacity(12000)
+      },
       back_buf:       Buffer::with_capacity(12000),
       token:          None,
       backend_token:  None,
@@ -190,54 +193,17 @@ impl ProxyClient<TlsServer> for Client {
   // Read content from the client
   fn readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
-    match self.stream.read(unsafe { self.front_buf.space() }) {
+    match self.stream.read(unsafe { self.http_state.front_buf.space() }) {
       Ok(0) => {
         self.front_interest.insert(EventSet::readable());
       },
       Ok(r) => {
         println!("FRONT [{:?}]: read {} bytes", self.token, r);
-        self.front_buf.fill(r);
-        if self.http_state.is_proxying() {
-          //if let Some((front,back)) = self.tokens() {
-          //  println!("FRONT [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-          //}
-          self.front_interest.remove(EventSet::readable());
-          self.back_interest.insert(EventSet::writable());
-          if let Some((frontend_token,backend_token)) = self.tokens() {
-            if let Some(ref sock) = self.backend {
-              event_loop.reregister(sock, backend_token, EventSet::readable(), PollOpt::edge());
-            }
-            event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-          }
-          self.rx_count = self.rx_count + r;
-        } else {
-          self.http_state = parse_until_stop(&self.http_state, &mut self.front_buf);
-          println!("parse_until_stop returned {:?}", self.http_state);
-          if self.http_state.is_error() {
-            println!("HTTP parsing error");
-            return ClientResult::CloseClient;
-          }
-          //println!("new state: {:?}", self.http_state);
-          if self.http_state.has_host() {
-            self.rx_count = self.front_buf.available_data();
-            self.front_interest.remove(EventSet::readable());
-            self.back_interest.insert(EventSet::writable());
-            if let Some((frontend_token,backend_token)) = self.tokens() {
-              if let Some(ref sock) = self.backend {
-                event_loop.reregister(sock, backend_token, EventSet::readable(), PollOpt::edge());
-              }
-              event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-            }
-            //println!("is now proxying, front buf flipped");
-            if let Some(frontend_token) = self.token {
-              event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-            }
-            return ClientResult::ConnectBackend;
-
-          } else {
-            self.front_interest.insert(EventSet::readable());
-          }
-        }
+        self.http_state.front_buf.fill(r);
+        self.reregister(event_loop);
+        let res = self.http_state.readable();
+        println!("TLS http_state.readable() returned {:?}", res);
+        return res;
       },
       Err(NonblockingSslError::WantRead) => {
         self.front_interest.insert(EventSet::readable());
@@ -263,7 +229,7 @@ impl ProxyClient<TlsServer> for Client {
   fn back_writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
     if let Some(ref mut sock) = self.backend {
-      match sock.try_write(&mut self.front_buf.data()) {
+      match sock.try_write(&mut self.http_state.front_buf.data()) {
         Ok(None) => {
           println!("client flushing buf; WOULDBLOCK");
 
@@ -274,7 +240,7 @@ impl ProxyClient<TlsServer> for Client {
           //if let Some((front,back)) = self.tokens() {
           //  println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           //}
-          self.front_buf.consume(r);
+          self.http_state.front_buf.consume(r);
 
           self.front_interest.insert(EventSet::readable());
           self.back_interest.remove(EventSet::writable());
@@ -491,11 +457,11 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
   }
 
   fn connect_to_backend(&mut self, client: &mut Client) -> Option<TcpStream> {
-    if let (Some(host), Some(rl)) = (client.http_state.get_host(), client.http_state.get_request_line()) {
+    if let (Some(host), Some(rl)) = (client.http_state.state.get_host(), client.http_state.state.get_request_line()) {
       if let Some(back) = self.backend_from_request(&host, &rl.uri) {
         if let Ok(socket) = TcpStream::connect(&back) {
-          client.http_state = RequestState {
-            req_position: client.http_state.req_position,
+          client.http_state.state = RequestState {
+            req_position: client.http_state.state.req_position,
             res_position: 0,
             request:  HttpState::Proxying(rl, host),
             response: HttpState::Initial
