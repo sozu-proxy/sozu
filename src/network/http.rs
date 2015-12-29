@@ -64,6 +64,10 @@ impl HttpProxy {
     }
     ClientResult::Continue
   }
+
+  pub fn to_copy(&self) -> usize {
+    min(self.front_buf.available_data(), self.should_copy.unwrap_or(0))
+  }
 }
 
 struct Client {
@@ -247,8 +251,7 @@ impl ProxyClient<HttpServer> for Client {
     //println!("back_writable: front_buf contains {} data, {} space", buf.available_data(), buf.available_space());
     let tokens = self.tokens();
     if let Some(ref mut sock) = self.backend {
-      let to_copy = min(self.http_state.front_buf.available_data(), self.http_state.should_copy.unwrap_or(0));
-      match sock.write(&(self.http_state.front_buf.data())[..to_copy]) {
+      match sock.write(&(self.http_state.front_buf.data())[..self.http_state.to_copy()]) {
         Ok(0) => {}
         Ok(r) => {
           self.http_state.front_buf.consume(r);
