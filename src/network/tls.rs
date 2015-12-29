@@ -3,7 +3,7 @@
 use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
 use mio::tcp::*;
-use std::io::{self,Read,ErrorKind};
+use std::io::{self,Read,Write,ErrorKind};
 use mio::*;
 use bytes::{Buf,ByteBuf,MutByteBuf};
 use bytes::buf::MutBuf;
@@ -197,7 +197,7 @@ impl ProxyClient<TlsServer> for Client {
   // Read content from the client
   fn readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
-    match self.stream.read(unsafe { self.http_state.front_buf.space() }) {
+    match self.stream.read(self.http_state.front_buf.space()) {
       Ok(0) => {},
       Ok(r) => {
         println!("FRONT [{:?}]: read {} bytes", self.token, r);
@@ -227,11 +227,11 @@ impl ProxyClient<TlsServer> for Client {
   fn back_writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
     if let Some(ref mut sock) = self.backend {
-      match sock.try_write(&mut self.http_state.front_buf.data()) {
-        Ok(None) => {
+      match sock.write(&mut self.http_state.front_buf.data()) {
+        Ok(0) => {
           //println!("client flushing buf; WOULDBLOCK");
         }
-        Ok(Some(r)) => {
+        Ok(r) => {
           //FIXME what happens if not everything was written?
           //if let Some((front,back)) = self.tokens() {
           //  println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
@@ -250,11 +250,11 @@ impl ProxyClient<TlsServer> for Client {
   fn back_readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
     if let Some(ref mut sock) = self.backend {
-      match sock.try_read(self.back_buf.space()) {
-        Ok(None) => {
-          println!("We just got readable, but were unable to read from the socket?");
+      match sock.read(self.back_buf.space()) {
+        Ok(0) => {
+          //println!("We just got readable, but were unable to read from the socket?");
         }
-        Ok(Some(r)) => {
+        Ok(r) => {
           //if let Some((front,back)) = self.tokens() {
           //  println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           //}
