@@ -2,6 +2,7 @@
 
 use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
+use std::cmp::min;
 use mio::tcp::*;
 use std::io::{self,Read,ErrorKind};
 use mio::*;
@@ -269,7 +270,8 @@ impl ProxyClient<HttpServer> for Client {
       //println!("data:\n{}", buf.data().to_hex(8));
       let tokens = self.tokens();
       if let Some(ref mut sock) = self.backend {
-        match sock.try_write(&(buf.data())[..self.should_copy.unwrap_or(0)]) {
+        let to_copy = min(buf.available_data(), self.should_copy.unwrap_or(0));
+        match sock.try_write(&(buf.data())[..to_copy]) {
           Ok(None) => {
             println!("client flushing buf; WOULDBLOCK");
 
