@@ -4,7 +4,7 @@ use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
 use std::cmp::min;
 use mio::tcp::*;
-use std::io::{self,Read,ErrorKind};
+use std::io::{self,Read,Write,ErrorKind};
 use mio::*;
 use bytes::{ByteBuf,MutByteBuf};
 use bytes::buf::MutBuf;
@@ -163,11 +163,11 @@ impl ProxyClient<HttpServer> for Client {
     if let Some(mut buf) = self.front_buf.take() {
       //println!("readable(): front_buf contains {} data, {} space", buf.available_data(), buf.available_space());
 
-      match self.sock.try_read(&mut buf.space()) {
-        Ok(None) | Ok(Some(0)) => {
+      match self.sock.read(&mut buf.space()) {
+        Ok(0) => {
           self.front_interest.insert(EventSet::readable());
         },
-        Ok(Some(r)) => {
+        Ok(r) => {
           //println!("FRONT [{:?}]: read {} bytes", self.token, r);
           buf.fill(r);
           if self.http_state.is_proxying() {
@@ -203,6 +203,9 @@ impl ProxyClient<HttpServer> for Client {
           }
         }
         Err(e) => match e.kind() {
+          ErrorKind::WouldBlock => {
+            self.front_interest.insert(EventSet::readable());
+          }
           ErrorKind::BrokenPipe => {
             println!("broken pipe reading from the client");
             return ClientResult::CloseClient;
@@ -223,13 +226,11 @@ impl ProxyClient<HttpServer> for Client {
     if let Some(mut buf) = self.back_buf.take() {
       //println!("writable(): back_buf contains {} data, {} space", buf.available_data(), buf.available_space());
 
-      match self.sock.try_write(buf.data()) {
-        Ok(None) => {
-          println!("client flushing buf; WOULDBLOCK");
-
+      match self.sock.write(buf.data()) {
+        Ok(0) => {
           self.front_interest.insert(EventSet::writable());
         }
-        Ok(Some(r)) => {
+        Ok(r) => {
           buf.consume(r);
           //FIXME what happens if not everything was written?
           if let Some((front,back)) = self.tokens() {
@@ -243,6 +244,9 @@ impl ProxyClient<HttpServer> for Client {
           self.back_interest.insert(EventSet::readable());
         }
         Err(e) => match e.kind() {
+          ErrorKind::WouldBlock => {
+            self.front_interest.insert(EventSet::writable());
+          }
           ErrorKind::BrokenPipe => {
             println!("broken pipe writing to the client");
             return ClientResult::CloseClient;
@@ -271,13 +275,11 @@ impl ProxyClient<HttpServer> for Client {
       let tokens = self.tokens();
       if let Some(ref mut sock) = self.backend {
         let to_copy = min(buf.available_data(), self.should_copy.unwrap_or(0));
-        match sock.try_write(&(buf.data())[..to_copy]) {
-          Ok(None) => {
-            println!("client flushing buf; WOULDBLOCK");
-
+        match sock.write(&(buf.data())[..to_copy]) {
+          Ok(0) => {
             self.back_interest.insert(EventSet::writable());
           }
-          Ok(Some(r)) => {
+          Ok(r) => {
             buf.consume(r);
             //self.http_state.0 = self.http_state.0 - r;
             if let Some(sz) = self.should_copy {
@@ -297,6 +299,9 @@ impl ProxyClient<HttpServer> for Client {
             self.back_interest.insert(EventSet::readable());
           }
           Err(e) => match e.kind() {
+            ErrorKind::WouldBlock => {
+              self.back_interest.insert(EventSet::writable());
+            },
             ErrorKind::BrokenPipe => {
               println!("broken pipe writing to the backend");
               return ClientResult::CloseClient;
@@ -326,11 +331,12 @@ impl ProxyClient<HttpServer> for Client {
       let tokens = self.tokens();
 
       if let Some(ref mut sock) = self.backend {
-        match sock.try_read(&mut buf.space()) {
-          Ok(None) => {
-            println!("We just got readable, but were unable to read from the socket?");
+        match sock.read(&mut buf.space()) {
+          Ok(0) => {
+            //println!("We just got readable, but were unable to read from the socket?");
+            self.back_interest.insert(EventSet::readable());
           }
-          Ok(Some(r)) => {
+          Ok(r) => {
             buf.fill(r);
             if let Some((front,back)) = tokens {
               //println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
@@ -340,6 +346,9 @@ impl ProxyClient<HttpServer> for Client {
             // prepare to provide this to writable
           }
           Err(e) => match e.kind() {
+            ErrorKind::WouldBlock => {
+              self.back_interest.insert(EventSet::readable());
+            },
             ErrorKind::BrokenPipe => {
               println!("broken pipe reading from the backend");
               return ClientResult::CloseClient;
