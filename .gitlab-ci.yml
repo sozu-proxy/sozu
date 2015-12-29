@@ -1,0 +1,5 @@
+before_script:
+  - echo $TOTO_VAR
+
+rust_build:
+  - cargo build 
