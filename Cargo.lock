@@ -8,7 +8,7 @@ dependencies = [
  "libc 0.2.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "log 0.3.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "mio 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "nom 1.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "nom 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "openssl 0.7.0 (git+https://github.com/Geal/rust-openssl)",
  "rand 0.3.12 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustc-serialize 0.3.16 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "nom"
-version = "1.0.1"
+version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
