@@ -313,12 +313,14 @@ impl HttpState {
 
   pub fn get_keep_alive(&self) -> Option<Connection> {
     match *self {
-      HttpState::HasRequestLine(_, ref conn)        |
-      HttpState::HasHost(_, ref conn, _)            |
-      HttpState::Request(_, ref conn, _)            |
-      HttpState::RequestWithBody(_, ref conn, _, _) |
-      HttpState::Proxying(_, ref conn, _)           => Some(conn.clone()),
-      _                                             => None
+      HttpState::HasRequestLine(_, ref conn)         |
+      HttpState::HasHost(_, ref conn, _)             |
+      HttpState::HasLength(_, ref conn, _)           |
+      HttpState::HasHostAndLength(_, ref conn, _, _) |
+      HttpState::Request(_, ref conn, _)             |
+      HttpState::RequestWithBody(_, ref conn, _, _)  |
+      HttpState::Proxying(_, ref conn, _)            => Some(conn.clone()),
+      _                                              => None
     }
   }
 
@@ -429,8 +431,27 @@ pub fn validate_request_header(state: HttpState, header: &Header) -> HttpState {
         _                                        => HttpState::Error(ErrorState::InvalidHttp)
       }
     },
-    HeaderValue::Connection(_) => {
-      state.clone()
+    // FIXME: for now, we don't remember if we cancel indiations from a previous Connection Header
+    HeaderValue::Connection(c) => {
+      let mut conn = state.get_keep_alive().unwrap_or(Connection::KeepAlive);
+      for value in c {
+      println!("GOT Connection header: {:?}", str::from_utf8(value).unwrap());
+        match value {
+          b"close"      => conn = Connection::Close,
+          b"keep-alive" => conn = Connection::KeepAlive,
+          _             => {}
+        }
+      }
+      match state {
+        HttpState::HasRequestLine(rl, _)                 => HttpState::HasRequestLine(rl, conn),
+        HttpState::HasHost(rl, _, host)                  => HttpState::HasHost(rl, conn, host),
+        HttpState::HasLength(rl, _, length)              => HttpState::HasLength(rl, conn, length),
+        HttpState::HasHostAndLength(rl, _, host, length) => HttpState::HasHostAndLength(rl, conn, host, length),
+        HttpState::Request(rl, _, host)                  => HttpState::Request(rl, conn, host),
+        HttpState::RequestWithBody(rl, _, host, length)  => HttpState::RequestWithBody(rl, conn, host, length),
+        HttpState::Proxying(rl, _, host)                 => HttpState::Proxying(rl, conn, host),
+        _                                                => HttpState::Error(ErrorState::InvalidHttp)
+      }
     },
 
     // FIXME: there should be an error for unsupported encoding
@@ -454,7 +475,12 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
       match request_line(buf) {
         IResult::Done(i, r)    => {
           if let Some(rl) = RRequestLine::from_request_line(r) {
-            let s = (BufferMove::Advance(buf.offset(i)), HttpState::HasRequestLine(rl, Connection::KeepAlive));
+            let conn = if rl.version == "11" {
+              Connection::KeepAlive
+            } else {
+              Connection::Close
+            };
+            let s = (BufferMove::Advance(buf.offset(i)), HttpState::HasRequestLine(rl, conn));
             //parse_request(&s.1, buf)
             s
           } else {
@@ -850,7 +876,7 @@ mod tests {
       let input =
           b"GET / HTTP/1.1\r\n\
             Host: localhost:8888\r\n\
-            Connection: Close\r\n\
+            Connection: close\r\n\
             \r\n";
       let initial = RequestState::new();
       let mut buf = Buffer::with_capacity(2048);
@@ -876,10 +902,11 @@ mod tests {
 
   // HTTP 1.0 is connection close by default
   #[test]
-  fn parse_request_http_1_0() {
+  fn parse_request_http_1_0_connection_close() {
       let input =
           b"GET / HTTP/1.0\r\n\
-            Host: localhost:8888\r\n";
+            Host: localhost:8888\r\n\
+            \r\n";
       let initial = RequestState::new();
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
@@ -890,7 +917,7 @@ mod tests {
       assert_eq!(
         result,
         RequestState {
-          req_position: 59,
+          req_position: 40,
           res_position: 0,
           request:  HttpState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
@@ -903,11 +930,11 @@ mod tests {
   }
 
   #[test]
-  fn parse_request_http_1_0_keep_alive() {
+  fn parse_request_http_1_0_connection_keep_alive() {
       let input =
           b"GET / HTTP/1.0\r\n\
-            Host: localhost:8888\r\n
-            Connection: keep-alive\r\n
+            Host: localhost:8888\r\n\
+            Connection: keep-alive\r\n\
             \r\n";
       let initial = RequestState::new();
       let mut buf = Buffer::with_capacity(2048);
@@ -919,7 +946,7 @@ mod tests {
       assert_eq!(
         result,
         RequestState {
-          req_position: 59,
+          req_position: 64,
           res_position: 0,
           request:  HttpState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
@@ -934,9 +961,9 @@ mod tests {
   #[test]
   fn parse_request_http_1_1_connection_close() {
       let input =
-          b"GET / HTTP/1.0\r\n\
-            Connection: close\r\n
-            Host: localhost:8888\r\n
+          b"GET / HTTP/1.1\r\n\
+            Connection: close\r\n\
+            Host: localhost:8888\r\n\
             \r\n";
       let initial = RequestState::new();
       let mut buf = Buffer::with_capacity(2048);
