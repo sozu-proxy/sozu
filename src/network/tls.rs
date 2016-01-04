@@ -169,6 +169,7 @@ impl ProxyClient<TlsServer> for Client {
     }
 
     match self.stream.write(self.back_buf.data()) {
+      Ok(0) => {}
       Ok(r) => {
         //FIXME what happens if not everything was written?
         //if let Some((front,back)) = self.tokens() {
@@ -239,7 +240,14 @@ impl ProxyClient<TlsServer> for Client {
 
           self.http_state.back_writable(r);
         }
-        Err(e) =>  println!("not implemented; client err={:?}", e),
+        Err(e) => match e.kind() {
+          ErrorKind::WouldBlock => {},
+          ErrorKind::BrokenPipe => {
+            println!("broken pipe writing to the backend");
+            return ClientResult::CloseClient;
+          },
+          _ => println!("not implemented; client err={:?}", e)
+        }
       }
     }
 
@@ -261,8 +269,13 @@ impl ProxyClient<TlsServer> for Client {
           //}
           self.back_buf.fill(r);
         }
-        Err(e) => {
-          println!("not implemented; client err={:?}", e);
+        Err(e) => match e.kind() {
+          ErrorKind::WouldBlock => {},
+          ErrorKind::BrokenPipe => {
+            println!("broken pipe writing to the backend");
+            return ClientResult::CloseClient;
+          },
+          _ => println!("not implemented; client err={:?}", e)
         }
       };
     }
