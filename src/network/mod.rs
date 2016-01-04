@@ -24,6 +24,8 @@ pub enum ServerMessage {
 #[derive(Debug,PartialEq,Eq)]
 pub enum ClientResult {
   CloseClient,
+  CloseBackend,
+  CloseBoth,
   Continue,
   ConnectBackend
 }

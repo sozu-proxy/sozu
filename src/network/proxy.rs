@@ -89,6 +89,14 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Me
     self.clients.remove(token);
   }
 
+  pub fn close_backend(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
+    if let Some(backend_token) = self.clients[token].back_token() {
+      if self.backend.contains(backend_token) {
+        self.backend.remove(backend_token);
+      }
+    }
+  }
+
   pub fn accept(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
     if let Some((client, should_connect)) = self.configuration.accept(token) {
       if let Ok(client_token) = self.clients.insert(client) {
@@ -139,6 +147,8 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Me
   pub fn interpret_client_order(&mut self, event_loop: &mut EventLoop<Self>, token: Token, order: ClientResult) {
     match order {
       ClientResult::CloseClient    => self.close_client(event_loop, token),
+      ClientResult::CloseBackend   => self.close_client(event_loop, token),
+      ClientResult::CloseBoth      => self.close_client(event_loop, token),
       ClientResult::ConnectBackend => self.connect_to_backend(event_loop, token),
       ClientResult::Continue       => {}
     }
