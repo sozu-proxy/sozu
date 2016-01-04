@@ -19,7 +19,7 @@ use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use network::buffer::Buffer;
 
-use parser::http11::{RequestState,parse_until_stop,BufferMove};
+use parser::http11::{HttpState,parse_until_stop,BufferMove};
 use nom::HexDisplay;
 
 use messages::{Command,HttpFront};
@@ -42,7 +42,7 @@ pub enum HttpProxyOrder {
 }
 
 pub struct HttpProxy {
-  pub state:          RequestState,
+  pub state:          HttpState,
   pub should_copy:    Option<usize>,
   pub front_buf:      Buffer,
 }
@@ -111,7 +111,7 @@ impl Client {
       sock:           sock,
       backend:        None,
       http_state:     HttpProxy {
-        state:          RequestState::new(),
+        state:          HttpState::new(),
         should_copy:    None,
         front_buf:      Buffer::with_capacity(12000),
       },

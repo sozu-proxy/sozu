@@ -82,6 +82,50 @@ impl RRequestLine {
   }
 }
 
+#[derive(PartialEq,Debug)]
+pub struct StatusLine<'a> {
+    pub version: [&'a [u8];2],
+    pub status: &'a [u8],
+    pub reason: &'a [u8],
+}
+
+#[derive(PartialEq,Debug,Clone)]
+pub struct RStatusLine {
+    pub version: String,
+    pub status:  u8,
+    pub reason:  String,
+}
+
+impl RStatusLine {
+  pub fn from_status_line(r: StatusLine) -> Option<RStatusLine> {
+    if let Ok(status_str) = str::from_utf8(r.status) {
+      if let Ok(status) = status_str.parse::<u8>() {
+        if let Ok(reason) = str::from_utf8(r.reason) {
+          if let Ok(version1) = str::from_utf8(r.version[0]) {
+            if let Ok(version2) = str::from_utf8(r.version[1]) {
+              Some(RStatusLine {
+                version: String::from(version1) + version2,
+                status:  status,
+                reason:  String::from(reason),
+              })
+            } else {
+              None
+            }
+          } else {
+            None
+          }
+        } else {
+          None
+        }
+      } else {
+        None
+      }
+    } else {
+      None
+    }
+  }
+}
+
 named!(pub http_version<[&[u8];2]>,
        chain!(
         tag!("HTTP/") ~
@@ -108,6 +152,24 @@ named!(pub request_line<RequestLine>,
             }
         }
        )
+);
+
+named!(pub status_line<StatusLine>,
+  chain!(
+    version: http_version ~
+             sp           ~
+    status:  take!(3)     ~
+             sp           ~
+    reason:  token        ~
+             crlf         ,
+    || {
+      StatusLine {
+        version: version,
+        status: status,
+        reason: reason,
+      }
+    }
+  )
 );
 
 #[derive(PartialEq,Debug)]
@@ -155,6 +217,25 @@ named!(pub request_head<Request>,
         crlf, || {
           Request {
             request_line: rl,
+            headers: hs
+          }
+        }
+       )
+);
+
+#[derive(PartialEq,Debug)]
+pub struct Response<'a> {
+    pub status_line: StatusLine<'a>,
+    pub headers: Vec<Header<'a>>
+}
+
+named!(pub response_head<Response>,
+       chain!(
+        sl: status_line ~
+        hs: many0!(message_header) ~
+        crlf, || {
+          Response {
+            status_line: sl,
             headers: hs
           }
         }
@@ -248,7 +329,7 @@ pub enum Connection {
 }
 
 #[derive(Debug,Clone,PartialEq)]
-pub enum HttpState {
+pub enum RequestState {
   Initial,
   Error(ErrorState),
   HasRequestLine(RRequestLine, Connection),
@@ -261,73 +342,73 @@ pub enum HttpState {
   //Proxying(RRequestLine, Host, LengthInformation, BackendToken)
 }
 
-impl HttpState {
+impl RequestState {
   pub fn has_host(&self) -> bool {
     match *self {
-      HttpState::HasHost(_, _, _)            |
-      HttpState::Request(_, _, _)            |
-      HttpState::RequestWithBody(_, _, _, _) |
-      HttpState::Proxying(_, _, _)           => true,
+      RequestState::HasHost(_, _, _)            |
+      RequestState::Request(_, _, _)            |
+      RequestState::RequestWithBody(_, _, _, _) |
+      RequestState::Proxying(_, _, _)           => true,
       _                                      => false
     }
   }
 
   pub fn is_proxying(&self) -> bool {
     match *self {
-      HttpState::Request(_, _, _) | HttpState::RequestWithBody(_, _, _, _) => true,
+      RequestState::Request(_, _, _) | RequestState::RequestWithBody(_, _, _, _) => true,
       _                                                                    => false
     }
   }
 
   pub fn get_host(&self) -> Option<String> {
     match *self {
-      HttpState::HasHost(_, _, ref host)            |
-      HttpState::Request(_, _, ref host)            |
-      HttpState::RequestWithBody(_, _, ref host, _) |
-      HttpState::Proxying(_, _, ref host)    => Some(host.clone()),
+      RequestState::HasHost(_, _, ref host)            |
+      RequestState::Request(_, _, ref host)            |
+      RequestState::RequestWithBody(_, _, ref host, _) |
+      RequestState::Proxying(_, _, ref host)    => Some(host.clone()),
       _                                      => None
     }
   }
 
   pub fn get_uri(&self) -> Option<String> {
     match *self {
-      HttpState::HasRequestLine(ref rl, _)        |
-      HttpState::HasHost(ref rl, _, _)            |
-      HttpState::Request(ref rl , _, _)           |
-      HttpState::RequestWithBody(ref rl, _, _, _) |
-      HttpState::Proxying(ref rl, _, _)           => Some(rl.uri.clone()),
+      RequestState::HasRequestLine(ref rl, _)        |
+      RequestState::HasHost(ref rl, _, _)            |
+      RequestState::Request(ref rl , _, _)           |
+      RequestState::RequestWithBody(ref rl, _, _, _) |
+      RequestState::Proxying(ref rl, _, _)           => Some(rl.uri.clone()),
       _                                           => None
     }
   }
 
   pub fn get_request_line(&self) -> Option<RRequestLine> {
     match *self {
-      HttpState::HasRequestLine(ref rl, _)        |
-      HttpState::HasHost(ref rl, _, _)            |
-      HttpState::Request(ref rl, _, _)            |
-      HttpState::RequestWithBody(ref rl, _, _, _) |
-      HttpState::Proxying(ref rl, _, _)           => Some(rl.clone()),
+      RequestState::HasRequestLine(ref rl, _)        |
+      RequestState::HasHost(ref rl, _, _)            |
+      RequestState::Request(ref rl, _, _)            |
+      RequestState::RequestWithBody(ref rl, _, _, _) |
+      RequestState::Proxying(ref rl, _, _)           => Some(rl.clone()),
       _                                           => None
     }
   }
 
   pub fn get_keep_alive(&self) -> Option<Connection> {
     match *self {
-      HttpState::HasRequestLine(_, ref conn)         |
-      HttpState::HasHost(_, ref conn, _)             |
-      HttpState::HasLength(_, ref conn, _)           |
-      HttpState::HasHostAndLength(_, ref conn, _, _) |
-      HttpState::Request(_, ref conn, _)             |
-      HttpState::RequestWithBody(_, ref conn, _, _)  |
-      HttpState::Proxying(_, ref conn, _)            => Some(conn.clone()),
+      RequestState::HasRequestLine(_, ref conn)         |
+      RequestState::HasHost(_, ref conn, _)             |
+      RequestState::HasLength(_, ref conn, _)           |
+      RequestState::HasHostAndLength(_, ref conn, _, _) |
+      RequestState::Request(_, ref conn, _)             |
+      RequestState::RequestWithBody(_, ref conn, _, _)  |
+      RequestState::Proxying(_, ref conn, _)            => Some(conn.clone()),
       _                                              => None
     }
   }
 
   pub fn should_copy(&self, position: usize) -> Option<usize> {
     match *self {
-      HttpState::RequestWithBody(_, _, _, LengthInformation::Length(l)) => Some(position + l),
-      HttpState::Request(_, _, _)                                       => Some(position),
+      RequestState::RequestWithBody(_, _, _, LengthInformation::Length(l)) => Some(position + l),
+      RequestState::Request(_, _, _)                                       => Some(position),
       _                                                                 => None
     }
   }
@@ -342,20 +423,20 @@ impl HttpState {
 }
 
 #[derive(Debug,PartialEq)]
-pub struct RequestState {
+pub struct HttpState {
   pub req_position: usize,
   pub res_position: usize,
-  pub request:      HttpState,
-  pub response:     HttpState
+  pub request:      RequestState,
+  pub response:     RequestState
 }
 
-impl RequestState {
-  pub fn new() -> RequestState {
-    RequestState {
+impl HttpState {
+  pub fn new() -> HttpState {
+    HttpState {
       req_position: 0,
       res_position: 0,
-      request:  HttpState::Initial,
-      response: HttpState::Initial
+      request:  RequestState::Initial,
+      response: RequestState::Initial
     }
   }
 
@@ -364,7 +445,7 @@ impl RequestState {
   }
 
   pub fn is_error(&self) -> bool {
-    if let HttpState::Error(_) = self.request {
+    if let RequestState::Error(_) = self.request {
       true
     } else {
       false
@@ -408,39 +489,39 @@ pub enum BufferMove {
   Delete(usize, usize)
 }
 
-pub fn default_response<O>(state: &HttpState, res: IResult<&[u8], O>) -> (BufferMove, HttpState) {
+pub fn default_response<O>(state: &RequestState, res: IResult<&[u8], O>) -> (BufferMove, RequestState) {
   match res {
-    IResult::Error(_)      => (BufferMove::None, HttpState::Error(ErrorState::InvalidHttp)),
+    IResult::Error(_)      => (BufferMove::None, RequestState::Error(ErrorState::InvalidHttp)),
     IResult::Incomplete(_) => (BufferMove::None, state.clone()),
     _                      => unreachable!()
   }
 }
 
-pub fn validate_request_header(state: HttpState, header: &Header) -> HttpState {
+pub fn validate_request_header(state: RequestState, header: &Header) -> RequestState {
   match header.value() {
     HeaderValue::Host(host) => {
       match state {
-        HttpState::HasRequestLine(rl, conn) => HttpState::HasHost(rl, conn, host),
-        HttpState::HasLength(rl, conn, l)   => HttpState::HasHostAndLength(rl, conn, host, l),
-        _                                   => HttpState::Error(ErrorState::InvalidHttp)
+        RequestState::HasRequestLine(rl, conn) => RequestState::HasHost(rl, conn, host),
+        RequestState::HasLength(rl, conn, l)   => RequestState::HasHostAndLength(rl, conn, host, l),
+        _                                   => RequestState::Error(ErrorState::InvalidHttp)
       }
     },
     HeaderValue::ContentLength(sz) => {
       match state {
-        HttpState::HasRequestLine(rl, conn) => HttpState::HasLength(rl, conn, LengthInformation::Length(sz)),
-        HttpState::HasHost(rl, conn, host)  => HttpState::HasHostAndLength(rl, conn, host, LengthInformation::Length(sz)),
-        _                                   => HttpState::Error(ErrorState::InvalidHttp)
+        RequestState::HasRequestLine(rl, conn) => RequestState::HasLength(rl, conn, LengthInformation::Length(sz)),
+        RequestState::HasHost(rl, conn, host)  => RequestState::HasHostAndLength(rl, conn, host, LengthInformation::Length(sz)),
+        _                                   => RequestState::Error(ErrorState::InvalidHttp)
       }
     },
     HeaderValue::Encoding(TransferEncodingValue::Chunked) => {
       match state {
-        HttpState::HasRequestLine(rl, conn)            => HttpState::HasLength(rl, conn, LengthInformation::Chunked),
-        HttpState::HasHost(rl, conn, host)             => HttpState::HasHostAndLength(rl, conn, host, LengthInformation::Chunked),
+        RequestState::HasRequestLine(rl, conn)            => RequestState::HasLength(rl, conn, LengthInformation::Chunked),
+        RequestState::HasHost(rl, conn, host)             => RequestState::HasHostAndLength(rl, conn, host, LengthInformation::Chunked),
         // Transfer-Encoding takes the precedence on Content-Length
-        HttpState::HasHostAndLength(rl, conn, host,
-           LengthInformation::Length(_))         => HttpState::HasHostAndLength(rl, conn, host, LengthInformation::Chunked),
-        HttpState::HasHostAndLength(_, _, _, _) => HttpState::Error(ErrorState::InvalidHttp),
-        _                                        => HttpState::Error(ErrorState::InvalidHttp)
+        RequestState::HasHostAndLength(rl, conn, host,
+           LengthInformation::Length(_))         => RequestState::HasHostAndLength(rl, conn, host, LengthInformation::Chunked),
+        RequestState::HasHostAndLength(_, _, _, _) => RequestState::Error(ErrorState::InvalidHttp),
+        _                                        => RequestState::Error(ErrorState::InvalidHttp)
       }
     },
     // FIXME: for now, we don't remember if we cancel indiations from a previous Connection Header
@@ -455,25 +536,25 @@ pub fn validate_request_header(state: HttpState, header: &Header) -> HttpState {
         }
       }
       match state {
-        HttpState::HasRequestLine(rl, _)                 => HttpState::HasRequestLine(rl, conn),
-        HttpState::HasHost(rl, _, host)                  => HttpState::HasHost(rl, conn, host),
-        HttpState::HasLength(rl, _, length)              => HttpState::HasLength(rl, conn, length),
-        HttpState::HasHostAndLength(rl, _, host, length) => HttpState::HasHostAndLength(rl, conn, host, length),
-        HttpState::Request(rl, _, host)                  => HttpState::Request(rl, conn, host),
-        HttpState::RequestWithBody(rl, _, host, length)  => HttpState::RequestWithBody(rl, conn, host, length),
-        HttpState::Proxying(rl, _, host)                 => HttpState::Proxying(rl, conn, host),
-        _                                                => HttpState::Error(ErrorState::InvalidHttp)
+        RequestState::HasRequestLine(rl, _)                 => RequestState::HasRequestLine(rl, conn),
+        RequestState::HasHost(rl, _, host)                  => RequestState::HasHost(rl, conn, host),
+        RequestState::HasLength(rl, _, length)              => RequestState::HasLength(rl, conn, length),
+        RequestState::HasHostAndLength(rl, _, host, length) => RequestState::HasHostAndLength(rl, conn, host, length),
+        RequestState::Request(rl, _, host)                  => RequestState::Request(rl, conn, host),
+        RequestState::RequestWithBody(rl, _, host, length)  => RequestState::RequestWithBody(rl, conn, host, length),
+        RequestState::Proxying(rl, _, host)                 => RequestState::Proxying(rl, conn, host),
+        _                                                => RequestState::Error(ErrorState::InvalidHttp)
       }
     },
 
     // FIXME: there should be an error for unsupported encoding
-    HeaderValue::Encoding(_) => HttpState::Error(ErrorState::InvalidHttp),
+    HeaderValue::Encoding(_) => RequestState::Error(ErrorState::InvalidHttp),
     HeaderValue::Other(_,_)  => state.clone(),
-    HeaderValue::Error       => HttpState::Error(ErrorState::InvalidHttp)
+    HeaderValue::Error       => RequestState::Error(ErrorState::InvalidHttp)
   }
 }
 
-pub fn parse_header(buf: &mut Buffer, state: HttpState) -> IResult<&[u8], HttpState> {
+pub fn parse_header(buf: &mut Buffer, state: RequestState) -> IResult<&[u8], RequestState> {
   match message_header(buf.data()) {
     IResult::Incomplete(i)   => IResult::Incomplete(i),
     IResult::Error(e)        => IResult::Error(e),
@@ -481,9 +562,9 @@ pub fn parse_header(buf: &mut Buffer, state: HttpState) -> IResult<&[u8], HttpSt
   }
 }
 
-pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
+pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestState) {
   match *state {
-    HttpState::Initial => {
+    RequestState::Initial => {
       match request_line(buf) {
         IResult::Done(i, r)    => {
           if let Some(rl) = RRequestLine::from_request_line(r) {
@@ -492,17 +573,17 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
             } else {
               Connection::Close
             };
-            let s = (BufferMove::Advance(buf.offset(i)), HttpState::HasRequestLine(rl, conn));
+            let s = (BufferMove::Advance(buf.offset(i)), RequestState::HasRequestLine(rl, conn));
             //parse_request(&s.1, buf)
             s
           } else {
-            (BufferMove::None, HttpState::Error(ErrorState::InvalidHttp))
+            (BufferMove::None, RequestState::Error(ErrorState::InvalidHttp))
           }
         },
         res => default_response(state, res)
       }
     },
-    HttpState::HasRequestLine(_, _) => {
+    RequestState::HasRequestLine(_, _) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
           (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
@@ -510,7 +591,7 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
         res => default_response(state, res)
       }
     },
-    HttpState::HasHost(ref rl, ref conn, ref h) => {
+    RequestState::HasHost(ref rl, ref conn, ref h) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
           (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
@@ -520,7 +601,7 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
           match crlf(buf) {
             IResult::Done(i, _) => {
               println!("headers parsed, stopping");
-              (BufferMove::Advance(buf.offset(i)), HttpState::Request(rl.clone(), conn.clone(), h.clone()))
+              (BufferMove::Advance(buf.offset(i)), RequestState::Request(rl.clone(), conn.clone(), h.clone()))
             },
             res => {
               println!("HasHost could not parse header for input:\n{}\n", buf.to_hex(8));
@@ -530,7 +611,7 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
         }
       }
     },
-    HttpState::HasHostAndLength(ref rl, ref conn, ref h, ref l) => {
+    RequestState::HasHostAndLength(ref rl, ref conn, ref h, ref l) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
           (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
@@ -541,7 +622,7 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
             IResult::Done(i, _) => {
               println!("headers parsed, stopping");
               (BufferMove::Advance(buf.offset(i)),
-               HttpState::RequestWithBody(rl.clone(), conn.clone(), h.clone(), l.clone())
+               RequestState::RequestWithBody(rl.clone(), conn.clone(), h.clone(), l.clone())
               )
             },
             res => {
@@ -554,12 +635,12 @@ pub fn parse_request(state: &HttpState, buf: &[u8]) -> (BufferMove, HttpState) {
     },
     _ => {
       println!("unimplemented state: {:?}", state);
-      (BufferMove::None, HttpState::Error(ErrorState::InvalidHttp))
+      (BufferMove::None, RequestState::Error(ErrorState::InvalidHttp))
     }
   }
 }
 
-pub fn parse_until_stop(rs: &RequestState, buf: &mut Buffer) -> RequestState {
+pub fn parse_until_stop(rs: &HttpState, buf: &mut Buffer) -> HttpState {
   let mut current_state = rs.request.clone();
   let mut position      = rs.req_position;
   //let (mut position, mut current_state) = state;
@@ -576,12 +657,12 @@ pub fn parse_until_stop(rs: &RequestState, buf: &mut Buffer) -> RequestState {
       break;
     }
     match current_state {
-      HttpState::Request(_,_,_) | HttpState::RequestWithBody(_,_,_,_) |
-        HttpState::Error(_) => break,
+      RequestState::Request(_,_,_) | RequestState::RequestWithBody(_,_,_,_) |
+        RequestState::Error(_) => break,
       _ => ()
     }
   }
-  RequestState {
+  HttpState {
     req_position: position,
     res_position: rs.res_position,
     request:  current_state,
@@ -721,7 +802,7 @@ mod tests {
             Accept: */*\r\n\
             Content-Length: 200\r\n\
             \r\n";
-      let initial = RequestState::new();
+      let initial = HttpState::new();
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
@@ -730,16 +811,16 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        RequestState {
+        HttpState {
           req_position: 109,
           res_position: 0,
-          request: HttpState::RequestWithBody(
+          request: RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
             LengthInformation::Length(200)
           ),
-          response: HttpState::Initial
+          response: RequestState::Initial
         }
       );
   }
@@ -753,10 +834,10 @@ mod tests {
             Accept: */*\r\n\
             Content-Length: 200\r\n\
             \r\n";
-      let initial = RequestState {
+      let initial = HttpState {
         req_position: 26,
         res_position: 0,
-        request:  HttpState::HasRequestLine(
+        request:  RequestState::HasRequestLine(
           RRequestLine {
             method: String::from("GET"),
             uri: String::from("/index.html"),
@@ -764,7 +845,7 @@ mod tests {
           },
           Connection::KeepAlive
         ),
-        response: HttpState::Initial
+        response: RequestState::Initial
       };
 
       let mut buf = Buffer::with_capacity(2048);
@@ -775,16 +856,16 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        RequestState {
+        HttpState {
           req_position: 109,
           res_position: 0,
-          request:    HttpState::RequestWithBody(
+          request:    RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
             LengthInformation::Length(200)
           ),
-          response: HttpState::Initial
+          response: RequestState::Initial
         }
       );
   }
@@ -799,7 +880,7 @@ mod tests {
             Transfer-Encoding: chunked\r\n\
             Accept: */*\r\n\
             \r\n";
-      let initial = RequestState::new();
+      let initial = HttpState::new();
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
@@ -808,16 +889,16 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        RequestState {
+        HttpState {
           req_position: 116,
           res_position: 0,
-          request:    HttpState::RequestWithBody(
+          request:    RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
             LengthInformation::Chunked
           ),
-          response: HttpState::Initial
+          response: RequestState::Initial
         }
       );
   }
@@ -832,7 +913,7 @@ mod tests {
             Accept: */*\r\n\
             Content-Length: 200\r\n\
             \r\n";
-      let initial = RequestState::new();
+      let initial = HttpState::new();
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
@@ -840,11 +921,11 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        RequestState {
+        HttpState {
           req_position: 128,
           res_position: 0,
-          request: HttpState::Error(ErrorState::InvalidHttp),
-          response: HttpState::Initial
+          request: RequestState::Error(ErrorState::InvalidHttp),
+          response: RequestState::Initial
         }
       );
   }
@@ -860,7 +941,7 @@ mod tests {
             Transfer-Encoding: chunked\r\n\
             Accept: */*\r\n\
             \r\n";
-      let initial = RequestState::new();
+      let initial = HttpState::new();
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
@@ -869,16 +950,16 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        RequestState {
+        HttpState {
           req_position: 136,
           res_position: 0,
-          request:  HttpState::RequestWithBody(
+          request:  RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
             LengthInformation::Chunked
           ),
-          response: HttpState::Initial
+          response: RequestState::Initial
         }
       );
   }
@@ -890,7 +971,7 @@ mod tests {
             Host: localhost:8888\r\n\
             Connection: close\r\n\
             \r\n";
-      let initial = RequestState::new();
+      let initial = HttpState::new();
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
@@ -899,15 +980,15 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        RequestState {
+        HttpState {
           req_position: 59,
           res_position: 0,
-          request:  HttpState::Request(
+          request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
             Connection::Close,
             String::from("localhost:8888")
           ),
-          response: HttpState::Initial
+          response: RequestState::Initial
         }
       );
   }
@@ -919,7 +1000,7 @@ mod tests {
           b"GET / HTTP/1.0\r\n\
             Host: localhost:8888\r\n\
             \r\n";
-      let initial = RequestState::new();
+      let initial = HttpState::new();
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
@@ -928,15 +1009,15 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        RequestState {
+        HttpState {
           req_position: 40,
           res_position: 0,
-          request:  HttpState::Request(
+          request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
             Connection::Close,
             String::from("localhost:8888")
           ),
-          response: HttpState::Initial
+          response: RequestState::Initial
         }
       );
   }
@@ -948,7 +1029,7 @@ mod tests {
             Host: localhost:8888\r\n\
             Connection: keep-alive\r\n\
             \r\n";
-      let initial = RequestState::new();
+      let initial = HttpState::new();
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
@@ -957,15 +1038,15 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        RequestState {
+        HttpState {
           req_position: 64,
           res_position: 0,
-          request:  HttpState::Request(
+          request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
             Connection::KeepAlive,
             String::from("localhost:8888")
           ),
-          response: HttpState::Initial
+          response: RequestState::Initial
         }
       );
   }
@@ -977,7 +1058,7 @@ mod tests {
             Connection: close\r\n\
             Host: localhost:8888\r\n\
             \r\n";
-      let initial = RequestState::new();
+      let initial = HttpState::new();
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
@@ -986,15 +1067,15 @@ mod tests {
       println!("result: {:?}", result);
       assert_eq!(
         result,
-        RequestState {
+        HttpState {
           req_position: 59,
           res_position: 0,
-          request:  HttpState::Request(
+          request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
             Connection::Close,
             String::from("localhost:8888")
           ),
-          response: HttpState::Initial
+          response: RequestState::Initial
         }
       );
   }
@@ -1012,7 +1093,7 @@ mod tests {
             \r\nabcdefgj";
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
-      let start_state = HttpState::Initial;
+      let start_state = RequestState::Initial;
 
       let next_state = handle_request_partial(&start_state, &mut buf, 0);
 

@@ -18,7 +18,7 @@ use openssl::ssl::{SslContext, SslMethod, Ssl, NonblockingSslStream, ServerNameC
 use openssl::ssl::error::NonblockingSslError;
 use openssl::x509::X509FileType;
 
-use parser::http11::{RequestState,HttpState,parse_until_stop};
+use parser::http11::{HttpState,RequestState,parse_until_stop};
 use network::buffer::Buffer;
 use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
@@ -62,7 +62,7 @@ impl Client {
       stream:         stream,
       backend:        None,
       http_state:     HttpProxy {
-        state:          RequestState::new(),
+        state:          HttpState::new(),
         should_copy:    None,
         front_buf:      Buffer::with_capacity(12000)
       },
@@ -453,11 +453,11 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
     if let (Some(host), Some(rl), Some(conn)) = (client.http_state.state.get_host(), client.http_state.state.get_request_line(), client.http_state.state.get_keep_alive()) {
       if let Some(back) = self.backend_from_request(&host, &rl.uri) {
         if let Ok(socket) = TcpStream::connect(&back) {
-          client.http_state.state = RequestState {
+          client.http_state.state = HttpState {
             req_position: client.http_state.state.req_position,
             res_position: 0,
-            request:  HttpState::Proxying(rl, conn, host),
-            response: HttpState::Initial
+            request:  RequestState::Proxying(rl, conn, host),
+            response: RequestState::Initial
           };
           client.status     = ConnectionStatus::Connected;
           return Some(socket);
