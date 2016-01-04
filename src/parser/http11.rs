@@ -331,6 +331,14 @@ impl HttpState {
       _                                                                 => None
     }
   }
+
+  pub fn should_keep_alive(&self) -> bool {
+    match self.get_keep_alive() {
+      Some(Connection::KeepAlive) => true,
+      Some(Connection::Close)     => false,
+      None                        => false
+    }
+  }
 }
 
 #[derive(Debug,PartialEq)]
@@ -385,6 +393,10 @@ impl RequestState {
 
   pub fn should_copy(&self) -> Option<usize> {
     self.request.should_copy(self.req_position)
+  }
+
+  pub fn should_keep_alive(&self) -> bool {
+    self.request.should_keep_alive()
   }
 }
 
