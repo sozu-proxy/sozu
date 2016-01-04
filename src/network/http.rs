@@ -233,6 +233,11 @@ impl ProxyClient<HttpServer> for Client {
   // Forward content to client
   fn writable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
     //println!("writable(): back_buf contains {} data, {} space", self.back_buf.available_data(), self.back_buf.available_space());
+
+    if self.back_buf.available_data() == 0 {
+      return ClientResult::Continue;
+    }
+
     match self.sock.write(self.back_buf.data()) {
       Ok(0) => {}
       Ok(r) => {
