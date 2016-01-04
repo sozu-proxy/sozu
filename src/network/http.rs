@@ -77,7 +77,20 @@ impl HttpProxy {
       }
     }
 
-    ClientResult::Continue
+    // The response ended, so we can close the connection, or accept a new request
+    if self.back_should_copy == None {
+      let sh = (self.state.front_should_keep_alive(), self.state.back_should_keep_alive());
+      println!("RESPONSE ENDED, SHOULD WE KEEP ALIVE? {:?}", sh);
+      let res = match sh {
+        (true, true)  => ClientResult::Continue,     // just reset
+        (true, false) => ClientResult::CloseBackend,
+        (false, _)    => ClientResult::CloseBoth,    // no connection pooling yet
+      };
+      self.state.reset();
+      res
+    } else {
+      ClientResult::Continue
+    }
   }
 
   pub fn back_readable(&mut self) -> ClientResult {
@@ -216,6 +229,12 @@ impl ProxyClient<HttpServer> for Client {
   fn set_tokens(&mut self, token: Token, backend: Token) {
     self.token         = Some(token);
     self.backend_token = Some(backend);
+  }
+
+  fn remove_backend(&mut self) {
+    println!("HTTP PROXY [{} -> {}] CLOSED BACKEND", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
+    self.backend       = None;
+    self.backend_token = None;
   }
 
   fn front_hup(&mut self) -> ClientResult {

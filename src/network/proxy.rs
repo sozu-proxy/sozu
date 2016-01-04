@@ -38,6 +38,7 @@ pub trait ProxyClient<Server:Handler> {
   fn writable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult;
   fn back_readable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult;
   fn back_writable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult;
+  fn remove_backend(&mut self);
 }
 
 pub trait ProxyConfiguration<Server:Handler,Client,Message> {
@@ -93,6 +94,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Me
     if let Some(backend_token) = self.clients[token].back_token() {
       if self.backend.contains(backend_token) {
         self.backend.remove(backend_token);
+        self.clients[token].remove_backend();
       }
     }
   }
@@ -147,7 +149,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Me
   pub fn interpret_client_order(&mut self, event_loop: &mut EventLoop<Self>, token: Token, order: ClientResult) {
     match order {
       ClientResult::CloseClient    => self.close_client(event_loop, token),
-      ClientResult::CloseBackend   => self.close_client(event_loop, token),
+      ClientResult::CloseBackend   => self.close_backend(event_loop, token),
       ClientResult::CloseBoth      => self.close_client(event_loop, token),
       ClientResult::ConnectBackend => self.connect_to_backend(event_loop, token),
       ClientResult::Continue       => {}
@@ -174,7 +176,8 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Ms
         }
       } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
         if let Some(tok) = self.get_client_token(token) {
-          self.clients[tok].back_readable(event_loop);
+          let order = self.clients[tok].back_readable(event_loop);
+          self.interpret_client_order(event_loop, tok, order);
         }
       }
     }
@@ -185,13 +188,15 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Ms
         println!("received writable for listener {:?}, this should not happen", token);
       } else  if token.as_usize() < self.max_listeners + self.max_connections {
         if self.clients.contains(token) {
-          self.clients[token].writable(event_loop);
+          let order = self.clients[token].writable(event_loop);
+          self.interpret_client_order(event_loop, token, order);
         } else {
           println!("client {:?} was removed", token);
         }
       } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
         if let Some(tok) = self.get_client_token(token) {
-          self.clients[tok].back_writable(event_loop);
+          let order = self.clients[tok].back_writable(event_loop);
+          self.interpret_client_order(event_loop, tok, order);
         }
       }
     }

@@ -250,6 +250,12 @@ impl ProxyClient<TcpServer> for Client {
     self.backend_token = Some(backend);
   }
 
+  fn remove_backend(&mut self) {
+    println!("TCP PROXY [{} -> {}] CLOSED BACKEND", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
+    self.backend       = None;
+    self.backend_token = None;
+  }
+
   fn front_hup(&mut self) -> ClientResult {
     if  self.status == ConnectionStatus::ServerClosed ||
         self.status == ConnectionStatus::ClientConnected { // the server never answered, the client closed

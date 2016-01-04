@@ -356,7 +356,7 @@ impl RequestState {
   pub fn is_proxying(&self) -> bool {
     match *self {
       RequestState::Request(_, _, _) | RequestState::RequestWithBody(_, _, _, _) => true,
-      _                                                                    => false
+      _                                                                          => false
     }
   }
 
@@ -494,9 +494,16 @@ impl HttpState {
     HttpState {
       req_position: 0,
       res_position: 0,
-      request:  RequestState::Initial,
-      response: ResponseState::Initial
+      request:      RequestState::Initial,
+      response:     ResponseState::Initial
     }
+  }
+
+  pub fn reset(&mut self) {
+    self.req_position = 0;
+    self.res_position = 0;
+    self.request      = RequestState::Initial;
+    self.response     = ResponseState::Initial;
   }
 
   pub fn has_host(&self) -> bool {
@@ -535,7 +542,7 @@ impl HttpState {
     self.request.should_copy(self.req_position)
   }
 
-  pub fn should_keep_alive(&self) -> bool {
+  pub fn front_should_keep_alive(&self) -> bool {
     self.request.should_keep_alive()
   }
 
@@ -874,7 +881,6 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer) -> HttpState {
 pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer) -> HttpState {
   let mut current_state = rs.response.clone();
   let mut position      = rs.res_position;
-  //let (mut position, mut current_state) = state;
   loop {
     //println!("pos[{}]: {:?}", position, current_state);
     let (mv, new_state) = parse_response(&current_state, &buf.data()[position..]);
