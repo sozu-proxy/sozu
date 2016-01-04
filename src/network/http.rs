@@ -19,7 +19,7 @@ use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use network::buffer::Buffer;
 
-use parser::http11::{HttpState,parse_until_stop,BufferMove};
+use parser::http11::{HttpState,parse_request_until_stop,BufferMove};
 use nom::HexDisplay;
 
 use messages::{Command,HttpFront};
@@ -50,8 +50,8 @@ pub struct HttpProxy {
 impl HttpProxy {
   pub fn readable(&mut self) -> ClientResult {
     if ! self.state.is_proxying() {
-      self.state = parse_until_stop(&self.state, &mut self.front_buf);
-      println!("parse_until_stop returned {:?}", self.state);
+      self.state = parse_request_until_stop(&self.state, &mut self.front_buf);
+      println!("parse_requesT_until_stop returned {:?}", self.state);
       if self.state.is_error() {
         return ClientResult::CloseClient;
       }

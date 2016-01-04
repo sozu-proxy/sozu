@@ -18,7 +18,7 @@ use openssl::ssl::{SslContext, SslMethod, Ssl, NonblockingSslStream, ServerNameC
 use openssl::ssl::error::NonblockingSslError;
 use openssl::x509::X509FileType;
 
-use parser::http11::{HttpState,RequestState,parse_until_stop};
+use parser::http11::{HttpState,RequestState,ResponseState,parse_request_until_stop};
 use network::buffer::Buffer;
 use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
@@ -457,7 +457,7 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
             req_position: client.http_state.state.req_position,
             res_position: 0,
             request:  RequestState::Proxying(rl, conn, host),
-            response: RequestState::Initial
+            response: ResponseState::Initial
           };
           client.status     = ConnectionStatus::Connected;
           return Some(socket);
