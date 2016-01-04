@@ -450,13 +450,13 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
   }
 
   fn connect_to_backend(&mut self, client: &mut Client) -> Option<TcpStream> {
-    if let (Some(host), Some(rl)) = (client.http_state.state.get_host(), client.http_state.state.get_request_line()) {
+    if let (Some(host), Some(rl), Some(conn)) = (client.http_state.state.get_host(), client.http_state.state.get_request_line(), client.http_state.state.get_keep_alive()) {
       if let Some(back) = self.backend_from_request(&host, &rl.uri) {
         if let Ok(socket) = TcpStream::connect(&back) {
           client.http_state.state = RequestState {
             req_position: client.http_state.state.req_position,
             res_position: 0,
-            request:  HttpState::Proxying(rl, host),
+            request:  HttpState::Proxying(rl, conn, host),
             response: HttpState::Initial
           };
           client.status     = ConnectionStatus::Connected;
