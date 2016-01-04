@@ -19,7 +19,7 @@ use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use network::buffer::Buffer;
 
-use parser::http11::{HttpState,parse_request_until_stop,BufferMove};
+use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop, BufferMove};
 use nom::HexDisplay;
 
 use messages::{Command,HttpFront};
@@ -42,9 +42,11 @@ pub enum HttpProxyOrder {
 }
 
 pub struct HttpProxy {
-  pub state:          HttpState,
-  pub should_copy:    Option<usize>,
-  pub front_buf:      Buffer,
+  pub state:             HttpState,
+  pub front_should_copy: Option<usize>,
+  pub back_should_copy:  Option<usize>,
+  pub front_buf:         Buffer,
+  pub back_buf:          Buffer,
 }
 
 impl HttpProxy {
@@ -66,10 +68,29 @@ impl HttpProxy {
   }
 
   pub fn writable(&mut self, copied: usize) -> ClientResult {
+    self.back_buf.consume(copied);
+    if let Some(sz) = self.back_should_copy {
+      if sz == copied {
+        self.back_should_copy = None;
+      } else {
+        self.back_should_copy = Some(sz - copied);
+      }
+    }
+
     ClientResult::Continue
   }
 
   pub fn back_readable(&mut self) -> ClientResult {
+    if ! self.state.is_back_proxying() {
+      self.state = parse_response_until_stop(&self.state, &mut self.back_buf);
+      println!("parse_response_until_stop returned {:?}", self.state);
+      if self.state.is_back_error() {
+        return ClientResult::CloseBackend;
+      }
+      if self.state.is_back_proxying() {
+        self.back_should_copy = self.state.back_should_copy();
+      }
+    }
     ClientResult::Continue
   }
 
@@ -89,13 +110,16 @@ impl HttpProxy {
   pub fn front_to_copy(&self) -> usize {
     min(self.front_buf.available_data(), self.front_should_copy.unwrap_or(0))
   }
+
+  pub fn back_to_copy(&self) -> usize {
+    min(self.back_buf.available_data(), self.back_should_copy.unwrap_or(0))
+  }
 }
 
 struct Client {
   sock:           TcpStream,
   backend:        Option<TcpStream>,
   http_state:     HttpProxy,
-  back_buf:       Buffer,
   token:          Option<Token>,
   backend_token:  Option<Token>,
   back_interest:  EventSet,
@@ -111,11 +135,12 @@ impl Client {
       sock:           sock,
       backend:        None,
       http_state:     HttpProxy {
-        state:          HttpState::new(),
-        should_copy:    None,
-        front_buf:      Buffer::with_capacity(12000),
+        state:             HttpState::new(),
+        front_should_copy: None,
+        back_should_copy:  None,
+        front_buf:         Buffer::with_capacity(12000),
+        back_buf:          Buffer::with_capacity(12000),
       },
-      back_buf:       Buffer::with_capacity(12000),
       token:          None,
       backend_token:  None,
       back_interest:  EventSet::all(),
@@ -246,14 +271,14 @@ impl ProxyClient<HttpServer> for Client {
   fn writable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
     //println!("writable(): back_buf contains {} data, {} space", self.back_buf.available_data(), self.back_buf.available_space());
 
-    if self.back_buf.available_data() == 0 {
+    if self.http_state.back_buf.available_data() == 0 {
       return ClientResult::Continue;
     }
 
-    let res = match self.sock.write(self.back_buf.data()) {
+    let res = match self.sock.write(&(self.http_state.back_buf.data())[..self.http_state.back_to_copy()]) {
       Ok(0) => { ClientResult::Continue }
       Ok(r) => {
-        self.back_buf.consume(r);
+        self.http_state.back_buf.consume(r);
         //FIXME what happens if not everything was written?
         if let Some((front,back)) = self.tokens() {
           //println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
@@ -320,13 +345,13 @@ impl ProxyClient<HttpServer> for Client {
     let tokens = self.tokens();
 
     let res = if let Some(ref mut sock) = self.backend {
-      match sock.read(&mut self.back_buf.space()) {
+      match sock.read(&mut self.http_state.back_buf.space()) {
         Ok(0) => {
           //println!("We just got readable, but were unable to read from the socket?");
           ClientResult::Continue
         }
         Ok(r) => {
-          self.back_buf.fill(r);
+          self.http_state.back_buf.fill(r);
           if let Some((front,back)) = tokens {
             //println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           }

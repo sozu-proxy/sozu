@@ -46,7 +46,6 @@ struct Client {
   backend:        Option<TcpStream>,
   stream:         NonblockingSslStream<TcpStream>,
   http_state:     HttpProxy,
-  back_buf:       Buffer,
   token:          Option<Token>,
   backend_token:  Option<Token>,
   back_interest:  EventSet,
@@ -62,11 +61,12 @@ impl Client {
       stream:         stream,
       backend:        None,
       http_state:     HttpProxy {
-        state:          HttpState::new(),
-        should_copy:    None,
-        front_buf:      Buffer::with_capacity(12000)
+        state:             HttpState::new(),
+        front_should_copy: None,
+        back_should_copy:  None,
+        front_buf:         Buffer::with_capacity(12000),
+        back_buf:          Buffer::with_capacity(12000),
       },
-      back_buf:       Buffer::with_capacity(12000),
       token:          None,
       backend_token:  None,
       back_interest:  EventSet::all(),
@@ -164,18 +164,18 @@ impl ProxyClient<TlsServer> for Client {
   // Forward content to client
   fn writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("writable back_buf({}): {}", b.remaining(), from_utf8((&b as &Buf).bytes()).unwrap());
-    if self.back_buf.available_data() == 0 {
+    if self.http_state.back_buf.available_data() == 0 {
       return ClientResult::Continue;
     }
 
-    match self.stream.write(self.back_buf.data()) {
+    match self.stream.write(&self.http_state.back_buf.data()[..self.http_state.back_to_copy()]) {
       Ok(0) => {}
       Ok(r) => {
         //FIXME what happens if not everything was written?
         //if let Some((front,back)) = self.tokens() {
         //  println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
         //}
-        self.back_buf.consume(r);
+        self.http_state.back_buf.consume(r);
 
         self.tx_count = self.tx_count + r;
       },
@@ -259,7 +259,7 @@ impl ProxyClient<TlsServer> for Client {
   fn back_readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
     if let Some(ref mut sock) = self.backend {
-      match sock.read(self.back_buf.space()) {
+      match sock.read(self.http_state.back_buf.space()) {
         Ok(0) => {
           //println!("We just got readable, but were unable to read from the socket?");
         }
@@ -267,7 +267,7 @@ impl ProxyClient<TlsServer> for Client {
           //if let Some((front,back)) = self.tokens() {
           //  println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           //}
-          self.back_buf.fill(r);
+          self.http_state.back_buf.fill(r);
         }
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => {},
