@@ -7,15 +7,18 @@ rustbuild-1.5:
   script:
     - rustc -V
     - cargo build
+    - cargo test
 
 rustbuild-1.6:
   image: waxzce/rust:1.6
   script:
     - rustc -V
     - cargo build
+    - cargo test
 
 rustbuild-1.7:
   image: waxzce/rust:1.7
   script:
     - rustc -V
     - cargo build
+    - cargo test
