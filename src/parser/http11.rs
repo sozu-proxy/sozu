@@ -866,13 +866,98 @@ mod tests {
           res_position: 0,
           request:  HttpState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
+            Connection::Close,
+            String::from("localhost:8888")
+          ),
+          response: HttpState::Initial
+        }
+      );
+  }
+
+  // HTTP 1.0 is connection close by default
+  #[test]
+  fn parse_request_http_1_0() {
+      let input =
+          b"GET / HTTP/1.0\r\n\
+            Host: localhost:8888\r\n";
+      let initial = RequestState::new();
+      let mut buf = Buffer::with_capacity(2048);
+      buf.write(&input[..]);
+
+      //let result = parse_request(&initial, input);
+      let result = parse_until_stop(&initial, &mut buf);
+      println!("result: {:?}", result);
+      assert_eq!(
+        result,
+        RequestState {
+          req_position: 59,
+          res_position: 0,
+          request:  HttpState::Request(
+            RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
+            Connection::Close,
+            String::from("localhost:8888")
+          ),
+          response: HttpState::Initial
+        }
+      );
+  }
+
+  #[test]
+  fn parse_request_http_1_0_keep_alive() {
+      let input =
+          b"GET / HTTP/1.0\r\n\
+            Host: localhost:8888\r\n
+            Connection: keep-alive\r\n
+            \r\n";
+      let initial = RequestState::new();
+      let mut buf = Buffer::with_capacity(2048);
+      buf.write(&input[..]);
+
+      //let result = parse_request(&initial, input);
+      let result = parse_until_stop(&initial, &mut buf);
+      println!("result: {:?}", result);
+      assert_eq!(
+        result,
+        RequestState {
+          req_position: 59,
+          res_position: 0,
+          request:  HttpState::Request(
+            RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
             Connection::KeepAlive,
             String::from("localhost:8888")
           ),
           response: HttpState::Initial
         }
       );
+  }
 
+  #[test]
+  fn parse_request_http_1_1_connection_close() {
+      let input =
+          b"GET / HTTP/1.0\r\n\
+            Connection: close\r\n
+            Host: localhost:8888\r\n
+            \r\n";
+      let initial = RequestState::new();
+      let mut buf = Buffer::with_capacity(2048);
+      buf.write(&input[..]);
+
+      //let result = parse_request(&initial, input);
+      let result = parse_until_stop(&initial, &mut buf);
+      println!("result: {:?}", result);
+      assert_eq!(
+        result,
+        RequestState {
+          req_position: 59,
+          res_position: 0,
+          request:  HttpState::Request(
+            RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
+            Connection::Close,
+            String::from("localhost:8888")
+          ),
+          response: HttpState::Initial
+        }
+      );
   }
   /*
   use std::str::from_utf8;
