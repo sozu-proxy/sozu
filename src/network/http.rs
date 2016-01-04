@@ -49,14 +49,14 @@ pub struct HttpProxy {
 
 impl HttpProxy {
   pub fn readable(&mut self) -> ClientResult {
-    if ! self.state.is_proxying() {
+    if ! self.state.is_front_proxying() {
       self.state = parse_request_until_stop(&self.state, &mut self.front_buf);
-      println!("parse_requesT_until_stop returned {:?}", self.state);
-      if self.state.is_error() {
+      println!("parse_request_until_stop returned {:?}", self.state);
+      if self.state.is_front_error() {
         return ClientResult::CloseClient;
       }
-      if self.state.is_proxying() {
-        self.should_copy = self.state.should_copy();
+      if self.state.is_front_proxying() {
+        self.front_should_copy = self.state.front_should_copy();
       }
       if self.state.has_host() {
         return ClientResult::ConnectBackend;
@@ -75,19 +75,19 @@ impl HttpProxy {
 
   pub fn back_writable(&mut self, copied: usize) -> ClientResult {
     self.front_buf.consume(copied);
-    if let Some(sz) = self.should_copy {
+    if let Some(sz) = self.front_should_copy {
       if sz == copied {
-        self.should_copy = None;
+        self.front_should_copy = None;
       } else {
-        self.should_copy = Some(sz - copied);
+        self.front_should_copy = Some(sz - copied);
       }
     }
 
     ClientResult::Continue
   }
 
-  pub fn to_copy(&self) -> usize {
-    min(self.front_buf.available_data(), self.should_copy.unwrap_or(0))
+  pub fn front_to_copy(&self) -> usize {
+    min(self.front_buf.available_data(), self.front_should_copy.unwrap_or(0))
   }
 }
 
@@ -284,7 +284,7 @@ impl ProxyClient<HttpServer> for Client {
     //println!("back_writable: front_buf contains {} data, {} space", buf.available_data(), buf.available_space());
     let tokens = self.tokens();
     let res = if let Some(ref mut sock) = self.backend {
-      match sock.write(&(self.http_state.front_buf.data())[..self.http_state.to_copy()]) {
+      match sock.write(&(self.http_state.front_buf.data())[..self.http_state.front_to_copy()]) {
         Ok(0) => { ClientResult::Continue }
         Ok(r) => {
           //FIXME what happens if not everything was written?

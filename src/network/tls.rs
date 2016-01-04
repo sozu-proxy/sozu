@@ -228,7 +228,7 @@ impl ProxyClient<TlsServer> for Client {
   fn back_writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
     if let Some(ref mut sock) = self.backend {
-      match sock.write(&self.http_state.front_buf.data()[..self.http_state.to_copy()]) {
+      match sock.write(&self.http_state.front_buf.data()[..self.http_state.front_to_copy()]) {
         Ok(0) => {
           //println!("client flushing buf; WOULDBLOCK");
         }
@@ -450,7 +450,7 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
   }
 
   fn connect_to_backend(&mut self, client: &mut Client) -> Option<TcpStream> {
-    if let (Some(host), Some(rl), Some(conn)) = (client.http_state.state.get_host(), client.http_state.state.get_request_line(), client.http_state.state.get_keep_alive()) {
+    if let (Some(host), Some(rl), Some(conn)) = (client.http_state.state.get_host(), client.http_state.state.get_request_line(), client.http_state.state.get_front_keep_alive()) {
       if let Some(back) = self.backend_from_request(&host, &rl.uri) {
         if let Ok(socket) = TcpStream::connect(&back) {
           client.http_state.state = HttpState {

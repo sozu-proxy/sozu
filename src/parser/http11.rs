@@ -435,6 +435,24 @@ pub enum ResponseState {
 }
 
 impl ResponseState {
+  pub fn is_proxying(&self) -> bool {
+    match *self {
+      ResponseState::Response(_, _) | ResponseState::ResponseWithBody(_, _, _) => true,
+      _                                                                        => false
+    }
+  }
+
+  pub fn get_status_line(&self) -> Option<RStatusLine> {
+    match *self {
+      ResponseState::HasStatusLine(ref sl, _)       |
+      ResponseState::HasLength(ref sl, _, _)        |
+      ResponseState::Response(ref sl, _)            |
+      ResponseState::ResponseWithBody(ref sl, _, _) |
+      ResponseState::Proxying(ref sl, _)            => Some(sl.clone()),
+      _                                             => None
+    }
+  }
+
   pub fn get_keep_alive(&self) -> Option<Connection> {
     match *self {
       ResponseState::HasStatusLine(_, ref conn)       |
@@ -446,7 +464,23 @@ impl ResponseState {
     }
   }
 
+  pub fn should_copy(&self, position: usize) -> Option<usize> {
+    match *self {
+      ResponseState::ResponseWithBody(_, _, LengthInformation::Length(l)) => Some(position + l),
+      ResponseState::Response(_, _)                                       => Some(position),
+      _                                                                   => None
+    }
+  }
+
+  pub fn should_keep_alive(&self) -> bool {
+    match self.get_keep_alive() {
+      Some(Connection::KeepAlive) => true,
+      Some(Connection::Close)     => false,
+      None                        => false
+    }
+  }
 }
+
 #[derive(Debug,PartialEq)]
 pub struct HttpState {
   pub req_position: usize,
@@ -469,7 +503,7 @@ impl HttpState {
     self.request.has_host()
   }
 
-  pub fn is_error(&self) -> bool {
+  pub fn is_front_error(&self) -> bool {
     if let RequestState::Error(_) = self.request {
       true
     } else {
@@ -477,7 +511,7 @@ impl HttpState {
     }
   }
 
-  pub fn is_proxying(&self) -> bool {
+  pub fn is_front_proxying(&self) -> bool {
     self.request.is_proxying()
   }
 
@@ -493,16 +527,44 @@ impl HttpState {
     self.request.get_request_line()
   }
 
-  pub fn get_keep_alive(&self) -> Option<Connection> {
+  pub fn get_front_keep_alive(&self) -> Option<Connection> {
     self.request.get_keep_alive()
   }
 
-  pub fn should_copy(&self) -> Option<usize> {
+  pub fn front_should_copy(&self) -> Option<usize> {
     self.request.should_copy(self.req_position)
   }
 
   pub fn should_keep_alive(&self) -> bool {
     self.request.should_keep_alive()
+  }
+
+  pub fn is_back_error(&self) -> bool {
+    if let ResponseState::Error(_) = self.response {
+      true
+    } else {
+      false
+    }
+  }
+
+  pub fn is_back_proxying(&self) -> bool {
+    self.response.is_proxying()
+  }
+
+  pub fn get_status_line(&self) -> Option<RStatusLine> {
+    self.response.get_status_line()
+  }
+
+  pub fn get_back_keep_alive(&self) -> Option<Connection> {
+    self.response.get_keep_alive()
+  }
+
+  pub fn back_should_copy(&self) -> Option<usize> {
+    self.response.should_copy(self.res_position)
+  }
+
+  pub fn back_should_keep_alive(&self) -> bool {
+    self.response.should_keep_alive()
   }
 }
 
