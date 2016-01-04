@@ -88,7 +88,7 @@ named!(pub http_version<[&[u8];2]>,
         major: digit ~
         tag!(".") ~
         minor: digit, || {
-            [minor, major] // ToDo do we need it?
+            [major, minor] // ToDo do we need it?
         }
        )
 );
