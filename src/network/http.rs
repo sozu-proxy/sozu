@@ -575,7 +575,6 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
   }
 
   fn accept(&mut self, token: Token) -> Option<(Client, bool)> {
-    println!("configuration accept({:?})", token);
     if self.listeners.contains(token) {
       let accepted = self.listeners[token].sock.accept();
 

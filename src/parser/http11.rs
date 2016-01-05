@@ -626,7 +626,7 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
     HeaderValue::Connection(c) => {
       let mut conn = state.get_keep_alive().unwrap_or(Connection::KeepAlive);
       for value in c {
-      println!("GOT Connection header: {:?}", str::from_utf8(value).unwrap());
+      //println!("GOT Connection header: {:?}", str::from_utf8(value).unwrap());
         match value {
           b"close"      => conn = Connection::Close,
           b"keep-alive" => conn = Connection::KeepAlive,
@@ -705,7 +705,6 @@ pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestSt
         IResult::Error(_)      => {
           match crlf(buf) {
             IResult::Done(i, _) => {
-              println!("headers parsed, stopping");
               (BufferMove::Advance(buf.offset(i)), RequestState::Request(rl.clone(), conn.clone(), h.clone()))
             },
             res => {
