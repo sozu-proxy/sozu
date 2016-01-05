@@ -296,6 +296,10 @@ impl<'a> Header<'a> {
       _ => HeaderValue::Other(self.name, self.value)
     }
   }
+
+  pub fn should_delete(&self) -> bool {
+    self.name == b"Connection"
+  }
 }
 
 pub enum HeaderValue<'a> {
@@ -679,7 +683,11 @@ pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestSt
     RequestState::HasRequestLine(_, _) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
+          if header.should_delete() {
+            (BufferMove::Delete(0, buf.offset(i)), validate_request_header(state.clone(), &header))
+          } else {
+            (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
+          }
         },
         res => default_request_result(state, res)
       }
@@ -687,7 +695,11 @@ pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestSt
     RequestState::HasHost(ref rl, ref conn, ref h) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
+          if header.should_delete() {
+            (BufferMove::Delete(0, buf.offset(i)), validate_request_header(state.clone(), &header))
+          } else {
+            (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
+          }
         },
         IResult::Incomplete(_) => (BufferMove::None, state.clone()),
         IResult::Error(_)      => {
@@ -707,7 +719,11 @@ pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestSt
     RequestState::HasHostAndLength(ref rl, ref conn, ref h, ref l) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
+          if header.should_delete() {
+            (BufferMove::Delete(0, buf.offset(i)), validate_request_header(state.clone(), &header))
+          } else {
+            (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
+          }
         },
         IResult::Incomplete(_) => (BufferMove::None, state.clone()),
         IResult::Error(_)      => {
@@ -804,7 +820,11 @@ pub fn parse_response(state: &ResponseState, buf: &[u8]) -> (BufferMove, Respons
     ResponseState::HasStatusLine(ref sl, ref conn) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          (BufferMove::Advance(buf.offset(i)), validate_response_header(state.clone(), &header))
+          if header.should_delete() {
+            (BufferMove::Delete(0, buf.offset(i)), validate_response_header(state.clone(), &header))
+          } else {
+            (BufferMove::Advance(buf.offset(i)), validate_response_header(state.clone(), &header))
+          }
         },
         IResult::Incomplete(_) => (BufferMove::None, state.clone()),
         IResult::Error(_)      => {
@@ -824,7 +844,11 @@ pub fn parse_response(state: &ResponseState, buf: &[u8]) -> (BufferMove, Respons
     ResponseState::HasLength(ref sl, ref conn, ref length) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          (BufferMove::Advance(buf.offset(i)), validate_response_header(state.clone(), &header))
+          if header.should_delete() {
+            (BufferMove::Delete(0, buf.offset(i)), validate_response_header(state.clone(), &header))
+          } else {
+            (BufferMove::Advance(buf.offset(i)), validate_response_header(state.clone(), &header))
+          }
         },
         IResult::Incomplete(_) => (BufferMove::None, state.clone()),
         IResult::Error(_)      => {
@@ -858,12 +882,19 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer) -> HttpState {
     //println!("input:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[position..]).to_hex(8), mv, new_state);
     //println!("mv: {:?}, new state: {:?}\n", mv, new_state);
     current_state = new_state;
-    if let BufferMove::Advance(sz) = mv {
-      assert!(sz != 0, "buffer move should not be 0");
-      position+=sz;
-    } else {
-      break;
+
+    match mv {
+      BufferMove::Advance(sz) => {
+        assert!(sz != 0, "buffer move should not be 0");
+        position+=sz;
+      },
+      BufferMove::Delete(start, end) => {
+        buf.delete_slice(position+start, end - start);
+        position += start;
+      },
+      _ => break
     }
+
     match current_state {
       RequestState::Request(_,_,_) | RequestState::RequestWithBody(_,_,_,_) |
         RequestState::Error(_) => break,
@@ -887,12 +918,19 @@ pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer) -> HttpState 
     //println!("input:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[position..]).to_hex(8), mv, new_state);
     //println!("mv: {:?}, new state: {:?}\n", mv, new_state);
     current_state = new_state;
-    if let BufferMove::Advance(sz) = mv {
-      assert!(sz != 0, "buffer move should not be 0");
-      position+=sz;
-    } else {
-      break;
+
+    match mv {
+      BufferMove::Advance(sz) => {
+        assert!(sz != 0, "buffer move should not be 0");
+        position+=sz;
+      },
+      BufferMove::Delete(start, end) => {
+        buf.delete_slice(position+start, end - start);
+        position += start;
+      },
+      _ => break
     }
+
     match current_state {
       ResponseState::Response(_,_) | ResponseState::ResponseWithBody(_,_,_) |
         ResponseState::Error(_) => break,
