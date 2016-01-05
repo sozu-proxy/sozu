@@ -1255,7 +1255,7 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          req_position: 59,
+          req_position: 40,
           res_position: 0,
           request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
@@ -1313,7 +1313,7 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          req_position: 64,
+          req_position: 40,
           res_position: 0,
           request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
@@ -1338,11 +1338,12 @@ mod tests {
 
       //let result = parse_request(&initial, input);
       let result = parse_request_until_stop(&initial, &mut buf);
+      println!("end buf:\n{}", buf.data().to_hex(8));
       println!("result: {:?}", result);
       assert_eq!(
         result,
         HttpState {
-          req_position: 59,
+          req_position: 40,
           res_position: 0,
           request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
