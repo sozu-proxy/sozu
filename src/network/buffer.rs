@@ -77,7 +77,11 @@ impl Buffer {
     unsafe {
       let begin    = self.position + start;
       let next_end = self.end - length;
-      ptr::copy( (&self.memory[begin+length..self.end]).as_ptr(), (&mut self.memory[begin..next_end]).as_mut_ptr(), length);
+      ptr::copy(
+        (&self.memory[begin+length..self.end]).as_ptr(),
+        (&mut self.memory[begin..next_end]).as_mut_ptr(),
+        self.end - (begin+length)
+      );
       self.end = next_end;
     }
     Some(self.available_data())
