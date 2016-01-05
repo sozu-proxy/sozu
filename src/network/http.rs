@@ -53,7 +53,7 @@ impl HttpProxy {
   pub fn readable(&mut self) -> ClientResult {
     if ! self.state.is_front_proxying() {
       self.state = parse_request_until_stop(&self.state, &mut self.front_buf);
-      println!("parse_request_until_stop returned {:?}", self.state);
+      //println!("parse_request_until_stop returned {:?}", self.state);
       if self.state.is_front_error() {
         return ClientResult::CloseClient;
       }
@@ -96,7 +96,7 @@ impl HttpProxy {
   pub fn back_readable(&mut self) -> ClientResult {
     if ! self.state.is_back_proxying() {
       self.state = parse_response_until_stop(&self.state, &mut self.back_buf);
-      println!("parse_response_until_stop returned {:?}", self.state);
+      //println!("parse_response_until_stop returned {:?}", self.state);
       if self.state.is_back_error() {
         return ClientResult::CloseBackend;
       }
@@ -265,7 +265,11 @@ impl ProxyClient<HttpServer> for Client {
     match self.sock.read(&mut self.http_state.front_buf.space()) {
       Ok(0) => {},
       Ok(r) => {
-        //println!("FRONT [{:?}]: read {} bytes", self.token, r);
+        if let Some(back) = self.back_token() {
+        //  println!("FRONT [{} -> {}]: read {} bytes", self.token.unwrap().as_usize(), back.as_usize(), r);
+        } else {
+        //  println!("FRONT [{}]: read {} bytes", self.token.unwrap().as_usize(), r);
+        }
         self.http_state.front_buf.fill(r);
         self.reregister(event_loop);
         return self.http_state.readable();
@@ -300,7 +304,7 @@ impl ProxyClient<HttpServer> for Client {
         self.http_state.back_buf.consume(r);
         //FIXME what happens if not everything was written?
         if let Some((front,back)) = self.tokens() {
-          //println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
+        //  println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
         }
 
         self.tx_count = self.tx_count + r;
@@ -332,9 +336,9 @@ impl ProxyClient<HttpServer> for Client {
         Ok(0) => { ClientResult::Continue }
         Ok(r) => {
           //FIXME what happens if not everything was written?
-          //if let Some((front,back)) = tokens {
-          //  println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-          //}
+          if let Some((front,back)) = tokens {
+          //  println!("BACK  [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+          }
 
           self.http_state.back_writable(r)
         }
@@ -372,7 +376,7 @@ impl ProxyClient<HttpServer> for Client {
         Ok(r) => {
           self.http_state.back_buf.fill(r);
           if let Some((front,back)) = tokens {
-            //println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+          //  println!("BACK  [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           }
           self.http_state.back_readable()
         }
