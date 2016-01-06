@@ -10,6 +10,7 @@ use nom::Err::*;
 use nom::{digit,is_alphanumeric};
 
 use std::str;
+use std::convert::From;
 
 // Primitives
 fn is_token_char(i: u8) -> bool {
@@ -203,6 +204,138 @@ pub fn comma_separated_header_value(input:&[u8]) -> Option<Vec<&[u8]>> {
 }
 
 named!(pub headers< Vec<Header> >, terminated!(many0!(message_header), opt!(crlf)));
+
+use std::str::{from_utf8, FromStr};
+use nom::{Err,ErrorKind};
+//named!(pub chunk_header<usize>,
+pub fn chunk_header(input: &[u8]) -> IResult<&[u8], usize> {
+  let (i, s) = try_parse!(input, map_res!(take_until_and_consume!(b"\r\n"), from_utf8));
+  match usize::from_str_radix(s, 16) {
+    Ok(sz) => IResult::Done(i, sz),
+    Err(_) => IResult::Error(::nom::Err::Code(::nom::ErrorKind::MapRes))
+  }
+}
+
+named!(pub end_of_chunk_and_header<usize>, preceded!(crlf, chunk_header));
+
+named!(pub trailer_line, terminated!(take_while1!(is_header_value_char), crlf));
+
+#[derive(PartialEq,Debug,Clone,Copy)]
+pub enum Chunk {
+  Initial,
+  Copying,
+  CopyingLastHeader,
+  Ended,
+  Error
+}
+
+impl Chunk {
+  pub fn should_copy(&self) -> bool {
+    Chunk::Copying == *self
+  }
+
+  pub fn should_parse(&self) -> bool {
+    match *self {
+      Chunk::Initial | Chunk::Copying | Chunk::CopyingLastHeader => true,
+      _                                                          => false
+    }
+  }
+
+  pub fn has_ended(&self) -> bool {
+    *self == Chunk::Ended
+  }
+
+  pub fn is_error(&self) -> bool {
+    *self == Chunk::Error
+  }
+
+  // FIXME: probably inefficient, since we don't parse again until the previous chunk was sent
+  // it should be possible to parse the next header from a specific position like parse_*_until_stop
+  // and return the biggest copying size
+  pub fn parse_one(&self, buf: &[u8]) -> (usize, Chunk) {
+    match *self {
+      // we parse the first header, and advance the position to the end of chunk
+      Chunk::Initial => {
+        match chunk_header(buf) {
+          IResult::Done(i, sz_str) => {
+            let sz = usize::from(sz_str);
+            if sz == 0 {
+              // size of header + 0 data
+              (buf.offset(i), Chunk::CopyingLastHeader)
+            } else {
+              // size of header + size of data
+              (buf.offset(i) + sz, Chunk::Copying)
+            }
+          },
+          IResult::Incomplete(_) => (0, Chunk::Initial),
+          IResult::Error(_)      => (0, Chunk::Error)
+        }
+      },
+      // we parse a crlf then a header, and advance the position to the end of chunk
+      Chunk::Copying => {
+        match end_of_chunk_and_header(buf) {
+          IResult::Done(i, sz_str) => {
+            let sz = usize::from(sz_str);
+            if sz == 0 {
+              // data to copy + size of header + 0 data
+              (buf.offset(i), Chunk::CopyingLastHeader)
+            } else {
+              // data to copy + size of header + size of next chunk
+              (buf.offset(i)+sz, Chunk::Copying)
+            }
+          },
+          IResult::Incomplete(_) => (0, Chunk::Copying),
+          IResult::Error(_)      => (0, Chunk::Error)
+        }
+      },
+      // we parse a crlf then stop
+      Chunk::CopyingLastHeader => {
+        match crlf(buf) {
+          IResult::Done(i, _) => {
+            (buf.offset(i), Chunk::Ended)
+          },
+          IResult::Incomplete(_) => (0, Chunk::CopyingLastHeader),
+          IResult::Error(_)      => (0, Chunk::Error)
+        }
+      },
+      _ => { (0, Chunk::Error) }
+    }
+  }
+
+  //pub fn parse
+  pub fn parse(&self, buf: &[u8]) -> (usize, Chunk) {
+    let mut current_state = *self;
+    let mut position      = 0;
+    let length            = buf.len();
+    loop {
+      println!(
+        "calling parse_one with {:?}, buffer:\n{}",
+        (position, current_state),
+        (&buf[position..]).to_hex(8)
+      );
+      let (mv, new_state) = current_state.parse_one(&buf[position..]);
+      current_state = new_state;
+      position += mv;
+      if mv == 0 {
+        break;
+      }
+
+      match current_state {
+        Chunk::Ended | Chunk::Error => {
+          break;
+        },
+        _ => {}
+      }
+
+      if position >= length {
+        break;
+      }
+
+    }
+
+    (position, current_state)
+  }
+}
 
 #[derive(PartialEq,Debug)]
 pub struct Request<'a> {
@@ -413,7 +546,7 @@ impl RequestState {
     match *self {
       RequestState::RequestWithBody(_, _, _, LengthInformation::Length(l)) => Some(position + l),
       RequestState::Request(_, _, _)                                       => Some(position),
-      _                                                                 => None
+      _                                                                    => None
     }
   }
 
@@ -422,6 +555,14 @@ impl RequestState {
       Some(Connection::KeepAlive) => true,
       Some(Connection::Close)     => false,
       None                        => false
+    }
+  }
+
+  pub fn should_chunk(&self) -> bool {
+    if let  RequestState::RequestWithBody(_, _, _, LengthInformation::Chunked) = *self {
+      true
+    } else {
+      false
     }
   }
 }
@@ -481,6 +622,14 @@ impl ResponseState {
       Some(Connection::KeepAlive) => true,
       Some(Connection::Close)     => false,
       None                        => false
+    }
+  }
+
+  pub fn should_chunk(&self) -> bool {
+    if let  ResponseState::ResponseWithBody(_, _, LengthInformation::Chunked) = *self {
+      true
+    } else {
+      false
     }
   }
 }
@@ -1353,6 +1502,59 @@ mod tests {
           response: ResponseState::Initial
         }
       );
+  }
+
+  #[test]
+  fn parse_chunk() {
+    let input =
+      b"4\r\n\
+      Wiki\r\n\
+      5\r\n\
+      pedia\r\n\
+      e\r\n \
+      in\r\n\r\nchunks.\r\n\
+      0\r\n\
+      \r\n";
+
+    let initial = Chunk::Initial;
+
+    let res = initial.parse(&input[..]);
+    println!("result: {:?}", res);
+    assert_eq!(
+      res,
+      (43, Chunk::Ended)
+    );
+  }
+
+  #[test]
+  fn parse_chunk_partial() {
+    let input =
+      b"4\r\n\
+      Wiki\r\n\
+      5\r\n\
+      pedia\r\n\
+      e\r\n \
+      in\r\n\r\nchunks.\r\n\
+      0\r\n\
+      \r\n";
+
+    let initial = Chunk::Initial;
+
+    println!("parsing input:\n{}", (&input[..12]).to_hex(8));
+    let res = initial.parse(&input[..12]);
+    println!("result: {:?}", res);
+    assert_eq!(
+      res,
+      (17, Chunk::Copying)
+    );
+
+    println!("consuming input:\n{}", (&input[..17]).to_hex(8));
+    println!("parsing input:\n{}", (&input[17..]).to_hex(8));
+    let res2 = res.1.parse(&input[17..]);
+    assert_eq!(
+      res2,
+      (26, Chunk::Ended)
+    );
   }
   /*
   use std::str::from_utf8;
