@@ -286,7 +286,7 @@ impl ProxyClient<HttpServer> for Client {
         },
       }
     }
-        self.reregister(event_loop);
+    self.reregister(event_loop);
     ClientResult::Continue
   }
 

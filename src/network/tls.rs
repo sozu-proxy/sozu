@@ -174,8 +174,8 @@ impl ProxyClient<TlsServer> for Client {
       return ClientResult::Continue;
     }
 
-    match self.stream.write(&self.http_state.back_buf.data()[..self.http_state.back_to_copy()]) {
-      Ok(0) => {}
+    let res = match self.stream.write(&self.http_state.back_buf.data()[..self.http_state.back_to_copy()]) {
+      Ok(0) => { ClientResult::Continue }
       Ok(r) => {
         //FIXME what happens if not everything was written?
         //if let Some((front,back)) = self.tokens() {
@@ -184,21 +184,24 @@ impl ProxyClient<TlsServer> for Client {
         self.http_state.back_buf.consume(r);
 
         self.tx_count = self.tx_count + r;
+        self.http_state.writable(r)
       },
       Err(NonblockingSslError::WantRead) => {
         //println!("writable WantRead");
+        ClientResult::Continue
       },
       Err(NonblockingSslError::WantWrite) => {
         //println!("writable WantWrite");
+        ClientResult::Continue
       }
       Err(e) => {
         println!("TLS client err={:?}", e);
         return ClientResult::CloseClient;
       }
-    }
+    };
 
     self.reregister(event_loop);
-    ClientResult::Continue
+    res
   }
 
   // Read content from the client
@@ -207,11 +210,11 @@ impl ProxyClient<TlsServer> for Client {
     match self.stream.read(self.http_state.front_buf.space()) {
       Ok(0) => {},
       Ok(r) => {
-        println!("FRONT [{:?}]: read {} bytes", self.token, r);
+        //println!("FRONT [{:?}]: read {} bytes", self.token, r);
         self.http_state.front_buf.fill(r);
         self.reregister(event_loop);
         let res = self.http_state.readable();
-        println!("TLS http_state.readable() returned {:?}", res);
+        //println!("TLS http_state.readable() returned {:?}", res);
         return res;
       },
       Err(NonblockingSslError::WantRead) => {
@@ -233,10 +236,10 @@ impl ProxyClient<TlsServer> for Client {
   // Forward content to application
   fn back_writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
-    if let Some(ref mut sock) = self.backend {
+    let res = if let Some(ref mut sock) = self.backend {
       match sock.write(&self.http_state.front_buf.data()[..self.http_state.front_to_copy()]) {
         Ok(0) => {
-          //println!("client flushing buf; WOULDBLOCK");
+          ClientResult::Continue
         }
         Ok(r) => {
           //FIXME what happens if not everything was written?
@@ -244,50 +247,62 @@ impl ProxyClient<TlsServer> for Client {
           //  println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           //}
 
-          self.http_state.back_writable(r);
+          self.http_state.back_writable(r)
         }
         Err(e) => match e.kind() {
-          ErrorKind::WouldBlock => {},
+          ErrorKind::WouldBlock => { ClientResult::Continue },
           ErrorKind::BrokenPipe => {
             println!("broken pipe writing to the backend");
-            return ClientResult::CloseClient;
+            return ClientResult::CloseBoth;
           },
-          _ => println!("not implemented; client err={:?}", e)
+          _ => {
+            println!("not implemented; client err={:?}", e);
+            return ClientResult::CloseBoth;
+          }
         }
       }
-    }
+    } else {
+      ClientResult::CloseBoth
+    };
 
     self.reregister(event_loop);
-    ClientResult::Continue
+    res
   }
 
   // Read content from application
   fn back_readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
-    if let Some(ref mut sock) = self.backend {
+    let res = if let Some(ref mut sock) = self.backend {
       match sock.read(self.http_state.back_buf.space()) {
         Ok(0) => {
           //println!("We just got readable, but were unable to read from the socket?");
+          ClientResult::Continue
         }
         Ok(r) => {
           //if let Some((front,back)) = self.tokens() {
           //  println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           //}
           self.http_state.back_buf.fill(r);
+          self.http_state.back_readable()
         }
         Err(e) => match e.kind() {
-          ErrorKind::WouldBlock => {},
+          ErrorKind::WouldBlock => { ClientResult::Continue },
           ErrorKind::BrokenPipe => {
             println!("broken pipe writing to the backend");
-            return ClientResult::CloseClient;
+            return ClientResult::CloseBoth;
           },
-          _ => println!("not implemented; client err={:?}", e)
+          _ => {
+            println!("not implemented; client err={:?}", e);
+            return ClientResult::CloseBoth;
+          }
         }
-      };
-    }
+      }
+    } else {
+      ClientResult::CloseBoth
+    };
 
     self.reregister(event_loop);
-    ClientResult::Continue
+    res
   }
 }
 
