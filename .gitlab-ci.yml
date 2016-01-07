@@ -3,15 +3,11 @@ before_script:
   - echo $TOTO_VAR
 
 rustbuild-1.5:
-  image: waxzce/rust_nginx:1.5
+  image: waxzce/rust:1.5
   script:
     - rustc -V
     - cargo build
     - cargo test
-    - ./docker_tests/run_nginx.sh
-    - cargo run &
-    - curl -v http://lolcatho.st:8080/
-    - curl -vk https://lolcatho.st:8443/
 
 rustbuild-1.6:
   image: waxzce/rust:1.6
