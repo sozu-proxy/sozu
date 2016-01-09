@@ -14,6 +14,7 @@ rustbuild-1.5:
     - cargo test
     - ./docker_tests/run_nginx.sh
     - cargo run &
+    - sleep 5
     - curl -v http://lolcatho.st:8080/
     - curl -vk https://lolcatho.st:8443/
 
