@@ -15,8 +15,8 @@ rustbuild-1.5:
     - ./docker_tests/run_nginx.sh
     - cargo run &
     - sleep 5
-    - curl —max-time 10 -v http://lolcatho.st:8080/
-    - curl —max-time 10 -vk https://lolcatho.st:8443/
+    - curl --max-time 10 -v http://lolcatho.st:8080/
+    - curl --max-time 10 -vk https://lolcatho.st:8443/
 
 rustbuild-1.6:
   image: waxzce/rust-1.6-nginx:latest
@@ -31,8 +31,8 @@ rustbuild-1.6:
     - ./docker_tests/run_nginx.sh
     - cargo run &
     - sleep 5
-    - curl —max-time 10 -v http://lolcatho.st:8080/
-    - curl —max-time 10 -vk https://lolcatho.st:8443/
+    - curl --max-time 10 -v http://lolcatho.st:8080/
+    - curl --max-time 10 -vk https://lolcatho.st:8443/
 
 
 rustbuild-1.7:
@@ -48,5 +48,5 @@ rustbuild-1.7:
     - ./docker_tests/run_nginx.sh
     - cargo run &
     - sleep 5
-    - curl —max-time 10 -v http://lolcatho.st:8080/
-    - curl —max-time 10 -vk https://lolcatho.st:8443/
+    - curl --max-time 10 -v http://lolcatho.st:8080/
+    - curl --max-time 10 -vk https://lolcatho.st:8443/
