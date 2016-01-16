@@ -303,7 +303,7 @@ impl Chunk {
   }
 
   //pub fn parse
-  pub fn parse(&self, buf: &[u8]) -> (usize, Chunk) {
+  pub fn parse(&self, buf: &[u8]) -> (BufferMove, Chunk) {
     let mut current_state = *self;
     let mut position      = 0;
     let length            = buf.len();
@@ -333,7 +333,10 @@ impl Chunk {
 
     }
 
-    (position, current_state)
+    match position {
+      0  => (BufferMove::None, current_state),
+      sz => (BufferMove::Advance(sz), current_state)
+    }
   }
 }
 
@@ -475,6 +478,7 @@ pub enum RequestState {
   HasHostAndLength(RRequestLine, Connection, Host, LengthInformation),
   Request(RRequestLine, Connection, Host),
   RequestWithBody(RRequestLine, Connection, Host, LengthInformation),
+  RequestWithBodyChunks(RRequestLine, Connection, Host, Chunk),
   Proxying(RRequestLine, Connection, Host)
   //Proxying(RRequestLine, Host, LengthInformation, BackendToken)
 }
@@ -485,6 +489,7 @@ impl RequestState {
       RequestState::HasHost(_, _, _)            |
       RequestState::Request(_, _, _)            |
       RequestState::RequestWithBody(_, _, _, _) |
+      RequestState::RequestWithBodyChunks(_, _, _, _) |
       RequestState::Proxying(_, _, _)           => true,
       _                                      => false
     }
@@ -492,7 +497,9 @@ impl RequestState {
 
   pub fn is_proxying(&self) -> bool {
     match *self {
-      RequestState::Request(_, _, _) | RequestState::RequestWithBody(_, _, _, _) => true,
+      RequestState::Request(_, _, _) |
+      RequestState::RequestWithBody(_, _, _, _) |
+      RequestState::RequestWithBodyChunks(_, _, _, _)  => true,
       _                                                                          => false
     }
   }
@@ -502,6 +509,7 @@ impl RequestState {
       RequestState::HasHost(_, _, ref host)            |
       RequestState::Request(_, _, ref host)            |
       RequestState::RequestWithBody(_, _, ref host, _) |
+      RequestState::RequestWithBodyChunks(_, _, ref host, _) |
       RequestState::Proxying(_, _, ref host)    => Some(host.clone()),
       _                                      => None
     }
@@ -513,6 +521,7 @@ impl RequestState {
       RequestState::HasHost(ref rl, _, _)            |
       RequestState::Request(ref rl , _, _)           |
       RequestState::RequestWithBody(ref rl, _, _, _) |
+      RequestState::RequestWithBodyChunks(ref rl, _, _, _) |
       RequestState::Proxying(ref rl, _, _)           => Some(rl.uri.clone()),
       _                                           => None
     }
@@ -524,6 +533,7 @@ impl RequestState {
       RequestState::HasHost(ref rl, _, _)            |
       RequestState::Request(ref rl, _, _)            |
       RequestState::RequestWithBody(ref rl, _, _, _) |
+      RequestState::RequestWithBodyChunks(ref rl, _, _, _) |
       RequestState::Proxying(ref rl, _, _)           => Some(rl.clone()),
       _                                           => None
     }
@@ -537,6 +547,7 @@ impl RequestState {
       RequestState::HasHostAndLength(_, ref conn, _, _) |
       RequestState::Request(_, ref conn, _)             |
       RequestState::RequestWithBody(_, ref conn, _, _)  |
+      RequestState::RequestWithBodyChunks(_, ref conn, _, _)  |
       RequestState::Proxying(_, ref conn, _)            => Some(conn.clone()),
       _                                              => None
     }
@@ -559,7 +570,7 @@ impl RequestState {
   }
 
   pub fn should_chunk(&self) -> bool {
-    if let  RequestState::RequestWithBody(_, _, _, LengthInformation::Chunked) = *self {
+    if let  RequestState::RequestWithBodyChunks(_, _, _, _) = *self {
       true
     } else {
       false
@@ -639,7 +650,7 @@ pub struct HttpState {
   pub req_position: usize,
   pub res_position: usize,
   pub request:      RequestState,
-  pub response:     ResponseState
+  pub response:     ResponseState,
 }
 
 impl HttpState {
@@ -648,7 +659,7 @@ impl HttpState {
       req_position: 0,
       res_position: 0,
       request:      RequestState::Initial,
-      response:     ResponseState::Initial
+      response:     ResponseState::Initial,
     }
   }
 
@@ -879,7 +890,10 @@ pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestSt
             IResult::Done(i, _) => {
               println!("headers parsed, stopping");
               (BufferMove::Advance(buf.offset(i)),
-               RequestState::RequestWithBody(rl.clone(), conn.clone(), h.clone(), l.clone())
+                match l {
+                  &LengthInformation::Chunked    => RequestState::RequestWithBodyChunks(rl.clone(), conn.clone(), h.clone(), Chunk::Initial.clone()),
+                  _ => RequestState::RequestWithBody(rl.clone(), conn.clone(), h.clone(), l.clone()),
+                }
               )
             },
             res => {
@@ -889,6 +903,11 @@ pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestSt
           }
         }
       }
+    },
+    RequestState::RequestWithBodyChunks(ref rl, ref conn, ref h, ref ch) => {
+      println!("\nCHUNKS: trying to parse chunks, from state == {:?}:\n{}", ch, buf.to_hex(8));
+      let (advance, chunk_state) = ch.parse(buf);
+      (advance, RequestState::RequestWithBodyChunks(rl.clone(), conn.clone(), h.clone(), chunk_state))
     },
     _ => {
       println!("unimplemented state: {:?}", state);
@@ -1045,15 +1064,17 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer) -> HttpState {
 
     match current_state {
       RequestState::Request(_,_,_) | RequestState::RequestWithBody(_,_,_,_) |
-        RequestState::Error(_) => break,
+        RequestState::Error(_) | RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended) => break,
       _ => ()
     }
+
+    if position > buf.data().len() { break }
   }
   HttpState {
     req_position: position,
     res_position: rs.res_position,
-    request:  current_state,
-    response: rs.response.clone()
+    request:      current_state,
+    response:     rs.response.clone(),
   }
 }
 
@@ -1088,8 +1109,8 @@ pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer) -> HttpState 
   HttpState {
     req_position: rs.req_position,
     res_position: position,
-    request:  rs.request.clone(),
-    response: current_state
+    request:      rs.request.clone(),
+    response:     current_state,
   }
 }
 
@@ -1315,11 +1336,11 @@ mod tests {
         HttpState {
           req_position: 116,
           res_position: 0,
-          request:    RequestState::RequestWithBody(
+          request:    RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
-            LengthInformation::Chunked
+            Chunk::Initial
           ),
           response: ResponseState::Initial
         }
@@ -1376,11 +1397,11 @@ mod tests {
         HttpState {
           req_position: 136,
           res_position: 0,
-          request:  RequestState::RequestWithBody(
+          request:  RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
-            LengthInformation::Chunked
+            Chunk::Initial
           ),
           response: ResponseState::Initial
         }
@@ -1522,7 +1543,7 @@ mod tests {
     println!("result: {:?}", res);
     assert_eq!(
       res,
-      (43, Chunk::Ended)
+      (BufferMove::Advance(43), Chunk::Ended)
     );
   }
 
@@ -1545,7 +1566,7 @@ mod tests {
     println!("result: {:?}", res);
     assert_eq!(
       res,
-      (17, Chunk::Copying)
+      (BufferMove::Advance(17), Chunk::Copying)
     );
 
     println!("consuming input:\n{}", (&input[..17]).to_hex(8));
@@ -1553,8 +1574,126 @@ mod tests {
     let res2 = res.1.parse(&input[17..]);
     assert_eq!(
       res2,
-      (26, Chunk::Ended)
+      (BufferMove::Advance(26), Chunk::Ended)
     );
+  }
+
+  #[test]
+  fn parse_requests_and_chunks_test() {
+      let input =
+          b"POST /index.html HTTP/1.1\r\n\
+            Host: localhost:8888\r\n\
+            User-Agent: curl/7.43.0\r\n\
+            Transfer-Encoding: chunked\r\n\
+            Accept: */*\r\n\
+            \r\n\
+            4\r\n\
+            Wiki\r\n\
+            5\r\n\
+            pedia\r\n\
+            e\r\n \
+            in\r\n\r\nchunks.\r\n\
+            0\r\n\
+            \r\n";
+      let initial = HttpState::new();
+      let mut buf = Buffer::with_capacity(2048);
+      buf.write(&input[..]);
+
+      //let result = parse_request(&initial, input);
+      let result = parse_request_until_stop(&initial, &mut buf);
+      println!("result: {:?}", result);
+      assert_eq!(
+        result,
+        HttpState {
+          req_position: 160,
+          res_position: 0,
+          request:    RequestState::RequestWithBodyChunks(
+            RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
+            Connection::KeepAlive,
+            String::from("localhost:8888"),
+            Chunk::Ended
+          ),
+          response: ResponseState::Initial
+        }
+      );
+  }
+
+  #[test]
+  fn parse_requests_and_chunks_partial_test() {
+      let input =
+          b"POST /index.html HTTP/1.1\r\n\
+            Host: localhost:8888\r\n\
+            User-Agent: curl/7.43.0\r\n\
+            Transfer-Encoding: chunked\r\n\
+            Accept: */*\r\n\
+            \r\n\
+            4\r\n\
+            Wiki\r\n\
+            5\r\n\
+            pedia\r\n\
+            e\r\n \
+            in\r\n\r\nchunks.\r\n\
+            0\r\n\
+            \r\n";
+      let initial = HttpState::new();
+      let mut buf = Buffer::with_capacity(2048);
+      buf.write(&input[..125]);
+      println!("parsing\n{}", &input[..125].to_hex(8));
+
+      let result = parse_request_until_stop(&initial, &mut buf);
+      println!("result: {:?}", result);
+      assert_eq!(
+        result,
+        HttpState {
+          req_position: 124,
+          res_position: 0,
+          request:    RequestState::RequestWithBodyChunks(
+            RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
+            Connection::KeepAlive,
+            String::from("localhost:8888"),
+            Chunk::Copying
+          ),
+          response: ResponseState::Initial
+        }
+      );
+      buf.write(&input[125..140]);
+      println!("parsing\n{}", &input[125..140].to_hex(8));
+
+      let result = parse_request_until_stop(&initial, &mut buf);
+      println!("result: {:?}", result);
+      assert_eq!(
+        result,
+        HttpState {
+          req_position: 153,
+          res_position: 0,
+          request:    RequestState::RequestWithBodyChunks(
+            RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
+            Connection::KeepAlive,
+            String::from("localhost:8888"),
+            Chunk::Copying
+          ),
+          response: ResponseState::Initial
+        }
+      );
+
+      buf.write(&input[140..]);
+      println!("parsing\n{}", &input[140..].to_hex(8));
+      let result = parse_request_until_stop(&initial, &mut buf);
+      println!("result: {:?}", result);
+      assert_eq!(
+        result,
+        HttpState {
+          req_position: 160,
+          res_position: 0,
+          request:    RequestState::RequestWithBodyChunks(
+            RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
+            Connection::KeepAlive,
+            String::from("localhost:8888"),
+            Chunk::Ended
+          ),
+          response: ResponseState::Initial
+        }
+      );
   }
   /*
   use std::str::from_utf8;

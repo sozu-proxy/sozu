@@ -174,6 +174,9 @@ impl ProxyClient<TlsServer> for Client {
       return ClientResult::Continue;
     }
 
+    if self.http_state.back_to_copy() == 0 {
+      return ClientResult::Continue;
+    }
     let res = match self.stream.write(&self.http_state.back_buf.data()[..self.http_state.back_to_copy()]) {
       Ok(0) => { ClientResult::Continue }
       Ok(r) => {
@@ -195,7 +198,7 @@ impl ProxyClient<TlsServer> for Client {
         ClientResult::Continue
       }
       Err(e) => {
-        println!("TLS client err={:?}", e);
+        println!("writable TLS client err={:?}", e);
         return ClientResult::CloseClient;
       }
     };
@@ -224,7 +227,7 @@ impl ProxyClient<TlsServer> for Client {
         //println!("writable WantWrite");
       },
       Err(e) => {
-        println!("TLS client err={:?}", e);
+        println!("readable TLS client err={:?}", e);
         return ClientResult::CloseClient;
       }
     }
