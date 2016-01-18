@@ -206,17 +206,27 @@ pub fn comma_separated_header_value(input:&[u8]) -> Option<Vec<&[u8]>> {
 named!(pub headers< Vec<Header> >, terminated!(many0!(message_header), opt!(crlf)));
 
 use std::str::{from_utf8, FromStr};
-use nom::{Err,ErrorKind};
-//named!(pub chunk_header<usize>,
-pub fn chunk_header(input: &[u8]) -> IResult<&[u8], usize> {
-  let (i, s) = try_parse!(input, map_res!(take_until_and_consume!(b"\r\n"), from_utf8));
+use nom::{Err,ErrorKind,Needed};
+
+pub fn is_hex_digit(chr: u8) -> bool {
+  (chr >= 0x30 && chr <= 0x39) ||
+  (chr >= 0x41 && chr <= 0x46) ||
+  (chr >= 0x61 && chr <= 0x66)
+}
+pub fn chunk_size(input: &[u8]) -> IResult<&[u8], usize> {
+  let (i, s) = try_parse!(input, map_res!(take_while!(is_hex_digit), from_utf8));
+  println!("hex digits parsed: {}", s);
+  if i.len() == 0 {
+    return IResult::Incomplete(Needed::Unknown);
+  }
   match usize::from_str_radix(s, 16) {
     Ok(sz) => IResult::Done(i, sz),
     Err(_) => IResult::Error(::nom::Err::Code(::nom::ErrorKind::MapRes))
   }
 }
 
-named!(pub end_of_chunk_and_header<usize>, preceded!(crlf, chunk_header));
+named!(pub chunk_header<usize>, terminated!(chunk_size, crlf));
+named!(pub end_of_chunk_and_header<usize>, dbg_dmp!(preceded!(crlf, chunk_header)));
 
 named!(pub trailer_line, terminated!(take_while1!(is_header_value_char), crlf));
 
@@ -1830,15 +1840,33 @@ mod tests {
       };
       let mut buf = Buffer::with_capacity(2048);
 
-      buf.write(&input[100..114]);
-      println!("parsing\n{}", &input[100..114].to_hex(8));
+      buf.write(&input[..114]);
+      println!("parsing\n{}", &input[0..114].to_hex(8));
       let result = parse_response_until_stop(&initial, &mut buf);
       println!("result: {:?}", result);
       assert_eq!(
         result,
         HttpState {
           req_position: 0,
-          res_position: 117,
+          res_position: 110,
+          request:      RequestState::Initial,
+          response:     ResponseState::ResponseWithBodyChunks(
+            RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
+            Connection::KeepAlive,
+            Chunk::Copying
+          ),
+        }
+      );
+
+      buf.write(&input[114..116]);
+      println!("parsing\n{}", &input[114..116].to_hex(8));
+      let result = parse_response_until_stop(&initial, &mut buf);
+      println!("result: {:?}", result);
+      assert_eq!(
+        result,
+        HttpState {
+          req_position: 0,
+          res_position: 115,
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1847,9 +1875,8 @@ mod tests {
           ),
         }
       );
-
-      buf.write(&input[100..115]);
-      println!("parsing\n{}", &input[100..115].to_hex(8));
+      buf.write(&input[116..]);
+      println!("parsing\n{}", &input[116..].to_hex(8));
       let result = parse_response_until_stop(&initial, &mut buf);
       println!("result: {:?}", result);
       assert_eq!(
@@ -1861,7 +1888,7 @@ mod tests {
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
             Connection::KeepAlive,
-            Chunk::CopyingLastHeader
+            Chunk::Ended
           ),
         }
       );
