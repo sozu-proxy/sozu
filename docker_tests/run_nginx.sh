@@ -9,8 +9,11 @@ echo "        listen 1026 default_server;" >> /etc/nginx/sites-enabled/mytest
 echo "        root /var/www/html;" >> /etc/nginx/sites-enabled/mytest
 echo "        index index.html index.htm index.nginx-debian.html;" >> /etc/nginx/sites-enabled/mytest
 echo "        server_name lolcatho.st;" >> /etc/nginx/sites-enabled/mytest
+echo "        port_in_redirect on;" >> /etc/nginx/sites-enabled/mytest
+echo "        server_name_in_redirect off;" >> /etc/nginx/sites-enabled/mytest
 echo "        location / {" >> /etc/nginx/sites-enabled/mytest
-echo "            try_files $uri $uri/ =404;" >> /etc/nginx/sites-enabled/mytest
+echo "            autoindex on;" >> /etc/nginx/sites-enabled/mytest
+#echo "            try_files $uri $uri/ =404;" >> /etc/nginx/sites-enabled/mytest
 echo "        }" >> /etc/nginx/sites-enabled/mytest
 echo "}" >> /etc/nginx/sites-enabled/mytest
 

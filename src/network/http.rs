@@ -49,15 +49,18 @@ pub struct HttpProxy {
 
 impl HttpProxy {
   pub fn readable(&mut self) -> ClientResult {
+    println!("front buffer({} bytes):\n{}", self.front_buf.data().len(), self.front_buf.data().to_hex(8));
     if ! self.state.is_front_proxying() {
       self.state = parse_request_until_stop(&self.state, &mut self.front_buf);
-      //println!("parse_request_until_stop returned {:?}", self.state);
+      println!("parse_request_until_stop returned {:?} => advance: {}", self.state, self.state.req_position);
       if self.state.is_front_error() {
         return ClientResult::CloseClient;
       }
       if self.state.has_host() {
         return ClientResult::ConnectBackend;
       }
+    } else {
+      println!("state: {:?}", self.state);
     }
     ClientResult::Continue
   }
@@ -84,9 +87,10 @@ impl HttpProxy {
   }
 
   pub fn back_readable(&mut self) -> ClientResult {
+    println!("back buffer ({} bytes):\n{}", self.back_buf.data().len(), self.back_buf.data().to_hex(8));
     if ! self.state.is_back_proxying() {
       self.state = parse_response_until_stop(&self.state, &mut self.back_buf);
-      //println!("parse_response_until_stop returned {:?}", self.state);
+      println!("parse_response_until_stop returned {:?} => advance: {}", self.state, self.state.res_position);
       if self.state.is_back_error() {
         return ClientResult::CloseBackend;
       }
