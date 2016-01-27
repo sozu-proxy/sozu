@@ -62,8 +62,6 @@ impl Client {
       backend:        None,
       http_state:     HttpProxy {
         state:             HttpState::new(),
-        front_should_copy: None,
-        back_should_copy:  None,
         front_buf:         Buffer::with_capacity(12000),
         back_buf:          Buffer::with_capacity(12000),
       },

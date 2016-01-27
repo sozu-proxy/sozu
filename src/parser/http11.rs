@@ -717,7 +717,19 @@ impl HttpState {
   }
 
   pub fn front_should_copy(&self) -> Option<usize> {
-    self.request.should_copy(self.req_position)
+    if self.req_position == 0 {
+      None
+    } else {
+      Some(self.req_position)
+    }
+  }
+
+  pub fn front_copied(&mut self, copied: usize) {
+    if copied > self.req_position {
+      self.request = RequestState::Error(ErrorState::TooMuchDataCopied)
+    } else {
+      self.req_position = self.req_position - copied
+    }
   }
 
   pub fn front_should_keep_alive(&self) -> bool {
@@ -744,8 +756,12 @@ impl HttpState {
     self.response.get_keep_alive()
   }
 
-  pub fn back_should_copy(&self) -> Option<usize> {
-    self.response.should_copy(self.res_position)
+  pub fn back_copied(&mut self, copied: usize) {
+    if copied > self.res_position {
+      self.request = RequestState::Error(ErrorState::TooMuchDataCopied)
+    } else {
+      self.res_position = self.res_position - copied
+    }
   }
 
   pub fn back_should_keep_alive(&self) -> bool {

@@ -43,8 +43,6 @@ pub enum HttpProxyOrder {
 
 pub struct HttpProxy {
   pub state:             HttpState,
-  pub front_should_copy: Option<usize>,
-  pub back_should_copy:  Option<usize>,
   pub front_buf:         Buffer,
   pub back_buf:          Buffer,
 }
@@ -57,9 +55,6 @@ impl HttpProxy {
       if self.state.is_front_error() {
         return ClientResult::CloseClient;
       }
-      if self.state.is_front_proxying() {
-        self.front_should_copy = self.state.front_should_copy();
-      }
       if self.state.has_host() {
         return ClientResult::ConnectBackend;
       }
@@ -69,16 +64,11 @@ impl HttpProxy {
 
   pub fn writable(&mut self, copied: usize) -> ClientResult {
     self.back_buf.consume(copied);
-    if let Some(sz) = self.back_should_copy {
-      if sz == copied {
-        self.back_should_copy = None;
-      } else {
-        self.back_should_copy = Some(sz - copied);
-      }
-    }
+    self.state.back_copied(copied);
 
     // The response ended, so we can close the connection, or accept a new request
-    if self.back_should_copy == None {
+    // FIXME: with Server Side Events, new responses can come
+    if self.state.is_back_proxying() && self.state.res_position == 0 {
       let sh = (self.state.front_should_keep_alive(), self.state.back_should_keep_alive());
       println!("RESPONSE ENDED, SHOULD WE KEEP ALIVE? {:?}", sh);
       let res = match sh {
@@ -100,32 +90,23 @@ impl HttpProxy {
       if self.state.is_back_error() {
         return ClientResult::CloseBackend;
       }
-      if self.state.is_back_proxying() {
-        self.back_should_copy = self.state.back_should_copy();
-      }
     }
     ClientResult::Continue
   }
 
   pub fn back_writable(&mut self, copied: usize) -> ClientResult {
     self.front_buf.consume(copied);
-    if let Some(sz) = self.front_should_copy {
-      if sz == copied {
-        self.front_should_copy = None;
-      } else {
-        self.front_should_copy = Some(sz - copied);
-      }
-    }
+    self.state.front_copied(copied);
 
     ClientResult::Continue
   }
 
   pub fn front_to_copy(&self) -> usize {
-    min(self.front_buf.available_data(), self.front_should_copy.unwrap_or(0))
+    min(self.front_buf.available_data(), self.state.req_position)
   }
 
   pub fn back_to_copy(&self) -> usize {
-    min(self.back_buf.available_data(), self.back_should_copy.unwrap_or(0))
+    min(self.back_buf.available_data(), self.state.res_position)
   }
 }
 
@@ -149,8 +130,6 @@ impl Client {
       backend:        None,
       http_state:     HttpProxy {
         state:             HttpState::new(),
-        front_should_copy: None,
-        back_should_copy:  None,
         front_buf:         Buffer::with_capacity(12000),
         back_buf:          Buffer::with_capacity(12000),
       },
