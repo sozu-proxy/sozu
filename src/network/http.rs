@@ -66,6 +66,7 @@ impl HttpProxy {
   }
 
   pub fn writable(&mut self, copied: usize) -> ClientResult {
+    self.back_buf.consume(copied);
     self.state.back_copied(copied);
 
     // The response ended, so we can close the connection, or accept a new request
@@ -98,6 +99,7 @@ impl HttpProxy {
   }
 
   pub fn back_writable(&mut self, copied: usize) -> ClientResult {
+    self.front_buf.consume(copied);
     self.state.front_copied(copied);
 
     ClientResult::Continue
@@ -282,7 +284,6 @@ impl ProxyClient<HttpServer> for Client {
     let res = match self.sock.write(&(self.http_state.back_buf.data())[..self.http_state.back_to_copy()]) {
       Ok(0) => { ClientResult::Continue }
       Ok(r) => {
-        self.http_state.back_buf.consume(r);
         //FIXME what happens if not everything was written?
         if let Some((front,back)) = self.tokens() {
         //  println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);

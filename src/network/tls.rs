@@ -182,7 +182,6 @@ impl ProxyClient<TlsServer> for Client {
         //if let Some((front,back)) = self.tokens() {
         //  println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
         //}
-        self.http_state.back_buf.consume(r);
 
         self.tx_count = self.tx_count + r;
         self.http_state.writable(r)
