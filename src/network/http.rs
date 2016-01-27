@@ -165,14 +165,11 @@ impl Client {
     self.front_interest.insert(EventSet::writable());
     self.back_interest.insert(EventSet::readable());
     self.back_interest.insert(EventSet::writable());
-    //println!("REREGISTER: {:?}", self.tokens());
     if let Some(frontend_token) = self.token {
-      //println!("reregister frontend {}: {:?}", frontend_token.as_usize(), self.front_interest);
       event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
     if let Some(backend_token) = self.backend_token {
       if let Some(ref sock) = self.backend {
-        //println!("reregister backend {}: {:?}", backend_token.as_usize(), self.back_interest);
         event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge() | PollOpt::oneshot());
       }
     }
@@ -248,11 +245,7 @@ impl ProxyClient<HttpServer> for Client {
     match self.sock.read(&mut self.http_state.front_buf.space()) {
       Ok(0) => {},
       Ok(r) => {
-        if let Some(back) = self.back_token() {
-        //  println!("FRONT [{} -> {}]: read {} bytes", self.token.unwrap().as_usize(), back.as_usize(), r);
-        } else {
-        //  println!("FRONT [{}]: read {} bytes", self.token.unwrap().as_usize(), r);
-        }
+        //println!("FRONT [{:?}]: read {} bytes", self.token, r);
         self.http_state.front_buf.fill(r);
         self.reregister(event_loop);
         return self.http_state.readable();
@@ -276,7 +269,6 @@ impl ProxyClient<HttpServer> for Client {
   // Forward content to client
   fn writable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
     //println!("writable(): back_buf contains {} data, {} space", self.back_buf.available_data(), self.back_buf.available_space());
-
     if self.http_state.back_buf.available_data() == 0 {
       return ClientResult::Continue;
     }
@@ -285,9 +277,9 @@ impl ProxyClient<HttpServer> for Client {
       Ok(0) => { ClientResult::Continue }
       Ok(r) => {
         //FIXME what happens if not everything was written?
-        if let Some((front,back)) = self.tokens() {
+        //if let Some((front,back)) = self.tokens() {
         //  println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
-        }
+        //}
 
         self.tx_count = self.tx_count + r;
         self.http_state.writable(r)
@@ -312,15 +304,14 @@ impl ProxyClient<HttpServer> for Client {
   // Forward content to application
   fn back_writable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
     //println!("back_writable: front_buf contains {} data, {} space", buf.available_data(), buf.available_space());
-    let tokens = self.tokens();
     let res = if let Some(ref mut sock) = self.backend {
       match sock.write(&(self.http_state.front_buf.data())[..self.http_state.front_to_copy()]) {
         Ok(0) => { ClientResult::Continue }
         Ok(r) => {
           //FIXME what happens if not everything was written?
-          if let Some((front,back)) = tokens {
+          //if let Some((front,back)) = self.tokens() {
           //  println!("BACK  [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-          }
+          //}
 
           self.http_state.back_writable(r)
         }
@@ -347,8 +338,6 @@ impl ProxyClient<HttpServer> for Client {
   // Read content from application
   fn back_readable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
     //println!("back_readable(): back_buf contains {} data, {} space", self.back_buf.available_data(), self.back_buf.available_space());
-    let tokens = self.tokens();
-
     let res = if let Some(ref mut sock) = self.backend {
       match sock.read(&mut self.http_state.back_buf.space()) {
         Ok(0) => {
@@ -356,10 +345,10 @@ impl ProxyClient<HttpServer> for Client {
           ClientResult::Continue
         }
         Ok(r) => {
-          self.http_state.back_buf.fill(r);
-          if let Some((front,back)) = tokens {
+          //if let Some((front,back)) = self.tokens() {
           //  println!("BACK  [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-          }
+          //}
+          self.http_state.back_buf.fill(r);
           self.http_state.back_readable()
         }
         Err(e) => match e.kind() {
@@ -381,7 +370,6 @@ impl ProxyClient<HttpServer> for Client {
     self.reregister(event_loop);
     res
   }
-
 }
 
 pub struct ApplicationListener {

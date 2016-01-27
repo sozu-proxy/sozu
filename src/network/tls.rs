@@ -165,6 +165,34 @@ impl ProxyClient<TlsServer> for Client {
     }
   }
 
+  // Read content from the client
+  fn readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
+    //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
+    match self.stream.read(self.http_state.front_buf.space()) {
+      Ok(0) => {},
+      Ok(r) => {
+        //println!("FRONT [{:?}]: read {} bytes", self.token, r);
+        self.http_state.front_buf.fill(r);
+        self.reregister(event_loop);
+        let res = self.http_state.readable();
+        return res;
+      },
+      Err(NonblockingSslError::WantRead) => {
+        //println!("writable WantRead");
+      },
+      Err(NonblockingSslError::WantWrite) => {
+        //println!("writable WantWrite");
+      },
+      Err(e) => {
+        println!("readable TLS client err={:?}", e);
+        return ClientResult::CloseClient;
+      }
+    }
+
+    self.reregister(event_loop);
+    ClientResult::Continue
+  }
+
   // Forward content to client
   fn writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("writable back_buf({}): {}", b.remaining(), from_utf8((&b as &Buf).bytes()).unwrap());
@@ -172,9 +200,6 @@ impl ProxyClient<TlsServer> for Client {
       return ClientResult::Continue;
     }
 
-    if self.http_state.back_to_copy() == 0 {
-      return ClientResult::Continue;
-    }
     let res = match self.stream.write(&self.http_state.back_buf.data()[..self.http_state.back_to_copy()]) {
       Ok(0) => { ClientResult::Continue }
       Ok(r) => {
@@ -204,43 +229,12 @@ impl ProxyClient<TlsServer> for Client {
     res
   }
 
-  // Read content from the client
-  fn readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
-    //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
-    match self.stream.read(self.http_state.front_buf.space()) {
-      Ok(0) => {},
-      Ok(r) => {
-        //println!("FRONT [{:?}]: read {} bytes", self.token, r);
-        self.http_state.front_buf.fill(r);
-        self.reregister(event_loop);
-        let res = self.http_state.readable();
-        //println!("TLS http_state.readable() returned {:?}", res);
-        return res;
-      },
-      Err(NonblockingSslError::WantRead) => {
-        //println!("writable WantRead");
-      },
-      Err(NonblockingSslError::WantWrite) => {
-        //println!("writable WantWrite");
-      },
-      Err(e) => {
-        println!("readable TLS client err={:?}", e);
-        return ClientResult::CloseClient;
-      }
-    }
-
-    self.reregister(event_loop);
-    ClientResult::Continue
-  }
-
   // Forward content to application
   fn back_writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
     //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
     let res = if let Some(ref mut sock) = self.backend {
       match sock.write(&self.http_state.front_buf.data()[..self.http_state.front_to_copy()]) {
-        Ok(0) => {
-          ClientResult::Continue
-        }
+        Ok(0) => { ClientResult::Continue }
         Ok(r) => {
           //FIXME what happens if not everything was written?
           //if let Some((front,back)) = self.tokens() {
