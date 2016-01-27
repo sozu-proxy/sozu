@@ -2,6 +2,7 @@
 
 use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
+use std::sync::{Arc,Mutex};
 use mio::tcp::*;
 use std::io::{self,Read,Write,ErrorKind};
 use mio::*;
@@ -309,40 +310,75 @@ pub struct ApplicationListener {
 type ClientToken = Token;
 
 pub struct ServerConfiguration {
-  instances: HashMap<String, Vec<SocketAddr>>,
-  listeners: Slab<ApplicationListener>,
-  fronts:    HashMap<String, Vec<HttpFront>>,
-  context:   SslContext,
-  tx:        mpsc::Sender<ServerMessage>
+  instances:    HashMap<String, Vec<SocketAddr>>,
+  listeners:    Slab<ApplicationListener>,
+  fronts:       HashMap<String, Vec<HttpFront>>,
+  default_cert: String,
+  contexts:     Arc<Mutex<HashMap<String, SslContext>>>,
+  tx:           mpsc::Sender<ServerMessage>
 }
 
 impl ServerConfiguration {
   pub fn new(max_listeners: usize,  tx: mpsc::Sender<ServerMessage>) -> ServerConfiguration {
+    let mut contexts = HashMap::new();
+
     let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
     //let mut context = SslContext::new(SslMethod::Sslv3).unwrap();
     context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
     context.set_private_key_file("assets/key.pem", X509FileType::PEM);
 
+
+    let mut context2 = SslContext::new(SslMethod::Tlsv1).unwrap();
+    //let mut context = SslContext::new(SslMethod::Sslv3).unwrap();
+    context2.set_certificate_file("assets/cert_test.pem", X509FileType::PEM);
+    context2.set_private_key_file("assets/key_test.pem", X509FileType::PEM);
+    contexts.insert(String::from("test.local"), context2);
+
     fn servername_callback(ssl: &mut Ssl, ad: &mut i32) -> i32 {
       println!("GOT SERVER NAME: {:?}", ssl.get_servername());
       0
     }
-    context.set_servername_callback(Some(servername_callback as ServerNameCallback));
+    //context.set_servername_callback(Some(servername_callback as ServerNameCallback));
 
-    /*
-    fn servername_callback_s(ssl: &mut Ssl, ad: &mut i32, data: &&str) -> i32 {
-      println!("got data: {}", *data);
+    
+    fn servername_callback_s(ssl: &mut Ssl, ad: &mut i32, data: &Arc<Mutex<HashMap<String, SslContext>>>) -> i32 {
+      println!("got data: {:?}", *data);
       println!("GOT SERVER NAME: {:?}", ssl.get_servername());
+      /*if let Ok(contexts) = data.try_lock() {
+        println!("looking for context for test.local");
+        if let Some(ctx) = contexts.get(&String::from("test.local")) {
+          println!("FOUND CONTEXT");
+          ssl.set_ssl_context(&ctx);
+        }
+      } else {
+        println!("COULD NOT LOCK");
+      }*/
       0
     }
-    context.set_servername_callback_with_data(servername_callback_s as ServerNameCallbackData<&str>, s);
-    */
+
+
+    let mut rc_ctx = Arc::new(Mutex::new(contexts));
+    let store_contexts = rc_ctx.clone();
+    context.set_servername_callback_with_data(
+      servername_callback_s as ServerNameCallbackData<Arc<Mutex<HashMap<String, SslContext>>>>,
+      store_contexts
+    );
+
+    if let Ok(mut context_hashmap) = rc_ctx.lock() {
+      println!("INSERTING");
+      context_hashmap.insert(String::from("lolcatho.st"), context);
+    } else {
+      println!("COULD NOT GET REFERENCE");
+    }
+    //let c = rc_ctx.get_mut(&String::from("lolcatho.st")).unwrap();
+    
 
     ServerConfiguration {
       instances: HashMap::new(),
       listeners: Slab::new_starting_at(Token(0), max_listeners),
       fronts:    HashMap::new(),
-      context:   context,
+      default_cert: String::from("lolcatho.st"),
+      contexts:  rc_ctx,
       tx:        tx
     }
   }
@@ -446,16 +482,24 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
       let accepted = self.listeners[token].sock.accept();
 
       if let Ok(Some((frontend_sock, _))) = accepted {
-        if let Ok(ssl) = Ssl::new(&self.context) {
-            if let Ok(stream) = NonblockingSslStream::accept(ssl, frontend_sock) {
-              if let Some(c) = Client::new(stream) {
-                return Some((c, false))
-              }
+        if let Ok(contexts) = self.contexts.lock() {
+          if let Some(context) = contexts.get(&self.default_cert) {
+            if let Ok(ssl) = Ssl::new(context) {
+                if let Ok(stream) = NonblockingSslStream::accept(ssl, frontend_sock) {
+                  if let Some(c) = Client::new(stream) {
+                    return Some((c, false))
+                  }
+                } else {
+                  println!("could not create ssl stream");
+                }
             } else {
-              println!("could not create ssl stream");
+              println!("could not create ssl context");
             }
+          } else {
+            println!("no available SSL context");
+          }
         } else {
-          println!("could not create ssl context");
+          println!("could not unlock contexts");
         }
       } else {
         println!("could not accept connection: {:?}", accepted);
