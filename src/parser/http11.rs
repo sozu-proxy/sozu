@@ -215,7 +215,6 @@ pub fn is_hex_digit(chr: u8) -> bool {
 }
 pub fn chunk_size(input: &[u8]) -> IResult<&[u8], usize> {
   let (i, s) = try_parse!(input, map_res!(take_while!(is_hex_digit), from_utf8));
-  println!("hex digits parsed: {}", s);
   if i.len() == 0 {
     return IResult::Incomplete(Needed::Unknown);
   }
@@ -226,7 +225,7 @@ pub fn chunk_size(input: &[u8]) -> IResult<&[u8], usize> {
 }
 
 named!(pub chunk_header<usize>, terminated!(chunk_size, crlf));
-named!(pub end_of_chunk_and_header<usize>, dbg_dmp!(preceded!(crlf, chunk_header)));
+named!(pub end_of_chunk_and_header<usize>, preceded!(crlf, chunk_header));
 
 named!(pub trailer_line, terminated!(take_while1!(is_header_value_char), crlf));
 
@@ -318,11 +317,6 @@ impl Chunk {
     let mut position      = 0;
     let length            = buf.len();
     loop {
-      println!(
-        "calling parse_one with {:?}, buffer:\n{}",
-        (position, current_state),
-        (&buf[position..]).to_hex(8)
-      );
       let (mv, new_state) = current_state.parse_one(&buf[position..]);
       current_state = new_state;
       position += mv;
@@ -933,7 +927,6 @@ pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestSt
       }
     },
     RequestState::RequestWithBodyChunks(ref rl, ref conn, ref h, ref ch) => {
-      println!("\nCHUNKS: trying to parse chunks, from state == {:?}:\n{}", ch, buf.to_hex(8));
       let (advance, chunk_state) = ch.parse(buf);
       (advance, RequestState::RequestWithBodyChunks(rl.clone(), conn.clone(), h.clone(), chunk_state))
     },
@@ -1064,7 +1057,6 @@ pub fn parse_response(state: &ResponseState, buf: &[u8]) -> (BufferMove, Respons
       }
     },
     ResponseState::ResponseWithBodyChunks(ref rl, ref conn, ref ch) => {
-      println!("\nCHUNKS: trying to parse chunks, from state == {:?}:\n{}", ch, buf.to_hex(8));
       let (advance, chunk_state) = ch.parse(buf);
       (advance, ResponseState::ResponseWithBodyChunks(rl.clone(), conn.clone(), chunk_state))
     },

@@ -66,7 +66,6 @@ impl HttpProxy {
   }
 
   pub fn writable(&mut self, copied: usize) -> ClientResult {
-    self.back_buf.consume(copied);
     self.state.back_copied(copied);
 
     // The response ended, so we can close the connection, or accept a new request
@@ -99,7 +98,6 @@ impl HttpProxy {
   }
 
   pub fn back_writable(&mut self, copied: usize) -> ClientResult {
-    self.front_buf.consume(copied);
     self.state.front_copied(copied);
 
     ClientResult::Continue
