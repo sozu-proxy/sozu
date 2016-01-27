@@ -462,14 +462,15 @@ pub type Host = String;
 #[derive(Debug,Clone,PartialEq)]
 pub enum ErrorState {
   InvalidHttp,
-  MissingHost
+  MissingHost,
+  TooMuchDataCopied
 }
 
 #[derive(Debug,Clone,PartialEq)]
 pub enum LengthInformation {
   Length(usize),
   Chunked,
-  Compressed
+  //Compressed
 }
 
 #[derive(Debug,Clone,PartialEq)]
@@ -902,12 +903,10 @@ pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestSt
           match crlf(buf) {
             IResult::Done(i, _) => {
               println!("headers parsed, stopping");
-              (BufferMove::Advance(buf.offset(i)),
                 match l {
-                  &LengthInformation::Chunked    => RequestState::RequestWithBodyChunks(rl.clone(), conn.clone(), h.clone(), Chunk::Initial.clone()),
-                  _ => RequestState::RequestWithBody(rl.clone(), conn.clone(), h.clone(), l.clone()),
+                  &LengthInformation::Chunked    => (BufferMove::Advance(buf.offset(i)), RequestState::RequestWithBodyChunks(rl.clone(), conn.clone(), h.clone(), Chunk::Initial.clone())),
+                  &LengthInformation::Length(sz) => (BufferMove::Advance(buf.offset(i) + sz), RequestState::RequestWithBody(rl.clone(), conn.clone(), h.clone(), l.clone())),
                 }
-              )
             },
             res => {
               println!("HasHostAndLength could not parse header for input:\n{}\n", buf.to_hex(8));
@@ -1035,12 +1034,10 @@ pub fn parse_response(state: &ResponseState, buf: &[u8]) -> (BufferMove, Respons
           match crlf(buf) {
             IResult::Done(i, _) => {
               println!("headers parsed, stopping");
-              (BufferMove::Advance(buf.offset(i)),
                 match length {
-                  &LengthInformation::Chunked    => ResponseState::ResponseWithBodyChunks(sl.clone(), conn.clone(), Chunk::Initial),
-                  _ => ResponseState::ResponseWithBody(sl.clone(), conn.clone(), length.clone()),
+                  &LengthInformation::Chunked    => (BufferMove::Advance(buf.offset(i)), ResponseState::ResponseWithBodyChunks(sl.clone(), conn.clone(), Chunk::Initial)),
+                  &LengthInformation::Length(sz) => (BufferMove::Advance(buf.offset(i) + sz), ResponseState::ResponseWithBody(sl.clone(), conn.clone(), length.clone())),
                 }
-              )
             },
             res => {
               println!("HasResponseLine could not parse header for input:\n{}\n", buf.to_hex(8));
@@ -1280,7 +1277,7 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          req_position: 109,
+          req_position: 309,
           res_position: 0,
           request: RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
@@ -1322,10 +1319,11 @@ mod tests {
       //let result = parse_request(&initial, input);
       let result = parse_request_until_stop(&initial, &mut buf);
       println!("result: {:?}", result);
+      println!("input length: {}", input.len());
       assert_eq!(
         result,
         HttpState {
-          req_position: 109,
+          req_position: 309,
           res_position: 0,
           request:    RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
