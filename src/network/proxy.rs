@@ -108,10 +108,10 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Me
           self.connect_to_backend(event_loop, client_token);
         }
       } else {
-        println!("could not add client to slab");
+        error!("could not add client to slab");
       }
     } else {
-      println!("could not create a client");
+      error!("could not create a client");
     }
   }
 
@@ -162,9 +162,9 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Ms
   type Message = Msg;
 
   fn ready(&mut self, event_loop: &mut EventLoop<Self>, token: Token, events: EventSet) {
-    //println!("{:?} got events: {:?}", token, events);
+    trace!("{:?} got events: {:?}", token, events);
     if events.is_readable() {
-      //println!("{:?} is readable", token);
+      trace!("{:?} is readable", token);
       if token.as_usize() < self.max_listeners {
         self.accept(event_loop, token)
       } else if token.as_usize() < self.max_listeners + self.max_connections {
@@ -172,7 +172,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Ms
           let order = self.clients[token].readable(event_loop);
           self.interpret_client_order(event_loop, token, order);
         } else {
-          println!("client {:?} was removed", token);
+          info!("client {:?} was removed", token);
         }
       } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
         if let Some(tok) = self.get_client_token(token) {
@@ -183,15 +183,15 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Ms
     }
 
     if events.is_writable() {
-      //println!("{:?} is writable", token);
+      trace!("{:?} is writable", token);
       if token.as_usize() < self.max_listeners {
-        println!("received writable for listener {:?}, this should not happen", token);
+        error!("received writable for listener {:?}, this should not happen", token);
       } else  if token.as_usize() < self.max_listeners + self.max_connections {
         if self.clients.contains(token) {
           let order = self.clients[token].writable(event_loop);
           self.interpret_client_order(event_loop, token, order);
         } else {
-          println!("client {:?} was removed", token);
+          info!("client {:?} was removed", token);
         }
       } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
         if let Some(tok) = self.get_client_token(token) {
@@ -203,14 +203,14 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Ms
 
     if events.is_hup() {
       if token.as_usize() < self.max_listeners {
-        println!("should not happen: server {:?} closed", token);
+        error!("should not happen: server {:?} closed", token);
       } else if token.as_usize() < self.max_listeners + self.max_connections {
         if self.clients.contains(token) {
           if self.clients[token].front_hup() == ClientResult::CloseClient {
             self.close_client(event_loop, token);
           }
         } else {
-          println!("client {:?} was removed", token);
+          info!("client {:?} was removed", token);
         }
       } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
         if let Some(tok) = self.get_client_token(token) {
@@ -227,11 +227,11 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Ms
   }
 
   fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {
-    println!("timeout");
+    warn!("timeout");
   }
 
   fn interrupted(&mut self, event_loop: &mut EventLoop<Self>) {
-    println!("interrupted");
+    warn!("interrupted");
   }
 }
 

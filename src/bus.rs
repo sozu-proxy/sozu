@@ -57,32 +57,32 @@ impl Bus {
     match self.rx.recv() {
       Ok(Message::Subscribe(ref tag, ref tx)) => {
         self.subscribe(tag, tx);
-        println!("SUBSCRIBED");
+        debug!("SUBSCRIBED");
         true
       },
       Ok(Message::Msg(ref c)) => {
-        println!("GOT MSG");
+        debug!("GOT MSG");
         let topics = c.get_topics();
 
         for t in topics {
           if let &Some(v) = &self.senders.get(&t) {
-            println!("GOT MSG 2");
+            debug!("GOT MSG 2");
             for tx in v {
-              println!("GOT MSG 3");
+              debug!("GOT MSG 3");
               // ToDo use result?
               let _ = tx.send(Message::Msg(c.clone()));
-              println!("{:?}", c);
+              debug!("{:?}", c);
             }
           }
         }
         true
       },
       Err(_) => {
-        println!("the bus's channel is closed, exiting");
+        error!("the bus's channel is closed, exiting");
         false
       }
       Ok(_) => {
-        println!("invalid message");
+        error!("invalid message");
         // FIXME: maybe we should not stop if there's an invalid message
         false
       }
@@ -90,18 +90,15 @@ impl Bus {
   }
 
   fn subscribe(&mut self, t: &Topic, tx: &Sender<Message>) {
-    println!("X");
     if ! &self.senders.contains_key(t) {
       let v = Vec::new();
       let t2 = t.clone();
       &self.senders.insert(t2, v);
-      println!("Y");
     }
     if let Some(ref mut v) = self.senders.get_mut(t) {
       v.push(tx.clone());
       // ToDo use result?
       let _ = tx.send(Message::SubscribeOk);
-      println!("Z");
     }
   }
 }

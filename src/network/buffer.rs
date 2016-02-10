@@ -33,7 +33,7 @@ impl Buffer {
     let cnt        = cmp::min(count, self.available_data());
     self.position += cnt;
     if self.position > self.capacity / 2 {
-      //println!("consume shift: pos {}, end {}", self.position, self.end);
+      //trace!("consume shift: pos {}, end {}", self.position, self.end);
       self.shift();
     }
     cnt
@@ -43,7 +43,7 @@ impl Buffer {
     let cnt   = cmp::min(count, self.available_space());
     self.end += cnt;
     if self.available_space() < self.available_data() + cnt {
-      //println!("fill shift: pos {}, end {}", self.position, self.end);
+      //trace!("fill shift: pos {}, end {}", self.position, self.end);
       self.shift();
     }
 

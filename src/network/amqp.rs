@@ -15,16 +15,16 @@ pub fn init_rabbitmq(bus_tx: Sender<Message>) {
 
     let connection_uri = &env::var("AMQP_URI").ok().expect("No RabbitMQ connection provided");
     let mut session = Session::open_url(connection_uri).ok().expect("Can't create session");
-    println!("Openned session");
+    info!("Openned session");
     let mut channel = session.open_channel(1).ok().expect("Error openning channel 1");
-    println!("Openned channel: {:?}", channel.id);
+    debug!("Openned channel: {:?}", channel.id);
 
     let queue_name = "test_queue";
     let queue_declare = channel.queue_declare(queue_name, false, true, false, false, false, Table::new());
 
-    println!("Queue declare: {:?}", queue_declare);
+    debug!("Queue declare: {:?}", queue_declare);
     channel.basic_prefetch(10);
-    println!("Declaring get iterator...");
+    debug!("Declaring get iterator...");
 
     thread::spawn(move || {
       loop {
@@ -39,7 +39,7 @@ pub fn init_rabbitmq(bus_tx: Sender<Message>) {
               Ok(command) => {
                   bus_tx.send(Message::Msg(command.clone()));
               }
-              Err(e) => println!("{}", e)
+              Err(e) => debug!("{}", e)
             }
         }
       }

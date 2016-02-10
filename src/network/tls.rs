@@ -139,7 +139,7 @@ impl ProxyClient<TlsServer> for Client {
   }
 
   fn remove_backend(&mut self) {
-    println!("TLS PROXY [{} -> {}] CLOSED BACKEND", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
+    debug!("TLS PROXY [{} -> {}] CLOSED BACKEND", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
     self.backend       = None;
     self.backend_token = None;
   }
@@ -168,24 +168,23 @@ impl ProxyClient<TlsServer> for Client {
 
   // Read content from the client
   fn readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
-    //println!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
     match self.stream.read(self.http_state.front_buf.space()) {
       Ok(0) => {},
       Ok(r) => {
-        //println!("FRONT [{:?}]: read {} bytes", self.token, r);
+        debug!("FRONT [{:?}]: read {} bytes", self.token, r);
         self.http_state.front_buf.fill(r);
         self.reregister(event_loop);
         let res = self.http_state.readable();
         return res;
       },
       Err(NonblockingSslError::WantRead) => {
-        //println!("writable WantRead");
+        trace!("writable WantRead");
       },
       Err(NonblockingSslError::WantWrite) => {
-        //println!("writable WantWrite");
+        trace!("writable WantWrite");
       },
       Err(e) => {
-        println!("readable TLS client err={:?}", e);
+        error!("readable TLS client err={:?}", e);
         return ClientResult::CloseClient;
       }
     }
@@ -196,7 +195,6 @@ impl ProxyClient<TlsServer> for Client {
 
   // Forward content to client
   fn writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
-    //println!("writable back_buf({}): {}", b.remaining(), from_utf8((&b as &Buf).bytes()).unwrap());
     if self.http_state.back_buf.available_data() == 0 {
       return ClientResult::Continue;
     }
@@ -205,23 +203,23 @@ impl ProxyClient<TlsServer> for Client {
       Ok(0) => { ClientResult::Continue }
       Ok(r) => {
         //FIXME what happens if not everything was written?
-        //if let Some((front,back)) = self.tokens() {
-        //  println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
-        //}
+        if let Some((front,back)) = self.tokens() {
+          debug!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
+        }
 
         self.tx_count = self.tx_count + r;
         self.http_state.writable(r)
       },
       Err(NonblockingSslError::WantRead) => {
-        //println!("writable WantRead");
+        trace!("writable WantRead");
         ClientResult::Continue
       },
       Err(NonblockingSslError::WantWrite) => {
-        //println!("writable WantWrite");
+        trace!("writable WantWrite");
         ClientResult::Continue
       }
       Err(e) => {
-        println!("writable TLS client err={:?}", e);
+        error!("writable TLS client err={:?}", e);
         return ClientResult::CloseClient;
       }
     };
@@ -232,26 +230,26 @@ impl ProxyClient<TlsServer> for Client {
 
   // Forward content to application
   fn back_writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
-    //println!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
+    let tokens = self.tokens().clone();
     let res = if let Some(ref mut sock) = self.backend {
       match sock.write(&self.http_state.front_buf.data()[..self.http_state.front_to_copy()]) {
         Ok(0) => { ClientResult::Continue }
         Ok(r) => {
           //FIXME what happens if not everything was written?
-          //if let Some((front,back)) = self.tokens() {
-          //  println!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-          //}
+          if let Some((front,back)) = tokens {
+            debug!("BACK [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+          }
 
           self.http_state.back_writable(r)
         }
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => { ClientResult::Continue },
           ErrorKind::BrokenPipe => {
-            println!("broken pipe writing to the backend");
+            error!("broken pipe writing to the backend");
             return ClientResult::CloseBoth;
           },
           _ => {
-            println!("not implemented; client err={:?}", e);
+            error!("not implemented; client err={:?}", e);
             return ClientResult::CloseBoth;
           }
         }
@@ -266,28 +264,28 @@ impl ProxyClient<TlsServer> for Client {
 
   // Read content from application
   fn back_readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
-    //println!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
+    let tokens = self.tokens().clone();
     let res = if let Some(ref mut sock) = self.backend {
       match sock.read(self.http_state.back_buf.space()) {
         Ok(0) => {
-          //println!("We just got readable, but were unable to read from the socket?");
+          error!("We just got readable, but were unable to read from the socket?");
           ClientResult::Continue
         }
         Ok(r) => {
-          //if let Some((front,back)) = self.tokens() {
-          //  println!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-          //}
+          if let Some((front,back)) = tokens {
+            debug!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+          }
           self.http_state.back_buf.fill(r);
           self.http_state.back_readable()
         }
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => { ClientResult::Continue },
           ErrorKind::BrokenPipe => {
-            println!("broken pipe writing to the backend");
+            error!("broken pipe writing to the backend");
             return ClientResult::CloseBoth;
           },
           _ => {
-            println!("not implemented; client err={:?}", e);
+            error!("not implemented; client err={:?}", e);
             return ClientResult::CloseBoth;
           }
         }
@@ -335,15 +333,15 @@ impl ServerConfiguration {
     contexts.insert(String::from("test.local"), context2);
 
     fn servername_callback(ssl: &mut Ssl, ad: &mut i32) -> i32 {
-      println!("GOT SERVER NAME: {:?}", ssl.get_servername());
+      trace!("GOT SERVER NAME: {:?}", ssl.get_servername());
       0
     }
     //context.set_servername_callback(Some(servername_callback as ServerNameCallback));
 
     
     fn servername_callback_s(ssl: &mut Ssl, ad: &mut i32, data: &Arc<Mutex<HashMap<String, SslContext>>>) -> i32 {
-      println!("got data: {:?}", *data);
-      println!("GOT SERVER NAME: {:?}", ssl.get_servername());
+      trace!("got data: {:?}", *data);
+      trace!("GOT SERVER NAME: {:?}", ssl.get_servername());
       /*if let Ok(contexts) = data.try_lock() {
         println!("looking for context for test.local");
         if let Some(ctx) = contexts.get(&String::from("test.local")) {
@@ -365,10 +363,10 @@ impl ServerConfiguration {
     );
 
     if let Ok(mut context_hashmap) = rc_ctx.lock() {
-      println!("INSERTING");
+      trace!("INSERTING");
       context_hashmap.insert(String::from("lolcatho.st"), context);
     } else {
-      println!("COULD NOT GET REFERENCE");
+      trace!("COULD NOT GET REFERENCE");
     }
     //let c = rc_ctx.get_mut(&String::from("lolcatho.st")).unwrap();
     
@@ -400,7 +398,7 @@ impl ServerConfiguration {
   }
 
   pub fn remove_http_front(&mut self, front: HttpFront, event_loop: &mut EventLoop<TlsServer>) {
-    println!("removing http_front {:?}", front);
+    info!("removing http_front {:?}", front);
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
       fronts.retain(|f| f != &front);
     }
@@ -420,7 +418,7 @@ impl ServerConfiguration {
       if let Some(instances) = self.instances.get_mut(app_id) {
         instances.retain(|addr| addr != instance_address);
       } else {
-        println!("Instance was already removed");
+        error!("Instance was already removed");
       }
   }
 
@@ -432,7 +430,7 @@ impl ServerConfiguration {
         if let Some(app_instances) = self.instances.get(&http_front.app_id) {
           let rnd = random::<usize>();
           let idx = rnd % app_instances.len();
-          println!("Connecting {} -> {:?}", host, app_instances.get(idx));
+          info!("Connecting {} -> {:?}", host, app_instances.get(idx));
           app_instances.get(idx).map(|& addr| addr)
         } else {
           None
@@ -464,15 +462,15 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
         self.listeners[tok].token = Some(tok);
         //self.fronts.insert(String::from(app_id), tok);
         event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
-        println!("registered listener on port {}", port);
+        info!("registered listener on port {}", port);
         Some(tok)
       } else {
-        println!("could not register listener on port {}", port);
+        error!("could not register listener on port {}", port);
         None
       }
 
     } else {
-      println!("could not declare listener on port {}", port);
+      error!("could not declare listener on port {}", port);
       None
     }
   }
@@ -490,19 +488,19 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
                     return Some((c, false))
                   }
                 } else {
-                  println!("could not create ssl stream");
+                  error!("could not create ssl stream");
                 }
             } else {
-              println!("could not create ssl context");
+              error!("could not create ssl context");
             }
           } else {
-            println!("no available SSL context");
+            error!("no available SSL context");
           }
         } else {
-          println!("could not unlock contexts");
+          error!("could not unlock contexts");
         }
       } else {
-        println!("could not accept connection: {:?}", accepted);
+        error!("could not accept connection: {:?}", accepted);
       }
     }
     None
@@ -527,20 +525,20 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<TlsServer>, message: HttpProxyOrder) {
-    println!("notified: {:?}", message);
+    trace!("notified: {:?}", message);
     match message {
       HttpProxyOrder::Command(Command::AddHttpFront(front)) => {
-        println!("add front {:?}", front);
+        info!("add front {:?}", front);
           self.add_http_front(front, event_loop);
           self.tx.send(ServerMessage::AddedFront);
       },
       HttpProxyOrder::Command(Command::RemoveHttpFront(front)) => {
-        println!("remove front {:?}", front);
+        info!("remove front {:?}", front);
         self.remove_http_front(front, event_loop);
         self.tx.send(ServerMessage::RemovedFront);
       },
       HttpProxyOrder::Command(Command::AddInstance(instance)) => {
-        println!("add instance {:?}", instance);
+        info!("add instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -549,7 +547,7 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
         }
       },
       HttpProxyOrder::Command(Command::RemoveInstance(instance)) => {
-        println!("remove instance {:?}", instance);
+        info!("remove instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -561,7 +559,7 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
         event_loop.shutdown();
       },
       _ => {
-        println!("unsupported message, ignoring");
+        error!("unsupported message, ignoring");
       }
     }
   }
@@ -581,9 +579,9 @@ pub fn start() {
   let mut server = TlsServer::new(1, 500, configuration);
 
   let join_guard = thread::spawn(move|| {
-    println!("starting event loop");
+    info!("starting event loop");
     event_loop.run(&mut server).unwrap();
-    println!("ending event loop");
+    info!("ending event loop");
     notify_tx.send(ServerMessage::Stopped);
   });
 
@@ -617,9 +615,9 @@ pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: 
   let mut server = TlsServer::new(max_listeners, max_connections, configuration);
 
   let join_guard = thread::spawn(move|| {
-    println!("starting event loop");
+    info!("starting event loop");
     event_loop.run(&mut server).unwrap();
-    println!("ending event loop");
+    info!("ending event loop");
     notify_tx.send(ServerMessage::Stopped);
   });
 

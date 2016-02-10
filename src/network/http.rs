@@ -49,10 +49,10 @@ pub struct HttpProxy {
 
 impl HttpProxy {
   pub fn readable(&mut self) -> ClientResult {
-    //println!("front buffer({} bytes):\n{}", self.front_buf.data().len(), self.front_buf.data().to_hex(8));
+    debug!("front buffer({} bytes):\n{}", self.front_buf.data().len(), self.front_buf.data().to_hex(8));
     if ! self.state.is_front_proxying() {
       self.state = parse_request_until_stop(&self.state, &mut self.front_buf);
-      //println!("parse_request_until_stop returned {:?} => advance: {}", self.state, self.state.req_position);
+      debug!("parse_request_until_stop returned {:?} => advance: {}", self.state, self.state.req_position);
       if self.state.is_front_error() {
         return ClientResult::CloseClient;
       }
@@ -60,7 +60,7 @@ impl HttpProxy {
         return ClientResult::ConnectBackend;
       }
     } else {
-      println!("state: {:?}", self.state);
+      debug!("state: {:?}", self.state);
     }
     ClientResult::Continue
   }
@@ -73,7 +73,7 @@ impl HttpProxy {
     // FIXME: with Server Side Events, new responses can come
     if self.state.is_back_proxying() && self.state.res_position == 0 {
       let sh = (self.state.front_should_keep_alive(), self.state.back_should_keep_alive());
-      println!("RESPONSE ENDED, SHOULD WE KEEP ALIVE? {:?}", sh);
+      trace!("RESPONSE ENDED, SHOULD WE KEEP ALIVE? {:?}", sh);
       let res = match sh {
         (true, true)  => ClientResult::Continue,     // just reset
         (true, false) => ClientResult::CloseBackend,
@@ -87,10 +87,10 @@ impl HttpProxy {
   }
 
   pub fn back_readable(&mut self) -> ClientResult {
-    //println!("back buffer ({} bytes):\n{}", self.back_buf.data().len(), self.back_buf.data().to_hex(8));
+    debug!("back buffer ({} bytes):\n{}", self.back_buf.data().len(), self.back_buf.data().to_hex(8));
     if ! self.state.is_back_proxying() {
       self.state = parse_response_until_stop(&self.state, &mut self.back_buf);
-      //println!("parse_response_until_stop returned {:?} => advance: {}", self.state, self.state.res_position);
+      debug!("parse_response_until_stop returned {:?} => advance: {}", self.state, self.state.res_position);
       if self.state.is_back_error() {
         return ClientResult::CloseBackend;
       }
@@ -212,7 +212,7 @@ impl ProxyClient<HttpServer> for Client {
   }
 
   fn remove_backend(&mut self) {
-    println!("HTTP PROXY [{} -> {}] CLOSED BACKEND", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
+    debug!("HTTP PROXY [{} -> {}] CLOSED BACKEND", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
     self.backend       = None;
     self.backend_token = None;
   }
@@ -241,11 +241,10 @@ impl ProxyClient<HttpServer> for Client {
 
   // Read content from the client
   fn readable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
-    //println!("readable(): front_buf contains {} data, {} space", buf.available_data(), buf.available_space());
     match self.sock.read(&mut self.http_state.front_buf.space()) {
       Ok(0) => {},
       Ok(r) => {
-        //println!("FRONT [{:?}]: read {} bytes", self.token, r);
+        debug!("FRONT [{:?}]: read {} bytes", self.token, r);
         self.http_state.front_buf.fill(r);
         self.reregister(event_loop);
         return self.http_state.readable();
@@ -253,11 +252,11 @@ impl ProxyClient<HttpServer> for Client {
       Err(e) => match e.kind() {
         ErrorKind::WouldBlock => {}
         ErrorKind::BrokenPipe => {
-          println!("broken pipe reading from the client");
+          debug!("broken pipe reading from the client");
           return ClientResult::CloseClient;
         },
         _ => {
-          println!("not implemented; client err={:?}", e);
+          debug!("not implemented; client err={:?}", e);
           return ClientResult::CloseBoth;
         },
       }
@@ -268,7 +267,6 @@ impl ProxyClient<HttpServer> for Client {
 
   // Forward content to client
   fn writable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
-    //println!("writable(): back_buf contains {} data, {} space", self.back_buf.available_data(), self.back_buf.available_space());
     if self.http_state.back_buf.available_data() == 0 {
       return ClientResult::Continue;
     }
@@ -277,9 +275,9 @@ impl ProxyClient<HttpServer> for Client {
       Ok(0) => { ClientResult::Continue }
       Ok(r) => {
         //FIXME what happens if not everything was written?
-        //if let Some((front,back)) = self.tokens() {
-        //  println!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
-        //}
+        if let Some((front,back)) = self.tokens() {
+          debug!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
+        }
 
         self.tx_count = self.tx_count + r;
         self.http_state.writable(r)
@@ -287,11 +285,11 @@ impl ProxyClient<HttpServer> for Client {
       Err(e) => match e.kind() {
         ErrorKind::WouldBlock => { ClientResult::Continue }
         ErrorKind::BrokenPipe => {
-          println!("broken pipe writing to the client");
+          debug!("broken pipe writing to the client");
           return ClientResult::CloseBoth;
         },
         _ => {
-          println!("not implemented; client err={:?}", e);
+          debug!("not implemented; client err={:?}", e);
           ClientResult::CloseBoth
         }
       }
@@ -303,26 +301,26 @@ impl ProxyClient<HttpServer> for Client {
 
   // Forward content to application
   fn back_writable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
-    //println!("back_writable: front_buf contains {} data, {} space", buf.available_data(), buf.available_space());
+    let tokens = self.tokens().clone();
     let res = if let Some(ref mut sock) = self.backend {
       match sock.write(&(self.http_state.front_buf.data())[..self.http_state.front_to_copy()]) {
         Ok(0) => { ClientResult::Continue }
         Ok(r) => {
           //FIXME what happens if not everything was written?
-          //if let Some((front,back)) = self.tokens() {
-          //  println!("BACK  [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-          //}
+          if let Some((front,back)) = tokens {
+            debug!("BACK  [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+          }
 
           self.http_state.back_writable(r)
         }
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => { ClientResult::Continue },
           ErrorKind::BrokenPipe => {
-            println!("broken pipe writing to the backend");
+            debug!("broken pipe writing to the backend");
             return ClientResult::CloseBoth;
           },
           _ => {
-            println!("not implemented; client err={:?}", e);
+            debug!("not implemented; client err={:?}", e);
             return ClientResult::CloseBoth;
           },
         }
@@ -337,7 +335,7 @@ impl ProxyClient<HttpServer> for Client {
 
   // Read content from application
   fn back_readable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
-    //println!("back_readable(): back_buf contains {} data, {} space", self.back_buf.available_data(), self.back_buf.available_space());
+    let tokens = self.tokens().clone();
     let res = if let Some(ref mut sock) = self.backend {
       match sock.read(&mut self.http_state.back_buf.space()) {
         Ok(0) => {
@@ -345,20 +343,20 @@ impl ProxyClient<HttpServer> for Client {
           ClientResult::Continue
         }
         Ok(r) => {
-          //if let Some((front,back)) = self.tokens() {
-          //  println!("BACK  [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
-          //}
+          if let Some((front,back)) = tokens {
+            debug!("BACK  [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
+          }
           self.http_state.back_buf.fill(r);
           self.http_state.back_readable()
         }
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => { ClientResult::Continue },
           ErrorKind::BrokenPipe => {
-            println!("broken pipe reading from the backend");
+            debug!("broken pipe reading from the backend");
             return ClientResult::CloseBoth;
           },
           _ => {
-            println!("not implemented; client err={:?}", e);
+            debug!("not implemented; client err={:?}", e);
             return ClientResult::CloseBoth;
           }
         }
@@ -414,7 +412,7 @@ impl ServerConfiguration {
   }
 
   pub fn remove_http_front(&mut self, front: HttpFront, event_loop: &mut EventLoop<HttpServer>) {
-    println!("removing http_front {:?}", front);
+    info!("removing http_front {:?}", front);
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
       fronts.retain(|f| f != &front);
     }
@@ -434,7 +432,7 @@ impl ServerConfiguration {
       if let Some(instances) = self.instances.get_mut(app_id) {
         instances.retain(|addr| addr != instance_address);
       } else {
-        println!("Instance was already removed");
+        error!("Instance was already removed");
       }
   }
 
@@ -446,7 +444,7 @@ impl ServerConfiguration {
         if let Some(app_instances) = self.instances.get(&http_front.app_id) {
           let rnd = random::<usize>();
           let idx = rnd % app_instances.len();
-          println!("Connecting {} -> {:?}", host, app_instances.get(idx));
+          debug!("Connecting {} -> {:?}", host, app_instances.get(idx));
           app_instances.get(idx).map(|& addr| addr)
         } else {
           None
@@ -478,15 +476,14 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
         self.listeners[tok].token = Some(tok);
         //self.fronts.insert(String::from(app_id), tok);
         event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
-        println!("registered listener({}) on port {}", tok.as_usize(), port);
+        info!("registered listener({}) on port {}", tok.as_usize(), port);
         Some(tok)
       } else {
-        println!("could not register listener on port {}", port);
+        error!("could not register listener on port {}", port);
         None
       }
-
     } else {
-      println!("could not declare listener on port {}", port);
+      error!("could not declare listener on port {}", port);
       None
     }
   }
@@ -505,20 +502,20 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
 
   fn notify(&mut self, event_loop: &mut EventLoop<HttpServer>, message: HttpProxyOrder) {
   // ToDo temporary
-    println!("notified: {:?}", message);
+    trace!("notified: {:?}", message);
     match message {
       HttpProxyOrder::Command(Command::AddHttpFront(front)) => {
-        println!("add front {:?}", front);
+        info!("add front {:?}", front);
           self.add_http_front(front, event_loop);
           self.tx.send(ServerMessage::AddedFront);
       },
       HttpProxyOrder::Command(Command::RemoveHttpFront(front)) => {
-        println!("remove front {:?}", front);
+        info!("remove front {:?}", front);
         self.remove_http_front(front, event_loop);
         self.tx.send(ServerMessage::RemovedFront);
       },
       HttpProxyOrder::Command(Command::AddInstance(instance)) => {
-        println!("add instance {:?}", instance);
+        info!("add instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -527,7 +524,7 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
         }
       },
       HttpProxyOrder::Command(Command::RemoveInstance(instance)) => {
-        println!("remove instance {:?}", instance);
+        info!("remove instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -539,7 +536,7 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
         event_loop.shutdown();
       },
       _ => {
-        println!("unsupported message, ignoring");
+        debug!("unsupported message, ignoring");
       }
     }
   }
@@ -554,7 +551,7 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
         }
       }
     } else {
-      println!("not found");
+      error!("listener not found for this socket accept");
     }
 
     None
@@ -577,9 +574,9 @@ pub fn start() {
   let mut server = HttpServer::new(1, 500, configuration);
 
   let join_guard = thread::spawn(move|| {
-    println!("starting event loop");
+    debug!("starting event loop");
     event_loop.run(&mut server).unwrap();
-    println!("ending event loop");
+    debug!("ending event loop");
     notify_tx.send(ServerMessage::Stopped);
   });
 
@@ -613,9 +610,9 @@ pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: 
   let mut server = HttpServer::new(max_listeners, max_connections, configuration);
 
   let join_guard = thread::spawn(move|| {
-    println!("starting event loop");
+    debug!("starting event loop");
     event_loop.run(&mut server).unwrap();
-    println!("ending event loop");
+    debug!("ending event loop");
     notify_tx.send(ServerMessage::Stopped);
   });
 

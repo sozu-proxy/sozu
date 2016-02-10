@@ -1,4 +1,5 @@
 #[macro_use] extern crate nom;
+#[macro_use] extern crate log;
 extern crate mio;
 extern crate bytes;
 extern crate time;
@@ -20,6 +21,9 @@ use messages::Topic;
 use bus::Message;
 
 fn main() {
+  env_logger::init().unwrap();
+  info!("starting up");
+
   let bus_tx = bus::start_bus();
   let (sender, _) = channel::<network::ServerMessage>();
   let (tx, jg) = network::http::start_listener("127.0.0.1:8080".parse().unwrap(), 10, 500, sender);
@@ -28,16 +32,16 @@ fn main() {
   let _ = bus_tx.send(Message::Subscribe(Topic::HttpProxyConfig, http_proxy_conf_input));
   /*let config_tx = tx.clone();
   if let Ok(Message::SubscribeOk) = http_proxy_conf_listener.recv() {
-  println!("Subscribed to http_proxy_conf commands");
+  info!("Subscribed to http_proxy_conf commands");
 
     network::amqp::init_rabbitmq(bus_tx);
-    println!("Subscribed to http_proxy_conf commands");
+    info!("Subscribed to http_proxy_conf commands");
 
     thread::spawn(move || {
       loop {
         if let Ok(Message::Msg(command)) = http_proxy_conf_listener.recv() {
           if let Err(e) = config_tx.send(network::http::HttpProxyOrder::Command(command)) {
-            println!("Error sending HttpProxyOrder: {:?}", e);
+            info!("Error sending HttpProxyOrder: {:?}", e);
           }
         }
       }
@@ -58,6 +62,6 @@ fn main() {
   tx2.send(network::tls::HttpProxyOrder::Command(messages::Command::AddInstance(tls_instance)));
 
   let _ = jg.join();
-  println!("good bye");
+  info!("good bye");
 }
 

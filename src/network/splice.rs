@@ -34,11 +34,11 @@ pub fn splice_in(stream: &AsRawFd, pipe: Pipe) -> Option<usize> {
     if res == -1 {
       let err = Error::last_os_error().kind();
       if err != ErrorKind::WouldBlock {
-        println!("err transferring from tcp({}) to pipe({}): {:?}", stream.as_raw_fd(), pipe[1], err);
+        error!("err transferring from tcp({}) to pipe({}): {:?}", stream.as_raw_fd(), pipe[1], err);
       }
       None
     } else {
-      //println!("transferred {} bytes from tcp({}) to pipe({})", res, stream.as_raw_fd(), pipe[1]);
+      //error!("transferred {} bytes from tcp({}) to pipe({})", res, stream.as_raw_fd(), pipe[1]);
       Some(res as usize)
     }
   }
@@ -50,11 +50,11 @@ pub fn splice_out(pipe: Pipe, stream: &AsRawFd) -> Option<usize> {
     if res == -1 {
       let err = Error::last_os_error().kind();
       if err != ErrorKind::WouldBlock {
-        println!("err transferring from pipe({}) to tcp({}): {:?}", pipe[0], stream.as_raw_fd(), err);
+        error!("err transferring from pipe({}) to tcp({}): {:?}", pipe[0], stream.as_raw_fd(), err);
       }
       None
     } else {
-      //println!("transferred {} bytes from pipe({}) to tcp({})", res, pipe[0], stream.as_raw_fd());
+      //error!("transferred {} bytes from pipe({}) to tcp({})", res, pipe[0], stream.as_raw_fd());
       Some(res as usize)
     }
   }
