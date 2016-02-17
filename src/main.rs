@@ -1,5 +1,6 @@
 #[macro_use] extern crate nom;
 #[macro_use] extern crate log;
+#[macro_use] extern crate lazy_static;
 extern crate mio;
 extern crate bytes;
 extern crate time;
@@ -19,10 +20,17 @@ use std::sync::mpsc::{channel};
 use std::thread;
 use messages::Topic;
 use bus::Message;
+use network::metrics::{METRICS,ProxyMetrics};
+use std::net::{UdpSocket,SocketAddr,ToSocketAddrs};
 
 fn main() {
   env_logger::init().unwrap();
   info!("starting up");
+  let metrics_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+  let metrics_host   = ("192.168.59.103", 8125).to_socket_addrs().unwrap().next().unwrap();
+  METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
+  let metrics_guard = ProxyMetrics::run();
+  METRICS.lock().unwrap().gauge("TEST", 42);
 
   let bus_tx = bus::start_bus();
   let (sender, _) = channel::<network::ServerMessage>();

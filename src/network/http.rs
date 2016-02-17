@@ -17,6 +17,7 @@ use time::precise_time_s;
 use rand::random;
 use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
+use network::metrics::{ProxyMetrics,METRICS};
 use network::buffer::Buffer;
 
 use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop, BufferMove};

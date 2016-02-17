@@ -14,6 +14,7 @@ libc = "*"
 log = "0.3"
 env_logger = "0.3"
 rustc-serialize = "0.3.15"
+lazy_static = "0.1.15"
 
 [dependencies.amqp]
 git = "https://github.com/Geal/rust-amqp"
