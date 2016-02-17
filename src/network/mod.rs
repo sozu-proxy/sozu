@@ -25,7 +25,8 @@ pub enum ServerMessage {
 pub enum ClientResult {
   CloseClient,
   CloseBackend,
-  CloseBoth,
+  CloseBothSuccess,
+  CloseBothFailure,
   Continue,
   ConnectBackend
 }

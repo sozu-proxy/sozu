@@ -148,11 +148,12 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Me
 
   pub fn interpret_client_order(&mut self, event_loop: &mut EventLoop<Self>, token: Token, order: ClientResult) {
     match order {
-      ClientResult::CloseClient    => self.close_client(event_loop, token),
-      ClientResult::CloseBackend   => self.close_backend(event_loop, token),
-      ClientResult::CloseBoth      => self.close_client(event_loop, token),
-      ClientResult::ConnectBackend => self.connect_to_backend(event_loop, token),
-      ClientResult::Continue       => {}
+      ClientResult::CloseClient      => self.close_client(event_loop, token),
+      ClientResult::CloseBackend     => self.close_backend(event_loop, token),
+      ClientResult::CloseBothSuccess => self.close_client(event_loop, token),
+      ClientResult::CloseBothFailure => self.close_client(event_loop, token),
+      ClientResult::ConnectBackend   => self.connect_to_backend(event_loop, token),
+      ClientResult::Continue         => {}
     }
   }
 }

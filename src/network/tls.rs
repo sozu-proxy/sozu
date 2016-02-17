@@ -246,16 +246,16 @@ impl ProxyClient<TlsServer> for Client {
           ErrorKind::WouldBlock => { ClientResult::Continue },
           ErrorKind::BrokenPipe => {
             error!("broken pipe writing to the backend");
-            return ClientResult::CloseBoth;
+            return ClientResult::CloseBothFailure;
           },
           _ => {
             error!("not implemented; client err={:?}", e);
-            return ClientResult::CloseBoth;
+            return ClientResult::CloseBothFailure;
           }
         }
       }
     } else {
-      ClientResult::CloseBoth
+      ClientResult::CloseBothFailure
     };
 
     self.reregister(event_loop);
@@ -282,21 +282,22 @@ impl ProxyClient<TlsServer> for Client {
           ErrorKind::WouldBlock => { ClientResult::Continue },
           ErrorKind::BrokenPipe => {
             error!("broken pipe writing to the backend");
-            return ClientResult::CloseBoth;
+            return ClientResult::CloseBothFailure;
           },
           _ => {
             error!("not implemented; client err={:?}", e);
-            return ClientResult::CloseBoth;
+            return ClientResult::CloseBothFailure;
           }
         }
       }
     } else {
-      ClientResult::CloseBoth
+      ClientResult::CloseBothFailure
     };
 
     self.reregister(event_loop);
     res
   }
+
 }
 
 pub struct ApplicationListener {

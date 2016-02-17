@@ -78,7 +78,7 @@ impl HttpProxy {
       let res = match sh {
         (true, true)  => ClientResult::Continue,     // just reset
         (true, false) => ClientResult::CloseBackend,
-        (false, _)    => ClientResult::CloseBoth,    // no connection pooling yet
+        (false, _)    => ClientResult::CloseBothSuccess,    // no connection pooling yet
       };
       self.state.reset();
       res
@@ -258,7 +258,7 @@ impl ProxyClient<HttpServer> for Client {
         },
         _ => {
           debug!("not implemented; client err={:?}", e);
-          return ClientResult::CloseBoth;
+          return ClientResult::CloseBothFailure;
         },
       }
     }
@@ -287,11 +287,11 @@ impl ProxyClient<HttpServer> for Client {
         ErrorKind::WouldBlock => { ClientResult::Continue }
         ErrorKind::BrokenPipe => {
           debug!("broken pipe writing to the client");
-          return ClientResult::CloseBoth;
+          return ClientResult::CloseBothFailure;
         },
         _ => {
           debug!("not implemented; client err={:?}", e);
-          ClientResult::CloseBoth
+          ClientResult::CloseBothFailure
         }
       }
     };
@@ -318,16 +318,16 @@ impl ProxyClient<HttpServer> for Client {
           ErrorKind::WouldBlock => { ClientResult::Continue },
           ErrorKind::BrokenPipe => {
             debug!("broken pipe writing to the backend");
-            return ClientResult::CloseBoth;
+            return ClientResult::CloseBothFailure;
           },
           _ => {
             debug!("not implemented; client err={:?}", e);
-            return ClientResult::CloseBoth;
+            return ClientResult::CloseBothFailure;
           },
         }
       }
     } else {
-      ClientResult::CloseBoth
+      ClientResult::CloseBothFailure
     };
 
     self.reregister(event_loop);
@@ -354,21 +354,22 @@ impl ProxyClient<HttpServer> for Client {
           ErrorKind::WouldBlock => { ClientResult::Continue },
           ErrorKind::BrokenPipe => {
             debug!("broken pipe reading from the backend");
-            return ClientResult::CloseBoth;
+            return ClientResult::CloseBothFailure;
           },
           _ => {
             debug!("not implemented; client err={:?}", e);
-            return ClientResult::CloseBoth;
+            return ClientResult::CloseBothFailure;
           }
         }
       }
     } else {
-      ClientResult::CloseBoth
+      ClientResult::CloseBothFailure
     };
 
     self.reregister(event_loop);
     res
   }
+
 }
 
 pub struct ApplicationListener {
