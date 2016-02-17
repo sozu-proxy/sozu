@@ -13,7 +13,7 @@ use std::error::Error;
 use mio::util::Slab;
 use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
-use time::precise_time_s;
+use time::{precise_time_s, precise_time_ns};
 use rand::random;
 use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
@@ -46,6 +46,9 @@ pub struct HttpProxy {
   pub state:             HttpState,
   pub front_buf:         Buffer,
   pub back_buf:          Buffer,
+  pub start:             u64,
+  pub req_size:          usize,
+  pub res_size:          usize,
 }
 
 impl HttpProxy {
@@ -55,6 +58,7 @@ impl HttpProxy {
       self.state = parse_request_until_stop(&self.state, &mut self.front_buf);
       debug!("parse_request_until_stop returned {:?} => advance: {}", self.state, self.state.req_position);
       if self.state.is_front_error() {
+        METRICS.lock().unwrap().time("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
         return ClientResult::CloseClient;
       }
       if self.state.has_host() {
@@ -80,6 +84,9 @@ impl HttpProxy {
         (true, false) => ClientResult::CloseBackend,
         (false, _)    => ClientResult::CloseBothSuccess,    // no connection pooling yet
       };
+      METRICS.lock().unwrap().time("http_proxy.success", (precise_time_ns() - self.start) / 1000);
+      METRICS.lock().unwrap().gauge("http_proxy.request_size", self.req_size as u64);
+      METRICS.lock().unwrap().gauge("http_proxy.response_size", self.res_size as u64);
       self.state.reset();
       res
     } else {
@@ -93,6 +100,7 @@ impl HttpProxy {
       self.state = parse_response_until_stop(&self.state, &mut self.back_buf);
       debug!("parse_response_until_stop returned {:?} => advance: {}", self.state, self.state.res_position);
       if self.state.is_back_error() {
+        METRICS.lock().unwrap().time("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
         return ClientResult::CloseBackend;
       }
     }
@@ -113,6 +121,7 @@ impl HttpProxy {
   pub fn back_to_copy(&self) -> usize {
     min(self.back_buf.available_data(), self.state.res_position)
   }
+
 }
 
 struct Client {
@@ -137,6 +146,9 @@ impl Client {
         state:             HttpState::new(),
         front_buf:         Buffer::with_capacity(12000),
         back_buf:          Buffer::with_capacity(12000),
+        start:             precise_time_ns(),
+        req_size:          0,
+        res_size:          0,
       },
       token:          None,
       backend_token:  None,
@@ -247,6 +259,7 @@ impl ProxyClient<HttpServer> for Client {
       Ok(r) => {
         debug!("FRONT [{:?}]: read {} bytes", self.token, r);
         self.http_state.front_buf.fill(r);
+        self.http_state.req_size = self.http_state.req_size + r;
         self.reregister(event_loop);
         return self.http_state.readable();
       }
@@ -348,6 +361,7 @@ impl ProxyClient<HttpServer> for Client {
             debug!("BACK  [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           }
           self.http_state.back_buf.fill(r);
+          self.http_state.res_size = self.http_state.res_size + r;
           self.http_state.back_readable()
         }
         Err(e) => match e.kind() {

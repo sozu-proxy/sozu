@@ -65,7 +65,6 @@ impl ProxyMetrics {
 
 
   pub fn count(&mut self, key: &str, count: i64) -> io::Result<usize> {
-    println!("COUNT");
     let fmt = format!("{}.{}:{}|c\n", &self.prefix, key, count);
     self.emit(&fmt)
   }

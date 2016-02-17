@@ -13,7 +13,7 @@ use std::error::Error;
 use mio::util::Slab;
 use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
-use time::precise_time_s;
+use time::{precise_time_s, precise_time_ns};
 use rand::random;
 use openssl::ssl::{SslContext, SslMethod, Ssl, NonblockingSslStream, ServerNameCallback, ServerNameCallbackData};
 use openssl::ssl::error::NonblockingSslError;
@@ -65,6 +65,9 @@ impl Client {
         state:             HttpState::new(),
         front_buf:         Buffer::with_capacity(12000),
         back_buf:          Buffer::with_capacity(12000),
+        start:             precise_time_ns(),
+        req_size:          0,
+        res_size:          0,
       },
       token:          None,
       backend_token:  None,

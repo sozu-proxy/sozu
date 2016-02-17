@@ -10,13 +10,15 @@ use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
 use std::error::Error;
 use mio::util::Slab;
-use std::net::SocketAddr;
+use std::io::Write;
 use std::str::FromStr;
 use std::marker::PhantomData;
 use std::fmt::Debug;
-use time::precise_time_s;
+use time::precise_time_ns;
 use rand::random;
+
 use network::{ClientResult,ServerMessage};
+use network::metrics::{METRICS,ProxyMetrics};
 
 use messages::{TcpFront,Command,Instance};
 
@@ -104,6 +106,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Me
       if let Ok(client_token) = self.clients.insert(client) {
         event_loop.register(self.clients[client_token].front_socket(), client_token, EventSet::readable(), PollOpt::edge());
         &self.clients[client_token].set_front_token(client_token);
+        METRICS.lock().unwrap().gauge("accept", 1);
         if should_connect {
           self.connect_to_backend(event_loop, client_token);
         }
