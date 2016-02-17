@@ -3,6 +3,9 @@
 use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
 use std::sync::{Arc,Mutex};
+use std::rc::{Rc,Weak};
+use std::cell::RefCell;
+use std::mem;
 use mio::tcp::*;
 use std::io::{self,Read,Write,ErrorKind};
 use mio::*;
@@ -23,7 +26,7 @@ use parser::http11::{HttpState,RequestState,ResponseState,parse_request_until_st
 use network::buffer::Buffer;
 use network::{ClientResult,ServerMessage};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
-use messages::{Command,HttpFront};
+use messages::{Command,TlsFront};
 use network::http::HttpProxy;
 
 type BackendToken = Token;
@@ -271,7 +274,7 @@ impl ProxyClient<TlsServer> for Client {
     let res = if let Some(ref mut sock) = self.backend {
       match sock.read(self.http_state.back_buf.space()) {
         Ok(0) => {
-          error!("We just got readable, but were unable to read from the socket?");
+          //error!("We just got readable, but were unable to read from the socket?");
           ClientResult::Continue
         }
         Ok(r) => {
@@ -314,9 +317,10 @@ type ClientToken = Token;
 pub struct ServerConfiguration {
   instances:    HashMap<String, Vec<SocketAddr>>,
   listeners:    Slab<ApplicationListener>,
-  fronts:       HashMap<String, Vec<HttpFront>>,
+  fronts:       HashMap<String, Vec<TlsFront>>,
   default_cert: String,
-  contexts:     Arc<Mutex<HashMap<String, SslContext>>>,
+  default_context: SslContext,
+  contexts:     Rc<RefCell<HashMap<String, SslContext>>>,
   tx:           mpsc::Sender<ServerMessage>
 }
 
@@ -329,63 +333,52 @@ impl ServerConfiguration {
     context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
     context.set_private_key_file("assets/key.pem", X509FileType::PEM);
 
-
-    let mut context2 = SslContext::new(SslMethod::Tlsv1).unwrap();
-    //let mut context = SslContext::new(SslMethod::Sslv3).unwrap();
-    context2.set_certificate_file("assets/cert_test.pem", X509FileType::PEM);
-    context2.set_private_key_file("assets/key_test.pem", X509FileType::PEM);
-    contexts.insert(String::from("test.local"), context2);
-
     fn servername_callback(ssl: &mut Ssl, ad: &mut i32) -> i32 {
       trace!("GOT SERVER NAME: {:?}", ssl.get_servername());
       0
     }
     //context.set_servername_callback(Some(servername_callback as ServerNameCallback));
 
-    
-    fn servername_callback_s(ssl: &mut Ssl, ad: &mut i32, data: &Arc<Mutex<HashMap<String, SslContext>>>) -> i32 {
-      trace!("got data: {:?}", *data);
-      trace!("GOT SERVER NAME: {:?}", ssl.get_servername());
-      /*if let Ok(contexts) = data.try_lock() {
-        println!("looking for context for test.local");
-        if let Some(ctx) = contexts.get(&String::from("test.local")) {
-          println!("FOUND CONTEXT");
-          ssl.set_ssl_context(&ctx);
+    fn servername_callback_s(ssl: &mut Ssl, ad: &mut i32, data: &Rc<RefCell<HashMap<String, SslContext>>>) -> i32 {
+      let mut contexts = data.borrow_mut();
+
+      if let Some(servername) = ssl.get_servername() {
+        trace!("looking for context for {:?}", servername);
+        //println!("contexts: {:?}", *contexts);
+        let opt_ctx = contexts.remove(&servername);
+        if let Some(ctx) = opt_ctx {
+          let context = ssl.set_ssl_context(&ctx);
+          mem::forget(ctx);
+          contexts.insert(String::from(servername), context);
         }
-      } else {
-        println!("COULD NOT LOCK");
-      }*/
+      }
       0
     }
 
-
-    let mut rc_ctx = Arc::new(Mutex::new(contexts));
+    let mut rc_ctx = Rc::new(RefCell::new(contexts));
     let store_contexts = rc_ctx.clone();
     context.set_servername_callback_with_data(
-      servername_callback_s as ServerNameCallbackData<Arc<Mutex<HashMap<String, SslContext>>>>,
+      servername_callback_s as ServerNameCallbackData<Rc<RefCell<HashMap<String, SslContext>>>>,
       store_contexts
     );
-
-    if let Ok(mut context_hashmap) = rc_ctx.lock() {
-      trace!("INSERTING");
-      context_hashmap.insert(String::from("lolcatho.st"), context);
-    } else {
-      trace!("COULD NOT GET REFERENCE");
-    }
-    //let c = rc_ctx.get_mut(&String::from("lolcatho.st")).unwrap();
-    
 
     ServerConfiguration {
       instances: HashMap::new(),
       listeners: Slab::new_starting_at(Token(0), max_listeners),
       fronts:    HashMap::new(),
       default_cert: String::from("lolcatho.st"),
+      default_context: context,
       contexts:  rc_ctx,
       tx:        tx
     }
   }
 
-  pub fn add_http_front(&mut self, http_front: HttpFront, event_loop: &mut EventLoop<TlsServer>) {
+  pub fn add_http_front(&mut self, http_front: TlsFront, event_loop: &mut EventLoop<TlsServer>) {
+    let mut ctx = SslContext::new(SslMethod::Tlsv1).unwrap();
+    ctx.set_certificate_file(&http_front.cert_path, X509FileType::PEM);
+    ctx.set_private_key_file(&http_front.key_path, X509FileType::PEM);
+    let hostname = http_front.hostname.clone();
+
     let front2 = http_front.clone();
     let front3 = http_front.clone();
     if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
@@ -399,9 +392,11 @@ impl ServerConfiguration {
     if self.fronts.get(&http_front.hostname).is_none() {
       self.fronts.insert(http_front.hostname, vec![front3]);
     }
+
+    self.contexts.borrow_mut().insert(hostname, ctx);
   }
 
-  pub fn remove_http_front(&mut self, front: HttpFront, event_loop: &mut EventLoop<TlsServer>) {
+  pub fn remove_http_front(&mut self, front: TlsFront, event_loop: &mut EventLoop<TlsServer>) {
     info!("removing http_front {:?}", front);
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
       fronts.retain(|f| f != &front);
@@ -427,7 +422,14 @@ impl ServerConfiguration {
   }
 
   pub fn backend_from_request(&self, host: &str, uri: &str) -> Option<SocketAddr> {
-    if let Some(http_fronts) = self.fronts.get(host) {
+    trace!("looking for backend for host: {}", host);
+    let real_host = if let Some(h) = host.split(":").next() {
+      h
+    } else {
+      host
+    };
+    trace!("looking for backend for real host: {}", host);
+    if let Some(http_fronts) = self.fronts.get(real_host) {
       // ToDo get the front with the most specific matching path_begin
       if let Some(http_front) = http_fronts.get(0) {
         // ToDo round-robin on instances
@@ -484,24 +486,16 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
       let accepted = self.listeners[token].sock.accept();
 
       if let Ok(Some((frontend_sock, _))) = accepted {
-        if let Ok(contexts) = self.contexts.lock() {
-          if let Some(context) = contexts.get(&self.default_cert) {
-            if let Ok(ssl) = Ssl::new(context) {
-                if let Ok(stream) = NonblockingSslStream::accept(ssl, frontend_sock) {
-                  if let Some(c) = Client::new(stream) {
-                    return Some((c, false))
-                  }
-                } else {
-                  error!("could not create ssl stream");
-                }
-            } else {
-              error!("could not create ssl context");
+        if let Ok(ssl) = Ssl::new(&self.default_context) {
+          if let Ok(stream) = NonblockingSslStream::accept(ssl, frontend_sock) {
+            if let Some(c) = Client::new(stream) {
+              return Some((c, false))
             }
           } else {
-            error!("no available SSL context");
+            error!("could not create ssl stream");
           }
         } else {
-          error!("could not unlock contexts");
+          error!("could not create ssl context");
         }
       } else {
         error!("could not accept connection: {:?}", accepted);
@@ -531,12 +525,12 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
   fn notify(&mut self, event_loop: &mut EventLoop<TlsServer>, message: HttpProxyOrder) {
     trace!("notified: {:?}", message);
     match message {
-      HttpProxyOrder::Command(Command::AddHttpFront(front)) => {
+      HttpProxyOrder::Command(Command::AddTlsFront(front)) => {
         info!("add front {:?}", front);
           self.add_http_front(front, event_loop);
           self.tx.send(ServerMessage::AddedFront);
       },
-      HttpProxyOrder::Command(Command::RemoveHttpFront(front)) => {
+      HttpProxyOrder::Command(Command::RemoveTlsFront(front)) => {
         info!("remove front {:?}", front);
         self.remove_http_front(front, event_loop);
         self.tx.send(ServerMessage::RemovedFront);
@@ -571,6 +565,7 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
 
 pub type TlsServer = Server<ServerConfiguration,Client,HttpProxyOrder>;
 
+/*
 pub fn start() {
   // ToDo temporary
   let mut event_loop = EventLoop::new().unwrap();
@@ -609,16 +604,17 @@ pub fn start() {
   //  println!("ending event loop");
   //});
 }
+*/
 
 pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<HttpProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
 
-  let configuration = ServerConfiguration::new(max_listeners, tx);
-  let mut server = TlsServer::new(max_listeners, max_connections, configuration);
-
   let join_guard = thread::spawn(move|| {
+    let configuration = ServerConfiguration::new(max_listeners, tx);
+    let mut server = TlsServer::new(max_listeners, max_connections, configuration);
+
     info!("starting event loop");
     event_loop.run(&mut server).unwrap();
     info!("ending event loop");

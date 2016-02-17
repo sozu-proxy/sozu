@@ -10,6 +10,16 @@ pub struct HttpFront {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+pub struct TlsFront {
+    pub app_id: String,
+    pub hostname: String,
+    pub path_begin: String,
+    pub port: u16,
+    pub cert_path: String,
+    pub key_path: String,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct TcpFront {
     pub app_id: String,
     pub port: u16
@@ -28,6 +38,9 @@ pub enum Command {
     AddHttpFront(HttpFront),
     RemoveHttpFront(HttpFront),
 
+    AddTlsFront(TlsFront),
+    RemoveTlsFront(TlsFront),
+
     AddTcpFront(TcpFront),
     RemoveTcpFront(TcpFront),
 
@@ -40,10 +53,12 @@ impl Command {
     match *self {
       Command::AddHttpFront(_)    => vec![Topic::HttpProxyConfig                       ],
       Command::RemoveHttpFront(_) => vec![Topic::HttpProxyConfig                       ],
+      Command::AddTlsFront(_)     => vec![Topic::TlsProxyConfig                        ],
+      Command::RemoveTlsFront(_)  => vec![Topic::TlsProxyConfig                        ],
       Command::AddTcpFront(_)     => vec![Topic::TcpProxyConfig                        ],
       Command::RemoveTcpFront(_)  => vec![Topic::TcpProxyConfig                        ],
-      Command::AddInstance(_)     => vec![Topic::HttpProxyConfig, Topic::TcpProxyConfig],
-      Command::RemoveInstance(_)  => vec![Topic::HttpProxyConfig, Topic::TcpProxyConfig]
+      Command::AddInstance(_)     => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
+      Command::RemoveInstance(_)  => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig]
     }
   }
 }
@@ -59,6 +74,12 @@ impl Decodable for Command {
       } else if &command_type == "REMOVE_HTTP_FRONT" {
         let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
         Ok(Command::RemoveHttpFront(acl))
+      } else if &command_type == "ADD_TLS_FRONT" {
+        let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
+        Ok(Command::AddTlsFront(acl))
+      } else if &command_type == "REMOVE_TLS_FRONT" {
+        let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
+        Ok(Command::RemoveTlsFront(acl))
       } else if &command_type == "ADD_TCP_FRONT" {
         let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
         Ok(Command::AddTcpFront(acl))
@@ -82,6 +103,7 @@ impl Decodable for Command {
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub enum Topic {
     HttpProxyConfig,
+    TlsProxyConfig,
     TcpProxyConfig
 }
 
