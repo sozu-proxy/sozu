@@ -505,20 +505,14 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
   }
 
   fn connect_to_backend(&mut self, client: &mut Client) -> Result<TcpStream,ConnectionError> {
-    if let (Some(host), Some(rl)) = (client.http_state.state.get_host(), client.http_state.state.get_request_line()) {
-      if let Some(back) = self.backend_from_request(&host, &rl.uri) {
-        if let Ok(socket) = TcpStream::connect(&back) {
-          client.status     = ConnectionStatus::Connected;
-          return Ok(socket);
-        } else {
-          return Err(ConnectionError::ToBeDefined);
-        }
-      } else {
-        return Err(ConnectionError::HostNotFound);
-      }
-    } else {
-      return Err(ConnectionError::NoHostNorPathGiven);
-    }
+      let host   = try!(client.http_state.state.get_host().ok_or(ConnectionError::NoHostGiven));
+      let rl     = try!(client.http_state.state.get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
+      let back   = try!(self.backend_from_request(&host, &rl.uri).ok_or(ConnectionError::HostNotFound));
+      let socket = try!(TcpStream::connect(&back).map_err(|_| ConnectionError::ToBeDefined));
+
+      client.status = ConnectionStatus::Connected;
+
+      Ok(socket)
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<HttpServer>, message: HttpProxyOrder) {
