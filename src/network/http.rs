@@ -517,7 +517,7 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
         return Err(ConnectionError::HostNotFound);
       }
     } else {
-      return Err(ConnectionError::ToBeDefined);
+      return Err(ConnectionError::NoHostNorPathGiven);
     }
   }
 

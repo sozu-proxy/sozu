@@ -34,6 +34,7 @@ pub enum ClientResult {
 
 #[derive(Debug,PartialEq,Eq)]
 pub enum ConnectionError {
+  NoHostNorPathGiven,
   HostNotFound,
   NoBackendAvailable,
   ToBeDefined
