@@ -31,3 +31,10 @@ pub enum ClientResult {
   Continue,
   ConnectBackend
 }
+
+#[derive(Debug,PartialEq,Eq)]
+pub enum ConnectionError {
+  HostNotFound,
+  NoBackendAvailable,
+  ToBeDefined
+}

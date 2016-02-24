@@ -24,7 +24,7 @@ use openssl::x509::X509FileType;
 
 use parser::http11::{HttpState,RequestState,ResponseState,parse_request_until_stop};
 use network::buffer::Buffer;
-use network::{ClientResult,ServerMessage};
+use network::{ClientResult,ServerMessage,ConnectionError};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,TlsFront};
 use network::http::HttpProxy;
@@ -504,7 +504,7 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
     None
   }
 
-  fn connect_to_backend(&mut self, client: &mut Client) -> Option<TcpStream> {
+  fn connect_to_backend(&mut self, client: &mut Client) -> Result<TcpStream,ConnectionError> {
     if let (Some(host), Some(rl), Some(conn)) = (client.http_state.state.get_host(), client.http_state.state.get_request_line(), client.http_state.state.get_front_keep_alive()) {
       if let Some(back) = self.backend_from_request(&host, &rl.uri) {
         if let Ok(socket) = TcpStream::connect(&back) {
@@ -515,11 +515,16 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
             response: ResponseState::Initial
           };
           client.status     = ConnectionStatus::Connected;
-          return Some(socket);
+          return Ok(socket);
+        } else {
+          return Err(ConnectionError::ToBeDefined)
         }
+      } else {
+        return Err(ConnectionError::HostNotFound)
       }
+    } else {
+        return Err(ConnectionError::ToBeDefined)
     }
-    None
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<TlsServer>, message: HttpProxyOrder) {
