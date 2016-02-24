@@ -100,11 +100,11 @@ impl Client {
     self.back_interest.insert(EventSet::writable());
     self.back_interest.insert(EventSet::readable());
     if let Some(frontend_token) = self.token {
-      event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+      event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::level() | PollOpt::oneshot());
     }
     if let Some(backend_token) = self.backend_token {
       if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::level() | PollOpt::oneshot());
       }
     }
   }
