@@ -142,7 +142,7 @@ impl Handler for CommandServer {
     }
   }
 
-  fn notify((&mut self, event_loop: &mut EventLoop<Self>, message: Self::Message) {
+  fn notify(&mut self, event_loop: &mut EventLoop<Self>, message: Self::Message) {
     // TODO: dispatch here to clients the list of messages you want to display
     info!("notify");
   }
