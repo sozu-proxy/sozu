@@ -17,7 +17,7 @@ use std::fmt::Debug;
 use time::precise_time_ns;
 use rand::random;
 
-use network::{ClientResult,ServerMessage};
+use network::{ClientResult,ServerMessage,ConnectionError};
 use network::metrics::{METRICS,ProxyMetrics};
 
 use messages::{TcpFront,Command,Instance};
@@ -45,7 +45,7 @@ pub trait ProxyClient<Server:Handler> {
 
 pub trait ProxyConfiguration<Server:Handler,Client,Message> {
   fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<Server>) -> Option<Token>;
-  fn connect_to_backend(&mut self, client:&mut Client) ->Option<TcpStream>;
+  fn connect_to_backend(&mut self, client:&mut Client) ->Result<TcpStream,ConnectionError>;
   fn notify(&mut self, event_loop: &mut EventLoop<Server>, message: Message);
   fn accept(&mut self, token: Token) -> Option<(Client, bool)>;
 }
@@ -119,7 +119,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Me
   }
 
   pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
-    if let Some(socket) = self.configuration.connect_to_backend(&mut self.clients[token]) {
+    if let Ok(socket) = self.configuration.connect_to_backend(&mut self.clients[token]) {
       if let Ok(backend_token) = self.backend.insert(token) {
         self.clients[token].set_back_socket(socket);
         self.clients[token].set_back_token(backend_token);
@@ -129,6 +129,11 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Me
         }
         return;
       }
+    } else {
+      // ToDo serve page explaining what happened
+      // - "domain not found" (aka "404 clever") page
+      // - 503 "service unavailable" (aka "your app is deploying") page
+      // - check other failing conditions
     }
     self.close_client(event_loop, token);
   }

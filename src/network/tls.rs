@@ -24,7 +24,7 @@ use openssl::x509::X509FileType;
 
 use parser::http11::{HttpState,RequestState,ResponseState,parse_request_until_stop};
 use network::buffer::Buffer;
-use network::{ClientResult,ServerMessage};
+use network::{ClientResult,ServerMessage,ConnectionError};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,TlsFront};
 use network::http::HttpProxy;
@@ -504,22 +504,22 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
     None
   }
 
-  fn connect_to_backend(&mut self, client: &mut Client) -> Option<TcpStream> {
-    if let (Some(host), Some(rl), Some(conn)) = (client.http_state.state.get_host(), client.http_state.state.get_request_line(), client.http_state.state.get_front_keep_alive()) {
-      if let Some(back) = self.backend_from_request(&host, &rl.uri) {
-        if let Ok(socket) = TcpStream::connect(&back) {
-          client.http_state.state = HttpState {
-            req_position: client.http_state.state.req_position,
-            res_position: 0,
-            request:  RequestState::Proxying(rl, conn, host),
-            response: ResponseState::Initial
-          };
-          client.status     = ConnectionStatus::Connected;
-          return Some(socket);
-        }
-      }
-    }
-    None
+  fn connect_to_backend(&mut self, client: &mut Client) -> Result<TcpStream,ConnectionError> {
+    let host   = try!(client.http_state.state.get_host().ok_or(ConnectionError::NoHostGiven));
+    let rl     = try!(client.http_state.state.get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
+    let conn   = try!(client.http_state.state.get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
+    let back   = try!(self.backend_from_request(&host, &rl.uri).ok_or(ConnectionError::HostNotFound));
+    let socket = try!(TcpStream::connect(&back).map_err(|_| ConnectionError::ToBeDefined));
+
+    client.http_state.state = HttpState {
+      req_position: client.http_state.state.req_position,
+      res_position: 0,
+      request:  RequestState::Proxying(rl, conn, host),
+      response: ResponseState::Initial
+    };
+    client.status = ConnectionStatus::Connected;
+
+    Ok(socket)
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<TlsServer>, message: HttpProxyOrder) {

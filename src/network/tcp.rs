@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use time::precise_time_s;
 use rand::random;
-use network::{ClientResult,ServerMessage};
+use network::{ClientResult,ServerMessage,ConnectionError};
 use network::proxy::{Server,ProxyClient,ProxyConfiguration};
 
 use messages::{TcpFront,Command,Instance};
@@ -514,14 +514,13 @@ impl ProxyConfiguration<TcpServer, Client,TcpProxyOrder> for ServerConfiguration
     }
   }
 
-  fn connect_to_backend(&mut self, client:&mut Client) ->Option<TcpStream> {
+  fn connect_to_backend(&mut self, client:&mut Client) ->Result<TcpStream,ConnectionError> {
     let rnd = random::<usize>();
     let idx = rnd % self.listeners[client.accept_token].back_addresses.len();
-    if let Some(backend_addr) = self.listeners[client.accept_token].back_addresses.get(idx) {
-      TcpStream::connect(backend_addr).ok()
-    } else {
-      None
-    }
+    let backend_addr = try!(self.listeners[client.accept_token].back_addresses.get(idx).ok_or(ConnectionError::ToBeDefined));
+    let stream = try!(TcpStream::connect(backend_addr).map_err(|_| ConnectionError::ToBeDefined));
+
+    Ok(stream)
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<TcpServer>, message: TcpProxyOrder) {
