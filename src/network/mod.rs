@@ -12,6 +12,8 @@ mod splice;
 pub mod tcp;
 pub mod proxy;
 
+use mio::Token;
+
 
 #[derive(Debug)]
 pub enum ServerMessage {
@@ -39,4 +41,23 @@ pub enum ConnectionError {
   HostNotFound,
   NoBackendAvailable,
   ToBeDefined
+}
+
+#[derive(Debug,PartialEq,Eq)]
+pub enum SocketType {
+  Listener,
+  FrontClient,
+  BackClient
+}
+
+pub fn socketType(token: Token, max_listeners: usize, max_connections: usize) -> Option<SocketType> {
+  if token.as_usize() < max_listeners {
+    Some(SocketType::Listener)
+  } else if token.as_usize() < max_listeners + max_connections {
+    Some(SocketType::FrontClient)
+  } else if token.as_usize() < max_listeners + 2 * max_connections {
+    Some(SocketType::BackClient)
+  } else {
+    None
+  }
 }

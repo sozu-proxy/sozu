@@ -17,7 +17,7 @@ use std::fmt::Debug;
 use time::precise_time_ns;
 use rand::random;
 
-use network::{ClientResult,ServerMessage,ConnectionError};
+use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socketType};
 use network::metrics::{METRICS,ProxyMetrics};
 
 use messages::{TcpFront,Command,Instance};
@@ -174,59 +174,86 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Ms
     trace!("{:?} got events: {:?}", token, events);
     if events.is_readable() {
       trace!("{:?} is readable", token);
-      if token.as_usize() < self.max_listeners {
-        self.accept(event_loop, token)
-      } else if token.as_usize() < self.max_listeners + self.max_connections {
-        if self.clients.contains(token) {
-          let order = self.clients[token].readable(event_loop);
-          self.interpret_client_order(event_loop, token, order);
-        } else {
-          info!("client {:?} was removed", token);
+
+      match socketType(token, self.max_listeners, self.max_connections) {
+        Some(SocketType::Listener) => {
+          self.accept(event_loop, token)
         }
-      } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
-        if let Some(tok) = self.get_client_token(token) {
-          let order = self.clients[tok].back_readable(event_loop);
-          self.interpret_client_order(event_loop, tok, order);
+
+        Some(SocketType::FrontClient) => {
+          if self.clients.contains(token) {
+            let order = self.clients[token].readable(event_loop);
+            self.interpret_client_order(event_loop, token, order);
+          } else {
+            info!("client {:?} was removed", token);
+          }
         }
+
+        Some(SocketType::BackClient) => {
+          if let Some(tok) = self.get_client_token(token) {
+            let order = self.clients[tok].back_readable(event_loop);
+            self.interpret_client_order(event_loop, tok, order);
+          }
+        }
+
+        None => {}
       }
     }
 
     if events.is_writable() {
       trace!("{:?} is writable", token);
-      if token.as_usize() < self.max_listeners {
-        error!("received writable for listener {:?}, this should not happen", token);
-      } else  if token.as_usize() < self.max_listeners + self.max_connections {
-        if self.clients.contains(token) {
-          let order = self.clients[token].writable(event_loop);
-          self.interpret_client_order(event_loop, token, order);
-        } else {
-          info!("client {:?} was removed", token);
+
+      match socketType(token, self.max_listeners, self.max_connections) {
+        Some(SocketType::Listener) => {
+          error!("received writable for listener {:?}, this should not happen", token);
         }
-      } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
-        if let Some(tok) = self.get_client_token(token) {
-          let order = self.clients[tok].back_writable(event_loop);
-          self.interpret_client_order(event_loop, tok, order);
+
+        Some(SocketType::FrontClient) => {
+          if self.clients.contains(token) {
+            let order = self.clients[token].writable(event_loop);
+            trace!("interpreting client order {:?}", order);
+            self.interpret_client_order(event_loop, token, order);
+          } else {
+            info!("client {:?} was removed", token);
+          }
         }
+
+        Some(SocketType::BackClient) => {
+          if let Some(tok) = self.get_client_token(token) {
+            let order = self.clients[tok].back_writable(event_loop);
+            self.interpret_client_order(event_loop, tok, order);
+          }
+        }
+
+        None => {}
       }
     }
 
     if events.is_hup() {
-      if token.as_usize() < self.max_listeners {
-        error!("should not happen: server {:?} closed", token);
-      } else if token.as_usize() < self.max_listeners + self.max_connections {
-        if self.clients.contains(token) {
-          if self.clients[token].front_hup() == ClientResult::CloseClient {
-            self.close_client(event_loop, token);
-          }
-        } else {
-          info!("client {:?} was removed", token);
+      match socketType(token, self.max_listeners, self.max_connections) {
+        Some(SocketType::Listener) => {
+          error!("should not happen: server {:?} closed", token);
         }
-      } else if token.as_usize() < self.max_listeners + 2 * self.max_connections {
-        if let Some(tok) = self.get_client_token(token) {
-          if self.clients[tok].front_hup() == ClientResult::CloseClient {
-            self.close_client(event_loop, tok);
+
+        Some(SocketType::FrontClient) => {
+          if self.clients.contains(token) {
+            if self.clients[token].front_hup() == ClientResult::CloseClient {
+              self.close_client(event_loop, token);
+            }
+          } else {
+            info!("client {:?} was removed", token);
           }
         }
+
+        Some(SocketType::BackClient) => {
+          if let Some(tok) = self.get_client_token(token) {
+            if self.clients[tok].front_hup() == ClientResult::CloseClient {
+              self.close_client(event_loop, tok);
+            }
+          }
+        }
+
+        None => {}
       }
     }
   }
