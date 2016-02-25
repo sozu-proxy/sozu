@@ -17,7 +17,7 @@ use std::fmt::Debug;
 use time::precise_time_ns;
 use rand::random;
 
-use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socket_type};
+use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socketType,ProxyOrder};
 use network::metrics::{METRICS,ProxyMetrics};
 
 use messages::{TcpFront,Command,Instance};
@@ -43,23 +43,22 @@ pub trait ProxyClient<Server:Handler> {
   fn remove_backend(&mut self);
 }
 
-pub trait ProxyConfiguration<Server:Handler,Client,Message> {
+pub trait ProxyConfiguration<Server:Handler,Client> {
   fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<Server>) -> Option<Token>;
   fn connect_to_backend(&mut self, client:&mut Client) ->Result<TcpStream,ConnectionError>;
-  fn notify(&mut self, event_loop: &mut EventLoop<Server>, message: Message);
+  fn notify(&mut self, event_loop: &mut EventLoop<Server>, message: ProxyOrder);
   fn accept(&mut self, token: Token) -> Option<(Client, bool)>;
 }
 
-pub struct Server<ServerConfiguration,Client,Message> {
+pub struct Server<ServerConfiguration,Client> {
   configuration:   ServerConfiguration,
   clients:         Slab<Client>,
   backend:         Slab<ClientToken>,
   max_listeners:   usize,
   max_connections: usize,
-  phantom: PhantomData<Message>
 }
 
-impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Message>, Client,Message>,Client:ProxyClient<Server<ServerConfiguration,Client,Message>>,Message:Send+Debug> Server<ServerConfiguration,Client,Message> {
+impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, Client>,Client:ProxyClient<Server<ServerConfiguration,Client>>> Server<ServerConfiguration,Client> {
   pub fn new(max_listeners: usize, max_connections: usize, configuration: ServerConfiguration) -> Self {
     Server {
       configuration:   configuration,
@@ -67,7 +66,6 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Me
       backend:         Slab::new_starting_at(Token(max_listeners+max_connections), max_connections),
       max_listeners:   max_listeners,
       max_connections: max_connections,
-      phantom:         PhantomData
     }
   }
 
@@ -166,9 +164,9 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Me
   }
 }
 
-impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Msg>, Client,Msg>,Client:ProxyClient<Server<ServerConfiguration,Client,Msg>>,Msg:Send+Debug> Handler for Server<ServerConfiguration,Client,Msg> {
+impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, Client>,Client:ProxyClient<Server<ServerConfiguration,Client>>> Handler for Server<ServerConfiguration,Client> {
   type Timeout = usize;
-  type Message = Msg;
+  type Message = ProxyOrder;
 
   fn ready(&mut self, event_loop: &mut EventLoop<Self>, token: Token, events: EventSet) {
     trace!("{:?} got events: {:?}", token, events);

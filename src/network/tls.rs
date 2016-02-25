@@ -445,7 +445,7 @@ impl ServerConfiguration {
 
 }
 
-impl ProxyConfiguration<TlsServer,Client,ProxyOrder> for ServerConfiguration {
+impl ProxyConfiguration<TlsServer,Client> for ServerConfiguration {
   fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<TlsServer>) -> Option<Token> {
     let addr_string = String::from("127.0.0.1:") + &port.to_string();
     let front = &addr_string.parse().unwrap();
@@ -557,7 +557,7 @@ impl ProxyConfiguration<TlsServer,Client,ProxyOrder> for ServerConfiguration {
   }
 }
 
-pub type TlsServer = Server<ServerConfiguration,Client,ProxyOrder>;
+pub type TlsServer = Server<ServerConfiguration,Client>;
 
 /*
 pub fn start() {

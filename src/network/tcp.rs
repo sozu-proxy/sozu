@@ -471,7 +471,7 @@ impl ServerConfiguration {
 
 }
 
-impl ProxyConfiguration<TcpServer, Client,ProxyOrder> for ServerConfiguration {
+impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
   fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<TcpServer>) -> Option<Token> {
     let addr_string = String::from("127.0.0.1:") + &port.to_string();
     let front = &addr_string.parse().unwrap();
@@ -576,7 +576,7 @@ impl ProxyConfiguration<TcpServer, Client,ProxyOrder> for ServerConfiguration {
 
 }
 
-pub type TcpServer = Server<ServerConfiguration,Client,ProxyOrder>;
+pub type TcpServer = Server<ServerConfiguration,Client>;
 
 pub fn start() {
   let mut event_loop = EventLoop::new().unwrap();

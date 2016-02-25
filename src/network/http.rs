@@ -486,7 +486,7 @@ impl ServerConfiguration {
 
 }
 
-impl ProxyConfiguration<HttpServer,Client,ProxyOrder> for ServerConfiguration {
+impl ProxyConfiguration<HttpServer,Client> for ServerConfiguration {
   fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<HttpServer>) -> Option<Token> {
     let addr_string = String::from("127.0.0.1:") + &port.to_string();
     let front = &addr_string.parse().unwrap();
@@ -586,7 +586,7 @@ impl ProxyConfiguration<HttpServer,Client,ProxyOrder> for ServerConfiguration {
 
 }
 
-pub type HttpServer = Server<ServerConfiguration,Client,ProxyOrder>;
+pub type HttpServer = Server<ServerConfiguration,Client>;
 
 pub fn start() {
   // ToDo temporary
