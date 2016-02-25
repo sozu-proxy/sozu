@@ -46,7 +46,7 @@ pub enum HttpProxyOrder {
   Stop
 }
 
-struct Client {
+pub struct Client {
   backend:        Option<TcpStream>,
   stream:         NonblockingSslStream<TcpStream>,
   http_state:     HttpProxy,

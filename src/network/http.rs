@@ -124,7 +124,7 @@ impl HttpProxy {
 
 }
 
-struct Client {
+pub struct Client {
   sock:           TcpStream,
   backend:        Option<TcpStream>,
   http_state:     HttpProxy,

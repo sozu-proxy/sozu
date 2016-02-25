@@ -1,0 +1,11 @@
+[package]
+name = "yxorp-bin"
+version = "0.1.0"
+authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
+
+[dependencies]
+log = "0.3"
+env_logger = "0.3"
+
+[dependencies.yxorp]
+path = ".."

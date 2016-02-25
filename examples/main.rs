@@ -1,28 +1,13 @@
-#[macro_use] extern crate nom;
 #[macro_use] extern crate log;
-#[macro_use] extern crate lazy_static;
-extern crate mio;
-extern crate bytes;
-extern crate time;
-extern crate libc;
-extern crate amqp;
 extern crate env_logger;
-extern crate rustc_serialize;
-extern crate rand;
-extern crate openssl;
+extern crate yxorp;
 
-mod bus;
-mod network;
-mod parser;
-mod messages;
-mod command;
-
+use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
-use std::thread;
-use messages::Topic;
-use bus::Message;
-use network::metrics::{METRICS,ProxyMetrics};
-use std::net::{UdpSocket,SocketAddr,ToSocketAddrs};
+use yxorp::{command,network,bus};
+use yxorp::messages::{self,Topic};
+use yxorp::bus::Message;
+use yxorp::network::metrics::{METRICS,ProxyMetrics};
 
 fn main() {
   env_logger::init().unwrap();

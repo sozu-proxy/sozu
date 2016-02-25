@@ -38,7 +38,7 @@ pub enum ConnectionStatus {
 }
 
 #[cfg(not(feature = "splice"))]
-struct Client {
+pub struct Client {
   sock:           TcpStream,
   backend:        Option<TcpStream>,
   front_buf:      Option<MutByteBuf>,
@@ -54,7 +54,7 @@ struct Client {
 }
 
 #[cfg(feature = "splice")]
-struct Client {
+pub struct Client {
   sock:           TcpStream,
   backend:        Option<TcpStream>,
   pipe_in:        splice::Pipe,
