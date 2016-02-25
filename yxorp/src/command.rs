@@ -3,10 +3,12 @@ use mio::unix::*;
 use bytes::{Buf, ByteBuf, MutByteBuf, SliceBuf};
 use mio::util::Slab;
 use std::path::PathBuf;
-use std::io::{self,Read,Write};
+use std::io::{self,Read,Write,ErrorKind};
 use std::iter::repeat;
 use std::thread;
 use std::str::from_utf8;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
 
 use yxorp::network::buffer::Buffer;
 
@@ -148,18 +150,32 @@ impl Handler for CommandServer {
   }
 }
 
-pub fn start() {
+pub fn start(folder: String) {
   thread::spawn(move || {
     let mut event_loop = EventLoop::new().unwrap();
-    let addr = PathBuf::from("./sock");
-println!("aaa");
-    let srv = UnixListener::bind(&addr).unwrap();
-  println!("bbb");
+    let addr = PathBuf::from(folder).join(&PathBuf::from("./sock"));
+    if let Err(e) = fs::remove_file(&addr) {
+      match e.kind() {
+        ErrorKind::NotFound => {},
+        _ => {
+          error!("could not delete previous socket at {:?}: {:?}", addr, e);
+          return;
+        }
+      }
+    }
+    match UnixListener::bind(&addr) {
+      Ok(srv) => {
+        if let Err(e) =  fs::set_permissions(&addr, fs::Permissions::from_mode(0o600)) {
+          error!("could not set the unix socket permissions: {:?}", e);
+          fs::remove_file(&addr);
+          return;
+        }
+        info!("listen for connections");
+        event_loop.register(&srv, SERVER, EventSet::readable(), PollOpt::level() | PollOpt::oneshot()).unwrap();
 
-    info!("listen for connections");
-    event_loop.register(&srv, SERVER, EventSet::readable(), PollOpt::level() | PollOpt::oneshot()).unwrap();
-
-println!("ccc");
-    event_loop.run(&mut CommandServer::new(srv)).unwrap()
+        event_loop.run(&mut CommandServer::new(srv)).unwrap()
+      },
+      Err(e) => error!("could not create unix socket: {:?}", e)
+    }
   });
 }
