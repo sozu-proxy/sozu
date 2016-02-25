@@ -24,7 +24,7 @@ use openssl::x509::X509FileType;
 
 use parser::http11::{HttpState,RequestState,ResponseState,parse_request_until_stop};
 use network::buffer::Buffer;
-use network::{ClientResult,ServerMessage,ConnectionError};
+use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,TlsFront};
 use network::http::HttpProxy;
@@ -38,12 +38,6 @@ pub enum ConnectionStatus {
   ClientClosed,
   ServerClosed,
   Closed
-}
-
-#[derive(Debug)]
-pub enum HttpProxyOrder {
-  Command(Command),
-  Stop
 }
 
 pub struct Client {
@@ -451,7 +445,7 @@ impl ServerConfiguration {
 
 }
 
-impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration {
+impl ProxyConfiguration<TlsServer,Client,ProxyOrder> for ServerConfiguration {
   fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<TlsServer>) -> Option<Token> {
     let addr_string = String::from("127.0.0.1:") + &port.to_string();
     let front = &addr_string.parse().unwrap();
@@ -522,20 +516,20 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
     Ok(socket)
   }
 
-  fn notify(&mut self, event_loop: &mut EventLoop<TlsServer>, message: HttpProxyOrder) {
+  fn notify(&mut self, event_loop: &mut EventLoop<TlsServer>, message: ProxyOrder) {
     trace!("notified: {:?}", message);
     match message {
-      HttpProxyOrder::Command(Command::AddTlsFront(front)) => {
+      ProxyOrder::Command(Command::AddTlsFront(front)) => {
         info!("add front {:?}", front);
           self.add_http_front(front, event_loop);
           self.tx.send(ServerMessage::AddedFront);
       },
-      HttpProxyOrder::Command(Command::RemoveTlsFront(front)) => {
+      ProxyOrder::Command(Command::RemoveTlsFront(front)) => {
         info!("remove front {:?}", front);
         self.remove_http_front(front, event_loop);
         self.tx.send(ServerMessage::RemovedFront);
       },
-      HttpProxyOrder::Command(Command::AddInstance(instance)) => {
+      ProxyOrder::Command(Command::AddInstance(instance)) => {
         info!("add instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
@@ -544,7 +538,7 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
           self.tx.send(ServerMessage::AddedInstance);
         }
       },
-      HttpProxyOrder::Command(Command::RemoveInstance(instance)) => {
+      ProxyOrder::Command(Command::RemoveInstance(instance)) => {
         info!("remove instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
@@ -553,7 +547,7 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
           self.tx.send(ServerMessage::RemovedInstance);
         }
       },
-      HttpProxyOrder::Stop                   => {
+      ProxyOrder::Stop                   => {
         event_loop.shutdown();
       },
       _ => {
@@ -563,7 +557,7 @@ impl ProxyConfiguration<TlsServer,Client,HttpProxyOrder> for ServerConfiguration
   }
 }
 
-pub type TlsServer = Server<ServerConfiguration,Client,HttpProxyOrder>;
+pub type TlsServer = Server<ServerConfiguration,Client,ProxyOrder>;
 
 /*
 pub fn start() {
@@ -606,7 +600,7 @@ pub fn start() {
 }
 */
 
-pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<HttpProxyOrder>,thread::JoinHandle<()>)  {
+pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
@@ -646,9 +640,9 @@ mod tests {
     let (tx,rx) = channel::<ServerMessage>();
     let (sender, jg) = start_listener(front, 10, 10, tx.clone());
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
-    sender.send(HttpProxyOrder::Command(Command::AddHttpFront(front)));
+    sender.send(ProxyOrder::Command(Command::AddHttpFront(front)));
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
-    sender.send(HttpProxyOrder::Command(Command::AddInstance(instance)));
+    sender.send(ProxyOrder::Command(Command::AddInstance(instance)));
     println!("test received: {:?}", rx.recv());
     println!("test received: {:?}", rx.recv());
     thread::sleep_ms(300);

@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
 use time::{precise_time_s, precise_time_ns};
 use rand::random;
-use network::{ClientResult,ServerMessage,ConnectionError};
+use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use network::metrics::{ProxyMetrics,METRICS};
 use network::buffer::Buffer;
@@ -34,12 +34,6 @@ pub enum ConnectionStatus {
   ClientClosed,
   ServerClosed,
   Closed
-}
-
-#[derive(Debug)]
-pub enum HttpProxyOrder {
-  Command(Command),
-  Stop
 }
 
 pub struct HttpProxy {
@@ -492,7 +486,7 @@ impl ServerConfiguration {
 
 }
 
-impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguration {
+impl ProxyConfiguration<HttpServer,Client,ProxyOrder> for ServerConfiguration {
   fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<HttpServer>) -> Option<Token> {
     let addr_string = String::from("127.0.0.1:") + &port.to_string();
     let front = &addr_string.parse().unwrap();
@@ -532,21 +526,21 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
       Ok(socket)
   }
 
-  fn notify(&mut self, event_loop: &mut EventLoop<HttpServer>, message: HttpProxyOrder) {
+  fn notify(&mut self, event_loop: &mut EventLoop<HttpServer>, message: ProxyOrder) {
   // ToDo temporary
     trace!("notified: {:?}", message);
     match message {
-      HttpProxyOrder::Command(Command::AddHttpFront(front)) => {
+      ProxyOrder::Command(Command::AddHttpFront(front)) => {
         info!("add front {:?}", front);
           self.add_http_front(front, event_loop);
           self.tx.send(ServerMessage::AddedFront);
       },
-      HttpProxyOrder::Command(Command::RemoveHttpFront(front)) => {
+      ProxyOrder::Command(Command::RemoveHttpFront(front)) => {
         info!("remove front {:?}", front);
         self.remove_http_front(front, event_loop);
         self.tx.send(ServerMessage::RemovedFront);
       },
-      HttpProxyOrder::Command(Command::AddInstance(instance)) => {
+      ProxyOrder::Command(Command::AddInstance(instance)) => {
         info!("add instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
@@ -555,7 +549,7 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
           self.tx.send(ServerMessage::AddedInstance);
         }
       },
-      HttpProxyOrder::Command(Command::RemoveInstance(instance)) => {
+      ProxyOrder::Command(Command::RemoveInstance(instance)) => {
         info!("remove instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
@@ -564,7 +558,7 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
           self.tx.send(ServerMessage::RemovedInstance);
         }
       },
-      HttpProxyOrder::Stop                   => {
+      ProxyOrder::Stop                   => {
         event_loop.shutdown();
       },
       _ => {
@@ -592,7 +586,7 @@ impl ProxyConfiguration<HttpServer,Client,HttpProxyOrder> for ServerConfiguratio
 
 }
 
-pub type HttpServer = Server<ServerConfiguration,Client,HttpProxyOrder>;
+pub type HttpServer = Server<ServerConfiguration,Client,ProxyOrder>;
 
 pub fn start() {
   // ToDo temporary
@@ -633,7 +627,7 @@ pub fn start() {
   //});
 }
 
-pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<HttpProxyOrder>,thread::JoinHandle<()>)  {
+pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
@@ -665,7 +659,7 @@ mod tests {
   use std::str::FromStr;
   use std::time::Duration;
   use messages::{Command,HttpFront,Instance};
-  use network::ServerMessage;
+  use network::{ProxyOrder,ServerMessage};
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
@@ -675,9 +669,9 @@ mod tests {
     let (tx,rx) = channel::<ServerMessage>();
     let (sender, jg) = start_listener(front, 10, 10, tx.clone());
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/"), port: 1024 };
-    sender.send(HttpProxyOrder::Command(Command::AddHttpFront(front)));
+    sender.send(ProxyOrder::Command(Command::AddHttpFront(front)));
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
-    sender.send(HttpProxyOrder::Command(Command::AddInstance(instance)));
+    sender.send(ProxyOrder::Command(Command::AddInstance(instance)));
     println!("test received: {:?}", rx.recv());
     println!("test received: {:?}", rx.recv());
     thread::sleep_ms(300);

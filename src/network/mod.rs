@@ -13,6 +13,7 @@ pub mod tcp;
 pub mod proxy;
 
 use mio::Token;
+use messages::Command;
 
 
 #[derive(Debug)]
@@ -22,6 +23,12 @@ pub enum ServerMessage {
   AddedInstance,
   RemovedInstance,
   Stopped
+}
+
+#[derive(Debug)]
+pub enum ProxyOrder {
+  Command(Command),
+  Stop
 }
 
 #[derive(Debug,PartialEq,Eq)]

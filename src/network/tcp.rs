@@ -14,18 +14,12 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use time::precise_time_s;
 use rand::random;
-use network::{ClientResult,ServerMessage,ConnectionError};
+use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyClient,ProxyConfiguration};
 
 use messages::{TcpFront,Command,Instance};
 
 const SERVER: Token = Token(0);
-
-#[derive(Debug)]
-pub enum TcpProxyOrder {
-  Command(Command),
-  Stop
-}
 
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub enum ConnectionStatus {
@@ -477,7 +471,7 @@ impl ServerConfiguration {
 
 }
 
-impl ProxyConfiguration<TcpServer, Client,TcpProxyOrder> for ServerConfiguration {
+impl ProxyConfiguration<TcpServer, Client,ProxyOrder> for ServerConfiguration {
   fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<TcpServer>) -> Option<Token> {
     let addr_string = String::from("127.0.0.1:") + &port.to_string();
     let front = &addr_string.parse().unwrap();
@@ -523,9 +517,9 @@ impl ProxyConfiguration<TcpServer, Client,TcpProxyOrder> for ServerConfiguration
     Ok(stream)
   }
 
-  fn notify(&mut self, event_loop: &mut EventLoop<TcpServer>, message: TcpProxyOrder) {
+  fn notify(&mut self, event_loop: &mut EventLoop<TcpServer>, message: ProxyOrder) {
     match message {
-      TcpProxyOrder::Command(Command::AddTcpFront(front)) => {
+      ProxyOrder::Command(Command::AddTcpFront(front)) => {
         trace!("{:?}", front);
         if let Some(token) = self.add_tcp_front(front.port, &front.app_id, event_loop) {
           self.tx.send(ServerMessage::AddedFront);
@@ -533,12 +527,12 @@ impl ProxyConfiguration<TcpServer, Client,TcpProxyOrder> for ServerConfiguration
           error!("Couldn't add tcp front");
         }
       },
-      TcpProxyOrder::Command(Command::RemoveTcpFront(front)) => {
+      ProxyOrder::Command(Command::RemoveTcpFront(front)) => {
         trace!("{:?}", front);
         let _ = self.remove_tcp_front(front.app_id, event_loop);
         self.tx.send(ServerMessage::RemovedFront);
       },
-      TcpProxyOrder::Command(Command::AddInstance(instance)) => {
+      ProxyOrder::Command(Command::AddInstance(instance)) => {
         trace!("{:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
@@ -548,7 +542,7 @@ impl ProxyConfiguration<TcpServer, Client,TcpProxyOrder> for ServerConfiguration
           error!("Couldn't add tcp front");
         }
       },
-      TcpProxyOrder::Command(Command::RemoveInstance(instance)) => {
+      ProxyOrder::Command(Command::RemoveInstance(instance)) => {
         trace!("{:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
@@ -558,7 +552,7 @@ impl ProxyConfiguration<TcpServer, Client,TcpProxyOrder> for ServerConfiguration
           error!("Couldn't add tcp front");
         }
       },
-      TcpProxyOrder::Stop                   => {
+      ProxyOrder::Stop                   => {
         event_loop.shutdown();
       },
       _ => {
@@ -582,7 +576,7 @@ impl ProxyConfiguration<TcpServer, Client,TcpProxyOrder> for ServerConfiguration
 
 }
 
-pub type TcpServer = Server<ServerConfiguration,Client,TcpProxyOrder>;
+pub type TcpServer = Server<ServerConfiguration,Client,ProxyOrder>;
 
 pub fn start() {
   let mut event_loop = EventLoop::new().unwrap();
@@ -610,7 +604,7 @@ pub fn start() {
   });
 }
 
-pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<TcpProxyOrder>,thread::JoinHandle<()>)  {
+pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
