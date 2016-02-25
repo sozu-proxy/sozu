@@ -8,7 +8,7 @@ use std::iter::repeat;
 use std::thread;
 use std::str::from_utf8;
 
-use network::buffer::Buffer;
+use yxorp::network::buffer::Buffer;
 
 const SERVER: Token = Token(0);
 const CLIENT: Token = Token(1);

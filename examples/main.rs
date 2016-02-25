@@ -4,7 +4,7 @@ extern crate yxorp;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
-use yxorp::{command,network,bus};
+use yxorp::{network,bus};
 use yxorp::messages::{self,Topic};
 use yxorp::bus::Message;
 use yxorp::network::metrics::{METRICS,ProxyMetrics};
@@ -60,7 +60,6 @@ fn main() {
   let tls_instance2 = messages::Instance { app_id: String::from("app_2"), ip_address: String::from("127.0.0.1"), port: 1026 };
   tx2.send(network::tls::HttpProxyOrder::Command(messages::Command::AddInstance(tls_instance2)));
 
-  command::start();
   let _ = jg.join();
   info!("good bye");
 }

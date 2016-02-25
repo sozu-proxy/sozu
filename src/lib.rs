@@ -15,4 +15,3 @@ pub mod bus;
 pub mod network;
 pub mod parser;
 pub mod messages;
-pub mod command;

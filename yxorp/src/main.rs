@@ -1,10 +1,14 @@
 #[macro_use] extern crate log;
 extern crate env_logger;
+extern crate bytes;
+extern crate mio;
 extern crate yxorp;
+
+mod command;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
-use yxorp::{command,network,bus};
+use yxorp::{network,bus};
 use yxorp::messages::{self,Topic};
 use yxorp::bus::Message;
 use yxorp::network::metrics::{METRICS,ProxyMetrics};

@@ -6,6 +6,8 @@ authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 [dependencies]
 log = "0.3"
 env_logger = "0.3"
+mio = "~0.5.0"
+bytes = "~0.3.0"
 
 [dependencies.yxorp]
 path = ".."
