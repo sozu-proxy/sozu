@@ -9,17 +9,24 @@ use std::thread;
 use std::str::from_utf8;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::collections::HashMap;
+use std::slice::Split;
+use log;
+use rustc_serialize::json::decode;
+use nom::{IResult,HexDisplay};
 
+use yxorp::messages::ConfigMessage;
+use yxorp::network::ProxyOrder;
 use yxorp::network::buffer::Buffer;
 
 const SERVER: Token = Token(0);
 const CLIENT: Token = Token(1);
 
 struct CommandClient {
-  sock:     UnixStream,
-  buf:      Buffer,
-  back_buf: Buffer,
-  token:    Option<Token>,
+  sock:      UnixStream,
+  buf:       Buffer,
+  back_buf:  Buffer,
+  token:     Option<Token>,
 }
 
 impl CommandClient {
@@ -32,22 +39,47 @@ impl CommandClient {
     }
   }
 
-  fn conn_readable(&mut self, event_loop: &mut EventLoop<CommandServer>, tok: Token) {
-    //debug!("server conn readable; tok={:?}", tok);
-    match self.sock.read(self.buf.space()) {
-      Ok(0) => {},
-      Ok(r) => {
-        self.buf.fill(r);
-        debug!("UNIX CLIENT[{}] sent {} bytes: {:?}", tok.as_usize(), r, from_utf8(self.buf.data()));
-      },
-      Err(e) => error!("UNIX CLIENT[{}] read error: {:?}", tok.as_usize(), e),
-    }
+  fn reregister(&self,  event_loop: &mut EventLoop<CommandServer>, tok: Token) {
     let mut interest = EventSet::hup();
     interest.insert(EventSet::readable());
     interest.insert(EventSet::writable());
     event_loop.register(&self.sock, tok, interest, PollOpt::level() | PollOpt::oneshot());
+  }
 
-    //TODO: return here the list of messages to transmit
+  fn conn_readable(&mut self, event_loop: &mut EventLoop<CommandServer>, tok: Token) -> Option<Vec<ConfigMessage>>{
+    //debug!("server conn readable; tok={:?}", tok);
+    match self.sock.read(self.buf.space()) {
+      Ok(0) => {
+        self.reregister(event_loop, tok);
+        return None;
+      },
+      Err(e) => {
+        log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error: {:?}", tok.as_usize(), e);
+        return None;
+      },
+      Ok(r) => {
+        self.buf.fill(r);
+        debug!("UNIX CLIENT[{}] sent {} bytes: {:?}", tok.as_usize(), r, from_utf8(self.buf.data()));
+      },
+    };
+
+    let mut res: Option<Vec<ConfigMessage>> = None;
+    let mut offset = 0usize;
+    match parse(self.buf.data()) {
+      IResult::Incomplete(_) => {
+        return Some(Vec::new());
+      },
+      IResult::Error(e)      => {
+        log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error: {:?}", tok.as_usize(), e);
+        return None;
+      },
+      IResult::Done(i, v)    => {
+        offset = self.buf.data().offset(i);
+        res = Some(v);
+      }
+    }
+    self.buf.consume(offset);
+    return res;
   }
 
   fn conn_writable(&mut self, event_loop: &mut EventLoop<CommandServer>, tok: Token) {
@@ -57,7 +89,7 @@ impl CommandClient {
       Ok(r) => {
         self.back_buf.consume(r);
       },
-      Err(e) => error!("UNIX CLIENT[{}] read error: {:?}", tok.as_usize(), e),
+      Err(e) => log!(log::LogLevel::Error,"UNIX CLIENT[{}] read error: {:?}", tok.as_usize(), e),
     }
     let mut interest = EventSet::hup();
     interest.insert(EventSet::readable());
@@ -66,9 +98,16 @@ impl CommandClient {
   }
 }
 
+fn parse(input: &[u8]) -> IResult<&[u8], Vec<ConfigMessage>> {
+  many0!(input,
+    complete!(terminated!(map_res!(map_res!(is_not!("\0"), from_utf8), decode), char!('\0')))
+  )
+}
+
 struct CommandServer {
   sock:  UnixListener,
-  conns: Slab<CommandClient>
+  conns: Slab<CommandClient>,
+  listeners: HashMap<String, Sender<ProxyOrder>>,
 }
 
 impl CommandServer {
@@ -97,12 +136,24 @@ impl CommandServer {
     &mut self.conns[tok]
   }
 
-  fn new(srv: UnixListener) -> CommandServer {
+  fn dispatch(&self, v: Vec<ConfigMessage>) {
+    for message in &v {
+      let command = message.command.clone();
+      if let Some(ref listener) = self.listeners.get(&message.listener) {
+        listener.send(ProxyOrder::Command(command));
+      } else {
+        log!(log::LogLevel::Error, "no listener found for tag: {}", message.listener);
+      }
+    }
+  }
+
+  fn new(srv: UnixListener, listeners: HashMap<String, Sender<ProxyOrder>>) -> CommandServer {
     let mut v = Vec::with_capacity(2048);
     v.extend(repeat(0).take(2048));
     CommandServer {
       sock:  srv,
-      conns: Slab::new_starting_at(Token(1), 128)
+      conns: Slab::new_starting_at(Token(1), 128),
+      listeners: listeners,
     }
   }
 }
@@ -126,7 +177,10 @@ impl Handler for CommandServer {
         SERVER => self.accept(event_loop).unwrap(),
         _      => {
           if self.conns.contains(token) {
-            self.conns[token].conn_readable(event_loop, token)
+            let optV = self.conns[token].conn_readable(event_loop, token);
+            if let Some(v) = optV {
+              self.dispatch(v);
+            }
           }
         }
       };
@@ -150,7 +204,7 @@ impl Handler for CommandServer {
   }
 }
 
-pub fn start(folder: String) {
+pub fn start(folder: String, listeners: HashMap<String, Sender<ProxyOrder>>) {
   thread::spawn(move || {
     let mut event_loop = EventLoop::new().unwrap();
     let addr = PathBuf::from(folder).join(&PathBuf::from("./sock"));
@@ -158,7 +212,7 @@ pub fn start(folder: String) {
       match e.kind() {
         ErrorKind::NotFound => {},
         _ => {
-          error!("could not delete previous socket at {:?}: {:?}", addr, e);
+          log!(log::LogLevel::Error, "could not delete previous socket at {:?}: {:?}", addr, e);
           return;
         }
       }
@@ -166,16 +220,18 @@ pub fn start(folder: String) {
     match UnixListener::bind(&addr) {
       Ok(srv) => {
         if let Err(e) =  fs::set_permissions(&addr, fs::Permissions::from_mode(0o600)) {
-          error!("could not set the unix socket permissions: {:?}", e);
+          log!( log::LogLevel::Error, "could not set the unix socket permissions: {:?}", e);
           fs::remove_file(&addr);
           return;
         }
         info!("listen for connections");
         event_loop.register(&srv, SERVER, EventSet::readable(), PollOpt::level() | PollOpt::oneshot()).unwrap();
 
-        event_loop.run(&mut CommandServer::new(srv)).unwrap()
+        event_loop.run(&mut CommandServer::new(srv, listeners)).unwrap()
       },
-      Err(e) => error!("could not create unix socket: {:?}", e)
+      Err(e) => {
+        log!(log::LogLevel::Error, "could not create unix socket: {:?}", e);
+      }
     }
   });
 }
