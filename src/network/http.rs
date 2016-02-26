@@ -88,7 +88,10 @@ impl HttpProxy {
     }
   }
 
-  pub fn back_readable(&mut self) -> ClientResult {
+  pub fn back_readable(&mut self, sz: usize) -> ClientResult {
+    self.back_buf.fill(sz);
+    self.res_size = self.res_size + sz;
+
     debug!("back buffer ({} bytes):\n{}", self.back_buf.data().len(), self.back_buf.data().to_hex(8));
     if ! self.state.is_back_proxying() {
       self.state = parse_response_until_stop(&self.state, &mut self.back_buf);
@@ -354,9 +357,7 @@ impl ProxyClient<HttpServer> for Client {
           if let Some((front,back)) = tokens {
             debug!("BACK  [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           }
-          self.http_state.back_buf.fill(r);
-          self.http_state.res_size = self.http_state.res_size + r;
-          self.http_state.back_readable()
+          self.http_state.back_readable(r)
         }
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => { ClientResult::Continue },

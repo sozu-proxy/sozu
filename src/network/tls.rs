@@ -275,8 +275,7 @@ impl ProxyClient<TlsServer> for Client {
           if let Some((front,back)) = tokens {
             debug!("BACK [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), r);
           }
-          self.http_state.back_buf.fill(r);
-          self.http_state.back_readable()
+          self.http_state.back_readable(r)
         }
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => { ClientResult::Continue },
