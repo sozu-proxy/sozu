@@ -17,7 +17,7 @@ use std::fmt::Debug;
 use time::precise_time_ns;
 use rand::random;
 
-use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socketType,ProxyOrder};
+use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socket_type,ProxyOrder};
 use network::metrics::{METRICS,ProxyMetrics};
 
 use messages::{TcpFront,Command,Instance};
