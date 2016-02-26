@@ -1144,6 +1144,7 @@ pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer) -> HttpState 
 }
 
 #[cfg(test)]
+#[allow(unused_must_use)]
 mod tests {
   use super::*;
   use nom::IResult::*;

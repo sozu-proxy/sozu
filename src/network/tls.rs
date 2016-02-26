@@ -320,7 +320,7 @@ pub struct ServerConfiguration {
 
 impl ServerConfiguration {
   pub fn new(max_listeners: usize,  tx: mpsc::Sender<ServerMessage>) -> ServerConfiguration {
-    let mut contexts = HashMap::new();
+    let contexts = HashMap::new();
 
     let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
     //let mut context = SslContext::new(SslMethod::Sslv3).unwrap();
@@ -349,7 +349,7 @@ impl ServerConfiguration {
       0
     }
 
-    let mut rc_ctx = Rc::new(RefCell::new(contexts));
+    let rc_ctx = Rc::new(RefCell::new(contexts));
     let store_contexts = rc_ctx.clone();
     context.set_servername_callback_with_data(
       servername_callback_s as ServerNameCallbackData<Rc<RefCell<HashMap<String, SslContext>>>>,

@@ -12,7 +12,7 @@ use std::error::Error;
 use mio::util::Slab;
 use std::net::SocketAddr;
 use std::str::FromStr;
-use time::precise_time_s;
+use time::{Duration,precise_time_s};
 use rand::random;
 use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyClient,ProxyConfiguration};
@@ -628,6 +628,7 @@ mod tests {
   use super::*;
   use std::net::{TcpListener, TcpStream, Shutdown};
   use std::io::{Read,Write};
+  use std::time::Duration;
   use std::{thread,str};
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
@@ -635,17 +636,17 @@ mod tests {
   fn mi() {
     thread::spawn(|| { start_server(); });
     start();
-    thread::sleep_ms(300);
+    thread::sleep(Duration::from_millis(300));
 
     let mut s1 = TcpStream::connect("127.0.0.1:1234").unwrap();
     let mut s3 = TcpStream::connect("127.0.0.1:1234").unwrap();
-    thread::sleep_ms(300);
+    thread::sleep(Duration::from_millis(300));
     let mut s2 = TcpStream::connect("127.0.0.1:1234").unwrap();
     s1.write(&b"hello"[..]);
     println!("s1 sent");
     s2.write(&b"pouet pouet"[..]);
     println!("s2 sent");
-    thread::sleep_ms(500);
+    thread::sleep(Duration::from_millis(500));
 
     let mut res = [0; 128];
     s1.write(&b"coucou"[..]);
@@ -658,8 +659,7 @@ mod tests {
     assert_eq!(&res[..sz2], &b"pouet pouet END"[..]);
 
 
-    thread::sleep_ms(200);
-    thread::sleep_ms(200);
+    thread::sleep(Duration::from_millis(400));
     sz1 = s1.read(&mut res[..]).unwrap();
     println!("s1 received again({}): {:?}", sz1, str::from_utf8(&res[..sz1]));
     assert_eq!(&res[..sz1], &b"coucou END"[..]);
@@ -731,7 +731,7 @@ mod tests {
         if sz > 0 {
           //println!("[{}] {:?}", id, str::from_utf8(&buf[..sz]));
           stream.write(&buf[..sz]);
-          thread::sleep_ms(20);
+          thread::sleep(Duration::from_millis(20));
           stream.write(&response[..]);
         }
       }

@@ -13,7 +13,7 @@ use std::error::Error;
 use mio::util::Slab;
 use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
-use time::{precise_time_s, precise_time_ns};
+use time::{Duration, precise_time_s, precise_time_ns};
 use rand::random;
 use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
@@ -674,16 +674,16 @@ mod tests {
     sender.send(ProxyOrder::Command(Command::AddInstance(instance)));
     println!("test received: {:?}", rx.recv());
     println!("test received: {:?}", rx.recv());
-    thread::sleep_ms(300);
+    thread::sleep(Duration::from_millis(300));
 
     let mut client = TcpStream::connect(("127.0.0.1", 1024)).unwrap();
     // 5 seconds of timeout
     client.set_read_timeout(Some(Duration::new(5,0)));
-    thread::sleep_ms(100);
+    thread::sleep(Duration::from_millis(100));
     let mut w  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\nConnection: Close\r\n\r\n"[..]);
     println!("http client write: {:?}", w);
     let mut buffer = [0;4096];
-    thread::sleep_ms(500);
+    thread::sleep(Duration::from_millis(500));
     let mut r = client.read(&mut buffer[..]);
     println!("http client read: {:?}", r);
     match r {
@@ -694,7 +694,7 @@ mod tests {
 
         println!("Response: {}", str::from_utf8(&buffer[..]).unwrap());
 
-        //thread::sleep_ms(300);
+        //thread::sleep(Duration::from_millis(300));
         //assert_eq!(&body, &"Hello World!"[..]);
         assert_eq!(sz, 154);
         //assert!(false);

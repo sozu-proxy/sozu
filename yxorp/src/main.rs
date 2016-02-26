@@ -11,9 +11,7 @@ mod command;
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
 use std::collections::HashMap;
-use yxorp::{network,bus};
-use yxorp::messages::{self,Topic};
-use yxorp::bus::Message;
+use yxorp::network;
 use yxorp::network::metrics::{METRICS,ProxyMetrics};
 
 fn main() {
@@ -24,7 +22,6 @@ fn main() {
   METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
   let metrics_guard = ProxyMetrics::run();
 
-  let bus_tx = bus::start_bus();
   let (sender, _) = channel::<network::ServerMessage>();
   let (tx, jg) = network::http::start_listener("127.0.0.1:8080".parse().unwrap(), 10, 500, sender);
 

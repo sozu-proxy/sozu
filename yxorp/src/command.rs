@@ -1,6 +1,5 @@
 use mio::*;
 use mio::unix::*;
-use bytes::{Buf, ByteBuf, MutByteBuf, SliceBuf};
 use mio::util::Slab;
 use std::path::PathBuf;
 use std::io::{self,Read,Write,ErrorKind};
@@ -10,7 +9,6 @@ use std::str::from_utf8;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::collections::HashMap;
-use std::slice::Split;
 use log;
 use rustc_serialize::json::decode;
 use nom::{IResult,HexDisplay};
@@ -20,7 +18,6 @@ use yxorp::network::ProxyOrder;
 use yxorp::network::buffer::Buffer;
 
 const SERVER: Token = Token(0);
-const CLIENT: Token = Token(1);
 
 struct CommandClient {
   sock:      UnixStream,
@@ -127,7 +124,7 @@ impl CommandServer {
     event_loop.register(&self.conns[tok].sock, tok, interest, PollOpt::level() | PollOpt::oneshot())
       .ok().expect("could not register socket with event loop");
 
-    let mut accept_interest = EventSet::readable();
+    let accept_interest = EventSet::readable();
     event_loop.register(&self.sock, SERVER, accept_interest, PollOpt::level() | PollOpt::oneshot());
     Ok(())
   }
@@ -177,8 +174,8 @@ impl Handler for CommandServer {
         SERVER => self.accept(event_loop).unwrap(),
         _      => {
           if self.conns.contains(token) {
-            let optV = self.conns[token].conn_readable(event_loop, token);
-            if let Some(v) = optV {
+            let opt_v = self.conns[token].conn_readable(event_loop, token);
+            if let Some(v) = opt_v {
               self.dispatch(v);
             }
           }
