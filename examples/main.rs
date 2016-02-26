@@ -4,9 +4,8 @@ extern crate yxorp;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
-use yxorp::{network,bus};
+use yxorp::network;
 use yxorp::messages::{self,Topic};
-use yxorp::bus::Message;
 use yxorp::network::metrics::{METRICS,ProxyMetrics};
 
 fn main() {
@@ -18,30 +17,8 @@ fn main() {
   let metrics_guard = ProxyMetrics::run();
   METRICS.lock().unwrap().gauge("TEST", 42);
 
-  let bus_tx = bus::start_bus();
   let (sender, _) = channel::<network::ServerMessage>();
   let (tx, jg) = network::http::start_listener("127.0.0.1:8080".parse().unwrap(), 10, 500, sender);
-
-  let (http_proxy_conf_input,http_proxy_conf_listener) = channel();
-  let _ = bus_tx.send(Message::Subscribe(Topic::HttpProxyConfig, http_proxy_conf_input));
-  /*let config_tx = tx.clone();
-  if let Ok(Message::SubscribeOk) = http_proxy_conf_listener.recv() {
-  info!("Subscribed to http_proxy_conf commands");
-
-    network::amqp::init_rabbitmq(bus_tx);
-    info!("Subscribed to http_proxy_conf commands");
-
-    thread::spawn(move || {
-      loop {
-        if let Ok(Message::Msg(command)) = http_proxy_conf_listener.recv() {
-          if let Err(e) = config_tx.send(network::http::HttpProxyOrder::Command(command)) {
-            info!("Error sending HttpProxyOrder: {:?}", e);
-          }
-        }
-      }
-    });
-  }
-  */
 
   let http_front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), port: 8080 };
   let http_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };

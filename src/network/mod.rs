@@ -2,7 +2,6 @@
 
 pub mod buffer;
 pub mod metrics;
-pub mod amqp;
 pub mod http;
 pub mod tls;
 
