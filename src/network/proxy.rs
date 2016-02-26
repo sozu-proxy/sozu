@@ -17,7 +17,7 @@ use std::fmt::Debug;
 use time::precise_time_ns;
 use rand::random;
 
-use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socketType};
+use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socket_type};
 use network::metrics::{METRICS,ProxyMetrics};
 
 use messages::{TcpFront,Command,Instance};
@@ -175,7 +175,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Ms
     if events.is_readable() {
       trace!("{:?} is readable", token);
 
-      match socketType(token, self.max_listeners, self.max_connections) {
+      match socket_type(token, self.max_listeners, self.max_connections) {
         Some(SocketType::Listener) => {
           self.accept(event_loop, token)
         }
@@ -203,7 +203,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Ms
     if events.is_writable() {
       trace!("{:?} is writable", token);
 
-      match socketType(token, self.max_listeners, self.max_connections) {
+      match socket_type(token, self.max_listeners, self.max_connections) {
         Some(SocketType::Listener) => {
           error!("received writable for listener {:?}, this should not happen", token);
         }
@@ -230,7 +230,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client,Ms
     }
 
     if events.is_hup() {
-      match socketType(token, self.max_listeners, self.max_connections) {
+      match socket_type(token, self.max_listeners, self.max_connections) {
         Some(SocketType::Listener) => {
           error!("should not happen: server {:?} closed", token);
         }

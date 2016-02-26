@@ -50,7 +50,7 @@ pub enum SocketType {
   BackClient
 }
 
-pub fn socketType(token: Token, max_listeners: usize, max_connections: usize) -> Option<SocketType> {
+pub fn socket_type(token: Token, max_listeners: usize, max_connections: usize) -> Option<SocketType> {
   if token.as_usize() < max_listeners {
     Some(SocketType::Listener)
   } else if token.as_usize() < max_listeners + max_connections {
