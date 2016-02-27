@@ -43,7 +43,7 @@ pub enum ConnectionStatus {
 
 pub struct Client {
   backend:        Option<TcpStream>,
-  stream:         NonblockingSslStream<TcpStream>,
+  frontend:       NonblockingSslStream<TcpStream>,
   http_state:     HttpProxy,
   token:          Option<Token>,
   backend_token:  Option<Token>,
@@ -57,7 +57,7 @@ pub struct Client {
 impl Client {
   fn new(stream: NonblockingSslStream<TcpStream>) -> Option<Client> {
     Some(Client {
-      stream:         stream,
+      frontend:       stream,
       backend:        None,
       http_state:     HttpProxy {
         state:             HttpState::new(),
@@ -82,7 +82,7 @@ impl Client {
 
 impl ProxyClient<TlsServer> for Client {
   fn front_socket(&self) -> &TcpStream {
-    self.stream.get_ref()
+    self.frontend.get_ref()
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
@@ -144,7 +144,7 @@ impl ProxyClient<TlsServer> for Client {
 
   // Read content from the client
   fn readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
-    let (sz, res) = self.stream.socket_read(self.http_state.front_buf.space());
+    let (sz, res) = self.frontend.socket_read(self.http_state.front_buf.space());
     debug!("FRONT [{:?}]: read {} bytes", self.token, sz);
     self.http_state.front_buf.fill(sz);
     match res {
@@ -166,7 +166,7 @@ impl ProxyClient<TlsServer> for Client {
       return ClientResult::Continue;
     }
 
-    let (sz, res) = self.stream.socket_write(&(self.http_state.back_buf.data())[..self.http_state.back_to_copy()]);
+    let (sz, res) = self.frontend.socket_write(&(self.http_state.back_buf.data())[..self.http_state.back_to_copy()]);
     if let Some((front,back)) = self.tokens() {
       debug!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), sz);
     }
@@ -279,7 +279,7 @@ impl HttpProxyClient<TlsServer> for Client {
     self.back_interest.insert(EventSet::writable());
     self.back_interest.insert(EventSet::readable());
     if let Some(frontend_token) = self.token {
-      event_loop.reregister(self.stream.get_ref(), frontend_token, self.front_interest, PollOpt::level() | PollOpt::oneshot());
+      event_loop.reregister(self.frontend.get_ref(), frontend_token, self.front_interest, PollOpt::level() | PollOpt::oneshot());
     }
     if let Some(backend_token) = self.backend_token {
       if let Some(ref sock) = self.backend {

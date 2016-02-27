@@ -123,7 +123,7 @@ impl HttpProxy {
 }
 
 pub struct Client {
-  sock:           TcpStream,
+  frontend:       TcpStream,
   backend:        Option<TcpStream>,
   http_state:     HttpProxy,
   token:          Option<Token>,
@@ -138,7 +138,7 @@ pub struct Client {
 impl Client {
   fn new(sock: TcpStream) -> Option<Client> {
     Some(Client {
-      sock:           sock,
+      frontend:       sock,
       backend:        None,
       http_state:     HttpProxy {
         state:             HttpState::new(),
@@ -164,7 +164,7 @@ impl Client {
 
 impl ProxyClient<HttpServer> for Client {
   fn front_socket(&self) -> &TcpStream {
-    &self.sock
+    &self.frontend
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
@@ -226,7 +226,7 @@ impl ProxyClient<HttpServer> for Client {
 
   // Read content from the client
   fn readable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
-    let (sz, res) = self.sock.socket_read(self.http_state.front_buf.space());
+    let (sz, res) = self.frontend.socket_read(self.http_state.front_buf.space());
     debug!("FRONT [{:?}]: read {} bytes", self.token, sz);
     self.http_state.front_buf.fill(sz);
     match res {
@@ -248,12 +248,11 @@ impl ProxyClient<HttpServer> for Client {
       return ClientResult::Continue;
     }
 
-    let (sz, res) = self.sock.socket_write(&(self.http_state.back_buf.data())[..self.http_state.back_to_copy()]);
+    let (sz, res) = self.frontend.socket_write(&(self.http_state.back_buf.data())[..self.http_state.back_to_copy()]);
     if let Some((front,back)) = self.tokens() {
       debug!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), sz);
     }
     self.tx_count = self.tx_count + sz;
-    debug!("FRONT [{:?}]: read {} bytes", self.token, sz);
     match res {
       SocketResult::Error => ClientResult::CloseClient,
       _                   => {
@@ -449,7 +448,7 @@ impl HttpProxyClient<HttpServer> for Client {
     self.back_interest.insert(EventSet::readable());
     self.back_interest.insert(EventSet::writable());
     if let Some(frontend_token) = self.token {
-      event_loop.reregister(&self.sock, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+      event_loop.reregister(&self.frontend, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
     if let Some(backend_token) = self.backend_token {
       if let Some(ref sock) = self.backend {
