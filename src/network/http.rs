@@ -331,32 +331,10 @@ impl ProxyClient<HttpServer> for Client {
 pub trait HttpProxyClient<Server:Handler> : ProxyClient<Server> {
   fn tokens(&self) -> Option<(Token,Token)>;
   // gives the backend socket and the back buffer
-  fn mut_back_readable(&mut self) -> Option<(&mut TcpStream, &mut Buffer)>;
-  // gives the backend socket and the front buffer
-  fn mut_back_writable(&mut self) -> Option<(&mut TcpStream, &mut Buffer)>;
   fn reregister(&mut self, event_loop: &mut EventLoop<Server>);
-  fn http_state(&mut self) -> &mut HttpProxy;
 }
 
 impl HttpProxyClient<HttpServer> for Client {
-  fn mut_back_readable(&mut self) -> Option<(&mut TcpStream, &mut Buffer)> {
-    match self.backend.as_mut() {
-      None    => None,
-      Some(r) => Some((r, &mut self.http_state.back_buf))
-    }
-  }
-
-  fn mut_back_writable(&mut self) -> Option<(&mut TcpStream, &mut Buffer)> {
-    match self.backend.as_mut() {
-      None    => None,
-      Some(r) => Some((r, &mut self.http_state.front_buf))
-    }
-  }
-
-  fn http_state(&mut self) -> &mut HttpProxy {
-    &mut self.http_state
-  }
-
   fn tokens(&self) -> Option<(Token,Token)> {
     if let Some(front) = self.token {
       if let Some(back) = self.backend_token {

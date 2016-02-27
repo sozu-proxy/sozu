@@ -246,24 +246,6 @@ impl ProxyClient<TlsServer> for Client {
 }
 
 impl HttpProxyClient<TlsServer> for Client {
-  fn mut_back_readable(&mut self) -> Option<(&mut TcpStream, &mut Buffer)> {
-    match self.backend.as_mut() {
-      None    => None,
-      Some(r) => Some((r, &mut self.http_state.back_buf))
-    }
-  }
-
-  fn mut_back_writable(&mut self) -> Option<(&mut TcpStream, &mut Buffer)> {
-    match self.backend.as_mut() {
-      None    => None,
-      Some(r) => Some((r, &mut self.http_state.front_buf))
-    }
-  }
-
-  fn http_state(&mut self) -> &mut HttpProxy {
-    &mut self.http_state
-  }
-
   fn tokens(&self) -> Option<(Token,Token)> {
     if let Some(front) = self.token {
       if let Some(back) = self.backend_token {
