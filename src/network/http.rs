@@ -19,6 +19,7 @@ use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use network::metrics::{ProxyMetrics,METRICS};
 use network::buffer::Buffer;
+use network::socket::{SocketHandler,SocketResult};
 
 use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop, BufferMove};
 use nom::HexDisplay;
@@ -225,29 +226,20 @@ impl ProxyClient<HttpServer> for Client {
 
   // Read content from the client
   fn readable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
-    match self.sock.read(&mut self.http_state.front_buf.space()) {
-      Ok(0) => {},
-      Ok(r) => {
-        debug!("FRONT [{:?}]: read {} bytes", self.token, r);
-        self.http_state.front_buf.fill(r);
-        self.http_state.req_size = self.http_state.req_size + r;
+    let (sz, res) = self.sock.socket_read(self.http_state.front_buf.space());
+    debug!("FRONT [{:?}]: read {} bytes", self.token, sz);
+    self.http_state.front_buf.fill(sz);
+    match res {
+      SocketResult::Error => ClientResult::CloseClient,
+      _                   => {
         self.reregister(event_loop);
-        return self.http_state.readable();
-      }
-      Err(e) => match e.kind() {
-        ErrorKind::WouldBlock => {}
-        ErrorKind::BrokenPipe => {
-          debug!("broken pipe reading from the client");
-          return ClientResult::CloseClient;
-        },
-        _ => {
-          debug!("not implemented; client err={:?}", e);
-          return ClientResult::CloseBothFailure;
-        },
+        if sz > 0 {
+        self.http_state.readable()
+        } else {
+          ClientResult::Continue
+        }
       }
     }
-    self.reregister(event_loop);
-    ClientResult::Continue
   }
 
   // Forward content to client
@@ -256,42 +248,83 @@ impl ProxyClient<HttpServer> for Client {
       return ClientResult::Continue;
     }
 
-    let res = match self.sock.write(&(self.http_state.back_buf.data())[..self.http_state.back_to_copy()]) {
-      Ok(0) => { ClientResult::Continue }
-      Ok(r) => {
-        //FIXME what happens if not everything was written?
-        if let Some((front,back)) = self.tokens() {
-          debug!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
-        }
-
-        self.tx_count = self.tx_count + r;
-        self.http_state.writable(r)
-      }
-      Err(e) => match e.kind() {
-        ErrorKind::WouldBlock => { ClientResult::Continue }
-        ErrorKind::BrokenPipe => {
-          debug!("broken pipe writing to the client");
-          return ClientResult::CloseBothFailure;
-        },
-        _ => {
-          debug!("not implemented; client err={:?}", e);
-          ClientResult::CloseBothFailure
+    let (sz, res) = self.sock.socket_write(&(self.http_state.back_buf.data())[..self.http_state.back_to_copy()]);
+    if let Some((front,back)) = self.tokens() {
+      debug!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), sz);
+    }
+    self.tx_count = self.tx_count + sz;
+    debug!("FRONT [{:?}]: read {} bytes", self.token, sz);
+    match res {
+      SocketResult::Error => ClientResult::CloseClient,
+      _                   => {
+        self.reregister(event_loop);
+        if sz > 0 {
+        self.http_state.writable(sz)
+        } else {
+          ClientResult::Continue
         }
       }
-    };
-
-    self.reregister(event_loop);
-    res
+    }
   }
 
   // Forward content to application
   fn back_writable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
-    self.http_back_writable(event_loop)
+    if self.http_state.front_buf.available_data() == 0 {
+      return ClientResult::Continue;
+    }
+
+    let tokens = self.tokens().clone();
+    let res = if let Some(ref mut sock) = self.backend {
+      let (sz, res) = sock.socket_write(&(self.http_state.front_buf.data())[..self.http_state.front_to_copy()]);
+      if let Some((front,back)) = tokens {
+        debug!("BACK  [{}->{}]: wrote {} bytes", front.as_usize(), back.as_usize(), sz);
+      }
+      match res {
+        SocketResult::Error => ClientResult::CloseBothFailure,
+        _                   => {
+          if sz > 0 {
+            self.http_state.back_writable(sz)
+          } else {
+            ClientResult::Continue
+          }
+        }
+      }
+    } else {
+      return ClientResult::CloseBothFailure
+    };
+
+    if res == ClientResult::Continue {
+      self.reregister(event_loop);
+    }
+    res
   }
 
   // Read content from application
   fn back_readable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
-    self.http_back_readable(event_loop)
+    let tokens = self.tokens().clone();
+    let res = if let Some(ref mut sock) = self.backend {
+      let (sz, r) = sock.socket_read(&mut self.http_state.back_buf.space());
+      if let Some((front,back)) = tokens {
+        debug!("BACK  [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), sz);
+      }
+      match r {
+        SocketResult::Error => ClientResult::CloseBothFailure,
+        _                   => {
+          if sz > 0 {
+            self.http_state.back_readable(sz)
+          } else {
+            ClientResult::Continue
+          }
+        }
+      }
+    } else {
+      return ClientResult::CloseBothFailure;
+    };
+
+    if res == ClientResult::Continue {
+      self.reregister(event_loop);
+    }
+    res
   }
 
 }

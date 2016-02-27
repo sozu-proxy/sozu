@@ -28,6 +28,7 @@ use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,TlsFront};
 use network::http::{HttpProxy,HttpProxyClient};
+use network::socket::{SocketHandler,SocketResult};
 
 type BackendToken = Token;
 #[derive(Debug,Clone,PartialEq,Eq)]
@@ -143,29 +144,20 @@ impl ProxyClient<TlsServer> for Client {
 
   // Read content from the client
   fn readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
-    match self.stream.read(self.http_state.front_buf.space()) {
-      Ok(0) => {},
-      Ok(r) => {
-        debug!("FRONT [{:?}]: read {} bytes", self.token, r);
-        self.http_state.front_buf.fill(r);
+    let (sz, res) = self.stream.socket_read(self.http_state.front_buf.space());
+    debug!("FRONT [{:?}]: read {} bytes", self.token, sz);
+    self.http_state.front_buf.fill(sz);
+    match res {
+      SocketResult::Error => ClientResult::CloseClient,
+      _                   => {
         self.reregister(event_loop);
-        let res = self.http_state.readable();
-        return res;
-      },
-      Err(NonblockingSslError::WantRead) => {
-        trace!("writable WantRead");
-      },
-      Err(NonblockingSslError::WantWrite) => {
-        trace!("writable WantWrite");
-      },
-      Err(e) => {
-        error!("readable TLS client err={:?}", e);
-        return ClientResult::CloseClient;
+        if sz > 0 {
+        self.http_state.readable()
+        } else {
+          ClientResult::Continue
+        }
       }
     }
-
-    self.reregister(event_loop);
-    ClientResult::Continue
   }
 
   // Forward content to client
@@ -174,43 +166,81 @@ impl ProxyClient<TlsServer> for Client {
       return ClientResult::Continue;
     }
 
-    let res = match self.stream.write(&self.http_state.back_buf.data()[..self.http_state.back_to_copy()]) {
-      Ok(0) => { ClientResult::Continue }
-      Ok(r) => {
-        //FIXME what happens if not everything was written?
-        if let Some((front,back)) = self.tokens() {
-          debug!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), r);
+    let (sz, res) = self.stream.socket_write(&(self.http_state.back_buf.data())[..self.http_state.back_to_copy()]);
+    if let Some((front,back)) = self.tokens() {
+      debug!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), sz);
+    }
+    match res {
+      SocketResult::Error => ClientResult::CloseClient,
+      _                   => {
+        self.reregister(event_loop);
+        if sz > 0 {
+        self.http_state.writable(sz)
+        } else {
+          ClientResult::Continue
         }
-
-        self.tx_count = self.tx_count + r;
-        self.http_state.writable(r)
-      },
-      Err(NonblockingSslError::WantRead) => {
-        trace!("writable WantRead");
-        ClientResult::Continue
-      },
-      Err(NonblockingSslError::WantWrite) => {
-        trace!("writable WantWrite");
-        ClientResult::Continue
       }
-      Err(e) => {
-        error!("writable TLS client err={:?}", e);
-        return ClientResult::CloseClient;
-      }
-    };
-
-    self.reregister(event_loop);
-    res
+    }
   }
 
   // Forward content to application
   fn back_writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
-    self.http_back_writable(event_loop)
+    if self.http_state.front_buf.available_data() == 0 {
+      return ClientResult::Continue;
+    }
+
+    let tokens = self.tokens().clone();
+    let res = if let Some(ref mut sock) = self.backend {
+      let (sz, res) = sock.socket_write(&(self.http_state.front_buf.data())[..self.http_state.front_to_copy()]);
+      if let Some((front,back)) = tokens {
+        debug!("BACK  [{}->{}]: wrote {} bytes", front.as_usize(), back.as_usize(), sz);
+      }
+      match res {
+        SocketResult::Error => ClientResult::CloseBothFailure,
+        _                   => {
+          if sz > 0 {
+            self.http_state.back_writable(sz)
+          } else {
+            ClientResult::Continue
+          }
+        }
+      }
+    } else {
+      return ClientResult::CloseBothFailure
+    };
+
+    if res == ClientResult::Continue {
+      self.reregister(event_loop);
+    }
+    res
   }
 
   // Read content from application
   fn back_readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
-    self.http_back_readable(event_loop)
+    let tokens = self.tokens().clone();
+    let res = if let Some(ref mut sock) = self.backend {
+      let (sz, r) = sock.socket_read(&mut self.http_state.back_buf.space());
+      if let Some((front,back)) = tokens {
+        debug!("BACK  [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), sz);
+      }
+      match r {
+        SocketResult::Error => ClientResult::CloseBothFailure,
+        _                   => {
+          if sz > 0 {
+            self.http_state.back_readable(sz)
+          } else {
+            ClientResult::Continue
+          }
+        }
+      }
+    } else {
+      return ClientResult::CloseBothFailure;
+    };
+
+    if res == ClientResult::Continue {
+      self.reregister(event_loop);
+    }
+    res
   }
 
 }
