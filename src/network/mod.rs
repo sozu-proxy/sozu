@@ -2,6 +2,7 @@
 
 pub mod buffer;
 pub mod metrics;
+pub mod socket;
 pub mod http;
 pub mod tls;
 
