@@ -160,6 +160,30 @@ impl Client {
 
   pub fn close(&self) {
   }
+
+  fn tokens(&self) -> Option<(Token,Token)> {
+    if let Some(front) = self.token {
+      if let Some(back) = self.backend_token {
+        return Some((front, back))
+      }
+    }
+    None
+  }
+
+  fn reregister(&mut self, event_loop: &mut EventLoop<HttpServer>) {
+    self.front_interest.insert(EventSet::readable());
+    self.front_interest.insert(EventSet::writable());
+    self.back_interest.insert(EventSet::readable());
+    self.back_interest.insert(EventSet::writable());
+    if let Some(frontend_token) = self.token {
+      event_loop.reregister(&self.frontend, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
+    }
+    if let Some(backend_token) = self.backend_token {
+      if let Some(ref sock) = self.backend {
+        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge() | PollOpt::oneshot());
+      }
+    }
+  }
 }
 
 impl ProxyClient<HttpServer> for Client {
@@ -326,38 +350,6 @@ impl ProxyClient<HttpServer> for Client {
     res
   }
 
-}
-
-pub trait HttpProxyClient<Server:Handler> : ProxyClient<Server> {
-  fn tokens(&self) -> Option<(Token,Token)>;
-  // gives the backend socket and the back buffer
-  fn reregister(&mut self, event_loop: &mut EventLoop<Server>);
-}
-
-impl HttpProxyClient<HttpServer> for Client {
-  fn tokens(&self) -> Option<(Token,Token)> {
-    if let Some(front) = self.token {
-      if let Some(back) = self.backend_token {
-        return Some((front, back))
-      }
-    }
-    None
-  }
-
-  fn reregister(&mut self, event_loop: &mut EventLoop<HttpServer>) {
-    self.front_interest.insert(EventSet::readable());
-    self.front_interest.insert(EventSet::writable());
-    self.back_interest.insert(EventSet::readable());
-    self.back_interest.insert(EventSet::writable());
-    if let Some(frontend_token) = self.token {
-      event_loop.reregister(&self.frontend, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
-    if let Some(backend_token) = self.backend_token {
-      if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-      }
-    }
-  }
 }
 
 pub struct ApplicationListener {

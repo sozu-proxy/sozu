@@ -27,7 +27,7 @@ use network::buffer::Buffer;
 use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,TlsFront};
-use network::http::{HttpProxy,HttpProxyClient};
+use network::http::HttpProxy;
 use network::socket::{SocketHandler,SocketResult};
 
 type BackendToken = Token;
@@ -77,6 +77,30 @@ impl Client {
     })
   }
   pub fn close(&self) {
+  }
+
+  fn tokens(&self) -> Option<(Token,Token)> {
+    if let Some(front) = self.token {
+      if let Some(back) = self.backend_token {
+        return Some((front, back))
+      }
+    }
+    None
+  }
+
+  fn reregister(&mut self,  event_loop: &mut EventLoop<TlsServer>) {
+    self.front_interest.insert(EventSet::readable());
+    self.front_interest.insert(EventSet::writable());
+    self.back_interest.insert(EventSet::writable());
+    self.back_interest.insert(EventSet::readable());
+    if let Some(frontend_token) = self.token {
+      event_loop.reregister(self.frontend.get_ref(), frontend_token, self.front_interest, PollOpt::level() | PollOpt::oneshot());
+    }
+    if let Some(backend_token) = self.backend_token {
+      if let Some(ref sock) = self.backend {
+        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::level() | PollOpt::oneshot());
+      }
+    }
   }
 }
 
@@ -243,32 +267,6 @@ impl ProxyClient<TlsServer> for Client {
     res
   }
 
-}
-
-impl HttpProxyClient<TlsServer> for Client {
-  fn tokens(&self) -> Option<(Token,Token)> {
-    if let Some(front) = self.token {
-      if let Some(back) = self.backend_token {
-        return Some((front, back))
-      }
-    }
-    None
-  }
-
-  fn reregister(&mut self,  event_loop: &mut EventLoop<TlsServer>) {
-    self.front_interest.insert(EventSet::readable());
-    self.front_interest.insert(EventSet::writable());
-    self.back_interest.insert(EventSet::writable());
-    self.back_interest.insert(EventSet::readable());
-    if let Some(frontend_token) = self.token {
-      event_loop.reregister(self.frontend.get_ref(), frontend_token, self.front_interest, PollOpt::level() | PollOpt::oneshot());
-    }
-    if let Some(backend_token) = self.backend_token {
-      if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::level() | PollOpt::oneshot());
-      }
-    }
-  }
 }
 
 pub struct ApplicationListener {
