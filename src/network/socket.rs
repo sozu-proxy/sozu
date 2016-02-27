@@ -13,6 +13,7 @@ pub enum SocketResult {
 pub trait SocketHandler {
   fn socket_read(&mut self,  buf: &mut[u8]) -> (usize, SocketResult);
   fn socket_write(&mut self, buf: &[u8])    -> (usize, SocketResult);
+  fn socket_ref(&self) -> &TcpStream;
 }
 
 impl SocketHandler for TcpStream {
@@ -51,6 +52,8 @@ impl SocketHandler for TcpStream {
       }
     }
   }
+
+  fn socket_ref(&self) -> &TcpStream { self }
 }
 
 impl SocketHandler for NonblockingSslStream<TcpStream> {
@@ -79,4 +82,6 @@ impl SocketHandler for NonblockingSslStream<TcpStream> {
       }
     }
   }
+
+  fn socket_ref(&self) -> &TcpStream { self.get_ref() }
 }
