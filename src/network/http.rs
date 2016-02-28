@@ -169,21 +169,6 @@ impl Client {
     }
     None
   }
-
-  fn reregister(&mut self, event_loop: &mut EventLoop<HttpServer>) {
-    self.front_interest.insert(EventSet::readable());
-    self.front_interest.insert(EventSet::writable());
-    self.back_interest.insert(EventSet::readable());
-    self.back_interest.insert(EventSet::writable());
-    if let Some(frontend_token) = self.token {
-      event_loop.reregister(&self.frontend, frontend_token, self.front_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
-    if let Some(backend_token) = self.backend_token {
-      if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-      }
-    }
-  }
 }
 
 impl ProxyClient<HttpServer> for Client {
@@ -256,7 +241,6 @@ impl ProxyClient<HttpServer> for Client {
     match res {
       SocketResult::Error => ClientResult::CloseClient,
       _                   => {
-        self.reregister(event_loop);
         if sz > 0 {
         self.http_state.readable()
         } else {
@@ -280,7 +264,6 @@ impl ProxyClient<HttpServer> for Client {
     match res {
       SocketResult::Error => ClientResult::CloseClient,
       _                   => {
-        self.reregister(event_loop);
         if sz > 0 {
         self.http_state.writable(sz)
         } else {
@@ -316,9 +299,6 @@ impl ProxyClient<HttpServer> for Client {
       return ClientResult::CloseBothFailure
     };
 
-    if res == ClientResult::Continue {
-      self.reregister(event_loop);
-    }
     res
   }
 
@@ -344,9 +324,6 @@ impl ProxyClient<HttpServer> for Client {
       return ClientResult::CloseBothFailure;
     };
 
-    if res == ClientResult::Continue {
-      self.reregister(event_loop);
-    }
     res
   }
 

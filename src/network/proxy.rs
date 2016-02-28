@@ -158,9 +158,31 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
       ClientResult::CloseBackend     => self.close_backend(event_loop, token),
       ClientResult::CloseBothSuccess => self.close_client(event_loop, token),
       ClientResult::CloseBothFailure => self.close_client(event_loop, token),
-      ClientResult::ConnectBackend   => self.connect_to_backend(event_loop, token),
-      ClientResult::Continue         => {}
+      ClientResult::ConnectBackend   => {
+        self.reregister(event_loop, token);
+        self.connect_to_backend(event_loop, token)
+      },
+      ClientResult::Continue         => self.reregister(event_loop, token)
     }
+  }
+
+  fn reregister(&self, event_loop: &mut EventLoop<Self>, token: Token) {
+    let client = &self.clients[token];
+    let mut front_interest = EventSet::hup();
+    let mut back_interest  = EventSet::hup();
+    front_interest.insert(EventSet::readable());
+    front_interest.insert(EventSet::writable());
+    back_interest.insert(EventSet::writable());
+    back_interest.insert(EventSet::readable());
+
+    if let Some(frontend_token) = client.front_token() {
+      event_loop.reregister(client.front_socket(), frontend_token, front_interest, PollOpt::level() | PollOpt::oneshot());
+    }
+     if let Some(backend_token) = client.back_token() {
+       if let Some(sock) = client.back_socket() {
+         event_loop.reregister(sock, backend_token, back_interest, PollOpt::level() | PollOpt::oneshot());
+       }
+     }
   }
 }
 

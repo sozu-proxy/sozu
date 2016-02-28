@@ -136,8 +136,6 @@ impl Client {
           self.tx_count = self.tx_count + r;
         }
       }
-      event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-      event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
     Ok(())
   }
@@ -158,8 +156,6 @@ impl Client {
       }
     };
 
-    event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     Ok(())
   }
 
@@ -183,8 +179,6 @@ impl Client {
           self.data_in = false;
         }
       }
-      event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-      event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     }
     Ok(())
   }
@@ -204,8 +198,6 @@ impl Client {
       }
     };
 
-    event_loop.reregister(&self.backend, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     Ok(())
   }
 }
@@ -298,10 +290,6 @@ impl ProxyClient<TcpServer> for Client {
       }
       self.back_buf = Some(b.flip());
     }
-    if let Some(ref sock) = self.backend {
-      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     ClientResult::Continue
   }
 
@@ -327,10 +315,6 @@ impl ProxyClient<TcpServer> for Client {
     };
     self.front_buf = Some(buf);
 
-    if let Some(ref sock) = self.backend {
-      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     ClientResult::Continue
   }
 
@@ -359,10 +343,6 @@ impl ProxyClient<TcpServer> for Client {
       }
       self.front_buf = Some(b.flip());
     }
-    if let Some(ref sock) = self.backend {
-      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     ClientResult::Continue
   }
 
@@ -389,10 +369,6 @@ impl ProxyClient<TcpServer> for Client {
     }
     self.back_buf = Some(buf);
 
-    if let Some(ref sock) = self.backend {
-      event_loop.reregister(sock, self.backend_token.unwrap(), self.back_interest, PollOpt::edge() | PollOpt::oneshot());
-    }
-    event_loop.reregister(&self.sock, self.token.unwrap(), self.front_interest, PollOpt::edge() | PollOpt::oneshot());
     ClientResult::Continue
   }
 }

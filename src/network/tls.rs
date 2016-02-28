@@ -87,21 +87,6 @@ impl Client {
     }
     None
   }
-
-  fn reregister(&mut self,  event_loop: &mut EventLoop<TlsServer>) {
-    self.front_interest.insert(EventSet::readable());
-    self.front_interest.insert(EventSet::writable());
-    self.back_interest.insert(EventSet::writable());
-    self.back_interest.insert(EventSet::readable());
-    if let Some(frontend_token) = self.token {
-      event_loop.reregister(self.frontend.get_ref(), frontend_token, self.front_interest, PollOpt::level() | PollOpt::oneshot());
-    }
-    if let Some(backend_token) = self.backend_token {
-      if let Some(ref sock) = self.backend {
-        event_loop.reregister(sock, backend_token, self.back_interest, PollOpt::level() | PollOpt::oneshot());
-      }
-    }
-  }
 }
 
 impl ProxyClient<TlsServer> for Client {
@@ -174,7 +159,6 @@ impl ProxyClient<TlsServer> for Client {
     match res {
       SocketResult::Error => ClientResult::CloseClient,
       _                   => {
-        self.reregister(event_loop);
         if sz > 0 {
         self.http_state.readable()
         } else {
@@ -197,7 +181,6 @@ impl ProxyClient<TlsServer> for Client {
     match res {
       SocketResult::Error => ClientResult::CloseClient,
       _                   => {
-        self.reregister(event_loop);
         if sz > 0 {
         self.http_state.writable(sz)
         } else {
@@ -233,9 +216,6 @@ impl ProxyClient<TlsServer> for Client {
       return ClientResult::CloseBothFailure
     };
 
-    if res == ClientResult::Continue {
-      self.reregister(event_loop);
-    }
     res
   }
 
@@ -261,9 +241,6 @@ impl ProxyClient<TlsServer> for Client {
       return ClientResult::CloseBothFailure;
     };
 
-    if res == ClientResult::Continue {
-      self.reregister(event_loop);
-    }
     res
   }
 
