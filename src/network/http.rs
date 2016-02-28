@@ -562,26 +562,6 @@ pub fn start() {
     debug!("ending event loop");
     notify_tx.send(ServerMessage::Stopped);
   });
-
-
-  //println!("listen for connections");
-  //event_loop.register(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-  //let mut s = Server::new(10, 500, tx);
-  //{
-  //  let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
-  //  s.add_tcp_front(1234, "yolo", &mut event_loop);
-  //  s.add_instance("yolo", &back, &mut event_loop);
-  //}
-  //{
-  //  let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
-  //  s.add_tcp_front(1235, "yolo", &mut event_loop);
-  //  s.add_instance("yolo", &back, &mut event_loop);
-  //}
-  //thread::spawn(move|| {
-  //  println!("starting event loop");
-  //  event_loop.run(&mut s).unwrap();
-  //  println!("ending event loop");
-  //});
 }
 
 pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {

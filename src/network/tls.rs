@@ -309,47 +309,6 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
 
 pub type TlsServer = Server<ServerConfiguration,Client<NonblockingSslStream<TcpStream>>>;
 
-/*
-pub fn start() {
-  // ToDo temporary
-  let mut event_loop = EventLoop::new().unwrap();
-
-  let (tx,rx) = channel::<ServerMessage>();
-  let channel = event_loop.channel();
-  let notify_tx = tx.clone();
-
-  let configuration = ServerConfiguration::new(1, tx);
-  let mut server = TlsServer::new(1, 500, configuration);
-
-  let join_guard = thread::spawn(move|| {
-    info!("starting event loop");
-    event_loop.run(&mut server).unwrap();
-    info!("ending event loop");
-    notify_tx.send(ServerMessage::Stopped);
-  });
-
-
-  //println!("listen for connections");
-  //event_loop.register(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-  //let mut s = TlsServer::new(10, 500, tx);
-  //{
-  //  let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
-  //  s.add_tcp_front(1234, "yolo", &mut event_loop);
-  //  s.add_instance("yolo", &back, &mut event_loop);
-  //}
-  //{
-  //  let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
-  //  s.add_tcp_front(1235, "yolo", &mut event_loop);
-  //  s.add_instance("yolo", &back, &mut event_loop);
-  //}
-  //thread::spawn(move|| {
-  //  println!("starting event loop");
-  //  event_loop.run(&mut s).unwrap();
-  //  println!("ending event loop");
-  //});
-}
-*/
-
 pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
