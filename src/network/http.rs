@@ -171,7 +171,7 @@ impl Client {
   }
 }
 
-impl ProxyClient<HttpServer> for Client {
+impl ProxyClient for Client {
   fn front_socket(&self) -> &TcpStream {
     &self.frontend
   }
@@ -234,7 +234,7 @@ impl ProxyClient<HttpServer> for Client {
   }
 
   // Read content from the client
-  fn readable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
+  fn readable(&mut self) -> ClientResult {
     let (sz, res) = self.frontend.socket_read(self.http_state.front_buf.space());
     debug!("FRONT [{:?}]: read {} bytes", self.token, sz);
     self.http_state.front_buf.fill(sz);
@@ -251,7 +251,7 @@ impl ProxyClient<HttpServer> for Client {
   }
 
   // Forward content to client
-  fn writable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
+  fn writable(&mut self) -> ClientResult {
     if self.http_state.back_buf.available_data() == 0 {
       return ClientResult::Continue;
     }
@@ -274,7 +274,7 @@ impl ProxyClient<HttpServer> for Client {
   }
 
   // Forward content to application
-  fn back_writable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
+  fn back_writable(&mut self) -> ClientResult {
     if self.http_state.front_buf.available_data() == 0 {
       return ClientResult::Continue;
     }
@@ -303,7 +303,7 @@ impl ProxyClient<HttpServer> for Client {
   }
 
   // Read content from application
-  fn back_readable(&mut self, event_loop: &mut EventLoop<HttpServer>) -> ClientResult {
+  fn back_readable(&mut self) -> ClientResult {
     let tokens = self.tokens().clone();
     let res = if let Some(ref mut sock) = self.backend {
       let (sz, r) = sock.socket_read(&mut self.http_state.back_buf.space());

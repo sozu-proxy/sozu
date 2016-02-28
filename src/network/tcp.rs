@@ -116,7 +116,7 @@ impl Client {
     self.backend_token = Some(backend);
   }
 
-  fn writable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> io::Result<()> {
+  fn writable(&mut self) -> io::Result<()> {
     trace!("in writable()");
     if self.data_out {
       match splice::splice_out(self.pipe_out, &self.sock) {
@@ -140,7 +140,7 @@ impl Client {
     Ok(())
   }
 
-  fn readable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> io::Result<()> {
+  fn readable(&mut self) -> io::Result<()> {
     //trace!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
 
     match splice::splice_in(&self.sock, self.pipe_in) {
@@ -159,7 +159,7 @@ impl Client {
     Ok(())
   }
 
-  fn back_writable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> io::Result<()> {
+  fn back_writable(&mut self) -> io::Result<()> {
     //trace!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
 
     if self.data_in {
@@ -183,7 +183,7 @@ impl Client {
     Ok(())
   }
 
-  fn back_readable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> io::Result<()> {
+  fn back_readable(&mut self) -> io::Result<()> {
     trace!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
 
     match splice::splice_in(&self.backend, self.pipe_out) {
@@ -202,7 +202,7 @@ impl Client {
   }
 }
 
-impl ProxyClient<TcpServer> for Client {
+impl ProxyClient for Client {
   fn front_socket(&self) -> &TcpStream {
     &self.sock
   }
@@ -264,7 +264,7 @@ impl ProxyClient<TcpServer> for Client {
     }
   }
 
-  fn writable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> ClientResult {
+  fn writable(&mut self) -> ClientResult {
     trace!("in writable()");
     if let Some(buf) = self.back_buf.take() {
       //trace!("in writable 2: back_buf contains {} bytes", buf.remaining());
@@ -293,7 +293,7 @@ impl ProxyClient<TcpServer> for Client {
     ClientResult::Continue
   }
 
-  fn readable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> ClientResult {
+  fn readable(&mut self) -> ClientResult {
     let mut buf = self.front_buf.take().unwrap();
     //trace!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
 
@@ -318,7 +318,7 @@ impl ProxyClient<TcpServer> for Client {
     ClientResult::Continue
   }
 
-  fn back_writable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> ClientResult {
+  fn back_writable(&mut self) -> ClientResult {
     if let Some(buf) = self.front_buf.take() {
       //trace!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
 
@@ -346,7 +346,7 @@ impl ProxyClient<TcpServer> for Client {
     ClientResult::Continue
   }
 
-  fn back_readable(&mut self, event_loop: &mut EventLoop<TcpServer>) -> ClientResult {
+  fn back_readable(&mut self) -> ClientResult {
     let mut buf = self.back_buf.take().unwrap();
     //trace!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
 

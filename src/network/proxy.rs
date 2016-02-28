@@ -25,7 +25,7 @@ use messages::{TcpFront,Command,Instance};
 const SERVER: Token = Token(0);
 type ClientToken = Token;
 
-pub trait ProxyClient<Server:Handler> {
+pub trait ProxyClient {
   fn front_socket(&self) -> &TcpStream;
   fn back_socket(&self)  -> Option<&TcpStream>;
   fn front_token(&self)  -> Option<Token>;
@@ -34,12 +34,12 @@ pub trait ProxyClient<Server:Handler> {
   fn set_front_token(&mut self, token: Token);
   fn set_back_token(&mut self, token: Token);
   fn set_tokens(&mut self, token: Token, backend: Token);
-  fn front_hup(&mut self) -> ClientResult;
-  fn back_hup(&mut self) -> ClientResult;
-  fn readable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult;
-  fn writable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult;
-  fn back_readable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult;
-  fn back_writable(&mut self, event_loop: &mut EventLoop<Server>) -> ClientResult;
+  fn front_hup(&mut self)     -> ClientResult;
+  fn back_hup(&mut self)      -> ClientResult;
+  fn readable(&mut self)      -> ClientResult;
+  fn writable(&mut self)      -> ClientResult;
+  fn back_readable(&mut self) -> ClientResult;
+  fn back_writable(&mut self) -> ClientResult;
   fn remove_backend(&mut self);
 }
 
@@ -58,7 +58,7 @@ pub struct Server<ServerConfiguration,Client> {
   max_connections: usize,
 }
 
-impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, Client>,Client:ProxyClient<Server<ServerConfiguration,Client>>> Server<ServerConfiguration,Client> {
+impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, Client>,Client:ProxyClient> Server<ServerConfiguration,Client> {
   pub fn new(max_listeners: usize, max_connections: usize, configuration: ServerConfiguration) -> Self {
     Server {
       configuration:   configuration,
@@ -186,7 +186,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
   }
 }
 
-impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, Client>,Client:ProxyClient<Server<ServerConfiguration,Client>>> Handler for Server<ServerConfiguration,Client> {
+impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, Client>,Client:ProxyClient> Handler for Server<ServerConfiguration,Client> {
   type Timeout = usize;
   type Message = ProxyOrder;
 
@@ -202,7 +202,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
         Some(SocketType::FrontClient) => {
           if self.clients.contains(token) {
-            let order = self.clients[token].readable(event_loop);
+            let order = self.clients[token].readable();
             self.interpret_client_order(event_loop, token, order);
           } else {
             info!("client {:?} was removed", token);
@@ -211,7 +211,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
         Some(SocketType::BackClient) => {
           if let Some(tok) = self.get_client_token(token) {
-            let order = self.clients[tok].back_readable(event_loop);
+            let order = self.clients[tok].back_readable();
             self.interpret_client_order(event_loop, tok, order);
           }
         }
@@ -230,7 +230,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
         Some(SocketType::FrontClient) => {
           if self.clients.contains(token) {
-            let order = self.clients[token].writable(event_loop);
+            let order = self.clients[token].writable();
             trace!("interpreting client order {:?}", order);
             self.interpret_client_order(event_loop, token, order);
           } else {
@@ -240,7 +240,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
         Some(SocketType::BackClient) => {
           if let Some(tok) = self.get_client_token(token) {
-            let order = self.clients[tok].back_writable(event_loop);
+            let order = self.clients[tok].back_writable();
             self.interpret_client_order(event_loop, tok, order);
           }
         }

@@ -89,7 +89,7 @@ impl Client {
   }
 }
 
-impl ProxyClient<TlsServer> for Client {
+impl ProxyClient for Client {
   fn front_socket(&self) -> &TcpStream {
     self.frontend.get_ref()
   }
@@ -152,7 +152,7 @@ impl ProxyClient<TlsServer> for Client {
   }
 
   // Read content from the client
-  fn readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
+  fn readable(&mut self) -> ClientResult {
     let (sz, res) = self.frontend.socket_read(self.http_state.front_buf.space());
     debug!("FRONT [{:?}]: read {} bytes", self.token, sz);
     self.http_state.front_buf.fill(sz);
@@ -169,7 +169,7 @@ impl ProxyClient<TlsServer> for Client {
   }
 
   // Forward content to client
-  fn writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
+  fn writable(&mut self) -> ClientResult {
     if self.http_state.back_buf.available_data() == 0 {
       return ClientResult::Continue;
     }
@@ -191,7 +191,7 @@ impl ProxyClient<TlsServer> for Client {
   }
 
   // Forward content to application
-  fn back_writable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
+  fn back_writable(&mut self) -> ClientResult {
     if self.http_state.front_buf.available_data() == 0 {
       return ClientResult::Continue;
     }
@@ -220,7 +220,7 @@ impl ProxyClient<TlsServer> for Client {
   }
 
   // Read content from application
-  fn back_readable(&mut self, event_loop: &mut EventLoop<TlsServer>) -> ClientResult {
+  fn back_readable(&mut self) -> ClientResult {
     let tokens = self.tokens().clone();
     let res = if let Some(ref mut sock) = self.backend {
       let (sz, r) = sock.socket_read(&mut self.http_state.back_buf.space());
