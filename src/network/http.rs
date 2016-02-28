@@ -122,8 +122,8 @@ impl HttpProxy {
 
 }
 
-pub struct Client {
-  frontend:       TcpStream,
+pub struct Client<Front:SocketHandler> {
+  frontend:       Front,
   backend:        Option<TcpStream>,
   http_state:     HttpProxy,
   token:          Option<Token>,
@@ -135,8 +135,8 @@ pub struct Client {
   tx_count:       usize,
 }
 
-impl Client {
-  fn new(sock: TcpStream) -> Option<Client> {
+impl<Front:SocketHandler> Client<Front> {
+  pub fn new(sock: Front) -> Option<Client<Front>> {
     Some(Client {
       frontend:       sock,
       backend:        None,
@@ -169,11 +169,19 @@ impl Client {
     }
     None
   }
+
+  pub fn http_state(&mut self) -> &mut HttpProxy {
+    &mut self.http_state
+  }
+
+  pub fn set_status(&mut self, status: ConnectionStatus) {
+    self.status = status;
+  }
 }
 
-impl ProxyClient for Client {
+impl<Front:SocketHandler> ProxyClient for Client<Front> {
   fn front_socket(&self) -> &TcpStream {
-    &self.frontend
+    self.frontend.socket_ref()
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
@@ -435,7 +443,7 @@ impl ServerConfiguration {
 
 }
 
-impl ProxyConfiguration<HttpServer,Client> for ServerConfiguration {
+impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
   fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<HttpServer>) -> Option<Token> {
     let addr_string = String::from("127.0.0.1:") + &port.to_string();
     let front = &addr_string.parse().unwrap();
@@ -464,7 +472,7 @@ impl ProxyConfiguration<HttpServer,Client> for ServerConfiguration {
     }
   }
 
-  fn connect_to_backend(&mut self, client: &mut Client) -> Result<TcpStream,ConnectionError> {
+  fn connect_to_backend(&mut self, client: &mut Client<TcpStream>) -> Result<TcpStream,ConnectionError> {
       let host   = try!(client.http_state.state.get_host().ok_or(ConnectionError::NoHostGiven));
       let rl     = try!(client.http_state.state.get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
       let back   = try!(self.backend_from_request(&host, &rl.uri).ok_or(ConnectionError::HostNotFound));
@@ -516,7 +524,7 @@ impl ProxyConfiguration<HttpServer,Client> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: Token) -> Option<(Client, bool)> {
+  fn accept(&mut self, token: Token) -> Option<(Client<TcpStream>, bool)> {
     if self.listeners.contains(token) {
       let accepted = self.listeners[token].sock.accept();
 
@@ -535,7 +543,7 @@ impl ProxyConfiguration<HttpServer,Client> for ServerConfiguration {
 
 }
 
-pub type HttpServer = Server<ServerConfiguration,Client>;
+pub type HttpServer = Server<ServerConfiguration,Client<TcpStream>>;
 
 pub fn start() {
   // ToDo temporary

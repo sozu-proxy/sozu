@@ -27,224 +27,10 @@ use network::buffer::Buffer;
 use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,TlsFront};
-use network::http::HttpProxy;
+use network::http::{HttpProxy,Client,ConnectionStatus};
 use network::socket::{SocketHandler,SocketResult};
 
 type BackendToken = Token;
-#[derive(Debug,Clone,PartialEq,Eq)]
-pub enum ConnectionStatus {
-  Initial,
-  ClientConnected,
-  Connected,
-  ClientClosed,
-  ServerClosed,
-  Closed
-}
-
-pub struct Client {
-  backend:        Option<TcpStream>,
-  frontend:       NonblockingSslStream<TcpStream>,
-  http_state:     HttpProxy,
-  token:          Option<Token>,
-  backend_token:  Option<Token>,
-  back_interest:  EventSet,
-  front_interest: EventSet,
-  status:         ConnectionStatus,
-  rx_count:       usize,
-  tx_count:       usize,
-}
-
-impl Client {
-  fn new(stream: NonblockingSslStream<TcpStream>) -> Option<Client> {
-    Some(Client {
-      frontend:       stream,
-      backend:        None,
-      http_state:     HttpProxy {
-        state:             HttpState::new(),
-        front_buf:         Buffer::with_capacity(12000),
-        back_buf:          Buffer::with_capacity(12000),
-        start:             precise_time_ns(),
-        req_size:          0,
-        res_size:          0,
-      },
-      token:          None,
-      backend_token:  None,
-      back_interest:  EventSet::all(),
-      front_interest: EventSet::all(),
-      status:         ConnectionStatus::Initial,
-      rx_count:       0,
-      tx_count:       0,
-    })
-  }
-  pub fn close(&self) {
-  }
-
-  fn tokens(&self) -> Option<(Token,Token)> {
-    if let Some(front) = self.token {
-      if let Some(back) = self.backend_token {
-        return Some((front, back))
-      }
-    }
-    None
-  }
-}
-
-impl ProxyClient for Client {
-  fn front_socket(&self) -> &TcpStream {
-    self.frontend.get_ref()
-  }
-
-  fn back_socket(&self)  -> Option<&TcpStream> {
-    self.backend.as_ref()
-  }
-
-  fn front_token(&self)  -> Option<Token> {
-    self.token
-  }
-
-  fn back_token(&self)   -> Option<Token> {
-    self.backend_token
-  }
-
-  fn set_back_socket(&mut self, socket:TcpStream) {
-    self.backend = Some(socket);
-  }
-
-  fn set_front_token(&mut self, token: Token) {
-    self.token         = Some(token);
-  }
-
-  fn set_back_token(&mut self, token: Token) {
-    self.backend_token = Some(token);
-  }
-
-  fn set_tokens(&mut self, token: Token, backend: Token) {
-    self.token         = Some(token);
-    self.backend_token = Some(backend);
-  }
-
-  fn remove_backend(&mut self) {
-    debug!("TLS PROXY [{} -> {}] CLOSED BACKEND", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
-    self.backend       = None;
-    self.backend_token = None;
-  }
-
-  fn front_hup(&mut self) -> ClientResult {
-    if  self.status == ConnectionStatus::ServerClosed ||
-        self.status == ConnectionStatus::ClientConnected { // the server never answered, the client closed
-      self.status = ConnectionStatus::Closed;
-      ClientResult::CloseClient
-    } else {
-      self.status = ConnectionStatus::ClientClosed;
-      ClientResult::Continue
-    }
-
-  }
-
-  fn back_hup(&mut self) -> ClientResult {
-    if self.status == ConnectionStatus::ClientClosed {
-      self.status = ConnectionStatus::Closed;
-      ClientResult::CloseClient
-    } else {
-      self.status = ConnectionStatus::ServerClosed;
-      ClientResult::Continue
-    }
-  }
-
-  // Read content from the client
-  fn readable(&mut self) -> ClientResult {
-    let (sz, res) = self.frontend.socket_read(self.http_state.front_buf.space());
-    debug!("FRONT [{:?}]: read {} bytes", self.token, sz);
-    self.http_state.front_buf.fill(sz);
-    match res {
-      SocketResult::Error => ClientResult::CloseClient,
-      _                   => {
-        if sz > 0 {
-        self.http_state.readable()
-        } else {
-          ClientResult::Continue
-        }
-      }
-    }
-  }
-
-  // Forward content to client
-  fn writable(&mut self) -> ClientResult {
-    if self.http_state.back_buf.available_data() == 0 {
-      return ClientResult::Continue;
-    }
-
-    let (sz, res) = self.frontend.socket_write(&(self.http_state.back_buf.data())[..self.http_state.back_to_copy()]);
-    if let Some((front,back)) = self.tokens() {
-      debug!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), sz);
-    }
-    match res {
-      SocketResult::Error => ClientResult::CloseClient,
-      _                   => {
-        if sz > 0 {
-        self.http_state.writable(sz)
-        } else {
-          ClientResult::Continue
-        }
-      }
-    }
-  }
-
-  // Forward content to application
-  fn back_writable(&mut self) -> ClientResult {
-    if self.http_state.front_buf.available_data() == 0 {
-      return ClientResult::Continue;
-    }
-
-    let tokens = self.tokens().clone();
-    let res = if let Some(ref mut sock) = self.backend {
-      let (sz, res) = sock.socket_write(&(self.http_state.front_buf.data())[..self.http_state.front_to_copy()]);
-      if let Some((front,back)) = tokens {
-        debug!("BACK  [{}->{}]: wrote {} bytes", front.as_usize(), back.as_usize(), sz);
-      }
-      match res {
-        SocketResult::Error => ClientResult::CloseBothFailure,
-        _                   => {
-          if sz > 0 {
-            self.http_state.back_writable(sz)
-          } else {
-            ClientResult::Continue
-          }
-        }
-      }
-    } else {
-      return ClientResult::CloseBothFailure
-    };
-
-    res
-  }
-
-  // Read content from application
-  fn back_readable(&mut self) -> ClientResult {
-    let tokens = self.tokens().clone();
-    let res = if let Some(ref mut sock) = self.backend {
-      let (sz, r) = sock.socket_read(&mut self.http_state.back_buf.space());
-      if let Some((front,back)) = tokens {
-        debug!("BACK  [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), sz);
-      }
-      match r {
-        SocketResult::Error => ClientResult::CloseBothFailure,
-        _                   => {
-          if sz > 0 {
-            self.http_state.back_readable(sz)
-          } else {
-            ClientResult::Continue
-          }
-        }
-      }
-    } else {
-      return ClientResult::CloseBothFailure;
-    };
-
-    res
-  }
-
-}
 
 pub struct ApplicationListener {
   sock:           TcpListener,
@@ -409,7 +195,7 @@ impl ServerConfiguration {
   }
 }
 
-impl ProxyConfiguration<TlsServer,Client> for ServerConfiguration {
+impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for ServerConfiguration {
   fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<TlsServer>) -> Option<Token> {
     let addr_string = String::from("127.0.0.1:") + &port.to_string();
     let front = &addr_string.parse().unwrap();
@@ -439,7 +225,7 @@ impl ProxyConfiguration<TlsServer,Client> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: Token) -> Option<(Client,bool)> {
+  fn accept(&mut self, token: Token) -> Option<(Client<NonblockingSslStream<TcpStream>>,bool)> {
     if self.listeners.contains(token) {
       let accepted = self.listeners[token].sock.accept();
 
@@ -462,20 +248,20 @@ impl ProxyConfiguration<TlsServer,Client> for ServerConfiguration {
     None
   }
 
-  fn connect_to_backend(&mut self, client: &mut Client) -> Result<TcpStream,ConnectionError> {
-    let host   = try!(client.http_state.state.get_host().ok_or(ConnectionError::NoHostGiven));
-    let rl     = try!(client.http_state.state.get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-    let conn   = try!(client.http_state.state.get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
+  fn connect_to_backend(&mut self, client: &mut Client<NonblockingSslStream<TcpStream>>) -> Result<TcpStream,ConnectionError> {
+    let host   = try!(client.http_state().state.get_host().ok_or(ConnectionError::NoHostGiven));
+    let rl     = try!(client.http_state().state.get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
+    let conn   = try!(client.http_state().state.get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
     let back   = try!(self.backend_from_request(&host, &rl.uri).ok_or(ConnectionError::HostNotFound));
     let socket = try!(TcpStream::connect(&back).map_err(|_| ConnectionError::ToBeDefined));
 
-    client.http_state.state = HttpState {
-      req_position: client.http_state.state.req_position,
+    client.http_state().state = HttpState {
+      req_position: client.http_state().state.req_position,
       res_position: 0,
       request:  RequestState::Proxying(rl, conn, host),
       response: ResponseState::Initial
     };
-    client.status = ConnectionStatus::Connected;
+    client.set_status(ConnectionStatus::Connected);
 
     Ok(socket)
   }
@@ -521,7 +307,7 @@ impl ProxyConfiguration<TlsServer,Client> for ServerConfiguration {
   }
 }
 
-pub type TlsServer = Server<ServerConfiguration,Client>;
+pub type TlsServer = Server<ServerConfiguration,Client<NonblockingSslStream<TcpStream>>>;
 
 /*
 pub fn start() {
