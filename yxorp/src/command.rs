@@ -161,14 +161,6 @@ impl Handler for CommandServer {
 
 	fn ready(&mut self, event_loop: &mut EventLoop<CommandServer>, token: Token, events: EventSet) {
     //trace!("ready: {:?} -> {:?}", token, events);
-    if events.is_hup() {
-      if self.conns.contains(token) {
-        event_loop.deregister(&self.conns[token].sock);
-        self.conns.remove(token);
-        trace!("closed client [{}]", token.as_usize());
-      }
-    }
-
     if events.is_readable() {
       match token {
         SERVER => self.accept(event_loop).unwrap(),
@@ -192,6 +184,14 @@ impl Handler for CommandServer {
           }
         }
       };
+    }
+
+    if events.is_hup() {
+      if self.conns.contains(token) {
+        event_loop.deregister(&self.conns[token].sock);
+        self.conns.remove(token);
+        trace!("closed client [{}]", token.as_usize());
+      }
     }
   }
 
