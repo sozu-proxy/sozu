@@ -384,6 +384,29 @@ impl ServerConfiguration {
       }
   }
 
+  // ToDo factor out with http.rs
+  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&TlsFront> {
+    if let Some(http_fronts) = self.fronts.get(host) {
+      let matching_fronts = http_fronts.iter().filter(|f| uri.starts_with(&f.path_begin)); // ToDo match on uri
+      let mut front = None;
+
+      for f in matching_fronts {
+        if front.is_none() {
+          front = Some(f);
+        }
+
+        if let Some(ff) = front {
+          if f.path_begin.len() > ff.path_begin.len() {
+            front = Some(f)
+          }
+        }
+      }
+      front
+    } else {
+      None
+    }
+  }
+
   pub fn backend_from_request(&self, host: &str, uri: &str) -> Option<SocketAddr> {
     trace!("looking for backend for host: {}", host);
     let real_host = if let Some(h) = host.split(":").next() {
@@ -392,18 +415,14 @@ impl ServerConfiguration {
       host
     };
     trace!("looking for backend for real host: {}", host);
-    if let Some(http_fronts) = self.fronts.get(real_host) {
-      // ToDo get the front with the most specific matching path_begin
-      if let Some(http_front) = http_fronts.get(0) {
-        // ToDo round-robin on instances
-        if let Some(app_instances) = self.instances.get(&http_front.app_id) {
-          let rnd = random::<usize>();
-          let idx = rnd % app_instances.len();
-          info!("Connecting {} -> {:?}", host, app_instances.get(idx));
-          app_instances.get(idx).map(|& addr| addr)
-        } else {
-          None
-        }
+
+    if let Some(tls_front) = self.frontend_from_request(real_host, uri) {
+      // ToDo round-robin on instances
+      if let Some(app_instances) = self.instances.get(&tls_front.app_id) {
+        let rnd = random::<usize>();
+        let idx = rnd % app_instances.len();
+        info!("Connecting {} -> {:?}", host, app_instances.get(idx));
+        app_instances.get(idx).map(|& addr| addr)
       } else {
         None
       }
@@ -411,7 +430,6 @@ impl ServerConfiguration {
       None
     }
   }
-
 }
 
 impl ProxyConfiguration<TlsServer,Client> for ServerConfiguration {
@@ -591,6 +609,7 @@ pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: 
 mod tests {
   extern crate tiny_http;
   use super::*;
+  use std::collections::HashMap;
   use std::net::{TcpListener, TcpStream, Shutdown};
   use std::io::{Read,Write};
   use std::{thread,str};
@@ -598,7 +617,12 @@ mod tests {
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
-  use messages::{Command,HttpFront,Instance};
+  use std::rc::{Rc,Weak};
+  use std::cell::RefCell;
+  use messages::{Command,TlsFront,Instance};
+  use mio::util::Slab;
+  use network::{ProxyOrder,ServerMessage};
+  use openssl::ssl::{SslContext, SslMethod, Ssl, NonblockingSslStream, ServerNameCallback, ServerNameCallbackData};
 
   /*
   #[allow(unused_mut, unused_must_use, unused_variables)]
@@ -664,4 +688,65 @@ mod tests {
     });
   }
 */
+
+
+
+  #[test]
+  fn frontend_from_request_test() {
+    let app_id1 = "app_1".to_owned();
+    let app_id2 = "app_2".to_owned();
+    let app_id3 = "app_3".to_owned();
+    let uri1 = "/".to_owned();
+    let uri2 = "/yolo".to_owned();
+    let uri3 = "/yolo/swag".to_owned();
+
+    let mut fronts = HashMap::new();
+    fronts.insert("lolcatho.st".to_owned(), vec![
+      TlsFront {
+        app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1, port: 8080,
+        key_path: "".to_owned(), cert_path: "".to_owned()
+      },
+      TlsFront {
+        app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2, port: 8080,
+        key_path: "".to_owned(), cert_path: "".to_owned()
+      },
+      TlsFront {
+        app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3, port: 8080,
+        key_path: "".to_owned(), cert_path: "".to_owned()
+      }
+    ]);
+    fronts.insert("other.domain".to_owned(), vec![
+      TlsFront {
+        app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(), port: 8080,
+        key_path: "".to_owned(), cert_path: "".to_owned()
+      },
+    ]);
+
+    let contexts = HashMap::new();
+    let rc_ctx = Rc::new(RefCell::new(contexts));
+
+    let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
+    let (tx,rx) = channel::<ServerMessage>();
+
+    let server_config = ServerConfiguration {
+      instances: HashMap::new(),
+      listeners: Slab::new(10),
+      fronts:    fronts,
+      default_cert: "".to_owned(),
+      default_context: context,
+      contexts: rc_ctx,
+      tx:        tx
+    };
+
+    let frontend1 = server_config.frontend_from_request("lolcatho.st", "/");
+    let frontend2 = server_config.frontend_from_request("lolcatho.st", "/test");
+    let frontend3 = server_config.frontend_from_request("lolcatho.st", "/yolo/test");
+    let frontend4 = server_config.frontend_from_request("lolcatho.st", "/yolo/swag");
+    let frontend5 = server_config.frontend_from_request("domain", "/");
+    assert_eq!(frontend1.unwrap().app_id, "app_1");
+    assert_eq!(frontend2.unwrap().app_id, "app_1");
+    assert_eq!(frontend3.unwrap().app_id, "app_2");
+    assert_eq!(frontend4.unwrap().app_id, "app_3");
+    assert_eq!(frontend5, None);
+  }
 }
