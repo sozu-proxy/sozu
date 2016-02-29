@@ -13,7 +13,7 @@ rustbuild-1.5:
     - cargo build
     - cargo test
     - ./docker_tests/run_nginx.sh
-    - cargo run &
+    - RUST_LOG=info ./target/debug/examples/main &
     - sleep 5
     - curl --max-time 10 -v http://lolcatho.st:8080/
     - curl --max-time 10 -vk https://lolcatho.st:8443/
@@ -29,7 +29,7 @@ rustbuild-1.6:
     - cargo build
     - cargo test
     - ./docker_tests/run_nginx.sh
-    - cargo run &
+    - RUST_LOG=info ./target/debug/examples/main &
     - sleep 5
     - curl --max-time 10 -v http://lolcatho.st:1026/
     - curl --max-time 10 -v http://lolcatho.st:8080/
@@ -47,7 +47,7 @@ rustbuild-1.7:
     - cargo build
     - cargo test
     - ./docker_tests/run_nginx.sh
-    - cargo run &
+    - RUST_LOG=info ./target/debug/examples/main &
     - sleep 5
     - curl --max-time 10 -v http://lolcatho.st:8080/
     - curl --max-time 10 -vk https://lolcatho.st:8443/
