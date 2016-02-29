@@ -23,6 +23,8 @@ use network::metrics::{METRICS,ProxyMetrics};
 use messages::{TcpFront,Command,Instance};
 
 const SERVER: Token = Token(0);
+const FRONT_TIMEOUT: u64 = 10000;
+const BACK_TIMEOUT:  u64 = 10000;
 type ClientToken = Token;
 
 pub trait ProxyClient {
@@ -33,6 +35,10 @@ pub trait ProxyClient {
   fn set_back_socket(&mut self, TcpStream);
   fn set_front_token(&mut self, token: Token);
   fn set_back_token(&mut self, token: Token);
+  fn front_timeout(&mut self) -> Option<Timeout>;
+  fn back_timeout(&mut self)  -> Option<Timeout>;
+  fn set_front_timeout(&mut self, timeout: Timeout);
+  fn set_back_timeout(&mut self, timeout: Timeout);
   fn set_tokens(&mut self, token: Token, backend: Token);
   fn front_hup(&mut self)     -> ClientResult;
   fn back_hup(&mut self)      -> ClientResult;
@@ -104,6 +110,9 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
       if let Ok(client_token) = self.clients.insert(client) {
         event_loop.register(self.clients[client_token].front_socket(), client_token, EventSet::readable(), PollOpt::edge());
         &self.clients[client_token].set_front_token(client_token);
+        if let Ok(timeout) = event_loop.timeout_ms(client_token.as_usize(), FRONT_TIMEOUT) {
+          &self.clients[client_token].set_front_timeout(timeout);
+        }
         METRICS.lock().unwrap().gauge("accept", 1);
         if should_connect {
           self.connect_to_backend(event_loop, client_token);
@@ -124,6 +133,9 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
         if let Some(sock) = self.clients[token].back_socket() {
           event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge());
+        }
+        if let Ok(timeout) = event_loop.timeout_ms(backend_token.as_usize(), BACK_TIMEOUT) {
+          &self.clients[token].set_back_timeout(timeout);
         }
         return;
       }
@@ -204,6 +216,16 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
           if self.clients.contains(token) {
             let order = self.clients[token].readable();
             self.interpret_client_order(event_loop, token, order);
+
+            // FIXME: should clear the timeout only if data was consumed
+            if let Some(timeout) = self.clients[token].front_timeout() {
+              //println!("[{}] clearing timeout", token.as_usize());
+              event_loop.clear_timeout(timeout);
+            }
+            if let Ok(timeout) = event_loop.timeout_ms(token.as_usize(), FRONT_TIMEOUT) {
+              //println!("[{}] resetting timeout", token.as_usize());
+              &self.clients[token].set_front_timeout(timeout);
+            }
           } else {
             info!("client {:?} was removed", token);
           }
@@ -213,6 +235,16 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
           if let Some(tok) = self.get_client_token(token) {
             let order = self.clients[tok].back_readable();
             self.interpret_client_order(event_loop, tok, order);
+
+            // FIXME: should clear the timeout only if data was consumed
+            if let Some(timeout) = self.clients[tok].back_timeout() {
+              //println!("[{}] clearing timeout", token.as_usize());
+              event_loop.clear_timeout(timeout);
+            }
+            if let Ok(timeout) = event_loop.timeout_ms(token.as_usize(), BACK_TIMEOUT) {
+              //println!("[{}] resetting timeout", token.as_usize());
+              &self.clients[tok].set_back_timeout(timeout);
+            }
           }
         }
 
@@ -283,7 +315,25 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
   }
 
   fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {
-    warn!("timeout");
+    let token = Token(timeout);
+    match socket_type(token, self.max_listeners, self.max_connections) {
+      Some(SocketType::Listener) => {
+        error!("the listener socket should have no timeout set");
+      },
+      Some(SocketType::FrontClient) => {
+        if self.clients.contains(token) {
+          error!("frontend [{}] got timeout, closing", timeout);
+          self.close_client(event_loop, token);
+        }
+      },
+      Some(SocketType::BackClient) => {
+        if let Some(tok) = self.get_client_token(token) {
+          error!("backend [{}] got timeout, closing", timeout);
+          self.close_client(event_loop, tok);
+        }
+      }
+      None => {}
+    }
   }
 
   fn interrupted(&mut self, event_loop: &mut EventLoop<Self>) {

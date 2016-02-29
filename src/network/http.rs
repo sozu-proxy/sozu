@@ -130,6 +130,8 @@ pub struct Client<Front:SocketHandler> {
   backend_token:  Option<Token>,
   back_interest:  EventSet,
   front_interest: EventSet,
+  front_timeout:  Option<Timeout>,
+  back_timeout:   Option<Timeout>,
   status:         ConnectionStatus,
   rx_count:       usize,
   tx_count:       usize,
@@ -152,6 +154,8 @@ impl<Front:SocketHandler> Client<Front> {
       backend_token:  None,
       back_interest:  EventSet::all(),
       front_interest: EventSet::all(),
+      front_timeout:  None,
+      back_timeout:   None,
       status:         ConnectionStatus::ClientConnected,
       rx_count:       0,
       tx_count:       0,
@@ -194,6 +198,22 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
   fn back_token(&self)   -> Option<Token> {
     self.backend_token
+  }
+
+  fn front_timeout(&mut self) -> Option<Timeout> {
+    self.front_timeout.take()
+  }
+
+  fn back_timeout(&mut self) -> Option<Timeout> {
+    self.back_timeout.take()
+  }
+
+  fn set_front_timeout(&mut self, timeout: Timeout) {
+    self.front_timeout = Some(timeout)
+  }
+
+  fn set_back_timeout(&mut self, timeout: Timeout) {
+    self.back_timeout = Some(timeout)
   }
 
   fn set_back_socket(&mut self, socket: TcpStream) {

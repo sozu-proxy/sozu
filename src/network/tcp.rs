@@ -42,6 +42,8 @@ pub struct Client {
   accept_token:   Token,
   back_interest:  EventSet,
   front_interest: EventSet,
+  front_timeout:  Option<Timeout>,
+  back_timeout:   Option<Timeout>,
   status:         ConnectionStatus,
   rx_count:       usize,
   tx_count:       usize
@@ -60,6 +62,8 @@ pub struct Client {
   accept_token:   Token,
   back_interest:  EventSet,
   front_interest: EventSet,
+  front_timeout:  Option<Timeout>,
+  back_timeout:   Option<Timeout>,
   status:         ConnectionStatus,
   rx_count:       usize,
   tx_count:       usize
@@ -78,6 +82,8 @@ impl Client {
       accept_token:   accept_token,
       back_interest:  EventSet::all(),
       front_interest: EventSet::all(),
+      front_timeout:  None,
+      back_timeout:   None,
       status:         ConnectionStatus::Connected,
       rx_count:       0,
       tx_count:       0
@@ -102,6 +108,8 @@ impl Client {
         accept_token:   accept_token,
         back_interest:  EventSet::all(),
         front_interest: EventSet::all(),
+        front_timeout:  None,
+        back_timeout:   None,
         status:         ConnectionStatus::Initial,
         tx_count:       0,
         rx_count:       0
@@ -234,6 +242,22 @@ impl ProxyClient for Client {
   fn set_tokens(&mut self, token: Token, backend: Token) {
     self.token         = Some(token);
     self.backend_token = Some(backend);
+  }
+
+  fn front_timeout(&mut self) -> Option<Timeout> {
+    self.front_timeout.take()
+  }
+
+  fn back_timeout(&mut self) -> Option<Timeout> {
+    self.back_timeout.take()
+  }
+
+  fn set_front_timeout(&mut self, timeout: Timeout) {
+    self.front_timeout = Some(timeout)
+  }
+
+  fn set_back_timeout(&mut self, timeout: Timeout) {
+    self.back_timeout = Some(timeout)
   }
 
   fn remove_backend(&mut self) {
