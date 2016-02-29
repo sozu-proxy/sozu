@@ -48,7 +48,7 @@ pub struct HttpProxy {
 
 impl HttpProxy {
   pub fn readable(&mut self) -> ClientResult {
-    debug!("front buffer({} bytes):\n{}", self.front_buf.data().len(), self.front_buf.data().to_hex(8));
+    trace!("front buffer({} bytes):\n{}", self.front_buf.data().len(), self.front_buf.data().to_hex(8));
     if ! self.state.is_front_proxying() {
       self.state = parse_request_until_stop(&self.state, &mut self.front_buf);
       debug!("parse_request_until_stop returned {:?} => advance: {}", self.state, self.state.req_position);
@@ -93,7 +93,7 @@ impl HttpProxy {
     self.back_buf.fill(sz);
     self.res_size = self.res_size + sz;
 
-    debug!("back buffer ({} bytes):\n{}", self.back_buf.data().len(), self.back_buf.data().to_hex(8));
+    trace!("back buffer ({} bytes):\n{}", self.back_buf.data().len(), self.back_buf.data().to_hex(8));
     if ! self.state.is_back_proxying() {
       self.state = parse_response_until_stop(&self.state, &mut self.back_buf);
       debug!("parse_response_until_stop returned {:?} => advance: {}", self.state, self.state.res_position);
