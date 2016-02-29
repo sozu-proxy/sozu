@@ -170,7 +170,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_request(&self, host: &str, uri: &str) -> Option<SocketAddr> {
+  pub fn backend_from_request(&self, client: &mut Client<NonblockingSslStream<TcpStream>>, host: &str, uri: &str) -> Option<SocketAddr> {
     trace!("looking for backend for host: {}", host);
     let real_host = if let Some(h) = host.split(":").next() {
       h
@@ -180,6 +180,7 @@ impl ServerConfiguration {
     trace!("looking for backend for real host: {}", host);
 
     if let Some(tls_front) = self.frontend_from_request(real_host, uri) {
+      client.set_status(ConnectionStatus::HasHost);
       // ToDo round-robin on instances
       if let Some(app_instances) = self.instances.get(&tls_front.app_id) {
         let rnd = random::<usize>();
@@ -187,9 +188,11 @@ impl ServerConfiguration {
         info!("Connecting {} -> {:?}", host, app_instances.get(idx));
         app_instances.get(idx).map(|& addr| addr)
       } else {
+        client.set_status(ConnectionStatus::Send503(0));
         None
       }
     } else {
+      client.set_status(ConnectionStatus::Send404(0));
       None
     }
   }
@@ -249,21 +252,29 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
   }
 
   fn connect_to_backend(&mut self, client: &mut Client<NonblockingSslStream<TcpStream>>) -> Result<TcpStream,ConnectionError> {
+    // FIXME: should check the host corresponds to SNI here
     let host   = try!(client.http_state().state.get_host().ok_or(ConnectionError::NoHostGiven));
     let rl     = try!(client.http_state().state.get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
     let conn   = try!(client.http_state().state.get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
-    let back   = try!(self.backend_from_request(&host, &rl.uri).ok_or(ConnectionError::HostNotFound));
-    let socket = try!(TcpStream::connect(&back).map_err(|_| ConnectionError::ToBeDefined));
+    let back   = try!(self.backend_from_request(client, &host, &rl.uri).ok_or(ConnectionError::HostNotFound));
+    //let socket = try!(TcpStream::connect(&back).map_err(|_| ConnectionError::ToBeDefined));
 
-    client.http_state().state = HttpState {
-      req_position: client.http_state().state.req_position,
-      res_position: 0,
-      request:  RequestState::Proxying(rl, conn, host),
-      response: ResponseState::Initial
-    };
-    client.set_status(ConnectionStatus::Connected);
+    if let Ok(socket) = TcpStream::connect(&back) {
+      client.set_status(ConnectionStatus::ProxyingFrontBack);
 
-    Ok(socket)
+      client.http_state().state = HttpState {
+        req_position: client.http_state().state.req_position,
+        res_position: 0,
+        request:  RequestState::Proxying(rl, conn, host),
+        response: ResponseState::Initial
+      };
+      //client.set_status(ConnectionStatus::Connected);
+
+      Ok(socket)
+    } else {
+      client.set_status(ConnectionStatus::Send503(0));
+      Err(ConnectionError::ToBeDefined)
+    }
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<TlsServer>, message: ProxyOrder) {

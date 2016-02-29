@@ -31,10 +31,16 @@ type BackendToken = Token;
 pub enum ConnectionStatus {
   Initial,
   ClientConnected,
-  Connected,
+  HasHost,
+  ProxyingFrontBack,
+  BackResponseValidated,
+  ProxyingBackFront,
+  End,
   ClientClosed,
   ServerClosed,
-  Closed
+  Closed,
+  Send404(usize),
+  Send503(usize),
 }
 
 pub struct HttpProxy {
@@ -441,8 +447,9 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_request(&self, host: &str, uri: &str) -> Option<SocketAddr> {
+  pub fn backend_from_request(&self, client: &mut Client<TcpStream>, host: &str, uri: &str) -> Option<SocketAddr> {
     if let Some(http_front) = self.frontend_from_request(host, uri) {
+      client.status = ConnectionStatus::HasHost;
       // ToDo round-robin on instances
       if let Some(app_instances) = self.instances.get(&http_front.app_id) {
         let rnd = random::<usize>();
@@ -450,9 +457,11 @@ impl ServerConfiguration {
         debug!("Connecting {} -> {:?}", host, app_instances.get(idx));
         app_instances.get(idx).map(|& addr| addr)
       } else {
+        client.status = ConnectionStatus::Send503(0);
         None
       }
     } else {
+      client.status = ConnectionStatus::Send404(0);
       None
     }
   }
@@ -491,12 +500,21 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
   fn connect_to_backend(&mut self, client: &mut Client<TcpStream>) -> Result<TcpStream,ConnectionError> {
       let host   = try!(client.http_state.state.get_host().ok_or(ConnectionError::NoHostGiven));
       let rl     = try!(client.http_state.state.get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-      let back   = try!(self.backend_from_request(&host, &rl.uri).ok_or(ConnectionError::HostNotFound));
-      let socket = try!(TcpStream::connect(&back).map_err(|_| ConnectionError::ToBeDefined));
+      let back   = try!(self.backend_from_request(client, &host, &rl.uri).ok_or(ConnectionError::HostNotFound));
+      let conn   = TcpStream::connect(&back);
 
-      client.status = ConnectionStatus::Connected;
+      if let Ok(socket) = conn {
+        client.status = ConnectionStatus::ProxyingFrontBack;
+        Ok(socket)
+      } else {
+        client.status = ConnectionStatus::Send503(0);
+        Err(ConnectionError::ToBeDefined)
+      }
+      /*let socket = try!(TcpStream::connect(&back).map_err(|_| ConnectionError::ToBeDefined));
 
-      Ok(socket)
+      client.status = ConnectionStatus::ProxyingFrontBack;
+
+      Ok(socket)*/
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<HttpServer>, message: ProxyOrder) {
