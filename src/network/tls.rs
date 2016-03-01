@@ -265,7 +265,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
       client.http_state().state = HttpState {
         req_position: client.http_state().state.req_position,
         res_position: 0,
-        request:  RequestState::Proxying(rl, conn, host),
+        request:  client.http_state().state.request,
         response: ResponseState::Initial
       };
       //client.set_status(ConnectionStatus::Connected);
