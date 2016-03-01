@@ -482,7 +482,7 @@ pub enum RequestState {
   HasLength(RRequestLine, Connection, LengthInformation),
   HasHostAndLength(RRequestLine, Connection, Host, LengthInformation),
   Request(RRequestLine, Connection, Host),
-  RequestWithBody(RRequestLine, Connection, Host, LengthInformation),
+  RequestWithBody(RRequestLine, Connection, Host, usize),
   RequestWithBodyChunks(RRequestLine, Connection, Host, Chunk),
 }
 
@@ -553,9 +553,9 @@ impl RequestState {
 
   pub fn should_copy(&self, position: usize) -> Option<usize> {
     match *self {
-      RequestState::RequestWithBody(_, _, _, LengthInformation::Length(l)) => Some(position + l),
-      RequestState::Request(_, _, _)                                       => Some(position),
-      _                                                                    => None
+      RequestState::RequestWithBody(_, _, _, l) => Some(position + l),
+      RequestState::Request(_, _, _)            => Some(position),
+      _                                         => None
     }
   }
 
@@ -583,7 +583,7 @@ pub enum ResponseState {
   HasStatusLine(RStatusLine, Connection),
   HasLength(RStatusLine, Connection, LengthInformation),
   Response(RStatusLine, Connection),
-  ResponseWithBody(RStatusLine, Connection, LengthInformation),
+  ResponseWithBody(RStatusLine, Connection, usize),
   ResponseWithBodyChunks(RStatusLine, Connection, Chunk),
 }
 
@@ -619,9 +619,9 @@ impl ResponseState {
 
   pub fn should_copy(&self, position: usize) -> Option<usize> {
     match *self {
-      ResponseState::ResponseWithBody(_, _, LengthInformation::Length(l)) => Some(position + l),
-      ResponseState::Response(_, _)                                       => Some(position),
-      _                                                                   => None
+      ResponseState::ResponseWithBody(_, _, l) => Some(position + l),
+      ResponseState::Response(_, _)            => Some(position),
+      _                                        => None
     }
   }
 
@@ -634,7 +634,7 @@ impl ResponseState {
   }
 
   pub fn should_chunk(&self) -> bool {
-    if let  ResponseState::ResponseWithBody(_, _, LengthInformation::Chunked) = *self {
+    if let  ResponseState::ResponseWithBodyChunks(_, _, _) = *self {
       true
     } else {
       false
@@ -903,7 +903,7 @@ pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestSt
               debug!("headers parsed, stopping");
                 match l {
                   &LengthInformation::Chunked    => (BufferMove::Advance(buf.offset(i)), RequestState::RequestWithBodyChunks(rl.clone(), conn.clone(), h.clone(), Chunk::Initial.clone())),
-                  &LengthInformation::Length(sz) => (BufferMove::Advance(buf.offset(i) + sz), RequestState::RequestWithBody(rl.clone(), conn.clone(), h.clone(), l.clone())),
+                  &LengthInformation::Length(sz) => (BufferMove::Advance(buf.offset(i) + sz), RequestState::RequestWithBody(rl.clone(), conn.clone(), h.clone(), sz)),
                 }
             },
             res => {
@@ -1033,7 +1033,7 @@ pub fn parse_response(state: &ResponseState, buf: &[u8]) -> (BufferMove, Respons
               debug!("headers parsed, stopping");
                 match length {
                   &LengthInformation::Chunked    => (BufferMove::Advance(buf.offset(i)), ResponseState::ResponseWithBodyChunks(sl.clone(), conn.clone(), Chunk::Initial)),
-                  &LengthInformation::Length(sz) => (BufferMove::Advance(buf.offset(i) + sz), ResponseState::ResponseWithBody(sl.clone(), conn.clone(), length.clone())),
+                  &LengthInformation::Length(sz) => (BufferMove::Advance(buf.offset(i) + sz), ResponseState::ResponseWithBody(sl.clone(), conn.clone(), sz)),
                 }
             },
             res => {
@@ -1280,7 +1280,7 @@ mod tests {
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
-            LengthInformation::Length(200)
+            200
           ),
           response: ResponseState::Initial
         }
@@ -1326,7 +1326,7 @@ mod tests {
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
-            LengthInformation::Length(200)
+            200
           ),
           response: ResponseState::Initial
         }
