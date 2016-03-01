@@ -21,9 +21,7 @@ version = "0.4"
 
 [dependencies.openssl]
 version = "~0.7.0"
-#features = ["tlsv1_2", "tlsv1_1", "sslv3"]
-features = ["tlsv1_2", "tlsv1_1", "sslv3"]
-#git = "https://github.com/Geal/rust-openssl"
+features = ["tlsv1_2", "tlsv1_1"]
 
 [features]
 default = []
