@@ -484,8 +484,6 @@ pub enum RequestState {
   Request(RRequestLine, Connection, Host),
   RequestWithBody(RRequestLine, Connection, Host, LengthInformation),
   RequestWithBodyChunks(RRequestLine, Connection, Host, Chunk),
-  Proxying(RRequestLine, Connection, Host)
-  //Proxying(RRequestLine, Host, LengthInformation, BackendToken)
 }
 
 impl RequestState {
@@ -494,18 +492,17 @@ impl RequestState {
       RequestState::HasHost(_, _, _)            |
       RequestState::Request(_, _, _)            |
       RequestState::RequestWithBody(_, _, _, _) |
-      RequestState::RequestWithBodyChunks(_, _, _, _) |
-      RequestState::Proxying(_, _, _)           => true,
-      _                                      => false
+      RequestState::RequestWithBodyChunks(_, _, _, _) => true
+      _                                               => false
     }
   }
 
   pub fn is_proxying(&self) -> bool {
     match *self {
-      RequestState::Request(_, _, _) |
+      RequestState::Request(_, _, _)            |
       RequestState::RequestWithBody(_, _, _, _) |
       RequestState::RequestWithBodyChunks(_, _, _, _)  => true,
-      _                                                                          => false
+      _                                                => false
     }
   }
 
@@ -514,9 +511,8 @@ impl RequestState {
       RequestState::HasHost(_, _, ref host)            |
       RequestState::Request(_, _, ref host)            |
       RequestState::RequestWithBody(_, _, ref host, _) |
-      RequestState::RequestWithBodyChunks(_, _, ref host, _) |
-      RequestState::Proxying(_, _, ref host)    => Some(host.clone()),
-      _                                      => None
+      RequestState::RequestWithBodyChunks(_, _, ref host, _) => Some(host.clone()),
+      _                                                      => None
     }
   }
 
@@ -526,9 +522,8 @@ impl RequestState {
       RequestState::HasHost(ref rl, _, _)            |
       RequestState::Request(ref rl , _, _)           |
       RequestState::RequestWithBody(ref rl, _, _, _) |
-      RequestState::RequestWithBodyChunks(ref rl, _, _, _) |
-      RequestState::Proxying(ref rl, _, _)           => Some(rl.uri.clone()),
-      _                                           => None
+      RequestState::RequestWithBodyChunks(ref rl, _, _, _) => Some(rl.uri.clone()),
+      _                                                    => None
     }
   }
 
@@ -538,9 +533,8 @@ impl RequestState {
       RequestState::HasHost(ref rl, _, _)            |
       RequestState::Request(ref rl, _, _)            |
       RequestState::RequestWithBody(ref rl, _, _, _) |
-      RequestState::RequestWithBodyChunks(ref rl, _, _, _) |
-      RequestState::Proxying(ref rl, _, _)           => Some(rl.clone()),
-      _                                           => None
+      RequestState::RequestWithBodyChunks(ref rl, _, _, _) => Some(rl.clone()),
+      _                                                    => None
     }
   }
 
@@ -552,9 +546,8 @@ impl RequestState {
       RequestState::HasHostAndLength(_, ref conn, _, _) |
       RequestState::Request(_, ref conn, _)             |
       RequestState::RequestWithBody(_, ref conn, _, _)  |
-      RequestState::RequestWithBodyChunks(_, ref conn, _, _)  |
-      RequestState::Proxying(_, ref conn, _)            => Some(conn.clone()),
-      _                                              => None
+      RequestState::RequestWithBodyChunks(_, ref conn, _, _) => Some(conn.clone()),
+      _                                                      => None
     }
   }
 
@@ -592,8 +585,6 @@ pub enum ResponseState {
   Response(RStatusLine, Connection),
   ResponseWithBody(RStatusLine, Connection, LengthInformation),
   ResponseWithBodyChunks(RStatusLine, Connection, Chunk),
-  Proxying(RStatusLine, Connection)
-  //Proxying(RRequestLine, Host, LengthInformation, BackendToken)
 }
 
 impl ResponseState {
@@ -610,9 +601,8 @@ impl ResponseState {
       ResponseState::HasLength(ref sl, _, _)              |
       ResponseState::Response(ref sl, _)                  |
       ResponseState::ResponseWithBody(ref sl, _, _)       |
-      ResponseState::ResponseWithBodyChunks(ref sl, _, _) |
-      ResponseState::Proxying(ref sl, _)            => Some(sl.clone()),
-      _                                             => None
+      ResponseState::ResponseWithBodyChunks(ref sl, _, _) => Some(sl.clone()),
+      _                                                   => None
     }
   }
 
@@ -622,9 +612,8 @@ impl ResponseState {
       ResponseState::HasLength(_, ref conn, _)              |
       ResponseState::Response(_, ref conn)                  |
       ResponseState::ResponseWithBody(_, ref conn, _)       |
-      ResponseState::ResponseWithBodyChunks(_, ref conn, _) |
-      ResponseState::Proxying(_, ref conn)            => Some(conn.clone()),
-      _                                               => None
+      ResponseState::ResponseWithBodyChunks(_, ref conn, _) => Some(conn.clone()),
+      _                                                     => None
     }
   }
 
@@ -824,7 +813,6 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
         RequestState::HasHostAndLength(rl, _, host, length) => RequestState::HasHostAndLength(rl, conn, host, length),
         RequestState::Request(rl, _, host)                  => RequestState::Request(rl, conn, host),
         RequestState::RequestWithBody(rl, _, host, length)  => RequestState::RequestWithBody(rl, conn, host, length),
-        RequestState::Proxying(rl, _, host)                 => RequestState::Proxying(rl, conn, host),
         _                                                => RequestState::Error(ErrorState::InvalidHttp)
       }
     },
