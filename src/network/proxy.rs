@@ -215,7 +215,6 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         Some(SocketType::FrontClient) => {
           if self.clients.contains(token) {
             let order = self.clients[token].readable();
-            self.interpret_client_order(event_loop, token, order);
 
             // FIXME: should clear the timeout only if data was consumed
             if let Some(timeout) = self.clients[token].front_timeout() {
@@ -226,6 +225,8 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
               //println!("[{}] resetting timeout", token.as_usize());
               &self.clients[token].set_front_timeout(timeout);
             }
+
+            self.interpret_client_order(event_loop, token, order);
           } else {
             info!("client {:?} was removed", token);
           }
@@ -234,7 +235,6 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         Some(SocketType::BackClient) => {
           if let Some(tok) = self.get_client_token(token) {
             let order = self.clients[tok].back_readable();
-            self.interpret_client_order(event_loop, tok, order);
 
             // FIXME: should clear the timeout only if data was consumed
             if let Some(timeout) = self.clients[tok].back_timeout() {
@@ -245,6 +245,8 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
               //println!("[{}] resetting timeout", token.as_usize());
               &self.clients[tok].set_back_timeout(timeout);
             }
+
+            self.interpret_client_order(event_loop, tok, order);
           }
         }
 
