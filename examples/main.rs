@@ -5,7 +5,7 @@ extern crate yxorp;
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
 use yxorp::network;
-use yxorp::messages::{self,Topic};
+use yxorp::messages;
 use yxorp::network::metrics::{METRICS,ProxyMetrics};
 
 fn main() {

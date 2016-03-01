@@ -458,7 +458,7 @@ mod tests {
     let contexts = HashMap::new();
     let rc_ctx = Rc::new(RefCell::new(contexts));
 
-    let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
+    let context = SslContext::new(SslMethod::Tlsv1).unwrap();
     let (tx,rx) = channel::<ServerMessage>();
 
     let server_config = ServerConfiguration {
