@@ -1669,10 +1669,10 @@ mod tests {
       let initial = HttpState::new();
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..125]);
-      println!("parsing\n{}", &input[..125].to_hex(8));
+      println!("parsing\n{}", buf.data().to_hex(8));
 
       let result = parse_request_until_stop(&initial, &mut buf);
-      println!("result: {:?}", result);
+      println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
         HttpState {
@@ -1687,11 +1687,13 @@ mod tests {
           response: ResponseState::Initial
         }
       );
-      buf.write(&input[125..140]);
-      println!("parsing\n{}", &input[125..140].to_hex(8));
 
-      let result = parse_request_until_stop(&initial, &mut buf);
-      println!("result: {:?}", result);
+      buf.consume(124);
+      buf.write(&input[125..140]);
+      println!("parsing\n{}", buf.data().to_hex(8));
+
+      let result = parse_request_until_stop(&result, &mut buf);
+      println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
         HttpState {
@@ -1707,10 +1709,12 @@ mod tests {
         }
       );
 
-      buf.write(&input[140..]);
-      println!("parsing\n{}", &input[140..].to_hex(8));
-      let result = parse_request_until_stop(&initial, &mut buf);
-      println!("result: {:?}", result);
+      let len = buf.data().len();
+      buf.consume(len);
+      buf.write(&input[153..]);
+      println!("parsing\n{}", buf.data().to_hex(8));
+      let result = parse_request_until_stop(&result, &mut buf);
+      println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
         HttpState {
@@ -1746,10 +1750,10 @@ mod tests {
       let initial = HttpState::new();
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..78]);
-      println!("parsing\n{}", &input[..78].to_hex(8));
+      println!("parsing\n{}", buf.data().to_hex(8));
 
       let result = parse_response_until_stop(&initial, &mut buf);
-      println!("result: {:?}", result);
+      println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
         HttpState {
@@ -1763,11 +1767,13 @@ mod tests {
           ),
         }
       );
-      buf.write(&input[78..100]);
-      println!("parsing\n{}", &input[78..100].to_hex(8));
 
-      let result = parse_response_until_stop(&initial, &mut buf);
-      println!("result: {:?}", result);
+      buf.consume(78);
+      buf.write(&input[81..100]);
+      println!("parsing\n{}", buf.data().to_hex(8));
+
+      let result = parse_response_until_stop(&result, &mut buf);
+      println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
         HttpState {
@@ -1782,10 +1788,12 @@ mod tests {
         }
       );
 
-      buf.write(&input[100..116]);
-      println!("parsing\n{}", &input[100..116].to_hex(8));
-      let result = parse_response_until_stop(&initial, &mut buf);
-      println!("result: {:?}", result);
+      buf.consume(19);
+      println!("remaining:\n{}", &input[110..].to_hex(8));
+      buf.write(&input[110..116]);
+      println!("parsing\n{}", buf.data().to_hex(8));
+      let result = parse_response_until_stop(&result, &mut buf);
+      println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
         HttpState {
@@ -1800,10 +1808,11 @@ mod tests {
         }
       );
 
+      buf.consume(5);
       buf.write(&input[116..]);
-      println!("parsing\n{}", &input[116..].to_hex(8));
-      let result = parse_response_until_stop(&initial, &mut buf);
-      println!("result: {:?}", result);
+      println!("parsing\n{}", buf.data().to_hex(8));
+      let result = parse_response_until_stop(&result, &mut buf);
+      println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
         HttpState {
