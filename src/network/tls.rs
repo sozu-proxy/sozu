@@ -262,10 +262,12 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
     if let Ok(socket) = TcpStream::connect(&back) {
       client.set_status(ConnectionStatus::ProxyingFrontBack);
 
+      let position  = client.http_state().state.req_position;
+      let req_state = client.http_state().state.request.clone();
       client.http_state().state = HttpState {
-        req_position: client.http_state().state.req_position,
+        req_position: position,
         res_position: 0,
-        request:  client.http_state().state.request,
+        request:  req_state,
         response: ResponseState::Initial
       };
       //client.set_status(ConnectionStatus::Connected);
