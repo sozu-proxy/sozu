@@ -492,7 +492,7 @@ impl RequestState {
       RequestState::HasHost(_, _, _)            |
       RequestState::Request(_, _, _)            |
       RequestState::RequestWithBody(_, _, _, _) |
-      RequestState::RequestWithBodyChunks(_, _, _, _) => true
+      RequestState::RequestWithBodyChunks(_, _, _, _) => true,
       _                                               => false
     }
   }
