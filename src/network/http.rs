@@ -15,13 +15,13 @@ use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
 use time::{Duration, precise_time_s, precise_time_ns};
 use rand::random;
-use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
+use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder,RequiredEvents};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use network::metrics::{ProxyMetrics,METRICS};
 use network::buffer::Buffer;
 use network::socket::{SocketHandler,SocketResult};
 
-use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop, BufferMove};
+use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop, BufferMove, RequestState, ResponseState, Chunk};
 use nom::HexDisplay;
 
 use messages::{Command,HttpFront};
@@ -33,8 +33,12 @@ pub enum ConnectionStatus {
   ClientConnected,
   HasHost,
   ProxyingFrontBack,
+  //ProxyingFrontBack(usize),
+  //ProxyingFrontBackChunk(usize),
   BackResponseValidated,
   ProxyingBackFront,
+  //ProxyingBackFront(usize),
+  //ProxyingBackFrontChunk(usize),
   End,
   ClientClosed,
   ServerClosed,
@@ -44,81 +48,28 @@ pub enum ConnectionStatus {
 }
 
 pub struct HttpProxy {
-  pub state:             HttpState,
-  pub front_buf:         Buffer,
-  pub back_buf:          Buffer,
-  pub start:             u64,
-  pub req_size:          usize,
-  pub res_size:          usize,
+  pub state:              HttpState,
+  pub front_buf:          Buffer,
+  pub back_buf:           Buffer,
+  pub front_buf_position: usize,
+  pub back_buf_position:  usize,
+  pub start:              u64,
+  pub req_size:           usize,
+  pub res_size:           usize,
 }
 
 impl HttpProxy {
-  pub fn readable(&mut self) -> ClientResult {
-    trace!("front buffer({} bytes):\n{}", self.front_buf.data().len(), self.front_buf.data().to_hex(8));
-    if ! self.state.is_front_proxying() {
-      self.state = parse_request_until_stop(&self.state, &mut self.front_buf);
-      debug!("parse_request_until_stop returned {:?} => advance: {}", self.state, self.state.req_position);
-      if self.state.is_front_error() {
-        METRICS.lock().unwrap().time("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
-        return ClientResult::CloseClient;
-      }
-      if self.state.has_host() {
-        return ClientResult::ConnectBackend;
-      }
-    } else {
-      debug!("state: {:?}", self.state);
-    }
-    ClientResult::Continue
-  }
-
-  pub fn writable(&mut self, copied: usize) -> ClientResult {
-    self.back_buf.consume(copied);
-    self.state.back_copied(copied);
-
-    // The response ended, so we can close the connection, or accept a new request
-    // FIXME: with Server Side Events, new responses can come
-    if self.state.is_back_proxying() && self.state.res_position == 0 {
-      let sh = (self.state.front_should_keep_alive(), self.state.back_should_keep_alive());
-      trace!("RESPONSE ENDED, SHOULD WE KEEP ALIVE? {:?}", sh);
-      let res = match sh {
-        (true, true)  => ClientResult::Continue,     // just reset
-        (true, false) => ClientResult::CloseBackend,
-        (false, _)    => ClientResult::CloseBothSuccess,    // no connection pooling yet
-      };
-      METRICS.lock().unwrap().time("http_proxy.success", (precise_time_ns() - self.start) / 1000);
-      METRICS.lock().unwrap().gauge("http_proxy.request_size", self.req_size as u64);
-      METRICS.lock().unwrap().gauge("http_proxy.response_size", self.res_size as u64);
-      self.state.reset();
-      res
-    } else {
-      ClientResult::Continue
-    }
-  }
-
-  pub fn back_readable(&mut self, sz: usize) -> ClientResult {
-    self.back_buf.fill(sz);
-    self.res_size = self.res_size + sz;
-
-    trace!("back buffer ({} bytes):\n{}", self.back_buf.data().len(), self.back_buf.data().to_hex(8));
-    if ! self.state.is_back_proxying() {
-      self.state = parse_response_until_stop(&self.state, &mut self.back_buf);
-      debug!("parse_response_until_stop returned {:?} => advance: {}", self.state, self.state.res_position);
-      if self.state.is_back_error() {
-        METRICS.lock().unwrap().time("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
-        return ClientResult::CloseBackend;
-      }
-    }
-    ClientResult::Continue
-  }
-
-  pub fn back_writable(&mut self, copied: usize) -> ClientResult {
-    self.front_buf.consume(copied);
-    self.state.front_copied(copied);
-
-    ClientResult::Continue
+  pub fn reset(&mut self) {
+    //println!("RESET");
+    self.state.reset();
+    self.front_buf_position = 0;
+    self.back_buf_position = 0;
+    self.front_buf.reset();
+    self.back_buf.reset();
   }
 
   pub fn front_to_copy(&self) -> usize {
+    //FIXME: req_position is from the beginning, but buffer available data may shift
     min(self.front_buf.available_data(), self.state.req_position)
   }
 
@@ -147,12 +98,14 @@ impl<Front:SocketHandler> Client<Front> {
       frontend:       sock,
       backend:        None,
       http_state:     HttpProxy {
-        state:             HttpState::new(),
-        front_buf:         Buffer::with_capacity(12000),
-        back_buf:          Buffer::with_capacity(12000),
-        start:             precise_time_ns(),
-        req_size:          0,
-        res_size:          0,
+        state:              HttpState::new(),
+        front_buf:          Buffer::with_capacity(12000),
+        back_buf:           Buffer::with_capacity(12000),
+        front_buf_position: 0,
+        back_buf_position:  0,
+        start:              precise_time_ns(),
+        req_size:           0,
+        res_size:           0,
       },
       token:          None,
       backend_token:  None,
@@ -264,97 +217,241 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   }
 
   // Read content from the client
-  fn readable(&mut self) -> ClientResult {
+  fn readable(&mut self) -> (RequiredEvents,ClientResult) {
+   trace!("readable REQ pos: {}, buf pos: {}, available: {}", self.http_state.state.req_position, self.http_state.front_buf_position, self.http_state.front_buf.available_data());
+    assert!(!self.http_state.state.is_front_error());
+
+    let has_host = self.http_state.state.has_host();
     let (sz, res) = self.frontend.socket_read(self.http_state.front_buf.space());
     debug!("FRONT [{:?}]: read {} bytes", self.token, sz);
     self.http_state.front_buf.fill(sz);
     match res {
-      SocketResult::Error => ClientResult::CloseClient,
+      SocketResult::Error => return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient),
       _                   => {
-        if sz > 0 {
-        self.http_state.readable()
+        if !has_host {
+          self.http_state.state = parse_request_until_stop(&self.http_state.state, &mut self.http_state.front_buf, 0);
+          debug!("parse_request_until_stop returned {:?} => advance: {}", self.http_state.state, self.http_state.state.req_position);
+          if self.http_state.state.is_front_error() {
+            METRICS.lock().unwrap().time("http_proxy.failure", (precise_time_ns() - self.http_state.start) / 1000);
+            return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+          }
+
+          if self.http_state.state.has_host() {
+            return (RequiredEvents::FrontReadBackWrite, ClientResult::ConnectBackend)
+          } else {
+            return (RequiredEvents::FrontReadBackNone, ClientResult::Continue)
+          }
         } else {
-          ClientResult::Continue
+          match self.http_state.state.request {
+            RequestState::Request(_,_,_) | RequestState::RequestWithBody(_,_,_,_) => {
+              //FIXME: should only read as much data as needed (ie not further than req_position)
+              if self.http_state.front_buf_position + self.http_state.front_buf.available_data() >= self.http_state.state.req_position {
+                return  (RequiredEvents::FrontNoneBackWrite, ClientResult::Continue)
+              } else {
+                return  (RequiredEvents::FrontReadBackWrite, ClientResult::Continue)
+              }
+            },
+            RequestState::RequestWithBodyChunks(_,_,_,ch) => {
+              if ch == Chunk::Ended {
+                panic!("front read should have stopped on chunk ended");
+                return (RequiredEvents::FrontNoneBackWrite, ClientResult::Continue);
+              } else if ch == Chunk::Error {
+                panic!("front read should have stopped on chunk error");
+                return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+              } else {
+                if self.http_state.front_buf_position + self.http_state.front_buf.available_data() >= self.http_state.state.req_position {
+                  let next_start: usize = self.http_state.state.req_position - self.http_state.front_buf_position;
+                  self.http_state.state = parse_request_until_stop(&self.http_state.state, &mut self.http_state.front_buf, next_start);
+                  debug!("parse_request_until_stop returned {:?} => advance: {}", self.http_state.state, self.http_state.state.req_position);
+                  if self.http_state.state.is_front_error() {
+                    METRICS.lock().unwrap().time("http_proxy.failure", (precise_time_ns() - self.http_state.start) / 1000);
+                    return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+                  }
+
+                  if let RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended) = self.http_state.state.request {
+                    return (RequiredEvents::FrontNoneBackWrite, ClientResult::Continue);
+                  } else {
+                    return (RequiredEvents::FrontReadBackWrite, ClientResult::Continue);
+                  }
+                } else {
+                  return (RequiredEvents::FrontReadBackWrite, ClientResult::Continue);
+                }
+              }
+            },
+            _ => {
+              let next_start: usize = self.http_state.state.req_position - self.http_state.front_buf_position;
+              self.http_state.state = parse_request_until_stop(&self.http_state.state, &mut self.http_state.front_buf, next_start);
+              debug!("parse_request_until_stop returned {:?} => advance: {}", self.http_state.state, self.http_state.state.req_position);
+              if self.http_state.state.is_front_error() {
+                METRICS.lock().unwrap().time("http_proxy.failure", (precise_time_ns() - self.http_state.start) / 1000);
+                return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+              }
+
+              if let RequestState::Request(_,_,_) = self.http_state.state.request {
+                return (RequiredEvents::FrontNoneBackWrite, ClientResult::Continue);
+              } else {
+                return (RequiredEvents::FrontReadBackWrite, ClientResult::Continue);
+              }
+            }
+          }
         }
       }
     }
   }
 
   // Forward content to client
-  fn writable(&mut self) -> ClientResult {
+  fn writable(&mut self) -> (RequiredEvents, ClientResult) {
+    trace!("writable RES pos: {}, buf pos: {}, available: {}", self.http_state.state.res_position, self.http_state.back_buf_position, self.http_state.back_buf.available_data());
+    assert!(self.http_state.back_buf_position + self.http_state.back_buf.available_data() <= self.http_state.state.res_position);
     if self.http_state.back_buf.available_data() == 0 {
-      return ClientResult::Continue;
+      return (RequiredEvents::FrontNoneBackRead, ClientResult::Continue);
     }
 
-    let (sz, res) = self.frontend.socket_write(&(self.http_state.back_buf.data())[..self.http_state.back_to_copy()]);
+    let to_copy = min(self.http_state.state.res_position - self.http_state.back_buf_position, self.http_state.back_buf.available_data());
+    let (sz, res) = self.frontend.socket_write(&(self.http_state.back_buf.data())[..to_copy]);
+    self.http_state.back_buf.consume(sz);
+    self.http_state.back_buf_position += sz;
     if let Some((front,back)) = self.tokens() {
       debug!("FRONT [{}<-{}]: wrote {} bytes", front.as_usize(), back.as_usize(), sz);
     }
-    self.tx_count = self.tx_count + sz;
     match res {
-      SocketResult::Error => ClientResult::CloseClient,
+      SocketResult::Error => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient),
       _                   => {
-        if sz > 0 {
-        self.http_state.writable(sz)
+        if self.http_state.back_buf_position == self.http_state.state.res_position {
+          match self.http_state.state.response {
+            ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended) => {
+              self.http_state.reset();
+              (RequiredEvents::FrontReadBackNone, ClientResult::Continue)
+            },
+            ResponseState::ResponseWithBodyChunks(_,_,_) => (RequiredEvents::FrontReadBackNone, ClientResult::Continue),
+            ResponseState::ResponseWithBody(_,_,_)       => {
+              self.http_state.reset();
+              (RequiredEvents::FrontReadBackNone, ClientResult::Continue)
+            },
+            ResponseState::Response(_,_) => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
+            _ => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure)
+          }
         } else {
-          ClientResult::Continue
+          (RequiredEvents::FrontWriteBackRead, ClientResult::Continue)
         }
       }
     }
   }
 
   // Forward content to application
-  fn back_writable(&mut self) -> ClientResult {
+  fn back_writable(&mut self) -> (RequiredEvents, ClientResult) {
+    trace!("back writable REQ pos: {}, buf pos: {}, available: {}", self.http_state.state.req_position, self.http_state.front_buf_position, self.http_state.front_buf.available_data());
+    assert!(self.http_state.front_buf_position + self.http_state.front_buf.available_data() <= self.http_state.state.req_position);
     if self.http_state.front_buf.available_data() == 0 {
-      return ClientResult::Continue;
+      return (RequiredEvents::FrontReadBackNone, ClientResult::Continue);
     }
 
+    let to_copy = min(self.http_state.state.req_position - self.http_state.front_buf_position, self.http_state.front_buf.available_data());
     let tokens = self.tokens().clone();
     let res = if let Some(ref mut sock) = self.backend {
-      let (sz, res) = sock.socket_write(&(self.http_state.front_buf.data())[..self.http_state.front_to_copy()]);
+      let (sz, socket_res) = sock.socket_write(&(self.http_state.front_buf.data())[..to_copy]);
+      self.http_state.front_buf.consume(sz);
+      self.http_state.front_buf_position += sz;
       if let Some((front,back)) = tokens {
         debug!("BACK  [{}->{}]: wrote {} bytes", front.as_usize(), back.as_usize(), sz);
       }
-      match res {
-        SocketResult::Error => ClientResult::CloseBothFailure,
+      match socket_res {
+        SocketResult::Error => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure),
         _                   => {
-          if sz > 0 {
-            self.http_state.back_writable(sz)
+          // FIXME/ should read exactly as much data as needed
+          if self.http_state.front_buf_position >= self.http_state.state.req_position {
+            match self.http_state.state.request {
+              RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended) => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
+              RequestState::RequestWithBodyChunks(_,_,_,_) => (RequiredEvents::FrontReadBackNone, ClientResult::Continue),
+              RequestState::RequestWithBody(_,_,_,_)       => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
+              RequestState::Request(_,_,_) => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
+              _ => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure)
+            }
           } else {
-            ClientResult::Continue
+            (RequiredEvents::FrontReadBackWrite, ClientResult::Continue)
           }
         }
       }
     } else {
-      return ClientResult::CloseBothFailure
+      return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure)
     };
 
     res
   }
 
   // Read content from application
-  fn back_readable(&mut self) -> ClientResult {
+  fn back_readable(&mut self) -> (RequiredEvents, ClientResult) {
+    trace!("writable RES pos: {}, buf pos: {}, available: {}", self.http_state.state.res_position, self.http_state.back_buf_position, self.http_state.back_buf.available_data());
+    assert!(self.http_state.back_buf_position + self.http_state.back_buf.available_data() <= self.http_state.state.res_position);
     let tokens = self.tokens().clone();
-    let res = if let Some(ref mut sock) = self.backend {
+    if let Some(ref mut sock) = self.backend {
       let (sz, r) = sock.socket_read(&mut self.http_state.back_buf.space());
+      self.http_state.back_buf.fill(sz);
       if let Some((front,back)) = tokens {
         debug!("BACK  [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), sz);
       }
       match r {
-        SocketResult::Error => ClientResult::CloseBothFailure,
+        SocketResult::Error => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure),
         _                   => {
-          if sz > 0 {
-            self.http_state.back_readable(sz)
-          } else {
-            ClientResult::Continue
+          match self.http_state.state.response {
+            ResponseState::Response(_,_) => panic!("should not go back in back_readable if the whole response was parsed"),
+            ResponseState::ResponseWithBody(_,_,_) => {
+              //FIXME: should only read as much data as needed (ie not further than req_position)
+              if self.http_state.back_buf_position + self.http_state.back_buf.available_data() >= self.http_state.state.res_position {
+                return  (RequiredEvents::FrontWriteBackNone, ClientResult::Continue)
+              } else {
+                return  (RequiredEvents::FrontWriteBackRead, ClientResult::Continue)
+              }
+            },
+            ResponseState::ResponseWithBodyChunks(_,_,ch) => {
+              if ch == Chunk::Ended {
+                panic!("back read should have stopped on chunk ended");
+                return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue);
+              } else if ch == Chunk::Error {
+                panic!("back read should have stopped on chunk error");
+                return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+              } else {
+                if self.http_state.back_buf_position + self.http_state.back_buf.available_data() >= self.http_state.state.res_position {
+                  let next_start: usize = self.http_state.state.res_position - self.http_state.back_buf_position;
+                  self.http_state.state = parse_response_until_stop(&self.http_state.state, &mut self.http_state.back_buf, next_start);
+                  debug!("parse_response_until_stop returned {:?} => advance: {}", self.http_state.state, self.http_state.state.res_position);
+                  if self.http_state.state.is_back_error() {
+                    METRICS.lock().unwrap().time("http_proxy.failure", (precise_time_ns() - self.http_state.start) / 1000);
+                    return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure);
+                  }
+
+                  if let ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended) = self.http_state.state.response {
+                    return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue);
+                  } else {
+                    return (RequiredEvents::FrontWriteBackRead, ClientResult::Continue);
+                  }
+                } else {
+                  return (RequiredEvents::FrontWriteBackRead, ClientResult::Continue);
+                }
+              }
+            },
+            ResponseState::Error(_) => panic!("back read should have stopped on responsestate error"),
+            _ => {
+              let next_start: usize = self.http_state.state.res_position - self.http_state.back_buf_position;
+              self.http_state.state = parse_response_until_stop(&self.http_state.state, &mut self.http_state.back_buf, next_start);
+              debug!("parse_response_until_stop returned {:?} => advance: {}", self.http_state.state, self.http_state.state.res_position);
+              if self.http_state.state.is_back_error() {
+                METRICS.lock().unwrap().time("http_proxy.failure", (precise_time_ns() - self.http_state.start) / 1000);
+                return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure);
+              }
+
+              if let ResponseState::Response(_,_) = self.http_state.state.response {
+                return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue);
+              } else {
+                return (RequiredEvents::FrontWriteBackRead, ClientResult::Continue);
+              }
+            }
           }
         }
       }
     } else {
-      return ClientResult::CloseBothFailure;
-    };
-
-    res
+      return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure);
+    }
   }
 
 }

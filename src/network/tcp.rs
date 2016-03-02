@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use time::{Duration,precise_time_s};
 use rand::random;
-use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
+use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder,RequiredEvents};
 use network::proxy::{Server,ProxyClient,ProxyConfiguration};
 
 use messages::{TcpFront,Command,Instance};
@@ -288,7 +288,7 @@ impl ProxyClient for Client {
     }
   }
 
-  fn writable(&mut self) -> ClientResult {
+  fn writable(&mut self) -> (RequiredEvents, ClientResult) {
     trace!("in writable()");
     if let Some(buf) = self.back_buf.take() {
       //trace!("in writable 2: back_buf contains {} bytes", buf.remaining());
@@ -314,10 +314,10 @@ impl ProxyClient for Client {
       }
       self.back_buf = Some(b.flip());
     }
-    ClientResult::Continue
+    (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
   }
 
-  fn readable(&mut self) -> ClientResult {
+  fn readable(&mut self) -> (RequiredEvents, ClientResult) {
     let mut buf = self.front_buf.take().unwrap();
     //trace!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
 
@@ -339,10 +339,10 @@ impl ProxyClient for Client {
     };
     self.front_buf = Some(buf);
 
-    ClientResult::Continue
+    (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
   }
 
-  fn back_writable(&mut self) -> ClientResult {
+  fn back_writable(&mut self) -> (RequiredEvents, ClientResult) {
     if let Some(buf) = self.front_buf.take() {
       //trace!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
 
@@ -367,10 +367,10 @@ impl ProxyClient for Client {
       }
       self.front_buf = Some(b.flip());
     }
-    ClientResult::Continue
+    (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
   }
 
-  fn back_readable(&mut self) -> ClientResult {
+  fn back_readable(&mut self) -> (RequiredEvents, ClientResult) {
     let mut buf = self.back_buf.take().unwrap();
     //trace!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
 
@@ -393,7 +393,7 @@ impl ProxyClient for Client {
     }
     self.back_buf = Some(buf);
 
-    ClientResult::Continue
+    (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
   }
 }
 

@@ -50,6 +50,11 @@ impl Buffer {
     cnt
   }
 
+  pub fn reset(&mut self) {
+    self.position = 0;
+    self.end      = 0;
+  }
+
   pub fn data(&self) -> &[u8] {
     &self.memory[self.position..self.end]
   }

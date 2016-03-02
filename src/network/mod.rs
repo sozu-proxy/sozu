@@ -32,6 +32,85 @@ pub enum ProxyOrder {
 }
 
 #[derive(Debug,PartialEq,Eq)]
+pub enum RequiredEvents {
+  FrontReadBackNone,
+  FrontWriteBackNone,
+  FrontReadWriteBackNone,
+  FrontNoneBackNone,
+  FrontReadBackRead,
+  FrontWriteBackRead,
+  FrontReadWriteBackRead,
+  FrontNoneBackRead,
+  FrontReadBackWrite,
+  FrontWriteBackWrite,
+  FrontReadWriteBackWrite,
+  FrontNoneBackWrite,
+  FrontReadBackReadWrite,
+  FrontWriteBackReadWrite,
+  FrontReadWriteBackReadWrite,
+  FrontNoneBackReadWrite,
+}
+
+impl RequiredEvents {
+
+  pub fn front_readable(&self) -> bool {
+    match *self {
+      RequiredEvents::FrontReadBackNone
+      | RequiredEvents:: FrontReadWriteBackNone
+      | RequiredEvents:: FrontReadBackRead
+      | RequiredEvents:: FrontReadWriteBackRead
+      | RequiredEvents:: FrontReadBackWrite
+      | RequiredEvents:: FrontReadWriteBackWrite
+      | RequiredEvents:: FrontReadBackReadWrite
+      | RequiredEvents:: FrontReadWriteBackReadWrite => true,
+      _ => false
+    }
+  }
+
+  pub fn front_writable(&self) -> bool {
+    match *self {
+        RequiredEvents::FrontWriteBackNone
+        | RequiredEvents::FrontReadWriteBackNone
+        | RequiredEvents::FrontWriteBackRead
+        | RequiredEvents::FrontReadWriteBackRead
+        | RequiredEvents::FrontWriteBackWrite
+        | RequiredEvents::FrontReadWriteBackWrite
+        | RequiredEvents::FrontWriteBackReadWrite
+        | RequiredEvents::FrontReadWriteBackReadWrite => true,
+        _ => false
+    }
+  }
+
+  pub fn back_readable(&self) -> bool {
+    match *self {
+        RequiredEvents::FrontReadBackRead
+        | RequiredEvents::FrontWriteBackRead
+        | RequiredEvents::FrontReadWriteBackRead
+        | RequiredEvents::FrontNoneBackRead
+        | RequiredEvents::FrontReadBackReadWrite
+        | RequiredEvents::FrontWriteBackReadWrite
+        | RequiredEvents::FrontReadWriteBackReadWrite
+        | RequiredEvents::FrontNoneBackReadWrite => true,
+        _ => false
+    }
+  }
+
+  pub fn back_writable(&self) -> bool {
+    match *self {
+        RequiredEvents::FrontReadBackWrite
+        | RequiredEvents::FrontWriteBackWrite
+        | RequiredEvents::FrontReadWriteBackWrite
+        | RequiredEvents::FrontNoneBackWrite
+        | RequiredEvents::FrontReadBackReadWrite
+        | RequiredEvents::FrontWriteBackReadWrite
+        | RequiredEvents::FrontReadWriteBackReadWrite
+        | RequiredEvents::FrontNoneBackReadWrite => true,
+        _ => false
+    }
+  }
+}
+
+#[derive(Debug,PartialEq,Eq)]
 pub enum ClientResult {
   CloseClient,
   CloseBackend,

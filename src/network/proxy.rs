@@ -17,7 +17,7 @@ use std::fmt::Debug;
 use time::precise_time_ns;
 use rand::random;
 
-use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socket_type,ProxyOrder};
+use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socket_type,ProxyOrder,RequiredEvents};
 use network::metrics::{METRICS,ProxyMetrics};
 
 use messages::{TcpFront,Command,Instance};
@@ -42,10 +42,10 @@ pub trait ProxyClient {
   fn set_tokens(&mut self, token: Token, backend: Token);
   fn front_hup(&mut self)     -> ClientResult;
   fn back_hup(&mut self)      -> ClientResult;
-  fn readable(&mut self)      -> ClientResult;
-  fn writable(&mut self)      -> ClientResult;
-  fn back_readable(&mut self) -> ClientResult;
-  fn back_writable(&mut self) -> ClientResult;
+  fn readable(&mut self)      -> (RequiredEvents, ClientResult);
+  fn writable(&mut self)      -> (RequiredEvents, ClientResult);
+  fn back_readable(&mut self) -> (RequiredEvents, ClientResult);
+  fn back_writable(&mut self) -> (RequiredEvents, ClientResult);
   fn remove_backend(&mut self);
 }
 
@@ -164,28 +164,51 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
     }
   }
 
-  pub fn interpret_client_order(&mut self, event_loop: &mut EventLoop<Self>, token: Token, order: ClientResult) {
-    match order {
+  pub fn interpret_client_order(&mut self, event_loop: &mut EventLoop<Self>, token: Token, order: (RequiredEvents, ClientResult)) {
+    //println!("ORDER: {:?}", order);
+    match order.1 {
       ClientResult::CloseClient      => self.close_client(event_loop, token),
       ClientResult::CloseBackend     => self.close_backend(event_loop, token),
       ClientResult::CloseBothSuccess => self.close_client(event_loop, token),
       ClientResult::CloseBothFailure => self.close_client(event_loop, token),
       ClientResult::ConnectBackend   => {
-        self.reregister(event_loop, token);
+        let mut front_interest = EventSet::hup();
+        let mut back_interest  = EventSet::hup();
+        front_interest.insert(EventSet::readable());
+        back_interest.insert(EventSet::writable());
+        self.reregister(event_loop, token, front_interest, back_interest);
         self.connect_to_backend(event_loop, token)
       },
-      ClientResult::Continue         => self.reregister(event_loop, token)
+      ClientResult::Continue         => {
+        let mut front_interest = EventSet::hup();
+        let mut back_interest  = EventSet::hup();
+        if order.0.front_readable() {
+          front_interest.insert(EventSet::readable());
+        }
+        if order.0.front_writable() {
+          front_interest.insert(EventSet::writable());
+        }
+        if order.0.back_readable() {
+          back_interest.insert(EventSet::readable());
+        }
+        if order.0.back_writable() {
+          back_interest.insert(EventSet::writable());
+        }
+        self.reregister(event_loop, token, front_interest, back_interest)
+      }
     }
   }
 
-  fn reregister(&self, event_loop: &mut EventLoop<Self>, token: Token) {
+  fn reregister(&self, event_loop: &mut EventLoop<Self>, token: Token, front_interest: EventSet, back_interest: EventSet) {
     let client = &self.clients[token];
+    /*
     let mut front_interest = EventSet::hup();
     let mut back_interest  = EventSet::hup();
     front_interest.insert(EventSet::readable());
     front_interest.insert(EventSet::writable());
     back_interest.insert(EventSet::writable());
     back_interest.insert(EventSet::readable());
+    */
 
     if let Some(frontend_token) = client.front_token() {
       event_loop.reregister(client.front_socket(), frontend_token, front_interest, PollOpt::level() | PollOpt::oneshot());
