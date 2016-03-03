@@ -121,11 +121,11 @@ impl CommandServer {
     let mut interest = EventSet::hup();
     interest.insert(EventSet::readable());
     interest.insert(EventSet::writable());
-    event_loop.register(&self.conns[tok].sock, tok, interest, PollOpt::level() | PollOpt::oneshot())
+    event_loop.register(&self.conns[tok].sock, tok, interest, PollOpt::level())
       .ok().expect("could not register socket with event loop");
 
     let accept_interest = EventSet::readable();
-    event_loop.register(&self.sock, SERVER, accept_interest, PollOpt::level() | PollOpt::oneshot());
+    event_loop.register(&self.sock, SERVER, accept_interest, PollOpt::level());
     Ok(())
   }
 
