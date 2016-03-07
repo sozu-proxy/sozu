@@ -424,10 +424,7 @@ impl ServerConfiguration {
     }
   }
 
-  fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<TcpServer>) -> Option<Token> {
-    let addr_string = String::from("127.0.0.1:") + &port.to_string();
-    let front = &addr_string.parse().unwrap();
-
+  fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, event_loop: &mut EventLoop<TcpServer>) -> Option<Token> {
     if let Ok(listener) = TcpListener::bind(front) {
       let addresses = if let Some(ads) = self.instances.get(app_id) {
         ads.clone()
@@ -447,15 +444,15 @@ impl ServerConfiguration {
         self.listeners[tok].token = Some(tok);
         self.fronts.insert(String::from(app_id), tok);
         event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
-        info!("registered listener for app {} on port {}", app_id, port);
+        info!("registered listener for app {} on port {}", app_id, front.port());
         Some(tok)
       } else {
-        error!("could not register listener for app {} on port {}", app_id, port);
+        error!("could not register listener for app {} on port {}", app_id, front.port());
         None
       }
 
     } else {
-      error!("could not declare listener for app {} on port {}", app_id, port);
+      error!("could not declare listener for app {} on port {}", app_id, front.port());
       None
     }
   }
@@ -520,12 +517,17 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
 
   fn notify(&mut self, event_loop: &mut EventLoop<TcpServer>, message: ProxyOrder) {
     match message {
-      ProxyOrder::Command(Command::AddTcpFront(front)) => {
-        trace!("{:?}", front);
-        if let Some(token) = self.add_tcp_front(front.port, &front.app_id, event_loop) {
-          self.tx.send(ServerMessage::AddedFront);
+      ProxyOrder::Command(Command::AddTcpFront(tcp_front)) => {
+        trace!("{:?}", tcp_front);
+        let addr_string = tcp_front.ip_address + &tcp_front.port.to_string();
+        if let Ok(front) = addr_string.parse() {
+          if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, event_loop) {
+            self.tx.send(ServerMessage::AddedFront);
+          } else {
+            error!("Couldn't add tcp front");
+          }
         } else {
-          error!("Couldn't add tcp front");
+          error!("Couldn't parse tcp front address");
         }
       },
       ProxyOrder::Command(Command::RemoveTcpFront(front)) => {
@@ -589,13 +591,15 @@ pub fn start() {
   let configuration = ServerConfiguration::new(10, tx);
   let mut s = TcpServer::new(10, 500, configuration);
   {
-    let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
-    s.configuration().add_tcp_front(1234, "yolo", &mut event_loop);
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1234").unwrap();
+    let back: SocketAddr  = FromStr::from_str("127.0.0.1:5678").unwrap();
+    s.configuration().add_tcp_front("yolo", &front, &mut event_loop);
     s.configuration().add_instance("yolo", &back, &mut event_loop);
   }
   {
-    let back: SocketAddr = FromStr::from_str("127.0.0.1:5678").unwrap();
-    s.configuration().add_tcp_front(1235, "yolo", &mut event_loop);
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1235").unwrap();
+    let back: SocketAddr  = FromStr::from_str("127.0.0.1:5678").unwrap();
+    s.configuration().add_tcp_front("yolo", &front, &mut event_loop);
     s.configuration().add_instance("yolo", &back, &mut event_loop);
   }
   thread::spawn(move|| {
@@ -611,7 +615,8 @@ pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Se
   let notify_tx = tx.clone();
   let configuration = ServerConfiguration::new(max_listeners, tx);
   let mut server = TcpServer::new(max_listeners, max_connections, configuration);
-  server.configuration().add_tcp_front(8443, "yolo", &mut event_loop);
+  let front: SocketAddr = FromStr::from_str("127.0.0.1:8443").unwrap();
+  server.configuration().add_tcp_front("yolo", &front, &mut event_loop);
 
   let join_guard = thread::spawn(move|| {
     info!("starting event loop");

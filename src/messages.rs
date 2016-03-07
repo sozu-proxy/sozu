@@ -22,6 +22,7 @@ pub struct TlsFront {
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct TcpFront {
     pub app_id: String,
+    pub ip_address: String,
     pub port: u16
 }
 
