@@ -191,6 +191,16 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
    trace!("readable REQ pos: {}, buf pos: {}, available: {}", self.http_state.state.req_position, self.http_state.front_buf_position, self.http_state.front_buf.available_data());
     assert!(!self.http_state.state.is_front_error());
 
+    if self.http_state.front_buf.available_space() == 0 {
+      if self.backend_token == None {
+        // We don't have a backend to empty the buffer into, close the connection
+        error!("[{:?}] front buffer full, no backend, closing the connection", self.token);
+        return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient)
+      } else {
+        return (RequiredEvents::FrontNoneBackWrite, ClientResult::Continue)
+      }
+    }
+
     let has_host = self.http_state.state.has_host();
     let (sz, res) = self.frontend.socket_read(self.http_state.front_buf.space());
     debug!("FRONT [{:?}]: read {} bytes", self.token, sz);
@@ -353,6 +363,12 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   fn back_readable(&mut self) -> (RequiredEvents, ClientResult) {
     trace!("writable RES pos: {}, buf pos: {}, available: {}", self.http_state.state.res_position, self.http_state.back_buf_position, self.http_state.back_buf.available_data());
     //assert!(self.http_state.back_buf_position + self.http_state.back_buf.available_data() <= self.http_state.state.res_position);
+
+    if self.http_state.back_buf.available_space() == 0 {
+      //println!("BACK BUFFER FULL({} bytes): TOKENS {:?} {:?}", self.http_state.back_buf.available_data(), self.token, self.backend_token);
+      return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue);
+    }
+
     let tokens = self.tokens().clone();
     if let Some(ref mut sock) = self.backend {
       let (sz, r) = sock.socket_read(&mut self.http_state.back_buf.space());
