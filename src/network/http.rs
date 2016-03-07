@@ -302,7 +302,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   // Forward content to client
   fn writable(&mut self) -> (RequiredEvents, ClientResult) {
     trace!("writable RES pos: {}, buf pos: {}, available: {}", self.http_state.state.res_position, self.http_state.back_buf_position, self.http_state.back_buf.available_data());
-    assert!(self.http_state.back_buf_position + self.http_state.back_buf.available_data() <= self.http_state.state.res_position);
+    //assert!(self.http_state.back_buf_position + self.http_state.back_buf.available_data() <= self.http_state.state.res_position);
     if self.http_state.back_buf.available_data() == 0 {
       return (RequiredEvents::FrontNoneBackRead, ClientResult::Continue);
     }
@@ -341,7 +341,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   // Forward content to application
   fn back_writable(&mut self) -> (RequiredEvents, ClientResult) {
     trace!("back writable REQ pos: {}, buf pos: {}, available: {}", self.http_state.state.req_position, self.http_state.front_buf_position, self.http_state.front_buf.available_data());
-    assert!(self.http_state.front_buf_position + self.http_state.front_buf.available_data() <= self.http_state.state.req_position);
+    //assert!(self.http_state.front_buf_position + self.http_state.front_buf.available_data() <= self.http_state.state.req_position);
     if self.http_state.front_buf.available_data() == 0 {
       return (RequiredEvents::FrontReadBackNone, ClientResult::Continue);
     }
@@ -382,7 +382,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   // Read content from application
   fn back_readable(&mut self) -> (RequiredEvents, ClientResult) {
     trace!("writable RES pos: {}, buf pos: {}, available: {}", self.http_state.state.res_position, self.http_state.back_buf_position, self.http_state.back_buf.available_data());
-    assert!(self.http_state.back_buf_position + self.http_state.back_buf.available_data() <= self.http_state.state.res_position);
+    //assert!(self.http_state.back_buf_position + self.http_state.back_buf.available_data() <= self.http_state.state.res_position);
     let tokens = self.tokens().clone();
     if let Some(ref mut sock) = self.backend {
       let (sz, r) = sock.socket_read(&mut self.http_state.back_buf.space());
