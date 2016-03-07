@@ -99,6 +99,35 @@ impl ServerConfiguration {
     }
   }
 
+  fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<TlsServer>) -> Option<Token> {
+    let addr_string = String::from("127.0.0.1:") + &port.to_string();
+    let front = &addr_string.parse().unwrap();
+
+    if let Ok(listener) = TcpListener::bind(front) {
+
+      let al = ApplicationListener {
+        sock:           listener,
+        token:          None,
+        front_address:  *front,
+      };
+
+      if let Ok(tok) = self.listeners.insert(al) {
+        self.listeners[tok].token = Some(tok);
+        //self.fronts.insert(String::from(app_id), tok);
+        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
+        info!("registered listener on port {}", port);
+        Some(tok)
+      } else {
+        error!("could not register listener on port {}", port);
+        None
+      }
+
+    } else {
+      error!("could not declare listener on port {}", port);
+      None
+    }
+  }
+
   pub fn add_http_front(&mut self, http_front: TlsFront, event_loop: &mut EventLoop<TlsServer>) {
     let mut ctx = SslContext::new(SslMethod::Tlsv1).unwrap();
     ctx.set_certificate_file(&http_front.cert_path, X509FileType::PEM);
@@ -198,35 +227,6 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for ServerConfiguration {
-  fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<TlsServer>) -> Option<Token> {
-    let addr_string = String::from("127.0.0.1:") + &port.to_string();
-    let front = &addr_string.parse().unwrap();
-
-    if let Ok(listener) = TcpListener::bind(front) {
-
-      let al = ApplicationListener {
-        sock:           listener,
-        token:          None,
-        front_address:  *front,
-      };
-
-      if let Ok(tok) = self.listeners.insert(al) {
-        self.listeners[tok].token = Some(tok);
-        //self.fronts.insert(String::from(app_id), tok);
-        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
-        info!("registered listener on port {}", port);
-        Some(tok)
-      } else {
-        error!("could not register listener on port {}", port);
-        None
-      }
-
-    } else {
-      error!("could not declare listener on port {}", port);
-      None
-    }
-  }
-
   fn accept(&mut self, token: Token) -> Option<(Client<NonblockingSslStream<TcpStream>>,bool)> {
     if self.listeners.contains(token) {
       let accepted = self.listeners[token].sock.accept();

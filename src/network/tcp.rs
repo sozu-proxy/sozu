@@ -424,6 +424,42 @@ impl ServerConfiguration {
     }
   }
 
+  fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<TcpServer>) -> Option<Token> {
+    let addr_string = String::from("127.0.0.1:") + &port.to_string();
+    let front = &addr_string.parse().unwrap();
+
+    if let Ok(listener) = TcpListener::bind(front) {
+      let addresses = if let Some(ads) = self.instances.get(app_id) {
+        ads.clone()
+      } else {
+        Vec::new()
+      };
+
+      let al = ApplicationListener {
+        app_id:         String::from(app_id),
+        sock:           listener,
+        token:          None,
+        front_address:  *front,
+        back_addresses: addresses
+      };
+
+      if let Ok(tok) = self.listeners.insert(al) {
+        self.listeners[tok].token = Some(tok);
+        self.fronts.insert(String::from(app_id), tok);
+        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
+        info!("registered listener for app {} on port {}", app_id, port);
+        Some(tok)
+      } else {
+        error!("could not register listener for app {} on port {}", app_id, port);
+        None
+      }
+
+    } else {
+      error!("could not declare listener for app {} on port {}", app_id, port);
+      None
+    }
+  }
+
   pub fn remove_tcp_front(&mut self, app_id: String, event_loop: &mut EventLoop<TcpServer>) -> Option<Token>{
     info!("removing tcp_front {:?}", app_id);
     // ToDo
@@ -472,41 +508,6 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
-  fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<TcpServer>) -> Option<Token> {
-    let addr_string = String::from("127.0.0.1:") + &port.to_string();
-    let front = &addr_string.parse().unwrap();
-
-    if let Ok(listener) = TcpListener::bind(front) {
-      let addresses = if let Some(ads) = self.instances.get(app_id) {
-        ads.clone()
-      } else {
-        Vec::new()
-      };
-
-      let al = ApplicationListener {
-        app_id:         String::from(app_id),
-        sock:           listener,
-        token:          None,
-        front_address:  *front,
-        back_addresses: addresses
-      };
-
-      if let Ok(tok) = self.listeners.insert(al) {
-        self.listeners[tok].token = Some(tok);
-        self.fronts.insert(String::from(app_id), tok);
-        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
-        info!("registered listener for app {} on port {}", app_id, port);
-        Some(tok)
-      } else {
-        error!("could not register listener for app {} on port {}", app_id, port);
-        None
-      }
-
-    } else {
-      error!("could not declare listener for app {} on port {}", app_id, port);
-      None
-    }
-  }
 
   fn connect_to_backend(&mut self, client:&mut Client) ->Result<TcpStream,ConnectionError> {
     let rnd = random::<usize>();

@@ -467,6 +467,34 @@ impl ServerConfiguration {
     }
   }
 
+  fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<HttpServer>) -> Option<Token> {
+    let addr_string = String::from("127.0.0.1:") + &port.to_string();
+    let front = &addr_string.parse().unwrap();
+
+    if let Ok(listener) = TcpListener::bind(front) {
+
+      let al = ApplicationListener {
+        sock:           listener,
+        token:          None,
+        front_address:  *front,
+      };
+
+      if let Ok(tok) = self.listeners.insert(al) {
+        self.listeners[tok].token = Some(tok);
+        //self.fronts.insert(String::from(app_id), tok);
+        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
+        info!("registered listener({}) on port {}", tok.as_usize(), port);
+        Some(tok)
+      } else {
+        error!("could not register listener on port {}", port);
+        None
+      }
+    } else {
+      error!("could not declare listener on port {}", port);
+      None
+    }
+  }
+
   pub fn add_http_front(&mut self, http_front: HttpFront, event_loop: &mut EventLoop<HttpServer>) {
     let front2 = http_front.clone();
     let front3 = http_front.clone();
@@ -551,34 +579,6 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
-  fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<HttpServer>) -> Option<Token> {
-    let addr_string = String::from("127.0.0.1:") + &port.to_string();
-    let front = &addr_string.parse().unwrap();
-
-    if let Ok(listener) = TcpListener::bind(front) {
-
-      let al = ApplicationListener {
-        sock:           listener,
-        token:          None,
-        front_address:  *front,
-      };
-
-      if let Ok(tok) = self.listeners.insert(al) {
-        self.listeners[tok].token = Some(tok);
-        //self.fronts.insert(String::from(app_id), tok);
-        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
-        info!("registered listener({}) on port {}", tok.as_usize(), port);
-        Some(tok)
-      } else {
-        error!("could not register listener on port {}", port);
-        None
-      }
-    } else {
-      error!("could not declare listener on port {}", port);
-      None
-    }
-  }
-
   fn connect_to_backend(&mut self, client: &mut Client<TcpStream>) -> Result<TcpStream,ConnectionError> {
       let host   = try!(client.http_state.state.get_host().ok_or(ConnectionError::NoHostGiven));
       let rl     = try!(client.http_state.state.get_request_line().ok_or(ConnectionError::NoRequestLineGiven));

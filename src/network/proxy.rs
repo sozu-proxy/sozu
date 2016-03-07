@@ -50,7 +50,6 @@ pub trait ProxyClient {
 }
 
 pub trait ProxyConfiguration<Server:Handler,Client> {
-  fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<Server>) -> Option<Token>;
   fn connect_to_backend(&mut self, client:&mut Client) ->Result<TcpStream,ConnectionError>;
   fn notify(&mut self, event_loop: &mut EventLoop<Server>, message: ProxyOrder);
   fn accept(&mut self, token: Token) -> Option<(Client, bool)>;
