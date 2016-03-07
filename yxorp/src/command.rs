@@ -44,7 +44,7 @@ impl CommandClient {
   }
 
   fn conn_readable(&mut self, event_loop: &mut EventLoop<CommandServer>, tok: Token) -> Option<Vec<ConfigMessage>>{
-    //debug!("server conn readable; tok={:?}", tok);
+    trace!("server conn readable; tok={:?}", tok);
     match self.sock.read(self.buf.space()) {
       Ok(0) => {
         self.reregister(event_loop, tok);
@@ -75,12 +75,13 @@ impl CommandClient {
         res = Some(v);
       }
     }
+    debug!("parsed {} bytes, result: {:?}", offset, res);
     self.buf.consume(offset);
     return res;
   }
 
   fn conn_writable(&mut self, event_loop: &mut EventLoop<CommandServer>, tok: Token) {
-    //debug!("server conn writable; tok={:?}", tok);
+    trace!("server conn writable; tok={:?}", tok);
     match self.sock.write(self.back_buf.data()) {
       Ok(0) => {},
       Ok(r) => {
