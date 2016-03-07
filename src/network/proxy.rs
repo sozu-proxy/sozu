@@ -201,14 +201,6 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
   fn reregister(&self, event_loop: &mut EventLoop<Self>, token: Token, front_interest: EventSet, back_interest: EventSet) {
     let client = &self.clients[token];
-    /*
-    let mut front_interest = EventSet::hup();
-    let mut back_interest  = EventSet::hup();
-    front_interest.insert(EventSet::readable());
-    front_interest.insert(EventSet::writable());
-    back_interest.insert(EventSet::writable());
-    back_interest.insert(EventSet::readable());
-    */
 
     if let Some(frontend_token) = client.front_token() {
       event_loop.reregister(client.front_socket(), frontend_token, front_interest, PollOpt::level() | PollOpt::oneshot());
