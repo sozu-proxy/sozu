@@ -125,7 +125,7 @@ impl CommandServer {
       .ok().expect("could not register socket with event loop");
 
     let accept_interest = EventSet::readable();
-    event_loop.register(&self.sock, SERVER, accept_interest, PollOpt::level());
+    event_loop.reregister(&self.sock, SERVER, accept_interest, PollOpt::level());
     Ok(())
   }
 
