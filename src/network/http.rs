@@ -27,25 +27,6 @@ use nom::HexDisplay;
 use messages::{Command,HttpFront};
 
 type BackendToken = Token;
-#[derive(Debug,Clone,PartialEq,Eq)]
-pub enum ConnectionStatus {
-  Initial,
-  ClientConnected,
-  HasHost,
-  ProxyingFrontBack,
-  //ProxyingFrontBack(usize),
-  //ProxyingFrontBackChunk(usize),
-  BackResponseValidated,
-  ProxyingBackFront,
-  //ProxyingBackFront(usize),
-  //ProxyingBackFrontChunk(usize),
-  End,
-  ClientClosed,
-  ServerClosed,
-  Closed,
-  Send404(usize),
-  Send503(usize),
-}
 
 pub struct HttpProxy {
   pub state:              HttpState,
@@ -87,7 +68,6 @@ pub struct Client<Front:SocketHandler> {
   backend_token:  Option<Token>,
   front_timeout:  Option<Timeout>,
   back_timeout:   Option<Timeout>,
-  status:         ConnectionStatus,
   rx_count:       usize,
   tx_count:       usize,
 }
@@ -111,7 +91,6 @@ impl<Front:SocketHandler> Client<Front> {
       backend_token:  None,
       front_timeout:  None,
       back_timeout:   None,
-      status:         ConnectionStatus::ClientConnected,
       rx_count:       0,
       tx_count:       0,
     })
@@ -133,9 +112,6 @@ impl<Front:SocketHandler> Client<Front> {
     &mut self.http_state
   }
 
-  pub fn set_status(&mut self, status: ConnectionStatus) {
-    self.status = status;
-  }
 }
 
 impl<Front:SocketHandler> ProxyClient for Client<Front> {
@@ -195,23 +171,17 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   }
 
   fn front_hup(&mut self) -> ClientResult {
-    if  self.status == ConnectionStatus::ServerClosed ||
-        self.status == ConnectionStatus::ClientConnected { // the server never answered, the client closed
-      self.status = ConnectionStatus::Closed;
+    if self.backend_token == None {
       ClientResult::CloseClient
     } else {
-      self.status = ConnectionStatus::ClientClosed;
       ClientResult::Continue
     }
-
   }
 
   fn back_hup(&mut self) -> ClientResult {
-    if self.status == ConnectionStatus::ClientClosed {
-      self.status = ConnectionStatus::Closed;
+    if self.token == None {
       ClientResult::CloseClient
     } else {
-      self.status = ConnectionStatus::ServerClosed;
       ClientResult::Continue
     }
   }
@@ -546,7 +516,6 @@ impl ServerConfiguration {
 
   pub fn backend_from_request(&self, client: &mut Client<TcpStream>, host: &str, uri: &str) -> Option<SocketAddr> {
     if let Some(http_front) = self.frontend_from_request(host, uri) {
-      client.status = ConnectionStatus::HasHost;
       // ToDo round-robin on instances
       if let Some(app_instances) = self.instances.get(&http_front.app_id) {
         let rnd = random::<usize>();
@@ -554,11 +523,11 @@ impl ServerConfiguration {
         debug!("Connecting {} -> {:?}", host, app_instances.get(idx));
         app_instances.get(idx).map(|& addr| addr)
       } else {
-        client.status = ConnectionStatus::Send503(0);
+        //FIXME: send 503 here
         None
       }
     } else {
-      client.status = ConnectionStatus::Send404(0);
+      // FIXME: send 404 here
       None
     }
   }
@@ -601,17 +570,11 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
       let conn   = TcpStream::connect(&back);
 
       if let Ok(socket) = conn {
-        client.status = ConnectionStatus::ProxyingFrontBack;
         Ok(socket)
       } else {
-        client.status = ConnectionStatus::Send503(0);
+        //FIXME: send 503 here
         Err(ConnectionError::ToBeDefined)
       }
-      /*let socket = try!(TcpStream::connect(&back).map_err(|_| ConnectionError::ToBeDefined));
-
-      client.status = ConnectionStatus::ProxyingFrontBack;
-
-      Ok(socket)*/
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<HttpServer>, message: ProxyOrder) {

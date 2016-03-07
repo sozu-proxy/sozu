@@ -27,7 +27,7 @@ use network::buffer::Buffer;
 use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,TlsFront};
-use network::http::{HttpProxy,Client,ConnectionStatus};
+use network::http::{HttpProxy,Client};
 use network::socket::{SocketHandler,SocketResult};
 
 type BackendToken = Token;
@@ -180,7 +180,6 @@ impl ServerConfiguration {
     trace!("looking for backend for real host: {}", host);
 
     if let Some(tls_front) = self.frontend_from_request(real_host, uri) {
-      client.set_status(ConnectionStatus::HasHost);
       // ToDo round-robin on instances
       if let Some(app_instances) = self.instances.get(&tls_front.app_id) {
         let rnd = random::<usize>();
@@ -188,11 +187,11 @@ impl ServerConfiguration {
         info!("Connecting {} -> {:?}", host, app_instances.get(idx));
         app_instances.get(idx).map(|& addr| addr)
       } else {
-        client.set_status(ConnectionStatus::Send503(0));
+        // FIXME: should send 503 here
         None
       }
     } else {
-      client.set_status(ConnectionStatus::Send404(0));
+      // FIXME: should send 404 here
       None
     }
   }
@@ -260,7 +259,6 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
     //let socket = try!(TcpStream::connect(&back).map_err(|_| ConnectionError::ToBeDefined));
 
     if let Ok(socket) = TcpStream::connect(&back) {
-      client.set_status(ConnectionStatus::ProxyingFrontBack);
 
       let position  = client.http_state().state.req_position;
       let req_state = client.http_state().state.request.clone();
@@ -270,11 +268,10 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         request:  req_state,
         response: ResponseState::Initial
       };
-      //client.set_status(ConnectionStatus::Connected);
 
       Ok(socket)
     } else {
-      client.set_status(ConnectionStatus::Send503(0));
+      // FIXME: should send 503 here
       Err(ConnectionError::ToBeDefined)
     }
   }
