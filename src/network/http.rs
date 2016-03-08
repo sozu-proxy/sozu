@@ -631,26 +631,6 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
 
 pub type HttpServer = Server<ServerConfiguration,Client<TcpStream>>;
 
-pub fn start() {
-  // ToDo temporary
-  let mut event_loop = EventLoop::new().unwrap();
-
-  let (tx,rx) = channel::<ServerMessage>();
-  let channel = event_loop.channel();
-  let notify_tx = tx.clone();
-
-  let front: SocketAddr = FromStr::from_str("127.0.0.1:8080").unwrap();
-  let configuration = ServerConfiguration::new(front, tx, &mut event_loop).unwrap();
-  let mut server = HttpServer::new(1, 500, configuration);
-
-  let join_guard = thread::spawn(move|| {
-    debug!("starting event loop");
-    event_loop.run(&mut server).unwrap();
-    debug!("ending event loop");
-    notify_tx.send(ServerMessage::Stopped);
-  });
-}
-
 pub fn start_listener(front: SocketAddr, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
