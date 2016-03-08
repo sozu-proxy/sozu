@@ -27,7 +27,7 @@ use network::buffer::Buffer;
 use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,TlsFront};
-use network::http::{HttpProxy,Client};
+use network::http::{HttpProxy,Client,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult};
 
 type BackendToken = Token;
@@ -35,14 +35,15 @@ type BackendToken = Token;
 type ClientToken = Token;
 
 pub struct ServerConfiguration {
-  listener:     TcpListener,
-  address:      SocketAddr,
-  instances:    HashMap<String, Vec<SocketAddr>>,
-  fronts:       HashMap<String, Vec<TlsFront>>,
-  default_cert: String,
+  listener:        TcpListener,
+  address:         SocketAddr,
+  instances:       HashMap<String, Vec<SocketAddr>>,
+  fronts:          HashMap<String, Vec<TlsFront>>,
+  default_cert:    String,
   default_context: SslContext,
-  contexts:     Rc<RefCell<HashMap<String, SslContext>>>,
-  tx:           mpsc::Sender<ServerMessage>
+  contexts:        Rc<RefCell<HashMap<String, SslContext>>>,
+  tx:              mpsc::Sender<ServerMessage>,
+  answers:         DefaultAnswers,
 }
 
 impl ServerConfiguration {
@@ -87,14 +88,18 @@ impl ServerConfiguration {
       Ok(listener) => {
         event_loop.register(&listener, Token(0), EventSet::readable(), PollOpt::level());
         Ok(ServerConfiguration {
-          listener: listener,
-          address:  address,
-          instances: HashMap::new(),
-          fronts:    HashMap::new(),
-          default_cert: String::from("lolcatho.st"),
+          listener:        listener,
+          address:         address,
+          instances:       HashMap::new(),
+          fronts:          HashMap::new(),
+          default_cert:    String::from("lolcatho.st"),
           default_context: context,
-          contexts:  rc_ctx,
-          tx:        tx
+          contexts:        rc_ctx,
+          tx:              tx,
+          answers:         DefaultAnswers {
+            NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
+            ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
+          }
         })
       },
       Err(e) => {
@@ -171,7 +176,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_request(&self, client: &mut Client<NonblockingSslStream<TcpStream>>, host: &str, uri: &str) -> Option<SocketAddr> {
+  pub fn backend_from_request(&self, client: &mut Client<NonblockingSslStream<TcpStream>>, host: &str, uri: &str) -> Result<SocketAddr,ConnectionError> {
     trace!("looking for backend for host: {}", host);
     let real_host = if let Some(h) = host.split(":").next() {
       h
@@ -186,14 +191,16 @@ impl ServerConfiguration {
         let rnd = random::<usize>();
         let idx = rnd % app_instances.len();
         info!("Connecting {} -> {:?}", host, app_instances.get(idx));
-        app_instances.get(idx).map(|& addr| addr)
+        app_instances.get(idx).map(|& addr| addr).ok_or(ConnectionError::NoBackendAvailable)
       } else {
         // FIXME: should send 503 here
-        None
+        client.set_answer(&self.answers.ServiceUnavailable);
+        Err(ConnectionError::NoBackendAvailable)
       }
     } else {
       // FIXME: should send 404 here
-      None
+      client.set_answer(&self.answers.NotFound);
+      Err(ConnectionError::HostNotFound)
     }
   }
 }
@@ -227,7 +234,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
     let host   = try!(client.http_state().state.get_host().ok_or(ConnectionError::NoHostGiven));
     let rl     = try!(client.http_state().state.get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
     let conn   = try!(client.http_state().state.get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
-    let back   = try!(self.backend_from_request(client, &host, &rl.uri).ok_or(ConnectionError::HostNotFound));
+    let back   = try!(self.backend_from_request(client, &host, &rl.uri));
     //let socket = try!(TcpStream::connect(&back).map_err(|_| ConnectionError::ToBeDefined));
 
     if let Ok(socket) = TcpStream::connect(&back) {
@@ -244,7 +251,8 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
       Ok(socket)
     } else {
       // FIXME: should send 503 here
-      Err(ConnectionError::ToBeDefined)
+      client.set_answer(&self.answers.ServiceUnavailable);
+      Err(ConnectionError::NoBackendAvailable)
     }
   }
 
@@ -326,6 +334,7 @@ mod tests {
   use messages::{Command,TlsFront,Instance};
   use mio::util::Slab;
   use network::{ProxyOrder,ServerMessage};
+  use network::http::DefaultAnswers;
   use openssl::ssl::{SslContext, SslMethod, Ssl, NonblockingSslStream, ServerNameCallback, ServerNameCallbackData};
 
   /*
@@ -441,7 +450,11 @@ mod tests {
       default_cert: "".to_owned(),
       default_context: context,
       contexts: rc_ctx,
-      tx:        tx
+      tx:        tx,
+      answers:   DefaultAnswers {
+        NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
+        ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
+      },
     };
 
     let frontend1 = server_config.frontend_from_request("lolcatho.st", "/");

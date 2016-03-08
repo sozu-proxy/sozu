@@ -125,26 +125,30 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
   }
 
   pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
-    if let Ok(socket) = self.configuration.connect_to_backend(&mut self.clients[token]) {
-      if let Ok(backend_token) = self.backend.insert(token) {
-        self.clients[token].set_back_socket(socket);
-        self.clients[token].set_back_token(backend_token);
+    match self.configuration.connect_to_backend(&mut self.clients[token]) {
+      Ok(socket) => {
+        if let Ok(backend_token) = self.backend.insert(token) {
+          self.clients[token].set_back_socket(socket);
+          self.clients[token].set_back_token(backend_token);
 
-        if let Some(sock) = self.clients[token].back_socket() {
-          event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge());
+          if let Some(sock) = self.clients[token].back_socket() {
+            event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge());
+          }
+          if let Ok(timeout) = event_loop.timeout_ms(backend_token.as_usize(), BACK_TIMEOUT) {
+            &self.clients[token].set_back_timeout(timeout);
+          }
+          return;
         }
-        if let Ok(timeout) = event_loop.timeout_ms(backend_token.as_usize(), BACK_TIMEOUT) {
-          &self.clients[token].set_back_timeout(timeout);
-        }
-        return;
-      }
-    } else {
-      // ToDo serve page explaining what happened
-      // - "domain not found" (aka "404 clever") page
-      // - 503 "service unavailable" (aka "your app is deploying") page
-      // - check other failing conditions
+      },
+      Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) => {
+        let mut front_interest = EventSet::hup();
+        front_interest.insert(EventSet::writable());
+        let client = &self.clients[token];
+
+        event_loop.reregister(client.front_socket(), token, front_interest, PollOpt::level() | PollOpt::oneshot());
+      },
+      _ => self.close_client(event_loop, token),
     }
-    self.close_client(event_loop, token);
   }
 
   pub fn get_client_token(&self, token: Token) -> Option<Token> {

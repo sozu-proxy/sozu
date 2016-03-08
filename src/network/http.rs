@@ -60,6 +60,12 @@ impl HttpProxy {
 
 }
 
+#[derive(PartialEq)]
+pub enum ClientStatus {
+  Normal,
+  DefaultAnswer,
+}
+
 pub struct Client<Front:SocketHandler> {
   frontend:       Front,
   backend:        Option<TcpStream>,
@@ -70,6 +76,7 @@ pub struct Client<Front:SocketHandler> {
   back_timeout:   Option<Timeout>,
   rx_count:       usize,
   tx_count:       usize,
+  status:         ClientStatus,
 }
 
 impl<Front:SocketHandler> Client<Front> {
@@ -93,6 +100,7 @@ impl<Front:SocketHandler> Client<Front> {
       back_timeout:   None,
       rx_count:       0,
       tx_count:       0,
+      status:         ClientStatus::Normal,
     })
   }
 
@@ -112,6 +120,11 @@ impl<Front:SocketHandler> Client<Front> {
     &mut self.http_state
   }
 
+  pub fn set_answer(&mut self, buf: &[u8])  {
+    self.http_state.back_buf.reset();
+    self.http_state.back_buf.write(buf);
+    self.status = ClientStatus::DefaultAnswer;
+  }
 }
 
 impl<Front:SocketHandler> ProxyClient for Client<Front> {
@@ -188,7 +201,11 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
   // Read content from the client
   fn readable(&mut self) -> (RequiredEvents,ClientResult) {
-   trace!("readable REQ pos: {}, buf pos: {}, available: {}", self.http_state.state.req_position, self.http_state.front_buf_position, self.http_state.front_buf.available_data());
+    if self.status == ClientStatus::DefaultAnswer {
+      return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue)
+    }
+
+    trace!("readable REQ pos: {}, buf pos: {}, available: {}", self.http_state.state.req_position, self.http_state.front_buf_position, self.http_state.front_buf.available_data());
     assert!(!self.http_state.state.is_front_error());
 
     if self.http_state.front_buf.available_space() == 0 {
@@ -281,6 +298,20 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
   // Forward content to client
   fn writable(&mut self) -> (RequiredEvents, ClientResult) {
+    if self.status == ClientStatus::DefaultAnswer {
+      let (sz, res) = self.frontend.socket_write(self.http_state.back_buf.data());
+      self.http_state.back_buf.consume(sz);
+
+      if self.http_state.back_buf.available_data() == 0 {
+        return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+      }
+
+      return match res {
+        SocketResult::Error => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient),
+        _                   => (RequiredEvents::FrontWriteBackNone, ClientResult::Continue)
+      };
+    }
+
     trace!("writable RES pos: {}, buf pos: {}, available: {}", self.http_state.state.res_position, self.http_state.back_buf_position, self.http_state.back_buf.available_data());
     //assert!(self.http_state.back_buf_position + self.http_state.back_buf.available_data() <= self.http_state.state.res_position);
     if self.http_state.back_buf.available_data() == 0 {
@@ -320,6 +351,10 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
   // Forward content to application
   fn back_writable(&mut self) -> (RequiredEvents, ClientResult) {
+    if self.status == ClientStatus::DefaultAnswer {
+      return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue)
+    }
+
     trace!("back writable REQ pos: {}, buf pos: {}, available: {}", self.http_state.state.req_position, self.http_state.front_buf_position, self.http_state.front_buf.available_data());
     //assert!(self.http_state.front_buf_position + self.http_state.front_buf.available_data() <= self.http_state.state.req_position);
     if self.http_state.front_buf.available_data() == 0 {
@@ -361,6 +396,10 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
   // Read content from application
   fn back_readable(&mut self) -> (RequiredEvents, ClientResult) {
+    if self.status == ClientStatus::DefaultAnswer {
+      return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue)
+    }
+
     trace!("writable RES pos: {}, buf pos: {}, available: {}", self.http_state.state.res_position, self.http_state.back_buf_position, self.http_state.back_buf.available_data());
     //assert!(self.http_state.back_buf_position + self.http_state.back_buf.available_data() <= self.http_state.state.res_position);
 
@@ -444,17 +483,23 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
 type ClientToken = Token;
 
+#[allow(non_snake_case)]
+pub struct DefaultAnswers {
+  pub NotFound:           Vec<u8>,
+  pub ServiceUnavailable: Vec<u8>
+}
+
 pub struct ServerConfiguration {
   listener:  TcpListener,
   address:   SocketAddr,
   instances: HashMap<String, Vec<SocketAddr>>,
   fronts:    HashMap<String, Vec<HttpFront>>,
-  tx:        mpsc::Sender<ServerMessage>
+  tx:        mpsc::Sender<ServerMessage>,
+  answers:   DefaultAnswers,
 }
 
 impl ServerConfiguration {
   pub fn new(address: SocketAddr, tx: mpsc::Sender<ServerMessage>, event_loop: &mut EventLoop<HttpServer>) -> io::Result<ServerConfiguration> {
-    //FIXME: should not unwrap here
     match TcpListener::bind(&address) {
       Ok(sock) => {
         event_loop.register(&sock, Token(0), EventSet::readable(), PollOpt::level());
@@ -463,7 +508,11 @@ impl ServerConfiguration {
           address:   address,
           instances: HashMap::new(),
           fronts:    HashMap::new(),
-          tx:        tx
+          tx:        tx,
+          answers:   DefaultAnswers {
+            NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
+            ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
+          }
         })
       },
       Err(e) => {
@@ -534,21 +583,23 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_request(&self, client: &mut Client<TcpStream>, host: &str, uri: &str) -> Option<SocketAddr> {
+  pub fn backend_from_request(&self, client: &mut Client<TcpStream>, host: &str, uri: &str) -> Result<SocketAddr,ConnectionError> {
     if let Some(http_front) = self.frontend_from_request(host, uri) {
       // ToDo round-robin on instances
       if let Some(app_instances) = self.instances.get(&http_front.app_id) {
         let rnd = random::<usize>();
         let idx = rnd % app_instances.len();
         debug!("Connecting {} -> {:?}", host, app_instances.get(idx));
-        app_instances.get(idx).map(|& addr| addr)
+        app_instances.get(idx).map(|& addr| addr).ok_or(ConnectionError::NoBackendAvailable)
       } else {
         //FIXME: send 503 here
-        None
+        client.set_answer(&self.answers.ServiceUnavailable);
+        Err(ConnectionError::NoBackendAvailable)
       }
     } else {
       // FIXME: send 404 here
-      None
+      client.set_answer(&self.answers.NotFound);
+      Err(ConnectionError::HostNotFound)
     }
   }
 
@@ -558,14 +609,15 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
   fn connect_to_backend(&mut self, client: &mut Client<TcpStream>) -> Result<TcpStream,ConnectionError> {
       let host   = try!(client.http_state.state.get_host().ok_or(ConnectionError::NoHostGiven));
       let rl     = try!(client.http_state.state.get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-      let back   = try!(self.backend_from_request(client, &host, &rl.uri).ok_or(ConnectionError::HostNotFound));
+      let back   = try!(self.backend_from_request(client, &host, &rl.uri));
       let conn   = TcpStream::connect(&back);
 
       if let Ok(socket) = conn {
         Ok(socket)
       } else {
         //FIXME: send 503 here
-        Err(ConnectionError::ToBeDefined)
+        client.set_answer(&self.answers.ServiceUnavailable);
+        Err(ConnectionError::NoBackendAvailable)
       }
   }
 
@@ -757,7 +809,11 @@ mod tests {
       address:   front,
       instances: HashMap::new(),
       fronts:    fronts,
-      tx:        tx
+      tx:        tx,
+      answers:   DefaultAnswers {
+        NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
+        ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
+      }
     };
 
     let frontend1 = server_config.frontend_from_request("lolcatho.st", "/");
