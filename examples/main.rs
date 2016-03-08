@@ -18,7 +18,7 @@ fn main() {
   METRICS.lock().unwrap().gauge("TEST", 42);
 
   let (sender, _) = channel::<network::ServerMessage>();
-  let (tx, jg) = network::http::start_listener("127.0.0.1:8080".parse().unwrap(), 10, 500, sender);
+  let (tx, jg) = network::http::start_listener("127.0.0.1:8080".parse().unwrap(), 500, sender);
 
   let http_front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), port: 8080 };
   let http_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
@@ -26,7 +26,7 @@ fn main() {
   tx.send(network::ProxyOrder::Command(messages::Command::AddInstance(http_instance)));
 
   let (sender2, _) = channel::<network::ServerMessage>();
-  let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 10, 500, sender2);
+  let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 500, sender2);
   let tls_front = messages::TlsFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st"), path_begin: String::from("/"), port: 8443, cert_path: String::from("assets/certificate.pem"), key_path: String::from("assets/key.pem") };
   tx2.send(network::ProxyOrder::Command(messages::Command::AddTlsFront(tls_front)));
   let tls_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };

@@ -32,17 +32,12 @@ use network::socket::{SocketHandler,SocketResult};
 
 type BackendToken = Token;
 
-pub struct ApplicationListener {
-  sock:           TcpListener,
-  token:          Option<Token>,
-  front_address:  SocketAddr
-}
-
 type ClientToken = Token;
 
 pub struct ServerConfiguration {
+  listener:     TcpListener,
+  address:      SocketAddr,
   instances:    HashMap<String, Vec<SocketAddr>>,
-  listeners:    Slab<ApplicationListener>,
   fronts:       HashMap<String, Vec<TlsFront>>,
   default_cert: String,
   default_context: SslContext,
@@ -51,7 +46,7 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(max_listeners: usize,  tx: mpsc::Sender<ServerMessage>) -> ServerConfiguration {
+  pub fn new(address: SocketAddr, tx: mpsc::Sender<ServerMessage>, event_loop: &mut EventLoop<TlsServer>) -> io::Result<ServerConfiguration> {
     let contexts = HashMap::new();
 
     let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
@@ -88,43 +83,24 @@ impl ServerConfiguration {
       store_contexts
     );
 
-    ServerConfiguration {
-      instances: HashMap::new(),
-      listeners: Slab::new_starting_at(Token(0), max_listeners),
-      fronts:    HashMap::new(),
-      default_cert: String::from("lolcatho.st"),
-      default_context: context,
-      contexts:  rc_ctx,
-      tx:        tx
-    }
-  }
-
-  fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<TlsServer>) -> Option<Token> {
-    let addr_string = String::from("127.0.0.1:") + &port.to_string();
-    let front = &addr_string.parse().unwrap();
-
-    if let Ok(listener) = TcpListener::bind(front) {
-
-      let al = ApplicationListener {
-        sock:           listener,
-        token:          None,
-        front_address:  *front,
-      };
-
-      if let Ok(tok) = self.listeners.insert(al) {
-        self.listeners[tok].token = Some(tok);
-        //self.fronts.insert(String::from(app_id), tok);
-        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
-        info!("registered listener on port {}", port);
-        Some(tok)
-      } else {
-        error!("could not register listener on port {}", port);
-        None
+    match TcpListener::bind(&address) {
+      Ok(listener) => {
+        event_loop.register(&listener, Token(0), EventSet::readable(), PollOpt::level());
+        Ok(ServerConfiguration {
+          listener: listener,
+          address:  address,
+          instances: HashMap::new(),
+          fronts:    HashMap::new(),
+          default_cert: String::from("lolcatho.st"),
+          default_context: context,
+          contexts:  rc_ctx,
+          tx:        tx
+        })
+      },
+      Err(e) => {
+        error!("could not create listener {:?}: {:?}", address, e);
+        Err(e)
       }
-
-    } else {
-      error!("could not declare listener on port {}", port);
-      None
     }
   }
 
@@ -138,10 +114,6 @@ impl ServerConfiguration {
     let front3 = http_front.clone();
     if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
         fronts.push(front2);
-    }
-
-    if self.listeners.iter().find(|l| l.front_address.port() == http_front.port).is_none() {
-      self.add_tcp_front(http_front.port, "", event_loop);
     }
 
     if self.fronts.get(&http_front.hostname).is_none() {
@@ -228,8 +200,8 @@ impl ServerConfiguration {
 
 impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for ServerConfiguration {
   fn accept(&mut self, token: Token) -> Option<(Client<NonblockingSslStream<TcpStream>>,bool)> {
-    if self.listeners.contains(token) {
-      let accepted = self.listeners[token].sock.accept();
+    if token.as_usize() == 0 {
+      let accepted = self.listener.accept();
 
       if let Ok(Some((frontend_sock, _))) = accepted {
         if let Ok(ssl) = Ssl::new(&self.default_context) {
@@ -319,14 +291,14 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
 
 pub type TlsServer = Server<ServerConfiguration,Client<NonblockingSslStream<TcpStream>>>;
 
-pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
+pub fn start_listener(front: SocketAddr, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
 
   let join_guard = thread::spawn(move|| {
-    let configuration = ServerConfiguration::new(max_listeners, tx);
-    let mut server = TlsServer::new(max_listeners, max_connections, configuration);
+    let configuration = ServerConfiguration::new(front, tx, &mut event_loop).unwrap();
+    let mut server = TlsServer::new(1, max_connections, configuration);
 
     info!("starting event loop");
     event_loop.run(&mut server).unwrap();
@@ -421,8 +393,7 @@ mod tests {
   }
 */
 
-
-
+  use mio::tcp;
   #[test]
   fn frontend_from_request_test() {
     let app_id1 = "app_1".to_owned();
@@ -460,9 +431,12 @@ mod tests {
     let context = SslContext::new(SslMethod::Tlsv1).unwrap();
     let (tx,rx) = channel::<ServerMessage>();
 
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").unwrap();
+    let listener = tcp::TcpListener::bind(&front).unwrap();
     let server_config = ServerConfiguration {
+      listener:  listener,
+      address:   front,
       instances: HashMap::new(),
-      listeners: Slab::new(10),
       fronts:    fronts,
       default_cert: "".to_owned(),
       default_context: context,

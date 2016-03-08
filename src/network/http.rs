@@ -442,56 +442,34 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
 }
 
-pub struct ApplicationListener {
-  sock:           TcpListener,
-  token:          Option<Token>,
-  front_address:  SocketAddr
-}
-
 type ClientToken = Token;
 
 pub struct ServerConfiguration {
+  listener:  TcpListener,
+  address:   SocketAddr,
   instances: HashMap<String, Vec<SocketAddr>>,
-  listeners: Slab<ApplicationListener>,
   fronts:    HashMap<String, Vec<HttpFront>>,
   tx:        mpsc::Sender<ServerMessage>
 }
 
 impl ServerConfiguration {
-  pub fn new(max_listeners: usize,  tx: mpsc::Sender<ServerMessage>) -> ServerConfiguration {
-    ServerConfiguration {
-      instances: HashMap::new(),
-      listeners: Slab::new_starting_at(Token(0), max_listeners),
-      fronts:    HashMap::new(),
-      tx:        tx
-    }
-  }
-
-  fn add_tcp_front(&mut self, port: u16, app_id: &str, event_loop: &mut EventLoop<HttpServer>) -> Option<Token> {
-    let addr_string = String::from("127.0.0.1:") + &port.to_string();
-    let front = &addr_string.parse().unwrap();
-
-    if let Ok(listener) = TcpListener::bind(front) {
-
-      let al = ApplicationListener {
-        sock:           listener,
-        token:          None,
-        front_address:  *front,
-      };
-
-      if let Ok(tok) = self.listeners.insert(al) {
-        self.listeners[tok].token = Some(tok);
-        //self.fronts.insert(String::from(app_id), tok);
-        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
-        info!("registered listener({}) on port {}", tok.as_usize(), port);
-        Some(tok)
-      } else {
-        error!("could not register listener on port {}", port);
-        None
+  pub fn new(address: SocketAddr, tx: mpsc::Sender<ServerMessage>, event_loop: &mut EventLoop<HttpServer>) -> io::Result<ServerConfiguration> {
+    //FIXME: should not unwrap here
+    match TcpListener::bind(&address) {
+      Ok(sock) => {
+        event_loop.register(&sock, Token(0), EventSet::readable(), PollOpt::level());
+        Ok(ServerConfiguration {
+          listener:  sock,
+          address:   address,
+          instances: HashMap::new(),
+          fronts:    HashMap::new(),
+          tx:        tx
+        })
+      },
+      Err(e) => {
+        error!("could not create listener {:?}: {:?}", address, e);
+        Err(e)
       }
-    } else {
-      error!("could not declare listener on port {}", port);
-      None
     }
   }
 
@@ -502,9 +480,7 @@ impl ServerConfiguration {
         fronts.push(front2);
     }
 
-    if self.listeners.iter().find(|&l| l.front_address.port() == http_front.port).is_none() {
-      self.add_tcp_front(http_front.port, "", event_loop);
-    }
+    // FIXME: check that http front port matches the listener's port
 
     if self.fronts.get(&http_front.hostname).is_none() {
       self.fronts.insert(http_front.hostname, vec![front3]);
@@ -635,8 +611,8 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
   }
 
   fn accept(&mut self, token: Token) -> Option<(Client<TcpStream>, bool)> {
-    if self.listeners.contains(token) {
-      let accepted = self.listeners[token].sock.accept();
+    if token.as_usize() == 0 {
+      let accepted = self.listener.accept();
 
       if let Ok(Some((frontend_sock, _))) = accepted {
         if let Some(c) = Client::new(frontend_sock) {
@@ -663,7 +639,8 @@ pub fn start() {
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
 
-  let configuration = ServerConfiguration::new(1, tx);
+  let front: SocketAddr = FromStr::from_str("127.0.0.1:8080").unwrap();
+  let configuration = ServerConfiguration::new(front, tx, &mut event_loop).unwrap();
   let mut server = HttpServer::new(1, 500, configuration);
 
   let join_guard = thread::spawn(move|| {
@@ -674,13 +651,13 @@ pub fn start() {
   });
 }
 
-pub fn start_listener(front: SocketAddr, max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
+pub fn start_listener(front: SocketAddr, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
 
-  let configuration = ServerConfiguration::new(max_listeners, tx);
-  let mut server = HttpServer::new(max_listeners, max_connections, configuration);
+  let configuration = ServerConfiguration::new(front, tx, &mut event_loop).unwrap();
+  let mut server = HttpServer::new(1, max_connections, configuration);
 
   let join_guard = thread::spawn(move|| {
     debug!("starting event loop");
@@ -714,7 +691,7 @@ mod tests {
     thread::spawn(|| { start_server(); });
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").unwrap();
     let (tx,rx) = channel::<ServerMessage>();
-    let (sender, jg) = start_listener(front, 10, 10, tx.clone());
+    let (sender, jg) = start_listener(front, 10, tx.clone());
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/"), port: 1024 };
     sender.send(ProxyOrder::Command(Command::AddHttpFront(front)));
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
@@ -771,6 +748,7 @@ mod tests {
     });
   }
 
+  use mio::tcp;
   #[test]
   fn frontend_from_request_test() {
     let app_id1 = "app_1".to_owned();
@@ -792,9 +770,12 @@ mod tests {
 
     let (tx,rx) = channel::<ServerMessage>();
 
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").unwrap();
+    let listener = tcp::TcpListener::bind(&front).unwrap();
     let server_config = ServerConfiguration {
+      listener:  listener,
+      address:   front,
       instances: HashMap::new(),
-      listeners: Slab::new(10),
       fronts:    fronts,
       tx:        tx
     };

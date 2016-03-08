@@ -23,10 +23,10 @@ fn main() {
   let metrics_guard = ProxyMetrics::run();
 
   let (sender, _) = channel::<network::ServerMessage>();
-  let (tx, jg) = network::http::start_listener("127.0.0.1:8080".parse().unwrap(), 10, 500, sender);
+  let (tx, jg) = network::http::start_listener("127.0.0.1:8080".parse().unwrap(), 500, sender);
 
   let (sender2, _) = channel::<network::ServerMessage>();
-  let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 10, 500, sender2);
+  let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 500, sender2);
 
   let mut listeners = HashMap::new();
   listeners.insert(String::from("HTTP"), tx);
