@@ -489,7 +489,7 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(address: SocketAddr, tx: mpsc::Sender<ServerMessage>, event_loop: &mut EventLoop<HttpServer>) -> io::Result<ServerConfiguration> {
+  pub fn new(address: SocketAddr, tx: mpsc::Sender<ServerMessage>, max_connections: usize, event_loop: &mut EventLoop<HttpServer>) -> io::Result<ServerConfiguration> {
     match TcpListener::bind(&address) {
       Ok(sock) => {
         event_loop.register(&sock, Token(0), EventSet::readable(), PollOpt::level());
@@ -499,7 +499,7 @@ impl ServerConfiguration {
           instances: HashMap::new(),
           fronts:    HashMap::new(),
           tx:        tx,
-          pool:      Pool::with_capacity(128, 0, || Buffer::with_capacity(12000)),
+          pool:      Pool::with_capacity(2*max_connections, 0, || Buffer::with_capacity(12000)),
           answers:   DefaultAnswers {
             NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
             ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
@@ -685,7 +685,7 @@ pub fn start_listener(front: SocketAddr, max_connections: usize, tx: mpsc::Sende
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
 
-  let configuration = ServerConfiguration::new(front, tx, &mut event_loop).unwrap();
+  let configuration = ServerConfiguration::new(front, tx, max_connections, &mut event_loop).unwrap();
   let mut server = HttpServer::new(1, max_connections, configuration);
 
   let join_guard = thread::spawn(move|| {
