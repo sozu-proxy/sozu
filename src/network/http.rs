@@ -613,6 +613,7 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
       let conn   = TcpStream::connect(&back);
 
       if let Ok(socket) = conn {
+        socket.set_nodelay(true);
         Ok(socket)
       } else {
         //FIXME: send 503 here
@@ -667,6 +668,7 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
       let accepted = self.listener.accept();
 
       if let Ok(Some((frontend_sock, _))) = accepted {
+        frontend_sock.set_nodelay(true);
         if let Some(c) = Client::new(frontend_sock) {
           return Some((c, false))
         }

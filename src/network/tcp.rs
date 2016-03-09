@@ -511,6 +511,7 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
     let idx = rnd % self.listeners[client.accept_token].back_addresses.len();
     let backend_addr = try!(self.listeners[client.accept_token].back_addresses.get(idx).ok_or(ConnectionError::ToBeDefined));
     let stream = try!(TcpStream::connect(backend_addr).map_err(|_| ConnectionError::ToBeDefined));
+    stream.set_nodelay(true);
 
     Ok(stream)
   }
@@ -569,6 +570,7 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
       let accepted = self.listeners[token].sock.accept();
 
       if let Ok(Some((frontend_sock, _))) = accepted {
+        frontend_sock.set_nodelay(true);
         if let Some(c) = Client::new(frontend_sock, token) {
           return Some((c, true));
         }

@@ -211,6 +211,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
       let accepted = self.listener.accept();
 
       if let Ok(Some((frontend_sock, _))) = accepted {
+        frontend_sock.set_nodelay(true);
         if let Ok(ssl) = Ssl::new(&self.default_context) {
           if let Ok(stream) = NonblockingSslStream::accept(ssl, frontend_sock) {
             if let Some(c) = Client::new(stream) {
