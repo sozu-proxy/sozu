@@ -27,7 +27,7 @@ use network::buffer::Buffer;
 use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,TlsFront};
-use network::http::{HttpProxy,Client,DefaultAnswers};
+use network::http::{Client,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult};
 
 type BackendToken = Token;
@@ -232,22 +232,22 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
 
   fn connect_to_backend(&mut self, client: &mut Client<NonblockingSslStream<TcpStream>>) -> Result<TcpStream,ConnectionError> {
     // FIXME: should check the host corresponds to SNI here
-    let host   = try!(client.http_state().state.get_host().ok_or(ConnectionError::NoHostGiven));
-    let rl     = try!(client.http_state().state.get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-    let conn   = try!(client.http_state().state.get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
+    let host   = try!(client.state().get_host().ok_or(ConnectionError::NoHostGiven));
+    let rl     = try!(client.state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
+    let conn   = try!(client.state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
     let back   = try!(self.backend_from_request(client, &host, &rl.uri));
     //let socket = try!(TcpStream::connect(&back).map_err(|_| ConnectionError::ToBeDefined));
 
     if let Ok(socket) = TcpStream::connect(&back) {
 
-      let position  = client.http_state().state.req_position;
-      let req_state = client.http_state().state.request.clone();
-      client.http_state().state = HttpState {
+      let position  = client.state().req_position;
+      let req_state = client.state().request.clone();
+      client.set_state(HttpState {
         req_position: position,
         res_position: 0,
         request:  req_state,
         response: ResponseState::Initial
-      };
+      });
 
       Ok(socket)
     } else {
