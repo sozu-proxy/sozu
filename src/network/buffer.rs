@@ -1,6 +1,7 @@
 use std::{cmp, ptr};
 use std::io::{self,Write,Read};
 use std::iter::repeat;
+use pool::Reset;
 
 pub struct Buffer {
   memory:   Vec<u8>,
@@ -141,6 +142,12 @@ impl Read for Buffer {
       self.position += len;
     }
     Ok(len)
+  }
+}
+
+impl Reset for Buffer {
+  fn reset(&mut self) {
+    self.reset();
   }
 }
 

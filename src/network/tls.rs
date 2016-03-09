@@ -14,6 +14,7 @@ use bytes::buf::MutBuf;
 use std::collections::HashMap;
 use std::error::Error;
 use mio::util::Slab;
+use pool::Pool;
 use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
 use time::{precise_time_s, precise_time_ns};
@@ -43,6 +44,7 @@ pub struct ServerConfiguration {
   default_context: SslContext,
   contexts:        Rc<RefCell<HashMap<String, SslContext>>>,
   tx:              mpsc::Sender<ServerMessage>,
+  pool:            Pool<Buffer>,
   answers:         DefaultAnswers,
 }
 
@@ -96,6 +98,7 @@ impl ServerConfiguration {
           default_context: context,
           contexts:        rc_ctx,
           tx:              tx,
+          pool:            Pool::with_capacity(128, 0, || Buffer::with_capacity(12000)),
           answers:         DefaultAnswers {
             NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
             ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
@@ -214,8 +217,12 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         frontend_sock.set_nodelay(true);
         if let Ok(ssl) = Ssl::new(&self.default_context) {
           if let Ok(stream) = NonblockingSslStream::accept(ssl, frontend_sock) {
-            if let Some(c) = Client::new(stream) {
-              return Some((c, false))
+            if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
+              if let Some(c) = Client::new(stream, front_buf, back_buf) {
+                return Some((c, false))
+              }
+            } else {
+              error!("could not get buffers from pool");
             }
           } else {
             error!("could not create ssl stream");
@@ -334,6 +341,8 @@ mod tests {
   use std::cell::RefCell;
   use messages::{Command,TlsFront,Instance};
   use mio::util::Slab;
+  use pool::Pool;
+  use network::buffer::Buffer;
   use network::{ProxyOrder,ServerMessage};
   use network::http::DefaultAnswers;
   use openssl::ssl::{SslContext, SslMethod, Ssl, NonblockingSslStream, ServerNameCallback, ServerNameCallbackData};
@@ -452,6 +461,7 @@ mod tests {
       default_context: context,
       contexts: rc_ctx,
       tx:        tx,
+      pool:      Pool::with_capacity(1, 0, || Buffer::with_capacity(12000)),
       answers:   DefaultAnswers {
         NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),

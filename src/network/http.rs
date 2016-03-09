@@ -8,6 +8,7 @@ use std::io::{self,Read,Write,ErrorKind};
 use mio::*;
 use bytes::{ByteBuf,MutByteBuf};
 use bytes::buf::MutBuf;
+use pool::{Pool,Checkout};
 use std::collections::HashMap;
 use std::error::Error;
 use mio::util::Slab;
@@ -46,8 +47,8 @@ pub struct Client<Front:SocketHandler> {
   status:         ClientStatus,
 
   state:              HttpState,
-  front_buf:          Buffer,
-  back_buf:           Buffer,
+  front_buf:          Checkout<Buffer>,
+  back_buf:           Checkout<Buffer>,
   front_buf_position: usize,
   back_buf_position:  usize,
   start:              u64,
@@ -56,7 +57,7 @@ pub struct Client<Front:SocketHandler> {
 }
 
 impl<Front:SocketHandler> Client<Front> {
-  pub fn new(sock: Front) -> Option<Client<Front>> {
+  pub fn new(sock: Front, front_buf: Checkout<Buffer>, back_buf: Checkout<Buffer>) -> Option<Client<Front>> {
     Some(Client {
       frontend:       sock,
       backend:        None,
@@ -69,8 +70,8 @@ impl<Front:SocketHandler> Client<Front> {
       status:         ClientStatus::Normal,
 
       state:              HttpState::new(),
-      front_buf:          Buffer::with_capacity(12000),
-      back_buf:           Buffer::with_capacity(12000),
+      front_buf:          front_buf,
+      back_buf:           back_buf,
       front_buf_position: 0,
       back_buf_position:  0,
       start:              precise_time_ns(),
@@ -483,6 +484,7 @@ pub struct ServerConfiguration {
   instances: HashMap<String, Vec<SocketAddr>>,
   fronts:    HashMap<String, Vec<HttpFront>>,
   tx:        mpsc::Sender<ServerMessage>,
+  pool:      Pool<Buffer>,
   answers:   DefaultAnswers,
 }
 
@@ -497,6 +499,7 @@ impl ServerConfiguration {
           instances: HashMap::new(),
           fronts:    HashMap::new(),
           tx:        tx,
+          pool:      Pool::with_capacity(128, 0, || Buffer::with_capacity(12000)),
           answers:   DefaultAnswers {
             NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
             ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
@@ -657,8 +660,12 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
 
       if let Ok(Some((frontend_sock, _))) = accepted {
         frontend_sock.set_nodelay(true);
-        if let Some(c) = Client::new(frontend_sock) {
-          return Some((c, false))
+        if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
+          if let Some(c) = Client::new(frontend_sock, front_buf, back_buf) {
+            return Some((c, false))
+          }
+        } else {
+          error!("could not get buffers from pool");
         }
       }
     } else {
@@ -706,6 +713,8 @@ mod tests {
   use std::time::Duration;
   use messages::{Command,HttpFront,Instance};
   use network::{ProxyOrder,ServerMessage};
+  use network::buffer::Buffer;
+  use pool::Pool;
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
@@ -800,6 +809,7 @@ mod tests {
       instances: HashMap::new(),
       fronts:    fronts,
       tx:        tx,
+      pool:      Pool::with_capacity(1,0, || Buffer::with_capacity(12000)),
       answers:   DefaultAnswers {
         NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),

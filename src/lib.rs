@@ -9,6 +9,7 @@ extern crate env_logger;
 extern crate rustc_serialize;
 extern crate rand;
 extern crate openssl;
+extern crate pool;
 
 pub mod network;
 pub mod parser;
