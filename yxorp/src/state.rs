@@ -2,7 +2,7 @@ use rustc_serialize::{Encodable, Decodable, Decoder};
 use std::collections::HashMap;
 use toml::encode_str;
 
-use yxorp::messages::{Command,HttpFront,Instance};
+use yxorp::messages::{Command,HttpFront,TlsFront,Instance};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct HttpProxyInstance {
@@ -118,6 +118,83 @@ impl HttpProxy {
   }
 }
 
+impl TlsProxy {
+  fn new(ip: String, port: u16) -> TlsProxy {
+    TlsProxy {
+      ip_address: ip,
+      port:       port,
+      fronts:     HashMap::new(),
+    }
+  }
+
+  fn handle_command(&mut self, command: &Command) {
+    match command {
+      &Command::AddTlsFront(ref front) => {
+        let f = TlsProxyFront {
+          app_id:     front.app_id.clone(),
+          hostname:   front.hostname.clone(),
+          path_begin: front.path_begin.clone(),
+          port:       front.port,
+          cert_path:  front.cert_path.clone(),
+          key_path:   front.key_path.clone(),
+          instances:  Vec::new()
+        };
+        self.fronts.insert(front.app_id.clone(), f);
+      },
+      &Command::RemoveTlsFront(ref front) => {
+        self.fronts.remove(&front.app_id);
+      },
+      &Command::AddInstance(ref instance)  => {
+        if let Some(front) = self.fronts.get_mut(&instance.app_id) {
+          let inst = HttpProxyInstance {
+            ip_address: instance.ip_address.clone(),
+            port:       instance.port,
+          };
+          front.instances.push(inst);
+        }
+      },
+      &Command::RemoveInstance(ref instance) => {
+        if let Some(front) = self.fronts.get_mut(&instance.app_id) {
+          let mut v = Vec::new();
+          for el in front.instances.iter() {
+            if el.ip_address != instance.ip_address || el.port != instance.port {
+              v.push(el.clone());
+            }
+          }
+          front.instances = v;
+        }
+      }
+      _ => {}
+    }
+  }
+
+  fn generate_commands(&self) -> Vec<Command> {
+    let mut v = Vec::new();
+    for (app_id, front) in &self.fronts {
+      v.push(Command::AddTlsFront(TlsFront {
+        app_id:     app_id.clone(),
+        hostname:   front.hostname.clone(),
+        path_begin: front.path_begin.clone(),
+        port:       front.port.clone(),
+        cert_path:  front.cert_path.clone(),
+        key_path:   front.key_path.clone(),
+      }));
+      for instance in front.instances.iter() {
+        v.push(Command::AddInstance(Instance {
+          app_id:     app_id.clone(),
+          ip_address: instance.ip_address.clone(),
+          port:       instance.port.clone(),
+        }));
+      }
+    }
+
+    v
+  }
+
+  fn encode(&self) -> String {
+    encode_str(self)
+  }
+}
 #[cfg(test)]
 mod tests {
   use super::*;
