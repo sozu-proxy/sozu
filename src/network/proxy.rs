@@ -104,8 +104,8 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
     }
   }
 
-  pub fn accept(&mut self, event_loop: &mut EventLoop<Self>) {
-    if let Some((client, should_connect)) = self.configuration.accept() {
+  pub fn accept(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
+    if let Some((client, should_connect)) = self.configuration.accept(token) {
       if let Ok(client_token) = self.clients.insert(client) {
         event_loop.register(self.clients[client_token].front_socket(), client_token, EventSet::readable(), PollOpt::edge());
         &self.clients[client_token].set_front_token(client_token);
@@ -227,7 +227,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
       match socket_type(token, self.max_listeners, self.max_connections) {
         Some(SocketType::Listener) => {
-          self.accept(event_loop)
+          self.accept(event_loop, token)
         }
 
         Some(SocketType::FrontClient) => {

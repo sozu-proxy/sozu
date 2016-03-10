@@ -658,7 +658,7 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self) -> Option<(Client<TcpStream>, bool)> {
+  fn accept(&mut self, token: Token) -> Option<(Client<TcpStream>, bool)> {
     if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
       let accepted = self.listener.accept();
 

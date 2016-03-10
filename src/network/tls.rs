@@ -209,7 +209,7 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for ServerConfiguration {
-  fn accept(&mut self) -> Option<(Client<NonblockingSslStream<TcpStream>>,bool)> {
+  fn accept(&mut self, token: Token) -> Option<(Client<NonblockingSslStream<TcpStream>>,bool)> {
     if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
       let accepted = self.listener.accept();
 
