@@ -8,6 +8,7 @@ dependencies = [
  "mio 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "nom 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustc-serialize 0.3.18 (registry+https://github.com/rust-lang/crates.io-index)",
+ "toml 0.1.27 (registry+https://github.com/rust-lang/crates.io-index)",
  "yxorp 0.1.0",
 ]
 
@@ -206,6 +207,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "pool"
+version = "0.1.3"
+source = "git+https://github.com/Geal/pool.git#04fb7aa7d5752f7b7ff20fbbc5545602f0c42556"
+
+[[package]]
 name = "rand"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -258,6 +264,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml"
+version = "0.1.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "rustc-serialize 0.3.18 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "user32-sys"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -302,9 +316,11 @@ dependencies = [
  "mio 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "nom 1.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "openssl 0.7.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "pool 0.1.3 (git+https://github.com/Geal/pool.git)",
  "rand 0.3.14 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustc-serialize 0.3.18 (registry+https://github.com/rust-lang/crates.io-index)",
  "slab 0.1.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "time 0.1.34 (registry+https://github.com/rust-lang/crates.io-index)",
+ "toml 0.1.27 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
