@@ -80,9 +80,9 @@ impl HttpProxy {
       &Command::RemoveInstance(ref instance) => {
         if let Some(front) = self.fronts.get_mut(&instance.app_id) {
           let mut v = Vec::new();
-          for el in front.instances.drain(..) {
+          for el in front.instances.iter() {
             if el.ip_address != instance.ip_address || el.port != instance.port {
-              v.push(el);
+              v.push(el.clone());
             }
           }
           front.instances = v;
