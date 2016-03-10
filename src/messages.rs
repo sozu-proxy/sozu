@@ -34,6 +34,14 @@ pub struct Instance {
     pub port: u16
 }
 
+#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+pub struct HttpProxyConfiguration {
+    pub front_timeout: u64,
+    pub back_timeout:  u64,
+    pub answer_404:    String,
+    pub answer_503:    String,
+}
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcEncodable)]
 pub enum Command {
     AddHttpFront(HttpFront),
@@ -46,7 +54,9 @@ pub enum Command {
     RemoveTcpFront(TcpFront),
 
     AddInstance(Instance),
-    RemoveInstance(Instance)
+    RemoveInstance(Instance),
+
+    HttpProxy(HttpProxyConfiguration),
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
@@ -65,7 +75,8 @@ impl Command {
       Command::AddTcpFront(_)     => vec![Topic::TcpProxyConfig                        ],
       Command::RemoveTcpFront(_)  => vec![Topic::TcpProxyConfig                        ],
       Command::AddInstance(_)     => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
-      Command::RemoveInstance(_)  => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig]
+      Command::RemoveInstance(_)  => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
+      Command::HttpProxy(_)       => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig],
     }
   }
 }
@@ -99,6 +110,9 @@ impl Decodable for Command {
       } else if &command_type == "REMOVE_INSTANCE" {
         let instance = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
         Ok(Command::RemoveInstance(instance))
+      } else if &command_type == "CONFIGURE_HTTP_PROXY" {
+        let conf = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
+        Ok(Command::HttpProxy(conf))
       } else {
         Err(decoder.error("unrecognized command"))
       }

@@ -46,6 +46,8 @@ pub struct ServerConfiguration {
   tx:              mpsc::Sender<ServerMessage>,
   pool:            Pool<Buffer>,
   answers:         DefaultAnswers,
+  front_timeout:   u64,
+  back_timeout:    u64,
 }
 
 impl ServerConfiguration {
@@ -99,6 +101,8 @@ impl ServerConfiguration {
           contexts:        rc_ctx,
           tx:              tx,
           pool:            Pool::with_capacity(2*max_connections, 0, || Buffer::with_capacity(12000)),
+          front_timeout:   50000,
+          back_timeout:    50000,
           answers:         DefaultAnswers {
             NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
             ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
@@ -293,6 +297,15 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
           self.tx.send(ServerMessage::RemovedInstance);
         }
       },
+      ProxyOrder::Command(Command::HttpProxy(configuration)) => {
+        info!("modifying proxy configuration: {:?}", configuration);
+        self.front_timeout = configuration.front_timeout;
+        self.back_timeout  = configuration.back_timeout;
+        self.answers = DefaultAnswers {
+          NotFound:           configuration.answer_404.into_bytes(),
+          ServiceUnavailable: configuration.answer_503.into_bytes(),
+        };
+      },
       ProxyOrder::Stop                   => {
         event_loop.shutdown();
       },
@@ -300,6 +313,14 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         error!("unsupported message, ignoring");
       }
     }
+  }
+
+  fn front_timeout(&self) -> u64 {
+    self.front_timeout
+  }
+
+  fn back_timeout(&self)  -> u64 {
+    self.back_timeout
   }
 }
 
@@ -460,6 +481,8 @@ mod tests {
       contexts: rc_ctx,
       tx:        tx,
       pool:      Pool::with_capacity(1, 0, || Buffer::with_capacity(12000)),
+      front_timeout: 50000,
+      back_timeout:  50000,
       answers:   DefaultAnswers {
         NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),

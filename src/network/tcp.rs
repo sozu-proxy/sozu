@@ -411,7 +411,9 @@ pub struct ServerConfiguration {
   fronts:    HashMap<String, Token>,
   instances: HashMap<String, Vec<SocketAddr>>,
   listeners: Slab<ApplicationListener>,
-  tx:        mpsc::Sender<ServerMessage>
+  tx:        mpsc::Sender<ServerMessage>,
+  front_timeout:   u64,
+  back_timeout:    u64,
 }
 
 impl ServerConfiguration {
@@ -420,7 +422,9 @@ impl ServerConfiguration {
       instances: HashMap::new(),
       listeners: Slab::new_starting_at(Token(0), max_listeners),
       fronts:    HashMap::new(),
-      tx:        tx
+      tx:        tx,
+      front_timeout: 50000,
+      back_timeout:  50000,
     }
   }
 
@@ -579,6 +583,13 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
     None
   }
 
+  fn front_timeout(&self) -> u64 {
+    self.front_timeout
+  }
+
+  fn back_timeout(&self)  -> u64 {
+    self.back_timeout
+  }
 }
 
 pub type TcpServer = Server<ServerConfiguration,Client>;
