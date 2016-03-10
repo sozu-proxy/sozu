@@ -119,11 +119,7 @@ mod tests {
 
     let new_state: Option<HttpProxy> = decode_str(&encoded);
     println!("deserialized:\n{:?}", new_state);
-    assert!(false);
+    assert_eq!(new_state, Some(state));
+    //assert!(false);
   }
 }
-/*
-pub struct ConfigState {
-  listeners
-}
-*/
