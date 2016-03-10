@@ -658,26 +658,21 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: Token) -> Option<(Client<TcpStream>, bool)> {
-    if token.as_usize() == 0 {
-      if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
-        let accepted = self.listener.accept();
+  fn accept(&mut self) -> Option<(Client<TcpStream>, bool)> {
+    if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
+      let accepted = self.listener.accept();
 
-        if let Ok(Some((frontend_sock, _))) = accepted {
-          frontend_sock.set_nodelay(true);
-          if let Some(c) = Client::new(frontend_sock, front_buf, back_buf) {
-            return Some((c, false))
-          }
-        } else {
-          error!("could not accept: {:?}", accepted);
+      if let Ok(Some((frontend_sock, _))) = accepted {
+        frontend_sock.set_nodelay(true);
+        if let Some(c) = Client::new(frontend_sock, front_buf, back_buf) {
+          return Some((c, false))
         }
       } else {
-        error!("could not get buffers from pool");
+        error!("could not accept: {:?}", accepted);
       }
     } else {
-      error!("listener not found for this socket accept");
+      error!("could not get buffers from pool");
     }
-
     None
   }
 

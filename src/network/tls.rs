@@ -209,30 +209,28 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for ServerConfiguration {
-  fn accept(&mut self, token: Token) -> Option<(Client<NonblockingSslStream<TcpStream>>,bool)> {
-    if token.as_usize() == 0 {
-      if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
-        let accepted = self.listener.accept();
+  fn accept(&mut self) -> Option<(Client<NonblockingSslStream<TcpStream>>,bool)> {
+    if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
+      let accepted = self.listener.accept();
 
-        if let Ok(Some((frontend_sock, _))) = accepted {
-          frontend_sock.set_nodelay(true);
-          if let Ok(ssl) = Ssl::new(&self.default_context) {
-            if let Ok(stream) = NonblockingSslStream::accept(ssl, frontend_sock) {
-              if let Some(c) = Client::new(stream, front_buf, back_buf) {
-                return Some((c, false))
-              }
-            } else {
-              error!("could not create ssl stream");
+      if let Ok(Some((frontend_sock, _))) = accepted {
+        frontend_sock.set_nodelay(true);
+        if let Ok(ssl) = Ssl::new(&self.default_context) {
+          if let Ok(stream) = NonblockingSslStream::accept(ssl, frontend_sock) {
+            if let Some(c) = Client::new(stream, front_buf, back_buf) {
+              return Some((c, false))
             }
           } else {
-            error!("could not create ssl context");
+            error!("could not create ssl stream");
           }
         } else {
-          error!("could not accept connection: {:?}", accepted);
+          error!("could not create ssl context");
         }
       } else {
-        error!("could not get buffers from pool");
+        error!("could not accept connection: {:?}", accepted);
       }
+    } else {
+      error!("could not get buffers from pool");
     }
     None
   }
