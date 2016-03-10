@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use yxorp::network;
 use yxorp::network::metrics::{METRICS,ProxyMetrics};
 
+use command::{Listener,ListenerType};
+
 fn main() {
   env_logger::init().unwrap();
   info!("starting up");
@@ -31,8 +33,10 @@ fn main() {
   let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 500, None, sender2);
 
   let mut listeners = HashMap::new();
-  listeners.insert(String::from("HTTP"), tx);
-  listeners.insert(String::from("TLS"),  tx2);
+  let l1 = Listener::new(String::from("HTTP"), ListenerType::HTTP, String::from("127.0.0.1"), 8080, tx);
+  let l2 = Listener::new(String::from("TLS"),  ListenerType::HTTPS, String::from("127.0.0.1"), 8443, tx2);
+  listeners.insert(String::from("HTTP"), l1);
+  listeners.insert(String::from("TLS"),  l2);
   command::start(String::from("./command_folder"), listeners);
   let _ = jg.join();
   info!("good bye");

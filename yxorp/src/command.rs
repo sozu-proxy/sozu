@@ -17,7 +17,39 @@ use yxorp::network::ProxyOrder;
 use yxorp::network::buffer::Buffer;
 use yxorp::messages::Command;
 
+use state::{HttpProxy,TlsProxy,ConfigState};
+
 const SERVER: Token = Token(0);
+
+pub enum ListenerType {
+  HTTP,
+  HTTPS,
+  TCP
+}
+
+pub struct Listener {
+  pub tag:           String,
+  pub listener_type: ListenerType,
+  pub sender:        Sender<ProxyOrder>,
+  pub state:         ConfigState,
+}
+
+impl Listener {
+  pub fn new(tag: String, listener_type: ListenerType, ip_address: String, port: u16, sender: Sender<ProxyOrder>) -> Listener {
+    let state = match listener_type {
+      ListenerType::HTTP  => ConfigState::Http(HttpProxy::new(ip_address, port)),
+      ListenerType::HTTPS => ConfigState::Tls(TlsProxy::new(ip_address, port)),
+      _                   => unimplemented!(),
+    };
+
+    Listener {
+      tag:           tag,
+      listener_type: listener_type,
+      sender:        sender,
+      state:         state,
+    }
+  }
+}
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct ConfigMessage {
@@ -111,7 +143,7 @@ fn parse(input: &[u8]) -> IResult<&[u8], Vec<ConfigMessage>> {
 struct CommandServer {
   sock:  UnixListener,
   conns: Slab<CommandClient>,
-  listeners: HashMap<String, Sender<ProxyOrder>>,
+  listeners: HashMap<String, Listener>,
 }
 
 impl CommandServer {
@@ -140,18 +172,19 @@ impl CommandServer {
     &mut self.conns[tok]
   }
 
-  fn dispatch(&self, v: Vec<ConfigMessage>) {
+  fn dispatch(&mut self, v: Vec<ConfigMessage>) {
     for message in &v {
       let command = message.command.clone();
-      if let Some(ref listener) = self.listeners.get(&message.listener) {
-        listener.send(ProxyOrder::Command(command));
+      if let Some(ref mut listener) = self.listeners.get_mut (&message.listener) {
+        listener.state.handle_command(&command);
+        listener.sender.send(ProxyOrder::Command(command));
       } else {
         log!(log::LogLevel::Error, "no listener found for tag: {}", message.listener);
       }
     }
   }
 
-  fn new(srv: UnixListener, listeners: HashMap<String, Sender<ProxyOrder>>) -> CommandServer {
+  fn new(srv: UnixListener, listeners: HashMap<String, Listener>) -> CommandServer {
     let mut v = Vec::with_capacity(2048);
     v.extend(repeat(0).take(2048));
     CommandServer {
@@ -208,7 +241,7 @@ impl Handler for CommandServer {
   }
 }
 
-pub fn start(folder: String, listeners: HashMap<String, Sender<ProxyOrder>>) {
+pub fn start(folder: String, listeners: HashMap<String, Listener>) {
   thread::spawn(move || {
     let mut event_loop = EventLoop::new().unwrap();
     let addr = PathBuf::from(folder).join(&PathBuf::from("./sock"));

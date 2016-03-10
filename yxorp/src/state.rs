@@ -44,8 +44,38 @@ pub struct TlsProxy {
   fronts:     HashMap<String, TlsProxyFront>
 }
 
+//#[derive(Debug,Clone,PartialEq,Eq,RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub enum ConfigState {
+  Http(HttpProxy),
+  Tls(TlsProxy),
+}
+
+impl ConfigState {
+  pub fn handle_command(&mut self, command: &Command) {
+    match *self {
+      ConfigState::Http(ref mut state) => state.handle_command(command),
+      ConfigState::Tls(ref mut state)  => state.handle_command(command),
+    }
+  }
+
+  pub fn generate_commands(&self) -> Vec<Command> {
+    match *self {
+      ConfigState::Http(ref state) => state.generate_commands(),
+      ConfigState::Tls(ref state)  => state.generate_commands(),
+    }
+  }
+
+  pub fn encode(&self) -> String {
+    match *self {
+      ConfigState::Http(ref state) => state.encode(),
+      ConfigState::Tls(ref state)  => state.encode(),
+    }
+  }
+}
+
 impl HttpProxy {
-  fn new(ip: String, port: u16) -> HttpProxy {
+  pub fn new(ip: String, port: u16) -> HttpProxy {
     HttpProxy {
       ip_address: ip,
       port:       port,
@@ -53,7 +83,7 @@ impl HttpProxy {
     }
   }
 
-  fn handle_command(&mut self, command: &Command) {
+  pub fn handle_command(&mut self, command: &Command) {
     match command {
       &Command::AddHttpFront(ref front) => {
         let f = HttpProxyFront {
@@ -92,7 +122,7 @@ impl HttpProxy {
     }
   }
 
-  fn generate_commands(&self) -> Vec<Command> {
+  pub fn generate_commands(&self) -> Vec<Command> {
     let mut v = Vec::new();
     for (app_id, front) in &self.fronts {
       v.push(Command::AddHttpFront(HttpFront {
@@ -113,13 +143,13 @@ impl HttpProxy {
     v
   }
 
-  fn encode(&self) -> String {
+  pub fn encode(&self) -> String {
     encode_str(self)
   }
 }
 
 impl TlsProxy {
-  fn new(ip: String, port: u16) -> TlsProxy {
+  pub fn new(ip: String, port: u16) -> TlsProxy {
     TlsProxy {
       ip_address: ip,
       port:       port,
@@ -127,7 +157,7 @@ impl TlsProxy {
     }
   }
 
-  fn handle_command(&mut self, command: &Command) {
+  pub fn handle_command(&mut self, command: &Command) {
     match command {
       &Command::AddTlsFront(ref front) => {
         let f = TlsProxyFront {
@@ -168,7 +198,7 @@ impl TlsProxy {
     }
   }
 
-  fn generate_commands(&self) -> Vec<Command> {
+  pub fn generate_commands(&self) -> Vec<Command> {
     let mut v = Vec::new();
     for (app_id, front) in &self.fronts {
       v.push(Command::AddTlsFront(TlsFront {
@@ -191,7 +221,7 @@ impl TlsProxy {
     v
   }
 
-  fn encode(&self) -> String {
+  pub fn encode(&self) -> String {
     encode_str(self)
   }
 }
