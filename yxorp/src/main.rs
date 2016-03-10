@@ -28,7 +28,7 @@ fn main() {
   let (tx, jg) = network::http::start_listener("127.0.0.1:8080".parse().unwrap(), 500, sender);
 
   let (sender2, _) = channel::<network::ServerMessage>();
-  let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 500, sender2);
+  let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 500, None, sender2);
 
   let mut listeners = HashMap::new();
   listeners.insert(String::from("HTTP"), tx);
