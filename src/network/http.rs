@@ -408,7 +408,11 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         SocketResult::Error => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure),
         _                   => {
           match self.state.response {
-            ResponseState::Response(_,_) => panic!("should not go back in back_readable if the whole response was parsed"),
+            ResponseState::Response(_,_) => {
+              //FIXME: this keeps happening, why? Readable event already in queue when parsing ended?
+              error!("should not go back in back_readable if the whole response was parsed");
+              return  (RequiredEvents::FrontWriteBackNone, ClientResult::Continue);
+            },
             ResponseState::ResponseWithBody(_,_,_) => {
               //FIXME: should only read as much data as needed (ie not further than req_position)
               if self.back_buf_position + self.back_buf.available_data() >= self.state.res_position {
