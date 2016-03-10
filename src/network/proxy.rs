@@ -346,13 +346,13 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
       },
       Some(SocketType::FrontClient) => {
         if self.clients.contains(token) {
-          error!("frontend [{}] got timeout, closing", timeout);
+          debug!("frontend [{}] got timeout, closing", timeout);
           self.close_client(event_loop, token);
         }
       },
       Some(SocketType::BackClient) => {
         if let Some(tok) = self.get_client_token(token) {
-          error!("backend [{}] got timeout, closing", timeout);
+          debug!("backend [{}] got timeout, closing", timeout);
           self.close_client(event_loop, tok);
         }
       }
