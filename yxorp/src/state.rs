@@ -2,7 +2,7 @@ use rustc_serialize::{Encodable, Decodable, Decoder};
 use std::collections::HashMap;
 use toml::encode_str;
 
-use yxorp::messages::Command;
+use yxorp::messages::{Command,HttpFront,Instance};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct HttpProxyInstance {
@@ -90,6 +90,27 @@ impl HttpProxy {
       }
       _ => {}
     }
+  }
+
+  fn generate_commands(&self) -> Vec<Command> {
+    let mut v = Vec::new();
+    for (app_id, front) in &self.fronts {
+      v.push(Command::AddHttpFront(HttpFront {
+        app_id:     app_id.clone(),
+        hostname:   front.hostname.clone(),
+        path_begin: front.path_begin.clone(),
+        port:       front.port.clone(),
+      }));
+      for instance in front.instances.iter() {
+        v.push(Command::AddInstance(Instance {
+          app_id:     app_id.clone(),
+          ip_address: instance.ip_address.clone(),
+          port:       instance.port.clone(),
+        }));
+      }
+    }
+
+    v
   }
 
   fn encode(&self) -> String {
