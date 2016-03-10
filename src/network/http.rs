@@ -667,6 +667,8 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
         } else {
           error!("could not get buffers from pool");
         }
+      } else {
+        error!("could not accept: {:?}", accepted);
       }
     } else {
       error!("listener not found for this socket accept");
