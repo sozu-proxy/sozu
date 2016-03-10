@@ -59,12 +59,6 @@ pub enum Command {
     HttpProxy(HttpProxyConfiguration),
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
-pub struct ConfigMessage {
-    pub listener: String,
-    pub command:  Command
-}
-
 impl Command {
   pub fn get_topics(&self) -> Vec<Topic> {
     match *self {
@@ -181,20 +175,6 @@ mod tests {
       app_id: String::from("xxx"),
       ip_address: String::from("yyy"),
       port: 8080
-    }));
-  }
-
-  #[test]
-  fn config_message_test() {
-    let raw_json = r#"{ "listener": "HTTP", "command":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}} }"#;
-    let config: ConfigMessage = json::decode(raw_json).unwrap();
-    println!("{:?}", config);
-    assert_eq!(config.listener, "HTTP");
-    assert_eq!(config.command, Command::AddHttpFront(HttpFront{
-      app_id: String::from("xxx"),
-      hostname: String::from("yyy"),
-      path_begin: String::from("xxx"),
-      port: 4242
     }));
   }
 }
