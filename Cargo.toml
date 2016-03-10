@@ -21,7 +21,7 @@ version = "0.4"
 
 [dependencies.openssl]
 version = "~0.7.0"
-features = ["tlsv1_2", "tlsv1_1"]
+features = ["tlsv1_2", "tlsv1_1", "rfc5114", "ecdh_auto"]
 
 [dependencies.pool]
 git = "https://github.com/Geal/pool.git"

@@ -1,12 +1,14 @@
 #[macro_use] extern crate log;
 extern crate env_logger;
 extern crate yxorp;
+extern crate openssl;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
 use yxorp::network;
 use yxorp::messages;
 use yxorp::network::metrics::{METRICS,ProxyMetrics};
+use openssl::ssl;
 
 fn main() {
   env_logger::init().unwrap();
@@ -26,7 +28,25 @@ fn main() {
   tx.send(network::ProxyOrder::Command(messages::Command::AddInstance(http_instance)));
 
   let (sender2, _) = channel::<network::ServerMessage>();
-  let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 500, sender2);
+
+  let options = ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |
+               ssl::SSL_OP_NO_TICKET | ssl::SSL_OP_NO_SSLV2 |
+               ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1;
+  let cipher_list = String::from("ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
+                              ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
+                              ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
+                              DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:\
+                              ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:\
+                              ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:\
+                              ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA384:\
+                              ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA256:\
+                              DHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA:\
+                              ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:\
+                              EDH-RSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:\
+                              AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:\
+                              !DSS");
+
+  let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 500, Some((options, cipher_list)), sender2);
   let tls_front = messages::TlsFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st"), path_begin: String::from("/"), port: 8443, cert_path: String::from("assets/certificate.pem"), key_path: String::from("assets/key.pem") };
   tx2.send(network::ProxyOrder::Command(messages::Command::AddTlsFront(tls_front)));
   let tls_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };

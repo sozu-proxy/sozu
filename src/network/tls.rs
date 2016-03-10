@@ -19,9 +19,12 @@ use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
 use time::{precise_time_s, precise_time_ns};
 use rand::random;
-use openssl::ssl::{SslContext, SslMethod, Ssl, NonblockingSslStream, ServerNameCallback, ServerNameCallbackData};
+use openssl::ssl::{SslContext, SslContextOptions, SslMethod,
+                   Ssl, NonblockingSslStream, ServerNameCallback,
+                   ServerNameCallbackData};
 use openssl::ssl::error::NonblockingSslError;
 use openssl::x509::X509FileType;
+use openssl::dh::DH;
 
 use parser::http11::{HttpState,RequestState,ResponseState,parse_request_until_stop};
 use network::buffer::Buffer;
@@ -51,11 +54,19 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(address: SocketAddr, tx: mpsc::Sender<ServerMessage>, max_connections: usize, event_loop: &mut EventLoop<TlsServer>) -> io::Result<ServerConfiguration> {
+  pub fn new(address: SocketAddr, tx: mpsc::Sender<ServerMessage>, max_connections: usize, options: Option<(SslContextOptions, String)>, event_loop: &mut EventLoop<TlsServer>) -> io::Result<ServerConfiguration> {
     let contexts = HashMap::new();
 
-    let mut context = SslContext::new(SslMethod::Tlsv1).unwrap();
-    //let mut context = SslContext::new(SslMethod::Sslv3).unwrap();
+    let mut context = SslContext::new(SslMethod::Tlsv1_2).unwrap();
+    if let Some((tls_options, ciphers)) = options {
+      context.set_options(tls_options);
+      context.set_cipher_list(&ciphers);
+    }
+
+    let dh = DH::get_2048_256().unwrap();
+    context.set_tmp_dh(dh);
+    context.set_ecdh_auto(true);
+
     context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
     context.set_private_key_file("assets/key.pem", X509FileType::PEM);
 
@@ -326,13 +337,13 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
 
 pub type TlsServer = Server<ServerConfiguration,Client<NonblockingSslStream<TcpStream>>>;
 
-pub fn start_listener(front: SocketAddr, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
+pub fn start_listener(front: SocketAddr, max_connections: usize, options: Option<(SslContextOptions, String)>, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
 
   let join_guard = thread::spawn(move|| {
-    let configuration = ServerConfiguration::new(front, tx, max_connections, &mut event_loop).unwrap();
+    let configuration = ServerConfiguration::new(front, tx, max_connections, options, &mut event_loop).unwrap();
     let mut server = TlsServer::new(1, max_connections, configuration);
 
     info!("starting event loop");
