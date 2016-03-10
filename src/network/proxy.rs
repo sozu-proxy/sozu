@@ -23,8 +23,8 @@ use network::metrics::{METRICS,ProxyMetrics};
 use messages::{TcpFront,Command,Instance};
 
 const SERVER: Token = Token(0);
-const FRONT_TIMEOUT: u64 = 10000;
-const BACK_TIMEOUT:  u64 = 10000;
+const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
+const DEFAULT_BACK_TIMEOUT:  u64 = 50000;
 type ClientToken = Token;
 
 pub trait ProxyClient {
@@ -61,6 +61,8 @@ pub struct Server<ServerConfiguration,Client> {
   backend:         Slab<ClientToken>,
   max_listeners:   usize,
   max_connections: usize,
+  front_timeout:   u64,
+  back_timeout:    u64,
 }
 
 impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, Client>,Client:ProxyClient> Server<ServerConfiguration,Client> {
@@ -71,6 +73,8 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
       backend:         Slab::new_starting_at(Token(max_listeners+max_connections), max_connections),
       max_listeners:   max_listeners,
       max_connections: max_connections,
+      front_timeout:   DEFAULT_FRONT_TIMEOUT,
+      back_timeout:    DEFAULT_BACK_TIMEOUT,
     }
   }
 
@@ -109,7 +113,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
       if let Ok(client_token) = self.clients.insert(client) {
         event_loop.register(self.clients[client_token].front_socket(), client_token, EventSet::readable(), PollOpt::edge());
         &self.clients[client_token].set_front_token(client_token);
-        if let Ok(timeout) = event_loop.timeout_ms(client_token.as_usize(), FRONT_TIMEOUT) {
+        if let Ok(timeout) = event_loop.timeout_ms(client_token.as_usize(), self.front_timeout) {
           &self.clients[client_token].set_front_timeout(timeout);
         }
         METRICS.lock().unwrap().gauge("accept", 1);
@@ -134,7 +138,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
           if let Some(sock) = self.clients[token].back_socket() {
             event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge());
           }
-          if let Ok(timeout) = event_loop.timeout_ms(backend_token.as_usize(), BACK_TIMEOUT) {
+          if let Ok(timeout) = event_loop.timeout_ms(backend_token.as_usize(), self.back_timeout) {
             &self.clients[token].set_back_timeout(timeout);
           }
           return;
@@ -239,7 +243,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
               //println!("[{}] clearing timeout", token.as_usize());
               event_loop.clear_timeout(timeout);
             }
-            if let Ok(timeout) = event_loop.timeout_ms(token.as_usize(), FRONT_TIMEOUT) {
+            if let Ok(timeout) = event_loop.timeout_ms(token.as_usize(), self.front_timeout) {
               //println!("[{}] resetting timeout", token.as_usize());
               &self.clients[token].set_front_timeout(timeout);
             }
@@ -259,7 +263,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
               //println!("[{}] clearing timeout", token.as_usize());
               event_loop.clear_timeout(timeout);
             }
-            if let Ok(timeout) = event_loop.timeout_ms(token.as_usize(), BACK_TIMEOUT) {
+            if let Ok(timeout) = event_loop.timeout_ms(token.as_usize(), self.back_timeout) {
               //println!("[{}] resetting timeout", token.as_usize());
               &self.clients[tok].set_back_timeout(timeout);
             }
