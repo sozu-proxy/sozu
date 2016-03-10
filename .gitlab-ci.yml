@@ -12,6 +12,8 @@ rustbuild-1.5:
     - cat /rust_update_date.txt
     - cargo build
     - cargo test
+    - cd yxorp && cargo test
+    - cd ..
     - ./docker_tests/run_nginx.sh
     - RUST_LOG=info ./target/debug/examples/main &
     - sleep 5
@@ -28,6 +30,8 @@ rustbuild-1.6:
     - cat /rust_update_date.txt
     - cargo build
     - cargo test
+    - cd yxorp && cargo test
+    - cd ..
     - ./docker_tests/run_nginx.sh
     - RUST_LOG=info ./target/debug/examples/main &
     - sleep 5
@@ -46,6 +50,8 @@ rustbuild-1.7:
     - cat /rust_update_date.txt
     - cargo build
     - cargo test
+    - cd yxorp && cargo test
+    - cd ..
     - ./docker_tests/run_nginx.sh
     - RUST_LOG=info ./target/debug/examples/main &
     - sleep 5
