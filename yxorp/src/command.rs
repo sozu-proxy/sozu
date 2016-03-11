@@ -10,7 +10,8 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::collections::HashMap;
 use log;
-use rustc_serialize::json::decode;
+use rustc_serialize::json::{decode,encode};
+use rustc_serialize::{Encodable,Encoder};
 use nom::{IResult,HexDisplay};
 
 use yxorp::network::ProxyOrder;
@@ -21,6 +22,7 @@ use state::{HttpProxy,TlsProxy,ConfigState};
 
 const SERVER: Token = Token(0);
 
+#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub enum ListenerType {
   HTTP,
   HTTPS,
@@ -51,6 +53,20 @@ impl Listener {
   }
 }
 
+impl Encodable for Listener {
+  fn encode<E: Encoder>(&self, e: &mut E) -> Result<(), E::Error> {
+    e.emit_map(3, |e| {
+      try!(e.emit_map_elt_key(0, |e| "tag".encode(e)));
+      try!(e.emit_map_elt_val(0, |e| self.tag.encode(e)));
+      try!(e.emit_map_elt_key(1, |e| "listener_type".encode(e)));
+      try!(e.emit_map_elt_val(1, |e| self.listener_type.encode(e)));
+      try!(e.emit_map_elt_key(2, |e| "state".encode(e)));
+      try!(e.emit_map_elt_val(2, |e| self.state.encode(e)));
+      Ok(())
+    })
+  }
+}
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct ConfigMessage {
     pub listener: String,
@@ -69,7 +85,7 @@ impl CommandClient {
     CommandClient {
       sock:     sock,
       buf:      Buffer::with_capacity(1024),
-      back_buf: Buffer::with_capacity(2048),
+      back_buf: Buffer::with_capacity(10000),
       token:    None,
     }
   }
@@ -172,12 +188,17 @@ impl CommandServer {
     &mut self.conns[tok]
   }
 
-  fn dispatch(&mut self, v: Vec<ConfigMessage>) {
+  fn dispatch(&mut self, token: Token, v: Vec<ConfigMessage>) {
     for message in &v {
       let command = message.command.clone();
       if let Some(ref mut listener) = self.listeners.get_mut (&message.listener) {
-        listener.state.handle_command(&command);
-        listener.sender.send(ProxyOrder::Command(command));
+        if message.command == Command::DumpConfiguration {
+          self.conns[token].back_buf.write(&encode(*listener).unwrap().into_bytes());
+          self.conns[token].back_buf.write(&b"\0"[..]);
+        } else {
+          listener.state.handle_command(&command);
+          listener.sender.send(ProxyOrder::Command(command));
+        }
       } else {
         log!(log::LogLevel::Error, "no listener found for tag: {}", message.listener);
       }
@@ -185,8 +206,6 @@ impl CommandServer {
   }
 
   fn new(srv: UnixListener, listeners: HashMap<String, Listener>) -> CommandServer {
-    let mut v = Vec::with_capacity(2048);
-    v.extend(repeat(0).take(2048));
     CommandServer {
       sock:  srv,
       conns: Slab::new_starting_at(Token(1), 128),
@@ -208,7 +227,7 @@ impl Handler for CommandServer {
           if self.conns.contains(token) {
             let opt_v = self.conns[token].conn_readable(event_loop, token);
             if let Some(v) = opt_v {
-              self.dispatch(v);
+              self.dispatch(token, v);
             }
           }
         }
