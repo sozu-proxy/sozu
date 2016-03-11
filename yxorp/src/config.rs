@@ -6,7 +6,6 @@ use toml::decode_str;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct ListenerConfig {
-  pub tag:             String,
   pub listener_type:   ListenerType,
   pub address:         String,
   pub port:            u16,
@@ -52,14 +51,12 @@ mod tests {
   fn serialize() {
     let mut map = HashMap::new();
     map.insert(String::from("HTTP"), ListenerConfig {
-      tag: String::from("HTTP"),
       listener_type: ListenerType::HTTP,
       address: String::from("127.0.0.1"),
       port: 8080,
       max_connections: 500,
     });
     map.insert(String::from("TLS"), ListenerConfig {
-      tag: String::from("TLS"),
       listener_type: ListenerType::HTTPS,
       address: String::from("127.0.0.1"),
       port: 8080,
@@ -76,6 +73,5 @@ mod tests {
 
     let encoded = encode_str(&config);
     println!("conf:\n{}", encoded);
-    assert!(false);
   }
 }
