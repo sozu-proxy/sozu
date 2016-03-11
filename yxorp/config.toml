@@ -1,0 +1,24 @@
+# yxorp test config file
+
+command_socket = "./command_folder/sock"
+
+[metrics]
+address = "192.168.59.103"
+port = 8125
+
+[listeners]
+
+[listeners.HTTP]
+address = "127.0.0.1"
+listener_type = "HTTP"
+max_connections = 500
+port = 8080
+tag = "HTTP"
+
+[listeners.TLS]
+address = "127.0.0.1"
+listener_type = "HTTPS"
+max_connections = 500
+port = 8443
+tag = "TLS"
+

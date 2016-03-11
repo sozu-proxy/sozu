@@ -7,12 +7,14 @@ extern crate rustc_serialize;
 extern crate yxorp;
 extern crate toml;
 
+mod config;
 mod command;
 mod state;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
 use std::collections::HashMap;
+use std::thread::JoinHandle;
 use yxorp::network;
 use yxorp::network::metrics::{METRICS,ProxyMetrics};
 
@@ -21,24 +23,44 @@ use command::{Listener,ListenerType};
 fn main() {
   env_logger::init().unwrap();
   info!("starting up");
-  let metrics_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
-  let metrics_host   = ("192.168.59.103", 8125).to_socket_addrs().unwrap().next().unwrap();
-  METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
-  let metrics_guard = ProxyMetrics::run();
 
-  let (sender, _) = channel::<network::ServerMessage>();
-  let (tx, jg) = network::http::start_listener("127.0.0.1:8080".parse().unwrap(), 500, sender);
+  // FIXME: should load configuration from a CLI argument
+  if let Ok(config) = config::Config::load_from_path("./config.toml") {
+    let metrics_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+    let metrics_host   = (config.metrics.address.as_str(), config.metrics.port).to_socket_addrs().unwrap().next().unwrap();
+    METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
+    let metrics_guard = ProxyMetrics::run();
 
-  let (sender2, _) = channel::<network::ServerMessage>();
-  let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 500, None, sender2);
+    let mut listeners = HashMap::new();
+    let mut jh_opt: Option<JoinHandle<()>> = None;
 
-  let mut listeners = HashMap::new();
-  let l1 = Listener::new(String::from("HTTP"), ListenerType::HTTP, String::from("127.0.0.1"), 8080, tx);
-  let l2 = Listener::new(String::from("TLS"),  ListenerType::HTTPS, String::from("127.0.0.1"), 8443, tx2);
-  listeners.insert(String::from("HTTP"), l1);
-  listeners.insert(String::from("TLS"),  l2);
-  command::start(String::from("./command_folder"), listeners);
-  let _ = jg.join();
-  info!("good bye");
+    for (ref tag, ref ls) in config.listeners {
+      let (sender, _) = channel::<network::ServerMessage>();
+      let mut address = ls.address.clone();
+      address.push(':');
+      address.push_str(&ls.port.to_string());
+
+      let (tx, jg) = match ls.listener_type {
+        ListenerType::HTTP => {
+          network::http::start_listener(address.parse().unwrap(), ls.max_connections, sender)
+        },
+        ListenerType::HTTPS => {
+          network::tls::start_listener(address.parse().unwrap(), ls.max_connections, None, sender)
+        },
+        _ => unimplemented!()
+      };
+      let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx);
+      listeners.insert(tag.clone(), l);
+      jh_opt = Some(jg);
+    };
+
+    command::start(config.command_socket, listeners);
+    if let Some(jh) = jh_opt {
+      let _ = jh.join();
+      info!("good bye");
+    }
+  } else {
+    println!("could not load configuration, stopping");
+  }
 }
 

@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::collections::HashMap;
 use log;
 use rustc_serialize::json::{decode,encode};
-use rustc_serialize::{Encodable,Encoder};
+use rustc_serialize::{Encodable,Decodable,Encoder,Decoder};
 use nom::{IResult,HexDisplay};
 
 use yxorp::network::ProxyOrder;
@@ -22,11 +22,33 @@ use state::{HttpProxy,TlsProxy,ConfigState};
 
 const SERVER: Token = Token(0);
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]
 pub enum ListenerType {
   HTTP,
   HTTPS,
   TCP
+}
+
+impl Encodable for ListenerType {
+  fn encode<E: Encoder>(&self, e: &mut E) -> Result<(), E::Error> {
+    match *self {
+      ListenerType::HTTP  => e.emit_str("HTTP"),
+      ListenerType::HTTPS => e.emit_str("HTTPS"),
+      ListenerType::TCP   => e.emit_str("TCP"),
+    }
+  }
+}
+
+impl Decodable for ListenerType {
+  fn decode<D: Decoder>(decoder: &mut D) -> Result<ListenerType, D::Error> {
+    let tag = try!(decoder.read_str());
+    match tag.as_str() {
+      "HTTP"  => Ok(ListenerType::HTTP),
+      "HTTPS" => Ok(ListenerType::HTTPS),
+      "TCP"   => Ok(ListenerType::TCP),
+      _       => Err(decoder.error("unrecognized listener type"))
+    }
+  }
 }
 
 pub struct Listener {
@@ -260,10 +282,10 @@ impl Handler for CommandServer {
   }
 }
 
-pub fn start(folder: String, listeners: HashMap<String, Listener>) {
+pub fn start(path: String, listeners: HashMap<String, Listener>) {
   thread::spawn(move || {
     let mut event_loop = EventLoop::new().unwrap();
-    let addr = PathBuf::from(folder).join(&PathBuf::from("./sock"));
+    let addr = PathBuf::from(path);
     if let Err(e) = fs::remove_file(&addr) {
       match e.kind() {
         ErrorKind::NotFound => {},
