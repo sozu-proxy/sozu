@@ -2,6 +2,7 @@
 
 use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
+use std::net::SocketAddr;
 use mio::tcp::*;
 use mio::*;
 use bytes::{ByteBuf,MutByteBuf};
@@ -55,6 +56,7 @@ pub trait ProxyConfiguration<Server:Handler,Client> {
   fn accept(&mut self, token: Token) -> Option<(Client, bool)>;
   fn front_timeout(&self) -> u64;
   fn back_timeout(&self)  -> u64;
+  fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
 }
 
 pub struct Server<ServerConfiguration,Client> {

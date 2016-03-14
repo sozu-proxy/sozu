@@ -337,6 +337,14 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
     }
   }
 
+  fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {
+    if let Some(app_instances) = self.instances.get_mut(&app_id) {
+      if let Some(ref mut backend) = app_instances.iter_mut().find(|backend| &backend.address == addr) {
+        backend.dec_connections();
+      }
+    }
+  }
+
   fn front_timeout(&self) -> u64 {
     self.front_timeout
   }
