@@ -482,10 +482,74 @@ pub struct DefaultAnswers {
   pub ServiceUnavailable: Vec<u8>
 }
 
+#[derive(PartialEq,Eq)]
+pub enum BackendStatus {
+  Normal,
+  Closing,
+  Closed,
+}
+
+pub struct Backend {
+  pub address:            SocketAddr,
+  pub status:             BackendStatus,
+  pub active_connections: usize,
+}
+
+impl Backend {
+  pub fn new(addr: SocketAddr) -> Backend {
+    Backend {
+      address:            addr,
+      status:             BackendStatus::Normal,
+      active_connections: 0,
+    }
+  }
+
+  pub fn set_closing(&mut self) {
+    self.status = BackendStatus::Closing;
+  }
+
+  pub fn can_open(&self) -> bool {
+    self.status == BackendStatus::Normal
+  }
+
+  pub fn inc_connections(&mut self) -> Option<usize> {
+    if self.status == BackendStatus::Normal {
+      self.active_connections += 1;
+      Some(self.active_connections)
+    } else {
+      None
+    }
+  }
+
+  pub fn dec_connections(&mut self) -> Option<usize> {
+    if self.active_connections == 0 {
+      self.status = BackendStatus::Closed;
+      return None;
+    }
+
+    match self.status {
+      BackendStatus::Normal => {
+        self.active_connections -= 1;
+        Some(self.active_connections)
+      }
+      BackendStatus::Closed  => None,
+      BackendStatus::Closing => {
+        self.active_connections -= 1;
+        if self.active_connections == 0 {
+          self.status = BackendStatus::Closed;
+          None
+        } else {
+          Some(self.active_connections)
+        }
+      },
+    }
+  }
+}
+
 pub struct ServerConfiguration {
   listener:  TcpListener,
   address:   SocketAddr,
-  instances: HashMap<String, Vec<SocketAddr>>,
+  instances: HashMap<String, Vec<Backend>>,
   fronts:    HashMap<String, Vec<HttpFront>>,
   tx:        mpsc::Sender<ServerMessage>,
   pool:      Pool<Buffer>,
@@ -544,17 +608,19 @@ impl ServerConfiguration {
 
   pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<HttpServer>) {
     if let Some(addrs) = self.instances.get_mut(app_id) {
-        addrs.push(*instance_address);
+      let mut backend = Backend::new(*instance_address);
+      addrs.push(backend);
     }
 
     if self.instances.get(app_id).is_none() {
-      self.instances.insert(String::from(app_id), vec![*instance_address]);
+      let mut backend = Backend::new(*instance_address);
+      self.instances.insert(String::from(app_id), vec![backend]);
     }
   }
 
   pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<HttpServer>) {
       if let Some(instances) = self.instances.get_mut(app_id) {
-        instances.retain(|addr| addr != instance_address);
+        instances.retain(|backend| &backend.address != instance_address);
       } else {
         error!("Instance was already removed");
       }
@@ -582,14 +648,23 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_request(&self, client: &mut Client<TcpStream>, host: &str, uri: &str) -> Result<SocketAddr,ConnectionError> {
-    if let Some(http_front) = self.frontend_from_request(host, uri) {
+  pub fn backend_from_request(&mut self, client: &mut Client<TcpStream>, host: &str, uri: &str) -> Result<SocketAddr,ConnectionError> {
+    // FIXME: the app id clone here is probably very inefficient
+    if let Some(app_id) = self.frontend_from_request(host, uri).map(|ref front| front.app_id.clone()) {
       // ToDo round-robin on instances
-      if let Some(app_instances) = self.instances.get(&http_front.app_id) {
+      if let Some(ref mut app_instances) = self.instances.get_mut(&app_id) {
+        if app_instances.len() == 0 {
+          client.set_answer(&self.answers.ServiceUnavailable);
+          return Err(ConnectionError::NoBackendAvailable);
+        }
         let rnd = random::<usize>();
-        let idx = rnd % app_instances.len();
-        debug!("Connecting {} -> {:?}", host, app_instances.get(idx));
-        app_instances.get(idx).map(|& addr| addr).ok_or(ConnectionError::NoBackendAvailable)
+        let mut instances:Vec<&mut Backend> = app_instances.iter_mut().filter(|backend| backend.can_open()).collect();
+        let idx = rnd % instances.len();
+        info!("Connecting {} -> {:?}", host, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
+        instances.get_mut(idx).map(|ref mut backend| {
+          backend.inc_connections();
+          backend.address
+        }).ok_or(ConnectionError::NoBackendAvailable)
       } else {
         //FIXME: send 503 here
         client.set_answer(&self.answers.ServiceUnavailable);

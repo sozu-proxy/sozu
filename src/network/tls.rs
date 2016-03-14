@@ -31,7 +31,7 @@ use network::buffer::Buffer;
 use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,TlsFront};
-use network::http::{Client,DefaultAnswers};
+use network::http::{Client,DefaultAnswers,Backend};
 use network::socket::{SocketHandler,SocketResult};
 
 type BackendToken = Token;
@@ -41,7 +41,7 @@ type ClientToken = Token;
 pub struct ServerConfiguration {
   listener:        TcpListener,
   address:         SocketAddr,
-  instances:       HashMap<String, Vec<SocketAddr>>,
+  instances:       HashMap<String, Vec<Backend>>,
   fronts:          HashMap<String, Vec<TlsFront>>,
   default_cert:    String,
   default_context: SslContext,
@@ -155,17 +155,19 @@ impl ServerConfiguration {
 
   pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<TlsServer>) {
     if let Some(addrs) = self.instances.get_mut(app_id) {
-        addrs.push(*instance_address);
+      let mut backend = Backend::new(*instance_address);
+      addrs.push(backend);
     }
 
     if self.instances.get(app_id).is_none() {
-      self.instances.insert(String::from(app_id), vec![*instance_address]);
+      let mut backend = Backend::new(*instance_address);
+      self.instances.insert(String::from(app_id), vec![backend]);
     }
   }
 
   pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<TlsServer>) {
       if let Some(instances) = self.instances.get_mut(app_id) {
-        instances.retain(|addr| addr != instance_address);
+        instances.retain(|backend| &backend.address != instance_address);
       } else {
         error!("Instance was already removed");
       }
@@ -194,7 +196,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_request(&self, client: &mut Client<NonblockingSslStream<TcpStream>>, host: &str, uri: &str) -> Result<SocketAddr,ConnectionError> {
+  pub fn backend_from_request(&mut self, client: &mut Client<NonblockingSslStream<TcpStream>>, host: &str, uri: &str) -> Result<SocketAddr,ConnectionError> {
     trace!("looking for backend for host: {}", host);
     let real_host = if let Some(h) = host.split(":").next() {
       h
@@ -203,13 +205,21 @@ impl ServerConfiguration {
     };
     trace!("looking for backend for real host: {}", host);
 
-    if let Some(tls_front) = self.frontend_from_request(real_host, uri) {
+    if let Some(app_id) = self.frontend_from_request(real_host, uri).map(|ref front| front.app_id.clone()) {
       // ToDo round-robin on instances
-      if let Some(app_instances) = self.instances.get(&tls_front.app_id) {
+      if let Some(ref mut app_instances) = self.instances.get_mut(&app_id) {
+        if app_instances.len() == 0 {
+          client.set_answer(&self.answers.ServiceUnavailable);
+          return Err(ConnectionError::NoBackendAvailable);
+        }
         let rnd = random::<usize>();
-        let idx = rnd % app_instances.len();
-        info!("Connecting {} -> {:?}", host, app_instances.get(idx));
-        app_instances.get(idx).map(|& addr| addr).ok_or(ConnectionError::NoBackendAvailable)
+        let mut instances:Vec<&mut Backend> = app_instances.iter_mut().filter(|backend| backend.can_open()).collect();
+        let idx = rnd % instances.len();
+        info!("Connecting {} -> {:?}", host, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
+        instances.get_mut(idx).map(|ref mut backend| {
+           backend.inc_connections();
+           backend.address
+         }).ok_or(ConnectionError::NoBackendAvailable)
       } else {
         // FIXME: should send 503 here
         client.set_answer(&self.answers.ServiceUnavailable);
