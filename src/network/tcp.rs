@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use time::{Duration,precise_time_s};
 use rand::random;
-use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder,RequiredEvents};
+use network::{Backend,ClientResult,ServerMessage,ConnectionError,ProxyOrder,RequiredEvents};
 use network::proxy::{Server,ProxyClient,ProxyConfiguration};
 
 use messages::{TcpFront,Command,Instance};
@@ -409,7 +409,7 @@ type ClientToken = Token;
 
 pub struct ServerConfiguration {
   fronts:    HashMap<String, Token>,
-  instances: HashMap<String, Vec<SocketAddr>>,
+  instances: HashMap<String, Vec<Backend>>,
   listeners: Slab<ApplicationListener>,
   tx:        mpsc::Sender<ServerMessage>,
   front_timeout:   u64,
@@ -430,8 +430,9 @@ impl ServerConfiguration {
 
   fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, event_loop: &mut EventLoop<TcpServer>) -> Option<Token> {
     if let Ok(listener) = TcpListener::bind(front) {
-      let addresses = if let Some(ads) = self.instances.get(app_id) {
-        ads.clone()
+      let addresses: Vec<SocketAddr> = if let Some(ads) = self.instances.get(app_id) {
+        let v: Vec<SocketAddr> = ads.iter().map(|backend| backend.address).collect();
+        v
       } else {
         Vec::new()
       };
@@ -483,11 +484,13 @@ impl ServerConfiguration {
 
   pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<TcpServer>) -> Option<Token> {
     if let Some(addrs) = self.instances.get_mut(app_id) {
-        addrs.push(*instance_address);
+      let mut backend = Backend::new(*instance_address);
+      addrs.push(backend);
     }
 
     if self.instances.get(app_id).is_none() {
-      self.instances.insert(String::from(app_id), vec![*instance_address]);
+      let mut backend = Backend::new(*instance_address);
+      self.instances.insert(String::from(app_id), vec![backend]);
     }
 
     if let Some(&tok) = self.fronts.get(app_id) {

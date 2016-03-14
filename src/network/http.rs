@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
 use time::{Duration, precise_time_s, precise_time_ns};
 use rand::random;
-use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder,RequiredEvents};
+use network::{Backend,ClientResult,ServerMessage,ConnectionError,ProxyOrder,RequiredEvents};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use network::metrics::{ProxyMetrics,METRICS};
 use network::buffer::Buffer;
@@ -480,70 +480,6 @@ type ClientToken = Token;
 pub struct DefaultAnswers {
   pub NotFound:           Vec<u8>,
   pub ServiceUnavailable: Vec<u8>
-}
-
-#[derive(PartialEq,Eq)]
-pub enum BackendStatus {
-  Normal,
-  Closing,
-  Closed,
-}
-
-pub struct Backend {
-  pub address:            SocketAddr,
-  pub status:             BackendStatus,
-  pub active_connections: usize,
-}
-
-impl Backend {
-  pub fn new(addr: SocketAddr) -> Backend {
-    Backend {
-      address:            addr,
-      status:             BackendStatus::Normal,
-      active_connections: 0,
-    }
-  }
-
-  pub fn set_closing(&mut self) {
-    self.status = BackendStatus::Closing;
-  }
-
-  pub fn can_open(&self) -> bool {
-    self.status == BackendStatus::Normal
-  }
-
-  pub fn inc_connections(&mut self) -> Option<usize> {
-    if self.status == BackendStatus::Normal {
-      self.active_connections += 1;
-      Some(self.active_connections)
-    } else {
-      None
-    }
-  }
-
-  pub fn dec_connections(&mut self) -> Option<usize> {
-    if self.active_connections == 0 {
-      self.status = BackendStatus::Closed;
-      return None;
-    }
-
-    match self.status {
-      BackendStatus::Normal => {
-        self.active_connections -= 1;
-        Some(self.active_connections)
-      }
-      BackendStatus::Closed  => None,
-      BackendStatus::Closing => {
-        self.active_connections -= 1;
-        if self.active_connections == 0 {
-          self.status = BackendStatus::Closed;
-          None
-        } else {
-          Some(self.active_connections)
-        }
-      },
-    }
-  }
 }
 
 pub struct ServerConfiguration {

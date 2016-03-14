@@ -28,10 +28,10 @@ use openssl::dh::DH;
 
 use parser::http11::{HttpState,RequestState,ResponseState,parse_request_until_stop};
 use network::buffer::Buffer;
-use network::{ClientResult,ServerMessage,ConnectionError,ProxyOrder};
+use network::{Backend,ClientResult,ServerMessage,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,TlsFront};
-use network::http::{Client,DefaultAnswers,Backend};
+use network::http::{Client,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult};
 
 type BackendToken = Token;
