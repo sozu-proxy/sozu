@@ -260,7 +260,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
     None
   }
 
-  fn connect_to_backend(&mut self, client: &mut Client<NonblockingSslStream<TcpStream>>) -> Result<TcpStream,ConnectionError> {
+  fn connect_to_backend(&mut self, client: &mut Client<NonblockingSslStream<TcpStream>>) -> Result<(),ConnectionError> {
     // FIXME: should check the host corresponds to SNI here
     let host   = try!(client.state().get_host().ok_or(ConnectionError::NoHostGiven));
     let rl     = try!(client.state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
@@ -279,7 +279,8 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         response: ResponseState::Initial
       });
 
-      Ok(socket)
+      client.set_back_socket(socket);
+      Ok(())
     } else {
       // FIXME: should send 503 here
       client.set_answer(&self.answers.ServiceUnavailable);

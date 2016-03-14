@@ -50,7 +50,7 @@ pub trait ProxyClient {
 }
 
 pub trait ProxyConfiguration<Server:Handler,Client> {
-  fn connect_to_backend(&mut self, client:&mut Client) ->Result<TcpStream,ConnectionError>;
+  fn connect_to_backend(&mut self, client:&mut Client) ->Result<(),ConnectionError>;
   fn notify(&mut self, event_loop: &mut EventLoop<Server>, message: ProxyOrder);
   fn accept(&mut self, token: Token) -> Option<(Client, bool)>;
   fn front_timeout(&self) -> u64;
@@ -128,9 +128,8 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
   pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
     match self.configuration.connect_to_backend(&mut self.clients[token]) {
-      Ok(socket) => {
+      Ok(()) => {
         if let Ok(backend_token) = self.backend.insert(token) {
-          self.clients[token].set_back_socket(socket);
           self.clients[token].set_back_token(backend_token);
 
           if let Some(sock) = self.clients[token].back_socket() {

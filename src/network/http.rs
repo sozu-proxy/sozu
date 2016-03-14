@@ -616,7 +616,7 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
-  fn connect_to_backend(&mut self, client: &mut Client<TcpStream>) -> Result<TcpStream,ConnectionError> {
+  fn connect_to_backend(&mut self, client: &mut Client<TcpStream>) -> Result<(),ConnectionError> {
       let host   = try!(client.state.get_host().ok_or(ConnectionError::NoHostGiven));
       let rl     = try!(client.state.get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
       let back   = try!(self.backend_from_request(client, &host, &rl.uri));
@@ -624,7 +624,8 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
 
       if let Ok(socket) = conn {
         socket.set_nodelay(true);
-        Ok(socket)
+        client.set_back_socket(socket);
+        Ok(())
       } else {
         //FIXME: send 503 here
         client.set_answer(&self.answers.ServiceUnavailable);

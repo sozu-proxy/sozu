@@ -513,14 +513,15 @@ impl ServerConfiguration {
 
 impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
 
-  fn connect_to_backend(&mut self, client:&mut Client) ->Result<TcpStream,ConnectionError> {
+  fn connect_to_backend(&mut self, client:&mut Client) ->Result<(),ConnectionError> {
     let rnd = random::<usize>();
     let idx = rnd % self.listeners[client.accept_token].back_addresses.len();
     let backend_addr = try!(self.listeners[client.accept_token].back_addresses.get(idx).ok_or(ConnectionError::ToBeDefined));
     let stream = try!(TcpStream::connect(backend_addr).map_err(|_| ConnectionError::ToBeDefined));
     stream.set_nodelay(true);
 
-    Ok(stream)
+    client.set_back_socket(stream);
+    Ok(())
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<TcpServer>, message: ProxyOrder) {
