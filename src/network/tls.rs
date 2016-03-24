@@ -206,6 +206,7 @@ impl ServerConfiguration {
     trace!("looking for backend for real host: {}", host);
 
     if let Some(app_id) = self.frontend_from_request(real_host, uri).map(|ref front| front.app_id.clone()) {
+      client.app_id = Some(app_id.clone());
       // ToDo round-robin on instances
       if let Some(ref mut app_instances) = self.instances.get_mut(&app_id) {
         if app_instances.len() == 0 {

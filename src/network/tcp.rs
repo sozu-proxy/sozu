@@ -46,7 +46,8 @@ pub struct Client {
   back_timeout:   Option<Timeout>,
   status:         ConnectionStatus,
   rx_count:       usize,
-  tx_count:       usize
+  tx_count:       usize,
+  app_id:         Option<String>,
 }
 
 #[cfg(feature = "splice")]
@@ -66,7 +67,8 @@ pub struct Client {
   back_timeout:   Option<Timeout>,
   status:         ConnectionStatus,
   rx_count:       usize,
-  tx_count:       usize
+  tx_count:       usize,
+  app_id:         Option<String>,
 }
 
 #[cfg(not(feature = "splice"))]
@@ -86,7 +88,8 @@ impl Client {
       back_timeout:   None,
       status:         ConnectionStatus::Connected,
       rx_count:       0,
-      tx_count:       0
+      tx_count:       0,
+      app_id:         None,
     })
   }
 
@@ -112,7 +115,8 @@ impl Client {
         back_timeout:   None,
         status:         ConnectionStatus::Initial,
         tx_count:       0,
-        rx_count:       0
+        rx_count:       0,
+        app_id:         None,
       })
     } else {
       None
@@ -516,6 +520,8 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
   fn connect_to_backend(&mut self, client:&mut Client) ->Result<(),ConnectionError> {
     let rnd = random::<usize>();
     let idx = rnd % self.listeners[client.accept_token].back_addresses.len();
+
+    client.app_id = Some(self.listeners[client.accept_token].app_id.clone());
     let backend_addr = try!(self.listeners[client.accept_token].back_addresses.get(idx).ok_or(ConnectionError::ToBeDefined));
     let stream = try!(TcpStream::connect(backend_addr).map_err(|_| ConnectionError::ToBeDefined));
     stream.set_nodelay(true);

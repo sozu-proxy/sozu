@@ -54,6 +54,7 @@ pub struct Client<Front:SocketHandler> {
   start:              u64,
   req_size:           usize,
   res_size:           usize,
+  pub app_id:         Option<String>,
 }
 
 impl<Front:SocketHandler> Client<Front> {
@@ -77,6 +78,7 @@ impl<Front:SocketHandler> Client<Front> {
       start:              precise_time_ns(),
       req_size:           0,
       res_size:           0,
+      app_id:             None,
     })
   }
 
@@ -587,6 +589,7 @@ impl ServerConfiguration {
   pub fn backend_from_request(&mut self, client: &mut Client<TcpStream>, host: &str, uri: &str) -> Result<SocketAddr,ConnectionError> {
     // FIXME: the app id clone here is probably very inefficient
     if let Some(app_id) = self.frontend_from_request(host, uri).map(|ref front| front.app_id.clone()) {
+      client.app_id = Some(app_id.clone());
       // ToDo round-robin on instances
       if let Some(ref mut app_instances) = self.instances.get_mut(&app_id) {
         if app_instances.len() == 0 {
