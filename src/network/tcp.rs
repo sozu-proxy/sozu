@@ -264,10 +264,15 @@ impl ProxyClient for Client {
     self.back_timeout = Some(timeout)
   }
 
-  fn remove_backend(&mut self) {
+  //FIXME: too much cloning in there, should optimize
+  fn remove_backend(&mut self) -> (String, SocketAddr) {
     debug!("TCP PROXY [{} -> {}] CLOSED BACKEND", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
+    let addr = {
+      self.backend.as_ref().map(|sock| sock.peer_addr().unwrap().clone()).unwrap()
+    };
     self.backend       = None;
     self.backend_token = None;
+    (self.app_id.as_ref().unwrap().clone(), addr)
   }
 
   fn front_hup(&mut self) -> ClientResult {

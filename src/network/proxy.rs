@@ -47,7 +47,7 @@ pub trait ProxyClient {
   fn writable(&mut self)      -> (RequiredEvents, ClientResult);
   fn back_readable(&mut self) -> (RequiredEvents, ClientResult);
   fn back_writable(&mut self) -> (RequiredEvents, ClientResult);
-  fn remove_backend(&mut self);
+  fn remove_backend(&mut self) -> (String, SocketAddr);
 }
 
 pub trait ProxyConfiguration<Server:Handler,Client> {

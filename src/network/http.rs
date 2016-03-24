@@ -168,10 +168,14 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     self.backend_token = Some(backend);
   }
 
-  fn remove_backend(&mut self) {
+  //FIXME: too much cloning in there, should optimize
+  //FIXME: unwrap bad, bad rust coder
+  fn remove_backend(&mut self) -> (String, SocketAddr) {
     debug!("HTTP PROXY [{} -> {}] CLOSED BACKEND", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
+    let addr:Option<SocketAddr> = self.backend.as_ref().map(|sock| sock.peer_addr().unwrap());
     self.backend       = None;
     self.backend_token = None;
+    ((self.app_id.as_ref().unwrap()).clone(), addr.unwrap())
   }
 
   fn front_hup(&mut self) -> ClientResult {
