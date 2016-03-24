@@ -196,7 +196,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_request(&mut self, client: &mut Client<NonblockingSslStream<TcpStream>>, host: &str, uri: &str) -> Result<SocketAddr,ConnectionError> {
+  pub fn backend_from_request(&mut self, client: &mut Client<NonblockingSslStream<TcpStream>>, host: &str, uri: &str) -> Result<TcpStream,ConnectionError> {
     trace!("looking for backend for host: {}", host);
     let real_host = if let Some(h) = host.split(":").next() {
       h
@@ -217,18 +217,17 @@ impl ServerConfiguration {
         let mut instances:Vec<&mut Backend> = app_instances.iter_mut().filter(|backend| backend.can_open()).collect();
         let idx = rnd % instances.len();
         info!("Connecting {} -> {:?}", host, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
-        instances.get_mut(idx).map(|ref mut backend| {
-           backend.inc_connections();
-           backend.address
-         }).ok_or(ConnectionError::NoBackendAvailable)
+        instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut backend| {
+          let conn =  TcpStream::connect(&backend.address).map_err(|_| ConnectionError::NoBackendAvailable);
+          if conn.is_ok() {
+             backend.inc_connections();
+          }
+          conn
+         })
       } else {
-        // FIXME: should send 503 here
-        client.set_answer(&self.answers.ServiceUnavailable);
         Err(ConnectionError::NoBackendAvailable)
       }
     } else {
-      // FIXME: should send 404 here
-      client.set_answer(&self.answers.NotFound);
       Err(ConnectionError::HostNotFound)
     }
   }
@@ -266,26 +265,31 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
     let host   = try!(client.state().get_host().ok_or(ConnectionError::NoHostGiven));
     let rl     = try!(client.state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
     let conn   = try!(client.state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
-    let back   = try!(self.backend_from_request(client, &host, &rl.uri));
-    //let socket = try!(TcpStream::connect(&back).map_err(|_| ConnectionError::ToBeDefined));
+    let conn   = self.backend_from_request(client, &host, &rl.uri);
 
-    if let Ok(socket) = TcpStream::connect(&back) {
+    match conn {
+      Ok(socket) => {
+        let position  = client.state().req_position;
+        let req_state = client.state().request.clone();
+        client.set_state(HttpState {
+          req_position: position,
+          res_position: 0,
+          request:  req_state,
+          response: ResponseState::Initial
+        });
 
-      let position  = client.state().req_position;
-      let req_state = client.state().request.clone();
-      client.set_state(HttpState {
-        req_position: position,
-        res_position: 0,
-        request:  req_state,
-        response: ResponseState::Initial
-      });
-
-      client.set_back_socket(socket);
-      Ok(())
-    } else {
-      // FIXME: should send 503 here
-      client.set_answer(&self.answers.ServiceUnavailable);
-      Err(ConnectionError::NoBackendAvailable)
+        client.set_back_socket(socket);
+        Ok(())
+      },
+      Err(ConnectionError::NoBackendAvailable) => {
+        client.set_answer(&self.answers.ServiceUnavailable);
+        Err(ConnectionError::NoBackendAvailable)
+      },
+      Err(ConnectionError::HostNotFound) => {
+        client.set_answer(&self.answers.NotFound);
+        Err(ConnectionError::HostNotFound)
+      },
+      e => panic!(e)
     }
   }
 
