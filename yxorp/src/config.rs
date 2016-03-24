@@ -31,7 +31,7 @@ impl Config {
     let mut data = String::new();
     try!(f.read_to_string(&mut data));
 
-    if let Some(config) = decode_str(data.as_str()) {
+    if let Some(config) = decode_str(&data[..]) {
       Ok(config)
     } else {
       Err(Error::new(ErrorKind::InvalidData, "could not parse the configuration file"))

@@ -42,7 +42,7 @@ impl Encodable for ListenerType {
 impl Decodable for ListenerType {
   fn decode<D: Decoder>(decoder: &mut D) -> Result<ListenerType, D::Error> {
     let tag = try!(decoder.read_str());
-    match tag.as_str() {
+    match &tag[..] {
       "HTTP"  => Ok(ListenerType::HTTP),
       "HTTPS" => Ok(ListenerType::HTTPS),
       "TCP"   => Ok(ListenerType::TCP),

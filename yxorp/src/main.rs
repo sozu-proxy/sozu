@@ -27,7 +27,7 @@ fn main() {
   // FIXME: should load configuration from a CLI argument
   if let Ok(config) = config::Config::load_from_path("./config.toml") {
     let metrics_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
-    let metrics_host   = (config.metrics.address.as_str(), config.metrics.port).to_socket_addrs().unwrap().next().unwrap();
+    let metrics_host   = (&config.metrics.address[..], config.metrics.port).to_socket_addrs().unwrap().next().unwrap();
     METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
     let metrics_guard = ProxyMetrics::run();
 
