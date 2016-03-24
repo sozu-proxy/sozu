@@ -47,7 +47,7 @@ pub trait ProxyClient {
   fn writable(&mut self)      -> (RequiredEvents, ClientResult);
   fn back_readable(&mut self) -> (RequiredEvents, ClientResult);
   fn back_writable(&mut self) -> (RequiredEvents, ClientResult);
-  fn remove_backend(&mut self) -> (String, SocketAddr);
+  fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>);
 }
 
 pub trait ProxyConfiguration<Server:Handler,Client> {
@@ -91,11 +91,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
       event_loop.deregister(sock);
     }
 
-    if let Some(backend_token) = self.clients[token].back_token() {
-      if self.backend.contains(backend_token) {
-        self.backend.remove(backend_token);
-      }
-    }
+    self.close_backend(event_loop, token);
     self.clients.remove(token);
   }
 
@@ -103,7 +99,9 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
     if let Some(backend_token) = self.clients[token].back_token() {
       if self.backend.contains(backend_token) {
         self.backend.remove(backend_token);
-        self.clients[token].remove_backend();
+        if let (Some(app_id), Some(addr)) = self.clients[token].remove_backend() {
+          self.configuration.close_backend(app_id, &addr);
+        }
       }
     }
   }
