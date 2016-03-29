@@ -10,6 +10,7 @@ use nom::Err::*;
 use nom::{digit,is_alphanumeric};
 
 use std::str;
+use std::ascii::AsciiExt;
 use std::convert::From;
 
 // Primitives
@@ -401,15 +402,16 @@ pub enum HeaderResult<T> {
 
 impl<'a> Header<'a> {
   pub fn value(&self) -> HeaderValue {
-    match self.name {
-      b"Host" => {
+    //FIXME: should replace with allocation-free, case insensitive matching here
+    match &self.name.to_ascii_lowercase()[..] {
+      b"host" => {
         if let Some(s) = str::from_utf8(self.value).map(|s| String::from(s)).ok() {
           HeaderValue::Host(s)
         } else {
           HeaderValue::Error
         }
       },
-      b"Content-Length" => {
+      b"content-length" => {
         if let Ok(l) = str::from_utf8(self.value) {
           if let Some(length) = l.parse().ok() {
              return HeaderValue::ContentLength(length)
@@ -417,8 +419,8 @@ impl<'a> Header<'a> {
         }
         HeaderValue::Error
       },
-      b"Transfer-Encoding" => {
-        match self.value {
+      b"transfer-encoding" => {
+        match &self.value.to_ascii_lowercase()[..] {
           b"chunked"  => HeaderValue::Encoding(TransferEncodingValue::Chunked),
           b"compress" => HeaderValue::Encoding(TransferEncodingValue::Compress),
           b"deflate"  => HeaderValue::Encoding(TransferEncodingValue::Deflate),
@@ -427,7 +429,7 @@ impl<'a> Header<'a> {
           _           => HeaderValue::Encoding(TransferEncodingValue::Unknown)
         }
       },
-      b"Connection" => {
+      b"connection" => {
         match comma_separated_header_value(self.value) {
           Some(tokens) => HeaderValue::Connection(tokens),
           None         => HeaderValue::Error
@@ -438,7 +440,7 @@ impl<'a> Header<'a> {
   }
 
   pub fn should_delete(&self) -> bool {
-    self.name == b"Connection"
+    &self.name.to_ascii_lowercase()[..] == b"connection"
   }
 }
 
