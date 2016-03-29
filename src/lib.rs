@@ -4,8 +4,6 @@
 extern crate mio;
 extern crate bytes;
 extern crate time;
-extern crate libc;
-extern crate env_logger;
 extern crate rustc_serialize;
 extern crate rand;
 extern crate openssl;

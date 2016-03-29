@@ -1,7 +1,6 @@
 #[macro_use] extern crate log;
 #[macro_use] extern crate nom;
 extern crate env_logger;
-extern crate bytes;
 extern crate mio;
 extern crate rustc_serialize;
 extern crate yxorp;
