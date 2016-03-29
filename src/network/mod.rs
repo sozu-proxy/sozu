@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 
 pub mod buffer;
-pub mod metrics;
+#[macro_use] pub mod metrics;
 pub mod socket;
 pub mod http;
 pub mod tls;

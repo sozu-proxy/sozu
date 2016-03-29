@@ -18,7 +18,6 @@ use time::{Duration, precise_time_s, precise_time_ns};
 use rand::random;
 use network::{Backend,ClientResult,ServerMessage,ConnectionError,ProxyOrder,RequiredEvents};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
-use network::metrics::{ProxyMetrics,METRICS};
 use network::buffer::Buffer;
 use network::socket::{SocketHandler,SocketResult};
 
@@ -224,7 +223,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           self.state = parse_request_until_stop(&self.state, &mut self.front_buf, 0);
           debug!("parse_request_until_stop returned {:?} => advance: {}", self.state, self.state.req_position);
           if self.state.is_front_error() {
-            METRICS.lock().unwrap().time("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+            time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
           }
 
@@ -256,7 +255,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                   self.state = parse_request_until_stop(&self.state, &mut self.front_buf, next_start);
                   debug!("parse_request_until_stop returned {:?} => advance: {}", self.state, self.state.req_position);
                   if self.state.is_front_error() {
-                    METRICS.lock().unwrap().time("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+                    time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
                     return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
                   }
 
@@ -275,7 +274,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               self.state = parse_request_until_stop(&self.state, &mut self.front_buf, next_start);
               debug!("parse_request_until_stop returned {:?} => advance: {}", self.state, self.state.req_position);
               if self.state.is_front_error() {
-                METRICS.lock().unwrap().time("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+                time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
                 return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
               }
 
@@ -440,7 +439,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                   self.state = parse_response_until_stop(&self.state, &mut self.back_buf, next_start);
                   debug!("parse_response_until_stop returned {:?} => advance: {}", self.state, self.state.res_position);
                   if self.state.is_back_error() {
-                    METRICS.lock().unwrap().time("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+                    time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
                     return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure);
                   }
 
@@ -460,7 +459,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               self.state = parse_response_until_stop(&self.state, &mut self.back_buf, next_start);
               debug!("parse_response_until_stop returned {:?} => advance: {}", self.state, self.state.res_position);
               if self.state.is_back_error() {
-                METRICS.lock().unwrap().time("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+                time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
                 return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure);
               }
 

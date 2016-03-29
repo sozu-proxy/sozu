@@ -19,8 +19,6 @@ use time::precise_time_ns;
 use rand::random;
 
 use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socket_type,ProxyOrder,RequiredEvents};
-use network::metrics::{METRICS,ProxyMetrics};
-
 use messages::{TcpFront,Command,Instance};
 
 const SERVER: Token = Token(0);
@@ -114,7 +112,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         if let Ok(timeout) = event_loop.timeout_ms(client_token.as_usize(), self.configuration.front_timeout()) {
           &self.clients[client_token].set_front_timeout(timeout);
         }
-        METRICS.lock().unwrap().gauge("accept", 1);
+        gauge!("accept", 1);
         if should_connect {
           self.connect_to_backend(event_loop, client_token);
         }

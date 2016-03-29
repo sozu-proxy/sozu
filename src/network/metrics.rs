@@ -20,7 +20,7 @@ pub struct ProxyMetrics {
 impl ProxyMetrics {
   pub fn new(prefix: String) -> Self {
     ProxyMetrics {
-      buffer: Buffer::with_capacity(500),
+      buffer: Buffer::with_capacity(2048),
       prefix: prefix,
       remote:   None,
     }
@@ -92,3 +92,33 @@ impl ProxyMetrics {
     self.emit(&fmt)
   }
 }
+
+#[macro_export]
+macro_rules! count (
+  ($key:expr, $value: expr) => (::network::metrics::METRICS.lock().unwrap().count($key, $value);)
+);
+
+#[macro_export]
+macro_rules! incr (
+  ($key:expr) => (::network::metrics::METRICS.lock().unwrap().incr($key);)
+);
+
+#[macro_export]
+macro_rules! decr (
+  ($key:expr) => (::network::metrics::METRICS.lock().unwrap().decr($key);)
+);
+
+#[macro_export]
+macro_rules! time (
+  ($key:expr, $value: expr) => (::network::metrics::METRICS.lock().unwrap().time($key, $value);)
+);
+
+#[macro_export]
+macro_rules! gauge (
+  ($key:expr, $value: expr) => (::network::metrics::METRICS.lock().unwrap().gauge($key, $value);)
+);
+
+#[macro_export]
+macro_rules! meter (
+  ($key:expr, $value: expr) => (::network::metrics::METRICS.lock().unwrap().meter($key, $value);)
+);
