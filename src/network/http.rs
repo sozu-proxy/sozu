@@ -408,7 +408,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       let (sz, r) = sock.socket_read(&mut self.back_buf.space());
       self.back_buf.fill(sz);
       if let Some((front,back)) = tokens {
-        debug!("BACK  [{}->{}]: read {} bytes", front.as_usize(), back.as_usize(), sz);
+        debug!("BACK  [{}<-{}]: read {} bytes", front.as_usize(), back.as_usize(), sz);
       }
       match r {
         SocketResult::Error => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure),
