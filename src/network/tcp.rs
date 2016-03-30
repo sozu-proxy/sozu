@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use time::{Duration,precise_time_s};
 use rand::random;
-use network::{Backend,ClientResult,ServerMessage,ConnectionError,ProxyOrder,RequiredEvents};
+use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents};
 use network::proxy::{Server,ProxyClient,ProxyConfiguration};
 
 use messages::{TcpFront,Command,Instance};
@@ -540,7 +540,7 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
         let addr_string = tcp_front.ip_address + &tcp_front.port.to_string();
         if let Ok(front) = addr_string.parse() {
           if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, event_loop) {
-            self.tx.send(ServerMessage::AddedFront(id));
+            self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
           } else {
             error!("Couldn't add tcp front");
           }
@@ -551,14 +551,14 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
       ProxyOrder::Command(id, Command::RemoveTcpFront(front)) => {
         trace!("{:?}", front);
         let _ = self.remove_tcp_front(front.app_id, event_loop);
-        self.tx.send(ServerMessage::RemovedFront(id));
+        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
         trace!("{:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
-          self.tx.send(ServerMessage::AddedInstance(id));
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
         } else {
           error!("Couldn't add tcp front");
         }
@@ -568,14 +568,14 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
-          self.tx.send(ServerMessage::RemovedInstance(id));
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
         } else {
           error!("Couldn't add tcp front");
         }
       },
       ProxyOrder::Stop(id)                   => {
         event_loop.shutdown();
-          self.tx.send(ServerMessage::Stopped(id));
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
       _ => {
         error!("unsupported message, ignoring");

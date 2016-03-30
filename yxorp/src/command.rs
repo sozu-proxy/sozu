@@ -123,7 +123,7 @@ impl CommandClient {
     self.message_ids.sort();
   }
 
-  fn has_message_id(&self, id: String) ->Option<usize> {
+  fn has_message_id(&self, id: &String) ->Option<usize> {
     self.message_ids.binary_search(&id).ok()
   }
 
@@ -306,10 +306,8 @@ impl Handler for CommandServer {
       while let Ok(msg) = listener.receiver.try_recv() {
         println!("got msg: {:?}", msg);
         for client in self.conns.iter_mut() {
-          if let Some(index) = client.has_message_id(msg.id()) {
-            //FIXME: encode the response
+          if let Some(index) = client.has_message_id(&msg.id) {
             client.back_buf.write(&encode(&msg).unwrap().into_bytes());
-            //client.back_buf.write(b"pouet");
             client.back_buf.write(&b"\0"[..]);
             client.remove_message_id(index);
           }

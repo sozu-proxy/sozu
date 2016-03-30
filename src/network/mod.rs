@@ -20,22 +20,18 @@ use messages::Command;
 pub type MessageId = String;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
-pub enum ServerMessage {
-  AddedFront(MessageId),
-  RemovedFront(MessageId),
-  AddedInstance(MessageId),
-  RemovedInstance(MessageId),
-  Stopped(MessageId)
+pub struct ServerMessage {
+  pub id:      MessageId,
+  pub message: ServerMessageType,
 }
 
-impl ServerMessage {
-  pub fn id(&self) -> String {
-    match *self {
-      ServerMessage::AddedFront(ref id)    | ServerMessage::RemovedFront(ref id)    |
-      ServerMessage::AddedInstance(ref id) | ServerMessage::RemovedInstance(ref id) |
-      ServerMessage::Stopped(ref id) => id.clone(),
-    }
-  }
+#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+pub enum ServerMessageType {
+  AddedFront,
+  RemovedFront,
+  AddedInstance,
+  RemovedInstance,
+  Stopped
 }
 
 #[derive(Debug)]

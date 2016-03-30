@@ -16,7 +16,7 @@ use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
 use time::{Duration, precise_time_s, precise_time_ns};
 use rand::random;
-use network::{Backend,ClientResult,ServerMessage,ConnectionError,ProxyOrder,RequiredEvents};
+use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use network::buffer::Buffer;
 use network::socket::{SocketHandler,SocketResult};
@@ -651,12 +651,12 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
       ProxyOrder::Command(id, Command::AddHttpFront(front)) => {
         info!("add front {:?}", front);
           self.add_http_front(front, event_loop);
-          self.tx.send(ServerMessage::AddedFront(id));
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
       },
       ProxyOrder::Command(id, Command::RemoveHttpFront(front)) => {
         info!("remove front {:?}", front);
         self.remove_http_front(front, event_loop);
-        self.tx.send(ServerMessage::RemovedFront(id));
+        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
         info!("add instance {:?}", instance);
@@ -664,7 +664,7 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send(ServerMessage::AddedInstance(id));
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
@@ -673,7 +673,7 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send(ServerMessage::RemovedInstance(id));
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
         }
       },
       ProxyOrder::Command(id, Command::HttpProxy(configuration)) => {
@@ -687,7 +687,7 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
       },
       ProxyOrder::Stop(id)                   => {
         event_loop.shutdown();
-        self.tx.send(ServerMessage::Stopped(id));
+        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
       _ => {
         debug!("unsupported message, ignoring");

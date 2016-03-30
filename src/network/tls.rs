@@ -28,7 +28,7 @@ use openssl::dh::DH;
 
 use parser::http11::{HttpState,RequestState,ResponseState,parse_request_until_stop};
 use network::buffer::Buffer;
-use network::{Backend,ClientResult,ServerMessage,ConnectionError,ProxyOrder};
+use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,TlsFront};
 use network::http::{Client,DefaultAnswers};
@@ -299,12 +299,12 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
       ProxyOrder::Command(id, Command::AddTlsFront(front)) => {
         info!("add front {:?}", front);
           self.add_http_front(front, event_loop);
-          self.tx.send(ServerMessage::AddedFront(id));
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
       },
       ProxyOrder::Command(id, Command::RemoveTlsFront(front)) => {
         info!("remove front {:?}", front);
         self.remove_http_front(front, event_loop);
-        self.tx.send(ServerMessage::RemovedFront(id));
+        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
         info!("add instance {:?}", instance);
@@ -312,7 +312,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send(ServerMessage::AddedInstance(id));
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
@@ -321,7 +321,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send(ServerMessage::RemovedInstance(id));
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
         }
       },
       ProxyOrder::Command(id, Command::HttpProxy(configuration)) => {
@@ -335,7 +335,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
       },
       ProxyOrder::Stop(id)                   => {
         event_loop.shutdown();
-        self.tx.send(ServerMessage::Stopped(id));
+        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
       _ => {
         error!("unsupported message, ignoring");
