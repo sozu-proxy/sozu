@@ -17,20 +17,21 @@ pub mod proxy;
 use mio::Token;
 use messages::Command;
 
+pub type MessageId = String;
 
 #[derive(Debug)]
 pub enum ServerMessage {
-  AddedFront,
-  RemovedFront,
-  AddedInstance,
-  RemovedInstance,
-  Stopped
+  AddedFront(MessageId),
+  RemovedFront(MessageId),
+  AddedInstance(MessageId),
+  RemovedInstance(MessageId),
+  Stopped(MessageId)
 }
 
 #[derive(Debug)]
 pub enum ProxyOrder {
-  Command(Command),
-  Stop
+  Command(MessageId,Command),
+  Stop(MessageId)
 }
 
 #[derive(Debug,PartialEq,Eq)]

@@ -19,15 +19,17 @@ fn main() {
   let metrics_guard = ProxyMetrics::run();
   METRICS.lock().unwrap().gauge("TEST", 42);
 
-  let (sender, _) = channel::<network::ServerMessage>();
+  let (sender, rec) = channel::<network::ServerMessage>();
   let (tx, jg) = network::http::start_listener("127.0.0.1:8080".parse().unwrap(), 500, sender);
 
   let http_front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), port: 8080 };
   let http_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
-  tx.send(network::ProxyOrder::Command(messages::Command::AddHttpFront(http_front)));
-  tx.send(network::ProxyOrder::Command(messages::Command::AddInstance(http_instance)));
+  tx.send(network::ProxyOrder::Command(String::from("ID_ABCD"), messages::Command::AddHttpFront(http_front)));
+  tx.send(network::ProxyOrder::Command(String::from("ID_EFGH"), messages::Command::AddInstance(http_instance)));
+  println!("HTTP -> {:?}", rec.recv().unwrap());
+  println!("HTTP -> {:?}", rec.recv().unwrap());
 
-  let (sender2, _) = channel::<network::ServerMessage>();
+  let (sender2, rec2) = channel::<network::ServerMessage>();
 
   let options = ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |
                ssl::SSL_OP_NO_TICKET | ssl::SSL_OP_NO_SSLV2 |
@@ -48,14 +50,19 @@ fn main() {
 
   let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 500, Some((options, cipher_list)), sender2);
   let tls_front = messages::TlsFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st"), path_begin: String::from("/"), port: 8443, cert_path: String::from("assets/certificate.pem"), key_path: String::from("assets/key.pem") };
-  tx2.send(network::ProxyOrder::Command(messages::Command::AddTlsFront(tls_front)));
+  tx2.send(network::ProxyOrder::Command(String::from("ID_IJKL"), messages::Command::AddTlsFront(tls_front)));
   let tls_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
-  tx2.send(network::ProxyOrder::Command(messages::Command::AddInstance(tls_instance)));
+  tx2.send(network::ProxyOrder::Command(String::from("ID_MNOP"), messages::Command::AddInstance(tls_instance)));
 
   let tls_front2 = messages::TlsFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/"), port: 8443, cert_path: String::from("assets/cert_test.pem"), key_path: String::from("assets/key_test.pem") };
-  tx2.send(network::ProxyOrder::Command(messages::Command::AddTlsFront(tls_front2)));
+  tx2.send(network::ProxyOrder::Command(String::from("ID_QRST"), messages::Command::AddTlsFront(tls_front2)));
   let tls_instance2 = messages::Instance { app_id: String::from("app_2"), ip_address: String::from("127.0.0.1"), port: 1026 };
-  tx2.send(network::ProxyOrder::Command(messages::Command::AddInstance(tls_instance2)));
+  tx2.send(network::ProxyOrder::Command(String::from("ID_UVWX"), messages::Command::AddInstance(tls_instance2)));
+
+  println!("TLS -> {:?}", rec2.recv().unwrap());
+  println!("TLS -> {:?}", rec2.recv().unwrap());
+  println!("TLS -> {:?}", rec2.recv().unwrap());
+  println!("TLS -> {:?}", rec2.recv().unwrap());
 
   let _ = jg.join();
   info!("good bye");

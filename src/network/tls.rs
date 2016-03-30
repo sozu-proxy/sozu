@@ -296,35 +296,35 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
   fn notify(&mut self, event_loop: &mut EventLoop<TlsServer>, message: ProxyOrder) {
     trace!("notified: {:?}", message);
     match message {
-      ProxyOrder::Command(Command::AddTlsFront(front)) => {
+      ProxyOrder::Command(id, Command::AddTlsFront(front)) => {
         info!("add front {:?}", front);
           self.add_http_front(front, event_loop);
-          self.tx.send(ServerMessage::AddedFront);
+          self.tx.send(ServerMessage::AddedFront(id));
       },
-      ProxyOrder::Command(Command::RemoveTlsFront(front)) => {
+      ProxyOrder::Command(id, Command::RemoveTlsFront(front)) => {
         info!("remove front {:?}", front);
         self.remove_http_front(front, event_loop);
-        self.tx.send(ServerMessage::RemovedFront);
+        self.tx.send(ServerMessage::RemovedFront(id));
       },
-      ProxyOrder::Command(Command::AddInstance(instance)) => {
+      ProxyOrder::Command(id, Command::AddInstance(instance)) => {
         info!("add instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send(ServerMessage::AddedInstance);
+          self.tx.send(ServerMessage::AddedInstance(id));
         }
       },
-      ProxyOrder::Command(Command::RemoveInstance(instance)) => {
+      ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
         info!("remove instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send(ServerMessage::RemovedInstance);
+          self.tx.send(ServerMessage::RemovedInstance(id));
         }
       },
-      ProxyOrder::Command(Command::HttpProxy(configuration)) => {
+      ProxyOrder::Command(id, Command::HttpProxy(configuration)) => {
         info!("modifying proxy configuration: {:?}", configuration);
         self.front_timeout = configuration.front_timeout;
         self.back_timeout  = configuration.back_timeout;
@@ -333,8 +333,9 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
           ServiceUnavailable: configuration.answer_503.into_bytes(),
         };
       },
-      ProxyOrder::Stop                   => {
+      ProxyOrder::Stop(id)                   => {
         event_loop.shutdown();
+        self.tx.send(ServerMessage::Stopped(id));
       },
       _ => {
         error!("unsupported message, ignoring");
@@ -373,7 +374,7 @@ pub fn start_listener(front: SocketAddr, max_connections: usize, options: Option
     info!("starting event loop");
     event_loop.run(&mut server).unwrap();
     info!("ending event loop");
-    notify_tx.send(ServerMessage::Stopped);
+    //notify_tx.send(ServerMessage::Stopped);
   });
 
   (channel, join_guard)

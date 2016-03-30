@@ -535,12 +535,12 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
 
   fn notify(&mut self, event_loop: &mut EventLoop<TcpServer>, message: ProxyOrder) {
     match message {
-      ProxyOrder::Command(Command::AddTcpFront(tcp_front)) => {
+      ProxyOrder::Command(id, Command::AddTcpFront(tcp_front)) => {
         trace!("{:?}", tcp_front);
         let addr_string = tcp_front.ip_address + &tcp_front.port.to_string();
         if let Ok(front) = addr_string.parse() {
           if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, event_loop) {
-            self.tx.send(ServerMessage::AddedFront);
+            self.tx.send(ServerMessage::AddedFront(id));
           } else {
             error!("Couldn't add tcp front");
           }
@@ -548,33 +548,34 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
           error!("Couldn't parse tcp front address");
         }
       },
-      ProxyOrder::Command(Command::RemoveTcpFront(front)) => {
+      ProxyOrder::Command(id, Command::RemoveTcpFront(front)) => {
         trace!("{:?}", front);
         let _ = self.remove_tcp_front(front.app_id, event_loop);
-        self.tx.send(ServerMessage::RemovedFront);
+        self.tx.send(ServerMessage::RemovedFront(id));
       },
-      ProxyOrder::Command(Command::AddInstance(instance)) => {
+      ProxyOrder::Command(id, Command::AddInstance(instance)) => {
         trace!("{:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
-          self.tx.send(ServerMessage::AddedInstance);
+          self.tx.send(ServerMessage::AddedInstance(id));
         } else {
           error!("Couldn't add tcp front");
         }
       },
-      ProxyOrder::Command(Command::RemoveInstance(instance)) => {
+      ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
         trace!("{:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
-          self.tx.send(ServerMessage::RemovedInstance);
+          self.tx.send(ServerMessage::RemovedInstance(id));
         } else {
           error!("Couldn't add tcp front");
         }
       },
-      ProxyOrder::Stop                   => {
+      ProxyOrder::Stop(id)                   => {
         event_loop.shutdown();
+          self.tx.send(ServerMessage::Stopped(id));
       },
       _ => {
         error!("unsupported message, ignoring");
@@ -656,7 +657,7 @@ pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Se
     info!("starting event loop");
     event_loop.run(&mut server).unwrap();
     info!("ending event loop");
-    notify_tx.send(ServerMessage::Stopped);
+    //notify_tx.send(ServerMessage::Stopped);
   });
 
   (channel, join_guard)

@@ -648,35 +648,35 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
   // ToDo temporary
     trace!("notified: {:?}", message);
     match message {
-      ProxyOrder::Command(Command::AddHttpFront(front)) => {
+      ProxyOrder::Command(id, Command::AddHttpFront(front)) => {
         info!("add front {:?}", front);
           self.add_http_front(front, event_loop);
-          self.tx.send(ServerMessage::AddedFront);
+          self.tx.send(ServerMessage::AddedFront(id));
       },
-      ProxyOrder::Command(Command::RemoveHttpFront(front)) => {
+      ProxyOrder::Command(id, Command::RemoveHttpFront(front)) => {
         info!("remove front {:?}", front);
         self.remove_http_front(front, event_loop);
-        self.tx.send(ServerMessage::RemovedFront);
+        self.tx.send(ServerMessage::RemovedFront(id));
       },
-      ProxyOrder::Command(Command::AddInstance(instance)) => {
+      ProxyOrder::Command(id, Command::AddInstance(instance)) => {
         info!("add instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send(ServerMessage::AddedInstance);
+          self.tx.send(ServerMessage::AddedInstance(id));
         }
       },
-      ProxyOrder::Command(Command::RemoveInstance(instance)) => {
+      ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
         info!("remove instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send(ServerMessage::RemovedInstance);
+          self.tx.send(ServerMessage::RemovedInstance(id));
         }
       },
-      ProxyOrder::Command(Command::HttpProxy(configuration)) => {
+      ProxyOrder::Command(id, Command::HttpProxy(configuration)) => {
         info!("modifying proxy configuration: {:?}", configuration);
         self.front_timeout = configuration.front_timeout;
         self.back_timeout  = configuration.back_timeout;
@@ -685,8 +685,9 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
           ServiceUnavailable: configuration.answer_503.into_bytes(),
         };
       },
-      ProxyOrder::Stop                   => {
+      ProxyOrder::Stop(id)                   => {
         event_loop.shutdown();
+        self.tx.send(ServerMessage::Stopped(id));
       },
       _ => {
         debug!("unsupported message, ignoring");
@@ -743,7 +744,7 @@ pub fn start_listener(front: SocketAddr, max_connections: usize, tx: mpsc::Sende
     debug!("starting event loop");
     event_loop.run(&mut server).unwrap();
     debug!("ending event loop");
-    notify_tx.send(ServerMessage::Stopped);
+    //notify_tx.send(ServerMessage::Stopped);
   });
 
   (channel, join_guard)
@@ -775,9 +776,9 @@ mod tests {
     let (tx,rx) = channel::<ServerMessage>();
     let (sender, jg) = start_listener(front, 10, tx.clone());
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/"), port: 1024 };
-    sender.send(ProxyOrder::Command(Command::AddHttpFront(front)));
+    sender.send(ProxyOrder::Command(String::from("ID_ABCD"), Command::AddHttpFront(front)));
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
-    sender.send(ProxyOrder::Command(Command::AddInstance(instance)));
+    sender.send(ProxyOrder::Command(String::from("ID_EFGH"), Command::AddInstance(instance)));
     println!("test received: {:?}", rx.recv());
     println!("test received: {:?}", rx.recv());
     thread::sleep(Duration::from_millis(300));
