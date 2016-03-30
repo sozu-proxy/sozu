@@ -360,7 +360,7 @@ mod tests {
 
   #[test]
   fn config_message_test() {
-    let raw_json = r#"{ "listener": "HTTP", "command":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}} }"#;
+    let raw_json = r#"{ "id": "ID_TEST", "listener": "HTTP", "command":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}} }"#;
     let config: ConfigMessage = json::decode(raw_json).unwrap();
     println!("{:?}", config);
     assert_eq!(config.listener, "HTTP");
