@@ -219,7 +219,7 @@ impl CommandServer {
           self.conns[token].back_buf.write(&b"\0"[..]);
         } else {
           listener.state.handle_command(&command);
-          listener.sender.send(ProxyOrder::Command(command));
+          listener.sender.send(ProxyOrder::Command(message.id.clone(), command));
         }
       } else {
         log!(log::LogLevel::Error, "no listener found for tag: {}", message.listener);
