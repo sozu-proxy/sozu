@@ -34,7 +34,7 @@ fn main() {
     let mut jh_opt: Option<JoinHandle<()>> = None;
 
     for (ref tag, ref ls) in config.listeners {
-      let (sender, _) = channel::<network::ServerMessage>();
+      let (sender, receiver) = channel::<network::ServerMessage>();
       let mut address = ls.address.clone();
       address.push(':');
       address.push_str(&ls.port.to_string());
@@ -48,7 +48,7 @@ fn main() {
         },
         _ => unimplemented!()
       };
-      let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx);
+      let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
       listeners.insert(tag.clone(), l);
       jh_opt = Some(jg);
     };

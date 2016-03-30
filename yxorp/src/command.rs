@@ -9,12 +9,13 @@ use std::str::from_utf8;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::collections::HashMap;
+use std::sync::mpsc;
 use log;
 use rustc_serialize::json::{decode,encode};
 use rustc_serialize::{Encodable,Decodable,Encoder,Decoder};
 use nom::{IResult,HexDisplay};
 
-use yxorp::network::ProxyOrder;
+use yxorp::network::{ProxyOrder,ServerMessage};
 use yxorp::network::buffer::Buffer;
 use yxorp::messages::Command;
 
@@ -55,11 +56,12 @@ pub struct Listener {
   pub tag:           String,
   pub listener_type: ListenerType,
   pub sender:        Sender<ProxyOrder>,
+  pub receiver:      mpsc::Receiver<ServerMessage>,
   pub state:         ConfigState,
 }
 
 impl Listener {
-  pub fn new(tag: String, listener_type: ListenerType, ip_address: String, port: u16, sender: Sender<ProxyOrder>) -> Listener {
+  pub fn new(tag: String, listener_type: ListenerType, ip_address: String, port: u16, sender: Sender<ProxyOrder>, receiver: mpsc::Receiver<ServerMessage>) -> Listener {
     let state = match listener_type {
       ListenerType::HTTP  => ConfigState::Http(HttpProxy::new(ip_address, port)),
       ListenerType::HTTPS => ConfigState::Tls(TlsProxy::new(ip_address, port)),
@@ -70,6 +72,7 @@ impl Listener {
       tag:           tag,
       listener_type: listener_type,
       sender:        sender,
+      receiver:      receiver,
       state:         state,
     }
   }
@@ -91,25 +94,41 @@ impl Encodable for Listener {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct ConfigMessage {
+    pub id:       String,
     pub listener: String,
     pub command:  Command
 }
 
 struct CommandClient {
-  sock:      UnixStream,
-  buf:       Buffer,
-  back_buf:  Buffer,
-  token:     Option<Token>,
+  sock:        UnixStream,
+  buf:         Buffer,
+  back_buf:    Buffer,
+  token:       Option<Token>,
+  message_ids: Vec<String>,
 }
 
 impl CommandClient {
   fn new(sock: UnixStream) -> CommandClient {
     CommandClient {
-      sock:     sock,
-      buf:      Buffer::with_capacity(1024),
-      back_buf: Buffer::with_capacity(10000),
-      token:    None,
+      sock:        sock,
+      buf:         Buffer::with_capacity(1024),
+      back_buf:    Buffer::with_capacity(10000),
+      token:       None,
+      message_ids: Vec::new(),
     }
+  }
+
+  fn add_message_id(&mut self, id: String) {
+    self.message_ids.push(id);
+    self.message_ids.sort();
+  }
+
+  fn has_message_id(&self, id: String) ->Option<usize> {
+    self.message_ids.binary_search(&id).ok()
+  }
+
+  fn remove_message_id(&mut self, index: usize) {
+    self.message_ids.remove(index);
   }
 
   fn reregister(&self,  event_loop: &mut EventLoop<CommandServer>, tok: Token) {
@@ -218,6 +237,7 @@ impl CommandServer {
           self.conns[token].back_buf.write(&encode(*listener).unwrap().into_bytes());
           self.conns[token].back_buf.write(&b"\0"[..]);
         } else {
+          self.conns[token].add_message_id(message.id.clone());
           listener.state.handle_command(&command);
           listener.sender.send(ProxyOrder::Command(message.id.clone(), command));
         }
@@ -280,6 +300,25 @@ impl Handler for CommandServer {
     // TODO: dispatch here to clients the list of messages you want to display
     info!("notify");
   }
+
+  fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {
+    for listener in self.listeners.values() {
+      while let Ok(msg) = listener.receiver.try_recv() {
+        println!("got msg: {:?}", msg);
+        for client in self.conns.iter_mut() {
+          if let Some(index) = client.has_message_id(msg.id()) {
+            //FIXME: encode the response
+            client.back_buf.write(&encode(&msg).unwrap().into_bytes());
+            //client.back_buf.write(b"pouet");
+            client.back_buf.write(&b"\0"[..]);
+            client.remove_message_id(index);
+          }
+        }
+      }
+    }
+    event_loop.timeout_ms(0, 700);
+  }
+
 }
 
 pub fn start(path: String, listeners: HashMap<String, Listener>) {
@@ -304,6 +343,7 @@ pub fn start(path: String, listeners: HashMap<String, Listener>) {
         }
         info!("listen for connections");
         event_loop.register(&srv, SERVER, EventSet::readable(), PollOpt::level() | PollOpt::oneshot()).unwrap();
+        event_loop.timeout_ms(0, 700);
 
         event_loop.run(&mut CommandServer::new(srv, listeners)).unwrap()
       },
