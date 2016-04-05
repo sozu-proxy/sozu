@@ -313,6 +313,8 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
+        } else {
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
@@ -322,6 +324,8 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
+        } else {
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::HttpProxy(configuration)) => {
@@ -337,8 +341,9 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         event_loop.shutdown();
         self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
-      _ => {
+      ProxyOrder::Command(id, _) => {
         error!("unsupported message, ignoring");
+        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
       }
     }
   }

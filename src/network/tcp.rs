@@ -543,9 +543,11 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
             self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
           } else {
             error!("Couldn't add tcp front");
+            self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot add tcp front"))});
           }
         } else {
           error!("Couldn't parse tcp front address");
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveTcpFront(front)) => {
@@ -560,7 +562,8 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
         if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
         } else {
-          error!("Couldn't add tcp front");
+          error!("Couldn't add tcp instance");
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot add tcp instance"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
@@ -570,15 +573,17 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
         if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
         } else {
-          error!("Couldn't add tcp front");
+          error!("Couldn't remove tcp instance");
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot remove tcp instance"))});
         }
       },
       ProxyOrder::Stop(id)                   => {
         event_loop.shutdown();
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
-      _ => {
+      ProxyOrder::Command(id, _) => {
         error!("unsupported message, ignoring");
+        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
       }
     }
   }

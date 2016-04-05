@@ -31,7 +31,8 @@ pub enum ServerMessageType {
   RemovedFront,
   AddedInstance,
   RemovedInstance,
-  Stopped
+  Stopped,
+  Error(String),
 }
 
 #[derive(Debug)]

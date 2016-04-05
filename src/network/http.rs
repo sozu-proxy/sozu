@@ -665,6 +665,8 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
+        } else {
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
@@ -674,6 +676,8 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
+        } else {
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::HttpProxy(configuration)) => {
@@ -689,8 +693,9 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
         event_loop.shutdown();
         self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
-      _ => {
+      ProxyOrder::Command(id, _) => {
         debug!("unsupported message, ignoring");
+        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
       }
     }
   }
