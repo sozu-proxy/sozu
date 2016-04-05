@@ -105,6 +105,7 @@ struct CommandClient {
   back_buf:    Buffer,
   token:       Option<Token>,
   message_ids: Vec<String>,
+  write_timeout: Option<Timeout>,
 }
 
 impl CommandClient {
@@ -115,6 +116,7 @@ impl CommandClient {
       back_buf:    Buffer::with_capacity(10000),
       token:       None,
       message_ids: Vec::new(),
+      write_timeout: None,
     }
   }
 
@@ -135,7 +137,7 @@ impl CommandClient {
     let mut interest = EventSet::hup();
     interest.insert(EventSet::readable());
     interest.insert(EventSet::writable());
-    event_loop.register(&self.sock, tok, interest, PollOpt::level() | PollOpt::oneshot());
+    event_loop.register(&self.sock, tok, interest, PollOpt::edge() | PollOpt::oneshot());
   }
 
   fn conn_readable(&mut self, event_loop: &mut EventLoop<CommandServer>, tok: Token) -> Option<Vec<ConfigMessage>>{
@@ -176,9 +178,17 @@ impl CommandClient {
   }
 
   fn conn_writable(&mut self, event_loop: &mut EventLoop<CommandServer>, tok: Token) {
+    if self.write_timeout.is_some() {
+      trace!("server conn writable; tok={:?}; waiting for timeout", tok.as_usize());
+      return;
+    }
+
     trace!("server conn writable; tok={:?}", tok);
     match self.sock.write(self.back_buf.data()) {
-      Ok(0) => {},
+      Ok(0) => {
+        //println!("[{}] setting timeout!", tok.as_usize());
+        self.write_timeout = event_loop.timeout_ms(self.token.unwrap().as_usize(), 700).ok();
+      },
       Ok(r) => {
         self.back_buf.consume(r);
       },
@@ -187,7 +197,7 @@ impl CommandClient {
     let mut interest = EventSet::hup();
     interest.insert(EventSet::readable());
     interest.insert(EventSet::writable());
-    event_loop.register(&self.sock, tok, interest, PollOpt::level() | PollOpt::oneshot());
+    event_loop.register(&self.sock, tok, interest, PollOpt::edge() | PollOpt::oneshot());
   }
 }
 
@@ -217,11 +227,11 @@ impl CommandServer {
     let mut interest = EventSet::hup();
     interest.insert(EventSet::readable());
     interest.insert(EventSet::writable());
-    event_loop.register(&self.conns[tok].sock, tok, interest, PollOpt::level())
+    event_loop.register(&self.conns[tok].sock, tok, interest, PollOpt::edge())
       .ok().expect("could not register socket with event loop");
 
     let accept_interest = EventSet::readable();
-    event_loop.reregister(&self.sock, SERVER, accept_interest, PollOpt::level());
+    event_loop.reregister(&self.sock, SERVER, accept_interest, PollOpt::edge());
     Ok(())
   }
 
@@ -302,19 +312,31 @@ impl Handler for CommandServer {
   }
 
   fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {
-    for listener in self.listeners.values() {
-      while let Ok(msg) = listener.receiver.try_recv() {
-        println!("got msg: {:?}", msg);
-        for client in self.conns.iter_mut() {
-          if let Some(index) = client.has_message_id(&msg.id) {
-            client.back_buf.write(&encode(&msg).unwrap().into_bytes());
-            client.back_buf.write(&b"\0"[..]);
-            client.remove_message_id(index);
+    if timeout == 0 {
+      for listener in self.listeners.values() {
+        while let Ok(msg) = listener.receiver.try_recv() {
+          //println!("got msg: {:?}", msg);
+          for client in self.conns.iter_mut() {
+            if let Some(index) = client.has_message_id(&msg.id) {
+              client.back_buf.write(&encode(&msg).unwrap().into_bytes());
+              client.back_buf.write(&b"\0"[..]);
+              client.remove_message_id(index);
+            }
           }
         }
       }
+      event_loop.timeout_ms(0, 700);
+    } else {
+      let token = Token(timeout);
+      if self.conns.contains(token) {
+        //println!("[{}] timeout ended, registering for writes", timeout);
+        self.conns[token].write_timeout = None;
+        let mut interest = EventSet::hup();
+        interest.insert(EventSet::readable());
+        interest.insert(EventSet::writable());
+        event_loop.register(&self.conns[token].sock, token, interest, PollOpt::edge() | PollOpt::oneshot());
+      }
     }
-    event_loop.timeout_ms(0, 700);
   }
 
 }
@@ -340,7 +362,7 @@ pub fn start(path: String, listeners: HashMap<String, Listener>) {
           return;
         }
         info!("listen for connections");
-        event_loop.register(&srv, SERVER, EventSet::readable(), PollOpt::level() | PollOpt::oneshot()).unwrap();
+        event_loop.register(&srv, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
         event_loop.timeout_ms(0, 700);
 
         event_loop.run(&mut CommandServer::new(srv, listeners)).unwrap()
