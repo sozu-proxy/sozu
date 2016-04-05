@@ -92,6 +92,23 @@ impl Encodable for Listener {
   }
 }
 
+pub struct ListenerConfiguration<'a> {
+  id:       String,
+  listener: &'a Listener,
+}
+
+impl<'a> Encodable for ListenerConfiguration<'a> {
+  fn encode<E: Encoder>(&self, e: &mut E) -> Result<(), E::Error> {
+    e.emit_map(2, |e| {
+      try!(e.emit_map_elt_key(0, |e| "id".encode(e)));
+      try!(e.emit_map_elt_val(0, |e| self.id.encode(e)));
+      try!(e.emit_map_elt_key(1, |e| "listener".encode(e)));
+      try!(e.emit_map_elt_val(1, |e| self.listener.encode(e)));
+      Ok(())
+    })
+  }
+}
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct ConfigMessage {
     pub id:       String,
@@ -244,7 +261,11 @@ impl CommandServer {
       let command = message.command.clone();
       if let Some(ref mut listener) = self.listeners.get_mut (&message.listener) {
         if message.command == Command::DumpConfiguration {
-          self.conns[token].back_buf.write(&encode(*listener).unwrap().into_bytes());
+          let conf = ListenerConfiguration {
+            id: message.id.clone(),
+            listener: listener,
+          };
+          self.conns[token].back_buf.write(&encode(&conf).unwrap().into_bytes());
           self.conns[token].back_buf.write(&b"\0"[..]);
         } else {
           self.conns[token].add_message_id(message.id.clone());
