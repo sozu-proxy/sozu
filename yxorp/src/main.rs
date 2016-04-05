@@ -39,18 +39,22 @@ fn main() {
       address.push(':');
       address.push_str(&ls.port.to_string());
 
-      let (tx, jg) = match ls.listener_type {
-        ListenerType::HTTP => {
-          network::http::start_listener(address.parse().unwrap(), ls.max_connections, sender)
-        },
-        ListenerType::HTTPS => {
-          network::tls::start_listener(address.parse().unwrap(), ls.max_connections, None, sender)
-        },
-        _ => unimplemented!()
-      };
-      let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
-      listeners.insert(tag.clone(), l);
-      jh_opt = Some(jg);
+      if let Ok(addr) = address.parse() {
+        let (tx, jg) = match ls.listener_type {
+          ListenerType::HTTP => {
+            network::http::start_listener(addr, ls.max_connections, sender)
+          },
+          ListenerType::HTTPS => {
+            network::tls::start_listener(addr, ls.max_connections, None, sender)
+          },
+          _ => unimplemented!()
+        };
+        let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
+        listeners.insert(tag.clone(), l);
+        jh_opt = Some(jg);
+      } else {
+        error!("could not parse address: {}", address);
+      }
     };
 
     command::start(config.command_socket, listeners);
