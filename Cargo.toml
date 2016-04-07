@@ -25,6 +25,10 @@ features = ["tlsv1_2", "tlsv1_1", "rfc5114", "ecdh_auto"]
 [dependencies.pool]
 git = "https://github.com/Geal/pool.git"
 
+[dependencies.uuid]
+version = "~0.2.0"
+features = ["v4"]
+
 [features]
 default = []
 splice  = []

@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use time::{Duration,precise_time_s};
 use rand::random;
+use uuid::Uuid;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents};
 use network::proxy::{Server,ProxyClient,ProxyConfiguration};
 
@@ -48,6 +49,7 @@ pub struct Client {
   rx_count:       usize,
   tx_count:       usize,
   app_id:         Option<String>,
+  request_id:     String,
 }
 
 #[cfg(feature = "splice")]
@@ -69,6 +71,7 @@ pub struct Client {
   rx_count:       usize,
   tx_count:       usize,
   app_id:         Option<String>,
+  request_id:     String,
 }
 
 #[cfg(not(feature = "splice"))]
@@ -90,6 +93,7 @@ impl Client {
       rx_count:       0,
       tx_count:       0,
       app_id:         None,
+      request_id:     Uuid::new_v4().hyphenated().to_string(),
     })
   }
 
@@ -117,6 +121,7 @@ impl Client {
         tx_count:       0,
         rx_count:       0,
         app_id:         None,
+        request_id:     Uuid::new_v4().hyphenated().to_string(),
       })
     } else {
       None

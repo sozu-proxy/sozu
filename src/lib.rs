@@ -8,6 +8,7 @@ extern crate rustc_serialize;
 extern crate rand;
 extern crate openssl;
 extern crate pool;
+extern crate uuid;
 
 pub mod network;
 pub mod parser;
