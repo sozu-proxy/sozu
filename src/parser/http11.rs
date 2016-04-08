@@ -1080,6 +1080,18 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize) 
     trace!("mv: {:?}, new state: {:?}\n", mv, new_state);
     current_state = new_state;
 
+    if header_end.is_none() {
+      //println!("current:{:?}", current_state);
+      match current_state {
+        RequestState::Request(_,_,_) | RequestState::RequestWithBody(_,_,_,_) |
+        RequestState::RequestWithBodyChunks(_,_,_,_) => {
+            //println!("FOUND HEADER END:{}\n{}", test_position, (&buf.data()[..test_position+2]).to_hex(8));
+            header_end = Some(rs.req_position + test_position + 2);
+          },
+        _ => ()
+      }
+    }
+
     match mv {
       BufferMove::Advance(sz) => {
         assert!(sz != 0, "buffer move should not be 0");
@@ -1092,17 +1104,6 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize) 
       _ => break
     }
 
-    if header_end.is_none() {
-      //println!("current:{:?}", current_state);
-      match current_state {
-        RequestState::Request(_,_,_) | RequestState::RequestWithBody(_,_,_,_) |
-        RequestState::RequestWithBodyChunks(_,_,_,_) => {
-            //println!("FOUND HEADER END:{}\n{}", test_position, (&buf.data()[..test_position+2]).to_hex(8));
-            header_end = Some(test_position + 2);
-          },
-        _ => ()
-      }
-    }
     match current_state {
       RequestState::Request(_,_,_) | RequestState::RequestWithBody(_,_,_,_) |
         RequestState::Error(_) | RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended) => break,
