@@ -1125,12 +1125,26 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize) 
 pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize) -> HttpState {
   let mut current_state = rs.response.clone();
   let mut position      = 0;
+  let mut header_end    = rs.res_header_end;
   loop {
+    let test_position = index+position;
     trace!("pos[{}]: {:?}", position, current_state);
-    let (mv, new_state) = parse_response(&current_state, &buf.data()[index+position..]);
-    trace!("input:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[index+position..]).to_hex(8), mv, new_state);
+    let (mv, new_state) = parse_response(&current_state, &buf.data()[test_position..]);
+    trace!("input:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[test_position..]).to_hex(8), mv, new_state);
     trace!("mv: {:?}, new state: {:?}\n", mv, new_state);
     current_state = new_state;
+
+    if header_end.is_none() {
+      //println!("current:{:?}", current_state);
+      match current_state {
+        ResponseState::Response(_,_) | ResponseState::ResponseWithBody(_,_,_) |
+        ResponseState::ResponseWithBodyChunks(_,_,_) => {
+            //println!("FOUND HEADER END:{}\n{}", test_position, (&buf.data()[..test_position+2]).to_hex(8));
+            header_end = Some(rs.res_position + test_position + 2);
+          },
+        _ => ()
+      }
+    }
 
     match mv {
       BufferMove::Advance(sz) => {
@@ -1157,7 +1171,7 @@ pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize)
     request:      rs.request.clone(),
     response:     current_state,
     req_header_end: rs.req_header_end,
-    res_header_end: None,
+    res_header_end: header_end,
   }
 }
 
@@ -1806,7 +1820,7 @@ mod tests {
           req_position: 0,
           res_position: 81,
           req_header_end: None,
-          res_header_end: None,
+          res_header_end: Some(74),
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1828,7 +1842,7 @@ mod tests {
           req_position: 0,
           res_position: 110,
           req_header_end: None,
-          res_header_end: None,
+          res_header_end: Some(74),
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1850,7 +1864,7 @@ mod tests {
           req_position: 0,
           res_position: 115,
           req_header_end: None,
-          res_header_end: None,
+          res_header_end: Some(74),
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1871,7 +1885,7 @@ mod tests {
           req_position: 0,
           res_position: 117,
           req_header_end: None,
-          res_header_end: None,
+          res_header_end: Some(74),
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1922,7 +1936,7 @@ mod tests {
           req_position: 0,
           res_position: 72,
           req_header_end: None,
-          res_header_end: None,
+          res_header_end: Some(74),
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1943,7 +1957,7 @@ mod tests {
           req_position: 0,
           res_position: 81,
           req_header_end: None,
-          res_header_end: None,
+          res_header_end: Some(74),
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1967,7 +1981,7 @@ mod tests {
           req_position: 0,
           res_position: 115,
           req_header_end: None,
-          res_header_end: None,
+          res_header_end: Some(74),
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1988,7 +2002,7 @@ mod tests {
           req_position: 0,
           res_position: 117,
           req_header_end: None,
-          res_header_end: None,
+          res_header_end: Some(74),
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
