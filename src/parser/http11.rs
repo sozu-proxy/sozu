@@ -1070,11 +1070,13 @@ pub fn parse_response(state: &ResponseState, buf: &[u8]) -> (BufferMove, Respons
 pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize) -> HttpState {
   let mut current_state = rs.request.clone();
   let mut position      = 0;
+  let mut header_end    = rs.req_header_end;
   //let (mut position, mut current_state) = state;
   loop {
+    let test_position = index+position;
     trace!("pos[{}]: {:?}", position, current_state);
-    let (mv, new_state) = parse_request(&current_state, &buf.data()[index+position..]);
-    trace!("input:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[index+position..]).to_hex(8), mv, new_state);
+    let (mv, new_state) = parse_request(&current_state, &buf.data()[test_position..]);
+    trace!("input:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[test_position..]).to_hex(8), mv, new_state);
     trace!("mv: {:?}, new state: {:?}\n", mv, new_state);
     current_state = new_state;
 
@@ -1090,6 +1092,17 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize) 
       _ => break
     }
 
+    if header_end.is_none() {
+      //println!("current:{:?}", current_state);
+      match current_state {
+        RequestState::Request(_,_,_) | RequestState::RequestWithBody(_,_,_,_) |
+        RequestState::RequestWithBodyChunks(_,_,_,_) => {
+            //println!("FOUND HEADER END:{}\n{}", test_position, (&buf.data()[..test_position+2]).to_hex(8));
+            header_end = Some(test_position + 2);
+          },
+        _ => ()
+      }
+    }
     match current_state {
       RequestState::Request(_,_,_) | RequestState::RequestWithBody(_,_,_,_) |
         RequestState::Error(_) | RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended) => break,
@@ -1103,7 +1116,7 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize) 
     res_position: rs.res_position,
     request:      current_state,
     response:     rs.response.clone(),
-    req_header_end: None,
+    req_header_end: header_end,
     res_header_end: rs.res_header_end,
   }
 }
@@ -1292,7 +1305,7 @@ mod tests {
         HttpState {
           req_position: 309,
           res_position: 0,
-          req_header_end: None,
+          req_header_end: Some(109),
           res_header_end: None,
           request: RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
@@ -1317,7 +1330,7 @@ mod tests {
       let initial = HttpState {
         req_position: 26,
         res_position: 0,
-        req_header_end: None,
+        req_header_end: Some(81),
         res_header_end: None,
         request:  RequestState::HasRequestLine(
           RRequestLine {
@@ -1342,7 +1355,7 @@ mod tests {
         HttpState {
           req_position: 309,
           res_position: 0,
-          req_header_end: None,
+          req_header_end: Some(81),
           res_header_end: None,
           request:    RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
@@ -1377,7 +1390,7 @@ mod tests {
         HttpState {
           req_position: 116,
           res_position: 0,
-          req_header_end: None,
+          req_header_end: Some(116),
           res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
@@ -1442,7 +1455,7 @@ mod tests {
         HttpState {
           req_position: 136,
           res_position: 0,
-          req_header_end: None,
+          req_header_end: Some(136),
           res_header_end: None,
           request:  RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
@@ -1474,7 +1487,7 @@ mod tests {
         HttpState {
           req_position: 40,
           res_position: 0,
-          req_header_end: None,
+          req_header_end: Some(40),
           res_header_end: None,
           request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
@@ -1505,7 +1518,7 @@ mod tests {
         HttpState {
           req_position: 40,
           res_position: 0,
-          req_header_end: None,
+          req_header_end: Some(40),
           res_header_end: None,
           request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
@@ -1536,7 +1549,7 @@ mod tests {
         HttpState {
           req_position: 40,
           res_position: 0,
-          req_header_end: None,
+          req_header_end: Some(40),
           res_header_end: None,
           request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
@@ -1568,7 +1581,7 @@ mod tests {
         HttpState {
           req_position: 40,
           res_position: 0,
-          req_header_end: None,
+          req_header_end: Some(40),
           res_header_end: None,
           request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
@@ -1662,7 +1675,7 @@ mod tests {
         HttpState {
           req_position: 160,
           res_position: 0,
-          req_header_end: None,
+          req_header_end: Some(117),
           res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
@@ -1704,7 +1717,7 @@ mod tests {
         HttpState {
           req_position: 124,
           res_position: 0,
-          req_header_end: None,
+          req_header_end: Some(117),
           res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
@@ -1727,7 +1740,7 @@ mod tests {
         HttpState {
           req_position: 153,
           res_position: 0,
-          req_header_end: None,
+          req_header_end: Some(117),
           res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
@@ -1750,7 +1763,7 @@ mod tests {
         HttpState {
           req_position: 160,
           res_position: 0,
-          req_header_end: None,
+          req_header_end: Some(117),
           res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
