@@ -645,29 +645,37 @@ impl ResponseState {
   }
 }
 
+pub type HeaderEndPosition = Option<usize>;
+
 #[derive(Debug,PartialEq)]
 pub struct HttpState {
-  pub req_position: usize,
-  pub res_position: usize,
-  pub request:      RequestState,
-  pub response:     ResponseState,
+  pub req_position:   usize,
+  pub res_position:   usize,
+  pub request:        RequestState,
+  pub response:       ResponseState,
+  pub req_header_end: HeaderEndPosition,
+  pub res_header_end: HeaderEndPosition,
 }
 
 impl HttpState {
   pub fn new() -> HttpState {
     HttpState {
-      req_position: 0,
-      res_position: 0,
-      request:      RequestState::Initial,
-      response:     ResponseState::Initial,
+      req_position:   0,
+      res_position:   0,
+      request:        RequestState::Initial,
+      response:       ResponseState::Initial,
+      req_header_end: None,
+      res_header_end: None,
     }
   }
 
   pub fn reset(&mut self) {
-    self.req_position = 0;
-    self.res_position = 0;
-    self.request      = RequestState::Initial;
-    self.response     = ResponseState::Initial;
+    self.req_position   = 0;
+    self.res_position   = 0;
+    self.request        = RequestState::Initial;
+    self.response       = ResponseState::Initial;
+    self.req_header_end = None;
+    self.res_header_end = None;
   }
 
   pub fn has_host(&self) -> bool {
@@ -1095,6 +1103,8 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize) 
     res_position: rs.res_position,
     request:      current_state,
     response:     rs.response.clone(),
+    req_header_end: None,
+    res_header_end: rs.res_header_end,
   }
 }
 
@@ -1132,6 +1142,8 @@ pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize)
     res_position: rs.res_position + position,
     request:      rs.request.clone(),
     response:     current_state,
+    req_header_end: rs.req_header_end,
+    res_header_end: None,
   }
 }
 
@@ -1280,6 +1292,8 @@ mod tests {
         HttpState {
           req_position: 309,
           res_position: 0,
+          req_header_end: None,
+          res_header_end: None,
           request: RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
@@ -1303,6 +1317,8 @@ mod tests {
       let initial = HttpState {
         req_position: 26,
         res_position: 0,
+        req_header_end: None,
+        res_header_end: None,
         request:  RequestState::HasRequestLine(
           RRequestLine {
             method: String::from("GET"),
@@ -1326,6 +1342,8 @@ mod tests {
         HttpState {
           req_position: 309,
           res_position: 0,
+          req_header_end: None,
+          res_header_end: None,
           request:    RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
@@ -1359,6 +1377,8 @@ mod tests {
         HttpState {
           req_position: 116,
           res_position: 0,
+          req_header_end: None,
+          res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
@@ -1391,6 +1411,8 @@ mod tests {
         HttpState {
           req_position: 128,
           res_position: 0,
+          req_header_end: None,
+          res_header_end: None,
           request: RequestState::Error(ErrorState::InvalidHttp),
           response: ResponseState::Initial
         }
@@ -1420,6 +1442,8 @@ mod tests {
         HttpState {
           req_position: 136,
           res_position: 0,
+          req_header_end: None,
+          res_header_end: None,
           request:  RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
@@ -1450,6 +1474,8 @@ mod tests {
         HttpState {
           req_position: 40,
           res_position: 0,
+          req_header_end: None,
+          res_header_end: None,
           request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
             Connection::Close,
@@ -1479,6 +1505,8 @@ mod tests {
         HttpState {
           req_position: 40,
           res_position: 0,
+          req_header_end: None,
+          res_header_end: None,
           request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
             Connection::Close,
@@ -1508,6 +1536,8 @@ mod tests {
         HttpState {
           req_position: 40,
           res_position: 0,
+          req_header_end: None,
+          res_header_end: None,
           request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
             Connection::KeepAlive,
@@ -1538,6 +1568,8 @@ mod tests {
         HttpState {
           req_position: 40,
           res_position: 0,
+          req_header_end: None,
+          res_header_end: None,
           request:  RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
             Connection::Close,
@@ -1630,6 +1662,8 @@ mod tests {
         HttpState {
           req_position: 160,
           res_position: 0,
+          req_header_end: None,
+          res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
@@ -1670,6 +1704,8 @@ mod tests {
         HttpState {
           req_position: 124,
           res_position: 0,
+          req_header_end: None,
+          res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
@@ -1691,6 +1727,8 @@ mod tests {
         HttpState {
           req_position: 153,
           res_position: 0,
+          req_header_end: None,
+          res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
@@ -1712,6 +1750,8 @@ mod tests {
         HttpState {
           req_position: 160,
           res_position: 0,
+          req_header_end: None,
+          res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
@@ -1751,6 +1791,8 @@ mod tests {
         HttpState {
           req_position: 0,
           res_position: 81,
+          req_header_end: None,
+          res_header_end: None,
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1771,6 +1813,8 @@ mod tests {
         HttpState {
           req_position: 0,
           res_position: 110,
+          req_header_end: None,
+          res_header_end: None,
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1791,6 +1835,8 @@ mod tests {
         HttpState {
           req_position: 0,
           res_position: 115,
+          req_header_end: None,
+          res_header_end: None,
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1810,6 +1856,8 @@ mod tests {
         HttpState {
           req_position: 0,
           res_position: 117,
+          req_header_end: None,
+          res_header_end: None,
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1839,6 +1887,8 @@ mod tests {
       let initial = HttpState {
         req_position: 0,
         res_position: 72,
+        req_header_end: None,
+        res_header_end: None,
         request:      RequestState::Initial,
         response:     ResponseState::ResponseWithBodyChunks(
           RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1857,6 +1907,8 @@ mod tests {
         HttpState {
           req_position: 0,
           res_position: 72,
+          req_header_end: None,
+          res_header_end: None,
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1876,6 +1928,8 @@ mod tests {
         HttpState {
           req_position: 0,
           res_position: 81,
+          req_header_end: None,
+          res_header_end: None,
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1898,6 +1952,8 @@ mod tests {
         HttpState {
           req_position: 0,
           res_position: 115,
+          req_header_end: None,
+          res_header_end: None,
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
@@ -1917,6 +1973,8 @@ mod tests {
         HttpState {
           req_position: 0,
           res_position: 117,
+          req_header_end: None,
+          res_header_end: None,
           request:      RequestState::Initial,
           response:     ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
