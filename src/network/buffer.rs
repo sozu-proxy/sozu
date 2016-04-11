@@ -123,7 +123,7 @@ impl Buffer {
   pub fn insert_slice(&mut self, data: &[u8], start: usize) -> Option<usize> {
     let data_len = data.len();
     if start > self.available_data() ||
-      self.position + start + data_len > self.capacity {
+      self.position + self.end + data_len > self.capacity {
       return None
     }
 
