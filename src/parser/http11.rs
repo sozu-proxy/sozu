@@ -435,7 +435,10 @@ impl<'a> Header<'a> {
           None         => HeaderValue::Error
         }
       },
-      b"forwarded" => {
+      b"forwarded" | b"x-forwarded-for" | b"x-forwarded-proto" | b"x-forwarded-port" => {
+        HeaderValue::Forwarded
+      },
+      /*b"forwarded" => {
         match comma_separated_header_value(self.value) {
           Some(forwarded) => HeaderValue::Forwarded(forwarded),
           None            => HeaderValue::Error
@@ -462,7 +465,7 @@ impl<'a> Header<'a> {
             Err(_)  => HeaderValue::Error,
           },
         }
-      }
+      }*/
       _ => HeaderValue::Other(self.name, self.value)
     }
   }
@@ -489,10 +492,13 @@ pub enum HeaderValue<'a> {
   //FIXME: are the references in Connection still valid after we delete that part of the headers?
   Connection(Vec<&'a [u8]>),
   Other(&'a[u8],&'a[u8]),
+  Forwarded,
+  /*
   Forwarded(Vec<&'a[u8]>),
   XForwardedFor(Vec<&'a[u8]>),
   XForwardedProto(ForwardedProtocol),
   XForwardedPort(u16),
+  */
   Error
 }
 
@@ -871,12 +877,15 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
       }
     },
 
-    // FIXME: there should be an error for unsupported encoding
+    /*
     HeaderValue::Forwarded(_)  => RequestState::Error(ErrorState::InvalidHttp),
     HeaderValue::XForwardedFor(_) => RequestState::Error(ErrorState::InvalidHttp),
     HeaderValue::XForwardedProto(_) => RequestState::Error(ErrorState::InvalidHttp),
     HeaderValue::XForwardedPort(_) => RequestState::Error(ErrorState::InvalidHttp),
+    */
+    // FIXME: there should be an error for unsupported encoding
     HeaderValue::Encoding(_) => RequestState::Error(ErrorState::InvalidHttp),
+    HeaderValue::Forwarded   => state.clone(),
     HeaderValue::Other(_,_)  => state.clone(),
     HeaderValue::Error       => RequestState::Error(ErrorState::InvalidHttp)
   }
@@ -1027,10 +1036,13 @@ pub fn validate_response_header(state: ResponseState, header: &Header) -> Respon
     // FIXME: there should be an error for unsupported encoding
     HeaderValue::Encoding(_) => ResponseState::Error(ErrorState::InvalidHttp),
     HeaderValue::Host(_)     => ResponseState::Error(ErrorState::InvalidHttp),
+    /*
     HeaderValue::Forwarded(_)  => ResponseState::Error(ErrorState::InvalidHttp),
     HeaderValue::XForwardedFor(_) => ResponseState::Error(ErrorState::InvalidHttp),
     HeaderValue::XForwardedProto(_) => ResponseState::Error(ErrorState::InvalidHttp),
     HeaderValue::XForwardedPort(_) => ResponseState::Error(ErrorState::InvalidHttp),
+    */
+    HeaderValue::Forwarded   => state.clone(),
     HeaderValue::Other(_,_)  => state.clone(),
     HeaderValue::Error       => ResponseState::Error(ErrorState::InvalidHttp)
   }

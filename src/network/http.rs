@@ -120,7 +120,25 @@ impl<Front:SocketHandler> Client<Front> {
   }
 
   //FIXME: maybe pregenerate it
-  pub fn request_header(&self) -> String {
+  pub fn added_request_header(&self) -> String {
+    use std::net::IpAddr;
+    if let (Ok(peer), Ok(front)) = (
+      self.front_socket().peer_addr().map(|addr| addr.ip()),
+      self.front_socket().local_addr().map(|addr| addr.ip())
+    ) {
+      match (peer, front) {
+        (IpAddr::V4(p), IpAddr::V4(f)) => format!("Forwarded: for={};by={}\r\nRequest-id: {}\r\n", peer, front, self.request_id),
+        (IpAddr::V4(p), IpAddr::V6(f)) => format!("Forwarded: for={};by=\"{}\"\r\nRequest-id: {}\r\n", peer, front, self.request_id),
+        (IpAddr::V6(p), IpAddr::V4(f)) => format!("Forwarded: for=\"{}\";by={}\r\nRequest-id: {}\r\n", peer, front, self.request_id),
+        (IpAddr::V6(p), IpAddr::V6(f)) => format!("Forwarded: for=\"{}\";by=\"{}\"\r\nRequest-id: {}\r\n", peer, front, self.request_id),
+      }
+    } else {
+      format!("Request-id: {}\r\n", self.request_id)
+    }
+  }
+
+  //FIXME: maybe pregenerate it
+  pub fn added_response_header(&self) -> String {
     format!("Request-id: {}\r\n", self.request_id)
   }
 }
@@ -228,7 +246,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       SocketResult::Error => return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient),
       _                   => {
         if !has_host {
-          let new_header = self.request_header();
+          let new_header = self.added_request_header();
           self.state = parse_request_until_stop(&self.state, &mut self.front_buf, 0, new_header.as_bytes());
           debug!("{} parse_request_until_stop returned {:?} => advance: {}", self.request_id, self.state, self.state.req_position);
           if self.state.is_front_error() {
@@ -261,7 +279,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               } else {
                 if self.front_buf_position + self.front_buf.available_data() >= self.state.req_position {
                   let next_start: usize = self.state.req_position - self.front_buf_position;
-                  let new_header = self.request_header();
+                  let new_header = self.added_request_header();
                   self.state = parse_request_until_stop(&self.state, &mut self.front_buf, next_start, new_header.as_bytes());
                   debug!("{} parse_request_until_stop returned {:?} => advance: {}", self.request_id, self.state, self.state.req_position);
                   if self.state.is_front_error() {
@@ -281,7 +299,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
             },
             _ => {
               let next_start: usize = self.state.req_position - self.front_buf_position;
-              let new_header = self.request_header();
+              let new_header = self.added_request_header();
               self.state = parse_request_until_stop(&self.state, &mut self.front_buf, next_start, new_header.as_bytes());
               debug!("{} parse_request_until_stop returned {:?} => advance: {}", self.request_id, self.state, self.state.req_position);
               if self.state.is_front_error() {
@@ -414,7 +432,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
 
     let tokens = self.tokens().clone();
-    let new_header = self.request_header();
+    let new_header = self.added_response_header();
     if let Some(ref mut sock) = self.backend {
       let (sz, r) = sock.socket_read(&mut self.back_buf.space());
       self.back_buf.fill(sz);
