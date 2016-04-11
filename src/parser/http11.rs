@@ -434,22 +434,65 @@ impl<'a> Header<'a> {
           Some(tokens) => HeaderValue::Connection(tokens),
           None         => HeaderValue::Error
         }
+      },
+      b"forwarded" => {
+        match comma_separated_header_value(self.value) {
+          Some(forwarded) => HeaderValue::Forwarded(forwarded),
+          None            => HeaderValue::Error
+        }
+      },
+      b"x-forwarded-for" => {
+        match comma_separated_header_value(self.value) {
+          Some(ips) => HeaderValue::XForwardedFor(ips),
+          None      => HeaderValue::Error
+        }
+      }
+      b"x-forwarded-proto" => {
+        match &self.value.to_ascii_lowercase()[..] {
+          b"http"  => HeaderValue::XForwardedProto(ForwardedProtocol::HTTP),
+          b"https" => HeaderValue::XForwardedProto(ForwardedProtocol::HTTPS),
+          _        => HeaderValue::Error
+        }
+      }
+      b"x-forwarded-port" => {
+        match str::from_utf8(self.value) {
+          Err(_)  => HeaderValue::Error,
+          Ok(s) => match u16::from_str(s) {
+            Ok(val) => HeaderValue::XForwardedPort(val),
+            Err(_)  => HeaderValue::Error,
+          },
+        }
       }
       _ => HeaderValue::Other(self.name, self.value)
     }
   }
 
   pub fn should_delete(&self) -> bool {
-    &self.name.to_ascii_lowercase()[..] == b"connection"
+    let lowercase = self.name.to_ascii_lowercase();
+    &lowercase[..] == b"connection"        ||
+    &lowercase[..] == b"forwarded"         ||
+    &lowercase[..] == b"x-forwarded-for"   ||
+    &lowercase[..] == b"x-forwarded-proto" ||
+    &lowercase[..] == b"x-forwarded-port"
   }
+}
+
+pub enum ForwardedProtocol {
+  HTTP,
+  HTTPS
 }
 
 pub enum HeaderValue<'a> {
   Host(String),
   ContentLength(usize),
   Encoding(TransferEncodingValue),
+  //FIXME: are the references in Connection still valid after we delete that part of the headers?
   Connection(Vec<&'a [u8]>),
   Other(&'a[u8],&'a[u8]),
+  Forwarded(Vec<&'a[u8]>),
+  XForwardedFor(Vec<&'a[u8]>),
+  XForwardedProto(ForwardedProtocol),
+  XForwardedPort(u16),
   Error
 }
 
@@ -829,6 +872,10 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
     },
 
     // FIXME: there should be an error for unsupported encoding
+    HeaderValue::Forwarded(_)  => RequestState::Error(ErrorState::InvalidHttp),
+    HeaderValue::XForwardedFor(_) => RequestState::Error(ErrorState::InvalidHttp),
+    HeaderValue::XForwardedProto(_) => RequestState::Error(ErrorState::InvalidHttp),
+    HeaderValue::XForwardedPort(_) => RequestState::Error(ErrorState::InvalidHttp),
     HeaderValue::Encoding(_) => RequestState::Error(ErrorState::InvalidHttp),
     HeaderValue::Other(_,_)  => state.clone(),
     HeaderValue::Error       => RequestState::Error(ErrorState::InvalidHttp)
@@ -980,6 +1027,10 @@ pub fn validate_response_header(state: ResponseState, header: &Header) -> Respon
     // FIXME: there should be an error for unsupported encoding
     HeaderValue::Encoding(_) => ResponseState::Error(ErrorState::InvalidHttp),
     HeaderValue::Host(_)     => ResponseState::Error(ErrorState::InvalidHttp),
+    HeaderValue::Forwarded(_)  => ResponseState::Error(ErrorState::InvalidHttp),
+    HeaderValue::XForwardedFor(_) => ResponseState::Error(ErrorState::InvalidHttp),
+    HeaderValue::XForwardedProto(_) => ResponseState::Error(ErrorState::InvalidHttp),
+    HeaderValue::XForwardedPort(_) => ResponseState::Error(ErrorState::InvalidHttp),
     HeaderValue::Other(_,_)  => state.clone(),
     HeaderValue::Error       => ResponseState::Error(ErrorState::InvalidHttp)
   }
