@@ -1143,6 +1143,11 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize, 
     trace!("mv: {:?}, new state: {:?}\n", mv, new_state);
     current_state = new_state;
 
+    if let BufferMove::Delete(start, end) = mv {
+      buf.delete_slice(index+position+start, index + end - start);
+      position += start;
+    }
+
     if header_end.is_none() {
       //println!("current:{:?}", current_state);
       match current_state {
@@ -1153,6 +1158,7 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize, 
             position  += insert.len();
             header_end = Some(rs.req_position + test_position + insert.len() + 2);
           } else {
+            error!("request buffer too small, cannot insert additional headers: {}", str::from_utf8(insert).unwrap());
             header_end = Some(rs.req_position + test_position + 2);
           }
         },
@@ -1165,10 +1171,7 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize, 
         assert!(sz != 0, "buffer move should not be 0");
         position+=sz;
       },
-      BufferMove::Delete(start, end) => {
-        buf.delete_slice(index+position+start, index + end - start);
-        position += start;
-      },
+      BufferMove::Delete(_, _) => {},
       _ => break
     }
 
@@ -1202,6 +1205,11 @@ pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize,
     trace!("mv: {:?}, new state: {:?}\n", mv, new_state);
     current_state = new_state;
 
+    if let BufferMove::Delete(start, end) = mv {
+      buf.delete_slice(index+position+start, index+end - start);
+      position += start;
+    }
+
     if header_end.is_none() {
       //println!("current:{:?}", current_state);
       match current_state {
@@ -1212,6 +1220,7 @@ pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize,
             position  += insert.len();
             header_end = Some(rs.res_position + test_position + insert.len() + 2);
           } else {
+            error!("response buffer too small, cannot insert additional headers: \"{}\"", str::from_utf8(insert).unwrap());
             header_end = Some(rs.res_position + test_position + 2);
           }
         },
@@ -1224,10 +1233,7 @@ pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize,
         assert!(sz != 0, "buffer move should not be 0");
         position+=sz;
       },
-      BufferMove::Delete(start, end) => {
-        buf.delete_slice(index+position+start, index+end - start);
-        position += start;
-      },
+      BufferMove::Delete(_, _) => {},
       _ => break
     }
 
