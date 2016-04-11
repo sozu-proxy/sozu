@@ -1148,16 +1148,14 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize, 
       match current_state {
         RequestState::Request(_,_,_) | RequestState::RequestWithBody(_,_,_,_) |
         RequestState::RequestWithBodyChunks(_,_,_,_) => {
-            if insert.len() > 0 {
-              //println!("FOUND HEADER END:{}\n{}", test_position, (&buf.data()[..test_position+2]).to_hex(8));
-              buf.insert_slice(insert, test_position);
-              //println!("ADDED HEADER:\n{}", (&buf.data()).to_hex(8));
-              position  += insert.len();
-              header_end = Some(rs.req_position + test_position + insert.len() + 2);
-            } else {
-              header_end = Some(rs.req_position + test_position + 2);
-            }
-          },
+          //println!("FOUND HEADER END:{}\n{}", test_position, (&buf.data()[..test_position+2]).to_hex(8));
+          if let Some(_) = buf.insert_slice(insert, test_position) {
+            position  += insert.len();
+            header_end = Some(rs.req_position + test_position + insert.len() + 2);
+          } else {
+            header_end = Some(rs.req_position + test_position + 2);
+          }
+        },
         _ => ()
       }
     }
@@ -1209,16 +1207,14 @@ pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize,
       match current_state {
         ResponseState::Response(_,_) | ResponseState::ResponseWithBody(_,_,_) |
         ResponseState::ResponseWithBodyChunks(_,_,_) => {
-            if insert.len() > 0 {
-              //println!("FOUND HEADER END:{}\n{}", test_position, (&buf.data()[..test_position+2]).to_hex(8));
-              buf.insert_slice(insert, test_position);
-              //println!("ADDED HEADER:\n{}", (&buf.data()).to_hex(8));
-              position  += insert.len();
-              header_end = Some(rs.res_position + test_position + insert.len() + 2);
-            } else {
-              header_end = Some(rs.res_position + test_position + 2);
-            }
-          },
+          //println!("FOUND HEADER END:{}\n{}", test_position, (&buf.data()[..test_position+2]).to_hex(8));
+          if let Some(_) = buf.insert_slice(insert, test_position) {
+            position  += insert.len();
+            header_end = Some(rs.res_position + test_position + insert.len() + 2);
+          } else {
+            header_end = Some(rs.res_position + test_position + 2);
+          }
+        },
         _ => ()
       }
     }
