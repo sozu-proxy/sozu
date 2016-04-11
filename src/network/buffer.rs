@@ -119,6 +119,23 @@ impl Buffer {
     }
     Some(self.available_data())
   }
+
+  pub fn insert_slice(&mut self, data: &[u8], start: usize) -> Option<usize> {
+    let data_len = data.len();
+    if start > self.available_data() ||
+      self.position + start + data_len > self.capacity {
+      return None
+    }
+
+    unsafe {
+      let begin     = self.position + start;
+      let slice_end = begin + data_len;
+      ptr::copy((&self.memory[start..self.end]).as_ptr(), (&mut self.memory[start+data_len..]).as_mut_ptr(), self.end - start);
+      ptr::copy(data.as_ptr(), (&mut self.memory[begin..slice_end]).as_mut_ptr(), data_len);
+      self.end = self.end + data_len;
+    }
+    Some(self.available_data())
+  }
 }
 
 impl Write for Buffer {
