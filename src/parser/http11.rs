@@ -476,7 +476,8 @@ impl<'a> Header<'a> {
     &lowercase[..] == b"forwarded"         ||
     &lowercase[..] == b"x-forwarded-for"   ||
     &lowercase[..] == b"x-forwarded-proto" ||
-    &lowercase[..] == b"x-forwarded-port"
+    &lowercase[..] == b"x-forwarded-port"  ||
+    &lowercase[..] == b"request-id"
   }
 }
 
