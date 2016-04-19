@@ -10,6 +10,7 @@ pub struct ListenerConfig {
   pub address:         String,
   pub port:            u16,
   pub max_connections: usize,
+  pub buffer_size:     usize,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
@@ -55,12 +56,14 @@ mod tests {
       address: String::from("127.0.0.1"),
       port: 8080,
       max_connections: 500,
+      buffer_size: 12000,
     });
     map.insert(String::from("TLS"), ListenerConfig {
       listener_type: ListenerType::HTTPS,
       address: String::from("127.0.0.1"),
       port: 8080,
       max_connections: 500,
+      buffer_size: 12000,
     });
     let config = Config {
       command_socket: String::from("./command_folder/sock"),

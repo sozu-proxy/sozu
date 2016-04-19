@@ -42,10 +42,10 @@ fn main() {
       if let Ok(addr) = address.parse() {
         let (tx, jg) = match ls.listener_type {
           ListenerType::HTTP => {
-            network::http::start_listener(addr, ls.max_connections, sender)
+            network::http::start_listener(addr, ls.max_connections, ls.buffer_size, sender)
           },
           ListenerType::HTTPS => {
-            network::tls::start_listener(addr, ls.max_connections, None, sender)
+            network::tls::start_listener(addr, ls.max_connections, ls.buffer_size, None, sender)
           },
           _ => unimplemented!()
         };

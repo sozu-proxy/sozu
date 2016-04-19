@@ -530,7 +530,7 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(address: SocketAddr, tx: mpsc::Sender<ServerMessage>, max_connections: usize, event_loop: &mut EventLoop<HttpServer>) -> io::Result<ServerConfiguration> {
+  pub fn new(address: SocketAddr, tx: mpsc::Sender<ServerMessage>, max_connections: usize, buffer_size: usize, event_loop: &mut EventLoop<HttpServer>) -> io::Result<ServerConfiguration> {
     match TcpListener::bind(&address) {
       Ok(sock) => {
         event_loop.register(&sock, Token(0), EventSet::readable(), PollOpt::level());
@@ -540,7 +540,7 @@ impl ServerConfiguration {
           instances: HashMap::new(),
           fronts:    HashMap::new(),
           tx:        tx,
-          pool:      Pool::with_capacity(2*max_connections, 0, || Buffer::with_capacity(12000)),
+          pool:      Pool::with_capacity(2*max_connections, 0, || Buffer::with_capacity(buffer_size)),
           front_timeout: 50000,
           back_timeout:  50000,
           answers:   DefaultAnswers {
@@ -767,12 +767,12 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
 
 pub type HttpServer = Server<ServerConfiguration,Client<TcpStream>>;
 
-pub fn start_listener(front: SocketAddr, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
+pub fn start_listener(front: SocketAddr, max_connections: usize, buffer_size: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
 
-  let configuration = ServerConfiguration::new(front, tx, max_connections, &mut event_loop).unwrap();
+  let configuration = ServerConfiguration::new(front, tx, max_connections, buffer_size, &mut event_loop).unwrap();
   let mut server = HttpServer::new(1, max_connections, configuration);
 
   let join_guard = thread::spawn(move|| {
@@ -809,7 +809,7 @@ mod tests {
     thread::spawn(|| { start_server(); });
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").unwrap();
     let (tx,rx) = channel::<ServerMessage>();
-    let (sender, jg) = start_listener(front, 10, tx.clone());
+    let (sender, jg) = start_listener(front, 10, 12000, tx.clone());
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/"), port: 1024 };
     sender.send(ProxyOrder::Command(String::from("ID_ABCD"), Command::AddHttpFront(front)));
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };

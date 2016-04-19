@@ -54,7 +54,7 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(address: SocketAddr, tx: mpsc::Sender<ServerMessage>, max_connections: usize, options: Option<(SslContextOptions, String)>, event_loop: &mut EventLoop<TlsServer>) -> io::Result<ServerConfiguration> {
+  pub fn new(address: SocketAddr, tx: mpsc::Sender<ServerMessage>, max_connections: usize, buffer_size: usize, options: Option<(SslContextOptions, String)>, event_loop: &mut EventLoop<TlsServer>) -> io::Result<ServerConfiguration> {
     let contexts = HashMap::new();
 
     let mut context = SslContext::new(SslMethod::Tlsv1_2).unwrap();
@@ -111,7 +111,7 @@ impl ServerConfiguration {
           default_context: context,
           contexts:        rc_ctx,
           tx:              tx,
-          pool:            Pool::with_capacity(2*max_connections, 0, || Buffer::with_capacity(12000)),
+          pool:            Pool::with_capacity(2*max_connections, 0, || Buffer::with_capacity(buffer_size)),
           front_timeout:   50000,
           back_timeout:    50000,
           answers:         DefaultAnswers {
@@ -372,13 +372,13 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
 
 pub type TlsServer = Server<ServerConfiguration,Client<NonblockingSslStream<TcpStream>>>;
 
-pub fn start_listener(front: SocketAddr, max_connections: usize, options: Option<(SslContextOptions, String)>, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
+pub fn start_listener(front: SocketAddr, max_connections: usize, buffer_size: usize, options: Option<(SslContextOptions, String)>, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
 
   let join_guard = thread::spawn(move|| {
-    let configuration = ServerConfiguration::new(front, tx, max_connections, options, &mut event_loop).unwrap();
+    let configuration = ServerConfiguration::new(front, tx, max_connections, buffer_size, options, &mut event_loop).unwrap();
     let mut server = TlsServer::new(1, max_connections, configuration);
 
     info!("starting event loop");

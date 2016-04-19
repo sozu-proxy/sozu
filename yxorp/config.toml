@@ -13,10 +13,12 @@ address = "127.0.0.1"
 listener_type = "HTTP"
 max_connections = 500
 port = 8080
+buffer_size = 12000
 
 [listeners.TLS]
 address = "127.0.0.1"
 listener_type = "HTTPS"
 max_connections = 500
 port = 8443
+buffer_size = 12000
 
