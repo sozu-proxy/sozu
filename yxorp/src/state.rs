@@ -1,6 +1,5 @@
-use rustc_serialize::{Encodable, Decodable, Encoder, Decoder};
+use rustc_serialize::{Encodable, Encoder, Decoder};
 use std::collections::HashMap;
-use toml::encode_str;
 
 use yxorp::messages::{Command,HttpFront,TlsFront,Instance};
 
@@ -223,8 +222,6 @@ impl TlsProxy {
 mod tests {
   use super::*;
   use yxorp::messages::{Command,HttpFront,Instance};
-  use rustc_serialize::Encodable;
-  use toml::decode_str;
 
   #[test]
   fn serialize() {
