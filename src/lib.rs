@@ -1,5 +1,9 @@
 #![feature(ip_addr)]
 
+#![cfg_attr(test, feature(test))]
+#[cfg(test)]
+extern crate test;
+
 #[macro_use] extern crate nom;
 #[macro_use] extern crate log;
 #[macro_use] extern crate lazy_static;

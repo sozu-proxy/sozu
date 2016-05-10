@@ -2151,3 +2151,73 @@ mod tests {
   }
   */
 }
+
+#[cfg(test)]
+mod bench {
+  use super::*;
+  use test::Bencher;
+  use network::buffer::Buffer;
+  use std::io::Write;
+  use nom::HexDisplay;
+
+  #[bench]
+  fn req_bench(b: &mut Bencher) {
+    let data = b"GET /reddit-init.en-us.O1zuMqOOQvY.js HTTP/1.1\r\n\
+                 Host: www.redditstatic.com\r\n\
+                 User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.8; rv:15.0) Gecko/20100101 Firefox/15.0.1\r\n\
+                 Accept: */*\r\n\
+                 Accept-Language: en-us,en;q=0.5\r\n\
+                 Accept-Encoding: gzip, deflate\r\n\
+                 Connection: keep-alive\r\n\
+                 Referer: http://www.reddit.com/\r\n\r\n";
+
+    let mut buf = Buffer::with_capacity(data.len());
+    buf.write(&data[..]);
+    let initial = HttpState::new();
+    //println!("res: {:?}", parse_request_until_stop(&initial, &mut buf, 0, b""));
+    b.iter(||{
+      parse_request_until_stop(&initial, &mut buf, 0, b"")
+    }); 
+  }
+
+  #[bench]
+  fn parse_req_bench(b: &mut Bencher) {
+    let data = b"GET /reddit-init.en-us.O1zuMqOOQvY.js HTTP/1.1\r\n\
+                 Host: www.redditstatic.com\r\n\
+                 User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.8; rv:15.0) Gecko/20100101 Firefox/15.0.1\r\n\
+                 Accept: */*\r\n\
+                 Accept-Language: en-us,en;q=0.5\r\n\
+                 Accept-Encoding: gzip, deflate\r\n\
+                 Connection: keep-alive\r\n\
+                 Referer: http://www.reddit.com/\r\n\r\n";
+    b.iter(||{
+      let mut current_state = RequestState::Initial;
+      let mut position      = 0;
+      loop {
+        let test_position = position;
+        let (mv, new_state) = parse_request(&current_state, &data[test_position..]);
+        current_state = new_state;
+
+        if let BufferMove::Delete(start, end) = mv {
+          position += end;
+        }
+        match mv {
+          BufferMove::Advance(sz) => {
+            position+=sz;
+          },
+          BufferMove::Delete(_, _) => {},
+          _ => break
+        }
+
+        match current_state {
+          RequestState::Request(_,_,_) | RequestState::RequestWithBody(_,_,_,_) |
+            RequestState::Error(_) | RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended) => break,
+          _ => ()
+        }
+
+        if position >= data.len() { break }
+        //println!("pos: {}, len: {}, state: {:?}, remaining:\n{}", position, data.len(), current_state, (&data[position..]).to_hex(8));
+      }
+    });
+  }
+}
