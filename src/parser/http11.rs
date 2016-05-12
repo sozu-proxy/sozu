@@ -20,9 +20,17 @@ fn is_token_char(i: u8) -> bool {
 }
 named!(pub token, take_while!(is_token_char));
 
+fn is_status_token_char(i: u8) -> bool {
+  is_alphanumeric(i) ||
+  b"!#$%&'*+-.^_`|~ \t".contains(&i)
+}
+
+named!(pub status_token, take_while!(is_status_token_char));
+
 fn is_ws(i: u8) -> bool {
   i == ' ' as u8 && i == '\t' as u8
 }
+
 named!(pub repeated_ws, take_while!(is_ws));
 named!(pub obsolete_ws, chain!(repeated_ws?, || { &b" "[..] }));
 
@@ -162,7 +170,7 @@ named!(pub status_line<StatusLine>,
              sp           ~
     status:  take!(3)     ~
              sp           ~
-    reason:  token        ~
+    reason:  status_token ~
              crlf         ,
     || {
       StatusLine {
@@ -372,7 +380,7 @@ pub struct Response<'a> {
 
 named!(pub response_head<Response>,
        chain!(
-        sl: status_line ~
+        sl: status_line            ~
         hs: many0!(message_header) ~
         crlf, || {
           Response {
@@ -2130,38 +2138,71 @@ mod tests {
 
   #[test]
   fn parse_response_302_test() {
-      let input =
-          b"HTTP/1.1 302 Found\r\n\
-            Cache-Control: no-cache\r\n\
-            Content-length: 0\r\n\
-            Location: https://www.clever-cloud.com\r\n\
-            Connection: close\r\n\
-            \r\n";
-      let initial = HttpState::new();
-      let mut buf = Buffer::with_capacity(2048);
-      buf.write(&input[..]);
+    let input =
+        b"HTTP/1.1 302 Found\r\n\
+          Cache-Control: no-cache\r\n\
+          Content-length: 0\r\n\
+          Location: https://www.clever-cloud.com\r\n\
+          Connection: close\r\n\
+          \r\n";
+    let initial = HttpState::new();
+    let mut buf = Buffer::with_capacity(2048);
+    buf.write(&input[..]);
 
-      let new_header = b"Request-Id: 123456789\r\n";
-      let result = parse_response_until_stop(&initial, &mut buf, 0, new_header);
-      println!("result: {:?}", result);
-      println!("buf:\n{}", buf.data().to_hex(8));
-      assert_eq!(
-        result,
-        HttpState {
-          req_position: 0,
-          res_position: 129,
-          req_header_end: None,
-          res_header_end: Some(129),
-          request: RequestState::Initial,
-          response: ResponseState::ResponseWithBody(
-            RStatusLine { version: String::from("11"), status: 302, reason: String::from("Found") },
-            Connection::Close,
-            0
-          ),
-        }
-      );
+    let new_header = b"Request-Id: 123456789\r\n";
+    let result = parse_response_until_stop(&initial, &mut buf, 0, new_header);
+    println!("result: {:?}", result);
+    println!("buf:\n{}", buf.data().to_hex(8));
+    assert_eq!(
+      result,
+      HttpState {
+        req_position: 0,
+        res_position: 129,
+        req_header_end: None,
+        res_header_end: Some(129),
+        request: RequestState::Initial,
+        response: ResponseState::ResponseWithBody(
+          RStatusLine { version: String::from("11"), status: 302, reason: String::from("Found") },
+          Connection::Close,
+          0
+        ),
+      }
+    );
   }
 
+  #[test]
+  fn parse_response_303_test() {
+    let input =
+        b"HTTP/1.1 303 See Other\r\n\
+          Cache-Control: no-cache\r\n\
+          Content-length: 0\r\n\
+          Location: https://www.clever-cloud.com\r\n\
+          Connection: close\r\n\
+          \r\n";
+    let initial = HttpState::new();
+    let mut buf = Buffer::with_capacity(2048);
+    buf.write(&input[..]);
+
+    let new_header = b"Request-Id: 123456789\r\n";
+    let result = parse_response_until_stop(&initial, &mut buf, 0, new_header);
+    println!("result: {:?}", result);
+    println!("buf:\n{}", buf.data().to_hex(8));
+    assert_eq!(
+      result,
+      HttpState {
+        req_position: 0,
+        res_position: 133,
+        req_header_end: None,
+        res_header_end: Some(133),
+        request: RequestState::Initial,
+        response: ResponseState::ResponseWithBody(
+          RStatusLine { version: String::from("11"), status: 303, reason: String::from("See Other") },
+          Connection::Close,
+          0
+        ),
+      }
+    );
+  }
   /*
   use std::str::from_utf8;
   use std::io::Write;
