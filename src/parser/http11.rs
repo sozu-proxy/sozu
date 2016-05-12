@@ -94,14 +94,14 @@ pub struct StatusLine<'a> {
 #[derive(PartialEq,Debug,Clone)]
 pub struct RStatusLine {
     pub version: String,
-    pub status:  u8,
+    pub status:  u16,
     pub reason:  String,
 }
 
 impl RStatusLine {
   pub fn from_status_line(r: StatusLine) -> Option<RStatusLine> {
     if let Ok(status_str) = str::from_utf8(r.status) {
-      if let Ok(status) = status_str.parse::<u8>() {
+      if let Ok(status) = status_str.parse::<u16>() {
         if let Ok(reason) = str::from_utf8(r.reason) {
           if let Ok(version1) = str::from_utf8(r.version[0]) {
             if let Ok(version2) = str::from_utf8(r.version[1]) {
@@ -2127,6 +2127,41 @@ mod tests {
         }
       );
   }
+
+  #[test]
+  fn parse_response_302_test() {
+      let input =
+          b"HTTP/1.1 302 Found\r\n\
+            Cache-Control: no-cache\r\n\
+            Content-length: 0\r\n\
+            Location: https://www.clever-cloud.com\r\n\
+            Connection: close\r\n\
+            \r\n";
+      let initial = HttpState::new();
+      let mut buf = Buffer::with_capacity(2048);
+      buf.write(&input[..]);
+
+      let new_header = b"Request-Id: 123456789\r\n";
+      let result = parse_response_until_stop(&initial, &mut buf, 0, new_header);
+      println!("result: {:?}", result);
+      println!("buf:\n{}", buf.data().to_hex(8));
+      assert_eq!(
+        result,
+        HttpState {
+          req_position: 0,
+          res_position: 129,
+          req_header_end: None,
+          res_header_end: Some(129),
+          request: RequestState::Initial,
+          response: ResponseState::ResponseWithBody(
+            RStatusLine { version: String::from("11"), status: 302, reason: String::from("Found") },
+            Connection::Close,
+            0
+          ),
+        }
+      );
+  }
+
   /*
   use std::str::from_utf8;
   use std::io::Write;
