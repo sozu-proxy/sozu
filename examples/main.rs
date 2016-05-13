@@ -21,12 +21,12 @@ fn main() {
   let pid = unsafe { libc::getpid() };
   let format = move |record: &LogRecord| {
     match record.level() {
-    LogLevel::Debug | LogLevel::Trace => format!("{}\t{}\t{}\t{}\t-\t{}",
+    LogLevel::Debug | LogLevel::Trace => format!("{}\t{}\t{}\t{}\t-\t{}\t{}",
       time::now_utc().rfc3339(), time::precise_time_ns(), pid,
-      record.level(), record.args()),
-    _ => format!("{}\t{}\t{}\t{}\t-\t{} {}",
+      record.level(), record.location().module_path(), record.args()),
+    _ => format!("{}\t{}\t{}\t{}\t-\t{}",
       time::now_utc().rfc3339(), time::precise_time_ns(), pid,
-      record.level(), record.location().module_path(), record.args())
+      record.level(), record.args())
 
     }
   };
