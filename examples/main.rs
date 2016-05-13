@@ -1,17 +1,45 @@
+#![feature(libc)]
 #[macro_use] extern crate log;
 extern crate env_logger;
 extern crate yxorp;
 extern crate openssl;
+extern crate time;
+extern crate libc;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
+use std::env;
 use yxorp::network;
 use yxorp::messages;
 use yxorp::network::metrics::{METRICS,ProxyMetrics};
 use openssl::ssl;
+use log::{LogRecord,LogLevelFilter,LogLevel};
+use env_logger::LogBuilder;
 
 fn main() {
-  env_logger::init().unwrap();
+  //env_logger::init().unwrap();
+  let pid = unsafe { libc::getpid() };
+  let format = move |record: &LogRecord| {
+    match record.level() {
+    LogLevel::Debug | LogLevel::Trace => format!("{}\t{}\t{}\t{}\t-\t{}",
+      time::now_utc().rfc3339(), time::precise_time_ns(), pid,
+      record.level(), record.args()),
+    _ => format!("{}\t{}\t{}\t{}\t-\t{} {}",
+      time::now_utc().rfc3339(), time::precise_time_ns(), pid,
+      record.level(), record.location().module_path(), record.args())
+
+    }
+  };
+
+  let mut builder = LogBuilder::new();
+  builder.format(format).filter(None, LogLevelFilter::Info);
+
+  if env::var("RUST_LOG").is_ok() {
+   builder.parse(&env::var("RUST_LOG").unwrap());
+  }
+
+  builder.init().unwrap();
+
   info!("starting up");
   let metrics_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
   let metrics_host   = ("192.168.59.103", 8125).to_socket_addrs().unwrap().next().unwrap();
@@ -26,8 +54,8 @@ fn main() {
   let http_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
   tx.send(network::ProxyOrder::Command(String::from("ID_ABCD"), messages::Command::AddHttpFront(http_front)));
   tx.send(network::ProxyOrder::Command(String::from("ID_EFGH"), messages::Command::AddInstance(http_instance)));
-  println!("HTTP -> {:?}", rec.recv().unwrap());
-  println!("HTTP -> {:?}", rec.recv().unwrap());
+  info!("HTTP -> {:?}", rec.recv().unwrap());
+  info!("HTTP -> {:?}", rec.recv().unwrap());
 
   let (sender2, rec2) = channel::<network::ServerMessage>();
 
@@ -59,10 +87,10 @@ fn main() {
   let tls_instance2 = messages::Instance { app_id: String::from("app_2"), ip_address: String::from("127.0.0.1"), port: 1026 };
   tx2.send(network::ProxyOrder::Command(String::from("ID_UVWX"), messages::Command::AddInstance(tls_instance2)));
 
-  println!("TLS -> {:?}", rec2.recv().unwrap());
-  println!("TLS -> {:?}", rec2.recv().unwrap());
-  println!("TLS -> {:?}", rec2.recv().unwrap());
-  println!("TLS -> {:?}", rec2.recv().unwrap());
+  info!("TLS -> {:?}", rec2.recv().unwrap());
+  info!("TLS -> {:?}", rec2.recv().unwrap());
+  info!("TLS -> {:?}", rec2.recv().unwrap());
+  info!("TLS -> {:?}", rec2.recv().unwrap());
 
   let _ = jg.join();
   info!("good bye");
