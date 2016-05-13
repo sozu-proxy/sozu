@@ -1167,7 +1167,8 @@ pub fn parse_request_until_stop(rs: &HttpState, request_id: &str, buf: &mut Buff
             position  += insert.len();
             header_end = Some(rs.req_position + test_position + insert.len() + 2);
           } else {
-            error!("PARSER\t{}\trequest buffer too small, cannot insert additional headers: {}", request_id, str::from_utf8(insert).unwrap());
+            // FIXME: insert should be passed as header, not buffer?
+            error!("PARSER\t{}\trequest buffer too small, cannot insert additional headers: {}", request_id, str::from_utf8(&insert[..insert.len()-2]).unwrap());
             header_end = Some(rs.req_position + test_position + 2);
           }
         },
@@ -1229,7 +1230,8 @@ pub fn parse_response_until_stop(rs: &HttpState, request_id: &str, buf: &mut Buf
             position  += insert.len();
             header_end = Some(rs.res_position + test_position + insert.len() + 2);
           } else {
-            error!("PARSER\t{}\tresponse buffer too small, cannot insert additional headers: \"{}\"", request_id, str::from_utf8(insert).unwrap());
+            // FIXME: insert should be passed as header, not buffer?
+            error!("PARSER\t{}\tresponse buffer too small, cannot insert additional headers: \"{}\"", request_id, str::from_utf8(&insert[..insert.len()-2]).unwrap());
             header_end = Some(rs.res_position + test_position + 2);
           }
         },
