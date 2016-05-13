@@ -1139,17 +1139,17 @@ pub fn parse_response(state: &ResponseState, buf: &[u8]) -> (BufferMove, Respons
   }
 }
 
-pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize, insert: &[u8]) -> HttpState {
+pub fn parse_request_until_stop(rs: &HttpState, request_id: &str, buf: &mut Buffer, index: usize, insert: &[u8]) -> HttpState {
   let mut current_state = rs.request.clone();
   let mut position      = 0;
   let mut header_end    = rs.req_header_end;
   //let (mut position, mut current_state) = state;
   loop {
     let test_position = index+position;
-    trace!("PARSER\tpos[{}]: {:?}", position, current_state);
+    trace!("PARSER\t{}\tpos[{}]: {:?}", request_id, position, current_state);
     let (mv, new_state) = parse_request(&current_state, &buf.data()[test_position..]);
-    trace!("PARSER\tinput:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[test_position..]).to_hex(16), mv, new_state);
-    trace!("PARSER\tmv: {:?}, new state: {:?}\n", mv, new_state);
+    trace!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, (&buf.data()[test_position..]).to_hex(16), mv, new_state);
+    trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
     current_state = new_state;
 
     if let BufferMove::Delete(start, end) = mv {
@@ -1167,7 +1167,7 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize, 
             position  += insert.len();
             header_end = Some(rs.req_position + test_position + insert.len() + 2);
           } else {
-            error!("PARSER\trequest buffer too small, cannot insert additional headers: {}", str::from_utf8(insert).unwrap());
+            error!("PARSER\t{}\trequest buffer too small, cannot insert additional headers: {}", request_id, str::from_utf8(insert).unwrap());
             header_end = Some(rs.req_position + test_position + 2);
           }
         },
@@ -1202,16 +1202,16 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize, 
   }
 }
 
-pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize, insert: &[u8]) -> HttpState {
+pub fn parse_response_until_stop(rs: &HttpState, request_id: &str, buf: &mut Buffer, index: usize, insert: &[u8]) -> HttpState {
   let mut current_state = rs.response.clone();
   let mut position      = 0;
   let mut header_end    = rs.res_header_end;
   loop {
     let test_position = index+position;
-    trace!("PARSER\tpos[{}]: {:?}", position, current_state);
+    trace!("PARSER\t{}\tpos[{}]: {:?}", request_id, position, current_state);
     let (mv, new_state) = parse_response(&current_state, &buf.data()[test_position..]);
-    trace!("PARSER\tinput:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[test_position..]).to_hex(16), mv, new_state);
-    trace!("PARSER\tmv: {:?}, new state: {:?}\n", mv, new_state);
+    trace!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, (&buf.data()[test_position..]).to_hex(16), mv, new_state);
+    trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
     current_state = new_state;
 
     if let BufferMove::Delete(start, end) = mv {
@@ -1229,7 +1229,7 @@ pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize,
             position  += insert.len();
             header_end = Some(rs.res_position + test_position + insert.len() + 2);
           } else {
-            error!("PARSER\tresponse buffer too small, cannot insert additional headers: \"{}\"", str::from_utf8(insert).unwrap());
+            error!("PARSER\t{}\tresponse buffer too small, cannot insert additional headers: \"{}\"", request_id, str::from_utf8(insert).unwrap());
             header_end = Some(rs.res_position + test_position + 2);
           }
         },
@@ -1401,7 +1401,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, &mut buf, 0, b"");
+      let result = parse_request_until_stop(&initial, "", &mut buf, 0, b"");
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -1450,7 +1450,7 @@ mod tests {
       buf.write(&input[26..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, &mut buf, 0, b"");
+      let result = parse_request_until_stop(&initial, "", &mut buf, 0, b"");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       assert_eq!(
@@ -1486,7 +1486,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, &mut buf, 0, b"");
+      let result = parse_request_until_stop(&initial, "", &mut buf, 0, b"");
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -1520,7 +1520,7 @@ mod tests {
       let mut buf = Buffer::with_capacity(2048);
       buf.write(&input[..]);
 
-      let result = parse_request_until_stop(&initial, &mut buf, 0, b"");
+      let result = parse_request_until_stop(&initial, "", &mut buf, 0, b"");
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -1551,7 +1551,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, &mut buf, 0, b"");
+      let result = parse_request_until_stop(&initial, "", &mut buf, 0, b"");
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -1583,7 +1583,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, &mut buf, 0, b"");
+      let result = parse_request_until_stop(&initial, "", &mut buf, 0, b"");
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -1614,7 +1614,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, &mut buf, 0, b"");
+      let result = parse_request_until_stop(&initial, "", &mut buf, 0, b"");
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -1645,7 +1645,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, &mut buf, 0, b"");
+      let result = parse_request_until_stop(&initial, "", &mut buf, 0, b"");
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -1676,7 +1676,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, &mut buf, 0, b"");
+      let result = parse_request_until_stop(&initial, "", &mut buf, 0, b"");
       println!("end buf:\n{}", buf.data().to_hex(16));
       println!("result: {:?}", result);
       assert_eq!(
@@ -1710,7 +1710,7 @@ mod tests {
       buf.write(&input[..]);
 
       let new_header = b"Request-Id: 123456789\r\n";
-      let result = parse_request_until_stop(&initial, &mut buf, 0, new_header);
+      let result = parse_request_until_stop(&initial, "", &mut buf, 0, new_header);
       println!("result: {:?}", result);
       println!("buf:\n{}", buf.data().to_hex(16));
       assert_eq!(
@@ -1806,7 +1806,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, &mut buf, 0, b"");
+      let result = parse_request_until_stop(&initial, "", &mut buf, 0, b"");
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -1848,7 +1848,7 @@ mod tests {
       buf.write(&input[..125]);
       println!("parsing\n{}", buf.data().to_hex(16));
 
-      let result = parse_request_until_stop(&initial, &mut buf, 0, b"");
+      let result = parse_request_until_stop(&initial, "", &mut buf, 0, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
@@ -1871,7 +1871,7 @@ mod tests {
       buf.write(&input[125..140]);
       println!("parsing\n{}", buf.data().to_hex(16));
 
-      let result = parse_request_until_stop(&result, &mut buf, 0, b"");
+      let result = parse_request_until_stop(&result, "", &mut buf, 0, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
@@ -1894,7 +1894,7 @@ mod tests {
       buf.consume(len);
       buf.write(&input[153..]);
       println!("parsing\n{}", buf.data().to_hex(16));
-      let result = parse_request_until_stop(&result, &mut buf, 0, b"");
+      let result = parse_request_until_stop(&result, "", &mut buf, 0, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
@@ -1935,7 +1935,7 @@ mod tests {
       buf.write(&input[..78]);
       println!("parsing\n{}", buf.data().to_hex(16));
 
-      let result = parse_response_until_stop(&initial, &mut buf, 0, b"");
+      let result = parse_response_until_stop(&initial, "", &mut buf, 0, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
@@ -1957,7 +1957,7 @@ mod tests {
       buf.write(&input[81..100]);
       println!("parsing\n{}", buf.data().to_hex(16));
 
-      let result = parse_response_until_stop(&result, &mut buf, 0, b"");
+      let result = parse_response_until_stop(&result, "", &mut buf, 0, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
@@ -1979,7 +1979,7 @@ mod tests {
       println!("remaining:\n{}", &input[110..].to_hex(16));
       buf.write(&input[110..116]);
       println!("parsing\n{}", buf.data().to_hex(16));
-      let result = parse_response_until_stop(&result, &mut buf, 0, b"");
+      let result = parse_response_until_stop(&result, "", &mut buf, 0, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
@@ -2000,7 +2000,7 @@ mod tests {
       buf.consume(5);
       buf.write(&input[116..]);
       println!("parsing\n{}", buf.data().to_hex(16));
-      let result = parse_response_until_stop(&result, &mut buf, 0, b"");
+      let result = parse_response_until_stop(&result, "", &mut buf, 0, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
@@ -2051,7 +2051,7 @@ mod tests {
 
       buf.write(&input[72..74]);
       println!("parsing\n{}", buf.data().to_hex(16));
-      let result = parse_response_until_stop(&initial, &mut buf, 0, b"");
+      let result = parse_response_until_stop(&initial, "", &mut buf, 0, b"");
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -2072,7 +2072,7 @@ mod tests {
       // we got the chunk header, but not the chunk content
       buf.write(&input[74..77]);
       println!("parsing\n{}", buf.data().to_hex(16));
-      let result = parse_response_until_stop(&result, &mut buf, 0, b"");
+      let result = parse_response_until_stop(&result, "", &mut buf, 0, b"");
       println!("result: {:?}", result);
       assert_eq!(
         result,
@@ -2096,7 +2096,7 @@ mod tests {
       // the external code copied the chunk content directly, starting at next chunk end
       buf.write(&input[81..115]);
       println!("parsing\n{}", buf.data().to_hex(16));
-      let result = parse_response_until_stop(&result, &mut buf, 0, b"");
+      let result = parse_response_until_stop(&result, "", &mut buf, 0, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
@@ -2117,7 +2117,7 @@ mod tests {
       buf.consume(len);
       buf.write(&input[115..]);
       println!("parsing\n{}", &input[115..].to_hex(16));
-      let result = parse_response_until_stop(&result, &mut buf, 0, b"");
+      let result = parse_response_until_stop(&result, "", &mut buf, 0, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(
         result,
@@ -2150,7 +2150,7 @@ mod tests {
     buf.write(&input[..]);
 
     let new_header = b"Request-Id: 123456789\r\n";
-    let result = parse_response_until_stop(&initial, &mut buf, 0, new_header);
+    let result = parse_response_until_stop(&initial, "", &mut buf, 0, new_header);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.data().to_hex(16));
     assert_eq!(
@@ -2184,7 +2184,7 @@ mod tests {
     buf.write(&input[..]);
 
     let new_header = b"Request-Id: 123456789\r\n";
-    let result = parse_response_until_stop(&initial, &mut buf, 0, new_header);
+    let result = parse_response_until_stop(&initial, "", &mut buf, 0, new_header);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.data().to_hex(16));
     assert_eq!(
@@ -2252,7 +2252,7 @@ mod bench {
     let initial = HttpState::new();
     //println!("res: {:?}", parse_request_until_stop(&initial, &mut buf, 0, b""));
     b.iter(||{
-      parse_request_until_stop(&initial, &mut buf, 0, b"")
+      parse_request_until_stop(&initial, "", &mut buf, 0, b"")
     }); 
   }
 

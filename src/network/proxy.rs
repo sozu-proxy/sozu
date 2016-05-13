@@ -31,6 +31,7 @@ pub trait ProxyClient {
   fn back_socket(&self)  -> Option<&TcpStream>;
   fn front_token(&self)  -> Option<Token>;
   fn back_token(&self)   -> Option<Token>;
+  fn log_context(&self)  -> String;
   fn set_back_socket(&mut self, TcpStream);
   fn set_front_token(&mut self, token: Token);
   fn set_back_token(&mut self, token: Token);

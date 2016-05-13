@@ -1,6 +1,7 @@
 #![allow(dead_code, unused_must_use, unused_variables, unused_imports)]
 
 use std::net::SocketAddr;
+use std::fmt;
 
 pub mod buffer;
 #[macro_use] pub mod metrics;
@@ -25,6 +26,12 @@ pub struct ServerMessage {
   pub message: ServerMessageType,
 }
 
+impl fmt::Display for ServerMessage {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    write!(f, "{}-{:?}", self.id, self.message)
+  }
+}
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub enum ServerMessageType {
   AddedFront,
@@ -39,6 +46,15 @@ pub enum ServerMessageType {
 pub enum ProxyOrder {
   Command(MessageId,Command),
   Stop(MessageId)
+}
+
+impl fmt::Display for ProxyOrder {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    match *self {
+      ProxyOrder::Command(ref id, ref msg) => write!(f, "{}-{:?}", id, msg),
+      ProxyOrder::Stop(ref id)             => write!(f, "{}-Stop", id)
+    }
+  }
 }
 
 #[derive(Debug,PartialEq,Eq)]

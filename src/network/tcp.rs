@@ -236,6 +236,14 @@ impl ProxyClient for Client {
     self.backend_token
   }
 
+  fn log_context(&self) -> String {
+    if let Some(ref app_id) = self.app_id {
+      format!("TCP\t{}\t{}\t", self.request_id, app_id)
+    } else {
+      format!("TCP\t{}\tunknown\t", self.request_id)
+    }
+  }
+
   fn set_back_socket(&mut self, socket: TcpStream) {
     self.backend         = Some(socket);
   }

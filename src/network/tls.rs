@@ -216,7 +216,7 @@ impl ServerConfiguration {
         let rnd = random::<usize>();
         let mut instances:Vec<&mut Backend> = app_instances.iter_mut().filter(|backend| backend.can_open()).collect();
         let idx = rnd % instances.len();
-        info!("TLS\tConnecting {} -> {:?}", host, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
+        info!("{}\tConnecting {} -> {:?}", client.log_context(), host, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
         instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut backend| {
           let conn =  TcpStream::connect(&backend.address).map_err(|_| ConnectionError::NoBackendAvailable);
           if conn.is_ok() {
@@ -242,7 +242,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         frontend_sock.set_nodelay(true);
         if let Ok(ssl) = Ssl::new(&self.default_context) {
           if let Ok(stream) = NonblockingSslStream::accept(ssl, frontend_sock) {
-            if let Some(c) = Client::new(stream, front_buf, back_buf) {
+            if let Some(c) = Client::new("TLS", stream, front_buf, back_buf) {
               return Some((c, false))
             }
           } else {
@@ -299,20 +299,20 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<TlsServer>, message: ProxyOrder) {
-    trace!("TLS\tnotified: {:?}", message);
+    trace!("TLS\t{} notified", message);
     match message {
       ProxyOrder::Command(id, Command::AddTlsFront(front)) => {
-        info!("TLS\tadd front {:?}", front);
+        info!("TLS\t{} add front {:?}", id, front);
           self.add_http_front(front, event_loop);
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
       },
       ProxyOrder::Command(id, Command::RemoveTlsFront(front)) => {
-        info!("TLS\tremove front {:?}", front);
+        info!("TLS\t{} remove front {:?}", id, front);
         self.remove_http_front(front, event_loop);
         self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
-        info!("TLS\tadd instance {:?}", instance);
+        info!("TLS\t{} add instance {:?}", id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -323,7 +323,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
-        info!("TLS\tremove instance {:?}", instance);
+        info!("TLS\t{} remove instance {:?}", id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -334,7 +334,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         }
       },
       ProxyOrder::Command(id, Command::HttpProxy(configuration)) => {
-        info!("TLS\tmodifying proxy configuration: {:?}", configuration);
+        info!("TLS\t{} modifying proxy configuration: {:?}", id, configuration);
         self.front_timeout = configuration.front_timeout;
         self.back_timeout  = configuration.back_timeout;
         self.answers = DefaultAnswers {
@@ -343,11 +343,12 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         };
       },
       ProxyOrder::Stop(id)                   => {
+        info!("HTTP\t{} shutdown", id);
         event_loop.shutdown();
         self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
-      ProxyOrder::Command(id, _) => {
-        error!("TLS\tunsupported message, ignoring");
+      ProxyOrder::Command(id, msg) => {
+        error!("TLS\t{} unsupported message, ignoring {:?}", id, msg);
         self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
       }
     }
