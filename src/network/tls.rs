@@ -71,7 +71,7 @@ impl ServerConfiguration {
     context.set_private_key_file("assets/key.pem", X509FileType::PEM);
 
     fn servername_callback(ssl: &mut Ssl, ad: &mut i32) -> i32 {
-      trace!("GOT SERVER NAME: {:?}", ssl.get_servername());
+      trace!("TLS\tGOT SERVER NAME: {:?}", ssl.get_servername());
       0
     }
     //context.set_servername_callback(Some(servername_callback as ServerNameCallback));
@@ -80,7 +80,7 @@ impl ServerConfiguration {
       let mut contexts = data.borrow_mut();
 
       if let Some(servername) = ssl.get_servername() {
-        trace!("looking for context for {:?}", servername);
+        trace!("TLS\tlooking for context for {:?}", servername);
         //println!("contexts: {:?}", *contexts);
         let opt_ctx = contexts.remove(&servername);
         if let Some(ctx) = opt_ctx {
@@ -121,7 +121,7 @@ impl ServerConfiguration {
         })
       },
       Err(e) => {
-        error!("could not create listener {:?}: {:?}", address, e);
+        error!("TLS\tcould not create listener {:?}: {:?}", address, e);
         Err(e)
       }
     }
@@ -147,7 +147,7 @@ impl ServerConfiguration {
   }
 
   pub fn remove_http_front(&mut self, front: TlsFront, event_loop: &mut EventLoop<TlsServer>) {
-    info!("removing http_front {:?}", front);
+    info!("TLS\tremoving http_front {:?}", front);
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
       fronts.retain(|f| f != &front);
     }
@@ -169,7 +169,7 @@ impl ServerConfiguration {
       if let Some(instances) = self.instances.get_mut(app_id) {
         instances.retain(|backend| &backend.address != instance_address);
       } else {
-        error!("Instance was already removed");
+        error!("TLS\tInstance was already removed");
       }
   }
 
@@ -197,13 +197,13 @@ impl ServerConfiguration {
   }
 
   pub fn backend_from_request(&mut self, client: &mut Client<NonblockingSslStream<TcpStream>>, host: &str, uri: &str) -> Result<TcpStream,ConnectionError> {
-    trace!("looking for backend for host: {}", host);
+    trace!("TLS\tlooking for backend for host: {}", host);
     let real_host = if let Some(h) = host.split(":").next() {
       h
     } else {
       host
     };
-    trace!("looking for backend for real host: {}", host);
+    trace!("TLS\tlooking for backend for real host: {}", host);
 
     if let Some(app_id) = self.frontend_from_request(real_host, uri).map(|ref front| front.app_id.clone()) {
       client.app_id = Some(app_id.clone());
@@ -216,7 +216,7 @@ impl ServerConfiguration {
         let rnd = random::<usize>();
         let mut instances:Vec<&mut Backend> = app_instances.iter_mut().filter(|backend| backend.can_open()).collect();
         let idx = rnd % instances.len();
-        info!("Connecting {} -> {:?}", host, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
+        info!("TLS\tConnecting {} -> {:?}", host, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
         instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut backend| {
           let conn =  TcpStream::connect(&backend.address).map_err(|_| ConnectionError::NoBackendAvailable);
           if conn.is_ok() {
@@ -246,16 +246,16 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
               return Some((c, false))
             }
           } else {
-            error!("could not create ssl stream");
+            error!("TLS\tcould not create ssl stream");
           }
         } else {
-          error!("could not create ssl context");
+          error!("TLS\tcould not create ssl context");
         }
       } else {
-        error!("could not accept connection: {:?}", accepted);
+        error!("TLS\tcould not accept connection: {:?}", accepted);
       }
     } else {
-      error!("could not get buffers from pool");
+      error!("TLS\tcould not get buffers from pool");
     }
     None
   }
@@ -299,20 +299,20 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<TlsServer>, message: ProxyOrder) {
-    trace!("notified: {:?}", message);
+    trace!("TLS\tnotified: {:?}", message);
     match message {
       ProxyOrder::Command(id, Command::AddTlsFront(front)) => {
-        info!("add front {:?}", front);
+        info!("TLS\tadd front {:?}", front);
           self.add_http_front(front, event_loop);
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
       },
       ProxyOrder::Command(id, Command::RemoveTlsFront(front)) => {
-        info!("remove front {:?}", front);
+        info!("TLS\tremove front {:?}", front);
         self.remove_http_front(front, event_loop);
         self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
-        info!("add instance {:?}", instance);
+        info!("TLS\tadd instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -323,7 +323,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
-        info!("remove instance {:?}", instance);
+        info!("TLS\tremove instance {:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -334,7 +334,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         }
       },
       ProxyOrder::Command(id, Command::HttpProxy(configuration)) => {
-        info!("modifying proxy configuration: {:?}", configuration);
+        info!("TLS\tmodifying proxy configuration: {:?}", configuration);
         self.front_timeout = configuration.front_timeout;
         self.back_timeout  = configuration.back_timeout;
         self.answers = DefaultAnswers {
@@ -347,7 +347,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
       ProxyOrder::Command(id, _) => {
-        error!("unsupported message, ignoring");
+        error!("TLS\tunsupported message, ignoring");
         self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
       }
     }
@@ -381,9 +381,9 @@ pub fn start_listener(front: SocketAddr, max_connections: usize, buffer_size: us
     let configuration = ServerConfiguration::new(front, tx, max_connections, buffer_size, options, &mut event_loop).unwrap();
     let mut server = TlsServer::new(1, max_connections, configuration);
 
-    info!("starting event loop");
+    info!("TLS\tstarting event loop");
     event_loop.run(&mut server).unwrap();
-    info!("ending event loop");
+    info!("TLS\tending event loop");
     //notify_tx.send(ServerMessage::Stopped);
   });
 

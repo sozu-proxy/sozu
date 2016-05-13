@@ -868,7 +868,7 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
     HeaderValue::Connection(c) => {
       let mut conn = state.get_keep_alive().unwrap_or(Connection::KeepAlive);
       for value in c {
-      trace!("GOT Connection header: {:?}", str::from_utf8(value).unwrap());
+      trace!("PARSER\tgot Connection header: {:?}", str::from_utf8(value).unwrap());
         match value {
           b"close"      => conn = Connection::Close,
           b"keep-alive" => conn = Connection::KeepAlive,
@@ -956,7 +956,7 @@ pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestSt
               (BufferMove::Advance(buf.offset(i)), RequestState::Request(rl.clone(), conn.clone(), h.clone()))
             },
             res => {
-              error!("HasHost could not parse header for input:\n{}\n", buf.to_hex(8));
+              error!("PARSER\tHasHost could not parse header for input:\n{}\n", buf.to_hex(8));
               default_request_result(state, res)
             }
           }
@@ -976,14 +976,14 @@ pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestSt
         IResult::Error(_)      => {
           match crlf(buf) {
             IResult::Done(i, _) => {
-              debug!("headers parsed, stopping");
+              debug!("PARSER\theaders parsed, stopping");
                 match l {
                   &LengthInformation::Chunked    => (BufferMove::Advance(buf.offset(i)), RequestState::RequestWithBodyChunks(rl.clone(), conn.clone(), h.clone(), Chunk::Initial.clone())),
                   &LengthInformation::Length(sz) => (BufferMove::Advance(buf.offset(i) + sz), RequestState::RequestWithBody(rl.clone(), conn.clone(), h.clone(), sz)),
                 }
             },
             res => {
-              error!("HasHostAndLength could not parse header for input:\n{}\n", buf.to_hex(8));
+              error!("PARSER\tHasHostAndLength could not parse header for input:\n{}\n", buf.to_hex(8));
               default_request_result(state, res)
             }
           }
@@ -996,7 +996,7 @@ pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestSt
       (advance, RequestState::RequestWithBodyChunks(rl.clone(), conn.clone(), h.clone(), chunk_state))
     },
     _ => {
-      error!("unimplemented state: {:?}", state);
+      error!("PARSER\tunimplemented state: {:?}", state);
       (BufferMove::None, RequestState::Error(ErrorState::InvalidHttp))
     }
   }
@@ -1028,7 +1028,7 @@ pub fn validate_response_header(state: ResponseState, header: &Header) -> Respon
     HeaderValue::Connection(c) => {
       let mut conn = state.get_keep_alive().unwrap_or(Connection::KeepAlive);
       for value in c {
-      trace!("GOT Connection header: {:?}", str::from_utf8(value).unwrap());
+      trace!("PARSER\tgot Connection header: {:?}", str::from_utf8(value).unwrap());
         match value {
           b"close"      => conn = Connection::Close,
           b"keep-alive" => conn = Connection::KeepAlive,
@@ -1090,11 +1090,11 @@ pub fn parse_response(state: &ResponseState, buf: &[u8]) -> (BufferMove, Respons
         IResult::Error(_)      => {
           match crlf(buf) {
             IResult::Done(i, _) => {
-              debug!("headers parsed, stopping");
+              debug!("PARSER\theaders parsed, stopping");
               (BufferMove::Advance(buf.offset(i)), ResponseState::Response(sl.clone(), conn.clone()))
             },
             res => {
-              error!("HasResponseLine could not parse header for input:\n{}\n", buf.to_hex(8));
+              error!("PARSER\tHasResponseLine could not parse header for input:\n{}\n", buf.to_hex(8));
               default_response_result(state, res)
             }
           }
@@ -1114,14 +1114,14 @@ pub fn parse_response(state: &ResponseState, buf: &[u8]) -> (BufferMove, Respons
         IResult::Error(_)      => {
           match crlf(buf) {
             IResult::Done(i, _) => {
-              debug!("headers parsed, stopping");
+              debug!("PARSER\theaders parsed, stopping");
                 match length {
                   &LengthInformation::Chunked    => (BufferMove::Advance(buf.offset(i)), ResponseState::ResponseWithBodyChunks(sl.clone(), conn.clone(), Chunk::Initial)),
                   &LengthInformation::Length(sz) => (BufferMove::Advance(buf.offset(i) + sz), ResponseState::ResponseWithBody(sl.clone(), conn.clone(), sz)),
                 }
             },
             res => {
-              error!("HasResponseLine could not parse header for input:\n{}\n", buf.to_hex(8));
+              error!("PARSER\tHasResponseLine could not parse header for input:\n{}\n", buf.to_hex(8));
               default_response_result(state, res)
             }
           }
@@ -1133,7 +1133,7 @@ pub fn parse_response(state: &ResponseState, buf: &[u8]) -> (BufferMove, Respons
       (advance, ResponseState::ResponseWithBodyChunks(rl.clone(), conn.clone(), chunk_state))
     },
     _ => {
-      error!("unimplemented state: {:?}", state);
+      error!("PARSER\tunimplemented state: {:?}", state);
       (BufferMove::None, ResponseState::Error(ErrorState::InvalidHttp))
     }
   }
@@ -1146,10 +1146,10 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize, 
   //let (mut position, mut current_state) = state;
   loop {
     let test_position = index+position;
-    trace!("pos[{}]: {:?}", position, current_state);
+    trace!("PARSER\tpos[{}]: {:?}", position, current_state);
     let (mv, new_state) = parse_request(&current_state, &buf.data()[test_position..]);
-    trace!("input:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[test_position..]).to_hex(8), mv, new_state);
-    trace!("mv: {:?}, new state: {:?}\n", mv, new_state);
+    trace!("PARSER\tinput:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[test_position..]).to_hex(8), mv, new_state);
+    trace!("PARSER\tmv: {:?}, new state: {:?}\n", mv, new_state);
     current_state = new_state;
 
     if let BufferMove::Delete(start, end) = mv {
@@ -1167,7 +1167,7 @@ pub fn parse_request_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize, 
             position  += insert.len();
             header_end = Some(rs.req_position + test_position + insert.len() + 2);
           } else {
-            error!("request buffer too small, cannot insert additional headers: {}", str::from_utf8(insert).unwrap());
+            error!("PARSER\trequest buffer too small, cannot insert additional headers: {}", str::from_utf8(insert).unwrap());
             header_end = Some(rs.req_position + test_position + 2);
           }
         },
@@ -1208,10 +1208,10 @@ pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize,
   let mut header_end    = rs.res_header_end;
   loop {
     let test_position = index+position;
-    trace!("pos[{}]: {:?}", position, current_state);
+    trace!("PARSER\tpos[{}]: {:?}", position, current_state);
     let (mv, new_state) = parse_response(&current_state, &buf.data()[test_position..]);
-    trace!("input:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[test_position..]).to_hex(8), mv, new_state);
-    trace!("mv: {:?}, new state: {:?}\n", mv, new_state);
+    trace!("PARSER\tinput:\n{}\nmv: {:?}, new state: {:?}\n", (&buf.data()[test_position..]).to_hex(8), mv, new_state);
+    trace!("PARSER\tmv: {:?}, new state: {:?}\n", mv, new_state);
     current_state = new_state;
 
     if let BufferMove::Delete(start, end) = mv {
@@ -1229,7 +1229,7 @@ pub fn parse_response_until_stop(rs: &HttpState, buf: &mut Buffer, index: usize,
             position  += insert.len();
             header_end = Some(rs.res_position + test_position + insert.len() + 2);
           } else {
-            error!("response buffer too small, cannot insert additional headers: \"{}\"", str::from_utf8(insert).unwrap());
+            error!("PARSER\tresponse buffer too small, cannot insert additional headers: \"{}\"", str::from_utf8(insert).unwrap());
             header_end = Some(rs.res_position + test_position + 2);
           }
         },

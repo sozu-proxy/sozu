@@ -34,7 +34,7 @@ pub fn splice_in(stream: &AsRawFd, pipe: Pipe) -> Option<usize> {
     if res == -1 {
       let err = Error::last_os_error().kind();
       if err != ErrorKind::WouldBlock {
-        error!("err transferring from tcp({}) to pipe({}): {:?}", stream.as_raw_fd(), pipe[1], err);
+        error!("SPLICE\terr transferring from tcp({}) to pipe({}): {:?}", stream.as_raw_fd(), pipe[1], err);
       }
       None
     } else {
@@ -50,7 +50,7 @@ pub fn splice_out(pipe: Pipe, stream: &AsRawFd) -> Option<usize> {
     if res == -1 {
       let err = Error::last_os_error().kind();
       if err != ErrorKind::WouldBlock {
-        error!("err transferring from pipe({}) to tcp({}): {:?}", pipe[0], stream.as_raw_fd(), err);
+        error!("SPLICE\terr transferring from pipe({}) to tcp({}): {:?}", pipe[0], stream.as_raw_fd(), err);
       }
       None
     } else {

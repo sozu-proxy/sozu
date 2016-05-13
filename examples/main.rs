@@ -21,10 +21,10 @@ fn main() {
   let pid = unsafe { libc::getpid() };
   let format = move |record: &LogRecord| {
     match record.level() {
-    LogLevel::Debug | LogLevel::Trace => format!("{}\t{}\t{}\t{}\t-\t{}\t{}",
+    LogLevel::Debug | LogLevel::Trace => format!("{}\t{}\t{}\t{}\t{}\t|\t{}",
       time::now_utc().rfc3339(), time::precise_time_ns(), pid,
-      record.level(), record.location().module_path(), record.args()),
-    _ => format!("{}\t{}\t{}\t{}\t-\t{}",
+      record.level(), record.args(), record.location().module_path()),
+    _ => format!("{}\t{}\t{}\t{}\t{}",
       time::now_utc().rfc3339(), time::precise_time_ns(), pid,
       record.level(), record.args())
 
@@ -40,7 +40,7 @@ fn main() {
 
   builder.init().unwrap();
 
-  info!("starting up");
+  info!("MAIN\tstarting up");
   let metrics_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
   let metrics_host   = ("192.168.59.103", 8125).to_socket_addrs().unwrap().next().unwrap();
   METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
@@ -54,8 +54,8 @@ fn main() {
   let http_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
   tx.send(network::ProxyOrder::Command(String::from("ID_ABCD"), messages::Command::AddHttpFront(http_front)));
   tx.send(network::ProxyOrder::Command(String::from("ID_EFGH"), messages::Command::AddInstance(http_instance)));
-  info!("HTTP -> {:?}", rec.recv().unwrap());
-  info!("HTTP -> {:?}", rec.recv().unwrap());
+  info!("MAIN\tHTTP -> {:?}", rec.recv().unwrap());
+  info!("MAIN\tHTTP -> {:?}", rec.recv().unwrap());
 
   let (sender2, rec2) = channel::<network::ServerMessage>();
 
@@ -87,12 +87,12 @@ fn main() {
   let tls_instance2 = messages::Instance { app_id: String::from("app_2"), ip_address: String::from("127.0.0.1"), port: 1026 };
   tx2.send(network::ProxyOrder::Command(String::from("ID_UVWX"), messages::Command::AddInstance(tls_instance2)));
 
-  info!("TLS -> {:?}", rec2.recv().unwrap());
-  info!("TLS -> {:?}", rec2.recv().unwrap());
-  info!("TLS -> {:?}", rec2.recv().unwrap());
-  info!("TLS -> {:?}", rec2.recv().unwrap());
+  info!("MAIN\tTLS -> {:?}", rec2.recv().unwrap());
+  info!("MAIN\tTLS -> {:?}", rec2.recv().unwrap());
+  info!("MAIN\tTLS -> {:?}", rec2.recv().unwrap());
+  info!("MAIN\tTLS -> {:?}", rec2.recv().unwrap());
 
   let _ = jg.join();
-  info!("good bye");
+  info!("MAIN\tgood bye");
 }
 

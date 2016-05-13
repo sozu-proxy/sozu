@@ -117,10 +117,10 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
           self.connect_to_backend(event_loop, client_token);
         }
       } else {
-        error!("could not add client to slab");
+        error!("PROXY\tcould not add client to slab");
       }
     } else {
-      error!("could not create a client");
+      error!("PROXY\tcould not create a client");
     }
   }
 
@@ -220,9 +220,9 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
   type Message = ProxyOrder;
 
   fn ready(&mut self, event_loop: &mut EventLoop<Self>, token: Token, events: EventSet) {
-    trace!("{:?} got events: {:?}", token, events);
+    trace!("PROXY\t{:?} got events: {:?}", token, events);
     if events.is_readable() {
-      trace!("{:?} is readable", token);
+      trace!("PROXY\t{:?} is readable", token);
 
       match socket_type(token, self.max_listeners, self.max_connections) {
         Some(SocketType::Listener) => {
@@ -245,7 +245,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
             self.interpret_client_order(event_loop, token, order);
           } else {
-            info!("client {:?} was removed", token);
+            info!("PROXY\tclient {:?} was removed", token);
           }
         }
 
@@ -272,20 +272,20 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
     }
 
     if events.is_writable() {
-      trace!("{:?} is writable", token);
+      trace!("PROXY\t{:?} is writable", token);
 
       match socket_type(token, self.max_listeners, self.max_connections) {
         Some(SocketType::Listener) => {
-          error!("received writable for listener {:?}, this should not happen", token);
+          error!("PROXY\treceived writable for listener {:?}, this should not happen", token);
         }
 
         Some(SocketType::FrontClient) => {
           if self.clients.contains(token) {
             let order = self.clients[token].writable();
-            trace!("interpreting client order {:?}", order);
+            trace!("PROXY\tinterpreting client order {:?}", order);
             self.interpret_client_order(event_loop, token, order);
           } else {
-            info!("client {:?} was removed", token);
+            info!("PROXY\tclient {:?} was removed", token);
           }
         }
 
@@ -303,7 +303,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
     if events.is_hup() {
       match socket_type(token, self.max_listeners, self.max_connections) {
         Some(SocketType::Listener) => {
-          error!("should not happen: server {:?} closed", token);
+          error!("PROXY\tshould not happen: server {:?} closed", token);
         }
 
         Some(SocketType::FrontClient) => {
@@ -312,7 +312,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
               self.close_client(event_loop, token);
             }
           } else {
-            info!("client {:?} was removed", token);
+            info!("PROXY\tclient {:?} was removed", token);
           }
         }
 
@@ -337,17 +337,17 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
     let token = Token(timeout);
     match socket_type(token, self.max_listeners, self.max_connections) {
       Some(SocketType::Listener) => {
-        error!("the listener socket should have no timeout set");
+        error!("PROXY\tthe listener socket should have no timeout set");
       },
       Some(SocketType::FrontClient) => {
         if self.clients.contains(token) {
-          debug!("frontend [{}] got timeout, closing", timeout);
+          debug!("PROXY\tfrontend [{}] got timeout, closing", timeout);
           self.close_client(event_loop, token);
         }
       },
       Some(SocketType::BackClient) => {
         if let Some(tok) = self.get_client_token(token) {
-          debug!("backend [{}] got timeout, closing", timeout);
+          debug!("PROXY\tbackend [{}] got timeout, closing", timeout);
           self.close_client(event_loop, tok);
         }
       }
@@ -356,7 +356,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
   }
 
   fn interrupted(&mut self, event_loop: &mut EventLoop<Self>) {
-    warn!("interrupted");
+    warn!("PROXY\tinterrupted");
   }
 }
 

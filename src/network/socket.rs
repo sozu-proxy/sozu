@@ -29,11 +29,11 @@ impl SocketHandler for TcpStream {
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
           ErrorKind::BrokenPipe => {
-            debug!("broken pipe reading from the socket");
+            debug!("SOCKET\tbroken pipe reading from the socket");
             return (size, SocketResult::Error)
           },
           _ => {
-            debug!("socket_write not implemented; client err={:?}", e);
+            debug!("SOCKET\tsocket_write not implemented; client err={:?}", e);
             return (size, SocketResult::Error)
           },
         }
@@ -53,11 +53,11 @@ impl SocketHandler for TcpStream {
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
           ErrorKind::BrokenPipe => {
-            debug!("broken pipe writing to the socket");
+            debug!("SOCKET\tbroken pipe writing to the socket");
             return (size, SocketResult::Error)
           },
           _ => {
-            debug!("socket_write not implemented; client err={:?}", e);
+            debug!("SOCKET\tsocket_write not implemented; client err={:?}", e);
             return (size, SocketResult::Error)
           },
         }
@@ -81,7 +81,7 @@ impl SocketHandler for NonblockingSslStream<TcpStream> {
         Err(NonblockingSslError::WantRead)    => return (size, SocketResult::WouldBlock),
         Err(NonblockingSslError::WantWrite)   => return (size, SocketResult::WouldBlock),
         Err(NonblockingSslError::SslError(e)) => {
-          error!("readable TLS client err={:?}", e);
+          error!("SOCKET-TLS\treadable TLS client err={:?}", e);
           return (size, SocketResult::Error)
         }
       }
@@ -100,7 +100,7 @@ impl SocketHandler for NonblockingSslStream<TcpStream> {
         Err(NonblockingSslError::WantRead)    => return (size, SocketResult::WouldBlock),
         Err(NonblockingSslError::WantWrite)   => return (size, SocketResult::WouldBlock),
         Err(NonblockingSslError::SslError(e)) => {
-          error!("readable TLS client err={:?}", e);
+          error!("SOCKET-TLS\treadable TLS client err={:?}", e);
           return (size, SocketResult::Error)
         }
       }

@@ -134,17 +134,17 @@ impl Client {
   }
 
   fn writable(&mut self) -> io::Result<()> {
-    trace!("in writable()");
+    trace!("{}\tTCP\tin writable()", self.request_id);
     if self.data_out {
       match splice::splice_out(self.pipe_out, &self.sock) {
         None => {
-          trace!("client flushing buf; WOULDBLOCK");
+          trace!("{}\tTCP\tclient flushing buf; WOULDBLOCK", self.request_id);
 
           self.front_interest.insert(EventSet::writable());
         }
         Some(r) => {
           //FIXME what happens if not everything was written?
-          debug!("FRONT [{}<-{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+          debug!("{}\tTCP\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
 
           //self.front_interest.insert(EventSet::readable());
           self.front_interest.remove(EventSet::writable());
@@ -162,10 +162,10 @@ impl Client {
 
     match splice::splice_in(&self.sock, self.pipe_in) {
       None => {
-        error!("We just got readable, but were unable to read from the socket?");
+        error!("{}\tTCP\tWe just got readable, but were unable to read from the socket?", self.request_id);
       }
       Some(r) => {
-        debug!("FRONT [{}->{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+        debug!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
         self.front_interest.remove(EventSet::readable());
         self.back_interest.insert(EventSet::writable());
         self.data_in = true;
@@ -182,13 +182,13 @@ impl Client {
     if self.data_in {
       match splice::splice_out(self.pipe_in, &self.backend) {
         None => {
-          error!("client flushing buf; WOULDBLOCK");
+          error!("{}\tTCP\tclient flushing buf; WOULDBLOCK", self.request_id);
 
           self.back_interest.insert(EventSet::writable());
         }
         Some(r) => {
           //FIXME what happens if not everything was written?
-          debug!("BACK  [{}->{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+          debug!("{}\tTCP\tBACK [{}->{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
 
           self.front_interest.insert(EventSet::readable());
           self.back_interest.remove(EventSet::writable());
@@ -201,14 +201,14 @@ impl Client {
   }
 
   fn back_readable(&mut self) -> io::Result<()> {
-    trace!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
+    trace!("{}\tTCP\tin back_readable(): back_mut_buf contains {} bytes", self.request_id, buf.remaining());
 
     match splice::splice_in(&self.backend, self.pipe_out) {
       None => {
-        error!("We just got readable, but were unable to read from the socket?");
+        error!("{}\tTCP\tWe just got readable, but were unable to read from the socket?", self.request_id);
       }
       Some(r) => {
-        debug!("BACK  [{}<-{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+        debug!("{}\tTCP\tBACK  [{}<-{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
         self.back_interest.remove(EventSet::readable());
         self.front_interest.insert(EventSet::writable());
         self.data_out = true;
@@ -271,7 +271,7 @@ impl ProxyClient for Client {
 
   //FIXME: too much cloning in there, should optimize
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    debug!("TCP PROXY [{} -> {}] CLOSED BACKEND", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
+    debug!("{}\tTCP\tPROXY [{} -> {}] CLOSED BACKEND", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
     let addr = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
     self.backend       = None;
     self.backend_token = None;
@@ -301,20 +301,20 @@ impl ProxyClient for Client {
   }
 
   fn writable(&mut self) -> (RequiredEvents, ClientResult) {
-    trace!("in writable()");
+    trace!("{}\tTCP\tin writable()", self.request_id);
     if let Some(buf) = self.back_buf.take() {
       //trace!("in writable 2: back_buf contains {} bytes", buf.remaining());
 
       let mut b = buf.flip();
       match self.sock.try_write_buf(&mut b) {
         Ok(None) => {
-          error!("client flushing buf; WOULDBLOCK");
+          error!("{}\tTCP\tclient flushing buf; WOULDBLOCK", self.request_id);
 
           self.front_interest.insert(EventSet::writable());
         }
         Ok(Some(r)) => {
           //FIXME what happens if not everything was written?
-          debug!("FRONT [{}<-{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+          debug!("{}\tTCP\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
 
           self.tx_count = self.tx_count + r;
 
@@ -322,7 +322,7 @@ impl ProxyClient for Client {
           self.front_interest.remove(EventSet::writable());
           self.back_interest.insert(EventSet::readable());
         }
-        Err(e) =>  error!("not implemented; client err={:?}", e),
+        Err(e) =>  error!("{}\tTCP\tnot implemented; client err={:?}", self.request_id, e),
       }
       self.back_buf = Some(b.flip());
     }
@@ -335,17 +335,17 @@ impl ProxyClient for Client {
 
     match self.sock.try_read_buf(&mut buf) {
       Ok(None) => {
-        error!("We just got readable, but were unable to read from the socket?");
+        error!("{}\tTCP\tWe just got readable, but were unable to read from the socket?", self.request_id);
       }
       Ok(Some(r)) => {
-        debug!("FRONT [{}->{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+        debug!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
         self.front_interest.remove(EventSet::readable());
         self.back_interest.insert(EventSet::writable());
         self.rx_count = self.rx_count + r;
         // prepare to provide this to writable
       }
       Err(e) => {
-        error!("not implemented; client err={:?}", e);
+        error!("{}\tTCP\tnot implemented; client err={:?}", self.request_id, e);
         //self.front_interest.remove(EventSet::readable());
       }
     };
@@ -362,19 +362,19 @@ impl ProxyClient for Client {
       if let Some(ref mut sock) = self.backend {
         match sock.try_write_buf(&mut b) {
           Ok(None) => {
-            error!("client flushing buf; WOULDBLOCK");
+            error!("{}\tTCP\tclient flushing buf; WOULDBLOCK", self.request_id);
 
             self.back_interest.insert(EventSet::writable());
           }
           Ok(Some(r)) => {
             //FIXME what happens if not everything was written?
-            debug!("BACK  [{}->{}]: wrote {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+            debug!("{}\tTCP\tBACK [{}->{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
 
             self.front_interest.insert(EventSet::readable());
             self.back_interest.remove(EventSet::writable());
             self.back_interest.insert(EventSet::readable());
           }
-          Err(e) =>  error!("not implemented; client err={:?}", e),
+          Err(e) =>  error!("{}\tTCP\tnot implemented; client err={:?}", self.request_id, e),
         }
       }
       self.front_buf = Some(b.flip());
@@ -384,21 +384,21 @@ impl ProxyClient for Client {
 
   fn back_readable(&mut self) -> (RequiredEvents, ClientResult) {
     let mut buf = self.back_buf.take().unwrap();
-    //trace!("in back_readable(): back_mut_buf contains {} bytes", buf.remaining());
+    //trace!("{}\tTCP\tin back_readable(): back_mut_buf contains {} bytes", self.request_id, buf.remaining());
 
     if let Some(ref mut sock) = self.backend {
       match sock.try_read_buf(&mut buf) {
         Ok(None) => {
-          error!("We just got readable, but were unable to read from the socket?");
+          error!("{}\tTCP\tWe just got readable, but were unable to read from the socket?", self.request_id);
         }
         Ok(Some(r)) => {
-          debug!("BACK  [{}<-{}]: read {} bytes", self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+          debug!("{}\tTCP\tBACK  [{}<-{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
           self.back_interest.remove(EventSet::readable());
           self.front_interest.insert(EventSet::writable());
           // prepare to provide this to writable
         }
         Err(e) => {
-          error!("not implemented; client err={:?}", e);
+          error!("{}\tTCP\tnot implemented; client err={:?}", self.request_id, e);
           //self.interest.remove(EventSet::readable());
         }
       };
@@ -461,21 +461,21 @@ impl ServerConfiguration {
         self.listeners[tok].token = Some(tok);
         self.fronts.insert(String::from(app_id), tok);
         event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
-        info!("registered listener for app {} on port {}", app_id, front.port());
+        info!("TCP\tregistered listener for app {} on port {}", app_id, front.port());
         Some(tok)
       } else {
-        error!("could not register listener for app {} on port {}", app_id, front.port());
+        error!("TCP\tcould not register listener for app {} on port {}", app_id, front.port());
         None
       }
 
     } else {
-      error!("could not declare listener for app {} on port {}", app_id, front.port());
+      error!("TCP\tcould not declare listener for app {} on port {}", app_id, front.port());
       None
     }
   }
 
   pub fn remove_tcp_front(&mut self, app_id: String, event_loop: &mut EventLoop<TcpServer>) -> Option<Token>{
-    info!("removing tcp_front {:?}", app_id);
+    info!("TCP\tremoving tcp_front {:?}", app_id);
     // ToDo
     // Removes all listeners for the given app_id
     // an app can't have two listeners. Is this a problem?
@@ -483,7 +483,7 @@ impl ServerConfiguration {
       if self.listeners.contains(tok) {
         event_loop.deregister(&self.listeners[tok].sock);
         self.listeners.remove(tok);
-        warn!("removed server {:?}", tok);
+        warn!("TCP\tremoved server {:?}", tok);
         //self.listeners[tok].sock.shutdown(Shutdown::Both);
         Some(tok)
       } else {
@@ -511,7 +511,7 @@ impl ServerConfiguration {
       application_listener.back_addresses.push(*instance_address);
       Some(tok)
     } else {
-      error!("No front for this instance");
+      error!("TCP\tNo front for this instance");
       None
     }
   }
@@ -541,44 +541,44 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
   fn notify(&mut self, event_loop: &mut EventLoop<TcpServer>, message: ProxyOrder) {
     match message {
       ProxyOrder::Command(id, Command::AddTcpFront(tcp_front)) => {
-        trace!("{:?}", tcp_front);
+        trace!("TCP\t{:?}", tcp_front);
         let addr_string = tcp_front.ip_address + &tcp_front.port.to_string();
         if let Ok(front) = addr_string.parse() {
           if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, event_loop) {
             self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
           } else {
-            error!("Couldn't add tcp front");
+            error!("TCP\tCouldn't add tcp front");
             self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot add tcp front"))});
           }
         } else {
-          error!("Couldn't parse tcp front address");
+          error!("TCP\tCouldn't parse tcp front address");
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveTcpFront(front)) => {
-        trace!("{:?}", front);
+        trace!("TCP\t{:?}", front);
         let _ = self.remove_tcp_front(front.app_id, event_loop);
         self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
-        trace!("{:?}", instance);
+        trace!("TCP\t{:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
         } else {
-          error!("Couldn't add tcp instance");
+          error!("TCP\tCouldn't add tcp instance");
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot add tcp instance"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
-        trace!("{:?}", instance);
+        trace!("TCP\t{:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
         } else {
-          error!("Couldn't remove tcp instance");
+          error!("TCP\tCouldn't remove tcp instance");
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot remove tcp instance"))});
         }
       },
@@ -587,7 +587,7 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
       ProxyOrder::Command(id, _) => {
-        error!("unsupported message, ignoring");
+        error!("TCP\tunsupported message, ignoring");
         self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
       }
     }
@@ -630,7 +630,7 @@ pub fn start() {
   let mut event_loop = EventLoop::new().unwrap();
 
 
-  info!("listen for connections");
+  info!("TCP\tlisten for connections");
   //event_loop.register(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
   let (tx,rx) = channel::<ServerMessage>();
   let configuration = ServerConfiguration::new(10, tx);
@@ -648,9 +648,9 @@ pub fn start() {
     s.configuration().add_instance("yolo", &back, &mut event_loop);
   }
   thread::spawn(move|| {
-    info!("starting event loop");
+    info!("TCP\tstarting event loop");
     event_loop.run(&mut s).unwrap();
-    info!("ending event loop");
+    info!("TCP\tending event loop");
   });
 }
 
@@ -664,9 +664,9 @@ pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Se
   server.configuration().add_tcp_front("yolo", &front, &mut event_loop);
 
   let join_guard = thread::spawn(move|| {
-    info!("starting event loop");
+    info!("TCP\tstarting event loop");
     event_loop.run(&mut server).unwrap();
-    info!("ending event loop");
+    info!("TCP\tending event loop");
     //notify_tx.send(ServerMessage::Stopped);
   });
 
