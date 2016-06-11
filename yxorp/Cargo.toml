@@ -7,7 +7,7 @@ authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 log = "0.3"
 env_logger = "0.3"
 mio = "~0.5.0"
-rustc-serialize = "0.3.15"
+rustc-serialize = "^0.3.15"
 nom = "~1.2.0"
 toml = "0.1"
 
