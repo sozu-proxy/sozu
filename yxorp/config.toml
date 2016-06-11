@@ -15,10 +15,16 @@ max_connections = 500
 port = 8080
 buffer_size = 12000
 
+#answers configuration is not active yet
+#answer_404 = "./404.html"
+#answer_503 = "./503.html"
+
 [listeners.TLS]
 address = "127.0.0.1"
 listener_type = "HTTPS"
 max_connections = 500
 port = 8443
 buffer_size = 12000
+#answer_404 = "./404.html"
+#answer_503 = "./503.html"
 
