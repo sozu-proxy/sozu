@@ -259,6 +259,21 @@ impl CommandServer {
   fn dispatch(&mut self, token: Token, v: Vec<ConfigMessage>) {
     for message in &v {
       let command = message.command.clone();
+      if let Command::DumpConfigurationToFile(path) = command {
+        if let Ok(mut f) = fs::File::create(&path) {
+          for listener in self.listeners.values() {
+            if let Ok(()) = f.write_all(&encode(&listener).unwrap().into_bytes()) {
+              f.write(&b"\n"[..]);
+              f.sync_all();
+            }
+          }
+          // FIXME: should send back a DONE message here
+        } else {
+          // FIXME: should send back error here
+          log!(log::LogLevel::Error, "could not open file: {}", &path);
+        }
+        return;
+      }
       if let Some(ref mut listener) = self.listeners.get_mut (&message.listener) {
         if message.command == Command::DumpConfiguration {
           let conf = ListenerConfiguration {
@@ -273,6 +288,7 @@ impl CommandServer {
           listener.sender.send(ProxyOrder::Command(message.id.clone(), command));
         }
       } else {
+        // FIXME: should send back error here
         log!(log::LogLevel::Error, "no listener found for tag: {}", message.listener);
       }
     }
