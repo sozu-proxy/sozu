@@ -94,7 +94,7 @@ impl Encodable for Listener {
 
 pub struct ListenerConfiguration<'a> {
   id:       String,
-  listener: &'a Listener,
+  listeners: Vec<&'a Listener>,
 }
 
 impl<'a> Encodable for ListenerConfiguration<'a> {
@@ -102,8 +102,8 @@ impl<'a> Encodable for ListenerConfiguration<'a> {
     e.emit_map(2, |e| {
       try!(e.emit_map_elt_key(0, |e| "id".encode(e)));
       try!(e.emit_map_elt_val(0, |e| self.id.encode(e)));
-      try!(e.emit_map_elt_key(1, |e| "listener".encode(e)));
-      try!(e.emit_map_elt_val(1, |e| self.listener.encode(e)));
+      try!(e.emit_map_elt_key(1, |e| "listeners".encode(e)));
+      try!(e.emit_map_elt_val(1, |e| self.listeners.encode(e)));
       Ok(())
     })
   }
@@ -274,19 +274,20 @@ impl CommandServer {
         }
         return;
       }
+      if let Command::DumpConfiguration = command {
+        let v: Vec<&Listener> = self.listeners.values().collect();
+        let conf = ListenerConfiguration {
+          id: message.id.clone(),
+          listeners: v,
+        };
+        self.conns[token].back_buf.write(&encode(&conf).unwrap().into_bytes());
+        self.conns[token].back_buf.write(&b"\0"[..]);
+        return;
+      }
       if let Some(ref mut listener) = self.listeners.get_mut (&message.listener) {
-        if message.command == Command::DumpConfiguration {
-          let conf = ListenerConfiguration {
-            id: message.id.clone(),
-            listener: listener,
-          };
-          self.conns[token].back_buf.write(&encode(&conf).unwrap().into_bytes());
-          self.conns[token].back_buf.write(&b"\0"[..]);
-        } else {
-          self.conns[token].add_message_id(message.id.clone());
-          listener.state.handle_command(&command);
-          listener.sender.send(ProxyOrder::Command(message.id.clone(), command));
-        }
+        self.conns[token].add_message_id(message.id.clone());
+        listener.state.handle_command(&command);
+        listener.sender.send(ProxyOrder::Command(message.id.clone(), command));
       } else {
         // FIXME: should send back error here
         log!(log::LogLevel::Error, "no listener found for tag: {}", message.listener);
