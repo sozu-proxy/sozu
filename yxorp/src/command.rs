@@ -109,11 +109,57 @@ impl<'a> Encodable for ListenerConfiguration<'a> {
   }
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash,RustcEncodable)]
+pub enum ConfigCommand {
+  ProxyConfiguration(Command),
+  SaveState(String),
+  DumpState,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,RustcEncodable)]
 pub struct ConfigMessage {
-    pub id:       String,
-    pub listener: String,
-    pub command:  Command
+  pub id:       String,
+  pub data:     ConfigCommand,
+  pub listener: Option<String>,
+}
+
+impl Decodable for ConfigMessage {
+  fn decode<D: Decoder>(decoder: &mut D) -> Result<ConfigMessage, D::Error> {
+    decoder.read_struct("root", 0, |decoder| {
+      let id = try!(decoder.read_struct_field("id", 0, |decoder| Decodable::decode(decoder)));
+      let listener:Option<String> = try!(decoder.read_struct_field("listener", 0, |decoder| Decodable::decode(decoder)));
+
+      let command_type: String = try!(decoder.read_struct_field("type", 0, |decoder| Decodable::decode(decoder)));
+      match command_type.as_str() {
+        "PROXY"      => {
+          let command = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
+          Ok(ConfigMessage {
+            id: id,
+            listener: listener,
+            data: ConfigCommand::ProxyConfiguration(command)
+          })
+        },
+        "SAVE_STATE" => {
+          let path = try!(decoder.read_struct_field("data", 0, |decoder| {
+            decoder.read_struct_field("path", 0, |decoder|Decodable::decode(decoder))
+          }));
+          Ok(ConfigMessage {
+            id: id,
+            listener: listener,
+            data: ConfigCommand::SaveState(path)
+          })
+        },
+        "DUMP_STATE" => {
+          Ok(ConfigMessage {
+            id: id,
+            listener: listener,
+            data: ConfigCommand::DumpState,
+          })
+        },
+        _ => Err(decoder.error("unrecognized command")),
+      }
+    })
+  }
 }
 
 struct CommandClient {
@@ -258,39 +304,46 @@ impl CommandServer {
 
   fn dispatch(&mut self, token: Token, v: Vec<ConfigMessage>) {
     for message in &v {
-      let command = message.command.clone();
-      if let Command::DumpConfigurationToFile(path) = command {
-        if let Ok(mut f) = fs::File::create(&path) {
-          for listener in self.listeners.values() {
-            if let Ok(()) = f.write_all(&encode(&listener).unwrap().into_bytes()) {
-              f.write(&b"\n"[..]);
-              f.sync_all();
+      let config_command = message.data.clone();
+      match config_command {
+        ConfigCommand::SaveState(path) => {
+          if let Ok(mut f) = fs::File::create(&path) {
+            for listener in self.listeners.values() {
+              if let Ok(()) = f.write_all(&encode(&listener).unwrap().into_bytes()) {
+                f.write(&b"\n"[..]);
+                f.sync_all();
+              }
             }
+            // FIXME: should send back a DONE message here
+          } else {
+            // FIXME: should send back error here
+            log!(log::LogLevel::Error, "could not open file: {}", &path);
           }
-          // FIXME: should send back a DONE message here
-        } else {
-          // FIXME: should send back error here
-          log!(log::LogLevel::Error, "could not open file: {}", &path);
+        },
+        ConfigCommand::DumpState => {
+          let v: Vec<&Listener> = self.listeners.values().collect();
+          let conf = ListenerConfiguration {
+            id: message.id.clone(),
+            listeners: v,
+          };
+          self.conns[token].back_buf.write(&encode(&conf).unwrap().into_bytes());
+          self.conns[token].back_buf.write(&b"\0"[..]);
+        },
+        ConfigCommand::ProxyConfiguration(command) => {
+          if let Some(ref tag) = message.listener {
+            if let Some(ref mut listener) = self.listeners.get_mut (tag) {
+              self.conns[token].add_message_id(message.id.clone());
+              listener.state.handle_command(&command);
+              listener.sender.send(ProxyOrder::Command(message.id.clone(), command));
+            } else {
+              // FIXME: should send back error here
+              log!(log::LogLevel::Error, "no listener found for tag: {}", tag);
+            }
+          } else {
+            // FIXME: should send back error here
+            log!(log::LogLevel::Error, "expecting listener tag");
+          }
         }
-        return;
-      }
-      if let Command::DumpConfiguration = command {
-        let v: Vec<&Listener> = self.listeners.values().collect();
-        let conf = ListenerConfiguration {
-          id: message.id.clone(),
-          listeners: v,
-        };
-        self.conns[token].back_buf.write(&encode(&conf).unwrap().into_bytes());
-        self.conns[token].back_buf.write(&b"\0"[..]);
-        return;
-      }
-      if let Some(ref mut listener) = self.listeners.get_mut (&message.listener) {
-        self.conns[token].add_message_id(message.id.clone());
-        listener.state.handle_command(&command);
-        listener.sender.send(ProxyOrder::Command(message.id.clone(), command));
-      } else {
-        // FIXME: should send back error here
-        log!(log::LogLevel::Error, "no listener found for tag: {}", message.listener);
       }
     }
   }
@@ -420,15 +473,38 @@ mod tests {
 
   #[test]
   fn config_message_test() {
-    let raw_json = r#"{ "id": "ID_TEST", "listener": "HTTP", "command":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}} }"#;
-    let config: ConfigMessage = json::decode(raw_json).unwrap();
-    println!("{:?}", config);
-    assert_eq!(config.listener, "HTTP");
-    assert_eq!(config.command, Command::AddHttpFront(HttpFront{
+    let raw_json = r#"{ "id": "ID_TEST", "type": "PROXY", "listener": "HTTP", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}} }"#;
+    let message: ConfigMessage = json::decode(raw_json).unwrap();
+    println!("{:?}", message);
+    assert_eq!(message.listener, Some(String::from("HTTP")));
+    assert_eq!(message.data, ConfigCommand::ProxyConfiguration(Command::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
       port: 4242
-    }));
+    })));
+  }
+
+  #[test]
+  fn save_state_test() {
+    let raw_json = r#"{ "id": "ID_TEST", "type": "SAVE_STATE", "data":{ "path": "./config_dump.json"} }"#;
+    let message: ConfigMessage = json::decode(raw_json).unwrap();
+    println!("{:?}", message);
+    assert_eq!(message.listener, None);
+    assert_eq!(message.data, ConfigCommand::SaveState(String::from("./config_dump.json")));
+  }
+
+  #[test]
+  fn dump_state_test() {
+    println!("A");
+    //let raw_json = r#"{ "id": "ID_TEST", "type": "DUMP_STATE" }"#;
+    let raw_json = "{ \"id\": \"ID_TEST\", \"type\": \"DUMP_STATE\" }";
+    println!("B");
+    let message: ConfigMessage = json::decode(raw_json).unwrap();
+    println!("C");
+    println!("{:?}", message);
+    assert_eq!(message.listener, None);
+    println!("D");
+    assert_eq!(message.data, ConfigCommand::DumpState);
   }
 }

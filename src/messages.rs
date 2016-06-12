@@ -57,10 +57,6 @@ pub enum Command {
     RemoveInstance(Instance),
 
     HttpProxy(HttpProxyConfiguration),
-
-    //FIXME: these should be in yxorp/command, not here
-    DumpConfiguration,
-    DumpConfigurationToFile(String),
 }
 
 impl Command {
@@ -75,8 +71,6 @@ impl Command {
       Command::AddInstance(_)     => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
       Command::RemoveInstance(_)  => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
       Command::HttpProxy(_)       => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig],
-      Command::DumpConfiguration  => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
-      Command::DumpConfigurationToFile(_)  => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
     }
   }
 }
@@ -113,12 +107,6 @@ impl Decodable for Command {
       } else if &command_type == "CONFIGURE_HTTP_PROXY" {
         let conf = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
         Ok(Command::HttpProxy(conf))
-      } else if &command_type == "DUMP_CONFIGURATION" {
-        Ok(Command::DumpConfiguration)
-      } else if &command_type == "DUMP_CONFIGURATION_TO_FILE" {
-        let path = try!(decoder.read_struct_field("path", 0, |decoder| Decodable::decode(decoder)));
-        println!("path: {}", path);
-        Ok(Command::DumpConfigurationToFile(path))
       } else {
         Err(decoder.error("unrecognized command"))
       }
