@@ -1,5 +1,3 @@
-#![feature(ip_addr)]
-
 #![cfg_attr(test, feature(test))]
 #[cfg(test)]
 extern crate test;
