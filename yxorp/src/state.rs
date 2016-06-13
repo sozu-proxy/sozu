@@ -27,13 +27,13 @@ pub struct HttpProxy {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct TlsProxyFront {
-  app_id:     String,
-  hostname:   String,
-  path_begin: String,
-  port:       u16,
-  cert_path:  String,
-  key_path:   String,
-  instances:  Vec<HttpProxyInstance>
+  app_id:      String,
+  hostname:    String,
+  path_begin:  String,
+  port:        u16,
+  certificate: Vec<u8>,
+  key:         Vec<u8>,
+  instances:   Vec<HttpProxyInstance>
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,RustcDecodable, RustcEncodable)]
@@ -157,13 +157,13 @@ impl TlsProxy {
     match command {
       &Command::AddTlsFront(ref front) => {
         let f = TlsProxyFront {
-          app_id:     front.app_id.clone(),
-          hostname:   front.hostname.clone(),
-          path_begin: front.path_begin.clone(),
-          port:       front.port,
-          cert_path:  front.cert_path.clone(),
-          key_path:   front.key_path.clone(),
-          instances:  Vec::new()
+          app_id:      front.app_id.clone(),
+          hostname:    front.hostname.clone(),
+          path_begin:  front.path_begin.clone(),
+          port:        front.port,
+          certificate: front.certificate.clone(),
+          key:         front.key.clone(),
+          instances:   Vec::new()
         };
         self.fronts.insert(front.app_id.clone(), f);
       },
@@ -198,12 +198,12 @@ impl TlsProxy {
     let mut v = Vec::new();
     for (app_id, front) in &self.fronts {
       v.push(Command::AddTlsFront(TlsFront {
-        app_id:     app_id.clone(),
-        hostname:   front.hostname.clone(),
-        path_begin: front.path_begin.clone(),
-        port:       front.port.clone(),
-        cert_path:  front.cert_path.clone(),
-        key_path:   front.key_path.clone(),
+        app_id:      app_id.clone(),
+        hostname:    front.hostname.clone(),
+        path_begin:  front.path_begin.clone(),
+        port:        front.port.clone(),
+        certificate: front.certificate.clone(),
+        key:         front.key.clone(),
       }));
       for instance in front.instances.iter() {
         v.push(Command::AddInstance(Instance {
