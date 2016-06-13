@@ -7,7 +7,7 @@ use std::rc::{Rc,Weak};
 use std::cell::RefCell;
 use std::mem;
 use mio::tcp::*;
-use std::io::{self,Read,Write,ErrorKind};
+use std::io::{self,Read,Write,ErrorKind,BufReader};
 use mio::*;
 use bytes::{Buf,ByteBuf,MutByteBuf};
 use bytes::buf::MutBuf;
@@ -23,8 +23,9 @@ use openssl::ssl::{SslContext, SslContextOptions, SslMethod,
                    Ssl, NonblockingSslStream, ServerNameCallback,
                    ServerNameCallbackData};
 use openssl::ssl::error::NonblockingSslError;
-use openssl::x509::X509FileType;
+use openssl::x509::{X509,X509FileType};
 use openssl::dh::DH;
+use openssl::crypto::pkey::PKey;
 
 use parser::http11::{HttpState,RequestState,ResponseState,parse_request_until_stop};
 use network::buffer::Buffer;
@@ -67,6 +68,7 @@ impl ServerConfiguration {
     context.set_tmp_dh(dh);
     context.set_ecdh_auto(true);
 
+    //FIXME: get the default cert and key from the configuration
     context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
     context.set_private_key_file("assets/key.pem", X509FileType::PEM);
 
@@ -127,23 +129,33 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_http_front(&mut self, http_front: TlsFront, event_loop: &mut EventLoop<TlsServer>) {
+  pub fn add_http_front(&mut self, http_front: TlsFront, event_loop: &mut EventLoop<TlsServer>) -> bool {
+    //FIXME: insert some error management with a Result here
     let mut ctx = SslContext::new(SslMethod::Tlsv1).unwrap();
-    ctx.set_certificate_file(&http_front.cert_path, X509FileType::PEM);
-    ctx.set_private_key_file(&http_front.key_path, X509FileType::PEM);
-    let hostname = http_front.hostname.clone();
 
-    let front2 = http_front.clone();
-    let front3 = http_front.clone();
-    if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
-        fronts.push(front2);
+    let mut cert_read =  BufReader::new(&http_front.certificate[..]);
+    let mut key_read =  BufReader::new(&http_front.certificate[..]);
+    if let (Ok(cert), Ok(key)) = (X509::from_pem(&mut cert_read), PKey::private_key_from_pem(&mut key_read)) {
+
+      ctx.set_certificate(&cert);
+      ctx.set_private_key(&key);
+      let hostname = http_front.hostname.clone();
+
+      let front2 = http_front.clone();
+      let front3 = http_front.clone();
+      if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
+          fronts.push(front2);
+      }
+
+      if self.fronts.get(&http_front.hostname).is_none() {
+        self.fronts.insert(http_front.hostname, vec![front3]);
+      }
+
+      self.contexts.borrow_mut().insert(hostname, ctx);
+      true
+    } else {
+      false
     }
-
-    if self.fronts.get(&http_front.hostname).is_none() {
-      self.fronts.insert(http_front.hostname, vec![front3]);
-    }
-
-    self.contexts.borrow_mut().insert(hostname, ctx);
   }
 
   pub fn remove_http_front(&mut self, front: TlsFront, event_loop: &mut EventLoop<TlsServer>) {
@@ -492,21 +504,21 @@ mod tests {
     fronts.insert("lolcatho.st".to_owned(), vec![
       TlsFront {
         app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1, port: 8080,
-        key_path: "".to_owned(), cert_path: "".to_owned()
+        key: vec!(), certificate: vec!()
       },
       TlsFront {
         app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2, port: 8080,
-        key_path: "".to_owned(), cert_path: "".to_owned()
+        key: vec!(), certificate: vec!()
       },
       TlsFront {
         app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3, port: 8080,
-        key_path: "".to_owned(), cert_path: "".to_owned()
+        key: vec!(), certificate: vec!()
       }
     ]);
     fronts.insert("other.domain".to_owned(), vec![
       TlsFront {
         app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(), port: 8080,
-        key_path: "".to_owned(), cert_path: "".to_owned()
+        key: vec!(), certificate: vec!()
       },
     ]);
 

@@ -8,6 +8,8 @@ extern crate libc;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
+use std::fs::File;
+use std::io::Read;
 use std::env;
 use yxorp::network;
 use yxorp::messages;
@@ -77,12 +79,27 @@ fn main() {
                               !DSS");
 
   let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 500, 12000, Some((options, cipher_list)), sender2);
-  let tls_front = messages::TlsFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st"), path_begin: String::from("/"), port: 8443, cert_path: String::from("assets/certificate.pem"), key_path: String::from("assets/key.pem") };
+
+  let mut cert1 = Vec::new();
+  let mut fcert1 = File::open("assets/certificate.pem").unwrap();
+  fcert1.read_to_end(&mut cert1);
+  let mut key1 = Vec::new();
+  let mut fkey1 = File::open("assets/key.pem").unwrap();
+  fkey1.read_to_end(&mut key1);
+
+  let tls_front = messages::TlsFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st"), path_begin: String::from("/"), port: 8443, certificate: cert1, key: key1 };
   tx2.send(network::ProxyOrder::Command(String::from("ID_IJKL"), messages::Command::AddTlsFront(tls_front)));
   let tls_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
   tx2.send(network::ProxyOrder::Command(String::from("ID_MNOP"), messages::Command::AddInstance(tls_instance)));
 
-  let tls_front2 = messages::TlsFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/"), port: 8443, cert_path: String::from("assets/cert_test.pem"), key_path: String::from("assets/key_test.pem") };
+  let mut cert2 = Vec::new();
+  let mut fcert2 = File::open("assets/cert_test.pem").unwrap();
+  fcert2.read_to_end(&mut cert2);
+  let mut key2 = Vec::new();
+  let mut fkey2 = File::open("assets/key_test.pem").unwrap();
+  fkey2.read_to_end(&mut key2);
+
+  let tls_front2 = messages::TlsFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/"), port: 8443, certificate: cert2, key: key2 };
   tx2.send(network::ProxyOrder::Command(String::from("ID_QRST"), messages::Command::AddTlsFront(tls_front2)));
   let tls_instance2 = messages::Instance { app_id: String::from("app_2"), ip_address: String::from("127.0.0.1"), port: 1026 };
   tx2.send(network::ProxyOrder::Command(String::from("ID_UVWX"), messages::Command::AddInstance(tls_instance2)));

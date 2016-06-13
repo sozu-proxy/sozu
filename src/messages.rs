@@ -15,8 +15,8 @@ pub struct TlsFront {
     pub hostname: String,
     pub path_begin: String,
     pub port: u16,
-    pub cert_path: String,
-    pub key_path: String,
+    pub certificate: Vec<u8>,
+    pub key:         Vec<u8>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
