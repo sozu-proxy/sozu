@@ -216,8 +216,13 @@ impl CommandClient {
           //return None;
         },
         Err(e) => {
-          log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error: {:?}", tok.as_usize(), e);
-          return None;
+          match e.kind() {
+            ErrorKind::WouldBlock => {},
+            code => {
+              log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error (kind: {:?}): {:?}", tok.as_usize(), code, e);
+              return None;
+            }
+          }
         },
         Ok(r) => {
           self.buf.fill(r);
