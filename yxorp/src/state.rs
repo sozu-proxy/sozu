@@ -9,36 +9,38 @@ pub struct HttpProxyInstance {
   port:       u16,
 }
 
+pub type AppId = String;
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct HttpProxyFront {
-  app_id:     String,
+  app_id:     AppId,
   hostname:   String,
   path_begin: String,
-  instances:  Vec<HttpProxyInstance>
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,RustcDecodable, RustcEncodable)]
 pub struct HttpProxy {
   ip_address: String,
   port:       u16,
-  fronts:     HashMap<String, HttpProxyFront>
+  fronts:     HashMap<AppId, Vec<HttpProxyFront>>,
+  instances:  HashMap<AppId, Vec<HttpProxyInstance>>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct TlsProxyFront {
-  app_id:      String,
+  app_id:      AppId,
   hostname:    String,
   path_begin:  String,
   certificate: Vec<u8>,
   key:         Vec<u8>,
-  instances:   Vec<HttpProxyInstance>
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,RustcDecodable, RustcEncodable)]
 pub struct TlsProxy {
   ip_address: String,
   port:       u16,
-  fronts:     HashMap<String, TlsProxyFront>
+  fronts:     HashMap<AppId, Vec<TlsProxyFront>>,
+  instances:  HashMap<AppId, Vec<HttpProxyInstance>>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq)]
@@ -78,6 +80,7 @@ impl HttpProxy {
       ip_address: ip,
       port:       port,
       fronts:     HashMap::new(),
+      instances:  HashMap::new(),
     }
   }
 
@@ -88,31 +91,40 @@ impl HttpProxy {
           app_id:     front.app_id.clone(),
           hostname:   front.hostname.clone(),
           path_begin: front.path_begin.clone(),
-          instances:  Vec::new()
         };
-        self.fronts.insert(front.app_id.clone(), f);
+        if self.fronts.contains_key(&front.app_id) {
+          self.fronts.get_mut(&front.app_id).unwrap().push(f);
+        } else {
+          self.fronts.insert(front.app_id.clone(), vec!(f));
+        }
       },
       &Command::RemoveHttpFront(ref front) => {
-        self.fronts.remove(&front.app_id);
+        if let Some(front_list) = self.fronts.get_mut(&front.app_id) {
+          front_list.retain(|el| el.hostname != front.hostname || el.path_begin != front.path_begin);
+        }
       },
       &Command::AddInstance(ref instance)  => {
-        if let Some(front) = self.fronts.get_mut(&instance.app_id) {
-          let inst = HttpProxyInstance {
-            ip_address: instance.ip_address.clone(),
-            port:       instance.port,
-          };
-          front.instances.push(inst);
+        let inst = HttpProxyInstance {
+          ip_address: instance.ip_address.clone(),
+          port:       instance.port,
+        };
+        if self.instances.contains_key(&instance.app_id) {
+          self.instances.get_mut(&instance.app_id).unwrap().push(inst);
+        } else {
+          self.instances.insert(instance.app_id.clone(), vec!(inst));
         }
       },
       &Command::RemoveInstance(ref instance) => {
-        if let Some(front) = self.fronts.get_mut(&instance.app_id) {
-          let mut v = Vec::new();
+        if let Some(instance_list) = self.instances.get_mut(&instance.app_id) {
+          instance_list.retain(|el| el.ip_address != instance.ip_address || el.port != instance.port);
+          /*let mut v = Vec::new();
           for el in front.instances.iter() {
             if el.ip_address != instance.ip_address || el.port != instance.port {
               v.push(el.clone());
             }
           }
           front.instances = v;
+          */
         }
       }
       _ => {}
@@ -121,18 +133,22 @@ impl HttpProxy {
 
   pub fn generate_commands(&self) -> Vec<Command> {
     let mut v = Vec::new();
-    for (app_id, front) in &self.fronts {
-      v.push(Command::AddHttpFront(HttpFront {
-        app_id:     app_id.clone(),
-        hostname:   front.hostname.clone(),
-        path_begin: front.path_begin.clone(),
-      }));
-      for instance in front.instances.iter() {
-        v.push(Command::AddInstance(Instance {
+    for (app_id, front_list) in self.fronts.iter() {
+      for front in front_list {
+        v.push(Command::AddHttpFront(HttpFront {
           app_id:     app_id.clone(),
-          ip_address: instance.ip_address.clone(),
-          port:       instance.port.clone(),
+          hostname:   front.hostname.clone(),
+          path_begin: front.path_begin.clone(),
         }));
+      }
+      for (app_id,instance_list) in self.instances.iter() {
+        for instance in instance_list {
+          v.push(Command::AddInstance(Instance {
+            app_id:     app_id.clone(),
+            ip_address: instance.ip_address.clone(),
+            port:       instance.port.clone(),
+          }));
+        }
       }
     }
 
@@ -146,6 +162,7 @@ impl TlsProxy {
       ip_address: ip,
       port:       port,
       fronts:     HashMap::new(),
+      instances:  HashMap::new(),
     }
   }
 
@@ -158,31 +175,37 @@ impl TlsProxy {
           path_begin:  front.path_begin.clone(),
           certificate: front.certificate.clone(),
           key:         front.key.clone(),
-          instances:   Vec::new()
         };
-        self.fronts.insert(front.app_id.clone(), f);
+        if self.fronts.contains_key(&front.app_id) {
+          self.fronts.get_mut(&front.app_id).unwrap().push(f);
+        } else {
+          self.fronts.insert(front.app_id.clone(), vec!(f));
+        }
       },
       &Command::RemoveTlsFront(ref front) => {
         self.fronts.remove(&front.app_id);
       },
       &Command::AddInstance(ref instance)  => {
-        if let Some(front) = self.fronts.get_mut(&instance.app_id) {
-          let inst = HttpProxyInstance {
-            ip_address: instance.ip_address.clone(),
-            port:       instance.port,
-          };
-          front.instances.push(inst);
+        let inst = HttpProxyInstance {
+          ip_address: instance.ip_address.clone(),
+          port:       instance.port,
+        };
+        if self.instances.contains_key(&instance.app_id) {
+          self.instances.get_mut(&instance.app_id).unwrap().push(inst);
+        } else {
+          self.instances.insert(instance.app_id.clone(), vec!(inst));
         }
       },
       &Command::RemoveInstance(ref instance) => {
-        if let Some(front) = self.fronts.get_mut(&instance.app_id) {
-          let mut v = Vec::new();
-          for el in front.instances.iter() {
+        if let Some(instance_list) = self.instances.get_mut(&instance.app_id) {
+          instance_list.retain(|el| el.ip_address != instance.ip_address || el.port != instance.port);
+          /*let mut v = Vec::new();
+          for el in instance_list.iter() {
             if el.ip_address != instance.ip_address || el.port != instance.port {
               v.push(el.clone());
             }
           }
-          front.instances = v;
+          front.instances = v;*/
         }
       }
       _ => {}
@@ -191,15 +214,19 @@ impl TlsProxy {
 
   pub fn generate_commands(&self) -> Vec<Command> {
     let mut v = Vec::new();
-    for (app_id, front) in &self.fronts {
-      v.push(Command::AddTlsFront(TlsFront {
-        app_id:      app_id.clone(),
-        hostname:    front.hostname.clone(),
-        path_begin:  front.path_begin.clone(),
-        certificate: front.certificate.clone(),
-        key:         front.key.clone(),
-      }));
-      for instance in front.instances.iter() {
+    for (app_id, front_list) in &self.fronts {
+      for front in front_list {
+        v.push(Command::AddTlsFront(TlsFront {
+          app_id:      app_id.clone(),
+          hostname:    front.hostname.clone(),
+          path_begin:  front.path_begin.clone(),
+          certificate: front.certificate.clone(),
+          key:         front.key.clone(),
+        }));
+      }
+    }
+    for (app_id, instance_list) in &self.instances {
+      for instance in instance_list {
         v.push(Command::AddInstance(Instance {
           app_id:     app_id.clone(),
           ip_address: instance.ip_address.clone(),

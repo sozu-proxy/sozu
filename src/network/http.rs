@@ -528,11 +528,14 @@ pub struct DefaultAnswers {
   pub ServiceUnavailable: Vec<u8>
 }
 
+pub type AppId    = String;
+pub type Hostname = String;
+
 pub struct ServerConfiguration {
   listener:  TcpListener,
   address:   SocketAddr,
-  instances: HashMap<String, Vec<Backend>>,
-  fronts:    HashMap<String, Vec<HttpFront>>,
+  instances: HashMap<AppId, Vec<Backend>>,
+  fronts:    HashMap<Hostname, Vec<HttpFront>>,
   tx:        mpsc::Sender<ServerMessage>,
   pool:      Pool<Buffer>,
   answers:   DefaultAnswers,
