@@ -205,25 +205,35 @@ impl CommandClient {
 
   fn conn_readable(&mut self, event_loop: &mut EventLoop<CommandServer>, tok: Token) -> Option<Vec<ConfigMessage>>{
     trace!("server conn readable; tok={:?}", tok);
-    match self.sock.read(self.buf.space()) {
-      Ok(0) => {
-        self.reregister(event_loop, tok);
-        return None;
-      },
-      Err(e) => {
-        log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error: {:?}", tok.as_usize(), e);
-        return None;
-      },
-      Ok(r) => {
-        self.buf.fill(r);
-        debug!("UNIX CLIENT[{}] sent {} bytes: {:?}", tok.as_usize(), r, from_utf8(self.buf.data()));
-      },
-    };
+    loop {
+      let size = self.buf.available_space();
+      if size == 0 { break; }
+
+      match self.sock.read(self.buf.space()) {
+        Ok(0) => {
+          self.reregister(event_loop, tok);
+          break;
+          //return None;
+        },
+        Err(e) => {
+          log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error: {:?}", tok.as_usize(), e);
+          return None;
+        },
+        Ok(r) => {
+          self.buf.fill(r);
+          debug!("UNIX CLIENT[{}] sent {} bytes: {:?}", tok.as_usize(), r, from_utf8(self.buf.data()));
+        },
+      };
+    }
 
     let mut res: Option<Vec<ConfigMessage>> = None;
     let mut offset = 0usize;
     match parse(self.buf.data()) {
       IResult::Incomplete(_) => {
+        if self.buf.available_space() == 0 {
+          log!(log::LogLevel::Error, "UNIX CLIENT[{}] buffer full, but not enough data: {:?}", tok.as_usize(), from_utf8(self.buf.data()));
+          return None;
+        }
         return Some(Vec::new());
       },
       IResult::Error(e)      => {
