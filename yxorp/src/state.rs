@@ -14,7 +14,6 @@ pub struct HttpProxyFront {
   app_id:     String,
   hostname:   String,
   path_begin: String,
-  port:       u16,
   instances:  Vec<HttpProxyInstance>
 }
 
@@ -30,7 +29,6 @@ pub struct TlsProxyFront {
   app_id:      String,
   hostname:    String,
   path_begin:  String,
-  port:        u16,
   certificate: Vec<u8>,
   key:         Vec<u8>,
   instances:   Vec<HttpProxyInstance>
@@ -90,7 +88,6 @@ impl HttpProxy {
           app_id:     front.app_id.clone(),
           hostname:   front.hostname.clone(),
           path_begin: front.path_begin.clone(),
-          port:       front.port,
           instances:  Vec::new()
         };
         self.fronts.insert(front.app_id.clone(), f);
@@ -129,7 +126,6 @@ impl HttpProxy {
         app_id:     app_id.clone(),
         hostname:   front.hostname.clone(),
         path_begin: front.path_begin.clone(),
-        port:       front.port.clone(),
       }));
       for instance in front.instances.iter() {
         v.push(Command::AddInstance(Instance {
@@ -160,7 +156,6 @@ impl TlsProxy {
           app_id:      front.app_id.clone(),
           hostname:    front.hostname.clone(),
           path_begin:  front.path_begin.clone(),
-          port:        front.port,
           certificate: front.certificate.clone(),
           key:         front.key.clone(),
           instances:   Vec::new()
@@ -201,7 +196,6 @@ impl TlsProxy {
         app_id:      app_id.clone(),
         hostname:    front.hostname.clone(),
         path_begin:  front.path_begin.clone(),
-        port:        front.port.clone(),
         certificate: front.certificate.clone(),
         key:         front.key.clone(),
       }));
@@ -226,8 +220,8 @@ mod tests {
   #[test]
   fn serialize() {
     let mut state = HttpProxy::new(String::from("127.0.0.1"), 80);
-    state.handle_command(&Command::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), port: 8080 }));
-    state.handle_command(&Command::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc"), port: 80 }));
+    state.handle_command(&Command::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") }));
+    state.handle_command(&Command::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc") }));
     state.handle_command(&Command::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 }));
     state.handle_command(&Command::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
     state.handle_command(&Command::AddInstance(Instance { app_id: String::from("app_2"), ip_address: String::from("192.167.1.2"), port: 1026 }));

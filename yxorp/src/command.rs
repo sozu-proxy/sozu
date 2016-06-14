@@ -473,7 +473,7 @@ mod tests {
 
   #[test]
   fn config_message_test() {
-    let raw_json = r#"{ "id": "ID_TEST", "type": "PROXY", "listener": "HTTP", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}} }"#;
+    let raw_json = r#"{ "id": "ID_TEST", "type": "PROXY", "listener": "HTTP", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}} }"#;
     let message: ConfigMessage = json::decode(raw_json).unwrap();
     println!("{:?}", message);
     assert_eq!(message.listener, Some(String::from("HTTP")));
@@ -481,7 +481,6 @@ mod tests {
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
-      port: 4242
     })));
   }
 

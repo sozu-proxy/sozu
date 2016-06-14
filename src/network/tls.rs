@@ -503,21 +503,21 @@ mod tests {
     let mut fronts = HashMap::new();
     fronts.insert("lolcatho.st".to_owned(), vec![
       TlsFront {
-        app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1, port: 8080,
+        app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1,
         key: vec!(), certificate: vec!()
       },
       TlsFront {
-        app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2, port: 8080,
+        app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2,
         key: vec!(), certificate: vec!()
       },
       TlsFront {
-        app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3, port: 8080,
+        app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3,
         key: vec!(), certificate: vec!()
       }
     ]);
     fronts.insert("other.domain".to_owned(), vec![
       TlsFront {
-        app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(), port: 8080,
+        app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(),
         key: vec!(), certificate: vec!()
       },
     ]);

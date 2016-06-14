@@ -6,7 +6,6 @@ pub struct HttpFront {
     pub app_id: String,
     pub hostname: String,
     pub path_begin: String,
-    pub port: u16
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
@@ -14,7 +13,6 @@ pub struct TlsFront {
     pub app_id: String,
     pub hostname: String,
     pub path_begin: String,
-    pub port: u16,
     pub certificate: Vec<u8>,
     pub key:         Vec<u8>,
 }
@@ -136,7 +134,6 @@ mod tests {
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
-      port: 4242
     }));
   }
 
@@ -149,7 +146,6 @@ mod tests {
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
-      port: 4242
     }));
   }
 

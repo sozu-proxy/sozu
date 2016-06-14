@@ -822,7 +822,7 @@ mod tests {
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").unwrap();
     let (tx,rx) = channel::<ServerMessage>();
     let (sender, jg) = start_listener(front, 10, 12000, tx.clone());
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/"), port: 1024 };
+    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
     sender.send(ProxyOrder::Command(String::from("ID_ABCD"), Command::AddHttpFront(front)));
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
     sender.send(ProxyOrder::Command(String::from("ID_EFGH"), Command::AddInstance(instance)));
@@ -890,12 +890,12 @@ mod tests {
 
     let mut fronts = HashMap::new();
     fronts.insert("lolcatho.st".to_owned(), vec![
-      HttpFront { app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1, port: 8080 },
-      HttpFront { app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2, port: 8080 },
-      HttpFront { app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3, port: 8080 }
+      HttpFront { app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1 },
+      HttpFront { app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2 },
+      HttpFront { app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3 }
     ]);
     fronts.insert("other.domain".to_owned(), vec![
-      HttpFront { app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(), port: 8080 },
+      HttpFront { app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned() },
     ]);
 
     let (tx,rx) = channel::<ServerMessage>();

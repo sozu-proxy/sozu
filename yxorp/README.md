@@ -61,7 +61,6 @@ Here is an example of one of those messages:
       "app_id":     "xxx",
       "hostname":   "yyy",
       "path_begin": "xxx",
-      "port":       4242
     }
   }
 }
