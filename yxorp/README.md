@@ -60,11 +60,33 @@ Here is an example of one of those messages:
     "data": {
       "app_id":     "xxx",
       "hostname":   "yyy",
-      "path_begin": "xxx",
+      "path_begin": "xxx"
     }
   }
 }
 ```
+
+For TLS:
+
+```json
+{
+  "id":       "ID_TEST",
+  "type":     "PROXY",
+  "listener": "TLS",
+  "data": {
+    "type": "ADD_TLS_FRONT",
+    "data": {
+      "app_id":      "xxx",
+      "hostname":    "yyy",
+      "path_begin":  "xxx",
+      "certificate": "<PEM data>",
+      "key":         "<PEM data>",
+      "certificate_chain": [ "<PEM data>", "<PEM data>" ]
+    }
+  }
+}
+```
+
 
 The listener attribute indicates the listener's name, as defined in the
 configuration file, in the section name (ie, `[listeners.HELLO]` creates
