@@ -57,7 +57,7 @@ fn main() {
       }
     };
 
-    command::start(config.command_socket, listeners);
+    command::start(config.command_socket, listeners, config.saved_state);
     if let Some(jh) = jh_opt {
       let _ = jh.join();
       info!("good bye");

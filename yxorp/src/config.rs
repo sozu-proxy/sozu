@@ -24,6 +24,7 @@ pub struct MetricsConfig {
 #[derive(Debug,Clone,PartialEq,Eq, RustcDecodable, RustcEncodable)]
 pub struct Config {
   pub command_socket: String,
+  pub saved_state:    Option<String>,
   pub metrics:        MetricsConfig,
   pub listeners:      HashMap<String, ListenerConfig>,
 }
@@ -73,6 +74,7 @@ mod tests {
     });
     let config = Config {
       command_socket: String::from("./command_folder/sock"),
+      saved_state: None,
       metrics: MetricsConfig {
         address: String::from("192.168.59.103"),
         port:    8125,

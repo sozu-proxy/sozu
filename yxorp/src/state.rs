@@ -48,6 +48,7 @@ pub struct TlsProxy {
 pub enum ConfigState {
   Http(HttpProxy),
   Tls(TlsProxy),
+  Tcp
 }
 
 impl ConfigState {
@@ -55,6 +56,7 @@ impl ConfigState {
     match *self {
       ConfigState::Http(ref mut state) => state.handle_command(command),
       ConfigState::Tls(ref mut state)  => state.handle_command(command),
+      ConfigState::Tcp                 => {},
     }
   }
 
@@ -62,6 +64,7 @@ impl ConfigState {
     match *self {
       ConfigState::Http(ref state) => state.generate_commands(),
       ConfigState::Tls(ref state)  => state.generate_commands(),
+      ConfigState::Tcp             => vec!(),
     }
   }
 }
@@ -71,6 +74,7 @@ impl Encodable for ConfigState {
     match *self {
       ConfigState::Http(ref state) => state.encode(e),
       ConfigState::Tls(ref state)  => state.encode(e),
+      ConfigState::Tcp             => Ok(())
     }
   }
 }

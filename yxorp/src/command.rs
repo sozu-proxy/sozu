@@ -2,7 +2,7 @@ use mio::*;
 use mio::unix::*;
 use mio::util::Slab;
 use std::path::PathBuf;
-use std::io::{self,Read,Write,ErrorKind};
+use std::io::{self,BufRead,BufReader,Read,Write,ErrorKind};
 use std::iter::repeat;
 use std::thread;
 use std::str::from_utf8;
@@ -52,6 +52,35 @@ impl Decodable for ListenerType {
   }
 }
 
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub struct ListenerDeserializer {
+  pub tag:   String,
+  pub state: ConfigState,
+}
+
+impl Decodable for ListenerDeserializer {
+  fn decode<D: Decoder>(decoder: &mut D) -> Result<ListenerDeserializer, D::Error> {
+    decoder.read_struct("root", 0, |decoder| {
+      let tag = try!(decoder.read_struct_field("tag", 0, |decoder| Decodable::decode(decoder)));
+      let listener_type:String = try!(decoder.read_struct_field("listener_type", 0, |decoder| Decodable::decode(decoder)));
+      let state = match &listener_type[..] {
+        "HTTP"  => {
+          ConfigState::Http(try!(decoder.read_struct_field("state", 0, |decoder| Decodable::decode(decoder))))
+        },
+        "HTTPS" => {
+          ConfigState::Tls(try!(decoder.read_struct_field("state", 0, |decoder| Decodable::decode(decoder))))
+        },
+        "TCP"   => ConfigState::Tcp,
+        _       => { return Err(decoder.error("unrecognized listener type")); }
+      };
+
+      Ok(ListenerDeserializer {
+        tag:   tag,
+        state: state,
+      })
+    })
+  }
+}
 pub struct Listener {
   pub tag:           String,
   pub listener_type: ListenerType,
@@ -361,7 +390,6 @@ impl CommandServer {
             listeners: v,
           };
           let encoded = encode(&conf).unwrap().into_bytes();
-          log!(log::LogLevel::Info, "encoded to {} bytes", encoded.len());
           if self.conns[token].back_buf.grow(encoded.len()) {
             log!(log::LogLevel::Info, "write buffer was not large enough, growing to {} bytes", encoded.len());
           }
@@ -471,8 +499,25 @@ impl Handler for CommandServer {
 
 }
 
-pub fn start(path: String, listeners: HashMap<String, Listener>) {
+pub fn start(path: String, mut listeners: HashMap<String, Listener>, saved_state: Option<String>) {
   thread::spawn(move || {
+    saved_state.as_ref().map(|state_path| {
+      fs::File::open(state_path).map(|mut f| {
+        let mut reader = BufReader::new(f);
+        reader.lines().map(|line_res| {
+          line_res.map(|line| {
+            if let Ok(listener_state) = decode::<ListenerDeserializer>(&line) {
+              listeners.get_mut(&listener_state.tag).as_mut().map(|ref mut listener| {
+                println!("setting listener {} state at {:?}", listener_state.tag, listener_state.state);
+                listener.state = listener_state.state.clone();
+              });
+            }
+          })
+        }).count();
+
+      });
+    });
+
     let mut event_loop = EventLoop::new().unwrap();
     let addr = PathBuf::from(path);
     if let Err(e) = fs::remove_file(&addr) {
