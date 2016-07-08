@@ -217,7 +217,9 @@ impl CommandClient {
         },
         Err(e) => {
           match e.kind() {
-            ErrorKind::WouldBlock => {},
+            ErrorKind::WouldBlock => {
+              break;
+            },
             code => {
               log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error (kind: {:?}): {:?}", tok.as_usize(), code, e);
               return None;
