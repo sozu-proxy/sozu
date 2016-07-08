@@ -133,13 +133,19 @@ impl ServerConfiguration {
     //FIXME: insert some error management with a Result here
     let mut ctx = SslContext::new(SslMethod::Tlsv1).unwrap();
 
-    let mut cert_read =  BufReader::new(&http_front.certificate.as_bytes()[..]);
-    let mut key_read =  BufReader::new(&http_front.key.as_bytes()[..]);
-    //FIXME: parse the certificate chain too
+    let mut cert_read  = BufReader::new(&http_front.certificate.as_bytes()[..]);
+    let mut key_read   = BufReader::new(&http_front.key.as_bytes()[..]);
+    let mut cert_chain: Vec<X509> = http_front.certificate_chain.iter().filter_map(|c| {
+      X509::from_pem(&mut BufReader::new(&c.as_bytes()[..])).ok()
+    }).collect();
+
     if let (Ok(cert), Ok(key)) = (X509::from_pem(&mut cert_read), PKey::private_key_from_pem(&mut key_read)) {
+      //FIXME: would need more logs here
 
       ctx.set_certificate(&cert);
       ctx.set_private_key(&key);
+      cert_chain.iter().map(|ref cert| ctx.add_extra_chain_cert(cert));
+
       let hostname = http_front.hostname.clone();
 
       let front2 = http_front.clone();
