@@ -791,9 +791,9 @@ pub fn start_listener(front: SocketAddr, max_connections: usize, buffer_size: us
   let mut server = HttpServer::new(1, max_connections, configuration);
 
   let join_guard = thread::spawn(move|| {
-    debug!("HTTP\tstarting event loop");
+    info!("HTTP\tstarting event loop");
     event_loop.run(&mut server).unwrap();
-    debug!("HTTP\tending event loop");
+    info!("HTTP\tending event loop");
     //notify_tx.send(ServerMessage::Stopped);
   });
 
