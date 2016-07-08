@@ -133,8 +133,9 @@ impl ServerConfiguration {
     //FIXME: insert some error management with a Result here
     let mut ctx = SslContext::new(SslMethod::Tlsv1).unwrap();
 
-    let mut cert_read =  BufReader::new(&http_front.certificate[..]);
-    let mut key_read =  BufReader::new(&http_front.certificate[..]);
+    let mut cert_read =  BufReader::new(&http_front.certificate.as_bytes()[..]);
+    let mut key_read =  BufReader::new(&http_front.key.as_bytes()[..]);
+    //FIXME: parse the certificate chain too
     if let (Ok(cert), Ok(key)) = (X509::from_pem(&mut cert_read), PKey::private_key_from_pem(&mut key_read)) {
 
       ctx.set_certificate(&cert);
@@ -504,21 +505,21 @@ mod tests {
     fronts.insert("lolcatho.st".to_owned(), vec![
       TlsFront {
         app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1,
-        key: vec!(), certificate: vec!()
+        key: String::new(), certificate: String::new(), certificate_chain: vec!()
       },
       TlsFront {
         app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2,
-        key: vec!(), certificate: vec!()
+        key: String::new(), certificate: String::new(), certificate_chain: vec!()
       },
       TlsFront {
         app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3,
-        key: vec!(), certificate: vec!()
+        key: String::new(), certificate: String::new(), certificate_chain: vec!()
       }
     ]);
     fronts.insert("other.domain".to_owned(), vec![
       TlsFront {
         app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(),
-        key: vec!(), certificate: vec!()
+        key: String::new(), certificate: String::new(), certificate_chain: vec!()
       },
     ]);
 

@@ -13,8 +13,9 @@ pub struct TlsFront {
     pub app_id: String,
     pub hostname: String,
     pub path_begin: String,
-    pub certificate: Vec<u8>,
-    pub key:         Vec<u8>,
+    pub certificate: String,
+    pub certificate_chain: Vec<String>,
+    pub key:         String,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
@@ -172,5 +173,29 @@ mod tests {
       ip_address: String::from("yyy"),
       port: 8080
     }));
+  }
+
+  #[test]
+  fn http_front_crash_test() {
+    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "aa", "hostname": "cltdl.fr", "path_begin": ""}}"#;
+    let command: Command = json::decode(raw_json).unwrap();
+    println!("{:?}", command);
+    assert!(command == Command::AddHttpFront(HttpFront{
+      app_id: String::from("aa"),
+      hostname: String::from("cltdl.fr"),
+      path_begin: String::from(""),
+    }));
+  }
+
+  #[test]
+  fn http_front_crash_test2() {
+    let raw_json = r#"{"app_id": "aa", "hostname": "cltdl.fr", "path_begin": ""}"#;
+    let front: HttpFront = json::decode(raw_json).unwrap();
+    println!("{:?}",front);
+    assert!(front == HttpFront{
+      app_id: String::from("aa"),
+      hostname: String::from("cltdl.fr"),
+      path_begin: String::from(""),
+    });
   }
 }

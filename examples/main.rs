@@ -80,26 +80,18 @@ fn main() {
 
   let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 500, 12000, Some((options, cipher_list)), sender2);
 
-  let mut cert1 = Vec::new();
-  let mut fcert1 = File::open("assets/certificate.pem").unwrap();
-  fcert1.read_to_end(&mut cert1);
-  let mut key1 = Vec::new();
-  let mut fkey1 = File::open("assets/key.pem").unwrap();
-  fkey1.read_to_end(&mut key1);
+  let cert1 = include_str!("../assets/certificate.pem");
+  let key1  = include_str!("../assets/key.pem");
 
-  let tls_front = messages::TlsFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st"), path_begin: String::from("/"), certificate: cert1, key: key1 };
+  let tls_front = messages::TlsFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st"), path_begin: String::from("/"), certificate: String::from(cert1), key: String::from(key1), certificate_chain: vec!() };
   tx2.send(network::ProxyOrder::Command(String::from("ID_IJKL"), messages::Command::AddTlsFront(tls_front)));
   let tls_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
   tx2.send(network::ProxyOrder::Command(String::from("ID_MNOP"), messages::Command::AddInstance(tls_instance)));
 
-  let mut cert2 = Vec::new();
-  let mut fcert2 = File::open("assets/cert_test.pem").unwrap();
-  fcert2.read_to_end(&mut cert2);
-  let mut key2 = Vec::new();
-  let mut fkey2 = File::open("assets/key_test.pem").unwrap();
-  fkey2.read_to_end(&mut key2);
+  let cert2 = include_str!("../assets/cert_test.pem");
+  let key2  = include_str!("../assets/key_test.pem");
 
-  let tls_front2 = messages::TlsFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/"), certificate: cert2, key: key2 };
+  let tls_front2 = messages::TlsFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/"), certificate: String::from(cert2), key: String::from(key2), certificate_chain: vec!() };
   tx2.send(network::ProxyOrder::Command(String::from("ID_QRST"), messages::Command::AddTlsFront(tls_front2)));
   let tls_instance2 = messages::Instance { app_id: String::from("app_2"), ip_address: String::from("127.0.0.1"), port: 1026 };
   tx2.send(network::ProxyOrder::Command(String::from("ID_UVWX"), messages::Command::AddInstance(tls_instance2)));
