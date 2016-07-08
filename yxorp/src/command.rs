@@ -360,7 +360,12 @@ impl CommandServer {
             id: message.id.clone(),
             listeners: v,
           };
-          self.conns[token].back_buf.write(&encode(&conf).unwrap().into_bytes());
+          let encoded = encode(&conf).unwrap().into_bytes();
+          log!(log::LogLevel::Info, "encoded to {} bytes", encoded.len());
+          if self.conns[token].back_buf.grow(encoded.len()) {
+            log!(log::LogLevel::Info, "write buffer was not large enough, growing to {} bytes", encoded.len());
+          }
+          self.conns[token].back_buf.write(&encoded);
           self.conns[token].back_buf.write(&b"\0"[..]);
         },
         ConfigCommand::ProxyConfiguration(command) => {

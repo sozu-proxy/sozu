@@ -22,6 +22,16 @@ impl Buffer {
     }
   }
 
+  pub fn grow(&mut self, new_size: usize) -> bool {
+    if self.capacity >= new_size {
+      return false;
+    }
+
+    self.memory.resize(new_size, 0);
+    self.capacity = new_size;
+    true
+  }
+
   pub fn available_data(&self) -> usize {
     self.end - self.position
   }
