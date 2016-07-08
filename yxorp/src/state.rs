@@ -31,8 +31,9 @@ pub struct TlsProxyFront {
   app_id:      AppId,
   hostname:    String,
   path_begin:  String,
-  certificate: Vec<u8>,
-  key:         Vec<u8>,
+  certificate: String,
+  key:         String,
+  certificate_chain: Vec<String>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,RustcDecodable, RustcEncodable)]
@@ -174,6 +175,7 @@ impl TlsProxy {
           hostname:    front.hostname.clone(),
           path_begin:  front.path_begin.clone(),
           certificate: front.certificate.clone(),
+          certificate_chain: front.certificate_chain.clone(),
           key:         front.key.clone(),
         };
         if self.fronts.contains_key(&front.app_id) {
@@ -221,6 +223,7 @@ impl TlsProxy {
           hostname:    front.hostname.clone(),
           path_begin:  front.path_begin.clone(),
           certificate: front.certificate.clone(),
+          certificate_chain: front.certificate_chain.clone(),
           key:         front.key.clone(),
         }));
       }
