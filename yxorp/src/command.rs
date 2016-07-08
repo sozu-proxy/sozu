@@ -264,16 +264,33 @@ impl CommandClient {
     }
 
     trace!("server conn writable; tok={:?}", tok);
-    match self.sock.write(self.back_buf.data()) {
-      Ok(0) => {
-        //println!("[{}] setting timeout!", tok.as_usize());
-        self.write_timeout = event_loop.timeout_ms(self.token.unwrap().as_usize(), 700).ok();
-      },
-      Ok(r) => {
-        self.back_buf.consume(r);
-      },
-      Err(e) => log!(log::LogLevel::Error,"UNIX CLIENT[{}] read error: {:?}", tok.as_usize(), e),
+    loop {
+      let size = self.back_buf.available_data();
+      if size == 0 { break; }
+
+      match self.sock.write(self.back_buf.data()) {
+        Ok(0) => {
+          //println!("[{}] setting timeout!", tok.as_usize());
+          self.write_timeout = event_loop.timeout_ms(self.token.unwrap().as_usize(), 700).ok();
+          break;
+        },
+        Ok(r) => {
+          self.back_buf.consume(r);
+        },
+        Err(e) => {
+          match e.kind() {
+            ErrorKind::WouldBlock => {
+              break;
+            },
+            code => {
+              log!(log::LogLevel::Error,"UNIX CLIENT[{}] write error: (kind: {:?}): {:?}", tok.as_usize(), code, e);
+              return;
+            }
+          }
+        }
+      }
     }
+
     let mut interest = EventSet::hup();
     interest.insert(EventSet::readable());
     interest.insert(EventSet::writable());
