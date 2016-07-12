@@ -390,7 +390,7 @@ impl CommandServer {
             listeners: v,
           };
           let encoded = encode(&conf).unwrap().into_bytes();
-          if self.conns[token].back_buf.grow(encoded.len()) {
+          if self.conns[token].back_buf.grow(encoded.len() + 10) {
             log!(log::LogLevel::Info, "write buffer was not large enough, growing to {} bytes", encoded.len());
           }
           self.conns[token].back_buf.write(&encoded);
