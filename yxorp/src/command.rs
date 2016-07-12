@@ -204,7 +204,7 @@ impl CommandClient {
   fn new(sock: UnixStream) -> CommandClient {
     CommandClient {
       sock:        sock,
-      buf:         Buffer::with_capacity(1024),
+      buf:         Buffer::with_capacity(10000),
       back_buf:    Buffer::with_capacity(10000),
       token:       None,
       message_ids: Vec::new(),
