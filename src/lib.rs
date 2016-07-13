@@ -1,3 +1,5 @@
+#![feature(custom_derive, plugin)]
+#![plugin(serde_macros)]
 #![cfg_attr(test, feature(test))]
 #[cfg(test)]
 extern crate test;
@@ -8,7 +10,8 @@ extern crate test;
 extern crate mio;
 extern crate bytes;
 extern crate time;
-extern crate rustc_serialize;
+extern crate serde;
+extern crate serde_json;
 extern crate rand;
 extern crate openssl;
 extern crate pool;

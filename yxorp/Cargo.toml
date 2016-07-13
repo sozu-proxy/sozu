@@ -8,8 +8,11 @@ log = "0.3"
 env_logger = "0.3"
 mio = "~0.5.0"
 rustc-serialize = "^0.3.15"
+serde = "~0.7"
+serde_json = "~0.7"
+serde_macros = "~0.7"
 nom = "~1.2.0"
-toml = "0.1"
+toml = "~0.1"
 
 [dependencies.yxorp]
 path = ".."

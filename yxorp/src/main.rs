@@ -1,10 +1,14 @@
+#![feature(custom_derive, plugin)]
+#![plugin(serde_macros)]
 #[macro_use] extern crate nom;
 #[macro_use] extern crate log;
 extern crate env_logger;
 extern crate mio;
-extern crate rustc_serialize;
 extern crate yxorp;
 extern crate toml;
+extern crate rustc_serialize;
+extern crate serde;
+extern crate serde_json;
 
 mod config;
 mod command;

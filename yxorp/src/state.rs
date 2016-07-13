@@ -1,9 +1,9 @@
-use rustc_serialize::{Encodable, Encoder, Decoder};
 use std::collections::HashMap;
+use serde;
 
 use yxorp::messages::{Command,HttpFront,TlsFront,Instance};
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpProxyInstance {
   ip_address: String,
   port:       u16,
@@ -11,14 +11,14 @@ pub struct HttpProxyInstance {
 
 pub type AppId = String;
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpProxyFront {
   app_id:     AppId,
   hostname:   String,
   path_begin: String,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
 pub struct HttpProxy {
   ip_address: String,
   port:       u16,
@@ -26,7 +26,7 @@ pub struct HttpProxy {
   instances:  HashMap<AppId, Vec<HttpProxyInstance>>,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct TlsProxyFront {
   app_id:      AppId,
   hostname:    String,
@@ -36,7 +36,7 @@ pub struct TlsProxyFront {
   certificate_chain: Vec<String>,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Serialize, Deserialize)]
 pub struct TlsProxy {
   ip_address: String,
   port:       u16,
@@ -69,11 +69,13 @@ impl ConfigState {
   }
 }
 
-impl Encodable for ConfigState {
-  fn encode<E: Encoder>(&self, e: &mut E) -> Result<(), E::Error> {
+impl serde::Serialize for ConfigState {
+  fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
+      where S: serde::Serializer,
+  {
     match *self {
-      ConfigState::Http(ref state) => state.encode(e),
-      ConfigState::Tls(ref state)  => state.encode(e),
+      ConfigState::Http(ref state) => state.serialize(serializer),
+      ConfigState::Tls(ref state)  => state.serialize(serializer),
       ConfigState::Tcp             => Ok(())
     }
   }

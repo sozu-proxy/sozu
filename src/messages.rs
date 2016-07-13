@@ -1,14 +1,14 @@
+use serde;
+use serde_json;
 
-use rustc_serialize::{Decodable, Decoder};
-
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpFront {
     pub app_id: String,
     pub hostname: String,
     pub path_begin: String,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct TlsFront {
     pub app_id: String,
     pub hostname: String,
@@ -18,7 +18,7 @@ pub struct TlsFront {
     pub key:         String,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct TcpFront {
     pub app_id: String,
     pub ip_address: String,
@@ -26,14 +26,14 @@ pub struct TcpFront {
 }
 
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable,RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct Instance {
     pub app_id: String,
     pub ip_address: String,
     pub port: u16
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpProxyConfiguration {
     pub front_timeout: u64,
     pub back_timeout:  u64,
@@ -41,7 +41,7 @@ pub struct HttpProxyConfiguration {
     pub answer_503:    String,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize)]
 pub enum Command {
     AddHttpFront(HttpFront),
     RemoveHttpFront(HttpFront),
@@ -74,45 +74,104 @@ impl Command {
   }
 }
 
-impl Decodable for Command {
-  fn decode<D: Decoder>(decoder: &mut D) -> Result<Command, D::Error> {
-    decoder.read_struct("root", 0, |decoder| {
-      let command_type: String = try!(decoder.read_struct_field("type", 0, |decoder| Decodable::decode(decoder)));
+enum CommandField {
+  Type,
+  Data,
+}
 
-      if &command_type == "ADD_HTTP_FRONT" {
-        let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
-        Ok(Command::AddHttpFront(acl))
-      } else if &command_type == "REMOVE_HTTP_FRONT" {
-        let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
-        Ok(Command::RemoveHttpFront(acl))
-      } else if &command_type == "ADD_TLS_FRONT" {
-        let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
-        Ok(Command::AddTlsFront(acl))
-      } else if &command_type == "REMOVE_TLS_FRONT" {
-        let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
-        Ok(Command::RemoveTlsFront(acl))
-      } else if &command_type == "ADD_TCP_FRONT" {
-        let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
-        Ok(Command::AddTcpFront(acl))
-      } else if &command_type == "REMOVE_TCP_FRONT" {
-        let acl = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
-        Ok(Command::RemoveTcpFront(acl))
-      } else if &command_type == "ADD_INSTANCE" {
-        let instance = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
-        Ok(Command::AddInstance(instance))
-      } else if &command_type == "REMOVE_INSTANCE" {
-        let instance = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
-        Ok(Command::RemoveInstance(instance))
-      } else if &command_type == "CONFIGURE_HTTP_PROXY" {
-        let conf = try!(decoder.read_struct_field("data", 0, |decoder| Decodable::decode(decoder)));
-        Ok(Command::HttpProxy(conf))
-      } else {
-        Err(decoder.error("unrecognized command"))
+
+impl serde::Deserialize for CommandField {
+  fn deserialize<D>(deserializer: &mut D) -> Result<CommandField, D::Error>
+        where D: serde::de::Deserializer {
+    struct CommandFieldVisitor;
+    impl serde::de::Visitor for CommandFieldVisitor {
+      type Value = CommandField;
+
+      fn visit_str<E>(&mut self, value: &str) -> Result<CommandField, E>
+        where E: serde::de::Error {
+        match value {
+          "type" => Ok(CommandField::Type),
+          "data" => Ok(CommandField::Data),
+          _ => Err(serde::de::Error::custom("expected type or data")),
+        }
       }
-    })
+    }
+
+    deserializer.deserialize(CommandFieldVisitor)
   }
 }
 
+struct CommandVisitor;
+impl serde::de::Visitor for CommandVisitor {
+  type Value = Command;
+
+  fn visit_map<V>(&mut self, mut visitor: V) -> Result<Command, V::Error>
+        where V: serde::de::MapVisitor {
+    let mut command_type:Option<String>    = None;
+    let mut data:Option<serde_json::Value> = None;
+
+    loop {
+      match try!(visitor.visit_key()) {
+        Some(CommandField::Type) => { command_type = Some(try!(visitor.visit_value())); }
+        Some(CommandField::Data) => { data = Some(try!(visitor.visit_value())); }
+        None => { break; }
+      }
+    }
+
+    println!("decoded type = {:?}, value= {:?}", command_type, data);
+    let command_type = match command_type {
+      Some(command) => command,
+      None => try!(visitor.missing_field("type")),
+    };
+    let data = match data {
+      Some(data) => data,
+      None => try!(visitor.missing_field("data")),
+    };
+
+    try!(visitor.end());
+
+    if &command_type == "ADD_HTTP_FRONT" {
+      let res = serde_json::from_value(data).or(Err(serde::de::Error::custom("add_http_front")));
+      println!("ADD_HTTP_FRONT => {:?}", res);
+      let acl = try!(res);
+      Ok(Command::AddHttpFront(acl))
+    } else if &command_type == "REMOVE_HTTP_FRONT" {
+      let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("remove_http_front"))));
+      Ok(Command::RemoveHttpFront(acl))
+    } else if &command_type == "ADD_TLS_FRONT" {
+      let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("add_tls_front"))));
+      Ok(Command::AddTlsFront(acl))
+    } else if &command_type == "REMOVE_TLS_FRONT" {
+      let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("remove_tls_front"))));
+      Ok(Command::RemoveTlsFront(acl))
+    } else if &command_type == "ADD_TCP_FRONT" {
+      let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("add_tcp_front"))));
+      Ok(Command::AddTcpFront(acl))
+    } else if &command_type == "REMOVE_TCP_FRONT" {
+      let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("remove_tcp_front"))));
+      Ok(Command::RemoveTcpFront(acl))
+    } else if &command_type == "ADD_INSTANCE" {
+      let instance = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("add_instance"))));
+      Ok(Command::AddInstance(instance))
+    } else if &command_type == "REMOVE_INSTANCE" {
+      let instance = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("remove_instance"))));
+      Ok(Command::RemoveInstance(instance))
+    } else if &command_type == "CONFIGURE_HTTP_PROXY" {
+      let conf = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("configure_http_proxy"))));
+      Ok(Command::HttpProxy(conf))
+    } else {
+      Err(serde::de::Error::custom("unrecognized command"))
+    }
+  }
+}
+
+impl serde::Deserialize for Command {
+  fn deserialize<D>(deserializer: &mut D) -> Result<Command, D::Error>
+        where D: serde::de::Deserializer {
+    static FIELDS: &'static [&'static str] = &["type", "data"];
+    deserializer.deserialize_struct("Command", FIELDS, CommandVisitor)
+  }
+}
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub enum Topic {
@@ -121,15 +180,16 @@ pub enum Topic {
     TcpProxyConfig
 }
 
+
 #[cfg(test)]
 mod tests {
   use super::*;
-  use rustc_serialize::json;
+  use serde_json;
 
   #[test]
   fn add_acl_test() {
     let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}}"#;
-    let command: Command = json::decode(raw_json).unwrap();
+    let command: Command = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", command);
     assert!(command == Command::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
@@ -141,7 +201,7 @@ mod tests {
   #[test]
   fn remove_acl_test() {
     let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}}"#;
-    let command: Command = json::decode(raw_json).unwrap();
+    let command: Command = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", command);
     assert!(command == Command::RemoveHttpFront(HttpFront{
       app_id: String::from("xxx"),
@@ -154,7 +214,7 @@ mod tests {
   #[test]
   fn add_instance_test() {
     let raw_json = r#"{"type": "ADD_INSTANCE", "data": {"app_id": "xxx", "ip_address": "yyy", "port": 8080}}"#;
-    let command: Command = json::decode(raw_json).unwrap();
+    let command: Command = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", command);
     assert!(command == Command::AddInstance(Instance{
       app_id: String::from("xxx"),
@@ -166,7 +226,7 @@ mod tests {
   #[test]
   fn remove_instance_test() {
     let raw_json = r#"{"type": "REMOVE_INSTANCE", "data": {"app_id": "xxx", "ip_address": "yyy", "port": 8080}}"#;
-    let command: Command = json::decode(raw_json).unwrap();
+    let command: Command = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", command);
     assert!(command == Command::RemoveInstance(Instance{
       app_id: String::from("xxx"),
@@ -178,7 +238,7 @@ mod tests {
   #[test]
   fn http_front_crash_test() {
     let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "aa", "hostname": "cltdl.fr", "path_begin": ""}}"#;
-    let command: Command = json::decode(raw_json).unwrap();
+    let command: Command = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", command);
     assert!(command == Command::AddHttpFront(HttpFront{
       app_id: String::from("aa"),
@@ -190,7 +250,7 @@ mod tests {
   #[test]
   fn http_front_crash_test2() {
     let raw_json = r#"{"app_id": "aa", "hostname": "cltdl.fr", "path_begin": ""}"#;
-    let front: HttpFront = json::decode(raw_json).unwrap();
+    let front: HttpFront = serde_json::from_str(raw_json).unwrap();
     println!("{:?}",front);
     assert!(front == HttpFront{
       app_id: String::from("aa"),
@@ -199,3 +259,4 @@ mod tests {
     });
   }
 }
+

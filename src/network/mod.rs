@@ -20,7 +20,7 @@ use messages::Command;
 
 pub type MessageId = String;
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct ServerMessage {
   pub id:      MessageId,
   pub message: ServerMessageType,
@@ -32,7 +32,7 @@ impl fmt::Display for ServerMessage {
   }
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub enum ServerMessageType {
   AddedFront,
   RemovedFront,
