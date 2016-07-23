@@ -40,6 +40,10 @@ impl Buffer {
     self.capacity - self.end
   }
 
+  pub fn capacity(&self) -> usize {
+    self.capacity
+  }
+
   pub fn consume(&mut self, count: usize) -> usize {
     let cnt        = cmp::min(count, self.available_data());
     self.position += cnt;

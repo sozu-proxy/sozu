@@ -344,6 +344,14 @@ impl serde::Deserialize for ConfigMessage {
   }
 }
 
+#[derive(Debug,PartialEq)]
+pub enum ConnReadError {
+  Continue,
+  FullBufferError,
+  ParseError,
+  SocketError,
+}
+
 struct CommandClient {
   sock:        UnixStream,
   buf:         Buffer,
@@ -385,7 +393,7 @@ impl CommandClient {
     event_loop.register(&self.sock, tok, interest, PollOpt::edge() | PollOpt::oneshot());
   }
 
-  fn conn_readable(&mut self, event_loop: &mut EventLoop<CommandServer>, tok: Token) -> Option<Vec<ConfigMessage>>{
+  fn conn_readable(&mut self, event_loop: &mut EventLoop<CommandServer>, tok: Token) -> Result<Vec<ConfigMessage>,ConnReadError>{
     trace!("server conn readable; tok={:?}", tok);
     loop {
       let size = self.buf.available_space();
@@ -404,7 +412,7 @@ impl CommandClient {
             },
             code => {
               log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error (kind: {:?}): {:?}", tok.as_usize(), code, e);
-              return None;
+              return Err(ConnReadError::SocketError);
             }
           }
         },
@@ -415,23 +423,27 @@ impl CommandClient {
       };
     }
 
-    let mut res: Option<Vec<ConfigMessage>> = None;
+    let mut res: Result<Vec<ConfigMessage>,ConnReadError> = Err(ConnReadError::Continue);
     let mut offset = 0usize;
     match parse(self.buf.data()) {
       IResult::Incomplete(_) => {
         if self.buf.available_space() == 0 {
           log!(log::LogLevel::Error, "UNIX CLIENT[{}] buffer full, but not enough data: {:?}", tok.as_usize(), from_utf8(self.buf.data()));
-          return None;
+          return Err(ConnReadError::FullBufferError);
         }
-        return Some(Vec::new());
+        return Ok(Vec::new());
       },
       IResult::Error(e)      => {
         log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error: {:?}", tok.as_usize(), e);
-        return None;
+        return Err(ConnReadError::ParseError);
       },
       IResult::Done(i, v)    => {
+        if self.buf.available_data() == i.len() && v.len() == 0 {
+          log!(log::LogLevel::Error, "UNIX CLIENT[{}] buffer full, cannot parse", tok.as_usize());
+          return Err(ConnReadError::FullBufferError);
+        }
         offset = self.buf.data().offset(i);
-        res = Some(v);
+        res = Ok(v);
       }
     }
     debug!("parsed {} bytes, result: {:?}", offset, res);
@@ -589,8 +601,20 @@ impl Handler for CommandServer {
         _      => {
           if self.conns.contains(token) {
             let opt_v = self.conns[token].conn_readable(event_loop, token);
-            if let Some(v) = opt_v {
-              self.dispatch(token, v);
+            match opt_v {
+              Ok(v) => self.dispatch(token, v),
+              Err(ConnReadError::Continue) => {},
+              Err(ConnReadError::ParseError) | Err(ConnReadError::SocketError) => {
+                event_loop.deregister(&self.conns[token].sock);
+                self.conns.remove(token);
+                trace!("closed client [{}]", token.as_usize());
+              }
+              Err(ConnReadError::FullBufferError) => {
+                //FIXME: automatically growing by 5kB every time may not be the best idea
+                let new_size = self.conns[token].buf.capacity()+5000;
+                log!(log::LogLevel::Error, "buffer not large enough, growing to {}", new_size);
+                self.conns[token].buf.grow(new_size);
+              }
             }
           }
         }
