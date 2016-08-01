@@ -22,6 +22,15 @@ impl Buffer {
     }
   }
 
+  pub fn from_slice(sl: &[u8]) -> Buffer {
+    Buffer {
+      memory:   Vec::from(sl),
+      capacity: sl.len(),
+      position: 0,
+      end:      sl.len()
+    }
+  }
+
   pub fn grow(&mut self, new_size: usize) -> bool {
     if self.capacity >= new_size {
       return false;
