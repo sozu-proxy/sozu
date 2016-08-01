@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::fmt;
 
 pub mod buffer;
+pub mod buffer_queue;
 #[macro_use] pub mod metrics;
 pub mod socket;
 pub mod http;
