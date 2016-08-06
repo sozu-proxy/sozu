@@ -3,7 +3,7 @@ use std::io::{self,Write,Read};
 use std::iter::repeat;
 use pool::Reset;
 
-#[derive(Debug,PartialEq)]
+#[derive(Debug,PartialEq,Clone)]
 pub struct Buffer {
   memory:   Vec<u8>,
   capacity: usize,

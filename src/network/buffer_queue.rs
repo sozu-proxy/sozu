@@ -2,6 +2,7 @@ use network::buffer::Buffer;
 use pool::Reset;
 use std::io::{self,Write};
 use nom::HexDisplay;
+use std::cmp::max;
 
 #[derive(Debug,PartialEq,Clone)]
 pub enum InputElement {
@@ -105,7 +106,11 @@ impl BufferQueue {
 
   pub fn unparsed_data(&self) -> &[u8] {
     let largest_size = self.merge_input_slices();
-    &self.buffer.data()[..largest_size]
+    if largest_size == 0 {
+      return &self.buffer.data()[0..0];
+    }
+    let end = max(self.buffer.data().len(), self.parsed_position+largest_size);
+    &self.buffer.data()[self.parsed_position..end]
   }
 
   /// should only be called with a count inferior to self.input_data_size()
@@ -348,6 +353,9 @@ mod tests {
     assert_eq!(b.parsed_position, 4);
     assert_eq!(b.start_parsing_position, 4);
     assert_eq!(b.input_queue, vec!(InputElement::Slice(6)));
+    println!("TEST[{}]", line!());
+    assert_eq!(b.unparsed_data(), &b"EFGHIJ"[..]);
+    println!("TEST[{}]", line!());
 
     b.slice_output(4);
     assert_eq!(b.output_queue, vec!(OutputElement::Slice(4)));
@@ -363,10 +371,15 @@ mod tests {
     b.consume_output_data(2);
     assert_eq!(b.next_output_data(), &b"CD"[..]);
 
+    println!("TEST[{}]", line!());
     b.consume_parsed_data(8);
     assert_eq!(b.parsed_position, 10);
     assert_eq!(b.start_parsing_position, 12);
     assert_eq!(b.input_queue, vec!());
+
+    println!("TEST[{}]", line!());
+    assert_eq!(b.unparsed_data(), &b""[..]);
+    println!("TEST[{}]", line!());
 
     println!("**test**");
     b.consume_output_data(2);
