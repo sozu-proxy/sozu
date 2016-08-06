@@ -8,7 +8,7 @@ use std::io::{self,Read,Write,ErrorKind};
 use mio::*;
 use bytes::{ByteBuf,MutByteBuf};
 use bytes::buf::MutBuf;
-use pool::{Pool,Checkout};
+use pool::{Pool,Checkout,Reset};
 use std::collections::HashMap;
 use std::error::Error;
 use mio::util::Slab;
@@ -20,6 +20,7 @@ use uuid::Uuid;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use network::buffer::Buffer;
+use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult};
 
 use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop, BufferMove, RequestState, ResponseState, Chunk};
@@ -47,8 +48,8 @@ pub struct Client<Front:SocketHandler> {
   status:         ClientStatus,
 
   state:              HttpState,
-  front_buf:          Checkout<Buffer>,
-  back_buf:           Checkout<Buffer>,
+  front_buf:          Checkout<BufferQueue>,
+  back_buf:           Checkout<BufferQueue>,
   front_buf_position: usize,
   back_buf_position:  usize,
   start:              u64,
@@ -60,7 +61,7 @@ pub struct Client<Front:SocketHandler> {
 }
 
 impl<Front:SocketHandler> Client<Front> {
-  pub fn new(server_context: &str, sock: Front, front_buf: Checkout<Buffer>, back_buf: Checkout<Buffer>) -> Option<Client<Front>> {
+  pub fn new(server_context: &str, sock: Front, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>) -> Option<Client<Front>> {
     Some(Client {
       frontend:       sock,
       backend:        None,
@@ -537,7 +538,7 @@ pub struct ServerConfiguration {
   instances: HashMap<AppId, Vec<Backend>>,
   fronts:    HashMap<Hostname, Vec<HttpFront>>,
   tx:        mpsc::Sender<ServerMessage>,
-  pool:      Pool<Buffer>,
+  pool:      Pool<BufferQueue>,
   answers:   DefaultAnswers,
   front_timeout:   u64,
   back_timeout:    u64,
@@ -554,7 +555,7 @@ impl ServerConfiguration {
           instances: HashMap::new(),
           fronts:    HashMap::new(),
           tx:        tx,
-          pool:      Pool::with_capacity(2*max_connections, 0, || Buffer::with_capacity(buffer_size)),
+          pool:      Pool::with_capacity(2*max_connections, 0, || BufferQueue::with_capacity(buffer_size)),
           front_timeout: 50000,
           back_timeout:  50000,
           answers:   DefaultAnswers {
@@ -815,7 +816,7 @@ mod tests {
   use std::time::Duration;
   use messages::{Command,HttpFront,Instance};
   use network::{ProxyOrder,ServerMessage};
-  use network::buffer::Buffer;
+  use network::buffer_queue::BufferQueue;
   use pool::Pool;
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
@@ -911,7 +912,7 @@ mod tests {
       instances: HashMap::new(),
       fronts:    fronts,
       tx:        tx,
-      pool:      Pool::with_capacity(1,0, || Buffer::with_capacity(12000)),
+      pool:      Pool::with_capacity(1,0, || BufferQueue::with_capacity(12000)),
       front_timeout: 50000,
       back_timeout:  50000,
       answers:   DefaultAnswers {

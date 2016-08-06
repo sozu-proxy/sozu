@@ -29,6 +29,7 @@ use openssl::crypto::pkey::PKey;
 
 use parser::http11::{HttpState,RequestState,ResponseState,parse_request_until_stop};
 use network::buffer::Buffer;
+use network::buffer_queue::BufferQueue;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder};
 use network::proxy::{Server,ProxyConfiguration,ProxyClient};
 use messages::{Command,TlsFront};
@@ -48,7 +49,7 @@ pub struct ServerConfiguration {
   default_context: SslContext,
   contexts:        Rc<RefCell<HashMap<String, SslContext>>>,
   tx:              mpsc::Sender<ServerMessage>,
-  pool:            Pool<Buffer>,
+  pool:            Pool<BufferQueue>,
   answers:         DefaultAnswers,
   front_timeout:   u64,
   back_timeout:    u64,
@@ -113,7 +114,7 @@ impl ServerConfiguration {
           default_context: context,
           contexts:        rc_ctx,
           tx:              tx,
-          pool:            Pool::with_capacity(2*max_connections, 0, || Buffer::with_capacity(buffer_size)),
+          pool:            Pool::with_capacity(2*max_connections, 0, || BufferQueue::with_capacity(buffer_size)),
           front_timeout:   50000,
           back_timeout:    50000,
           answers:         DefaultAnswers {
@@ -428,6 +429,7 @@ mod tests {
   use mio::util::Slab;
   use pool::Pool;
   use network::buffer::Buffer;
+  use network::buffer_queue::BufferQueue;
   use network::{ProxyOrder,ServerMessage};
   use network::http::DefaultAnswers;
   use openssl::ssl::{SslContext, SslMethod, Ssl, NonblockingSslStream, ServerNameCallback, ServerNameCallbackData};
@@ -546,7 +548,7 @@ mod tests {
       default_context: context,
       contexts: rc_ctx,
       tx:        tx,
-      pool:      Pool::with_capacity(1, 0, || Buffer::with_capacity(12000)),
+      pool:      Pool::with_capacity(1, 0, || BufferQueue::with_capacity(12000)),
       front_timeout: 50000,
       back_timeout:  50000,
       answers:   DefaultAnswers {
