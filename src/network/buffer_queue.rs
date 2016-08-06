@@ -1,40 +1,22 @@
 use network::buffer::Buffer;
+use pool::Reset;
+use std::io::{self,Write};
+use nom::HexDisplay;
 
-#[derive(Debug,PartialEq)]
-pub enum Element {
-  /// start, end in the stream
-  Slice(usize, usize),
-  Insert(Vec<u8>),
-  // Splice(usize) // should copy x bytes in kernel
+#[derive(Debug,PartialEq,Clone)]
+pub enum InputElement {
+  /// length in the stream
+  Slice(usize),
+  Splice(usize), // x bytes copied in kernel
 }
 
-impl Element {
-  pub fn consume(&self, size: usize) -> (usize,Option<Element>) {
-    println!("consuming {} bytes of {:?}", size, self);
-    match *self {
-      Element::Slice(begin, end) => {
-        if size >= end - begin {
-          (size - (end - begin), None)
-        } else {
-          (0, Some(Element::Slice(begin + size, end)))
-        }
-      },
-      Element::Insert(ref v)     => {
-        if size >= v.len() {
-          (size - v.len(), None)
-        } else {
-          (0, Some(Element::Insert(Vec::from(&v[size..]))))
-        }
-      }
-    }
-  }
-
-  pub fn available_data(&self) -> usize {
-    match self {
-      &Element::Slice(begin, end) => end - begin,
-      &Element::Insert(ref data)  => data.len(),
-    }
-  }
+#[derive(Debug,PartialEq,Clone)]
+pub enum OutputElement {
+  /// length in the stream
+  Slice(usize),
+  Delete(usize),
+  Insert(Vec<u8>),
+  Splice(usize), // should copy x bytes from kernel to socket
 }
 
 /// The BufferQueue has two roles: holding incoming data, and indicating
@@ -51,108 +33,295 @@ impl Element {
 /// a Slice(begin, end) would point to buffer.data()[begin-position..end-position]
 /// (in the easiest case)
 ///
+/// unparsed_position is the index in the stream of data that was
+/// not parsed yet
+///
 /// The buffer's available data may be smaller than `end - begin`.
 /// It can happen if the parser indicated we need to copy more data than is available,
 /// like with a content length
 ///
 /// should the buffer queue indicate how much data it needs?
-#[derive(Debug,PartialEq)]
+//#[derive(Debug,PartialEq,Clone)]
 pub struct BufferQueue {
-  pub position:  usize,
-  pub buffer:    Buffer,
-  pub queue:     Vec<Element>,
+  /// position of buffer start in stream
+  pub buffer_position:        usize,
+  pub parsed_position:        usize,
+  pub output_position:        usize,
+  pub start_parsing_position: usize,
+  pub buffer:                 Buffer,
+  /// Vec<(start, length)>
+  pub input_queue:            Vec<InputElement>,
+  pub output_queue:           Vec<OutputElement>,
 }
 
 impl BufferQueue {
-  pub fn available_data(&self) -> usize {
-    self.queue.iter().fold(0, |acc, ref el| acc + el.available_data())
+  pub fn with_capacity(capacity: usize) -> BufferQueue {
+    BufferQueue {
+      buffer_position:        0,
+      parsed_position:        0,
+      output_position:        0,
+      start_parsing_position: 0,
+      buffer:                 Buffer::with_capacity(capacity),
+      input_queue:            Vec::with_capacity(8),
+      output_queue:           Vec::with_capacity(8),
+    }
   }
 
-  //FIXME: implement this
-  pub fn unparsed_data(&self) {}
-  //FIXME: implement this
-  pub fn consumed_unparsed_data(&mut self) {}
-  //FIXME: implement this
-  pub fn needed_data(&self)  {}
-
-  pub fn next_buffer(&self) -> Option<&[u8]> {
-    self.queue.get(0).map(|el| {
-      match el {
-        &Element::Slice(begin, end) => self.calculate_slice(begin, end),
-        &Element::Insert(ref v)     => &v[..]
+  pub fn available_input_data(&self) -> usize {
+    self.input_queue.iter().fold(0, |acc, el| {
+      acc + match el {
+        &InputElement::Slice(sz) | &InputElement::Splice(sz) => sz
       }
     })
   }
 
-  /// begin should not be smaller than position
-  /// begin can be larger than position+buffer_available_size
-  /// end must be larger than begin
-  /// bufferqueue.position => position in the stream (may be larger than the underlying buffer)
-  /// buffer.position      => position in the buffer (no larger than buffer.capacity)
-  /// buffer.end           => end of available data in the buffer (no larger than buffer.capacity)
-  /// slice.begin          => position of slice beginning in the stream (larger or equal to bufferqueue.position,
-  ///                           can be larger than buffer position, end or capacity)
-  /// slice.end            => position of slice end in the stream (larger or equal to slice.begin,
-  ///                           can be larger than buffer position, end or capacity)
-  ///
-  ///  position in input stream or output stream (where do we count the insert?)
-  pub fn calculate_slice(&self, begin:usize, end: usize) -> &[u8] {
-    &self.buffer.data()[(begin - self.position)..(end - self.position)]
+  pub fn spliced_input(&mut self, count: usize) {
+    self.input_queue.push(InputElement::Splice(count));
   }
 
-  pub fn consume(&mut self, size: usize) {
+  pub fn merge_input_slices(&self) -> usize {
+    let mut acc = 0usize;
+    for el in self.input_queue.iter() {
+      match el {
+        &InputElement::Splice(_) => break,
+        &InputElement::Slice(sz) => acc += sz,
+      }
+    }
+
+    assert!(acc <= self.buffer.available_data(), "the merged input slices can't be larger than current data in buffer");
+    acc
+  }
+
+  pub fn input_data_size(&self) -> usize {
+    let mut acc = 0usize;
+    for el in self.input_queue.iter() {
+      match el {
+        &InputElement::Splice(sz) => acc += sz,
+        &InputElement::Slice(sz)  => acc += sz,
+      }
+    }
+    acc
+  }
+
+  pub fn unparsed_data(&self) -> &[u8] {
+    let largest_size = self.merge_input_slices();
+    &self.buffer.data()[..largest_size]
+  }
+
+  /// should only be called with a count inferior to self.input_data_size()
+  pub fn consume_parsed_data(&mut self, size: usize) {
+    //FIXME: to_consume must contain unparsed_position - parsed_position ?
     let mut to_consume = size;
-    let mut consumed   = 0;
     while to_consume > 0 {
-      let new_first_element = match self.queue.first() {
+      let new_first_element = match self.input_queue.first() {
+        None => {
+          //assert!(to_consume == 0, "no more element in queue, we should not ask to consume {} more bytes", to_consume);
+          break;
+        },
+        Some(&InputElement::Slice(sz)) => {
+          if to_consume >= sz {
+            to_consume -= sz;
+            None
+          } else {
+            let new_element = InputElement::Slice(sz - to_consume);
+            to_consume = 0;
+            Some(new_element)
+          }
+        },
+        Some(&InputElement::Splice(sz)) => {
+          if to_consume >= sz {
+            to_consume -= sz;
+            None
+          } else {
+            panic!("we should not start parsing from inside a splicing buffer. But what if consume_parsed_data was called during a parsing loop? Should only call consume_parsed_data after the parsing loop finished");
+          }
+        },
+      };
+
+      match new_first_element {
+        None     => { self.input_queue.remove(0); },
+        Some(el) => { self.input_queue[0] = el; },
+      };
+    }
+
+    self.parsed_position        += size - to_consume;
+    self.start_parsing_position += size;
+  }
+
+
+  pub fn slice_output(&mut self, count: usize) {
+    self.output_queue.push(OutputElement::Slice(count));
+  }
+
+  pub fn delete_output(&mut self, count: usize) {
+    self.output_queue.push(OutputElement::Delete(count));
+  }
+
+  pub fn splice_output(&mut self, count: usize) {
+    self.output_queue.push(OutputElement::Splice(count));
+  }
+
+  pub fn insert_output(&mut self, v: Vec<u8>) {
+    self.output_queue.push(OutputElement::Insert(v));
+  }
+
+  pub fn output_data_size(&self) -> usize {
+    let mut acc = 0usize;
+    for el in self.output_queue.iter() {
+      match el {
+        &OutputElement::Splice(sz)    => acc += sz,
+        &OutputElement::Slice(sz)     => acc += sz,
+        &OutputElement::Insert(ref v) => acc += v.len(),
+        &OutputElement::Delete(_)     => {},
+      }
+    }
+    acc
+  }
+
+  pub fn merge_output_slices(&self) -> usize {
+    let mut acc = 0usize;
+    for el in self.output_queue.iter() {
+      match el {
+        &OutputElement::Slice(sz) => acc += sz,
+        _ => break,
+      }
+    }
+
+    assert!(acc <= self.buffer.available_data(), "the merged output slices can't be larger than current data in buffer");
+    acc
+  }
+
+  pub fn merge_output_deletes(&self) -> usize {
+    let mut acc = 0usize;
+    for el in self.output_queue.iter() {
+      match el {
+        &OutputElement::Delete(sz) => acc += sz,
+        _ => break,
+      }
+    }
+
+    assert!(acc <= self.buffer.available_data(), "the merged output deletes can't be larger than current data in buffer");
+    acc
+  }
+
+
+  pub fn next_output_data(&self) -> &[u8] {
+    let mut it = self.output_queue.iter();
+    //first, calculate how many bytes we need to jump
+    let mut start         = 0usize;
+    let mut largest_size  = 0usize;
+    let mut delete_ended  = false;
+    for el in it {
+      println!("start={}, length={}, el = {:?}", start, largest_size, el);
+      if !delete_ended {
+        match el {
+          &OutputElement::Delete(sz) => start += sz,
+          _ => {
+            delete_ended = true;
+            match el {
+              &OutputElement::Slice(sz)     => largest_size += sz,
+              &OutputElement::Insert(ref v) => return &v[..],
+              _ => break,
+            }
+          },
+        }
+      } else {
+        match el {
+          &OutputElement::Slice(sz) => largest_size += sz,
+          _ => break,
+        }
+      }
+    }
+
+    println!("buffer data: {:?}", self.buffer.data());
+    println!("calculated start={}, length={}", start, largest_size);
+    &self.buffer.data()[start..start+largest_size]
+  }
+
+  /// should only be called with a count inferior to self.input_data_size()
+  pub fn consume_output_data(&mut self, size: usize) {
+    let mut to_consume = size;
+    while to_consume > 0 {
+      let new_first_element = match self.output_queue.first() {
         None => {
           assert!(to_consume == 0, "no more element in queue, we should not ask to consume {} more bytes", to_consume);
           break;
         },
-        Some(el) => match el {
-          &Element::Slice(begin, end) => {
-            if to_consume >= end - begin {
-              consumed  += end - begin;
-              to_consume = to_consume - (end - begin);
-              None
-            } else {
-              consumed += to_consume;
-              let new_element = Element::Slice(begin + to_consume, end);
-              to_consume = 0;
-              Some(new_element)
-            }
-          },
-          &Element::Insert(ref v)     => {
-            if to_consume >= v.len() {
-              to_consume = to_consume - v.len();
-              None
-            } else {
-              let new_element = Element::Insert(Vec::from(&v[to_consume..]));
-              to_consume = 0;
-              Some(new_element)
-            }
+        Some(&OutputElement::Slice(sz)) => {
+          self.buffer_position += to_consume;
+          self.buffer.consume(to_consume);
+
+          if to_consume >= sz {
+            to_consume -= sz;
+            None
+          } else {
+            let new_element = OutputElement::Slice(sz - to_consume);
+            to_consume = 0;
+            Some(new_element)
           }
-        }
+        },
+        Some(&OutputElement::Delete(sz)) => {
+          self.buffer_position += sz;
+          //FIXME: what if we can't delete that much data?
+          self.buffer.consume(sz);
+          None
+        },
+        Some(&OutputElement::Splice(sz)) => {
+          if to_consume >= sz {
+            to_consume -= sz;
+            None
+          } else {
+            let new_element = OutputElement::Splice(sz - to_consume);
+            to_consume = 0;
+            Some(new_element)
+          }
+        },
+        Some(&OutputElement::Insert(ref v)) => {
+          if to_consume >= v.len() {
+            to_consume = to_consume - v.len();
+            None
+          } else {
+            let new_element = OutputElement::Insert(Vec::from(&v[to_consume..]));
+            to_consume = 0;
+            Some(new_element)
+          }
+        },
       };
 
       match new_first_element {
-        None     => { self.queue.remove(0); },
-        // FIXME: do we test for the presence of the first element here?
-        Some(el) => { self.queue[0] = el; },
+        None     => { self.output_queue.remove(0); },
+        Some(el) => { self.output_queue[0] = el; },
       };
-    };
+    }
+  }
+}
 
-    println!("consumed: {}", consumed);
-    self.buffer.consume(consumed);
-    self.position += consumed;
+impl Write for BufferQueue {
+  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+    match self.buffer.write(buf) {
+      Err(e) => Err(e),
+      Ok(sz) => {
+        self.input_queue.push(InputElement::Slice(sz));
+        Ok(sz)
+      }
+    }
   }
 
-  pub fn next(&self) -> Option<&Element> {
-    self.queue.get(0)
+  fn flush(&mut self) -> io::Result<()> {
+    Ok(())
   }
+}
 
-  // FIXME: implement Write to get incoming data
-  pub fn write(&mut self, input: &[u8]) {}
+impl Reset for BufferQueue {
+  fn reset(&mut self) {
+    self.parsed_position = 0;
+    self.output_position = 0;
+    self.buffer_position = 0;
+    self.start_parsing_position = 0;
+    self.buffer.reset();
+    self.input_queue.clear();
+    self.output_queue.clear();
+  }
 }
 
 #[cfg(test)]
@@ -160,52 +329,81 @@ mod tests {
   use super::*;
   use network::buffer::Buffer;
   use nom::HexDisplay;
+  use std::io::Write;
 
   #[test]
   fn consume() {
     let mut b = BufferQueue {
-      position: 0,
-      buffer:   Buffer::from_slice(b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"),
-      queue:    vec!(
-        Element::Slice(0, 3),
-        Element::Insert(Vec::from(&b"test"[..])),
-        Element::Slice(5, 10)
-      )
+      parsed_position:        0,
+      output_position:        0,
+      buffer_position:        0,
+      start_parsing_position: 0,
+      buffer:                 Buffer::from_slice(b"ABCDEFGHIJ"),
+      input_queue:            vec!(InputElement::Slice(10)),
+      output_queue:           vec!()
     };
 
-    assert_eq!(b.next_buffer(), Some(&b"ABC"[..]));
-    b.consume(3);
-    assert_eq!(b.position, 3);
-    assert_eq!(b.queue, vec!(
-        Element::Insert(Vec::from(&b"test"[..])),
-        Element::Slice(5, 10))
+    assert_eq!(b.unparsed_data(), &b"ABCDEFGHIJ"[..]);
+    b.consume_parsed_data(4);
+    assert_eq!(b.parsed_position, 4);
+    assert_eq!(b.start_parsing_position, 4);
+    assert_eq!(b.input_queue, vec!(InputElement::Slice(6)));
+
+    b.slice_output(4);
+    assert_eq!(b.output_queue, vec!(OutputElement::Slice(4)));
+
+    b.insert_output(Vec::from(&b"test"[..]));
+    assert_eq!(b.output_queue, vec!(
+        OutputElement::Slice(4),
+        OutputElement::Insert(Vec::from(&b"test"[..]))
+      )
+    );
+    assert_eq!(b.next_output_data(), &b"ABCD"[..]);
+
+    b.consume_output_data(2);
+    assert_eq!(b.next_output_data(), &b"CD"[..]);
+
+    b.consume_parsed_data(8);
+    assert_eq!(b.parsed_position, 10);
+    assert_eq!(b.start_parsing_position, 12);
+    assert_eq!(b.input_queue, vec!());
+
+    println!("**test**");
+    b.consume_output_data(2);
+    assert_eq!(b.next_output_data(), &b"test"[..]);
+    b.consume_output_data(2);
+    assert_eq!(b.next_output_data(), &b"st"[..]);
+
+    b.delete_output(2);
+    b.slice_output(4);
+    assert_eq!(
+      b.output_queue,
+      vec!(
+        OutputElement::Insert(Vec::from(&b"st"[..])),
+        OutputElement::Delete(2),
+        OutputElement::Slice(4)
+      )
     );
 
-    assert_eq!(b.next_buffer(), Some(&b"test"[..]));
-    b.consume(2);
-    assert_eq!(b.position, 3);
-    assert_eq!(b.queue, vec!(
-        Element::Insert(Vec::from(&b"st"[..])),
-        Element::Slice(5, 10))
+    b.consume_output_data(2);
+    assert_eq!(
+      b.output_queue,
+      vec!(
+        OutputElement::Delete(2),
+        OutputElement::Slice(4)
+      )
     );
+    assert_eq!(b.next_output_data(), &b"GHIJ"[..]);
 
-    assert_eq!(b.next_buffer(), Some(&b"st"[..]));
-    b.consume(2);
-    assert_eq!(b.position, 3);
-    assert_eq!(b.queue, vec!(
-        Element::Slice(5, 10))
+    b.consume_output_data(1);
+    assert_eq!(
+      b.output_queue,
+      vec!(
+        OutputElement::Slice(3)
+      )
     );
+    assert_eq!(b.next_output_data(), &b"HIJ"[..]);
 
-    assert_eq!(b.next_buffer(), Some(&b"FGHIJ"[..]));
-    b.consume(2);
-    assert_eq!(b.position, 5);
-    assert_eq!(b.queue, vec!(Element::Slice(7, 10)));
-
-    assert_eq!(b.next_buffer(), Some(&b"HIJ"[..]));
-    b.consume(3);
-    assert_eq!(b.position, 8);
-    assert_eq!(b.queue, vec!());
-
-    assert_eq!(b.next_buffer(), None);
+    b.write(&b"KLMNOP"[..]);
   }
 }
