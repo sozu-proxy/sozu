@@ -370,7 +370,9 @@ impl Write for BufferQueue {
     match self.buffer.write(buf) {
       Err(e) => Err(e),
       Ok(sz) => {
-        self.input_queue.push(InputElement::Slice(sz));
+        if sz > 0 {
+          self.input_queue.push(InputElement::Slice(sz));
+        }
         Ok(sz)
       }
     }
