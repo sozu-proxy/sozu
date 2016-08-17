@@ -315,14 +315,16 @@ impl BufferQueue {
           break;
         },
         Some(&OutputElement::Slice(sz)) => {
-          self.buffer_position += to_consume;
-          self.buffer.consume(to_consume);
 
           if to_consume >= sz {
             to_consume -= sz;
+            self.buffer_position += sz;
+            self.buffer.consume(sz);
             None
           } else {
             let new_element = OutputElement::Slice(sz - to_consume);
+            self.buffer_position += to_consume;
+            self.buffer.consume(to_consume);
             to_consume = 0;
             Some(new_element)
           }
