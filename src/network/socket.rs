@@ -3,7 +3,7 @@ use mio::tcp::TcpStream;
 use openssl::ssl::NonblockingSslStream;
 use openssl::ssl::error::{NonblockingSslError,SslError};
 
-#[derive(Debug)]
+#[derive(Debug,PartialEq,Copy,Clone)]
 pub enum SocketResult {
   Continue,
   WouldBlock,
