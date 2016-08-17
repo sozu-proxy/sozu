@@ -139,8 +139,8 @@ impl BufferQueue {
       return &self.buffer.data()[0..0];
     }
     //println!("available buffer data: {}, buffer position: {}, parsed_position: {}, start: {}, merged slices size: {}",
-      self.buffer.available_data(), self.buffer_position,
-    self.parsed_position, start, largest_size);
+    //  self.buffer.available_data(), self.buffer_position,
+    //self.parsed_position, start, largest_size);
     let end = max(self.buffer.available_data(), start+largest_size);
     &self.buffer.data()[start..end]
   }
