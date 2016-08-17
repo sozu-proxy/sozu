@@ -2,7 +2,7 @@ use network::buffer::Buffer;
 use pool::Reset;
 use std::io::{self,Write};
 use nom::HexDisplay;
-use std::cmp::max;
+use std::cmp::{min,max};
 
 #[derive(Debug,PartialEq,Clone)]
 pub enum InputElement {
@@ -42,7 +42,7 @@ pub enum OutputElement {
 /// like with a content length
 ///
 /// should the buffer queue indicate how much data it needs?
-//#[derive(Debug,PartialEq,Clone)]
+#[derive(Debug,PartialEq,Clone)]
 pub struct BufferQueue {
   /// position of buffer start in stream
   pub buffer_position:        usize,
@@ -76,8 +76,35 @@ impl BufferQueue {
     })
   }
 
+  pub fn sliced_input(&mut self, count: usize) {
+    let needed = self.start_parsing_position - self.parsed_position;
+    if needed > 0 {
+      if count >= needed {
+        self.parsed_position = self.start_parsing_position;
+        self.slice_output(needed);
+      } else {
+        self.parsed_position += count;
+        self.slice_output(count);
+      }
+    } else {
+      if count > 0 {
+        self.input_queue.push(InputElement::Slice(count));
+      }
+    }
+    //println!("sliced_input: buffer size: {}, parsed_position: {} start_parsing_position: {}, input_queue: {:?}, output_queue: {:?}",
+    //  self.buffer.available_data(), self.parsed_position, self.start_parsing_position,
+    //  self.input_queue, self.output_queue);
+  }
+
   pub fn spliced_input(&mut self, count: usize) {
-    self.input_queue.push(InputElement::Splice(count));
+    //FIXME: do the same thing with needed data as in sliced_input
+    if count >0 {
+      self.input_queue.push(InputElement::Splice(count));
+    }
+  }
+
+  pub fn needs_input(&self) -> bool {
+    self.start_parsing_position > self.parsed_position
   }
 
   pub fn merge_input_slices(&self) -> usize {
@@ -106,11 +133,16 @@ impl BufferQueue {
 
   pub fn unparsed_data(&self) -> &[u8] {
     let largest_size = self.merge_input_slices();
-    if largest_size == 0 {
+    //println!("buffer: {}, parsed: {}", self.buffer_position, self.parsed_position);
+    let start = self.parsed_position - self.buffer_position;
+    if largest_size == 0 || start >= self.buffer.available_data() {
       return &self.buffer.data()[0..0];
     }
-    let end = max(self.buffer.data().len(), self.parsed_position+largest_size);
-    &self.buffer.data()[self.parsed_position..end]
+    //println!("available buffer data: {}, buffer position: {}, parsed_position: {}, start: {}, merged slices size: {}",
+      self.buffer.available_data(), self.buffer_position,
+    self.parsed_position, start, largest_size);
+    let end = max(self.buffer.available_data(), start+largest_size);
+    &self.buffer.data()[start..end]
   }
 
   /// should only be called with a count inferior to self.input_data_size()
@@ -170,14 +202,35 @@ impl BufferQueue {
     self.output_queue.push(OutputElement::Insert(v));
   }
 
+  pub fn has_output_data(&self) -> bool {
+    self.output_queue.len() > 0
+  }
+
   pub fn output_data_size(&self) -> usize {
     let mut acc = 0usize;
+    let mut available_buffer_size = self.buffer.available_data();
+
     for el in self.output_queue.iter() {
       match el {
         &OutputElement::Splice(sz)    => acc += sz,
-        &OutputElement::Slice(sz)     => acc += sz,
+        &OutputElement::Slice(sz)     => {
+          if available_buffer_size >= sz {
+            acc += sz;
+            available_buffer_size -= sz;
+          } else {
+            let advance = sz - available_buffer_size;
+            acc += advance;
+            return acc;
+          }
+        },
         &OutputElement::Insert(ref v) => acc += v.len(),
-        &OutputElement::Delete(_)     => {},
+        &OutputElement::Delete(sz)    => {
+          if available_buffer_size >=sz {
+            available_buffer_size -= sz;
+          } else {
+            return acc;
+          }
+        },
       }
     }
     acc
@@ -216,8 +269,10 @@ impl BufferQueue {
     let mut start         = 0usize;
     let mut largest_size  = 0usize;
     let mut delete_ended  = false;
+    let mut available_buffer_size = self.buffer.available_data();
+    //println!("NEXT OUTPUT DATA:\nqueue:\n{:?}\nbuffer:\n{}", self.output_queue, self.buffer.data().to_hex(16));
     for el in it {
-      println!("start={}, length={}, el = {:?}", start, largest_size, el);
+      //println!("start={}, length={}, el = {:?}", start, largest_size, el);
       if !delete_ended {
         match el {
           &OutputElement::Delete(sz) => start += sz,
@@ -238,9 +293,16 @@ impl BufferQueue {
       }
     }
 
-    println!("buffer data: {:?}", self.buffer.data());
-    println!("calculated start={}, length={}", start, largest_size);
-    &self.buffer.data()[start..start+largest_size]
+    //println!("buffer data: {:?}", self.buffer.data());
+    //println!("calculated start={}, length={}", start, largest_size);
+    //FIXME: should not be larger than the buffer
+    let length = self.buffer.available_data();
+    if start > length {
+      &self.buffer.data()[0..0]
+    } else {
+      let end = min(start+largest_size, length);
+      &self.buffer.data()[start..end]
+    }
   }
 
   /// should only be called with a count inferior to self.input_data_size()
@@ -368,7 +430,10 @@ mod tests {
     );
     assert_eq!(b.next_output_data(), &b"ABCD"[..]);
 
+    println!("before consume: {:?}", b);
     b.consume_output_data(2);
+    println!("after consume: {:?}", b);
+    println!("next output data: {}", b.next_output_data().to_hex(8));
     assert_eq!(b.next_output_data(), &b"CD"[..]);
 
     println!("TEST[{}]", line!());
