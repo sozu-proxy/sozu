@@ -107,6 +107,10 @@ impl BufferQueue {
     self.start_parsing_position > self.parsed_position
   }
 
+  pub fn can_restart_parsing(&self) -> bool {
+    self.start_parsing_position == self.buffer_position
+  }
+
   pub fn merge_input_slices(&self) -> usize {
     let mut acc = 0usize;
     for el in self.input_queue.iter() {

@@ -379,10 +379,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     match res {
       SocketResult::Error => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient),
       _                   => {
-        //FIXME WRONG CHECK HERE
-        //let res = if self.back_buf_position == self.state.res_position {
-        //FIXME do it for back_writable too
-        let res = if (*self.back_buf).buffer_position == (*self.back_buf).start_parsing_position {
+        let res = if self.back_buf.can_restart_parsing() {
           match self.state.response {
             ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended) => {
               self.reset();
