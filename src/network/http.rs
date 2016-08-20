@@ -253,16 +253,13 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     debug!("{}\tFRONT [{:?}]: read {} bytes", self.log_context(), self.token, sz);
     self.front_buf.buffer.fill(sz);
     self.front_buf.sliced_input(sz);
-    //println!("READABLE[{}] res={:?} sz={}", line!(), res, sz);
-    //println!("GOT DATA:\n{}", self.front_buf.buffer.data().to_hex(16));
-    //println!("GOT UNPARSED DATA:\n{}", self.front_buf.unparsed_data().to_hex(16));
     match res {
       SocketResult::Error => return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient),
       _                   => {
         if !has_host {
           let new_header = self.added_request_header();
-          self.state = parse_request_until_stop(&self.state, &self.request_id, &mut self.front_buf, 0, new_header.as_bytes());
-          debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
+          self.state = parse_request_until_stop(&self.state, &self.request_id, &mut self.front_buf, new_header.as_bytes());
+          //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
           if self.state.is_front_error() {
             time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
@@ -294,9 +291,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               } else {
                 //if self.front_buf_position + self.front_buf.buffer.available_data() >= self.state.req_position {
                 if ! self.front_buf.needs_input() {
-                  let next_start: usize = self.state.req_position - self.front_buf_position;
                   let new_header = self.added_request_header();
-                  self.state = parse_request_until_stop(&self.state, &self.request_id, &mut self.front_buf, next_start, new_header.as_bytes());
+                  self.state = parse_request_until_stop(&self.state, &self.request_id, &mut self.front_buf, new_header.as_bytes());
                   debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
                   if self.state.is_front_error() {
                     time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
@@ -314,9 +310,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               }
             },
             _ => {
-              let next_start: usize = self.state.req_position - self.front_buf_position;
               let new_header = self.added_request_header();
-              self.state = parse_request_until_stop(&self.state, &self.request_id, &mut self.front_buf, next_start, new_header.as_bytes());
+              self.state = parse_request_until_stop(&self.state, &self.request_id, &mut self.front_buf, new_header.as_bytes());
               debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
               if self.state.is_front_error() {
                 time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
@@ -511,8 +506,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               } else {
                 //if self.back_buf_position + self.back_buf.buffer.available_data() >= self.state.res_position {
                 if ! self.back_buf.needs_input() {
-                  let next_start: usize = self.state.res_position - self.back_buf_position;
-                  self.state = parse_response_until_stop(&self.state, &self.request_id, &mut self.back_buf, next_start, new_header.as_bytes());
+                  self.state = parse_response_until_stop(&self.state, &self.request_id, &mut self.back_buf, new_header.as_bytes());
                   debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
                   if self.state.is_back_error() {
                     time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
@@ -532,7 +526,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
             ResponseState::Error(_) => panic!("{}\tback read should have stopped on responsestate error", context),
             _ => {
               let next_start: usize = self.state.res_position - self.back_buf_position;
-              self.state = parse_response_until_stop(&self.state, &self.request_id, &mut self.back_buf, next_start, new_header.as_bytes());
+              self.state = parse_response_until_stop(&self.state, &self.request_id, &mut self.back_buf, new_header.as_bytes());
               debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
               if self.state.is_back_error() {
                 time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
