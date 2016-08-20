@@ -708,7 +708,6 @@ pub type HeaderEndPosition = Option<usize>;
 
 #[derive(Debug,PartialEq)]
 pub struct HttpState {
-  pub req_position:   usize,
   pub res_position:   usize,
   pub request:        RequestState,
   pub response:       ResponseState,
@@ -719,7 +718,6 @@ pub struct HttpState {
 impl HttpState {
   pub fn new() -> HttpState {
     HttpState {
-      req_position:   0,
       res_position:   0,
       request:        RequestState::Initial,
       response:       ResponseState::Initial,
@@ -729,7 +727,6 @@ impl HttpState {
   }
 
   pub fn reset(&mut self) {
-    self.req_position   = 0;
     self.res_position   = 0;
     self.request        = RequestState::Initial;
     self.response       = ResponseState::Initial;
@@ -769,6 +766,7 @@ impl HttpState {
     self.request.get_keep_alive()
   }
 
+  /*
   pub fn front_should_copy(&self) -> Option<usize> {
     if self.req_position == 0 {
       None
@@ -784,6 +782,7 @@ impl HttpState {
       self.req_position = self.req_position - copied
     }
   }
+  */
 
   pub fn front_should_keep_alive(&self) -> bool {
     self.request.should_keep_alive()
@@ -1193,7 +1192,6 @@ pub fn parse_request_until_stop(rs: &HttpState, request_id: &str, buf: &mut Buff
   }
 
   HttpState {
-    req_position: buf.start_parsing_position,
     res_position: rs.res_position,
     request:      current_state,
     response:     rs.response.clone(),
@@ -1256,7 +1254,6 @@ pub fn parse_response_until_stop(rs: &HttpState, request_id: &str, buf: &mut Buf
   }
 
   HttpState {
-    req_position: rs.req_position,
     res_position: buf.start_parsing_position,
     request:      rs.request.clone(),
     response:     current_state,
@@ -1412,10 +1409,10 @@ mod tests {
         OutputElement::Slice(26), OutputElement::Slice(22), OutputElement::Slice(25),
         OutputElement::Slice(13), OutputElement::Slice(21),
         OutputElement::Insert(vec!()), OutputElement::Slice(202)));
+      assert_eq!(buf.start_parsing_position, 309);
       assert_eq!(
         result,
         HttpState {
-          req_position: 309,
           res_position: 0,
           //FIXME: wrong header end here, should be 109
           req_header_end: Some(309),
@@ -1441,7 +1438,6 @@ mod tests {
             Content-Length: 200\r\n\
             \r\n";
       let initial = HttpState {
-        req_position: 26,
         res_position: 0,
         req_header_end: Some(81),
         res_header_end: None,
@@ -1469,10 +1465,10 @@ mod tests {
       OutputElement::Slice(22), OutputElement::Slice(25),
         OutputElement::Slice(13), OutputElement::Slice(21),
         OutputElement::Slice(202)));
+      assert_eq!(buf.start_parsing_position, 309);
       assert_eq!(
         result,
         HttpState {
-          req_position: 309,
           res_position: 0,
           req_header_end: Some(81),
           res_header_end: None,
@@ -1504,10 +1500,10 @@ mod tests {
       //let result = parse_request(&initial, input);
       let result = parse_request_until_stop(&initial, "", &mut buf, b"");
       println!("result: {:?}", result);
+      assert_eq!(buf.start_parsing_position, 116);
       assert_eq!(
         result,
         HttpState {
-          req_position: 116,
           res_position: 0,
           req_header_end: Some(116),
           res_header_end: None,
@@ -1538,10 +1534,10 @@ mod tests {
 
       let result = parse_request_until_stop(&initial, "", &mut buf, b"");
       println!("result: {:?}", result);
+      assert_eq!(buf.start_parsing_position, 128);
       assert_eq!(
         result,
         HttpState {
-          req_position: 128,
           res_position: 0,
           req_header_end: None,
           res_header_end: None,
@@ -1569,10 +1565,10 @@ mod tests {
       //let result = parse_request(&initial, input);
       let result = parse_request_until_stop(&initial, "", &mut buf, b"");
       println!("result: {:?}", result);
+      assert_eq!(buf.start_parsing_position, 136);
       assert_eq!(
         result,
         HttpState {
-          req_position: 136,
           res_position: 0,
           req_header_end: Some(136),
           res_header_end: None,
@@ -1606,10 +1602,10 @@ mod tests {
       assert_eq!(buf.output_queue, vec!(
         OutputElement::Slice(16), OutputElement::Slice(22), OutputElement::Delete(19),
         OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+      assert_eq!(buf.start_parsing_position, 59);
       assert_eq!(
         result,
         HttpState {
-          req_position: 59,
           res_position: 0,
           req_header_end: Some(59),
           res_header_end: None,
@@ -1637,10 +1633,10 @@ mod tests {
       //let result = parse_request(&initial, input);
       let result = parse_request_until_stop(&initial, "", &mut buf, b"");
       println!("result: {:?}", result);
+      assert_eq!(buf.start_parsing_position, 40);
       assert_eq!(
         result,
         HttpState {
-          req_position: 40,
           res_position: 0,
           req_header_end: Some(40),
           res_header_end: None,
@@ -1673,10 +1669,10 @@ mod tests {
       assert_eq!(buf.output_queue, vec!(
         OutputElement::Slice(16), OutputElement::Slice(22), OutputElement::Delete(24),
         OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+      assert_eq!(buf.start_parsing_position, 64);
       assert_eq!(
         result,
         HttpState {
-          req_position: 64,
           res_position: 0,
           req_header_end: Some(64),
           res_header_end: None,
@@ -1708,10 +1704,10 @@ mod tests {
       assert_eq!(buf.output_queue, vec!(
         OutputElement::Slice(16), OutputElement::Delete(19), OutputElement::Slice(22),
         OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+      assert_eq!(buf.start_parsing_position, 59);
       assert_eq!(
         result,
         HttpState {
-          req_position: 59,
           res_position: 0,
           req_header_end: Some(59),
           res_header_end: None,
@@ -1748,10 +1744,10 @@ mod tests {
         OutputElement::Slice(13), OutputElement::Slice(21), OutputElement::Insert(Vec::from(&new_header[..])),
       OutputElement::Slice(202)));
       println!("buf:\n{}", buf.buffer.data().to_hex(16));
+      assert_eq!(buf.start_parsing_position, 309);
       assert_eq!(
         result,
         HttpState {
-          req_position: 309,
           res_position: 0,
           req_header_end: Some(309),
           res_header_end: None,
@@ -1843,10 +1839,10 @@ mod tests {
       //let result = parse_request(&initial, input);
       let result = parse_request_until_stop(&initial, "", &mut buf, b"");
       println!("result: {:?}", result);
+      assert_eq!(buf.start_parsing_position, 160);
       assert_eq!(
         result,
         HttpState {
-          req_position: 160,
           res_position: 0,
           req_header_end: Some(117),
           res_header_end: None,
@@ -1885,10 +1881,10 @@ mod tests {
 
       let result = parse_request_until_stop(&initial, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
+      assert_eq!(buf.start_parsing_position, 124);
       assert_eq!(
         result,
         HttpState {
-          req_position: 124,
           res_position: 0,
           req_header_end: Some(117),
           res_header_end: None,
@@ -1908,10 +1904,10 @@ mod tests {
 
       let result = parse_request_until_stop(&result, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
+      assert_eq!(buf.start_parsing_position, 153);
       assert_eq!(
         result,
         HttpState {
-          req_position: 153,
           res_position: 0,
           req_header_end: Some(117),
           res_header_end: None,
@@ -1931,10 +1927,10 @@ mod tests {
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
       let result = parse_request_until_stop(&result, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
+      assert_eq!(buf.start_parsing_position, 160);
       assert_eq!(
         result,
         HttpState {
-          req_position: 160,
           res_position: 0,
           req_header_end: Some(117),
           res_header_end: None,
@@ -1975,7 +1971,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          req_position: 0,
           res_position: 81,
           req_header_end: None,
           res_header_end: Some(74),
@@ -1997,7 +1992,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          req_position: 0,
           res_position: 110,
           req_header_end: None,
           res_header_end: Some(74),
@@ -2019,7 +2013,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          req_position: 0,
           res_position: 115,
           req_header_end: None,
           res_header_end: Some(74),
@@ -2040,7 +2033,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          req_position: 0,
           res_position: 117,
           req_header_end: None,
           res_header_end: Some(74),
@@ -2071,7 +2063,6 @@ mod tests {
             0\r\n\
             \r\n";
       let initial = HttpState {
-        req_position: 0,
         res_position: 72,
         req_header_end: None,
         res_header_end: None,
@@ -2096,7 +2087,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          req_position: 0,
           res_position: 74,
           req_header_end: None,
           res_header_end: Some(74),
@@ -2117,7 +2107,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          req_position: 0,
           res_position: 81,
           req_header_end: None,
           res_header_end: Some(74),
@@ -2141,7 +2130,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          req_position: 0,
           res_position: 115,
           req_header_end: None,
           res_header_end: Some(74),
@@ -2162,7 +2150,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          req_position: 0,
           res_position: 117,
           req_header_end: None,
           res_header_end: Some(74),
@@ -2207,7 +2194,6 @@ mod tests {
     assert_eq!(
       result,
       HttpState {
-        req_position: 0,
         res_position: 125,
         req_header_end: None,
         res_header_end: Some(125),
@@ -2248,7 +2234,6 @@ mod tests {
     assert_eq!(
       result,
       HttpState {
-        req_position: 0,
         res_position: 129,
         req_header_end: None,
         res_header_end: Some(129),

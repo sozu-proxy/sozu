@@ -289,13 +289,11 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
 
     match conn {
       Ok(socket) => {
-        let position  = client.state().req_position;
         let req_state = client.state().request.clone();
         let req_header_end = client.state().req_header_end;
         let res_header_end = client.state().res_header_end;
         // FIXME: is this still needed?
         client.set_state(HttpState {
-          req_position: position,
           res_position: 0,
           req_header_end: req_header_end,
           res_header_end: res_header_end,
