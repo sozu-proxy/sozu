@@ -1144,6 +1144,7 @@ pub fn parse_request_until_stop(rs: &HttpState, request_id: &str, buf: &mut Buff
   let mut header_end     = rs.req_header_end;
   loop {
     let (mv, new_state) = parse_request(&current_state, buf.unparsed_data());
+    //println!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, &buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, &buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
     current_state = new_state;
@@ -1274,7 +1275,7 @@ pub fn parse_response_until_stop(rs: &HttpState, request_id: &str, buf: &mut Buf
           match current_state {
             ResponseState::Response(_,_) |
             ResponseState::ResponseWithBodyChunks(_,_,_) => {
-              println!("FOUND HEADER END (delete):{}", buf.start_parsing_position);
+              //println!("FOUND HEADER END (delete):{}", buf.start_parsing_position);
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(insert));
               buf.delete_output(length);
@@ -1304,8 +1305,10 @@ pub fn parse_response_until_stop(rs: &HttpState, request_id: &str, buf: &mut Buf
         ResponseState::Error(_) | ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended) => break,
       _ => ()
     }
+    //println!("move: {:?}, new state: {:?}, input_queue {:?}, output_queue: {:?}", mv, current_state, buf.input_queue, buf.output_queue);
   }
 
+  //println!("end state: {:?}, input_queue {:?}, output_queue: {:?}", current_state, buf.input_queue, buf.output_queue);
   HttpState {
     request:      rs.request.clone(),
     response:     current_state,

@@ -168,7 +168,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
   }
 
   pub fn interpret_client_order(&mut self, event_loop: &mut EventLoop<Self>, token: Token, order: (RequiredEvents, ClientResult)) {
-    //println!("ORDER: {:?}", order);
+    //println!("INTERPRET ORDER: {:?}", order);
     match order.1 {
       ClientResult::CloseClient      => self.close_client(event_loop, token),
       ClientResult::CloseBackend     => self.close_backend(event_loop, token),
