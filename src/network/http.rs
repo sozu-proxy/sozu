@@ -357,7 +357,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       };
     }
 
-    trace!("{}\twritable front pos: {}, buf pos: {}, available: {}", self.log_context(), self.state.res_position, self.back_buf_position, self.back_buf.buffer.available_data());
+    //trace!("{}\twritable front pos: {}, buf pos: {}, available: {}", self.log_context(), self.state.res_position, self.back_buf_position, self.back_buf.buffer.available_data());
     //assert!(self.back_buf_position + self.back_buf.available_data() <= self.state.res_position);
     if self.back_buf.buffer.available_data() == 0 {
       return (RequiredEvents::FrontNoneBackRead, ClientResult::Continue);
@@ -458,7 +458,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue)
     }
 
-    trace!("{}\treadable back pos: {}, buf pos: {}, available: {}", self.log_context(), self.state.res_position, self.back_buf_position, self.back_buf.buffer.available_data());
+    //trace!("{}\treadable back pos: {}, buf pos: {}, available: {}", self.log_context(), self.state.res_position, self.back_buf_position, self.back_buf.buffer.available_data());
     //assert!(self.back_buf_position + self.back_buf.available_data() <= self.state.res_position);
 
     if self.back_buf.buffer.available_space() == 0 {
@@ -507,7 +507,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                 //if self.back_buf_position + self.back_buf.buffer.available_data() >= self.state.res_position {
                 if ! self.back_buf.needs_input() {
                   self.state = parse_response_until_stop(&self.state, &self.request_id, &mut self.back_buf, new_header.as_bytes());
-                  debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
+                  //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
                   if self.state.is_back_error() {
                     time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
                     return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure);
@@ -525,9 +525,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
             },
             ResponseState::Error(_) => panic!("{}\tback read should have stopped on responsestate error", context),
             _ => {
-              let next_start: usize = self.state.res_position - self.back_buf_position;
               self.state = parse_response_until_stop(&self.state, &self.request_id, &mut self.back_buf, new_header.as_bytes());
-              debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
+              //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
               if self.state.is_back_error() {
                 time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
                 return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure);

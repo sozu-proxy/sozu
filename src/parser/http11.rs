@@ -708,7 +708,6 @@ pub type HeaderEndPosition = Option<usize>;
 
 #[derive(Debug,PartialEq)]
 pub struct HttpState {
-  pub res_position:   usize,
   pub request:        RequestState,
   pub response:       ResponseState,
   pub req_header_end: HeaderEndPosition,
@@ -718,7 +717,6 @@ pub struct HttpState {
 impl HttpState {
   pub fn new() -> HttpState {
     HttpState {
-      res_position:   0,
       request:        RequestState::Initial,
       response:       ResponseState::Initial,
       req_header_end: None,
@@ -727,7 +725,6 @@ impl HttpState {
   }
 
   pub fn reset(&mut self) {
-    self.res_position   = 0;
     self.request        = RequestState::Initial;
     self.response       = ResponseState::Initial;
     self.req_header_end = None;
@@ -808,6 +805,7 @@ impl HttpState {
     self.response.get_keep_alive()
   }
 
+  /*
   pub fn back_copied(&mut self, copied: usize) {
     if copied > self.res_position {
       self.request = RequestState::Error(ErrorState::TooMuchDataCopied)
@@ -815,6 +813,7 @@ impl HttpState {
       self.res_position = self.res_position - copied
     }
   }
+  */
 
   pub fn back_should_keep_alive(&self) -> bool {
     self.response.should_keep_alive()
@@ -1192,7 +1191,6 @@ pub fn parse_request_until_stop(rs: &HttpState, request_id: &str, buf: &mut Buff
   }
 
   HttpState {
-    res_position: rs.res_position,
     request:      current_state,
     response:     rs.response.clone(),
     req_header_end: header_end,
@@ -1254,7 +1252,6 @@ pub fn parse_response_until_stop(rs: &HttpState, request_id: &str, buf: &mut Buf
   }
 
   HttpState {
-    res_position: buf.start_parsing_position,
     request:      rs.request.clone(),
     response:     current_state,
     req_header_end: rs.req_header_end,
@@ -1413,7 +1410,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          res_position: 0,
           //FIXME: wrong header end here, should be 109
           req_header_end: Some(309),
           res_header_end: None,
@@ -1438,7 +1434,6 @@ mod tests {
             Content-Length: 200\r\n\
             \r\n";
       let initial = HttpState {
-        res_position: 0,
         req_header_end: Some(81),
         res_header_end: None,
         request:  RequestState::HasRequestLine(
@@ -1469,7 +1464,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          res_position: 0,
           req_header_end: Some(81),
           res_header_end: None,
           request:    RequestState::RequestWithBody(
@@ -1504,7 +1498,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          res_position: 0,
           req_header_end: Some(116),
           res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
@@ -1538,7 +1531,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          res_position: 0,
           req_header_end: None,
           res_header_end: None,
           request: RequestState::Error(ErrorState::InvalidHttp),
@@ -1569,7 +1561,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          res_position: 0,
           req_header_end: Some(136),
           res_header_end: None,
           request:  RequestState::RequestWithBodyChunks(
@@ -1606,7 +1597,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          res_position: 0,
           req_header_end: Some(59),
           res_header_end: None,
           request:  RequestState::Request(
@@ -1637,7 +1627,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          res_position: 0,
           req_header_end: Some(40),
           res_header_end: None,
           request:  RequestState::Request(
@@ -1673,7 +1662,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          res_position: 0,
           req_header_end: Some(64),
           res_header_end: None,
           request:  RequestState::Request(
@@ -1708,7 +1696,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          res_position: 0,
           req_header_end: Some(59),
           res_header_end: None,
           request:  RequestState::Request(
@@ -1748,7 +1735,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          res_position: 0,
           req_header_end: Some(309),
           res_header_end: None,
           request: RequestState::RequestWithBody(
@@ -1843,7 +1829,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          res_position: 0,
           req_header_end: Some(117),
           res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
@@ -1885,7 +1870,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          res_position: 0,
           req_header_end: Some(117),
           res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
@@ -1908,7 +1892,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          res_position: 0,
           req_header_end: Some(117),
           res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
@@ -1931,7 +1914,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          res_position: 0,
           req_header_end: Some(117),
           res_header_end: None,
           request:    RequestState::RequestWithBodyChunks(
@@ -1968,10 +1950,10 @@ mod tests {
 
       let result = parse_response_until_stop(&initial, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
+      assert_eq!(buf.start_parsing_position, 81);
       assert_eq!(
         result,
         HttpState {
-          res_position: 81,
           req_header_end: None,
           res_header_end: Some(74),
           request:      RequestState::Initial,
@@ -1989,10 +1971,10 @@ mod tests {
 
       let result = parse_response_until_stop(&result, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
+      assert_eq!(buf.start_parsing_position, 110);
       assert_eq!(
         result,
         HttpState {
-          res_position: 110,
           req_header_end: None,
           res_header_end: Some(74),
           request:      RequestState::Initial,
@@ -2010,10 +1992,10 @@ mod tests {
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
       let result = parse_response_until_stop(&result, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
+      assert_eq!(buf.start_parsing_position, 115);
       assert_eq!(
         result,
         HttpState {
-          res_position: 115,
           req_header_end: None,
           res_header_end: Some(74),
           request:      RequestState::Initial,
@@ -2030,10 +2012,10 @@ mod tests {
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
       let result = parse_response_until_stop(&result, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
+      assert_eq!(buf.start_parsing_position, 117);
       assert_eq!(
         result,
         HttpState {
-          res_position: 117,
           req_header_end: None,
           res_header_end: Some(74),
           request:      RequestState::Initial,
@@ -2063,7 +2045,6 @@ mod tests {
             0\r\n\
             \r\n";
       let initial = HttpState {
-        res_position: 72,
         req_header_end: None,
         res_header_end: None,
         request:      RequestState::Initial,
@@ -2084,10 +2065,10 @@ mod tests {
       println!("initial input:\n{}", &input[..72].to_hex(8));
       println!("buffer output: {:?}", buf.output_queue);
       assert_eq!(buf.output_queue, vec!(OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+      assert_eq!(buf.start_parsing_position, 74);
       assert_eq!(
         result,
         HttpState {
-          res_position: 74,
           req_header_end: None,
           res_header_end: Some(74),
           request:      RequestState::Initial,
@@ -2104,10 +2085,10 @@ mod tests {
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
       let result = parse_response_until_stop(&result, "", &mut buf, b"");
       println!("result: {:?}", result);
+      assert_eq!(buf.start_parsing_position, 81);
       assert_eq!(
         result,
         HttpState {
-          res_position: 81,
           req_header_end: None,
           res_header_end: Some(74),
           request:      RequestState::Initial,
@@ -2127,10 +2108,10 @@ mod tests {
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
       let result = parse_response_until_stop(&result, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
+      assert_eq!(buf.start_parsing_position, 115);
       assert_eq!(
         result,
         HttpState {
-          res_position: 115,
           req_header_end: None,
           res_header_end: Some(74),
           request:      RequestState::Initial,
@@ -2147,10 +2128,10 @@ mod tests {
       println!("parsing\n{}", &input[115..].to_hex(16));
       let result = parse_response_until_stop(&result, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
+      assert_eq!(buf.start_parsing_position, 117);
       assert_eq!(
         result,
         HttpState {
-          res_position: 117,
           req_header_end: None,
           res_header_end: Some(74),
           request:      RequestState::Initial,
@@ -2191,10 +2172,10 @@ mod tests {
         OutputElement::Delete(19),
         OutputElement::Insert(Vec::from(&new_header[..])),
         OutputElement::Slice(2)));
+    assert_eq!(buf.start_parsing_position, 125);
     assert_eq!(
       result,
       HttpState {
-        res_position: 125,
         req_header_end: None,
         res_header_end: Some(125),
         request: RequestState::Initial,
@@ -2231,10 +2212,10 @@ mod tests {
       OutputElement::Slice(19), OutputElement::Slice(40),
       OutputElement::Delete(19), OutputElement::Insert(Vec::from(&new_header[..])),
       OutputElement::Slice(2)));
+    assert_eq!(buf.start_parsing_position, 129);
     assert_eq!(
       result,
       HttpState {
-        res_position: 129,
         req_header_end: None,
         res_header_end: Some(129),
         request: RequestState::Initial,

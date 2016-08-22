@@ -294,7 +294,6 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         let res_header_end = client.state().res_header_end;
         // FIXME: is this still needed?
         client.set_state(HttpState {
-          res_position: 0,
           req_header_end: req_header_end,
           res_header_end: res_header_end,
           request:  req_state,
