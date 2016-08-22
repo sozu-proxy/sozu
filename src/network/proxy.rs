@@ -185,6 +185,13 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
       ClientResult::Continue         => {
         let mut front_interest = EventSet::hup();
         let mut back_interest  = EventSet::hup();
+        //FIXME: instead of reregister, register once with Hup, Read and Write,
+        //store the current interest depending on the protocol implementation,
+        //and when ready is called, if there is interest, call the function right
+        //away, otherwise store its readiness state
+        //find a way to call the function later when the protocol shows interest
+        //again
+        //this will drastically reduce the number of calls to reregister
         if order.0.front_readable() {
           front_interest.insert(EventSet::readable());
         }
