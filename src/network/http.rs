@@ -47,7 +47,7 @@ pub struct Client<Front:SocketHandler> {
   tx_count:       usize,
   status:         ClientStatus,
 
-  state:              HttpState,
+  state:              Option<HttpState>,
   front_buf:          Checkout<BufferQueue>,
   back_buf:           Checkout<BufferQueue>,
   front_buf_position: usize,
@@ -73,7 +73,7 @@ impl<Front:SocketHandler> Client<Front> {
       tx_count:       0,
       status:         ClientStatus::Normal,
 
-      state:              HttpState::new(),
+      state:              Some(HttpState::new()),
       front_buf:          front_buf,
       back_buf:           back_buf,
       front_buf_position: 0,
@@ -91,7 +91,7 @@ impl<Front:SocketHandler> Client<Front> {
   }
 
   pub fn reset(&mut self) {
-    self.state.reset();
+    self.state.as_mut().unwrap().reset();
     self.front_buf_position = 0;
     self.back_buf_position = 0;
     self.front_buf.reset();
@@ -108,11 +108,11 @@ impl<Front:SocketHandler> Client<Front> {
   }
 
   pub fn state(&mut self) -> &mut HttpState {
-    &mut self.state
+    self.state.as_mut().unwrap()
   }
 
   pub fn set_state(&mut self, state: HttpState) {
-    self.state = state;
+    self.state = Some(state);
   }
 
   pub fn set_answer(&mut self, buf: &[u8])  {
@@ -236,7 +236,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
 
     //trace!("{}\treadable front pos: {}, buf pos: {}, available: {}", self.log_context(), self.state.req_position, self.front_buf_position, self.front_buf.buffer.available_data());
-    assert!(!self.state.is_front_error());
+    assert!(!self.state.as_ref().unwrap().is_front_error());
 
     if self.front_buf.buffer.available_space() == 0 {
       if self.backend_token == None {
@@ -248,7 +248,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       }
     }
 
-    let has_host = self.state.has_host();
+    let has_host = self.state.as_ref().unwrap().has_host();
     let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
     debug!("{}\tFRONT [{:?}]: read {} bytes", self.log_context(), self.token, sz);
     self.front_buf.buffer.fill(sz);
@@ -258,21 +258,21 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       _                   => {
         if !has_host {
           let new_header = self.added_request_header();
-          self.state = parse_request_until_stop(&self.state, &self.request_id, &mut self.front_buf, new_header.as_bytes());
+          self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.front_buf, new_header.as_bytes()));
           //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
-          if self.state.is_front_error() {
+          if self.state.as_ref().unwrap().is_front_error() {
             time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
           }
 
-          if self.state.has_host() {
+          if self.state.as_ref().unwrap().has_host() {
             return (RequiredEvents::FrontReadBackWrite, ClientResult::ConnectBackend)
           } else {
             return (RequiredEvents::FrontReadBackNone, ClientResult::Continue)
           }
         } else {
-          match self.state.request {
-            RequestState::Request(_,_,_) | RequestState::RequestWithBody(_,_,_,_) => {
+          match self.state.as_ref().unwrap().request {
+            Some(RequestState::Request(_,_,_)) | Some(RequestState::RequestWithBody(_,_,_,_)) => {
               //FIXME: should only read as much data as needed (ie not further than req_position)
               //if self.front_buf_position + self.front_buf.buffer.available_data() >= self.state.req_position {
               if ! self.front_buf.needs_input() {
@@ -281,7 +281,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                 return  (RequiredEvents::FrontReadBackWrite, ClientResult::Continue)
               }
             },
-            RequestState::RequestWithBodyChunks(_,_,_,ch) => {
+            Some(RequestState::RequestWithBodyChunks(_,_,_,ch)) => {
               if ch == Chunk::Ended {
                 panic!("{}\tfront read should have stopped on chunk ended", self.log_context(),);
                 return (RequiredEvents::FrontNoneBackWrite, ClientResult::Continue);
@@ -292,14 +292,14 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                 //if self.front_buf_position + self.front_buf.buffer.available_data() >= self.state.req_position {
                 if ! self.front_buf.needs_input() {
                   let new_header = self.added_request_header();
-                  self.state = parse_request_until_stop(&self.state, &self.request_id, &mut self.front_buf, new_header.as_bytes());
+                  self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.front_buf, new_header.as_bytes()));
                   //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
-                  if self.state.is_front_error() {
+                  if self.state.as_ref().unwrap().is_front_error() {
                     time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
                     return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
                   }
 
-                  if let RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended) = self.state.request {
+                  if let Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) = self.state.as_ref().unwrap().request {
                     return (RequiredEvents::FrontNoneBackWrite, ClientResult::Continue);
                   } else {
                     return (RequiredEvents::FrontReadBackWrite, ClientResult::Continue);
@@ -311,14 +311,14 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
             },
             _ => {
               let new_header = self.added_request_header();
-              self.state = parse_request_until_stop(&self.state, &self.request_id, &mut self.front_buf, new_header.as_bytes());
+              self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.front_buf, new_header.as_bytes()));
               //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
-              if self.state.is_front_error() {
+              if self.state.as_ref().unwrap().is_front_error() {
                 time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
                 return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
               }
 
-              if let RequestState::Request(_,_,_) = self.state.request {
+              if let Some(RequestState::Request(_,_,_)) = self.state.as_ref().unwrap().request {
                 return (RequiredEvents::FrontNoneBackWrite, ClientResult::Continue);
               } else {
                 return (RequiredEvents::FrontReadBackWrite, ClientResult::Continue);
@@ -375,17 +375,17 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       SocketResult::Error => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient),
       _                   => {
         let res = if self.back_buf.can_restart_parsing() {
-          match self.state.response {
-            ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended) => {
+          match self.state.as_ref().unwrap().response {
+            Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
               self.reset();
               (RequiredEvents::FrontReadBackNone, ClientResult::Continue)
             },
-            ResponseState::ResponseWithBodyChunks(_,_,_) => (RequiredEvents::FrontReadBackNone, ClientResult::Continue),
-            ResponseState::ResponseWithBody(_,_,_)       => {
+            Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => (RequiredEvents::FrontReadBackNone, ClientResult::Continue),
+            Some(ResponseState::ResponseWithBody(_,_,_))       => {
               self.reset();
               (RequiredEvents::FrontReadBackNone, ClientResult::Continue)
             },
-            ResponseState::Response(_,_) => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
+            Some(ResponseState::Response(_,_)) => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
             _ => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure)
           }
         } else {
@@ -433,11 +433,11 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           // FIXME/ should read exactly as much data as needed
           //if self.front_buf_position >= self.state.req_position {
           if self.front_buf.can_restart_parsing() {
-            match self.state.request {
-              RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended) => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
-              RequestState::RequestWithBodyChunks(_,_,_,_) => (RequiredEvents::FrontReadBackNone, ClientResult::Continue),
-              RequestState::RequestWithBody(_,_,_,_)       => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
-              RequestState::Request(_,_,_) => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
+            match self.state.as_ref().unwrap().request {
+              Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
+              Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => (RequiredEvents::FrontReadBackNone, ClientResult::Continue),
+              Some(RequestState::RequestWithBody(_,_,_,_))       => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
+              Some(RequestState::Request(_,_,_)) => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
               _ => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure)
             }
           } else {
@@ -481,13 +481,13 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       match r {
         SocketResult::Error => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure),
         _                   => {
-          match self.state.response {
-            ResponseState::Response(_,_) => {
+          match self.state.as_ref().unwrap().response {
+            Some(ResponseState::Response(_,_)) => {
               //FIXME: this keeps happening, why? Readable event already in queue when parsing ended?
               error!("{}\tshould not go back in back_readable if the whole response was parsed", context);
               return  (RequiredEvents::FrontWriteBackNone, ClientResult::Continue);
             },
-            ResponseState::ResponseWithBody(_,_,_) => {
+            Some(ResponseState::ResponseWithBody(_,_,_)) => {
               //FIXME: should only read as much data as needed (ie not further than req_position)
               //if self.back_buf_position + self.back_buf.buffer.available_data() >= self.state.res_position {
               if ! self.back_buf.needs_input() {
@@ -496,7 +496,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                 return  (RequiredEvents::FrontWriteBackRead, ClientResult::Continue)
               }
             },
-            ResponseState::ResponseWithBodyChunks(_,_,ch) => {
+            Some(ResponseState::ResponseWithBodyChunks(_,_,ch)) => {
               if ch == Chunk::Ended {
                 panic!("{}\tback read should have stopped on chunk ended", context);
                 return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue);
@@ -506,14 +506,14 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               } else {
                 //if self.back_buf_position + self.back_buf.buffer.available_data() >= self.state.res_position {
                 if ! self.back_buf.needs_input() {
-                  self.state = parse_response_until_stop(&self.state, &self.request_id, &mut self.back_buf, new_header.as_bytes());
+                  self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.back_buf, new_header.as_bytes()));
                   //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
-                  if self.state.is_back_error() {
+                  if self.state.as_ref().unwrap().is_back_error() {
                     time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
                     return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure);
                   }
 
-                  if let ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended) = self.state.response {
+                  if let Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) = self.state.as_ref().unwrap().response {
                     return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue);
                   } else {
                     return (RequiredEvents::FrontWriteBackRead, ClientResult::Continue);
@@ -523,16 +523,16 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                 }
               }
             },
-            ResponseState::Error(_) => panic!("{}\tback read should have stopped on responsestate error", context),
+            Some(ResponseState::Error(_)) => panic!("{}\tback read should have stopped on responsestate error", context),
             _ => {
-              self.state = parse_response_until_stop(&self.state, &self.request_id, &mut self.back_buf, new_header.as_bytes());
+              self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.back_buf, new_header.as_bytes()));
               //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
-              if self.state.is_back_error() {
+              if self.state.as_ref().unwrap().is_back_error() {
                 time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
                 return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure);
               }
 
-              if let ResponseState::Response(_,_) = self.state.response {
+              if let Some(ResponseState::Response(_,_)) = self.state.as_ref().unwrap().response {
                 return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue);
               } else {
                 return (RequiredEvents::FrontWriteBackRead, ClientResult::Continue);
@@ -695,8 +695,8 @@ impl ServerConfiguration {
 
 impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
   fn connect_to_backend(&mut self, client: &mut Client<TcpStream>) -> Result<(),ConnectionError> {
-      let host   = try!(client.state.get_host().ok_or(ConnectionError::NoHostGiven));
-      let rl     = try!(client.state.get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
+      let host   = try!(client.state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
+      let rl     = try!(client.state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
       let conn   = self.backend_from_request(client, &host, &rl.uri);
 
       match conn {

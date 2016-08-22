@@ -709,8 +709,8 @@ pub type HeaderEndPosition = Option<usize>;
 
 #[derive(Debug,PartialEq)]
 pub struct HttpState {
-  pub request:        RequestState,
-  pub response:       ResponseState,
+  pub request:        Option<RequestState>,
+  pub response:       Option<ResponseState>,
   pub req_header_end: HeaderEndPosition,
   pub res_header_end: HeaderEndPosition,
 }
@@ -718,26 +718,26 @@ pub struct HttpState {
 impl HttpState {
   pub fn new() -> HttpState {
     HttpState {
-      request:        RequestState::Initial,
-      response:       ResponseState::Initial,
+      request:        Some(RequestState::Initial),
+      response:       Some(ResponseState::Initial),
       req_header_end: None,
       res_header_end: None,
     }
   }
 
   pub fn reset(&mut self) {
-    self.request        = RequestState::Initial;
-    self.response       = ResponseState::Initial;
+    self.request        = Some(RequestState::Initial);
+    self.response       = Some(ResponseState::Initial);
     self.req_header_end = None;
     self.res_header_end = None;
   }
 
   pub fn has_host(&self) -> bool {
-    self.request.has_host()
+    self.request.as_ref().map(|r| r.has_host()).unwrap()
   }
 
   pub fn is_front_error(&self) -> bool {
-    if let RequestState::Error(_) = self.request {
+    if let Some(RequestState::Error(_)) = self.request {
       true
     } else {
       false
@@ -745,23 +745,23 @@ impl HttpState {
   }
 
   pub fn is_front_proxying(&self) -> bool {
-    self.request.is_proxying()
+    self.request.as_ref().map(|r| r.is_proxying()).unwrap()
   }
 
   pub fn get_host(&self) -> Option<String> {
-    self.request.get_host()
+    self.request.as_ref().map(|r| r.get_host()).unwrap()
   }
 
   pub fn get_uri(&self) -> Option<String> {
-    self.request.get_uri()
+    self.request.as_ref().map(|r| r.get_uri()).unwrap()
   }
 
   pub fn get_request_line(&self) -> Option<RRequestLine> {
-    self.request.get_request_line()
+    self.request.as_ref().map(|r| r.get_request_line()).unwrap()
   }
 
   pub fn get_front_keep_alive(&self) -> Option<Connection> {
-    self.request.get_keep_alive()
+    self.request.as_ref().map(|r| r.get_keep_alive()).unwrap()
   }
 
   /*
@@ -783,11 +783,11 @@ impl HttpState {
   */
 
   pub fn front_should_keep_alive(&self) -> bool {
-    self.request.should_keep_alive()
+    self.request.as_ref().map(|r| r.should_keep_alive()).unwrap()
   }
 
   pub fn is_back_error(&self) -> bool {
-    if let ResponseState::Error(_) = self.response {
+    if let Some(ResponseState::Error(_)) = self.response {
       true
     } else {
       false
@@ -795,15 +795,15 @@ impl HttpState {
   }
 
   pub fn is_back_proxying(&self) -> bool {
-    self.response.is_proxying()
+    self.response.as_ref().map(|r| r.is_proxying()).unwrap()
   }
 
   pub fn get_status_line(&self) -> Option<RStatusLine> {
-    self.response.get_status_line()
+    self.response.as_ref().map(|r| r.get_status_line()).unwrap()
   }
 
   pub fn get_back_keep_alive(&self) -> Option<Connection> {
-    self.response.get_keep_alive()
+    self.response.as_ref().map(|ref r| r.get_keep_alive()).unwrap()
   }
 
   /*
@@ -817,7 +817,7 @@ impl HttpState {
   */
 
   pub fn back_should_keep_alive(&self) -> bool {
-    self.response.should_keep_alive()
+    self.response.as_ref().map(|ref r| r.should_keep_alive()).unwrap()
   }
 }
 
@@ -829,10 +829,10 @@ pub enum BufferMove {
   Delete(usize, usize)
 }
 
-pub fn default_request_result<O>(state: &RequestState, res: IResult<&[u8], O>) -> (BufferMove, RequestState) {
+pub fn default_request_result<O>(state: RequestState, res: IResult<&[u8], O>) -> (BufferMove, RequestState) {
   match res {
     IResult::Error(_)      => (BufferMove::None, RequestState::Error(ErrorState::InvalidHttp)),
-    IResult::Incomplete(_) => (BufferMove::None, state.clone()),
+    IResult::Incomplete(_) => (BufferMove::None, state),
     _                      => unreachable!()
   }
 }
@@ -894,8 +894,8 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
     */
     // FIXME: there should be an error for unsupported encoding
     HeaderValue::Encoding(_) => RequestState::Error(ErrorState::InvalidHttp),
-    HeaderValue::Forwarded   => state.clone(),
-    HeaderValue::Other(_,_)  => state.clone(),
+    HeaderValue::Forwarded   => state,
+    HeaderValue::Other(_,_)  => state,
     HeaderValue::Error       => RequestState::Error(ErrorState::InvalidHttp)
   }
 }
@@ -908,8 +908,8 @@ pub fn parse_header(buf: &mut Buffer, state: RequestState) -> IResult<&[u8], Req
   }
 }
 
-pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestState) {
-  match *state {
+pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestState) {
+  match state {
     RequestState::Initial => {
       match request_line(buf) {
         IResult::Done(i, r)    => {
@@ -932,68 +932,68 @@ pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestSt
       match message_header(buf) {
         IResult::Done(i, header) => {
           if header.should_delete() {
-            (BufferMove::Delete(0, buf.offset(i)), validate_request_header(state.clone(), &header))
+            (BufferMove::Delete(0, buf.offset(i)), validate_request_header(state, &header))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
+            (BufferMove::Advance(buf.offset(i)), validate_request_header(state, &header))
           }
         },
         res => default_request_result(state, res)
       }
     },
-    RequestState::HasHost(ref rl, ref conn, ref h) => {
+    RequestState::HasHost(rl, conn, h) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
           if header.should_delete() {
-            (BufferMove::Delete(0, buf.offset(i)), validate_request_header(state.clone(), &header))
+            (BufferMove::Delete(0, buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
+            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
           }
         },
-        IResult::Incomplete(_) => (BufferMove::None, state.clone()),
+        IResult::Incomplete(_) => (BufferMove::None, RequestState::HasHost(rl, conn, h)),
         IResult::Error(_)      => {
           match crlf(buf) {
             IResult::Done(i, _) => {
-              (BufferMove::Advance(buf.offset(i)), RequestState::Request(rl.clone(), conn.clone(), h.clone()))
+              (BufferMove::Advance(buf.offset(i)), RequestState::Request(rl, conn, h))
             },
             res => {
               error!("PARSER\tHasHost could not parse header for input:\n{}\n", buf.to_hex(16));
-              default_request_result(state, res)
+              default_request_result(RequestState::HasHost(rl, conn, h), res)
             }
           }
         }
       }
     },
-    RequestState::HasHostAndLength(ref rl, ref conn, ref h, ref l) => {
+    RequestState::HasHostAndLength(rl, conn, h, l) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
           if header.should_delete() {
-            (BufferMove::Delete(0, buf.offset(i)), validate_request_header(state.clone(), &header))
+            (BufferMove::Delete(0, buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_request_header(state.clone(), &header))
+            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
           }
         },
-        IResult::Incomplete(_) => (BufferMove::None, state.clone()),
+        IResult::Incomplete(_) => (BufferMove::None, RequestState::HasHostAndLength(rl, conn, h, l)),
         IResult::Error(_)      => {
           match crlf(buf) {
             IResult::Done(i, _) => {
               debug!("PARSER\theaders parsed, stopping");
                 match l {
-                  &LengthInformation::Chunked    => (BufferMove::Advance(buf.offset(i)), RequestState::RequestWithBodyChunks(rl.clone(), conn.clone(), h.clone(), Chunk::Initial.clone())),
-                  &LengthInformation::Length(sz) => (BufferMove::Advance(buf.offset(i)), RequestState::RequestWithBody(rl.clone(), conn.clone(), h.clone(), sz)),
+                  LengthInformation::Chunked    => (BufferMove::Advance(buf.offset(i)), RequestState::RequestWithBodyChunks(rl, conn, h, Chunk::Initial)),
+                  LengthInformation::Length(sz) => (BufferMove::Advance(buf.offset(i)), RequestState::RequestWithBody(rl, conn, h, sz)),
                 }
             },
             res => {
               error!("PARSER\tHasHostAndLength could not parse header for input:\n{}\n", buf.to_hex(16));
-              default_request_result(state, res)
+              default_request_result(RequestState::HasHostAndLength(rl, conn, h, l), res)
             }
           }
         }
       }
     },
-    RequestState::RequestWithBodyChunks(ref rl, ref conn, ref h, ref ch) => {
+    RequestState::RequestWithBodyChunks(rl, conn, h, ch) => {
       let (advance, chunk_state) = ch.parse(buf);
       //FIXME: should handle Chunk::Error here
-      (advance, RequestState::RequestWithBodyChunks(rl.clone(), conn.clone(), h.clone(), chunk_state))
+      (advance, RequestState::RequestWithBodyChunks(rl, conn, h, chunk_state))
     },
     _ => {
       error!("PARSER\tunimplemented state: {:?}", state);
@@ -1002,10 +1002,10 @@ pub fn parse_request(state: &RequestState, buf: &[u8]) -> (BufferMove, RequestSt
   }
 }
 
-pub fn default_response_result<O>(state: &ResponseState, res: IResult<&[u8], O>) -> (BufferMove, ResponseState) {
+pub fn default_response_result<O>(state: ResponseState, res: IResult<&[u8], O>) -> (BufferMove, ResponseState) {
   match res {
     IResult::Error(_)      => (BufferMove::None, ResponseState::Error(ErrorState::InvalidHttp)),
-    IResult::Incomplete(_) => (BufferMove::None, state.clone()),
+    IResult::Incomplete(_) => (BufferMove::None, state),
     _                      => unreachable!()
   }
 }
@@ -1051,14 +1051,14 @@ pub fn validate_response_header(state: ResponseState, header: &Header) -> Respon
     HeaderValue::XForwardedProto(_) => ResponseState::Error(ErrorState::InvalidHttp),
     HeaderValue::XForwardedPort(_) => ResponseState::Error(ErrorState::InvalidHttp),
     */
-    HeaderValue::Forwarded   => state.clone(),
-    HeaderValue::Other(_,_)  => state.clone(),
+    HeaderValue::Forwarded   => state,
+    HeaderValue::Other(_,_)  => state,
     HeaderValue::Error       => ResponseState::Error(ErrorState::InvalidHttp)
   }
 }
 
-pub fn parse_response(state: &ResponseState, buf: &[u8]) -> (BufferMove, ResponseState) {
-  match *state {
+pub fn parse_response(state: ResponseState, buf: &[u8]) -> (BufferMove, ResponseState) {
+  match state {
     ResponseState::Initial => {
       match status_line(buf) {
         IResult::Done(i, r)    => {
@@ -1077,60 +1077,60 @@ pub fn parse_response(state: &ResponseState, buf: &[u8]) -> (BufferMove, Respons
         res => default_response_result(state, res)
       }
     },
-    ResponseState::HasStatusLine(ref sl, ref conn) => {
+    ResponseState::HasStatusLine(sl, conn) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
           if header.should_delete() {
-            (BufferMove::Delete(0, buf.offset(i)), validate_response_header(state.clone(), &header))
+            (BufferMove::Delete(0, buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_response_header(state.clone(), &header))
+            (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header))
           }
         },
-        IResult::Incomplete(_) => (BufferMove::None, state.clone()),
+        IResult::Incomplete(_) => (BufferMove::None, ResponseState::HasStatusLine(sl, conn)),
         IResult::Error(_)      => {
           match crlf(buf) {
             IResult::Done(i, _) => {
               debug!("PARSER\theaders parsed, stopping");
-              (BufferMove::Advance(buf.offset(i)), ResponseState::Response(sl.clone(), conn.clone()))
+              (BufferMove::Advance(buf.offset(i)), ResponseState::Response(sl, conn))
             },
             res => {
               error!("PARSER\tHasResponseLine could not parse header for input:\n{}\n", buf.to_hex(16));
-              default_response_result(state, res)
+              default_response_result(ResponseState::HasStatusLine(sl, conn), res)
             }
           }
         }
       }
     },
-    ResponseState::HasLength(ref sl, ref conn, ref length) => {
+    ResponseState::HasLength(sl, conn, length) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
           if header.should_delete() {
-            (BufferMove::Delete(0, buf.offset(i)), validate_response_header(state.clone(), &header))
+            (BufferMove::Delete(0, buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_response_header(state.clone(), &header))
+            (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header))
           }
         },
-        IResult::Incomplete(_) => (BufferMove::None, state.clone()),
+        IResult::Incomplete(_) => (BufferMove::None, ResponseState::HasLength(sl, conn, length)),
         IResult::Error(_)      => {
           match crlf(buf) {
             IResult::Done(i, _) => {
               debug!("PARSER\theaders parsed, stopping");
                 match length {
-                  &LengthInformation::Chunked    => (BufferMove::Advance(buf.offset(i)), ResponseState::ResponseWithBodyChunks(sl.clone(), conn.clone(), Chunk::Initial)),
-                  &LengthInformation::Length(sz) => (BufferMove::Advance(buf.offset(i)), ResponseState::ResponseWithBody(sl.clone(), conn.clone(), sz)),
+                  LengthInformation::Chunked    => (BufferMove::Advance(buf.offset(i)), ResponseState::ResponseWithBodyChunks(sl, conn, Chunk::Initial)),
+                  LengthInformation::Length(sz) => (BufferMove::Advance(buf.offset(i)), ResponseState::ResponseWithBody(sl, conn, sz)),
                 }
             },
             res => {
               error!("PARSER\tHasResponseLine could not parse header for input:\n{}\n", buf.to_hex(16));
-              default_response_result(state, res)
+              default_response_result(ResponseState::HasLength(sl, conn, length), res)
             }
           }
         }
       }
     },
-    ResponseState::ResponseWithBodyChunks(ref rl, ref conn, ref ch) => {
+    ResponseState::ResponseWithBodyChunks(rl, conn, ch) => {
       let (advance, chunk_state) = ch.parse(buf);
-      (advance, ResponseState::ResponseWithBodyChunks(rl.clone(), conn.clone(), chunk_state))
+      (advance, ResponseState::ResponseWithBodyChunks(rl, conn, chunk_state))
     },
     _ => {
       error!("PARSER\tunimplemented state: {:?}", state);
@@ -1139,11 +1139,11 @@ pub fn parse_response(state: &ResponseState, buf: &[u8]) -> (BufferMove, Respons
   }
 }
 
-pub fn parse_request_until_stop(rs: &HttpState, request_id: &str, buf: &mut BufferQueue, insert: &[u8]) -> HttpState {
-  let mut current_state  = rs.request.clone();
+pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue, insert: &[u8]) -> HttpState {
+  let mut current_state  = rs.request.take().expect("the request state should never be None outside of this function");
   let mut header_end     = rs.req_header_end;
   loop {
-    let (mv, new_state) = parse_request(&current_state, buf.unparsed_data());
+    let (mv, new_state) = parse_request(current_state, buf.unparsed_data());
     //println!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, &buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, &buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
@@ -1220,19 +1220,19 @@ pub fn parse_request_until_stop(rs: &HttpState, request_id: &str, buf: &mut Buff
 
   //println!("END OF PARSE REQUEST, output queue: {:?}", buf.output_queue);
   HttpState {
-    request:      current_state,
-    response:     rs.response.clone(),
+    request:      Some(current_state),
+    response:     rs.response.take(),
     req_header_end: header_end,
     res_header_end: rs.res_header_end,
   }
 }
 
-pub fn parse_response_until_stop(rs: &HttpState, request_id: &str, buf: &mut BufferQueue, insert: &[u8]) -> HttpState {
-  let mut current_state = rs.response.clone();
+pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue, insert: &[u8]) -> HttpState {
+  let mut current_state = rs.response.take().expect("the response state should never be None outside of this function");
   let mut header_end    = rs.res_header_end;
   loop {
     //trace!("PARSER\t{}\tpos[{}]: {:?}", request_id, position, current_state);
-    let (mv, new_state) = parse_response(&current_state, buf.unparsed_data());
+    let (mv, new_state) = parse_response(current_state, buf.unparsed_data());
     //trace!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
     current_state = new_state;
@@ -1310,8 +1310,8 @@ pub fn parse_response_until_stop(rs: &HttpState, request_id: &str, buf: &mut Buf
 
   //println!("end state: {:?}, input_queue {:?}, output_queue: {:?}", current_state, buf.input_queue, buf.output_queue);
   HttpState {
-    request:      rs.request.clone(),
-    response:     current_state,
+    request:      rs.request.take(),
+    response:     Some(current_state),
     req_header_end: rs.req_header_end,
     res_header_end: header_end,
   }
@@ -1456,8 +1456,8 @@ mod tests {
       buf.write(&input[..]);
       println!("buffer input: {:?}", buf.input_queue);
 
-      //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, "", &mut buf, b"");
+      //let result = parse_request(initial, input);
+      let result = parse_request_until_stop(initial, "", &mut buf, b"");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);
@@ -1473,13 +1473,13 @@ mod tests {
           //FIXME: wrong header end here, should be 109
           req_header_end: Some(109),
           res_header_end: None,
-          request: RequestState::RequestWithBody(
+          request: Some(RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
             200
-          ),
-          response: ResponseState::Initial
+          )),
+          response: Some(ResponseState::Initial)
         }
       );
   }
@@ -1496,15 +1496,15 @@ mod tests {
       let initial = HttpState {
         req_header_end: None,
         res_header_end: None,
-        request:  RequestState::HasRequestLine(
+        request:  Some(RequestState::HasRequestLine(
           RRequestLine {
             method: String::from("GET"),
             uri: String::from("/index.html"),
             version: String::from("11")
           },
           Connection::KeepAlive
-        ),
-        response: ResponseState::Initial
+        )),
+        response: Some(ResponseState::Initial)
       };
 
       let mut buf = BufferQueue::with_capacity(2048);
@@ -1517,7 +1517,7 @@ mod tests {
       println!("unparsed data after consume(26):\n{}", buf.unparsed_data().to_hex(16));
       println!("buffer output: {:?}", buf.output_queue);
 
-      let result = parse_request_until_stop(&initial, "", &mut buf, b"");
+      let result = parse_request_until_stop(initial, "", &mut buf, b"");
       println!("unparsed data after parsing:\n{}", buf.unparsed_data().to_hex(16));
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
@@ -1533,13 +1533,13 @@ mod tests {
         HttpState {
           req_header_end: Some(109),
           res_header_end: None,
-          request:    RequestState::RequestWithBody(
+          request:    Some(RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
             200
-          ),
-          response: ResponseState::Initial
+          )),
+          response: Some(ResponseState::Initial)
         }
       );
   }
@@ -1558,8 +1558,8 @@ mod tests {
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]);
 
-      //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, "", &mut buf, b"");
+      //let result = parse_request(initial, input);
+      let result = parse_request_until_stop(initial, "", &mut buf, b"");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 116);
       assert_eq!(
@@ -1567,13 +1567,13 @@ mod tests {
         HttpState {
           req_header_end: Some(116),
           res_header_end: None,
-          request:    RequestState::RequestWithBodyChunks(
+          request:    Some(RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
             Chunk::Initial
-          ),
-          response: ResponseState::Initial
+          )),
+          response: Some(ResponseState::Initial)
         }
       );
   }
@@ -1592,7 +1592,7 @@ mod tests {
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]);
 
-      let result = parse_request_until_stop(&initial, "", &mut buf, b"");
+      let result = parse_request_until_stop(initial, "", &mut buf, b"");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 128);
       assert_eq!(
@@ -1600,8 +1600,8 @@ mod tests {
         HttpState {
           req_header_end: None,
           res_header_end: None,
-          request: RequestState::Error(ErrorState::InvalidHttp),
-          response: ResponseState::Initial
+          request: Some(RequestState::Error(ErrorState::InvalidHttp)),
+          response: Some(ResponseState::Initial)
         }
       );
   }
@@ -1621,8 +1621,8 @@ mod tests {
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]);
 
-      //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, "", &mut buf, b"");
+      //let result = parse_request(initial, input);
+      let result = parse_request_until_stop(initial, "", &mut buf, b"");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 136);
       assert_eq!(
@@ -1630,13 +1630,13 @@ mod tests {
         HttpState {
           req_header_end: Some(136),
           res_header_end: None,
-          request:  RequestState::RequestWithBodyChunks(
+          request:  Some(RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
             Chunk::Initial
-          ),
-          response: ResponseState::Initial
+          )),
+          response: Some(ResponseState::Initial)
         }
       );
   }
@@ -1652,8 +1652,8 @@ mod tests {
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]);
 
-      //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, "", &mut buf, b"");
+      //let result = parse_request(initial, input);
+      let result = parse_request_until_stop(initial, "", &mut buf, b"");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer output: {:?}", buf.output_queue);
@@ -1666,12 +1666,12 @@ mod tests {
         HttpState {
           req_header_end: Some(59),
           res_header_end: None,
-          request:  RequestState::Request(
+          request:  Some(RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
             Connection::Close,
             String::from("localhost:8888")
-          ),
-          response: ResponseState::Initial
+          )),
+          response: Some(ResponseState::Initial)
         }
       );
   }
@@ -1687,8 +1687,8 @@ mod tests {
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]);
 
-      //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, "", &mut buf, b"");
+      //let result = parse_request(initial, input);
+      let result = parse_request_until_stop(initial, "", &mut buf, b"");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 40);
       assert_eq!(
@@ -1696,12 +1696,12 @@ mod tests {
         HttpState {
           req_header_end: Some(40),
           res_header_end: None,
-          request:  RequestState::Request(
+          request:  Some(RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
             Connection::Close,
             String::from("localhost:8888")
-          ),
-          response: ResponseState::Initial
+          )),
+          response: Some(ResponseState::Initial)
         }
       );
   }
@@ -1717,8 +1717,8 @@ mod tests {
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]);
 
-      //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, "", &mut buf, b"");
+      //let result = parse_request(initial, input);
+      let result = parse_request_until_stop(initial, "", &mut buf, b"");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer output: {:?}", buf.output_queue);
@@ -1731,12 +1731,12 @@ mod tests {
         HttpState {
           req_header_end: Some(64),
           res_header_end: None,
-          request:  RequestState::Request(
+          request:  Some(RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
             Connection::KeepAlive,
             String::from("localhost:8888")
-          ),
-          response: ResponseState::Initial
+          )),
+          response: Some(ResponseState::Initial)
         }
       );
   }
@@ -1752,8 +1752,8 @@ mod tests {
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]);
 
-      //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, "", &mut buf, b"");
+      //let result = parse_request(initial, input);
+      let result = parse_request_until_stop(initial, "", &mut buf, b"");
       println!("end buf:\n{}", buf.buffer.data().to_hex(16));
       println!("result: {:?}", result);
       assert_eq!(buf.output_queue, vec!(
@@ -1765,12 +1765,12 @@ mod tests {
         HttpState {
           req_header_end: Some(59),
           res_header_end: None,
-          request:  RequestState::Request(
+          request:  Some(RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
             Connection::Close,
             String::from("localhost:8888")
-          ),
-          response: ResponseState::Initial
+          )),
+          response: Some(ResponseState::Initial)
         }
       );
   }
@@ -1789,7 +1789,7 @@ mod tests {
       buf.write(&input[..]);
 
       let new_header = b"Request-Id: 123456789\r\n";
-      let result = parse_request_until_stop(&initial, "", &mut buf, new_header);
+      let result = parse_request_until_stop(initial, "", &mut buf, new_header);
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer output: {:?}", buf.output_queue);
@@ -1804,13 +1804,13 @@ mod tests {
         HttpState {
           req_header_end: Some(109),
           res_header_end: None,
-          request: RequestState::RequestWithBody(
+          request: Some(RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
             200
-          ),
-          response: ResponseState::Initial
+          )),
+          response: Some(ResponseState::Initial)
         }
       );
   }
@@ -1889,8 +1889,8 @@ mod tests {
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]);
 
-      //let result = parse_request(&initial, input);
-      let result = parse_request_until_stop(&initial, "", &mut buf, b"");
+      //let result = parse_request(initial, input);
+      let result = parse_request_until_stop(initial, "", &mut buf, b"");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 160);
       assert_eq!(
@@ -1898,13 +1898,13 @@ mod tests {
         HttpState {
           req_header_end: Some(117),
           res_header_end: None,
-          request:    RequestState::RequestWithBodyChunks(
+          request:    Some(RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
             Chunk::Ended
-          ),
-          response: ResponseState::Initial
+          )),
+          response: Some(ResponseState::Initial)
         }
       );
   }
@@ -1931,7 +1931,7 @@ mod tests {
       buf.write(&input[..125]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_request_until_stop(&initial, "", &mut buf, b"");
+      let result = parse_request_until_stop(initial, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 124);
       assert_eq!(
@@ -1939,13 +1939,13 @@ mod tests {
         HttpState {
           req_header_end: Some(117),
           res_header_end: None,
-          request:    RequestState::RequestWithBodyChunks(
+          request:    Some(RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
             Chunk::Copying
-          ),
-          response: ResponseState::Initial
+          )),
+          response: Some(ResponseState::Initial)
         }
       );
 
@@ -1953,7 +1953,7 @@ mod tests {
       buf.write(&input[125..140]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_request_until_stop(&result, "", &mut buf, b"");
+      let result = parse_request_until_stop(result, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 153);
       assert_eq!(
@@ -1961,13 +1961,13 @@ mod tests {
         HttpState {
           req_header_end: Some(117),
           res_header_end: None,
-          request:    RequestState::RequestWithBodyChunks(
+          request:    Some(RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
             Chunk::Copying
-          ),
-          response: ResponseState::Initial
+          )),
+          response: Some(ResponseState::Initial)
         }
       );
 
@@ -1975,7 +1975,7 @@ mod tests {
       //buf.consume(len);
       buf.write(&input[153..]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_request_until_stop(&result, "", &mut buf, b"");
+      let result = parse_request_until_stop(result, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 160);
       assert_eq!(
@@ -1983,13 +1983,13 @@ mod tests {
         HttpState {
           req_header_end: Some(117),
           res_header_end: None,
-          request:    RequestState::RequestWithBodyChunks(
+          request:    Some(RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
             Connection::KeepAlive,
             String::from("localhost:8888"),
             Chunk::Ended
-          ),
-          response: ResponseState::Initial
+          )),
+          response: Some(ResponseState::Initial)
         }
       );
   }
@@ -2015,7 +2015,7 @@ mod tests {
       buf.write(&input[..78]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_response_until_stop(&initial, "", &mut buf, b"");
+      let result = parse_response_until_stop(initial, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 81);
       assert_eq!(
@@ -2023,12 +2023,12 @@ mod tests {
         HttpState {
           req_header_end: None,
           res_header_end: Some(74),
-          request:      RequestState::Initial,
-          response:     ResponseState::ResponseWithBodyChunks(
+          request:      Some(RequestState::Initial),
+          response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
             Connection::KeepAlive,
             Chunk::Copying
-          ),
+          )),
         }
       );
 
@@ -2036,7 +2036,7 @@ mod tests {
       buf.write(&input[81..100]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_response_until_stop(&result, "", &mut buf, b"");
+      let result = parse_response_until_stop(result, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 110);
       assert_eq!(
@@ -2044,12 +2044,12 @@ mod tests {
         HttpState {
           req_header_end: None,
           res_header_end: Some(74),
-          request:      RequestState::Initial,
-          response:     ResponseState::ResponseWithBodyChunks(
+          request:      Some(RequestState::Initial),
+          response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
             Connection::KeepAlive,
             Chunk::Copying
-          ),
+          )),
         }
       );
 
@@ -2057,7 +2057,7 @@ mod tests {
       println!("remaining:\n{}", &input[110..].to_hex(16));
       buf.write(&input[110..116]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(&result, "", &mut buf, b"");
+      let result = parse_response_until_stop(result, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 115);
       assert_eq!(
@@ -2065,19 +2065,19 @@ mod tests {
         HttpState {
           req_header_end: None,
           res_header_end: Some(74),
-          request:      RequestState::Initial,
-          response:     ResponseState::ResponseWithBodyChunks(
+          request:      Some(RequestState::Initial),
+          response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
             Connection::KeepAlive,
             Chunk::CopyingLastHeader
-          ),
+          )),
         }
       );
 
       //buf.consume(5);
       buf.write(&input[116..]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(&result, "", &mut buf, b"");
+      let result = parse_response_until_stop(result, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 117);
       assert_eq!(
@@ -2085,12 +2085,12 @@ mod tests {
         HttpState {
           req_header_end: None,
           res_header_end: Some(74),
-          request:      RequestState::Initial,
-          response:     ResponseState::ResponseWithBodyChunks(
+          request:      Some(RequestState::Initial),
+          response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
             Connection::KeepAlive,
             Chunk::Ended
-          ),
+          )),
         }
       );
   }
@@ -2114,19 +2114,19 @@ mod tests {
       let initial = HttpState {
         req_header_end: None,
         res_header_end: None,
-        request:      RequestState::Initial,
-        response:     ResponseState::HasLength(
+        request:      Some(RequestState::Initial),
+        response:     Some(ResponseState::HasLength(
           RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
           Connection::KeepAlive,
           LengthInformation::Chunked
-        ),
+        )),
       };
       let mut buf = BufferQueue::with_capacity(2048);
 
       buf.write(&input[..74]);
       buf.consume_parsed_data(72);
       //println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(&initial, "", &mut buf, b"");
+      let result = parse_response_until_stop(initial, "", &mut buf, b"");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("initial input:\n{}", &input[..72].to_hex(8));
@@ -2138,19 +2138,19 @@ mod tests {
         HttpState {
           req_header_end: None,
           res_header_end: Some(74),
-          request:      RequestState::Initial,
-          response:     ResponseState::ResponseWithBodyChunks(
+          request:      Some(RequestState::Initial),
+          response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
             Connection::KeepAlive,
             Chunk::Initial
-          ),
+          )),
         }
       );
 
       // we got the chunk header, but not the chunk content
       buf.write(&input[74..77]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(&result, "", &mut buf, b"");
+      let result = parse_response_until_stop(result, "", &mut buf, b"");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 81);
       assert_eq!(
@@ -2158,12 +2158,12 @@ mod tests {
         HttpState {
           req_header_end: None,
           res_header_end: Some(74),
-          request:      RequestState::Initial,
-          response:     ResponseState::ResponseWithBodyChunks(
+          request:      Some(RequestState::Initial),
+          response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
             Connection::KeepAlive,
             Chunk::Copying
-          ),
+          )),
         }
       );
 
@@ -2173,7 +2173,7 @@ mod tests {
       // the external code copied the chunk content directly, starting at next chunk end
       buf.write(&input[81..115]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(&result, "", &mut buf, b"");
+      let result = parse_response_until_stop(result, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 115);
       assert_eq!(
@@ -2181,19 +2181,19 @@ mod tests {
         HttpState {
           req_header_end: None,
           res_header_end: Some(74),
-          request:      RequestState::Initial,
-          response:     ResponseState::ResponseWithBodyChunks(
+          request:      Some(RequestState::Initial),
+          response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
             Connection::KeepAlive,
             Chunk::CopyingLastHeader
-          ),
+          )),
         }
       );
       let len = buf.buffer.data().len();
       //buf.consume(len);
       buf.write(&input[115..]);
       println!("parsing\n{}", &input[115..].to_hex(16));
-      let result = parse_response_until_stop(&result, "", &mut buf, b"");
+      let result = parse_response_until_stop(result, "", &mut buf, b"");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 117);
       assert_eq!(
@@ -2201,12 +2201,12 @@ mod tests {
         HttpState {
           req_header_end: None,
           res_header_end: Some(74),
-          request:      RequestState::Initial,
-          response:     ResponseState::ResponseWithBodyChunks(
+          request:      Some(RequestState::Initial),
+          response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
             Connection::KeepAlive,
             Chunk::Ended
-          ),
+          )),
         }
       );
   }
@@ -2225,7 +2225,7 @@ mod tests {
     buf.write(&input[..]);
 
     let new_header = b"Request-Id: 123456789\r\n";
-    let result = parse_response_until_stop(&initial, "", &mut buf, new_header);
+    let result = parse_response_until_stop(initial, "", &mut buf, new_header);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
@@ -2245,12 +2245,12 @@ mod tests {
       HttpState {
         req_header_end: None,
         res_header_end: Some(125),
-        request: RequestState::Initial,
-        response: ResponseState::ResponseWithBody(
+        request:  Some(RequestState::Initial),
+        response: Some(ResponseState::ResponseWithBody(
           RStatusLine { version: String::from("11"), status: 302, reason: String::from("Found") },
           Connection::Close,
           0
-        ),
+        )),
       }
     );
   }
@@ -2269,7 +2269,7 @@ mod tests {
     buf.write(&input[..]);
 
     let new_header = b"Request-Id: 123456789\r\n";
-    let result = parse_response_until_stop(&initial, "", &mut buf, new_header);
+    let result = parse_response_until_stop(initial, "", &mut buf, new_header);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
@@ -2285,12 +2285,12 @@ mod tests {
       HttpState {
         req_header_end: None,
         res_header_end: Some(129),
-        request: RequestState::Initial,
-        response: ResponseState::ResponseWithBody(
+        request: Some(RequestState::Initial),
+        response: Some(ResponseState::ResponseWithBody(
           RStatusLine { version: String::from("11"), status: 303, reason: String::from("See Other") },
           Connection::Close,
           0
-        ),
+        )),
       }
     );
   }
@@ -2341,11 +2341,11 @@ mod bench {
 
     let mut buf = BufferQueue::with_capacity(data.len());
     buf.write(&data[..]);
-    let initial = HttpState::new();
-    //println!("res: {:?}", parse_request_until_stop(&initial, &mut buf, b""));
+    //println!("res: {:?}", parse_request_until_stop(initial, &mut buf, b""));
     b.iter(||{
-      parse_request_until_stop(&initial, "", &mut buf, b"")
-    }); 
+      let mut initial = HttpState::new();
+      parse_request_until_stop(initial, "", &mut buf, b"")
+    });
   }
 
   #[bench]
@@ -2363,7 +2363,7 @@ mod bench {
       let mut position      = 0;
       loop {
         let test_position = position;
-        let (mv, new_state) = parse_request(&current_state, &data[test_position..]);
+        let (mv, new_state) = parse_request(current_state, &data[test_position..]);
         current_state = new_state;
 
         if let BufferMove::Delete(start, end) = mv {

@@ -297,7 +297,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
           req_header_end: req_header_end,
           res_header_end: res_header_end,
           request:  req_state,
-          response: ResponseState::Initial
+          response: Some(ResponseState::Initial)
         });
 
         client.set_back_socket(socket);
