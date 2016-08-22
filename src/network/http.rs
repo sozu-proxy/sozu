@@ -849,7 +849,7 @@ mod tests {
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn mi() {
-    thread::spawn(|| { start_server(); });
+    start_server();
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").unwrap();
     let (tx,rx) = channel::<ServerMessage>();
     let (sender, jg) = start_listener(front, 10, 12000, tx.clone());
