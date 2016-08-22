@@ -8,8 +8,6 @@ extern crate libc;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
-use std::fs::File;
-use std::io::Read;
 use std::env;
 use yxorp::network;
 use yxorp::messages;

@@ -136,7 +136,7 @@ impl ServerConfiguration {
 
     let mut cert_read  = BufReader::new(&http_front.certificate.as_bytes()[..]);
     let mut key_read   = BufReader::new(&http_front.key.as_bytes()[..]);
-    let mut cert_chain: Vec<X509> = http_front.certificate_chain.iter().filter_map(|c| {
+    let cert_chain: Vec<X509> = http_front.certificate_chain.iter().filter_map(|c| {
       X509::from_pem(&mut BufReader::new(&c.as_bytes()[..])).ok()
     }).collect();
 

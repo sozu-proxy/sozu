@@ -1972,8 +1972,6 @@ mod tests {
         }
       );
 
-      let len = buf.buffer.data().len();
-      //buf.consume(len);
       buf.write(&input[153..]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
       let result = parse_request_until_stop(result, "", &mut buf, b"");
@@ -2190,8 +2188,6 @@ mod tests {
           )),
         }
       );
-      let len = buf.buffer.data().len();
-      //buf.consume(len);
       buf.write(&input[115..]);
       println!("parsing\n{}", &input[115..].to_hex(16));
       let result = parse_response_until_stop(result, "", &mut buf, b"");
@@ -2344,7 +2340,7 @@ mod bench {
     buf.write(&data[..]);
     //println!("res: {:?}", parse_request_until_stop(initial, &mut buf, b""));
     b.iter(||{
-      let mut initial = HttpState::new();
+      let initial = HttpState::new();
       parse_request_until_stop(initial, "", &mut buf, b"")
     });
   }

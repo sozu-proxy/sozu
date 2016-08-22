@@ -268,12 +268,12 @@ impl BufferQueue {
 
 
   pub fn next_output_data(&self) -> &[u8] {
-    let mut it = self.output_queue.iter();
+    let it = self.output_queue.iter();
     //first, calculate how many bytes we need to jump
     let mut start         = 0usize;
     let mut largest_size  = 0usize;
     let mut delete_ended  = false;
-    let mut available_buffer_size = self.buffer.available_data();
+    let available_buffer_size = self.buffer.available_data();
     //println!("NEXT OUTPUT DATA:\nqueue:\n{:?}\nbuffer:\n{}", self.output_queue, self.buffer.data().to_hex(16));
     for el in it {
       //println!("start={}, length={}, el = {:?}", start, largest_size, el);
