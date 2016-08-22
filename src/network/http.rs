@@ -583,8 +583,9 @@ impl ServerConfiguration {
           fronts:    HashMap::new(),
           tx:        tx,
           pool:      Pool::with_capacity(2*max_connections, 0, || BufferQueue::with_capacity(buffer_size)),
-          front_timeout: 50000,
-          back_timeout:  50000,
+          //FIXME: make the timeout values configurable
+          front_timeout: 5000,
+          back_timeout:  5000,
           answers:   DefaultAnswers {
             NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
             ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
