@@ -824,9 +824,10 @@ impl HttpState {
 #[derive(Debug,PartialEq)]
 pub enum BufferMove {
   None,
+  /// length
   Advance(usize),
-  // start, length
-  Delete(usize, usize)
+  /// length
+  Delete(usize)
 }
 
 pub fn default_request_result<O>(state: RequestState, res: IResult<&[u8], O>) -> (BufferMove, RequestState) {
@@ -932,7 +933,7 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
       match message_header(buf) {
         IResult::Done(i, header) => {
           if header.should_delete() {
-            (BufferMove::Delete(0, buf.offset(i)), validate_request_header(state, &header))
+            (BufferMove::Delete(buf.offset(i)), validate_request_header(state, &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_request_header(state, &header))
           }
@@ -944,7 +945,7 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
       match message_header(buf) {
         IResult::Done(i, header) => {
           if header.should_delete() {
-            (BufferMove::Delete(0, buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
+            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
           }
@@ -967,7 +968,7 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
       match message_header(buf) {
         IResult::Done(i, header) => {
           if header.should_delete() {
-            (BufferMove::Delete(0, buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
+            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
           }
@@ -1081,7 +1082,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8]) -> (BufferMove, Response
       match message_header(buf) {
         IResult::Done(i, header) => {
           if header.should_delete() {
-            (BufferMove::Delete(0, buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header))
+            (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header))
           }
@@ -1105,7 +1106,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8]) -> (BufferMove, Response
       match message_header(buf) {
         IResult::Done(i, header) => {
           if header.should_delete() {
-            (BufferMove::Delete(0, buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header))
+            (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header))
           }
@@ -1180,7 +1181,7 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
           }
         }
       },
-      BufferMove::Delete(begin, length) => {
+      BufferMove::Delete(length) => {
         buf.consume_parsed_data(length);
         if header_end.is_none() {
           match current_state {
@@ -1269,7 +1270,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
         }
         //FIXME: if we add a slice here, we will get a first large slice, then a long list of buffer size slices added by the slice_input function
       },
-      BufferMove::Delete(begin, length) => {
+      BufferMove::Delete(length) => {
         buf.consume_parsed_data(length);
         if header_end.is_none() {
           match current_state {
@@ -2366,14 +2367,14 @@ mod bench {
         let (mv, new_state) = parse_request(current_state, &data[test_position..]);
         current_state = new_state;
 
-        if let BufferMove::Delete(start, end) = mv {
+        if let BufferMove::Delete(end) = mv {
           position += end;
         }
         match mv {
           BufferMove::Advance(sz) => {
             position+=sz;
           },
-          BufferMove::Delete(_, _) => {},
+          BufferMove::Delete(_) => {},
           _ => break
         }
 
