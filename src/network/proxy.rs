@@ -26,6 +26,25 @@ const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
 const DEFAULT_BACK_TIMEOUT:  u64 = 50000;
 type ClientToken = Token;
 
+#[derive(Debug)]
+pub struct Readiness {
+  pub front_interest:  EventSet,
+  pub back_interest:   EventSet,
+  pub front_readiness: EventSet,
+  pub back_readiness:  EventSet,
+}
+
+impl Readiness {
+  pub fn new() -> Readiness {
+    Readiness {
+      front_interest:  EventSet::none(),
+      back_interest:   EventSet::none(),
+      front_readiness: EventSet::none(),
+      back_readiness:  EventSet::none(),
+    }
+  }
+}
+
 pub trait ProxyClient {
   fn front_socket(&self) -> &TcpStream;
   fn back_socket(&self)  -> Option<&TcpStream>;
@@ -47,6 +66,7 @@ pub trait ProxyClient {
   fn back_readable(&mut self) -> (RequiredEvents, ClientResult);
   fn back_writable(&mut self) -> (RequiredEvents, ClientResult);
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>);
+  fn readiness(&mut self)      -> &mut Readiness;
 }
 
 pub trait ProxyConfiguration<Server:Handler,Client> {
@@ -108,7 +128,8 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
   pub fn accept(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
     if let Some((client, should_connect)) = self.configuration.accept(token) {
       if let Ok(client_token) = self.clients.insert(client) {
-        event_loop.register(self.clients[client_token].front_socket(), client_token, EventSet::readable(), PollOpt::edge());
+        self.clients[client_token].readiness().front_interest = EventSet::readable() | EventSet::hup() | EventSet::error();
+        event_loop.register(self.clients[client_token].front_socket(), client_token, EventSet::all(), PollOpt::edge() );
         &self.clients[client_token].set_front_token(client_token);
         if let Ok(timeout) = event_loop.timeout_ms(client_token.as_usize(), self.configuration.front_timeout()) {
           &self.clients[client_token].set_front_timeout(timeout);
@@ -131,8 +152,9 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         if let Ok(backend_token) = self.backend.insert(token) {
           self.clients[token].set_back_token(backend_token);
 
+          self.clients[token].readiness().back_interest = EventSet::writable() | EventSet::hup() | EventSet::error();
           if let Some(sock) = self.clients[token].back_socket() {
-            event_loop.register(sock, backend_token, EventSet::writable(), PollOpt::edge());
+            event_loop.register(sock, backend_token, EventSet::all(), PollOpt::edge());
           }
           if let Ok(timeout) = event_loop.timeout_ms(backend_token.as_usize(), self.configuration.back_timeout()) {
             &self.clients[token].set_back_timeout(timeout);
@@ -141,11 +163,12 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         }
       },
       Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) => {
-        let mut front_interest = EventSet::hup();
-        front_interest.insert(EventSet::writable());
-        let client = &self.clients[token];
+        self.clients[token].readiness().front_interest = EventSet::writable() | EventSet::hup() | EventSet::error();
+        //let mut front_interest = EventSet::hup();
+        //front_interest.insert(EventSet::writable());
+        //let client = &self.clients[token];
 
-        event_loop.reregister(client.front_socket(), token, front_interest, PollOpt::level() | PollOpt::oneshot());
+        //event_loop.reregister(client.front_socket(), token, front_interest, PollOpt::level() | PollOpt::oneshot());
       },
       _ => self.close_client(event_loop, token),
     }
@@ -175,16 +198,18 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
       ClientResult::CloseBothSuccess => self.close_client(event_loop, token),
       ClientResult::CloseBothFailure => self.close_client(event_loop, token),
       ClientResult::ConnectBackend   => {
-        let mut front_interest = EventSet::hup();
-        let mut back_interest  = EventSet::hup();
-        front_interest.insert(EventSet::readable());
-        back_interest.insert(EventSet::writable());
-        self.reregister(event_loop, token, front_interest, back_interest);
+        //let mut front_interest = EventSet::hup();
+        //let mut back_interest  = EventSet::hup();
+        //front_interest.insert(EventSet::readable());
+        //back_interest.insert(EventSet::writable());
+        //self.reregister(event_loop, token, front_interest, back_interest);
+        self.clients[token].readiness().front_interest = EventSet::readable() | EventSet::hup() | EventSet::error();
+        self.clients[token].readiness().back_interest = EventSet::writable() | EventSet::hup() | EventSet::error();
         self.connect_to_backend(event_loop, token)
       },
       ClientResult::Continue         => {
-        let mut front_interest = EventSet::hup();
-        let mut back_interest  = EventSet::hup();
+        let mut front_interest = EventSet::hup() | EventSet::error();
+        let mut back_interest  = EventSet::hup() | EventSet::error();
         //FIXME: instead of reregister, register once with Hup, Read and Write,
         //store the current interest depending on the protocol implementation,
         //and when ready is called, if there is interest, call the function right
@@ -204,7 +229,9 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         if order.0.back_writable() {
           back_interest.insert(EventSet::writable());
         }
-        self.reregister(event_loop, token, front_interest, back_interest)
+        self.clients[token].readiness().front_interest = front_interest;
+        self.clients[token].readiness().back_interest  = back_interest;
+        //self.reregister(event_loop, token, front_interest, back_interest)
       }
     }
   }
@@ -229,110 +256,139 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
   fn ready(&mut self, event_loop: &mut EventLoop<Self>, token: Token, events: EventSet) {
     trace!("PROXY\t{:?} got events: {:?}", token, events);
-    if events.is_readable() {
-      trace!("PROXY\t{:?} is readable", token);
 
-      match socket_type(token, self.max_listeners, self.max_connections) {
-        Some(SocketType::Listener) => {
-          self.accept(event_loop, token)
+    let client_token:Token = match socket_type(token, self.max_listeners, self.max_connections) {
+      Some(SocketType::Listener) => {
+        if events.is_readable() {
+          self.accept(event_loop, token);
+          return;
         }
 
-        Some(SocketType::FrontClient) => {
-          if self.clients.contains(token) {
-            let order = self.clients[token].readable();
-
-            // FIXME: should clear the timeout only if data was consumed
-            if let Some(timeout) = self.clients[token].front_timeout() {
-              //println!("[{}] clearing timeout", token.as_usize());
-              event_loop.clear_timeout(timeout);
-            }
-            if let Ok(timeout) = event_loop.timeout_ms(token.as_usize(), self.configuration.front_timeout()) {
-              //println!("[{}] resetting timeout", token.as_usize());
-              &self.clients[token].set_front_timeout(timeout);
-            }
-
-            self.interpret_client_order(event_loop, token, order);
-          } else {
-            info!("PROXY\tclient {:?} was removed", token);
-          }
-        }
-
-        Some(SocketType::BackClient) => {
-          if let Some(tok) = self.get_client_token(token) {
-            let order = self.clients[tok].back_readable();
-
-            // FIXME: should clear the timeout only if data was consumed
-            if let Some(timeout) = self.clients[tok].back_timeout() {
-              //println!("[{}] clearing timeout", token.as_usize());
-              event_loop.clear_timeout(timeout);
-            }
-            if let Ok(timeout) = event_loop.timeout_ms(token.as_usize(), self.configuration.back_timeout()) {
-              //println!("[{}] resetting timeout", token.as_usize());
-              &self.clients[tok].set_back_timeout(timeout);
-            }
-
-            self.interpret_client_order(event_loop, tok, order);
-          }
-        }
-
-        None => {}
-      }
-    }
-
-    if events.is_writable() {
-      trace!("PROXY\t{:?} is writable", token);
-
-      match socket_type(token, self.max_listeners, self.max_connections) {
-        Some(SocketType::Listener) => {
+        if events.is_writable() {
           error!("PROXY\treceived writable for listener {:?}, this should not happen", token);
+          return;
         }
 
-        Some(SocketType::FrontClient) => {
-          if self.clients.contains(token) {
-            let order = self.clients[token].writable();
-            trace!("PROXY\tinterpreting client order {:?}", order);
-            self.interpret_client_order(event_loop, token, order);
-          } else {
-            info!("PROXY\tclient {:?} was removed", token);
-          }
-        }
-
-        Some(SocketType::BackClient) => {
-          if let Some(tok) = self.get_client_token(token) {
-            let order = self.clients[tok].back_writable();
-            self.interpret_client_order(event_loop, tok, order);
-          }
-        }
-
-        None => {}
-      }
-    }
-
-    if events.is_hup() {
-      match socket_type(token, self.max_listeners, self.max_connections) {
-        Some(SocketType::Listener) => {
+        if events.is_hup() {
           error!("PROXY\tshould not happen: server {:?} closed", token);
+          return;
+        }
+        unreachable!();
+      },
+      Some(SocketType::FrontClient) => {
+        if self.clients.contains(token) {
+          self.clients[token].readiness().front_readiness = self.clients[token].readiness().front_readiness | events;
+          token
+        } else {
+          return;
+        }
+      },
+      Some(SocketType::BackClient) => {
+        if let Some(tok) = self.get_client_token(token) {
+          self.clients[tok].readiness().back_readiness = self.clients[tok].readiness().back_readiness | events;
+          tok
+        } else {
+          return;
+        }
+      },
+      None => {
+        return;
+      }
+    };
+
+    loop {
+      //println!("PROXY\tclient:{:?} readiness: {:?}", client_token, self.clients[client_token].readiness());
+      let front_interest = self.clients[client_token].readiness().front_interest &
+        self.clients[client_token].readiness().front_readiness;
+      let back_interest = self.clients[client_token].readiness().back_interest &
+        self.clients[client_token].readiness().back_readiness;
+
+      //println!("PROXY\tclient:{:?} front: {:?}", client_token, front_interest);
+      //println!("PROXY\tclient:{:?} back:  {:?}", client_token, back_interest);
+      //println!("PROXY\tclients: {:?}", self.clients);
+
+      if front_interest == EventSet::none() && back_interest == EventSet::none() {
+        //println!("quitting loop\n");
+        break;
+      } else {
+        //println!("will handle");
+        //println!("\n");
+      }
+
+      if !self.clients.contains(client_token) {
+        //println!("the client was deleted, quitting loop\n");
+        break;
+      }
+
+      if front_interest.is_readable() {
+        let order = self.clients[client_token].readable();
+
+        // FIXME: should clear the timeout only if data was consumed
+        if let Some(timeout) = self.clients[client_token].front_timeout() {
+          //println!("[{}] clearing timeout", token.as_usize());
+          event_loop.clear_timeout(timeout);
+        }
+        if let Ok(timeout) = event_loop.timeout_ms(token.as_usize(), self.configuration.front_timeout()) {
+          //println!("[{}] resetting timeout", token.as_usize());
+          &self.clients[client_token].set_front_timeout(timeout);
         }
 
-        Some(SocketType::FrontClient) => {
-          if self.clients.contains(token) {
-            if self.clients[token].front_hup() == ClientResult::CloseClient {
-              self.close_client(event_loop, token);
-            }
-          } else {
-            info!("PROXY\tclient {:?} was removed", token);
-          }
+        self.interpret_client_order(event_loop, client_token, order);
+        //self.clients[client_token].readiness().front_readiness.remove(EventSet::readable());
+      }
+
+      if back_interest.is_readable() {
+        let order = self.clients[client_token].back_readable();
+
+        // FIXME: should clear the timeout only if data was consumed
+        if let Some(timeout) = self.clients[client_token].back_timeout() {
+          //println!("[{}] clearing timeout", token.as_usize());
+          event_loop.clear_timeout(timeout);
+        }
+        if let Ok(timeout) = event_loop.timeout_ms(token.as_usize(), self.configuration.back_timeout()) {
+          //println!("[{}] resetting timeout", token.as_usize());
+          &self.clients[client_token].set_back_timeout(timeout);
         }
 
-        Some(SocketType::BackClient) => {
-          if let Some(tok) = self.get_client_token(token) {
-            if self.clients[tok].front_hup() == ClientResult::CloseClient {
-              self.close_client(event_loop, tok);
-            }
-          }
-        }
+        self.interpret_client_order(event_loop, client_token, order);
+        //self.clients[client_token].readiness().back_readiness.remove(EventSet::readable());
+      }
 
-        None => {}
+      if front_interest.is_writable() {
+        let order = self.clients[client_token].writable();
+        trace!("PROXY\tinterpreting client order {:?}", order);
+        self.interpret_client_order(event_loop, client_token, order);
+        //self.clients[client_token].readiness().front_readiness.remove(EventSet::writable());
+      }
+
+      if back_interest.is_writable() {
+        let order = self.clients[client_token].back_writable();
+        self.interpret_client_order(event_loop, client_token, order);
+        //self.clients[client_token].readiness().back_readiness.remove(EventSet::writable());
+      }
+
+      if front_interest.is_hup() {
+        if self.clients[client_token].front_hup() == ClientResult::CloseClient {
+          self.close_client(event_loop, client_token);
+          self.clients[client_token].readiness().front_interest = EventSet::none();
+          self.clients[client_token].readiness().back_interest  = EventSet::none();
+          self.clients[client_token].readiness().back_readiness.remove(EventSet::hup());
+        }
+        self.clients[client_token].readiness().front_readiness.remove(EventSet::hup());
+      }
+      if !self.clients.contains(client_token) {
+        //println!("the client was deleted, quitting loop\n");
+        break;
+      }
+
+      if back_interest.is_hup() {
+        if self.clients[client_token].front_hup() == ClientResult::CloseClient {
+          self.close_client(event_loop, client_token);
+          self.clients[client_token].readiness().front_interest = EventSet::none();
+          self.clients[client_token].readiness().back_interest  = EventSet::none();
+          self.clients[client_token].readiness().front_readiness.remove(EventSet::hup());
+        }
+        self.clients[client_token].readiness().back_readiness.remove(EventSet::hup());
       }
     }
   }

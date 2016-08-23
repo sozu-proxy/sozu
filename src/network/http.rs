@@ -18,7 +18,7 @@ use time::{Duration, precise_time_s, precise_time_ns};
 use rand::random;
 use uuid::Uuid;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents};
-use network::proxy::{Server,ProxyConfiguration,ProxyClient};
+use network::proxy::{Server,ProxyConfiguration,ProxyClient,Readiness};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult};
@@ -58,6 +58,7 @@ pub struct Client<Front:SocketHandler> {
   pub app_id:         Option<String>,
   request_id:         String,
   server_context:     String,
+  readiness:          Readiness,
 }
 
 impl<Front:SocketHandler> Client<Front> {
@@ -84,6 +85,7 @@ impl<Front:SocketHandler> Client<Front> {
       app_id:             None,
       request_id:         Uuid::new_v4().hyphenated().to_string(),
       server_context:     String::from(server_context),
+      readiness:          Readiness::new(),
     })
   }
 
@@ -203,6 +205,10 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     self.backend_token = Some(backend);
   }
 
+  fn readiness(&mut self) -> &mut Readiness {
+    &mut self.readiness
+  }
+
   //FIXME: too much cloning in there, should optimize
   //FIXME: unwrap bad, bad rust coder
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
@@ -254,8 +260,15 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     self.front_buf.buffer.fill(sz);
     self.front_buf.sliced_input(sz);
     match res {
-      SocketResult::Error => return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient),
+      SocketResult::Error => {
+        self.readiness.front_readiness.remove(EventSet::readable());
+        return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+      },
       _                   => {
+        if res == SocketResult::WouldBlock {
+          self.readiness.front_readiness.remove(EventSet::readable());
+        }
+
         if !has_host {
           let new_header = self.added_request_header();
           self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.front_buf, new_header.as_bytes()));
@@ -346,6 +359,9 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       }
       //let (sz, res) = self.frontend.socket_write(self.back_buf.next_output_data());
       //self.back_buf.consume_output_data(sz);
+      if res != SocketResult::Continue {
+        self.readiness.front_readiness.remove(EventSet::writable());
+      }
 
       if self.back_buf.buffer.available_data() == 0 {
         return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
@@ -372,8 +388,15 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       //debug!("{}\tFRONT [{}<-{}]: back buf: {:?}", self.log_context(), front.as_usize(), back.as_usize(), *self.back_buf);
     }
     match res {
-      SocketResult::Error => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient),
+      SocketResult::Error => {
+        self.readiness.front_readiness.remove(EventSet::writable());
+        (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient)
+      },
       _                   => {
+        if res == SocketResult::WouldBlock {
+          self.readiness.front_readiness.remove(EventSet::writable());
+        }
+
         let res = if self.back_buf.can_restart_parsing() {
           match self.state.as_ref().unwrap().response {
             Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
@@ -424,6 +447,11 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         self.front_buf_position += current_sz;
         sz += current_sz;
       }
+
+      if socket_res != SocketResult::Continue {
+        self.readiness.back_readiness.remove(EventSet::writable());
+      }
+
       if let Some((front,back)) = tokens {
         debug!("{}\tBACK [{}->{}]: wrote {} bytes", context, front.as_usize(), back.as_usize(), sz);
       }
@@ -478,6 +506,11 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       if let Some((front,back)) = tokens {
         debug!("{}\tBACK  [{}<-{}]: read {} bytes", context, front.as_usize(), back.as_usize(), sz);
       }
+
+      if r != SocketResult::Continue {
+        self.readiness.back_readiness.remove(EventSet::readable());
+      }
+
       match r {
         SocketResult::Error => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure),
         _                   => {

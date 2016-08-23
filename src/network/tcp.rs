@@ -16,7 +16,7 @@ use time::{Duration,precise_time_s};
 use rand::random;
 use uuid::Uuid;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents};
-use network::proxy::{Server,ProxyClient,ProxyConfiguration};
+use network::proxy::{Server,ProxyClient,ProxyConfiguration,Readiness};
 
 use messages::{TcpFront,Command,Instance};
 
@@ -50,6 +50,7 @@ pub struct Client {
   tx_count:       usize,
   app_id:         Option<String>,
   request_id:     String,
+  readiness:      Readiness,
 }
 
 #[cfg(feature = "splice")]
@@ -72,6 +73,7 @@ pub struct Client {
   tx_count:       usize,
   app_id:         Option<String>,
   request_id:     String,
+  readiness:      Readiness,
 }
 
 #[cfg(not(feature = "splice"))]
@@ -94,6 +96,7 @@ impl Client {
       tx_count:       0,
       app_id:         None,
       request_id:     Uuid::new_v4().hyphenated().to_string(),
+      readiness:      Readiness::new(),
     })
   }
 
@@ -122,6 +125,7 @@ impl Client {
         rx_count:       0,
         app_id:         None,
         request_id:     Uuid::new_v4().hyphenated().to_string(),
+        readiness:      Readiness::new(),
       })
     } else {
       None
@@ -327,6 +331,9 @@ impl ProxyClient for Client {
           self.tx_count = self.tx_count + r;
 
           //self.front_interest.insert(EventSet::readable());
+          if r > 0 {
+            self.readiness.front_readiness.remove(EventSet::writable());
+          }
           self.front_interest.remove(EventSet::writable());
           self.back_interest.insert(EventSet::readable());
         }
@@ -346,7 +353,10 @@ impl ProxyClient for Client {
         error!("{}\tTCP\tWe just got readable, but were unable to read from the socket?", self.request_id);
       }
       Ok(Some(r)) => {
-        debug!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+        println!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+        if r > 0 {
+          self.readiness.front_readiness.remove(EventSet::readable());
+        }
         self.front_interest.remove(EventSet::readable());
         self.back_interest.insert(EventSet::writable());
         self.rx_count = self.rx_count + r;
@@ -378,6 +388,9 @@ impl ProxyClient for Client {
             //FIXME what happens if not everything was written?
             debug!("{}\tTCP\tBACK [{}->{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
 
+            if r > 0 {
+              self.readiness.back_readiness.remove(EventSet::writable());
+            }
             self.front_interest.insert(EventSet::readable());
             self.back_interest.remove(EventSet::writable());
             self.back_interest.insert(EventSet::readable());
@@ -400,7 +413,10 @@ impl ProxyClient for Client {
           error!("{}\tTCP\tWe just got readable, but were unable to read from the socket?", self.request_id);
         }
         Ok(Some(r)) => {
-          debug!("{}\tTCP\tBACK  [{}<-{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+          println!("{}\tTCP\tBACK  [{}<-{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+          if r > 0 {
+            self.readiness.back_readiness.remove(EventSet::readable());
+          }
           self.back_interest.remove(EventSet::readable());
           self.front_interest.insert(EventSet::writable());
           // prepare to provide this to writable
@@ -415,6 +431,11 @@ impl ProxyClient for Client {
 
     (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
   }
+
+  fn readiness(&mut self) -> &mut Readiness {
+    &mut self.readiness
+  }
+
 }
 
 pub struct ApplicationListener {
