@@ -32,7 +32,6 @@ pub enum ConnectionStatus {
   Closed
 }
 
-#[cfg(not(feature = "splice"))]
 pub struct Client {
   sock:           TcpStream,
   backend:        Option<TcpStream>,
@@ -53,30 +52,6 @@ pub struct Client {
   readiness:      Readiness,
 }
 
-#[cfg(feature = "splice")]
-pub struct Client {
-  sock:           TcpStream,
-  backend:        Option<TcpStream>,
-  pipe_in:        splice::Pipe,
-  pipe_out:       splice::Pipe,
-  data_in:        bool,
-  data_out:       bool,
-  token:          Option<Token>,
-  backend_token:  Option<Token>,
-  accept_token:   Token,
-  back_interest:  EventSet,
-  front_interest: EventSet,
-  front_timeout:  Option<Timeout>,
-  back_timeout:   Option<Timeout>,
-  status:         ConnectionStatus,
-  rx_count:       usize,
-  tx_count:       usize,
-  app_id:         Option<String>,
-  request_id:     String,
-  readiness:      Readiness,
-}
-
-#[cfg(not(feature = "splice"))]
 impl Client {
   fn new(sock: TcpStream, accept_token: Token) -> Option<Client> {
     Some(Client {
@@ -98,128 +73,6 @@ impl Client {
       request_id:     Uuid::new_v4().hyphenated().to_string(),
       readiness:      Readiness::new(),
     })
-  }
-
-}
-
-#[cfg(feature = "splice")]
-impl Client {
-  fn new(sock: TcpStream, backend: TcpStream, accept_token: Token) -> Option<Client> {
-    if let (Some(pipe_in), Some(pipe_out)) = (splice::create_pipe(), splice::create_pipe()) {
-      Some(Client {
-        sock:           sock,
-        backend:        backend,
-        pipe_in:        pipe_in,
-        pipe_out:       pipe_out,
-        data_in:        false,
-        data_out:       false,
-        token:          None,
-        backend_token:  None,
-        accept_token:   accept_token,
-        back_interest:  EventSet::all(),
-        front_interest: EventSet::all(),
-        front_timeout:  None,
-        back_timeout:   None,
-        status:         ConnectionStatus::Initial,
-        tx_count:       0,
-        rx_count:       0,
-        app_id:         None,
-        request_id:     Uuid::new_v4().hyphenated().to_string(),
-        readiness:      Readiness::new(),
-      })
-    } else {
-      None
-    }
-  }
-
-  pub fn set_tokens(&mut self, token: Token, backend: Token) {
-    self.token         = Some(token);
-    self.backend_token = Some(backend);
-  }
-
-  fn writable(&mut self) -> io::Result<()> {
-    trace!("{}\tTCP\tin writable()", self.request_id);
-    if self.data_out {
-      match splice::splice_out(self.pipe_out, &self.sock) {
-        None => {
-          trace!("{}\tTCP\tclient flushing buf; WOULDBLOCK", self.request_id);
-
-          self.front_interest.insert(EventSet::writable());
-        }
-        Some(r) => {
-          //FIXME what happens if not everything was written?
-          debug!("{}\tTCP\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
-
-          //self.front_interest.insert(EventSet::readable());
-          self.front_interest.remove(EventSet::writable());
-          self.back_interest.insert(EventSet::readable());
-          self.data_out = false;
-          self.tx_count = self.tx_count + r;
-        }
-      }
-    }
-    Ok(())
-  }
-
-  fn readable(&mut self) -> io::Result<()> {
-    //trace!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
-
-    match splice::splice_in(&self.sock, self.pipe_in) {
-      None => {
-        error!("{}\tTCP\tWe just got readable, but were unable to read from the socket?", self.request_id);
-      }
-      Some(r) => {
-        debug!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
-        self.front_interest.remove(EventSet::readable());
-        self.back_interest.insert(EventSet::writable());
-        self.data_in = true;
-        self.rx_count = self.rx_count + r;
-      }
-    };
-
-    Ok(())
-  }
-
-  fn back_writable(&mut self) -> io::Result<()> {
-    //trace!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
-
-    if self.data_in {
-      match splice::splice_out(self.pipe_in, &self.backend) {
-        None => {
-          error!("{}\tTCP\tclient flushing buf; WOULDBLOCK", self.request_id);
-
-          self.back_interest.insert(EventSet::writable());
-        }
-        Some(r) => {
-          //FIXME what happens if not everything was written?
-          debug!("{}\tTCP\tBACK [{}->{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
-
-          self.front_interest.insert(EventSet::readable());
-          self.back_interest.remove(EventSet::writable());
-          self.back_interest.insert(EventSet::readable());
-          self.data_in = false;
-        }
-      }
-    }
-    Ok(())
-  }
-
-  fn back_readable(&mut self) -> io::Result<()> {
-    trace!("{}\tTCP\tin back_readable(): back_mut_buf contains {} bytes", self.request_id, buf.remaining());
-
-    match splice::splice_in(&self.backend, self.pipe_out) {
-      None => {
-        error!("{}\tTCP\tWe just got readable, but were unable to read from the socket?", self.request_id);
-      }
-      Some(r) => {
-        debug!("{}\tTCP\tBACK  [{}<-{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
-        self.back_interest.remove(EventSet::readable());
-        self.front_interest.insert(EventSet::writable());
-        self.data_out = true;
-      }
-    };
-
-    Ok(())
   }
 }
 
