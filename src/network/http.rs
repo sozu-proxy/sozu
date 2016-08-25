@@ -394,19 +394,13 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       }
 
       if self.back_buf.buffer.available_data() == 0 {
-        self.readiness.back_interest   = EventSet::none();
-        self.readiness.front_interest  = EventSet::none();
-        self.readiness.back_readiness  = EventSet::none();
-        self.readiness.front_readiness = EventSet::none();
+        self.readiness.reset();
         println!("FIXME: should not close until the write ended");
         return ClientResult::CloseClient;
       }
 
       if res == SocketResult::Error {
-        self.readiness.back_interest   = EventSet::none();
-        self.readiness.front_interest  = EventSet::none();
-        self.readiness.back_readiness  = EventSet::none();
-        self.readiness.front_readiness = EventSet::none();
+        self.readiness.reset();
         return ClientResult::CloseClient;
       } else {
         return ClientResult::Continue;
@@ -429,10 +423,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
     match res {
       SocketResult::Error => {
-        self.readiness.back_interest   = EventSet::none();
-        self.readiness.front_interest  = EventSet::none();
-        self.readiness.back_readiness  = EventSet::none();
-        self.readiness.front_readiness = EventSet::none();
+        self.readiness.reset();
         ClientResult::CloseClient
       },
       _                   => {
@@ -461,10 +452,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               ClientResult::Continue
             },
             _ => {
-              self.readiness.back_interest   = EventSet::none();
-              self.readiness.front_interest  = EventSet::none();
-              self.readiness.back_readiness  = EventSet::none();
-              self.readiness.front_readiness = EventSet::none();
+              self.readiness.reset();
               ClientResult::CloseBothFailure
             }
           }
@@ -519,10 +507,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       }
       match socket_res {
         SocketResult::Error => {
-          self.readiness.back_interest   = EventSet::none();
-          self.readiness.front_interest  = EventSet::none();
-          self.readiness.back_readiness  = EventSet::none();
-          self.readiness.front_readiness = EventSet::none();
+          self.readiness.reset();
           ClientResult::CloseBothFailure
         },
         _                   => {
@@ -548,10 +533,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                 ClientResult::Continue
               },
               _ => {
-                self.readiness.back_interest   = EventSet::none();
-                self.readiness.front_interest  = EventSet::none();
-                self.readiness.back_readiness  = EventSet::none();
-                self.readiness.front_readiness = EventSet::none();
+                self.readiness.reset();
                 ClientResult::CloseBothFailure
               }
             }
@@ -562,12 +544,9 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           }
         }
       }
-      } else {
-        self.readiness.back_interest   = EventSet::none();
-        self.readiness.front_interest  = EventSet::none();
-        self.readiness.back_readiness  = EventSet::none();
-        self.readiness.front_readiness = EventSet::none();
-        return ClientResult::CloseBothFailure;
+    } else {
+      self.readiness.reset();
+      return ClientResult::CloseBothFailure;
     };
 
     res
