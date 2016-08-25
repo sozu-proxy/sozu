@@ -98,6 +98,7 @@ impl<Front:SocketHandler> Client<Front> {
     self.back_buf_position = 0;
     self.front_buf.reset();
     self.back_buf.reset();
+    self.readiness = Readiness::new();
   }
 
   fn tokens(&self) -> Option<(Token,Token)> {
@@ -236,9 +237,12 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   }
 
   // Read content from the client
-  fn readable(&mut self) -> (RequiredEvents,ClientResult) {
+  fn readable(&mut self) -> ClientResult {
     if self.status == ClientStatus::DefaultAnswer {
-      return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue)
+      self.readiness.front_interest.insert(EventSet::writable());
+      self.readiness.back_interest.remove(EventSet::readable());
+      self.readiness.back_interest.remove(EventSet::writable());
+      return ClientResult::Continue;
     }
 
     //trace!("{}\treadable front pos: {}, buf pos: {}, available: {}", self.log_context(), self.state.req_position, self.front_buf_position, self.front_buf.buffer.available_data());
@@ -248,9 +252,13 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       if self.backend_token == None {
         // We don't have a backend to empty the buffer into, close the connection
         error!("{}\t[{:?}] front buffer full, no backend, closing the connection", self.log_context(), self.token);
-        return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient)
+        self.readiness.front_interest = EventSet::none();
+        self.readiness.back_interest  = EventSet::none();
+        return ClientResult::CloseClient;
       } else {
-        return (RequiredEvents::FrontNoneBackWrite, ClientResult::Continue)
+        self.readiness.front_interest.remove(EventSet::readable());
+        self.readiness.back_interest.insert(EventSet::writable());
+        return ClientResult::Continue;
       }
     }
 
@@ -259,10 +267,15 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     debug!("{}\tFRONT [{:?}]: read {} bytes", self.log_context(), self.token, sz);
     self.front_buf.buffer.fill(sz);
     self.front_buf.sliced_input(sz);
+
+    if self.front_buf.buffer.available_space() == 0 {
+      self.readiness.front_interest.remove(EventSet::readable());
+    }
+
     match res {
       SocketResult::Error => {
-        self.readiness.front_readiness.remove(EventSet::readable());
-        return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+        self.readiness.reset();
+        return ClientResult::CloseClient;
       },
       _                   => {
         if res == SocketResult::WouldBlock {
@@ -275,32 +288,36 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
           if self.state.as_ref().unwrap().is_front_error() {
             time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
-            return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+            self.readiness.front_interest.remove(EventSet::readable());
+            return ClientResult::CloseClient;
           }
 
           if self.state.as_ref().unwrap().has_host() {
-            return (RequiredEvents::FrontReadBackWrite, ClientResult::ConnectBackend)
+            self.readiness.back_interest.insert(EventSet::writable());
+            return ClientResult::ConnectBackend;
           } else {
-            return (RequiredEvents::FrontReadBackNone, ClientResult::Continue)
+            return ClientResult::Continue;
           }
         } else {
+          self.readiness.back_interest.insert(EventSet::writable());
           match self.state.as_ref().unwrap().request {
             Some(RequestState::Request(_,_,_)) | Some(RequestState::RequestWithBody(_,_,_,_)) => {
-              //FIXME: should only read as much data as needed (ie not further than req_position)
-              //if self.front_buf_position + self.front_buf.buffer.available_data() >= self.state.req_position {
               if ! self.front_buf.needs_input() {
-                return  (RequiredEvents::FrontNoneBackWrite, ClientResult::Continue)
+                self.readiness.front_interest.remove(EventSet::readable());
+                return  ClientResult::Continue;
               } else {
-                return  (RequiredEvents::FrontReadBackWrite, ClientResult::Continue)
+                return  ClientResult::Continue;
               }
             },
             Some(RequestState::RequestWithBodyChunks(_,_,_,ch)) => {
               if ch == Chunk::Ended {
-                panic!("{}\tfront read should have stopped on chunk ended", self.log_context(),);
-                return (RequiredEvents::FrontNoneBackWrite, ClientResult::Continue);
+                error!("{}\tfront read should have stopped on chunk ended", self.log_context(),);
+                self.readiness.front_interest.remove(EventSet::readable());
+                return ClientResult::Continue;
               } else if ch == Chunk::Error {
-                panic!("{}\tfront read should have stopped on chunk error", self.log_context(),);
-                return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+                error!("{}\tfront read should have stopped on chunk error", self.log_context(),);
+                self.readiness.reset();
+                return ClientResult::CloseClient;
               } else {
                 //if self.front_buf_position + self.front_buf.buffer.available_data() >= self.state.req_position {
                 if ! self.front_buf.needs_input() {
@@ -309,16 +326,18 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                   //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
                   if self.state.as_ref().unwrap().is_front_error() {
                     time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
-                    return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+                    self.readiness.reset();
+                    return ClientResult::CloseClient;
                   }
 
                   if let Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) = self.state.as_ref().unwrap().request {
-                    return (RequiredEvents::FrontNoneBackWrite, ClientResult::Continue);
+                    self.readiness.front_interest.remove(EventSet::readable());
+                    return ClientResult::Continue;
                   } else {
-                    return (RequiredEvents::FrontReadBackWrite, ClientResult::Continue);
+                    return ClientResult::Continue;
                   }
                 } else {
-                  return (RequiredEvents::FrontReadBackWrite, ClientResult::Continue);
+                  return ClientResult::Continue;
                 }
               }
             },
@@ -328,13 +347,17 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
               if self.state.as_ref().unwrap().is_front_error() {
                 time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
-                return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+                self.readiness.reset();
+                return ClientResult::CloseClient;
               }
 
               if let Some(RequestState::Request(_,_,_)) = self.state.as_ref().unwrap().request {
-                return (RequiredEvents::FrontNoneBackWrite, ClientResult::Continue);
+                self.readiness.front_interest.remove(EventSet::readable());
+                self.readiness.back_interest.insert(EventSet::writable());
+                return ClientResult::Continue;
               } else {
-                return (RequiredEvents::FrontReadBackWrite, ClientResult::Continue);
+                self.readiness.back_interest.insert(EventSet::writable());
+                return ClientResult::Continue;
               }
             }
           }
@@ -344,12 +367,16 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   }
 
   // Forward content to client
-  fn writable(&mut self) -> (RequiredEvents, ClientResult) {
+  fn writable(&mut self) -> ClientResult {
+
     if self.status == ClientStatus::DefaultAnswer {
+      if self.back_buf.output_data_size() == 0 {
+        self.readiness.front_interest.remove(EventSet::writable());
+      }
+
       let mut sz = 0usize;
       let mut res = SocketResult::Continue;
       while res == SocketResult::Continue && self.back_buf.output_data_size() > 0 {
-        //trace!("{}\toutput_queue:{:?}", self.log_context, self.back_buf.output_queue);
         let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
         res = current_res;
         //println!("FRONT_WRITABLE[{}] wrote {} bytes:\n{}\nres={:?}", line!(), sz, self.back_buf.next_output_data().to_hex(16), res);
@@ -357,26 +384,35 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         self.back_buf_position += current_sz;
         sz += current_sz;
       }
-      //let (sz, res) = self.frontend.socket_write(self.back_buf.next_output_data());
-      //self.back_buf.consume_output_data(sz);
+
       if res != SocketResult::Continue {
         self.readiness.front_readiness.remove(EventSet::writable());
       }
 
       if self.back_buf.buffer.available_data() == 0 {
-        return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+        self.readiness.back_interest   = EventSet::none();
+        self.readiness.front_interest  = EventSet::none();
+        self.readiness.back_readiness  = EventSet::none();
+        self.readiness.front_readiness = EventSet::none();
+        println!("FIXME: should not close until the write ended");
+        return ClientResult::CloseClient;
       }
 
-      return match res {
-        SocketResult::Error => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient),
-        _                   => (RequiredEvents::FrontWriteBackNone, ClientResult::Continue)
-      };
+      if res == SocketResult::Error {
+        self.readiness.back_interest   = EventSet::none();
+        self.readiness.front_interest  = EventSet::none();
+        self.readiness.back_readiness  = EventSet::none();
+        self.readiness.front_readiness = EventSet::none();
+        return ClientResult::CloseClient;
+      } else {
+        return ClientResult::Continue;
+      }
     }
 
-    //trace!("{}\twritable front pos: {}, buf pos: {}, available: {}", self.log_context(), self.state.res_position, self.back_buf_position, self.back_buf.buffer.available_data());
-    //assert!(self.back_buf_position + self.back_buf.available_data() <= self.state.res_position);
-    if self.back_buf.buffer.available_data() == 0 {
-      return (RequiredEvents::FrontNoneBackRead, ClientResult::Continue);
+    if self.back_buf.output_data_size() == 0 {
+      self.readiness.back_interest.insert(EventSet::readable());
+      self.readiness.front_interest.remove(EventSet::writable());
+      return ClientResult::Continue;
     }
 
     //let to_copy = min(self.state.res_position - self.back_buf_position, self.back_buf.buffer.available_data());
@@ -389,8 +425,11 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
     match res {
       SocketResult::Error => {
-        self.readiness.front_readiness.remove(EventSet::writable());
-        (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient)
+        self.readiness.back_interest   = EventSet::none();
+        self.readiness.front_interest  = EventSet::none();
+        self.readiness.back_readiness  = EventSet::none();
+        self.readiness.front_readiness = EventSet::none();
+        ClientResult::CloseClient
       },
       _                   => {
         if res == SocketResult::WouldBlock {
@@ -401,18 +440,33 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           match self.state.as_ref().unwrap().response {
             Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
               self.reset();
-              (RequiredEvents::FrontReadBackNone, ClientResult::Continue)
+              self.readiness.front_interest.insert(EventSet::readable());
+              ClientResult::Continue
             },
-            Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => (RequiredEvents::FrontReadBackNone, ClientResult::Continue),
+            Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
+              self.readiness.back_interest.insert(EventSet::readable());
+              ClientResult::Continue
+            },
             Some(ResponseState::ResponseWithBody(_,_,_))       => {
               self.reset();
-              (RequiredEvents::FrontReadBackNone, ClientResult::Continue)
+              self.readiness.front_interest.insert(EventSet::readable());
+              ClientResult::Continue
             },
-            Some(ResponseState::Response(_,_)) => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
-            _ => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure)
+            Some(ResponseState::Response(_,_)) => {
+              self.readiness.front_interest.insert(EventSet::readable());
+              ClientResult::Continue
+            },
+            _ => {
+              self.readiness.back_interest   = EventSet::none();
+              self.readiness.front_interest  = EventSet::none();
+              self.readiness.back_readiness  = EventSet::none();
+              self.readiness.front_readiness = EventSet::none();
+              ClientResult::CloseBothFailure
+            }
           }
         } else {
-          (RequiredEvents::FrontWriteBackRead, ClientResult::Continue)
+          self.readiness.back_interest.insert(EventSet::readable());
+          ClientResult::Continue
         };
         //println!("WRITABLE returning: {:?}", res);
         res
@@ -421,15 +475,19 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   }
 
   // Forward content to application
-  fn back_writable(&mut self) -> (RequiredEvents, ClientResult) {
+  fn back_writable(&mut self) -> ClientResult {
     if self.status == ClientStatus::DefaultAnswer {
-      return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue)
+      self.readiness.back_interest.remove(EventSet::writable());
+      self.readiness.front_interest.insert(EventSet::writable());
+      return ClientResult::Continue;
     }
 
     //trace!("{}\twritable back pos: {}, buf pos: {}, available: {}", self.log_context(), self.state.req_position, self.front_buf_position, self.front_buf.buffer.available_data());
     //assert!(self.front_buf_position + self.front_buf.available_data() <= self.state.req_position);
     if self.front_buf.buffer.available_data() == 0 {
-      return (RequiredEvents::FrontReadBackNone, ClientResult::Continue);
+      self.readiness.front_interest.insert(EventSet::readable());
+      self.readiness.back_interest.remove(EventSet::writable());
+      return ClientResult::Continue;
     }
 
     let tokens = self.tokens().clone();
@@ -453,37 +511,69 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       }
 
       if let Some((front,back)) = tokens {
-        debug!("{}\tBACK [{}->{}]: wrote {} bytes", context, front.as_usize(), back.as_usize(), sz);
+        println!("{}\tBACK [{}->{}]: wrote {} bytes", context, front.as_usize(), back.as_usize(), sz);
       }
       match socket_res {
-        SocketResult::Error => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure),
+        SocketResult::Error => {
+          self.readiness.back_interest   = EventSet::none();
+          self.readiness.front_interest  = EventSet::none();
+          self.readiness.back_readiness  = EventSet::none();
+          self.readiness.front_readiness = EventSet::none();
+          ClientResult::CloseBothFailure
+        },
         _                   => {
           // FIXME/ should read exactly as much data as needed
           //if self.front_buf_position >= self.state.req_position {
           if self.front_buf.can_restart_parsing() {
             match self.state.as_ref().unwrap().request {
-              Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
-              Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => (RequiredEvents::FrontReadBackNone, ClientResult::Continue),
-              Some(RequestState::RequestWithBody(_,_,_,_))       => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
-              Some(RequestState::Request(_,_,_)) => (RequiredEvents::FrontNoneBackRead, ClientResult::Continue),
-              _ => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure)
+              Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
+                self.readiness.front_interest.remove(EventSet::readable());
+                self.readiness.back_interest.insert(EventSet::readable());
+                ClientResult::Continue
+              },
+              Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
+                self.readiness.front_interest.insert(EventSet::readable());
+                ClientResult::Continue
+              },
+              Some(RequestState::RequestWithBody(_,_,_,_))       => {
+                self.readiness.back_interest.insert(EventSet::readable());
+                ClientResult::Continue
+              },
+              Some(RequestState::Request(_,_,_)) => {
+                self.readiness.back_interest.insert(EventSet::readable());
+                ClientResult::Continue
+              },
+              _ => {
+                self.readiness.back_interest   = EventSet::none();
+                self.readiness.front_interest  = EventSet::none();
+                self.readiness.back_readiness  = EventSet::none();
+                self.readiness.front_readiness = EventSet::none();
+                ClientResult::CloseBothFailure
+              }
             }
           } else {
-            (RequiredEvents::FrontReadBackWrite, ClientResult::Continue)
+            self.readiness.front_interest.insert(EventSet::readable());
+            self.readiness.back_interest.insert(EventSet::writable());
+            ClientResult::Continue
           }
         }
       }
-    } else {
-      return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure)
+      } else {
+        self.readiness.back_interest   = EventSet::none();
+        self.readiness.front_interest  = EventSet::none();
+        self.readiness.back_readiness  = EventSet::none();
+        self.readiness.front_readiness = EventSet::none();
+        return ClientResult::CloseBothFailure;
     };
 
     res
   }
 
   // Read content from application
-  fn back_readable(&mut self) -> (RequiredEvents, ClientResult) {
+  fn back_readable(&mut self) -> ClientResult {
     if self.status == ClientStatus::DefaultAnswer {
-      return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue)
+      self.readiness.back_interest.remove(EventSet::readable());
+      return ClientResult::Continue;
     }
 
     //trace!("{}\treadable back pos: {}, buf pos: {}, available: {}", self.log_context(), self.state.res_position, self.back_buf_position, self.back_buf.buffer.available_data());
@@ -491,7 +581,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
     if self.back_buf.buffer.available_space() == 0 {
       //println!("BACK BUFFER FULL({} bytes): TOKENS {:?} {:?}", self.back_buf.available_data(), self.token, self.backend_token);
-      return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue);
+      self.readiness.back_interest.remove(EventSet::readable());
+      return ClientResult::Continue;
     }
 
     let tokens     = self.tokens().clone();
@@ -512,30 +603,35 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       }
 
       match r {
-        SocketResult::Error => (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure),
+        SocketResult::Error => {
+          self.readiness.reset();
+          ClientResult::CloseBothFailure
+        },
         _                   => {
           match self.state.as_ref().unwrap().response {
             Some(ResponseState::Response(_,_)) => {
               //FIXME: this keeps happening, why? Readable event already in queue when parsing ended?
               error!("{}\tshould not go back in back_readable if the whole response was parsed", context);
-              return  (RequiredEvents::FrontWriteBackNone, ClientResult::Continue);
+              self.readiness.back_interest.remove(EventSet::readable());
+              return  ClientResult::Continue;
             },
             Some(ResponseState::ResponseWithBody(_,_,_)) => {
-              //FIXME: should only read as much data as needed (ie not further than req_position)
-              //if self.back_buf_position + self.back_buf.buffer.available_data() >= self.state.res_position {
               if ! self.back_buf.needs_input() {
-                return  (RequiredEvents::FrontWriteBackNone, ClientResult::Continue)
+                self.readiness.back_interest.remove(EventSet::readable());
+                return ClientResult::Continue;
               } else {
-                return  (RequiredEvents::FrontWriteBackRead, ClientResult::Continue)
+                return ClientResult::Continue;
               }
             },
             Some(ResponseState::ResponseWithBodyChunks(_,_,ch)) => {
               if ch == Chunk::Ended {
-                panic!("{}\tback read should have stopped on chunk ended", context);
-                return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue);
+                error!("{}\tback read should have stopped on chunk ended", context);
+                self.readiness.back_interest.remove(EventSet::readable());
+                return ClientResult::Continue;
               } else if ch == Chunk::Error {
-                panic!("{}\tback read should have stopped on chunk error", context);
-                return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+                error!("{}\tback read should have stopped on chunk error", context);
+                self.readiness.reset();
+                return ClientResult::CloseClient;
               } else {
                 //if self.back_buf_position + self.back_buf.buffer.available_data() >= self.state.res_position {
                 if ! self.back_buf.needs_input() {
@@ -543,16 +639,19 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                   //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
                   if self.state.as_ref().unwrap().is_back_error() {
                     time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
-                    return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure);
+                    self.readiness.reset();
+                    return ClientResult::CloseBothFailure;
                   }
 
                   if let Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) = self.state.as_ref().unwrap().response {
-                    return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue);
+                    self.readiness.back_interest.remove(EventSet::readable());
+                    return ClientResult::Continue;
                   } else {
-                    return (RequiredEvents::FrontWriteBackRead, ClientResult::Continue);
+                    self.readiness.front_interest.insert(EventSet::writable());
+                    return ClientResult::Continue;
                   }
                 } else {
-                  return (RequiredEvents::FrontWriteBackRead, ClientResult::Continue);
+                  return ClientResult::Continue;
                 }
               }
             },
@@ -562,20 +661,25 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
               if self.state.as_ref().unwrap().is_back_error() {
                 time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
-                return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure);
+                self.readiness.reset();
+                return ClientResult::CloseBothFailure;
               }
 
               if let Some(ResponseState::Response(_,_)) = self.state.as_ref().unwrap().response {
-                return (RequiredEvents::FrontWriteBackNone, ClientResult::Continue);
+                self.readiness.front_interest.insert(EventSet::writable());
+                self.readiness.back_interest.remove(EventSet::readable());
+                return ClientResult::Continue;
               } else {
-                return (RequiredEvents::FrontWriteBackRead, ClientResult::Continue);
+                self.readiness.front_interest.insert(EventSet::writable());
+                return ClientResult::Continue;
               }
             }
           }
         }
       }
     } else {
-      return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure);
+      self.readiness.reset();
+      return ClientResult::CloseBothFailure;
     }
   }
 
@@ -736,6 +840,7 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
         Ok(socket) => {
         socket.set_nodelay(true);
         client.set_back_socket(socket);
+        client.readiness().back_interest.insert(EventSet::writable());
         Ok(())
         },
         Err(ConnectionError::NoBackendAvailable) => {
@@ -813,7 +918,9 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
 
       if let Ok(Some((frontend_sock, _))) = accepted {
         frontend_sock.set_nodelay(true);
-        if let Some(c) = Client::new("HTTP", frontend_sock, front_buf, back_buf) {
+        if let Some(mut c) = Client::new("HTTP", frontend_sock, front_buf, back_buf) {
+          c.readiness().front_interest.insert(EventSet::readable());
+          c.readiness().back_interest.remove(EventSet::readable() | EventSet::writable());
           return Some((c, false))
         }
       } else {

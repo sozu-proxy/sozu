@@ -43,6 +43,13 @@ impl Readiness {
       back_readiness:  EventSet::none(),
     }
   }
+
+  pub fn reset(&mut self) {
+    self.front_interest  = EventSet::none();
+    self.back_interest   = EventSet::none();
+    self.front_readiness = EventSet::none();
+    self.back_readiness  = EventSet::none();
+  }
 }
 
 pub trait ProxyClient {
@@ -61,10 +68,10 @@ pub trait ProxyClient {
   fn set_tokens(&mut self, token: Token, backend: Token);
   fn front_hup(&mut self)     -> ClientResult;
   fn back_hup(&mut self)      -> ClientResult;
-  fn readable(&mut self)      -> (RequiredEvents, ClientResult);
-  fn writable(&mut self)      -> (RequiredEvents, ClientResult);
-  fn back_readable(&mut self) -> (RequiredEvents, ClientResult);
-  fn back_writable(&mut self) -> (RequiredEvents, ClientResult);
+  fn readable(&mut self)      -> ClientResult;
+  fn writable(&mut self)      -> ClientResult;
+  fn back_readable(&mut self) -> ClientResult;
+  fn back_writable(&mut self) -> ClientResult;
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>);
   fn readiness(&mut self)      -> &mut Readiness;
 }
@@ -152,7 +159,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         if let Ok(backend_token) = self.backend.insert(token) {
           self.clients[token].set_back_token(backend_token);
 
-          self.clients[token].readiness().back_interest = EventSet::writable() | EventSet::hup() | EventSet::error();
+          //self.clients[token].readiness().back_interest = EventSet::writable() | EventSet::hup() | EventSet::error();
           if let Some(sock) = self.clients[token].back_socket() {
             event_loop.register(sock, backend_token, EventSet::all(), PollOpt::edge());
           }
@@ -190,9 +197,9 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
     }
   }
 
-  pub fn interpret_client_order(&mut self, event_loop: &mut EventLoop<Self>, token: Token, order: (RequiredEvents, ClientResult)) {
+  pub fn interpret_client_order(&mut self, event_loop: &mut EventLoop<Self>, token: Token, order: ClientResult) {
     //println!("INTERPRET ORDER: {:?}", order);
-    match order.1 {
+    match order {
       ClientResult::CloseClient      => self.close_client(event_loop, token),
       ClientResult::CloseBackend     => self.close_backend(event_loop, token),
       ClientResult::CloseBothSuccess => self.close_client(event_loop, token),
@@ -203,13 +210,13 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         //front_interest.insert(EventSet::readable());
         //back_interest.insert(EventSet::writable());
         //self.reregister(event_loop, token, front_interest, back_interest);
-        self.clients[token].readiness().front_interest = EventSet::readable() | EventSet::hup() | EventSet::error();
-        self.clients[token].readiness().back_interest = EventSet::writable() | EventSet::hup() | EventSet::error();
+        //self.clients[token].readiness().front_interest = EventSet::readable() | EventSet::hup() | EventSet::error();
+        //self.clients[token].readiness().back_interest = EventSet::writable() | EventSet::hup() | EventSet::error();
         self.connect_to_backend(event_loop, token)
       },
       ClientResult::Continue         => {
-        let mut front_interest = EventSet::hup() | EventSet::error();
-        let mut back_interest  = EventSet::hup() | EventSet::error();
+        //let mut front_interest = EventSet::hup() | EventSet::error();
+        //let mut back_interest  = EventSet::hup() | EventSet::error();
         //FIXME: instead of reregister, register once with Hup, Read and Write,
         //store the current interest depending on the protocol implementation,
         //and when ready is called, if there is interest, call the function right
@@ -217,6 +224,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         //find a way to call the function later when the protocol shows interest
         //again
         //this will drastically reduce the number of calls to reregister
+        /*
         if order.0.front_readable() {
           front_interest.insert(EventSet::readable());
         }
@@ -229,8 +237,9 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         if order.0.back_writable() {
           back_interest.insert(EventSet::writable());
         }
-        self.clients[token].readiness().front_interest = front_interest;
-        self.clients[token].readiness().back_interest  = back_interest;
+        */
+        //self.clients[token].readiness().front_interest = front_interest;
+        //self.clients[token].readiness().back_interest  = back_interest;
         //self.reregister(event_loop, token, front_interest, back_interest)
       }
     }

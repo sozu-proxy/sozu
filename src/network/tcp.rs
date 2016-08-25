@@ -170,10 +170,11 @@ impl ProxyClient for Client {
     }
   }
 
-  fn readable(&mut self) -> (RequiredEvents, ClientResult) {
+  fn readable(&mut self) -> ClientResult {
     println!("{}\tTCP\tFRONT [{}->{}] readable", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
     if self.front_buf.buffer.available_space() == 0 {
-      return (RequiredEvents::FrontNoneBackReadWrite, ClientResult::Continue);
+      self.readiness.front_interest.remove(EventSet::readable());
+      return ClientResult::Continue;
     }
 
     let (sz, res) = self.sock.socket_read(self.front_buf.buffer.space());
@@ -185,23 +186,25 @@ impl ProxyClient for Client {
 
     match res {
       SocketResult::Error => {
-        self.readiness.front_readiness.remove(EventSet::readable());
-        return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+        self.readiness.reset();
+        return ClientResult::CloseClient;
       },
       _                   => {
         if res == SocketResult::WouldBlock {
           self.readiness.front_readiness.remove(EventSet::readable());
         }
-        return (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue);
+        self.readiness.back_interest.insert(EventSet::writable());
+        return ClientResult::Continue;
       }
     }
   }
 
-  fn writable(&mut self) -> (RequiredEvents, ClientResult) {
+  fn writable(&mut self) -> ClientResult {
     println!("{}\tTCP\tFRONT [{}<-{}] writable", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
-     if self.back_buf.buffer.available_data() == 0 {
-        return (RequiredEvents::FrontReadBackReadWrite, ClientResult::Continue);
-     }
+    if self.back_buf.buffer.available_data() == 0 {
+      self.readiness.front_interest.remove(EventSet::writable());
+      return ClientResult::Continue;
+    }
 
      let mut sz = 0usize;
      let mut socket_res = SocketResult::Continue;
@@ -216,23 +219,26 @@ impl ProxyClient for Client {
 
      match socket_res {
        SocketResult::Error => {
-         self.readiness.front_readiness.remove(EventSet::writable());
-         (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure)
+         self.readiness.reset();
+         ClientResult::CloseBothFailure
        },
        SocketResult::WouldBlock => {
          self.readiness.front_readiness.remove(EventSet::writable());
-         (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
+         self.readiness.back_interest.insert(EventSet::readable());
+         ClientResult::Continue
        },
        SocketResult::Continue => {
-         (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
+         self.readiness.back_interest.insert(EventSet::readable());
+         ClientResult::Continue
        }
      }
   }
 
-  fn back_readable(&mut self) -> (RequiredEvents, ClientResult) {
+  fn back_readable(&mut self) -> ClientResult {
     println!("{}\tTCP\tBACK [{}<-{}] back_readable", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
     if self.back_buf.buffer.available_space() == 0 {
-      return (RequiredEvents::FrontWriteBackRead, ClientResult::Continue);
+      self.readiness.back_interest.remove(EventSet::readable());
+      return ClientResult::Continue;
     }
 
     if let Some(ref mut sock) = self.backend {
@@ -245,25 +251,29 @@ impl ProxyClient for Client {
 
       match res {
         SocketResult::Error => {
-          self.readiness.back_readiness.remove(EventSet::readable());
-          return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+          self.readiness.reset();
+          return ClientResult::CloseClient;
         },
         _                   => {
           if res == SocketResult::WouldBlock {
             self.readiness.back_readiness.remove(EventSet::readable());
           }
-          return (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue);
+          self.readiness.front_interest.insert(EventSet::writable());
+          return ClientResult::Continue;
         }
       }
     } else {
-      (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure)
+      self.readiness.reset();
+      ClientResult::CloseBothFailure
     }
   }
 
-  fn back_writable(&mut self) -> (RequiredEvents, ClientResult) {
+  fn back_writable(&mut self) -> ClientResult {
       println!("{}\tTCP\tBACK [{}->{}] back_writable", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
      if self.front_buf.buffer.available_data() == 0 {
-        return (RequiredEvents::FrontReadWriteBackRead, ClientResult::Continue);
+        self.readiness.back_interest.remove(EventSet::writable());
+        self.readiness.front_interest.insert(EventSet::readable());
+        return ClientResult::Continue;
      }
 
      let mut sz = 0usize;
@@ -281,15 +291,17 @@ impl ProxyClient for Client {
 
      match socket_res {
        SocketResult::Error => {
-         self.readiness.back_readiness.remove(EventSet::writable());
-         (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure)
+         self.readiness.reset();
+         ClientResult::CloseBothFailure
        },
        SocketResult::WouldBlock => {
          self.readiness.back_readiness.remove(EventSet::writable());
-         (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
+         self.readiness.front_interest.insert(EventSet::readable());
+         ClientResult::Continue
        },
        SocketResult::Continue => {
-         (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
+         self.readiness.front_interest.insert(EventSet::readable());
+         ClientResult::Continue
        }
      }
   }
@@ -427,7 +439,11 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
     let stream = try!(TcpStream::connect(backend_addr).map_err(|_| ConnectionError::ToBeDefined));
     stream.set_nodelay(true);
 
+    println!("CONNECT TO BACKEND: {:?}", backend_addr);
     client.set_back_socket(stream);
+    client.readiness().front_interest.insert(EventSet::readable() | EventSet::writable());
+    client.readiness().back_interest.insert(EventSet::readable() | EventSet::writable());
+    println!("CLIENT readiness: {:?}", client.readiness());
     Ok(())
   }
 
