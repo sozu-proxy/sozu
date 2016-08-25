@@ -171,7 +171,6 @@ impl ProxyClient for Client {
   }
 
   fn readable(&mut self) -> ClientResult {
-    println!("{}\tTCP\tFRONT [{}->{}] readable", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
     if self.front_buf.buffer.available_space() == 0 {
       self.readiness.front_interest.remove(EventSet::readable());
       return ClientResult::Continue;
@@ -200,7 +199,6 @@ impl ProxyClient for Client {
   }
 
   fn writable(&mut self) -> ClientResult {
-    println!("{}\tTCP\tFRONT [{}<-{}] writable", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
     if self.back_buf.buffer.available_data() == 0 {
       self.readiness.front_interest.remove(EventSet::writable());
       return ClientResult::Continue;
@@ -235,7 +233,6 @@ impl ProxyClient for Client {
   }
 
   fn back_readable(&mut self) -> ClientResult {
-    println!("{}\tTCP\tBACK [{}<-{}] back_readable", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
     if self.back_buf.buffer.available_space() == 0 {
       self.readiness.back_interest.remove(EventSet::readable());
       return ClientResult::Continue;
@@ -269,7 +266,6 @@ impl ProxyClient for Client {
   }
 
   fn back_writable(&mut self) -> ClientResult {
-      println!("{}\tTCP\tBACK [{}->{}] back_writable", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
      if self.front_buf.buffer.available_data() == 0 {
         self.readiness.back_interest.remove(EventSet::writable());
         self.readiness.front_interest.insert(EventSet::readable());
