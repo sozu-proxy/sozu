@@ -177,10 +177,14 @@ impl ProxyClient for Client {
     }
 
     let (sz, res) = self.sock.socket_read(self.front_buf.buffer.space());
-    self.front_buf.buffer.fill(sz);
-    self.front_buf.sliced_input(sz);
-    self.front_buf.consume_parsed_data(sz);
-    self.front_buf.slice_output(sz);
+    if sz > 0 {
+      self.front_buf.buffer.fill(sz);
+      self.front_buf.sliced_input(sz);
+      self.front_buf.consume_parsed_data(sz);
+      self.front_buf.slice_output(sz);
+    } else {
+      self.readiness.front_readiness.remove(EventSet::readable());
+    }
     println!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
 
     match res {

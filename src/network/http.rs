@@ -272,6 +272,10 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       self.readiness.front_interest.remove(EventSet::readable());
     }
 
+    if sz == 0 {
+      self.readiness.front_readiness.remove(EventSet::readable());
+    }
+
     match res {
       SocketResult::Error => {
         self.readiness.reset();
@@ -598,7 +602,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         debug!("{}\tBACK  [{}<-{}]: read {} bytes", context, front.as_usize(), back.as_usize(), sz);
       }
 
-      if r != SocketResult::Continue {
+      if r != SocketResult::Continue || sz == 0 {
         self.readiness.back_readiness.remove(EventSet::readable());
       }
 
