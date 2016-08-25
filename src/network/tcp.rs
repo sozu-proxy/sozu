@@ -185,7 +185,7 @@ impl ProxyClient for Client {
     } else {
       self.readiness.front_readiness.remove(EventSet::readable());
     }
-    println!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
+    trace!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
 
     match res {
       SocketResult::Error => {
@@ -217,7 +217,7 @@ impl ProxyClient for Client {
        self.back_buf.consume_output_data(current_sz);
        sz += current_sz;
      }
-     println!("{}\tTCP\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
+     trace!("{}\tTCP\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
 
      match socket_res {
        SocketResult::Error => {
@@ -248,7 +248,7 @@ impl ProxyClient for Client {
       self.back_buf.sliced_input(sz);
       self.back_buf.consume_parsed_data(sz);
       self.back_buf.slice_output(sz);
-      println!("{}\tTCP\tBACK  [{}<-{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
+      trace!("{}\tTCP\tBACK  [{}<-{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
 
       match res {
         SocketResult::Error => {
@@ -287,7 +287,7 @@ impl ProxyClient for Client {
          sz += current_sz;
        }
      }
-    println!("{}\tTCP\tBACK [{}->{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
+    trace!("{}\tTCP\tBACK [{}->{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
 
      match socket_res {
        SocketResult::Error => {
@@ -439,11 +439,9 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
     let stream = try!(TcpStream::connect(backend_addr).map_err(|_| ConnectionError::ToBeDefined));
     stream.set_nodelay(true);
 
-    println!("CONNECT TO BACKEND: {:?}", backend_addr);
     client.set_back_socket(stream);
     client.readiness().front_interest.insert(EventSet::readable() | EventSet::writable());
     client.readiness().back_interest.insert(EventSet::readable() | EventSet::writable());
-    println!("CLIENT readiness: {:?}", client.readiness());
     Ok(())
   }
 
