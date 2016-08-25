@@ -515,7 +515,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       }
 
       if let Some((front,back)) = tokens {
-        println!("{}\tBACK [{}->{}]: wrote {} bytes", context, front.as_usize(), back.as_usize(), sz);
+        //println!("{}\tBACK [{}->{}]: wrote {} bytes", context, front.as_usize(), back.as_usize(), sz);
       }
       match socket_res {
         SocketResult::Error => {
