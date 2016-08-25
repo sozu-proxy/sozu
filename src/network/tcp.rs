@@ -17,6 +17,10 @@ use rand::random;
 use uuid::Uuid;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents};
 use network::proxy::{Server,ProxyClient,ProxyConfiguration,Readiness};
+use network::buffer::Buffer;
+use network::buffer_queue::BufferQueue;
+use network::socket::{SocketHandler,SocketResult};
+use pool::{Pool,Checkout,Reset};
 
 use messages::{TcpFront,Command,Instance};
 
@@ -35,8 +39,8 @@ pub enum ConnectionStatus {
 pub struct Client {
   sock:           TcpStream,
   backend:        Option<TcpStream>,
-  front_buf:      Option<MutByteBuf>,
-  back_buf:       Option<MutByteBuf>,
+  front_buf:      Checkout<BufferQueue>,
+  back_buf:       Checkout<BufferQueue>,
   token:          Option<Token>,
   backend_token:  Option<Token>,
   accept_token:   Token,
@@ -53,12 +57,13 @@ pub struct Client {
 }
 
 impl Client {
-  fn new(sock: TcpStream, accept_token: Token) -> Option<Client> {
+  fn new(sock: TcpStream, accept_token: Token, front_buf: Checkout<BufferQueue>,
+    back_buf: Checkout<BufferQueue>) -> Option<Client> {
     Some(Client {
       sock:           sock,
       backend:        None,
-      front_buf:      Some(ByteBuf::mut_with_capacity(2048)),
-      back_buf:       Some(ByteBuf::mut_with_capacity(2048)),
+      front_buf:      front_buf,
+      back_buf:       back_buf,
       token:          None,
       backend_token:  None,
       accept_token:   accept_token,
@@ -102,11 +107,11 @@ impl ProxyClient for Client {
   }
 
   fn set_back_socket(&mut self, socket: TcpStream) {
-    self.backend         = Some(socket);
+    self.backend       = Some(socket);
   }
 
   fn set_front_token(&mut self, token: Token) {
-    self.token         = Some(token); 
+    self.token         = Some(token);
   }
 
   fn set_back_token(&mut self, token: Token) {
@@ -165,124 +170,128 @@ impl ProxyClient for Client {
     }
   }
 
-  fn writable(&mut self) -> (RequiredEvents, ClientResult) {
-    trace!("{}\tTCP\tin writable()", self.request_id);
-    if let Some(buf) = self.back_buf.take() {
-      //trace!("in writable 2: back_buf contains {} bytes", buf.remaining());
-
-      let mut b = buf.flip();
-      match self.sock.try_write_buf(&mut b) {
-        Ok(None) => {
-          error!("{}\tTCP\tclient flushing buf; WOULDBLOCK", self.request_id);
-
-          self.front_interest.insert(EventSet::writable());
-        }
-        Ok(Some(r)) => {
-          //FIXME what happens if not everything was written?
-          debug!("{}\tTCP\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
-
-          self.tx_count = self.tx_count + r;
-
-          //self.front_interest.insert(EventSet::readable());
-          if r > 0 {
-            self.readiness.front_readiness.remove(EventSet::writable());
-          }
-          self.front_interest.remove(EventSet::writable());
-          self.back_interest.insert(EventSet::readable());
-        }
-        Err(e) =>  error!("{}\tTCP\tnot implemented; client err={:?}", self.request_id, e),
-      }
-      self.back_buf = Some(b.flip());
-    }
-    (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
-  }
-
   fn readable(&mut self) -> (RequiredEvents, ClientResult) {
-    let mut buf = self.front_buf.take().unwrap();
-    //trace!("in readable(): front_mut_buf contains {} bytes", buf.remaining());
+    println!("{}\tTCP\tFRONT [{}->{}] readable", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
+    if self.front_buf.buffer.available_space() == 0 {
+      return (RequiredEvents::FrontNoneBackReadWrite, ClientResult::Continue);
+    }
 
-    match self.sock.try_read_buf(&mut buf) {
-      Ok(None) => {
-        error!("{}\tTCP\tWe just got readable, but were unable to read from the socket?", self.request_id);
-      }
-      Ok(Some(r)) => {
-        println!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
-        if r > 0 {
+    let (sz, res) = self.sock.socket_read(self.front_buf.buffer.space());
+    self.front_buf.buffer.fill(sz);
+    self.front_buf.sliced_input(sz);
+    self.front_buf.consume_parsed_data(sz);
+    self.front_buf.slice_output(sz);
+    println!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
+
+    match res {
+      SocketResult::Error => {
+        self.readiness.front_readiness.remove(EventSet::readable());
+        return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+      },
+      _                   => {
+        if res == SocketResult::WouldBlock {
           self.readiness.front_readiness.remove(EventSet::readable());
         }
-        self.front_interest.remove(EventSet::readable());
-        self.back_interest.insert(EventSet::writable());
-        self.rx_count = self.rx_count + r;
-        // prepare to provide this to writable
+        return (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue);
       }
-      Err(e) => {
-        error!("{}\tTCP\tnot implemented; client err={:?}", self.request_id, e);
-        //self.front_interest.remove(EventSet::readable());
-      }
-    };
-    self.front_buf = Some(buf);
-
-    (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
+    }
   }
 
-  fn back_writable(&mut self) -> (RequiredEvents, ClientResult) {
-    if let Some(buf) = self.front_buf.take() {
-      //trace!("in back_writable 2: front_buf contains {} bytes", buf.remaining());
+  fn writable(&mut self) -> (RequiredEvents, ClientResult) {
+    println!("{}\tTCP\tFRONT [{}<-{}] writable", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
+     if self.back_buf.buffer.available_data() == 0 {
+        return (RequiredEvents::FrontReadBackReadWrite, ClientResult::Continue);
+     }
 
-      let mut b = buf.flip();
-      if let Some(ref mut sock) = self.backend {
-        match sock.try_write_buf(&mut b) {
-          Ok(None) => {
-            error!("{}\tTCP\tclient flushing buf; WOULDBLOCK", self.request_id);
+     let mut sz = 0usize;
+     let mut socket_res = SocketResult::Continue;
 
-            self.back_interest.insert(EventSet::writable());
-          }
-          Ok(Some(r)) => {
-            //FIXME what happens if not everything was written?
-            debug!("{}\tTCP\tBACK [{}->{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
+     while socket_res == SocketResult::Continue && self.back_buf.output_data_size() > 0 {
+       let (current_sz, current_res) = self.sock.socket_write(self.back_buf.next_output_data());
+       socket_res = current_res;
+       self.back_buf.consume_output_data(current_sz);
+       sz += current_sz;
+     }
+     println!("{}\tTCP\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
 
-            if r > 0 {
-              self.readiness.back_readiness.remove(EventSet::writable());
-            }
-            self.front_interest.insert(EventSet::readable());
-            self.back_interest.remove(EventSet::writable());
-            self.back_interest.insert(EventSet::readable());
-          }
-          Err(e) =>  error!("{}\tTCP\tnot implemented; client err={:?}", self.request_id, e),
-        }
-      }
-      self.front_buf = Some(b.flip());
-    }
-    (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
+     match socket_res {
+       SocketResult::Error => {
+         self.readiness.front_readiness.remove(EventSet::writable());
+         (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure)
+       },
+       SocketResult::WouldBlock => {
+         self.readiness.front_readiness.remove(EventSet::writable());
+         (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
+       },
+       SocketResult::Continue => {
+         (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
+       }
+     }
   }
 
   fn back_readable(&mut self) -> (RequiredEvents, ClientResult) {
-    let mut buf = self.back_buf.take().unwrap();
-    //trace!("{}\tTCP\tin back_readable(): back_mut_buf contains {} bytes", self.request_id, buf.remaining());
+    println!("{}\tTCP\tBACK [{}<-{}] back_readable", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
+    if self.back_buf.buffer.available_space() == 0 {
+      return (RequiredEvents::FrontWriteBackRead, ClientResult::Continue);
+    }
 
     if let Some(ref mut sock) = self.backend {
-      match sock.try_read_buf(&mut buf) {
-        Ok(None) => {
-          error!("{}\tTCP\tWe just got readable, but were unable to read from the socket?", self.request_id);
-        }
-        Ok(Some(r)) => {
-          println!("{}\tTCP\tBACK  [{}<-{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), r);
-          if r > 0 {
+      let (sz, res) = sock.socket_read(self.back_buf.buffer.space());
+      self.back_buf.buffer.fill(sz);
+      self.back_buf.sliced_input(sz);
+      self.back_buf.consume_parsed_data(sz);
+      self.back_buf.slice_output(sz);
+      println!("{}\tTCP\tBACK  [{}<-{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
+
+      match res {
+        SocketResult::Error => {
+          self.readiness.back_readiness.remove(EventSet::readable());
+          return (RequiredEvents::FrontNoneBackNone, ClientResult::CloseClient);
+        },
+        _                   => {
+          if res == SocketResult::WouldBlock {
             self.readiness.back_readiness.remove(EventSet::readable());
           }
-          self.back_interest.remove(EventSet::readable());
-          self.front_interest.insert(EventSet::writable());
-          // prepare to provide this to writable
+          return (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue);
         }
-        Err(e) => {
-          error!("{}\tTCP\tnot implemented; client err={:?}", self.request_id, e);
-          //self.interest.remove(EventSet::readable());
-        }
-      };
+      }
+    } else {
+      (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure)
     }
-    self.back_buf = Some(buf);
+  }
 
-    (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
+  fn back_writable(&mut self) -> (RequiredEvents, ClientResult) {
+      println!("{}\tTCP\tBACK [{}->{}] back_writable", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
+     if self.front_buf.buffer.available_data() == 0 {
+        return (RequiredEvents::FrontReadWriteBackRead, ClientResult::Continue);
+     }
+
+     let mut sz = 0usize;
+     let mut socket_res = SocketResult::Continue;
+
+     if let Some(ref mut sock) = self.backend {
+       while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
+         let (current_sz, current_res) = sock.socket_write(self.front_buf.next_output_data());
+         socket_res = current_res;
+         self.front_buf.consume_output_data(current_sz);
+         sz += current_sz;
+       }
+     }
+    println!("{}\tTCP\tBACK [{}->{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
+
+     match socket_res {
+       SocketResult::Error => {
+         self.readiness.back_readiness.remove(EventSet::writable());
+         (RequiredEvents::FrontNoneBackNone, ClientResult::CloseBothFailure)
+       },
+       SocketResult::WouldBlock => {
+         self.readiness.back_readiness.remove(EventSet::writable());
+         (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
+       },
+       SocketResult::Continue => {
+         (RequiredEvents::FrontReadWriteBackReadWrite, ClientResult::Continue)
+       }
+     }
   }
 
   fn readiness(&mut self) -> &mut Readiness {
@@ -302,10 +311,11 @@ pub struct ApplicationListener {
 type ClientToken = Token;
 
 pub struct ServerConfiguration {
-  fronts:    HashMap<String, Token>,
-  instances: HashMap<String, Vec<Backend>>,
-  listeners: Slab<ApplicationListener>,
-  tx:        mpsc::Sender<ServerMessage>,
+  fronts:          HashMap<String, Token>,
+  instances:       HashMap<String, Vec<Backend>>,
+  listeners:       Slab<ApplicationListener>,
+  tx:              mpsc::Sender<ServerMessage>,
+  pool:            Pool<BufferQueue>,
   front_timeout:   u64,
   back_timeout:    u64,
 }
@@ -313,12 +323,13 @@ pub struct ServerConfiguration {
 impl ServerConfiguration {
   pub fn new(max_listeners: usize,  tx: mpsc::Sender<ServerMessage>) -> ServerConfiguration {
     ServerConfiguration {
-      instances: HashMap::new(),
-      listeners: Slab::new_starting_at(Token(0), max_listeners),
-      fronts:    HashMap::new(),
-      tx:        tx,
-      front_timeout: 50000,
-      back_timeout:  50000,
+      instances:     HashMap::new(),
+      listeners:     Slab::new_starting_at(Token(0), max_listeners),
+      fronts:        HashMap::new(),
+      tx:            tx,
+      pool:          Pool::with_capacity(2*max_listeners, 0, || BufferQueue::with_capacity(2048)),
+      front_timeout: 5000,
+      back_timeout:  5000,
     }
   }
 
@@ -476,15 +487,19 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
   }
 
   fn accept(&mut self, token: Token) -> Option<(Client, bool)> {
-    if self.listeners.contains(token) {
-      let accepted = self.listeners[token].sock.accept();
+    if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
+      if self.listeners.contains(token) {
+        let accepted = self.listeners[token].sock.accept();
 
-      if let Ok(Some((frontend_sock, _))) = accepted {
-        frontend_sock.set_nodelay(true);
-        if let Some(c) = Client::new(frontend_sock, token) {
-          return Some((c, true));
+        if let Ok(Some((frontend_sock, _))) = accepted {
+          frontend_sock.set_nodelay(true);
+          if let Some(c) = Client::new(frontend_sock, token, front_buf, back_buf) {
+            return Some((c, true));
+          }
         }
       }
+    } else {
+      error!("TCP\tcould not get buffers from pool");
     }
     None
   }
