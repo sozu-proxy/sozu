@@ -281,71 +281,56 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
-      _                   => {
-        if res == SocketResult::WouldBlock {
-          self.readiness.front_readiness.remove(EventSet::readable());
-        }
+      SocketResult::WouldBlock => {
+        self.readiness.front_readiness.remove(EventSet::readable());
+      },
+      SocketResult::Continue => {}
+    };
 
-        if !has_host {
-          let new_header = self.added_request_header();
-          self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.front_buf, new_header.as_bytes()));
-          //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
-          if self.state.as_ref().unwrap().is_front_error() {
-            time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+    let has_host = self.state.as_ref().unwrap().has_host();
+    if !has_host {
+      println!("readable[{}]", line!());
+      let new_header = self.added_request_header();
+      self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.front_buf, new_header.as_bytes()));
+      println!("{}\tparse_request_until_stop returned {:?}", self.log_context(), self.state);
+      if self.state.as_ref().unwrap().is_front_error() {
+        time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+        self.readiness.front_interest.remove(EventSet::readable());
+        return ClientResult::CloseClient;
+      }
+
+      if self.state.as_ref().unwrap().has_host() {
+        self.readiness.back_interest.insert(EventSet::writable());
+        return ClientResult::ConnectBackend;
+      } else {
+        return ClientResult::Continue;
+      }
+    } else {
+      self.readiness.back_interest.insert(EventSet::writable());
+      match self.state.as_ref().unwrap().request {
+        Some(RequestState::Request(_,_,_)) | Some(RequestState::RequestWithBody(_,_,_,_)) => {
+          if ! self.front_buf.needs_input() {
+            println!("readable[{}] does not needs input: {} request = {:?}", line!(),
+            self.front_buf.input_data_size(), self.state.as_ref().unwrap().request);
+            println!("unparsed data:\n{}", self.front_buf.unparsed_data().to_hex(16));
             self.readiness.front_interest.remove(EventSet::readable());
-            return ClientResult::CloseClient;
-          }
-
-          if self.state.as_ref().unwrap().has_host() {
-            self.readiness.back_interest.insert(EventSet::writable());
-            return ClientResult::ConnectBackend;
+            return  ClientResult::Continue;
           } else {
-            return ClientResult::Continue;
+            return  ClientResult::Continue;
           }
-        } else {
-          self.readiness.back_interest.insert(EventSet::writable());
-          match self.state.as_ref().unwrap().request {
-            Some(RequestState::Request(_,_,_)) | Some(RequestState::RequestWithBody(_,_,_,_)) => {
-              if ! self.front_buf.needs_input() {
-                self.readiness.front_interest.remove(EventSet::readable());
-                return  ClientResult::Continue;
-              } else {
-                return  ClientResult::Continue;
-              }
-            },
-            Some(RequestState::RequestWithBodyChunks(_,_,_,ch)) => {
-              if ch == Chunk::Ended {
-                error!("{}\tfront read should have stopped on chunk ended", self.log_context(),);
-                self.readiness.front_interest.remove(EventSet::readable());
-                return ClientResult::Continue;
-              } else if ch == Chunk::Error {
-                error!("{}\tfront read should have stopped on chunk error", self.log_context(),);
-                self.readiness.reset();
-                return ClientResult::CloseClient;
-              } else {
-                //if self.front_buf_position + self.front_buf.buffer.available_data() >= self.state.req_position {
-                if ! self.front_buf.needs_input() {
-                  let new_header = self.added_request_header();
-                  self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.front_buf, new_header.as_bytes()));
-                  //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
-                  if self.state.as_ref().unwrap().is_front_error() {
-                    time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
-                    self.readiness.reset();
-                    return ClientResult::CloseClient;
-                  }
-
-                  if let Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) = self.state.as_ref().unwrap().request {
-                    self.readiness.front_interest.remove(EventSet::readable());
-                    return ClientResult::Continue;
-                  } else {
-                    return ClientResult::Continue;
-                  }
-                } else {
-                  return ClientResult::Continue;
-                }
-              }
-            },
-            _ => {
+        },
+        Some(RequestState::RequestWithBodyChunks(_,_,_,ch)) => {
+          if ch == Chunk::Ended {
+            error!("{}\tfront read should have stopped on chunk ended", self.log_context(),);
+            self.readiness.front_interest.remove(EventSet::readable());
+            return ClientResult::Continue;
+          } else if ch == Chunk::Error {
+            error!("{}\tfront read should have stopped on chunk error", self.log_context(),);
+            self.readiness.reset();
+            return ClientResult::CloseClient;
+          } else {
+            //if self.front_buf_position + self.front_buf.buffer.available_data() >= self.state.req_position {
+            if ! self.front_buf.needs_input() {
               let new_header = self.added_request_header();
               self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.front_buf, new_header.as_bytes()));
               //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
@@ -355,15 +340,34 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                 return ClientResult::CloseClient;
               }
 
-              if let Some(RequestState::Request(_,_,_)) = self.state.as_ref().unwrap().request {
+              if let Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) = self.state.as_ref().unwrap().request {
                 self.readiness.front_interest.remove(EventSet::readable());
-                self.readiness.back_interest.insert(EventSet::writable());
                 return ClientResult::Continue;
               } else {
-                self.readiness.back_interest.insert(EventSet::writable());
                 return ClientResult::Continue;
               }
+            } else {
+              return ClientResult::Continue;
             }
+          }
+        },
+      _ => {
+        let new_header = self.added_request_header();
+          self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.front_buf, new_header.as_bytes()));
+          //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
+          if self.state.as_ref().unwrap().is_front_error() {
+            time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+            self.readiness.reset();
+            return ClientResult::CloseClient;
+          }
+
+          if let Some(RequestState::Request(_,_,_)) = self.state.as_ref().unwrap().request {
+            self.readiness.front_interest.remove(EventSet::readable());
+            self.readiness.back_interest.insert(EventSet::writable());
+            return ClientResult::Continue;
+          } else {
+            self.readiness.back_interest.insert(EventSet::writable());
+            return ClientResult::Continue;
           }
         }
       }
