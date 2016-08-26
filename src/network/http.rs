@@ -262,7 +262,6 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       }
     }
 
-    let has_host = self.state.as_ref().unwrap().has_host();
     let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
     println!("{}\tFRONT [{:?}]: read {} bytes", self.log_context(), self.token, sz);
 
