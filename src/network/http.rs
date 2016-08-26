@@ -264,9 +264,19 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
     let has_host = self.state.as_ref().unwrap().has_host();
     let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
-    debug!("{}\tFRONT [{:?}]: read {} bytes", self.log_context(), self.token, sz);
-    self.front_buf.buffer.fill(sz);
-    self.front_buf.sliced_input(sz);
+    println!("{}\tFRONT [{:?}]: read {} bytes", self.log_context(), self.token, sz);
+
+    if sz > 0 {
+      self.front_buf.buffer.fill(sz);
+      self.front_buf.sliced_input(sz);
+
+      if self.front_buf.start_parsing_position > self.front_buf.parsed_position {
+        let to_consume = min(self.front_buf.input_data_size(),
+        self.front_buf.start_parsing_position - self.front_buf.parsed_position);
+        self.front_buf.consume_parsed_data(to_consume);
+      }
+
+    }
 
     if self.front_buf.buffer.available_space() == 0 {
       self.readiness.front_interest.remove(EventSet::readable());
