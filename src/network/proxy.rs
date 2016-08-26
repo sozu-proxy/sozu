@@ -204,44 +204,8 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
       ClientResult::CloseBackend     => self.close_backend(event_loop, token),
       ClientResult::CloseBothSuccess => self.close_client(event_loop, token),
       ClientResult::CloseBothFailure => self.close_client(event_loop, token),
-      ClientResult::ConnectBackend   => {
-        //let mut front_interest = EventSet::hup();
-        //let mut back_interest  = EventSet::hup();
-        //front_interest.insert(EventSet::readable());
-        //back_interest.insert(EventSet::writable());
-        //self.reregister(event_loop, token, front_interest, back_interest);
-        //self.clients[token].readiness().front_interest = EventSet::readable() | EventSet::hup() | EventSet::error();
-        //self.clients[token].readiness().back_interest = EventSet::writable() | EventSet::hup() | EventSet::error();
-        self.connect_to_backend(event_loop, token)
-      },
-      ClientResult::Continue         => {
-        //let mut front_interest = EventSet::hup() | EventSet::error();
-        //let mut back_interest  = EventSet::hup() | EventSet::error();
-        //FIXME: instead of reregister, register once with Hup, Read and Write,
-        //store the current interest depending on the protocol implementation,
-        //and when ready is called, if there is interest, call the function right
-        //away, otherwise store its readiness state
-        //find a way to call the function later when the protocol shows interest
-        //again
-        //this will drastically reduce the number of calls to reregister
-        /*
-        if order.0.front_readable() {
-          front_interest.insert(EventSet::readable());
-        }
-        if order.0.front_writable() {
-          front_interest.insert(EventSet::writable());
-        }
-        if order.0.back_readable() {
-          back_interest.insert(EventSet::readable());
-        }
-        if order.0.back_writable() {
-          back_interest.insert(EventSet::writable());
-        }
-        */
-        //self.clients[token].readiness().front_interest = front_interest;
-        //self.clients[token].readiness().back_interest  = back_interest;
-        //self.reregister(event_loop, token, front_interest, back_interest)
-      }
+      ClientResult::ConnectBackend   => self.connect_to_backend(event_loop, token),
+      ClientResult::Continue         => {}
     }
   }
 
