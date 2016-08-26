@@ -841,10 +841,12 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
         },
         Err(ConnectionError::NoBackendAvailable) => {
           client.set_answer(&self.answers.ServiceUnavailable);
+          client.readiness().front_interest.insert(EventSet::writable());
           Err(ConnectionError::NoBackendAvailable)
         }
         Err(ConnectionError::HostNotFound) => {
           client.set_answer(&self.answers.NotFound);
+          client.readiness().front_interest.insert(EventSet::writable());
           Err(ConnectionError::HostNotFound)
         }
         e => panic!(e)
@@ -1043,7 +1045,7 @@ mod tests {
     // 5 seconds of timeout
     client.set_read_timeout(Some(Duration::new(5,0)));
     thread::sleep(Duration::from_millis(100));
-    let mut w  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\n\r\n"[..]);
+    let mut w  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..]);
     println!("http client write: {:?}", w);
     let mut buffer = [0;4096];
     thread::sleep(Duration::from_millis(500));
@@ -1063,8 +1065,8 @@ mod tests {
         //assert!(false);
       }
     }
-    let mut w2  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\n\r\n"[..]);
     let mut buffer2 = [0;4096];
+    let mut w2  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..]);
     thread::sleep(Duration::from_millis(500));
     let mut r2 = client.read(&mut buffer2[..]);
     println!("http client read: {:?}", r2);
