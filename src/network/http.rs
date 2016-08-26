@@ -602,6 +602,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               return  ClientResult::Continue;
             },
             Some(ResponseState::ResponseWithBody(_,_,_)) => {
+              self.readiness.front_interest.insert(EventSet::writable());
               if ! self.back_buf.needs_input() {
                 self.readiness.back_interest.remove(EventSet::readable());
                 return ClientResult::Continue;
