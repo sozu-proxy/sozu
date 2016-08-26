@@ -493,7 +493,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
     //trace!("{}\twritable back pos: {}, buf pos: {}, available: {}", self.log_context(), self.state.req_position, self.front_buf_position, self.front_buf.buffer.available_data());
     //assert!(self.front_buf_position + self.front_buf.available_data() <= self.state.req_position);
-    if self.front_buf.buffer.available_data() == 0 {
+    if self.front_buf.output_data_size() == 0 {
       self.readiness.front_interest.insert(EventSet::readable());
       self.readiness.back_interest.remove(EventSet::writable());
       return ClientResult::Continue;
