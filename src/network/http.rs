@@ -417,10 +417,17 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       return ClientResult::Continue;
     }
 
-    //let to_copy = min(self.state.res_position - self.back_buf_position, self.back_buf.buffer.available_data());
-    let (sz, res) = self.frontend.socket_write(self.back_buf.next_output_data());
-    self.back_buf.consume_output_data(sz);
-    self.back_buf_position += sz;
+    let mut sz = 0usize;
+    let mut res = SocketResult::Continue;
+    while res == SocketResult::Continue && self.back_buf.output_data_size() > 0 {
+      let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
+      res = current_res;
+      //println!("FRONT_WRITABLE[{}] wrote {} bytes:\n{}\nres={:?}", line!(), sz, self.back_buf.next_output_data().to_hex(16), res);
+      self.back_buf.consume_output_data(current_sz);
+      self.back_buf_position += current_sz;
+      sz += current_sz;
+    }
+
     if let Some((front,back)) = self.tokens() {
       debug!("{}\tFRONT [{}<-{}]: wrote {} bytes", self.log_context(), front.as_usize(), back.as_usize(), sz);
       //debug!("{}\tFRONT [{}<-{}]: back buf: {:?}", self.log_context(), front.as_usize(), back.as_usize(), *self.back_buf);
