@@ -1011,6 +1011,67 @@ mod tests {
     }
   }
 
+  #[allow(unused_mut, unused_must_use, unused_variables)]
+  #[test]
+  fn keep_alive() {
+    start_server();
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1031").unwrap();
+    let (tx,rx) = channel::<ServerMessage>();
+    let (sender, jg) = start_listener(front, 10, 12000, tx.clone());
+    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1031"), path_begin: String::from("/") };
+    sender.send(ProxyOrder::Command(String::from("ID_ABCD"), Command::AddHttpFront(front)));
+    let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
+    sender.send(ProxyOrder::Command(String::from("ID_EFGH"), Command::AddInstance(instance)));
+    println!("test received: {:?}", rx.recv());
+    println!("test received: {:?}", rx.recv());
+    thread::sleep(Duration::from_millis(300));
+
+    let mut client = TcpStream::connect(("127.0.0.1", 1031)).unwrap();
+    // 5 seconds of timeout
+    client.set_read_timeout(Some(Duration::new(5,0)));
+    thread::sleep(Duration::from_millis(100));
+    let mut w  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\n\r\n"[..]);
+    println!("http client write: {:?}", w);
+    let mut buffer = [0;4096];
+    thread::sleep(Duration::from_millis(500));
+    let mut r = client.read(&mut buffer[..]);
+    println!("http client read: {:?}", r);
+    match r {
+      Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
+      Ok(sz) => {
+        // Read the Response.
+        println!("read response");
+
+        println!("Response: {}", str::from_utf8(&buffer[..]).unwrap());
+
+        //thread::sleep(Duration::from_millis(300));
+        //assert_eq!(&body, &"Hello World!"[..]);
+        assert_eq!(sz, 204);
+        //assert!(false);
+      }
+    }
+    let mut w2  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\n\r\n"[..]);
+    let mut buffer2 = [0;4096];
+    thread::sleep(Duration::from_millis(500));
+    let mut r2 = client.read(&mut buffer2[..]);
+    println!("http client read: {:?}", r2);
+    match r2 {
+      Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
+      Ok(sz) => {
+        // Read the Response.
+        println!("read response");
+
+        println!("Response: {}", str::from_utf8(&buffer2[..]).unwrap());
+
+        //thread::sleep(Duration::from_millis(300));
+        //assert_eq!(&body, &"Hello World!"[..]);
+        assert_eq!(sz, 204);
+        //assert!(false);
+      }
+    }
+  }
+
+
   use self::tiny_http::{ServerBuilder, Response};
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
