@@ -525,6 +525,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       //if self.front_buf_position >= self.state.req_position {
       if self.front_buf.can_restart_parsing() {
         match self.state.as_ref().unwrap().request {
+          Some(RequestState::Request(_,_,_))                            |
+          Some(RequestState::RequestWithBody(_,_,_,_))                  |
           Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
             self.readiness.front_interest.remove(EventSet::readable());
             self.readiness.back_interest.insert(EventSet::readable());
@@ -533,16 +535,6 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           },
           Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
             self.readiness.front_interest.insert(EventSet::readable());
-            ClientResult::Continue
-          },
-          Some(RequestState::RequestWithBody(_,_,_,_))       => {
-            self.readiness.back_interest.insert(EventSet::readable());
-            self.readiness.back_interest.remove(EventSet::writable());
-            ClientResult::Continue
-          },
-          Some(RequestState::Request(_,_,_)) => {
-            self.readiness.back_interest.insert(EventSet::readable());
-            self.readiness.back_interest.remove(EventSet::writable());
             ClientResult::Continue
           },
           _ => {
