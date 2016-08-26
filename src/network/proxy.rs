@@ -264,7 +264,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
   type Message = ProxyOrder;
 
   fn ready(&mut self, event_loop: &mut EventLoop<Self>, token: Token, events: EventSet) {
-    trace!("PROXY\t{:?} got events: {:?}", token, events);
+    //println!("PROXY\t{:?} got events: {:?}", token, events);
 
     let client_token:Token = match socket_type(token, self.max_listeners, self.max_connections) {
       Some(SocketType::Listener) => {
@@ -306,26 +306,18 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
     };
 
     loop {
-      //println!("PROXY\tclient:{:?} readiness: {:?}", client_token, self.clients[client_token].readiness());
       let front_interest = self.clients[client_token].readiness().front_interest &
         self.clients[client_token].readiness().front_readiness;
       let back_interest = self.clients[client_token].readiness().back_interest &
         self.clients[client_token].readiness().back_readiness;
 
-      //println!("PROXY\tclient:{:?} front: {:?}", client_token, front_interest);
-      //println!("PROXY\tclient:{:?} back:  {:?}", client_token, back_interest);
-      //println!("PROXY\tclients: {:?}", self.clients);
+      //println!("PROXY\t{:?} {:?} | {:?} front: {:?} | back: {:?} ", client_token, events, self.clients[client_token].readiness(), front_interest, back_interest);
 
       if front_interest == EventSet::none() && back_interest == EventSet::none() {
-        //println!("quitting loop\n");
         break;
-      } else {
-        //println!("will handle");
-        //println!("\n");
       }
 
       if !self.clients.contains(client_token) {
-        //println!("the client was deleted, quitting loop\n");
         break;
       }
 
@@ -386,7 +378,6 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         self.clients[client_token].readiness().front_readiness.remove(EventSet::hup());
       }
       if !self.clients.contains(client_token) {
-        //println!("the client was deleted, quitting loop\n");
         break;
       }
 

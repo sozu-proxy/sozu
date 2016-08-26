@@ -691,7 +691,7 @@ mod tests {
       let response = b" END";
       while let Ok(sz) = stream.read(&mut buf[..]) {
         if sz > 0 {
-          //println!("[{}] {:?}", id, str::from_utf8(&buf[..sz]));
+          println!("ECHO[{}] got \"{:?}\"", id, str::from_utf8(&buf[..sz]));
           stream.write(&buf[..sz]);
           thread::sleep(Duration::from_millis(20));
           stream.write(&response[..]);

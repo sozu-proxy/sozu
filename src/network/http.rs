@@ -263,7 +263,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
 
     let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
-    println!("{}\tFRONT [{:?}]: read {} bytes", self.log_context(), self.token, sz);
+    debug!("{}\tFRONT [{:?}]: read {} bytes", self.log_context(), self.token, sz);
 
     if sz > 0 {
       self.front_buf.buffer.fill(sz);
@@ -298,10 +298,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
     let has_host = self.state.as_ref().unwrap().has_host();
     if !has_host {
-      println!("readable[{}]", line!());
       let new_header = self.added_request_header();
       self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.front_buf, new_header.as_bytes()));
-      println!("{}\tparse_request_until_stop returned {:?}", self.log_context(), self.state);
       if self.state.as_ref().unwrap().is_front_error() {
         time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
         self.readiness.front_interest.remove(EventSet::readable());
@@ -319,9 +317,6 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       match self.state.as_ref().unwrap().request {
         Some(RequestState::Request(_,_,_)) | Some(RequestState::RequestWithBody(_,_,_,_)) => {
           if ! self.front_buf.needs_input() {
-            println!("readable[{}] does not needs input: {} request = {:?}", line!(),
-            self.front_buf.input_data_size(), self.state.as_ref().unwrap().request);
-            println!("unparsed data:\n{}", self.front_buf.unparsed_data().to_hex(16));
             self.readiness.front_interest.remove(EventSet::readable());
             return  ClientResult::Continue;
           } else {
@@ -386,6 +381,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   // Forward content to client
   fn writable(&mut self) -> ClientResult {
 
+    let output_size = self.back_buf.output_data_size();
     if self.status == ClientStatus::DefaultAnswer {
       if self.back_buf.output_data_size() == 0 {
         self.readiness.front_interest.remove(EventSet::writable());
@@ -396,7 +392,6 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       while res == SocketResult::Continue && self.back_buf.output_data_size() > 0 {
         let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
         res = current_res;
-        //println!("FRONT_WRITABLE[{}] wrote {} bytes:\n{}\nres={:?}", line!(), sz, self.back_buf.next_output_data().to_hex(16), res);
         self.back_buf.consume_output_data(current_sz);
         self.back_buf_position += current_sz;
         sz += current_sz;
@@ -438,7 +433,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
 
     if let Some((front,back)) = self.tokens() {
-      println!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}", self.log_context(), front.as_usize(), back.as_usize(), sz, output_size);
+      debug!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}, buffer position {} restart position {}", self.log_context(), front.as_usize(), back.as_usize(), sz, output_size, self.back_buf.buffer_position, self.back_buf.start_parsing_position);
       //debug!("{}\tFRONT [{}<-{}]: back buf: {:?}", self.log_context(), front.as_usize(), back.as_usize(), *self.back_buf);
     }
 
@@ -454,13 +449,11 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
 
     if self.back_buf.can_restart_parsing() {
-      println!("can restart parsing for state response: {:?}", self.state.as_ref().unwrap().response);
       match self.state.as_ref().unwrap().response {
         // FIXME: should only restart parsing if we are using keepalive
         Some(ResponseState::Response(_,_))                            |
           Some(ResponseState::ResponseWithBody(_,_,_))                  |
           Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
-            println!("{}\tfinished handling response {:?}", self.log_context(), self.state.as_ref().unwrap());
             self.reset();
             self.readiness.front_interest.insert(EventSet::readable());
             ClientResult::Continue
@@ -471,13 +464,11 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
             ClientResult::Continue
           },
           _ => {
-            println!("{}\terror handling response {:?}", self.log_context(), self.state.as_ref().unwrap());
             self.readiness.reset();
             ClientResult::CloseBothFailure
           }
       }
     } else {
-      println!("can't restart parsing for state response: {:?}", self.state.as_ref().unwrap().response);
       self.readiness.back_interest.insert(EventSet::readable());
       ClientResult::Continue
     }
@@ -501,6 +492,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
     let tokens = self.tokens().clone();
     let context = self.log_context();
+    let output_size = self.front_buf.output_data_size();
     let res = if let Some(ref mut sock) = self.backend {
       //let (sz, socket_res) = sock.socket_write(&(self.front_buf.next_buffer_unwrap())[..to_copy]);
       let mut sz = 0usize;
@@ -516,7 +508,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       }
 
       if let Some((front,back)) = tokens {
-        println!("{}\tBACK [{}->{}]: wrote {} bytes of {}", context, front.as_usize(), back.as_usize(), sz, output_size);
+        debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", context, front.as_usize(), back.as_usize(), sz, output_size);
       }
       match socket_res {
         SocketResult::Error => {
