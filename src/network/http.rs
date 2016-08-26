@@ -444,22 +444,17 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
         let res = if self.back_buf.can_restart_parsing() {
           match self.state.as_ref().unwrap().response {
+            // FIXME: should only restart parsing if we are using keepalive
+            Some(ResponseState::Response(_,_))                            |
+            Some(ResponseState::ResponseWithBody(_,_,_))                  |
             Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
               self.reset();
               self.readiness.front_interest.insert(EventSet::readable());
               ClientResult::Continue
             },
+            // restart parsing, since there will be other chunks next
             Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
               self.readiness.back_interest.insert(EventSet::readable());
-              ClientResult::Continue
-            },
-            Some(ResponseState::ResponseWithBody(_,_,_))       => {
-              self.reset();
-              self.readiness.front_interest.insert(EventSet::readable());
-              ClientResult::Continue
-            },
-            Some(ResponseState::Response(_,_)) => {
-              self.readiness.front_interest.insert(EventSet::readable());
               ClientResult::Continue
             },
             _ => {
