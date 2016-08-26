@@ -518,6 +518,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
                 self.readiness.front_interest.remove(EventSet::readable());
                 self.readiness.back_interest.insert(EventSet::readable());
+                self.readiness.back_interest.remove(EventSet::writable());
                 ClientResult::Continue
               },
               Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
@@ -526,10 +527,12 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               },
               Some(RequestState::RequestWithBody(_,_,_,_))       => {
                 self.readiness.back_interest.insert(EventSet::readable());
+                self.readiness.back_interest.remove(EventSet::writable());
                 ClientResult::Continue
               },
               Some(RequestState::Request(_,_,_)) => {
                 self.readiness.back_interest.insert(EventSet::readable());
+                self.readiness.back_interest.remove(EventSet::writable());
                 ClientResult::Continue
               },
               _ => {
