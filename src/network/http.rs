@@ -429,46 +429,48 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
 
     if let Some((front,back)) = self.tokens() {
-      debug!("{}\tFRONT [{}<-{}]: wrote {} bytes", self.log_context(), front.as_usize(), back.as_usize(), sz);
+      println!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}", self.log_context(), front.as_usize(), back.as_usize(), sz, output_size);
       //debug!("{}\tFRONT [{}<-{}]: back buf: {:?}", self.log_context(), front.as_usize(), back.as_usize(), *self.back_buf);
     }
+
     match res {
       SocketResult::Error => {
         self.readiness.reset();
-        ClientResult::CloseClient
+        return ClientResult::CloseClient;
       },
-      _                   => {
-        if res == SocketResult::WouldBlock {
-          self.readiness.front_readiness.remove(EventSet::writable());
-        }
+      SocketResult::WouldBlock => {
+        self.readiness.front_readiness.remove(EventSet::writable());
+      },
+      SocketResult::Continue => {},
+    }
 
-        let res = if self.back_buf.can_restart_parsing() {
-          match self.state.as_ref().unwrap().response {
-            // FIXME: should only restart parsing if we are using keepalive
-            Some(ResponseState::Response(_,_))                            |
-            Some(ResponseState::ResponseWithBody(_,_,_))                  |
-            Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
-              self.reset();
-              self.readiness.front_interest.insert(EventSet::readable());
-              ClientResult::Continue
-            },
-            // restart parsing, since there will be other chunks next
-            Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
-              self.readiness.back_interest.insert(EventSet::readable());
-              ClientResult::Continue
-            },
-            _ => {
-              self.readiness.reset();
-              ClientResult::CloseBothFailure
-            }
+    if self.back_buf.can_restart_parsing() {
+      println!("can restart parsing for state response: {:?}", self.state.as_ref().unwrap().response);
+      match self.state.as_ref().unwrap().response {
+        // FIXME: should only restart parsing if we are using keepalive
+        Some(ResponseState::Response(_,_))                            |
+          Some(ResponseState::ResponseWithBody(_,_,_))                  |
+          Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
+            println!("{}\tfinished handling response {:?}", self.log_context(), self.state.as_ref().unwrap());
+            self.reset();
+            self.readiness.front_interest.insert(EventSet::readable());
+            ClientResult::Continue
+          },
+          // restart parsing, since there will be other chunks next
+          Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
+            self.readiness.back_interest.insert(EventSet::readable());
+            ClientResult::Continue
+          },
+          _ => {
+            println!("{}\terror handling response {:?}", self.log_context(), self.state.as_ref().unwrap());
+            self.readiness.reset();
+            ClientResult::CloseBothFailure
           }
-        } else {
-          self.readiness.back_interest.insert(EventSet::readable());
-          ClientResult::Continue
-        };
-        //println!("WRITABLE returning: {:?}", res);
-        res
       }
+    } else {
+      println!("can't restart parsing for state response: {:?}", self.state.as_ref().unwrap().response);
+      self.readiness.back_interest.insert(EventSet::readable());
+      ClientResult::Continue
     }
   }
 
@@ -504,54 +506,54 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         sz += current_sz;
       }
 
-      if socket_res != SocketResult::Continue {
-        self.readiness.back_readiness.remove(EventSet::writable());
-      }
-
       if let Some((front,back)) = tokens {
-        //println!("{}\tBACK [{}->{}]: wrote {} bytes", context, front.as_usize(), back.as_usize(), sz);
+        println!("{}\tBACK [{}->{}]: wrote {} bytes of {}", context, front.as_usize(), back.as_usize(), sz, output_size);
       }
       match socket_res {
         SocketResult::Error => {
           self.readiness.reset();
-          ClientResult::CloseBothFailure
+          return ClientResult::CloseBothFailure;
         },
-        _                   => {
-          // FIXME/ should read exactly as much data as needed
-          //if self.front_buf_position >= self.state.req_position {
-          if self.front_buf.can_restart_parsing() {
-            match self.state.as_ref().unwrap().request {
-              Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
-                self.readiness.front_interest.remove(EventSet::readable());
-                self.readiness.back_interest.insert(EventSet::readable());
-                self.readiness.back_interest.remove(EventSet::writable());
-                ClientResult::Continue
-              },
-              Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
-                self.readiness.front_interest.insert(EventSet::readable());
-                ClientResult::Continue
-              },
-              Some(RequestState::RequestWithBody(_,_,_,_))       => {
-                self.readiness.back_interest.insert(EventSet::readable());
-                self.readiness.back_interest.remove(EventSet::writable());
-                ClientResult::Continue
-              },
-              Some(RequestState::Request(_,_,_)) => {
-                self.readiness.back_interest.insert(EventSet::readable());
-                self.readiness.back_interest.remove(EventSet::writable());
-                ClientResult::Continue
-              },
-              _ => {
-                self.readiness.reset();
-                ClientResult::CloseBothFailure
-              }
-            }
-          } else {
-            self.readiness.front_interest.insert(EventSet::readable());
-            self.readiness.back_interest.insert(EventSet::writable());
+        SocketResult::WouldBlock => {
+          self.readiness.back_readiness.remove(EventSet::writable());
+
+        },
+        SocketResult::Continue => {}
+      }
+
+      // FIXME/ should read exactly as much data as needed
+      //if self.front_buf_position >= self.state.req_position {
+      if self.front_buf.can_restart_parsing() {
+        match self.state.as_ref().unwrap().request {
+          Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
+            self.readiness.front_interest.remove(EventSet::readable());
+            self.readiness.back_interest.insert(EventSet::readable());
+            self.readiness.back_interest.remove(EventSet::writable());
             ClientResult::Continue
+          },
+          Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
+            self.readiness.front_interest.insert(EventSet::readable());
+            ClientResult::Continue
+          },
+          Some(RequestState::RequestWithBody(_,_,_,_))       => {
+            self.readiness.back_interest.insert(EventSet::readable());
+            self.readiness.back_interest.remove(EventSet::writable());
+            ClientResult::Continue
+          },
+          Some(RequestState::Request(_,_,_)) => {
+            self.readiness.back_interest.insert(EventSet::readable());
+            self.readiness.back_interest.remove(EventSet::writable());
+            ClientResult::Continue
+          },
+          _ => {
+            self.readiness.reset();
+            ClientResult::CloseBothFailure
           }
         }
+      } else {
+        self.readiness.front_interest.insert(EventSet::readable());
+        self.readiness.back_interest.insert(EventSet::writable());
+        ClientResult::Continue
       }
     } else {
       self.readiness.reset();
