@@ -14,31 +14,245 @@ use bytes::buf::MutBuf;
 use std::collections::HashMap;
 use std::error::Error;
 use mio::util::Slab;
-use pool::Pool;
+use pool::{Pool,Checkout};
 use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
 use time::{precise_time_s, precise_time_ns};
 use rand::random;
-use openssl::ssl::{SslContext, SslContextOptions, SslMethod,
-                   Ssl, NonblockingSslStream, ServerNameCallback,
-                   ServerNameCallbackData};
-use openssl::ssl::error::NonblockingSslError;
+use openssl::ssl::{HandshakeError,MidHandshakeSslStream,
+                   SslContext, SslContextOptions, SslMethod,
+                   Ssl, SslRef, SslStream, SniError};
 use openssl::x509::{X509,X509FileType};
 use openssl::dh::DH;
 use openssl::crypto::pkey::PKey;
 
-use parser::http11::{HttpState,RequestState,ResponseState,parse_request_until_stop};
+use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder};
-use network::proxy::{Server,ProxyConfiguration,ProxyClient};
+use network::proxy::{Server,ProxyConfiguration,ProxyClient,Readiness};
 use messages::{Command,TlsFront};
-use network::http::{Client,DefaultAnswers};
+use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult};
 
 type BackendToken = Token;
 
 type ClientToken = Token;
+
+pub enum TlsState {
+  Initial,
+  Handshake,
+  Established,
+  Error,
+}
+
+pub struct TemporaryState {
+  server_context: String,
+  front_buf:      Checkout<BufferQueue>,
+  back_buf:       Checkout<BufferQueue>,
+}
+
+pub struct TlsClient {
+  front: Option<TcpStream>,
+  front_token: Option<Token>,
+  front_timeout: Option<Timeout>,
+  temp: Option<TemporaryState>,
+  ssl: Option<Ssl>,
+  mid: Option<MidHandshakeSslStream<TcpStream>>,
+  http:  Option<http::Client<SslStream<TcpStream>>>,
+  state: TlsState,
+  handshake_readiness: Readiness,
+}
+
+impl TlsClient {
+  pub fn new(server_context: &str, ssl:Ssl, sock: TcpStream, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>) -> Option<TlsClient> {
+    Some(TlsClient {
+      front: Some(sock),
+      front_token: None,
+      front_timeout: None,
+      temp: Some(TemporaryState {
+        server_context: String::from(server_context),
+        front_buf: front_buf,
+        back_buf: back_buf,
+      }),
+      ssl: Some(ssl),
+      mid: None,
+      http:  None,
+      state: TlsState::Initial,
+      handshake_readiness: Readiness {
+        front_interest:  EventSet::readable() | EventSet::hup() | EventSet::error(),
+        back_interest:   EventSet::none(),
+        front_readiness: EventSet::none(),
+        back_readiness:  EventSet::none(),
+      }
+    })
+  }
+}
+
+impl ProxyClient for TlsClient {
+  fn front_socket(&self) -> &TcpStream {
+    if let Some(ref state) = self.http.as_ref() {
+      state.front_socket()
+    } else {
+      self.front.as_ref().unwrap()
+    }
+  }
+
+  fn back_socket(&self)  -> Option<&TcpStream> {
+    self.http.as_ref().unwrap().back_socket()
+  }
+
+  fn front_token(&self)  -> Option<Token> {
+    if let Some(ref state) = self.http.as_ref() {
+      state.front_token()
+    } else {
+      self.front_token
+    }
+  }
+
+  fn back_token(&self)   -> Option<Token> {
+    self.http.as_ref().unwrap().back_token()
+  }
+
+  fn log_context(&self)  -> String {
+    self.http.as_ref().unwrap().log_context()
+  }
+
+  fn set_back_socket(&mut self, sock:TcpStream) {
+    self.http.as_mut().unwrap().set_back_socket(sock)
+  }
+
+  fn set_front_token(&mut self, token: Token) {
+    if let Some(ref mut state) = self.http.as_mut() {
+      state.set_front_token(token)
+    } else {
+      self.front_token = Some(token)
+    }
+  }
+
+  fn set_back_token(&mut self, token: Token) {
+    self.http.as_mut().unwrap().set_back_token(token)
+  }
+
+  fn front_timeout(&mut self) -> Option<Timeout> {
+    if let Some(ref mut state) = self.http.as_mut() {
+      state.front_timeout()
+    } else {
+      self.front_timeout
+    }
+  }
+
+  fn back_timeout(&mut self)  -> Option<Timeout> {
+    self.http.as_mut().unwrap().back_timeout()
+  }
+
+  fn set_front_timeout(&mut self, timeout: Timeout) {
+    if let Some(ref mut state) = self.http.as_mut() {
+      state.set_front_timeout(timeout)
+    } else {
+      self.front_timeout = Some(timeout)
+    }
+  }
+
+  fn set_back_timeout(&mut self, timeout: Timeout) {
+    self.http.as_mut().unwrap().set_back_timeout(timeout)
+  }
+
+  fn set_tokens(&mut self, token: Token, backend: Token) {
+    self.http.as_mut().unwrap().set_tokens(token, backend)
+  }
+
+  fn front_hup(&mut self)     -> ClientResult {
+    self.http.as_mut().unwrap().front_hup()
+  }
+
+  fn back_hup(&mut self)      -> ClientResult {
+    self.http.as_mut().unwrap().back_hup()
+  }
+
+  fn readable(&mut self)      -> ClientResult {
+    match self.state {
+      TlsState::Error   => return ClientResult::CloseClient,
+      TlsState::Initial => {
+        let ssl = self.ssl.take().unwrap();
+        let sock = self.front.take().unwrap();
+        match SslStream::accept(ssl, sock) {
+          Ok(stream) => {
+            let temp   = self.temp.take().unwrap();
+            self.http  = http::Client::new(&temp.server_context, stream, temp.front_buf, temp.back_buf);
+            let front_token = self.front_token.take().unwrap();
+            let timeout     = self.front_timeout.take().unwrap();
+            self.set_front_token(front_token);
+            self.set_front_timeout(timeout);
+            self.state = TlsState::Established;
+          },
+          Err(HandshakeError::Failure(e)) => {
+            println!("handshake failed: {:?}", e);
+            self.state = TlsState::Error;
+            return ClientResult::CloseClient;
+          },
+          Err(HandshakeError::Interrupted(mid)) => {
+            self.state = TlsState::Handshake;
+            self.mid = Some(mid);
+            return ClientResult::Continue;
+          }
+        }
+      },
+      TlsState::Handshake => {
+        let mid = self.mid.take().unwrap();
+        match mid.handshake() {
+          Ok(stream) => {
+            let temp   = self.temp.take().unwrap();
+            self.http  = http::Client::new(&temp.server_context, stream, temp.front_buf, temp.back_buf);
+            let front_token = self.front_token.take().unwrap();
+            let timeout     = self.front_timeout.take().unwrap();
+            self.set_front_token(front_token);
+            self.set_front_timeout(timeout);
+            self.state = TlsState::Established;
+          },
+          Err(HandshakeError::Failure(e)) => {
+            println!("handshake failed: {:?}", e);
+            self.state = TlsState::Error;
+            return ClientResult::CloseClient;
+          },
+          Err(HandshakeError::Interrupted(new_mid)) => {
+            self.state = TlsState::Handshake;
+            self.mid = Some(new_mid);
+            return ClientResult::Continue;
+          }
+        }
+      },
+      TlsState::Established => {}
+    }
+
+    //execute the main readable() method after handshake was done
+    self.http.as_mut().unwrap().readable()
+  }
+
+  fn writable(&mut self)      -> ClientResult {
+    self.http.as_mut().unwrap().writable()
+  }
+
+  fn back_readable(&mut self) -> ClientResult {
+    self.http.as_mut().unwrap().back_readable()
+  }
+
+  fn back_writable(&mut self) -> ClientResult {
+    self.http.as_mut().unwrap().back_writable()
+  }
+
+  fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
+    self.http.as_mut().unwrap().remove_backend()
+  }
+
+  fn readiness(&mut self)      -> &mut Readiness {
+    if let Some(state) = self.http.as_mut() {
+      state.readiness()
+    } else {
+      &mut self.handshake_readiness
+    }
+  }
+}
 
 pub struct ServerConfiguration {
   listener:        TcpListener,
@@ -47,7 +261,7 @@ pub struct ServerConfiguration {
   fronts:          HashMap<String, Vec<TlsFront>>,
   default_cert:    String,
   default_context: SslContext,
-  contexts:        Rc<RefCell<HashMap<String, SslContext>>>,
+  contexts:        Arc<Mutex<HashMap<String, SslContext>>>,
   tx:              mpsc::Sender<ServerMessage>,
   pool:            Pool<BufferQueue>,
   answers:         DefaultAnswers,
@@ -66,41 +280,31 @@ impl ServerConfiguration {
     }
 
     let dh = DH::get_2048_256().unwrap();
-    context.set_tmp_dh(dh);
+    context.set_tmp_dh(&dh);
     context.set_ecdh_auto(true);
 
     //FIXME: get the default cert and key from the configuration
     context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
     context.set_private_key_file("assets/key.pem", X509FileType::PEM);
 
-    fn servername_callback(ssl: &mut Ssl, ad: &mut i32) -> i32 {
-      trace!("TLS\tGOT SERVER NAME: {:?}", ssl.get_servername());
-      0
-    }
-    //context.set_servername_callback(Some(servername_callback as ServerNameCallback));
+    let rc_ctx = Arc::new(Mutex::new(contexts));
+    let ref_ctx = rc_ctx.clone();
+    context.set_servername_callback(move |ssl: &mut SslRef| {
+      let contexts = ref_ctx.lock().unwrap();
 
-    fn servername_callback_s(ssl: &mut Ssl, ad: &mut i32, data: &Rc<RefCell<HashMap<String, SslContext>>>) -> i32 {
-      let mut contexts = data.borrow_mut();
-
-      if let Some(servername) = ssl.get_servername() {
+      if let Some(servername) = ssl.servername() {
         trace!("TLS\tlooking for context for {:?}", servername);
-        //println!("contexts: {:?}", *contexts);
-        let opt_ctx = contexts.remove(&servername);
-        if let Some(ctx) = opt_ctx {
-          let context = ssl.set_ssl_context(&ctx);
-          mem::forget(ctx);
-          contexts.insert(String::from(servername), context);
+        if let Some(ref ctx) = contexts.get(&servername) {
+          let context: &SslContext = ctx;
+          if let Ok(()) = ssl.set_ssl_context(context.clone()) {
+            return Ok(());
+          }
         }
       }
-      0
-    }
+      Err(SniError::Fatal(0))
+    });
 
-    let rc_ctx = Rc::new(RefCell::new(contexts));
-    let store_contexts = rc_ctx.clone();
-    context.set_servername_callback_with_data(
-      servername_callback_s as ServerNameCallbackData<Rc<RefCell<HashMap<String, SslContext>>>>,
-      store_contexts
-    );
+
 
     match TcpListener::bind(&address) {
       Ok(listener) => {
@@ -134,10 +338,10 @@ impl ServerConfiguration {
     //FIXME: insert some error management with a Result here
     let mut ctx = SslContext::new(SslMethod::Tlsv1).unwrap();
 
-    let mut cert_read  = BufReader::new(&http_front.certificate.as_bytes()[..]);
-    let mut key_read   = BufReader::new(&http_front.key.as_bytes()[..]);
+    let mut cert_read  = &http_front.certificate.as_bytes()[..];
+    let mut key_read   = &http_front.key.as_bytes()[..];
     let cert_chain: Vec<X509> = http_front.certificate_chain.iter().filter_map(|c| {
-      X509::from_pem(&mut BufReader::new(&c.as_bytes()[..])).ok()
+      X509::from_pem(c.as_bytes()).ok()
     }).collect();
 
     if let (Ok(cert), Ok(key)) = (X509::from_pem(&mut cert_read), PKey::private_key_from_pem(&mut key_read)) {
@@ -159,7 +363,11 @@ impl ServerConfiguration {
         self.fronts.insert(http_front.hostname, vec![front3]);
       }
 
-      self.contexts.borrow_mut().insert(hostname, ctx);
+      //FIXME: this is blocking
+      {
+        let mut contexts = self.contexts.lock().unwrap();
+        contexts.insert(hostname, ctx);
+      }
       true
     } else {
       false
@@ -216,7 +424,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_request(&mut self, client: &mut Client<NonblockingSslStream<TcpStream>>, host: &str, uri: &str) -> Result<TcpStream,ConnectionError> {
+  pub fn backend_from_request(&mut self, client: &mut TlsClient, host: &str, uri: &str) -> Result<TcpStream,ConnectionError> {
     trace!("TLS\tlooking for backend for host: {}", host);
     let real_host = if let Some(h) = host.split(":").next() {
       h
@@ -226,17 +434,17 @@ impl ServerConfiguration {
     trace!("TLS\tlooking for backend for real host: {}", host);
 
     if let Some(app_id) = self.frontend_from_request(real_host, uri).map(|ref front| front.app_id.clone()) {
-      client.app_id = Some(app_id.clone());
+      client.http.as_mut().unwrap().app_id = Some(app_id.clone());
       // ToDo round-robin on instances
       if let Some(ref mut app_instances) = self.instances.get_mut(&app_id) {
         if app_instances.len() == 0 {
-          client.set_answer(&self.answers.ServiceUnavailable);
+          client.http.as_mut().unwrap().set_answer(&self.answers.ServiceUnavailable);
           return Err(ConnectionError::NoBackendAvailable);
         }
         let rnd = random::<usize>();
         let mut instances:Vec<&mut Backend> = app_instances.iter_mut().filter(|backend| backend.can_open()).collect();
         let idx = rnd % instances.len();
-        info!("{}\tConnecting {} -> {:?}", client.log_context(), host, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
+        info!("{}\tConnecting {} -> {:?}", client.http.as_mut().unwrap().log_context(), host, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
         instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut backend| {
           let conn =  TcpStream::connect(&backend.address).map_err(|_| ConnectionError::NoBackendAvailable);
           if conn.is_ok() {
@@ -253,20 +461,16 @@ impl ServerConfiguration {
   }
 }
 
-impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for ServerConfiguration {
-  fn accept(&mut self, token: Token) -> Option<(Client<NonblockingSslStream<TcpStream>>,bool)> {
+impl ProxyConfiguration<TlsServer,TlsClient> for ServerConfiguration {
+  fn accept(&mut self, token: Token) -> Option<(TlsClient,bool)> {
     if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
       let accepted = self.listener.accept();
 
       if let Ok(Some((frontend_sock, _))) = accepted {
         frontend_sock.set_nodelay(true);
         if let Ok(ssl) = Ssl::new(&self.default_context) {
-          if let Ok(stream) = NonblockingSslStream::accept(ssl, frontend_sock) {
-            if let Some(c) = Client::new("TLS", stream, front_buf, back_buf) {
-              return Some((c, false))
-            }
-          } else {
-            error!("TLS\tcould not create ssl stream");
+          if let Some(c) = TlsClient::new("TLS", ssl, frontend_sock, front_buf, back_buf) {
+            return Some((c, false))
           }
         } else {
           error!("TLS\tcould not create ssl context");
@@ -280,20 +484,20 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
     None
   }
 
-  fn connect_to_backend(&mut self, client: &mut Client<NonblockingSslStream<TcpStream>>) -> Result<(),ConnectionError> {
+  fn connect_to_backend(&mut self, client: &mut TlsClient) -> Result<(),ConnectionError> {
     // FIXME: should check the host corresponds to SNI here
-    let host   = try!(client.state().get_host().ok_or(ConnectionError::NoHostGiven));
-    let rl     = try!(client.state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-    let conn   = try!(client.state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
+    let host   = try!(client.http.as_mut().unwrap().state().get_host().ok_or(ConnectionError::NoHostGiven));
+    let rl:RRequestLine = try!(client.http.as_mut().unwrap().state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
+    let conn   = try!(client.http.as_mut().unwrap().state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
     let conn   = self.backend_from_request(client, &host, &rl.uri);
 
     match conn {
       Ok(socket) => {
-        let req_state = client.state().request.clone();
-        let req_header_end = client.state().req_header_end;
-        let res_header_end = client.state().res_header_end;
+        let req_state = client.http.as_mut().unwrap().state().request.clone();
+        let req_header_end = client.http.as_mut().unwrap().state().req_header_end;
+        let res_header_end = client.http.as_mut().unwrap().state().res_header_end;
         // FIXME: is this still needed?
-        client.set_state(HttpState {
+        client.http.as_mut().unwrap().set_state(HttpState {
           req_header_end: req_header_end,
           res_header_end: res_header_end,
           request:  req_state,
@@ -304,11 +508,11 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
         Ok(())
       },
       Err(ConnectionError::NoBackendAvailable) => {
-        client.set_answer(&self.answers.ServiceUnavailable);
+        client.http.as_mut().unwrap().set_answer(&self.answers.ServiceUnavailable);
         Err(ConnectionError::NoBackendAvailable)
       },
       Err(ConnectionError::HostNotFound) => {
-        client.set_answer(&self.answers.NotFound);
+        client.http.as_mut().unwrap().set_answer(&self.answers.NotFound);
         Err(ConnectionError::HostNotFound)
       },
       e => panic!(e)
@@ -388,7 +592,7 @@ impl ProxyConfiguration<TlsServer,Client<NonblockingSslStream<TcpStream>>> for S
   }
 }
 
-pub type TlsServer = Server<ServerConfiguration,Client<NonblockingSslStream<TcpStream>>>;
+pub type TlsServer = Server<ServerConfiguration,TlsClient>;
 
 pub fn start_listener(front: SocketAddr, max_connections: usize, buffer_size: usize, options: Option<(SslContextOptions, String)>, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
@@ -421,6 +625,7 @@ mod tests {
   use std::str::FromStr;
   use std::time::Duration;
   use std::rc::{Rc,Weak};
+  use std::sync::{Arc,Mutex};
   use std::cell::RefCell;
   use messages::{Command,TlsFront,Instance};
   use mio::util::Slab;
@@ -429,7 +634,7 @@ mod tests {
   use network::buffer_queue::BufferQueue;
   use network::{ProxyOrder,ServerMessage};
   use network::http::DefaultAnswers;
-  use openssl::ssl::{SslContext, SslMethod, Ssl, NonblockingSslStream, ServerNameCallback, ServerNameCallbackData};
+  use openssl::ssl::{SslContext, SslMethod, Ssl, SslStream};
 
   /*
   #[allow(unused_mut, unused_must_use, unused_variables)]
@@ -529,7 +734,7 @@ mod tests {
     ]);
 
     let contexts = HashMap::new();
-    let rc_ctx = Rc::new(RefCell::new(contexts));
+    let rc_ctx = Arc::new(Mutex::new(contexts));
 
     let context = SslContext::new(SslMethod::Tlsv1).unwrap();
     let (tx,rx) = channel::<ServerMessage>();

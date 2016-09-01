@@ -1,7 +1,7 @@
 use std::io::{ErrorKind,Read,Write};
 use mio::tcp::TcpStream;
-use openssl::ssl::NonblockingSslStream;
-use openssl::ssl::error::{NonblockingSslError,SslError};
+use openssl::ssl::SslStream;
+use openssl::ssl::error::Error;
 
 #[derive(Debug,PartialEq,Copy,Clone)]
 pub enum SocketResult {
@@ -68,22 +68,23 @@ impl SocketHandler for TcpStream {
   fn socket_ref(&self) -> &TcpStream { self }
 }
 
-impl SocketHandler for NonblockingSslStream<TcpStream> {
+impl SocketHandler for SslStream<TcpStream> {
   fn socket_read(&mut self,  buf: &mut[u8]) -> (usize, SocketResult) {
     let mut size = 0usize;
     loop {
       if size == buf.len() {
         return (size, SocketResult::Continue);
       }
-      match self.read(&mut buf[size..]) {
+      match self.ssl_read(&mut buf[size..]) {
         Ok(0)  => return (size, SocketResult::Continue),
         Ok(sz) => size += sz,
-        Err(NonblockingSslError::WantRead)    => return (size, SocketResult::WouldBlock),
-        Err(NonblockingSslError::WantWrite)   => return (size, SocketResult::WouldBlock),
-        Err(NonblockingSslError::SslError(e)) => {
+        Err(Error::WantRead(_))  => return (size, SocketResult::WouldBlock),
+        Err(Error::WantWrite(_)) => return (size, SocketResult::WouldBlock),
+        Err(Error::Stream(e))    => {
           error!("SOCKET-TLS\treadable TLS client err={:?}", e);
           return (size, SocketResult::Error)
-        }
+        },
+        _ => return (size, SocketResult::Error)
       }
     }
   }
@@ -94,15 +95,16 @@ impl SocketHandler for NonblockingSslStream<TcpStream> {
       if size == buf.len() {
         return (size, SocketResult::Continue);
       }
-      match self.write(&buf[size..]) {
+      match self.ssl_write(&buf[size..]) {
         Ok(0)  => return (size, SocketResult::Continue),
         Ok(sz) => size +=sz,
-        Err(NonblockingSslError::WantRead)    => return (size, SocketResult::WouldBlock),
-        Err(NonblockingSslError::WantWrite)   => return (size, SocketResult::WouldBlock),
-        Err(NonblockingSslError::SslError(e)) => {
+        Err(Error::WantRead(_))  => return (size, SocketResult::WouldBlock),
+        Err(Error::WantWrite(_)) => return (size, SocketResult::WouldBlock),
+        Err(Error::Stream(e))    => {
           error!("SOCKET-TLS\treadable TLS client err={:?}", e);
           return (size, SocketResult::Error)
-        }
+        },
+        _ => return (size, SocketResult::Error)
       }
     }
   }

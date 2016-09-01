@@ -24,7 +24,7 @@ tiny_http= "0.4"
 env_logger = "0.3"
 
 [dependencies.openssl]
-version = "~0.7.0"
+version = "~0.8.0"
 features = ["tlsv1_2", "tlsv1_1", "rfc5114", "ecdh_auto"]
 
 [dependencies.pool]
