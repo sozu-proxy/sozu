@@ -741,7 +741,7 @@ mod tests {
     let context = SslContext::new(SslMethod::Tlsv1).unwrap();
     let (tx,rx) = channel::<ServerMessage>();
 
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").unwrap();
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1031").unwrap();
     let listener = tcp::TcpListener::bind(&front).unwrap();
     let server_config = ServerConfiguration {
       listener:  listener,
@@ -753,8 +753,8 @@ mod tests {
       contexts: rc_ctx,
       tx:        tx,
       pool:      Pool::with_capacity(1, 0, || BufferQueue::with_capacity(12000)),
-      front_timeout: 50000,
-      back_timeout:  50000,
+      front_timeout: 5000,
+      back_timeout:  5000,
       answers:   DefaultAnswers {
         NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
