@@ -184,6 +184,7 @@ impl ProxyClient for TlsClient {
             let timeout     = self.front_timeout.take().unwrap();
             self.set_front_token(front_token);
             self.set_front_timeout(timeout);
+            self.readiness().front_interest = EventSet::readable() | EventSet::hup() | EventSet::error();
             self.state = TlsState::Established;
           },
           Err(HandshakeError::Failure(e)) => {
@@ -208,6 +209,7 @@ impl ProxyClient for TlsClient {
             let timeout     = self.front_timeout.take().unwrap();
             self.set_front_token(front_token);
             self.set_front_timeout(timeout);
+            self.readiness().front_interest = EventSet::readable() | EventSet::hup() | EventSet::error();
             self.state = TlsState::Established;
           },
           Err(HandshakeError::Failure(e)) => {
