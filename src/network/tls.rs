@@ -175,7 +175,7 @@ impl ProxyClient for TlsClient {
       TlsState::Error   => return ClientResult::CloseClient,
       TlsState::Initial => {
         let ssl = self.ssl.take().unwrap();
-        let sock = self.front.take().unwrap();
+        let sock = self.front.as_ref().map(|f| f.try_clone().unwrap()).unwrap();
         match SslStream::accept(ssl, sock) {
           Ok(stream) => {
             let temp   = self.temp.take().unwrap();
