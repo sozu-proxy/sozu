@@ -33,7 +33,7 @@ use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionErr
 use network::proxy::{Server,ProxyConfiguration,ProxyClient,Readiness};
 use messages::{Command,TlsFront};
 use network::http::{self,DefaultAnswers};
-use network::socket::{SocketHandler,SocketResult};
+use network::socket::{SocketHandler,SocketResult,server_bind};
 
 type BackendToken = Token;
 
@@ -308,7 +308,7 @@ impl ServerConfiguration {
 
 
 
-    match TcpListener::bind(&address) {
+    match server_bind(&address) {
       Ok(listener) => {
         event_loop.register(&listener, Token(0), EventSet::readable(), PollOpt::level());
         Ok(ServerConfiguration {

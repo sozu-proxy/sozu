@@ -16,6 +16,7 @@ extern crate rand;
 extern crate openssl;
 extern crate pool;
 extern crate uuid;
+extern crate net2;
 
 pub mod network;
 pub mod parser;

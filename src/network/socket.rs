@@ -1,7 +1,10 @@
-use std::io::{ErrorKind,Read,Write};
-use mio::tcp::TcpStream;
+use std::io::{self,ErrorKind,Read,Write};
+use std::net::{SocketAddr,SocketAddrV4,SocketAddrV6};
+use mio::tcp::{TcpListener,TcpStream};
 use openssl::ssl::SslStream;
 use openssl::ssl::error::Error;
+use net2::TcpBuilder;
+use net2::unix::UnixTcpBuilderExt;
 
 #[derive(Debug,PartialEq,Copy,Clone)]
 pub enum SocketResult {
@@ -111,3 +114,25 @@ impl SocketHandler for SslStream<TcpStream> {
 
   fn socket_ref(&self) -> &TcpStream { self.get_ref() }
 }
+
+pub fn server_bind(addr: &SocketAddr) -> io::Result<TcpListener> {
+  let sock = try!(match *addr {
+    SocketAddr::V4(..) => TcpBuilder::new_v4(),
+    SocketAddr::V6(..) => TcpBuilder::new_v6(),
+  });
+
+  // set so_reuseaddr, but only on unix (mirrors what libstd does)
+  if cfg!(unix) {
+    try!(sock.reuse_address(true));
+  }
+
+  try!(sock.reuse_port(true));
+
+  // bind the socket
+  try!(sock.bind(addr));
+
+  // listen
+  let listener = try!(sock.listen(1024));
+  TcpListener::from_listener(listener, addr)
+}
+

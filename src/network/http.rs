@@ -21,7 +21,7 @@ use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionErr
 use network::proxy::{Server,ProxyConfiguration,ProxyClient,Readiness};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
-use network::socket::{SocketHandler,SocketResult};
+use network::socket::{SocketHandler,SocketResult,server_bind};
 
 use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop, BufferMove, RequestState, ResponseState, Chunk};
 use nom::HexDisplay;
@@ -698,7 +698,7 @@ pub struct ServerConfiguration {
 
 impl ServerConfiguration {
   pub fn new(address: SocketAddr, tx: mpsc::Sender<ServerMessage>, max_connections: usize, buffer_size: usize, event_loop: &mut EventLoop<HttpServer>) -> io::Result<ServerConfiguration> {
-    match TcpListener::bind(&address) {
+    match server_bind(&address) {
       Ok(sock) => {
         event_loop.register(&sock, Token(0), EventSet::readable(), PollOpt::level());
         Ok(ServerConfiguration {

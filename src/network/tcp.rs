@@ -19,7 +19,7 @@ use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionErr
 use network::proxy::{Server,ProxyClient,ProxyConfiguration,Readiness};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
-use network::socket::{SocketHandler,SocketResult};
+use network::socket::{SocketHandler,SocketResult,server_bind};
 use pool::{Pool,Checkout,Reset};
 
 use messages::{TcpFront,Command,Instance};
@@ -346,7 +346,7 @@ impl ServerConfiguration {
   }
 
   fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, event_loop: &mut EventLoop<TcpServer>) -> Option<Token> {
-    if let Ok(listener) = TcpListener::bind(front) {
+    if let Ok(listener) = server_bind(front) {
       let addresses: Vec<SocketAddr> = if let Some(ads) = self.instances.get(app_id) {
         let v: Vec<SocketAddr> = ads.iter().map(|backend| backend.address).collect();
         v
