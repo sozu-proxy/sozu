@@ -991,7 +991,7 @@ mod tests {
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn mi() {
-    start_server();
+    start_server(1025);
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").unwrap();
     let (tx,rx) = channel::<ServerMessage>();
     let (sender, jg) = start_listener(front, 10, 12000, tx.clone());
@@ -1032,13 +1032,13 @@ mod tests {
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn keep_alive() {
-    start_server();
+    start_server(1028);
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1031").unwrap();
     let (tx,rx) = channel::<ServerMessage>();
     let (sender, jg) = start_listener(front, 10, 12000, tx.clone());
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1031"), path_begin: String::from("/") };
     sender.send(ProxyOrder::Command(String::from("ID_ABCD"), Command::AddHttpFront(front)));
-    let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
+    let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1028 };
     sender.send(ProxyOrder::Command(String::from("ID_EFGH"), Command::AddInstance(instance)));
     println!("test received: {:?}", rx.recv());
     println!("test received: {:?}", rx.recv());
@@ -1068,8 +1068,11 @@ mod tests {
         //assert!(false);
       }
     }
+
+    println!("first request ended, will send second one");
     let mut buffer2 = [0;4096];
     let mut w2  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..]);
+    println!("http client write: {:?}", w2);
     thread::sleep(Duration::from_millis(500));
     let mut r2 = client.read(&mut buffer2[..]);
     println!("http client read: {:?}", r2);
@@ -1093,10 +1096,10 @@ mod tests {
   use self::tiny_http::{ServerBuilder, Response};
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
-  fn start_server() {
+  fn start_server(port: u16) {
     thread::spawn(move|| {
-      let server = ServerBuilder::new().with_port(1025).build().unwrap();
-      println!("starting web server");
+      let server = ServerBuilder::new().with_port(port).build().unwrap();
+      println!("starting web server in port {}", port);
 
       for request in server.incoming_requests() {
         println!("backend web server got request -> method: {:?}, url: {:?}, headers: {:?}",
@@ -1109,6 +1112,8 @@ mod tests {
         request.respond(response);
         println!("backend web server sent response");
       }
+
+      println!("server on port {} closed", port);
     });
   }
 
