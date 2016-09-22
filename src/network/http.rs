@@ -63,7 +63,7 @@ pub struct Client<Front:SocketHandler> {
 
 impl<Front:SocketHandler> Client<Front> {
   pub fn new(server_context: &str, sock: Front, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>) -> Option<Client<Front>> {
-    Some(Client {
+    let mut client = Client {
       frontend:       sock,
       backend:        None,
       token:          None,
@@ -86,7 +86,13 @@ impl<Front:SocketHandler> Client<Front> {
       request_id:         Uuid::new_v4().hyphenated().to_string(),
       server_context:     String::from(server_context),
       readiness:          Readiness::new(),
-    })
+    };
+    let req_header = client.added_request_header();
+    let res_header = client.added_response_header();
+    client.state.as_mut().map(|ref mut state| state.added_req_header = req_header);
+    client.state.as_mut().map(|ref mut state| state.added_res_header = res_header);
+
+    Some(client)
   }
 
   pub fn close(&self) {
@@ -94,6 +100,10 @@ impl<Front:SocketHandler> Client<Front> {
 
   pub fn reset(&mut self) {
     self.state.as_mut().unwrap().reset();
+    let req_header = self.added_request_header();
+    let res_header = self.added_response_header();
+    self.state.as_mut().map(|ref mut state| state.added_req_header = req_header);
+    self.state.as_mut().map(|ref mut state| state.added_res_header = res_header);
     self.front_buf_position = 0;
     self.back_buf_position = 0;
     self.front_buf.reset();
@@ -298,8 +308,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
     let has_host = self.state.as_ref().unwrap().has_host();
     if !has_host {
-      let new_header = self.added_request_header();
-      self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.front_buf, new_header.as_bytes()));
+      self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
+        &mut self.front_buf));
       if self.state.as_ref().unwrap().is_front_error() {
         time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
         self.readiness.front_interest.remove(EventSet::readable());
@@ -335,8 +345,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           } else {
             //if self.front_buf_position + self.front_buf.buffer.available_data() >= self.state.req_position {
             if ! self.front_buf.needs_input() {
-              let new_header = self.added_request_header();
-              self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.front_buf, new_header.as_bytes()));
+              self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
+                &mut self.front_buf));
               //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
               if self.state.as_ref().unwrap().is_front_error() {
                 time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
@@ -356,8 +366,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           }
         },
       _ => {
-        let new_header = self.added_request_header();
-          self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.front_buf, new_header.as_bytes()));
+          self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
+            &mut self.front_buf));
           //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_context(), self.state, self.state.req_position);
           if self.state.as_ref().unwrap().is_front_error() {
             time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
@@ -573,7 +583,6 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
 
     let tokens     = self.tokens().clone();
-    let new_header = self.added_response_header();
     let context    = self.log_context();
 
     if let Some(ref mut sock) = self.backend {
@@ -623,7 +632,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               } else {
                 //if self.back_buf_position + self.back_buf.buffer.available_data() >= self.state.res_position {
                 if ! self.back_buf.needs_input() {
-                  self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.back_buf, new_header.as_bytes()));
+                  self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id,
+                    &mut self.back_buf));
                   //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
                   if self.state.as_ref().unwrap().is_back_error() {
                     time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
@@ -645,7 +655,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
             },
             Some(ResponseState::Error(_)) => panic!("{}\tback read should have stopped on responsestate error", context),
             _ => {
-              self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id, &mut self.back_buf, new_header.as_bytes()));
+              self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id,
+                &mut self.back_buf));
               //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
               if self.state.as_ref().unwrap().is_back_error() {
                 time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);

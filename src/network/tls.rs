@@ -498,12 +498,16 @@ impl ProxyConfiguration<TlsServer,TlsClient> for ServerConfiguration {
         let req_state = client.http.as_mut().unwrap().state().request.clone();
         let req_header_end = client.http.as_mut().unwrap().state().req_header_end;
         let res_header_end = client.http.as_mut().unwrap().state().res_header_end;
+        let added_req_header = client.http.as_mut().unwrap().state().added_req_header.clone();
+        let added_res_header = client.http.as_mut().unwrap().state().added_res_header.clone();
         // FIXME: is this still needed?
         client.http.as_mut().unwrap().set_state(HttpState {
           req_header_end: req_header_end,
           res_header_end: res_header_end,
           request:  req_state,
-          response: Some(ResponseState::Initial)
+          response: Some(ResponseState::Initial),
+          added_req_header: added_req_header,
+          added_res_header: added_res_header,
         });
 
         client.set_back_socket(socket);
