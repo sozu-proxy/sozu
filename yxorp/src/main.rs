@@ -1,4 +1,4 @@
-#![feature(custom_derive, plugin)]
+#![feature(custom_derive, plugin, libc)]
 #![plugin(serde_macros)]
 #[macro_use] extern crate nom;
 #[macro_use] extern crate log;
@@ -9,6 +9,8 @@ extern crate toml;
 extern crate rustc_serialize;
 extern crate serde;
 extern crate serde_json;
+extern crate time;
+extern crate libc;
 
 mod config;
 mod command;
@@ -18,13 +20,36 @@ use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
 use std::collections::HashMap;
 use std::thread::JoinHandle;
+use std::env;
 use yxorp::network;
 use yxorp::network::metrics::{METRICS,ProxyMetrics};
+use log::{LogRecord,LogLevelFilter,LogLevel};
+use env_logger::LogBuilder;
 
 use command::{Listener,ListenerType};
 
 fn main() {
-  env_logger::init().unwrap();
+  let pid = unsafe { libc::getpid() };
+  let format = move |record: &LogRecord| {
+    match record.level() {
+    LogLevel::Debug | LogLevel::Trace => format!("{}\t{}\t{}\t{}\t{}\t|\t{}",
+      time::now_utc().rfc3339(), time::precise_time_ns(), pid,
+      record.level(), record.args(), record.location().module_path()),
+    _ => format!("{}\t{}\t{}\t{}\t{}",
+      time::now_utc().rfc3339(), time::precise_time_ns(), pid,
+      record.level(), record.args())
+
+    }
+  };
+
+  let mut builder = LogBuilder::new();
+  builder.format(format).filter(None, LogLevelFilter::Info);
+
+  if env::var("RUST_LOG").is_ok() {
+   builder.parse(&env::var("RUST_LOG").unwrap());
+  }
+
+  builder.init().unwrap();
   info!("starting up");
 
   // FIXME: should load configuration from a CLI argument

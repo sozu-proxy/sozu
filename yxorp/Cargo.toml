@@ -13,6 +13,7 @@ serde_json = "~0.8"
 serde_macros = "~0.8"
 nom = "~1.2.0"
 toml = "~0.1"
+time = "^0.1.34"
 
 [dependencies.yxorp]
 path = ".."
