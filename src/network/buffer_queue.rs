@@ -373,7 +373,7 @@ impl BufferQueue {
     println!("{}", str::from_utf8(self.unparsed_data()).unwrap());
   }
 
-  pub fn print_and_output(&mut self) {
+  pub fn print_and_consume_output(&mut self) {
     while self.output_data_size() > 0 {
       println!("{}", str::from_utf8(self.next_output_data()).unwrap());
       let len = self.next_output_data().len();
