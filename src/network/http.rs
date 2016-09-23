@@ -106,9 +106,6 @@ impl<Front:SocketHandler> Client<Front> {
     Some(client)
   }
 
-  pub fn close(&self) {
-  }
-
   pub fn reset(&mut self) {
     self.state.as_mut().unwrap().reset();
     let req_header = self.added_request_header();
@@ -182,6 +179,10 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
   fn back_token(&self)   -> Option<Token> {
     self.backend_token
+  }
+
+  fn close(&mut self) {
+    println!("HTTP closing[{:?}] front: {:?}, back: {:?}", self.token, *self.front_buf, *self.back_buf);
   }
 
   fn log_context(&self) -> String {

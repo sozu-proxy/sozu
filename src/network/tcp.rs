@@ -98,6 +98,10 @@ impl ProxyClient for Client {
     self.backend_token
   }
 
+  fn close(&mut self) {
+    println!("TCP closing[{:?}] front: {:?}, back: {:?}", self.token, *self.front_buf, *self.back_buf);
+  }
+
   fn log_context(&self) -> String {
     if let Some(ref app_id) = self.app_id {
       format!("TCP\t{}\t{}\t", self.request_id, app_id)

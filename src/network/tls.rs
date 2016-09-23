@@ -114,6 +114,11 @@ impl ProxyClient for TlsClient {
     self.http.as_ref().unwrap().back_token()
   }
 
+  fn close(&mut self) {
+    //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
+    self.http.as_mut().map(|http| http.close());
+  }
+
   fn log_context(&self)  -> String {
     self.http.as_ref().unwrap().log_context()
   }
