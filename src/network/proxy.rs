@@ -304,6 +304,12 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         //self.clients[client_token].readiness().front_readiness.remove(EventSet::readable());
       }
 
+      if back_interest.is_writable() {
+        let order = self.clients[client_token].back_writable();
+        self.interpret_client_order(event_loop, client_token, order);
+        //self.clients[client_token].readiness().back_readiness.remove(EventSet::writable());
+      }
+
       if back_interest.is_readable() {
         let order = self.clients[client_token].back_readable();
 
@@ -326,12 +332,6 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         trace!("PROXY\tinterpreting client order {:?}", order);
         self.interpret_client_order(event_loop, client_token, order);
         //self.clients[client_token].readiness().front_readiness.remove(EventSet::writable());
-      }
-
-      if back_interest.is_writable() {
-        let order = self.clients[client_token].back_writable();
-        self.interpret_client_order(event_loop, client_token, order);
-        //self.clients[client_token].readiness().back_readiness.remove(EventSet::writable());
       }
 
       if front_interest.is_hup() {
