@@ -277,7 +277,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
       let back_interest = self.clients[client_token].readiness().back_interest &
         self.clients[client_token].readiness().back_readiness;
 
-      //println!("PROXY\t{:?} {:?} | {:?} front: {:?} | back: {:?} ", client_token, events, self.clients[client_token].readiness(), front_interest, back_interest);
+      //info!("PROXY\t{:?} {:?} | {:?} front: {:?} | back: {:?} ", client_token, events, self.clients[client_token].readiness(), front_interest, back_interest);
 
       if front_interest == EventSet::none() && back_interest == EventSet::none() {
         break;
