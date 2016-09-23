@@ -119,7 +119,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
     }
 
     self.close_backend(event_loop, token);
-    self.clients.close();
+    self.clients[token].close();
     self.clients.remove(token);
   }
 
