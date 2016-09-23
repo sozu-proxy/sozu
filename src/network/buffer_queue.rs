@@ -1,8 +1,9 @@
 use network::buffer::Buffer;
 use pool::Reset;
-use std::io::{self,Write};
 use nom::HexDisplay;
+use std::io::{self,Write};
 use std::cmp::{min,max};
+use std::str;
 
 #[derive(Debug,PartialEq,Clone)]
 pub enum InputElement {
@@ -365,6 +366,18 @@ impl BufferQueue {
         None     => { self.output_queue.remove(0); },
         Some(el) => { self.output_queue[0] = el; },
       };
+    }
+  }
+
+  pub fn print_unparsed(&self) {
+    println!("{}", str::from_utf8(self.unparsed_data()).unwrap());
+  }
+
+  pub fn print_and_output(&mut self) {
+    while self.output_data_size() > 0 {
+      println!("{}", str::from_utf8(self.next_output_data()).unwrap());
+      let len = self.next_output_data().len();
+      self.consume_output_data(len);
     }
   }
 }
