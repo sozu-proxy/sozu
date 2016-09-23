@@ -334,12 +334,13 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
       if front_interest.is_hup() {
         if self.clients[client_token].front_hup() == ClientResult::CloseClient {
-          self.close_client(event_loop, client_token);
           self.clients[client_token].readiness().front_interest = EventSet::none();
           self.clients[client_token].readiness().back_interest  = EventSet::none();
           self.clients[client_token].readiness().back_readiness.remove(EventSet::hup());
+          self.close_client(event_loop, client_token);
+        } else {
+          self.clients[client_token].readiness().front_readiness.remove(EventSet::hup());
         }
-        self.clients[client_token].readiness().front_readiness.remove(EventSet::hup());
       }
       if !self.clients.contains(client_token) {
         break;
@@ -347,12 +348,13 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
       if back_interest.is_hup() {
         if self.clients[client_token].front_hup() == ClientResult::CloseClient {
-          self.close_client(event_loop, client_token);
           self.clients[client_token].readiness().front_interest = EventSet::none();
           self.clients[client_token].readiness().back_interest  = EventSet::none();
           self.clients[client_token].readiness().front_readiness.remove(EventSet::hup());
+          self.close_client(event_loop, client_token);
+        } else {
+          self.clients[client_token].readiness().back_readiness.remove(EventSet::hup());
         }
-        self.clients[client_token].readiness().back_readiness.remove(EventSet::hup());
       }
     }
   }
