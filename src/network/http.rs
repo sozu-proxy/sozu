@@ -316,6 +316,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       SocketResult::Continue => {}
     };
 
+    // Looking for the host header
     let has_host = self.state.as_ref().unwrap().has_host();
     if !has_host {
       self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
@@ -338,10 +339,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         Some(RequestState::Request(_,_,_)) | Some(RequestState::RequestWithBody(_,_,_,_)) => {
           if ! self.front_buf.needs_input() {
             self.readiness.front_interest.remove(EventSet::readable());
-            return  ClientResult::Continue;
-          } else {
-            return  ClientResult::Continue;
           }
+          return ClientResult::Continue;
         },
         Some(RequestState::RequestWithBodyChunks(_,_,_,ch)) => {
           if ch == Chunk::Ended {
@@ -471,7 +470,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     if self.back_buf.can_restart_parsing() {
       match self.state.as_ref().unwrap().response {
         // FIXME: should only restart parsing if we are using keepalive
-        Some(ResponseState::Response(_,_))                            |
+        Some(ResponseState::Response(_,_))                              |
           Some(ResponseState::ResponseWithBody(_,_,_))                  |
           Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
             self.reset();
