@@ -624,10 +624,16 @@ impl RequestState {
   }
 
   pub fn should_keep_alive(&self) -> bool {
-    match self.get_keep_alive() {
-      Some(Connection::KeepAlive) => true,
-      Some(Connection::Close)     => false,
-      None                        => false
+    //FIXME: should not clone here
+    let rl =  self.get_request_line();
+    let version: &str    = rl.as_ref().map(|rl| rl.version.as_str()).unwrap_or("");
+    let keep_alive = self.get_keep_alive();
+    match (version, keep_alive) {
+      (_, Some(Connection::KeepAlive)) => true,
+      (_, Some(Connection::Close))     => false,
+      ("10", None)                     => false,
+      ("11", None)                     => true,
+      (_, _)                           => false,
     }
   }
 
@@ -690,10 +696,16 @@ impl ResponseState {
   }
 
   pub fn should_keep_alive(&self) -> bool {
-    match self.get_keep_alive() {
-      Some(Connection::KeepAlive) => true,
-      Some(Connection::Close)     => false,
-      None                        => false
+    //FIXME: should not clone here
+    let sl = self.get_status_line();
+    let version    = sl.as_ref().map(|sl| sl.version.as_str()).unwrap_or("");
+    let keep_alive = self.get_keep_alive();
+    match (version, keep_alive) {
+      (_, Some(Connection::KeepAlive)) => true,
+      (_, Some(Connection::Close))     => false,
+      ("10", None)                     => false,
+      ("11", None)                     => true,
+      (_, _)                           => false,
     }
   }
 

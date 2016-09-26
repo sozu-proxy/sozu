@@ -473,9 +473,22 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         Some(ResponseState::Response(_,_))                              |
           Some(ResponseState::ResponseWithBody(_,_,_))                  |
           Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
-            self.reset();
-            self.readiness.front_interest.insert(EventSet::readable());
-            ClientResult::Continue
+            let front_keep_alive = self.state.as_ref().map(|st| st.request.as_ref().map(|r| r.should_keep_alive()).unwrap_or(false)).unwrap_or(false);
+            let back_keep_alive  = self.state.as_ref().map(|st| st.response.as_ref().map(|r| r.should_keep_alive()).unwrap_or(false)).unwrap_or(false);
+
+            //FIXME: we could get smarter about this
+            // with no keepalive on backend, we could open a new backend ConnectionError
+            // with no keepalive on front but keepalive on backend, we could have
+            // a pool of connections
+            if front_keep_alive && back_keep_alive {
+              self.reset();
+              self.readiness.front_interest.insert(EventSet::readable());
+              ClientResult::Continue
+            } else {
+              info!("keepalive front: {}, back: {}, closing connections", front_keep_alive, back_keep_alive);
+              self.readiness.reset();
+              ClientResult::CloseBothSuccess
+            }
           },
           // restart parsing, since there will be other chunks next
           Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
