@@ -484,6 +484,10 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               self.reset();
               self.readiness.front_interest.insert(EventSet::readable());
               ClientResult::Continue
+            } else if front_keep_alive && !back_keep_alive {
+              self.reset();
+              self.readiness.front_interest.insert(EventSet::readable());
+              ClientResult::CloseBackend
             } else {
               info!("keepalive front: {}, back: {}, closing connections", front_keep_alive, back_keep_alive);
               self.readiness.reset();
@@ -860,6 +864,8 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
         socket.set_nodelay(true);
         client.set_back_socket(socket);
         client.readiness().back_interest.insert(EventSet::writable());
+        client.readiness().back_interest.insert(EventSet::hup());
+        client.readiness().back_interest.insert(EventSet::error());
         Ok(())
         },
         Err(ConnectionError::NoBackendAvailable) => {
