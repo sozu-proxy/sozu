@@ -358,6 +358,15 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
           self.clients[client_token].readiness().back_readiness.remove(EventSet::hup());
         }
       }
+
+      if front_interest.is_error() || back_interest.is_error() {
+        error!("PROXY client {:?} got an error: front: {:?} back: {:?}", client_token, front_interest,
+          back_interest);
+        self.clients[client_token].readiness().front_interest = EventSet::none();
+        self.clients[client_token].readiness().back_interest  = EventSet::none();
+        self.close_client(event_loop, client_token);
+        break;
+      }
     }
   }
 
