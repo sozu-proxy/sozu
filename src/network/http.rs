@@ -182,7 +182,6 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   }
 
   fn close(&mut self) {
-    println!("HTTP closing[{:?}] front: {:?}, back: {:?}", self.token, *self.front_buf, *self.back_buf);
   }
 
   fn log_context(&self) -> String {
