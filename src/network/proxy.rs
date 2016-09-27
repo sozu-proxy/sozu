@@ -77,8 +77,15 @@ pub trait ProxyClient {
   fn readiness(&mut self)      -> &mut Readiness;
 }
 
+#[derive(Debug,PartialEq)]
+pub enum BackendConnectAction {
+  New,
+  Reuse,
+  Replace,
+}
+
 pub trait ProxyConfiguration<Server:Handler,Client> {
-  fn connect_to_backend(&mut self, client:&mut Client) ->Result<(),ConnectionError>;
+  fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Server>, client:&mut Client) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut EventLoop<Server>, message: ProxyOrder);
   fn accept(&mut self, token: Token) -> Option<(Client, bool)>;
   fn front_timeout(&self) -> u64;
@@ -156,8 +163,22 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
   }
 
   pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
-    match self.configuration.connect_to_backend(&mut self.clients[token]) {
-      Ok(()) => {
+    match self.configuration.connect_to_backend(event_loop, &mut self.clients[token]) {
+      Ok(BackendConnectAction::Reuse) => {
+        info!("keepalive, reusing backend connection");
+      }
+      Ok(BackendConnectAction::Replace) => {
+        if let Some(backend_token) = self.clients[token].back_token() {
+          if let Some(sock) = self.clients[token].back_socket() {
+            event_loop.register(sock, backend_token, EventSet::all(), PollOpt::edge());
+          }
+          if let Ok(timeout) = event_loop.timeout_ms(backend_token.as_usize(), self.configuration.back_timeout()) {
+            &self.clients[token].set_back_timeout(timeout);
+          }
+          return;
+        }
+      },
+      Ok(BackendConnectAction::New) => {
         if let Ok(backend_token) = self.backend.insert(token) {
           self.clients[token].set_back_token(backend_token);
 

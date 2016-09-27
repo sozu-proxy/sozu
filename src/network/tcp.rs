@@ -16,7 +16,7 @@ use time::{Duration,precise_time_s};
 use rand::random;
 use uuid::Uuid;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents};
-use network::proxy::{Server,ProxyClient,ProxyConfiguration,Readiness};
+use network::proxy::{BackendConnectAction,Server,ProxyClient,ProxyConfiguration,Readiness};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -434,7 +434,7 @@ impl ServerConfiguration {
 
 impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
 
-  fn connect_to_backend(&mut self, client:&mut Client) ->Result<(),ConnectionError> {
+  fn connect_to_backend(&mut self, event_loop: &mut EventLoop<TcpServer>, client:&mut Client) ->Result<BackendConnectAction,ConnectionError> {
     let rnd = random::<usize>();
     let idx = rnd % self.listeners[client.accept_token].back_addresses.len();
 
@@ -446,7 +446,7 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
     client.set_back_socket(stream);
     client.readiness().front_interest.insert(EventSet::readable() | EventSet::writable());
     client.readiness().back_interest.insert(EventSet::readable() | EventSet::writable());
-    Ok(())
+    Ok(BackendConnectAction::New)
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<TcpServer>, message: ProxyOrder) {

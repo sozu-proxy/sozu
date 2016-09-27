@@ -18,7 +18,7 @@ use time::{Duration, precise_time_s, precise_time_ns};
 use rand::random;
 use uuid::Uuid;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents};
-use network::proxy::{Server,ProxyConfiguration,ProxyClient,Readiness};
+use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -830,51 +830,65 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_request(&mut self, client: &mut Client<TcpStream>, host: &str, uri: &str) -> Result<TcpStream,ConnectionError> {
+  pub fn backend_from_app_id(&mut self, client: &mut Client<TcpStream>, app_id: &str) -> Result<TcpStream,ConnectionError> {
     // FIXME: the app id clone here is probably very inefficient
-    if let Some(app_id) = self.frontend_from_request(host, uri).map(|ref front| front.app_id.clone()) {
-      client.app_id = Some(app_id.clone());
-      // ToDo round-robin on instances
-      if let Some(ref mut app_instances) = self.instances.get_mut(&app_id) {
-        if app_instances.len() == 0 {
-          client.set_answer(&self.answers.ServiceUnavailable);
-          return Err(ConnectionError::NoBackendAvailable);
-        }
-        let rnd = random::<usize>();
-        let mut instances:Vec<&mut Backend> = app_instances.iter_mut().filter(|backend| backend.can_open()).collect();
-        let idx = rnd % instances.len();
-        info!("{}\tConnecting {} -> {:?}", client.log_ctx, host, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
-        instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut backend| {
-          let conn: Result<TcpStream, ConnectionError> = TcpStream::connect(&backend.address).map_err(|_| ConnectionError::NoBackendAvailable);
-          if conn.is_ok() {
-            backend.inc_connections();
-          }
-          conn
-        })
-      } else {
-        Err(ConnectionError::NoBackendAvailable)
+    //if let Some(app_id) = self.frontend_from_request(host, uri).map(|ref front| front.app_id.clone()) {
+    client.app_id = Some(String::from(app_id));
+    // ToDo round-robin on instances
+    if let Some(ref mut app_instances) = self.instances.get_mut(app_id) {
+      if app_instances.len() == 0 {
+        client.set_answer(&self.answers.ServiceUnavailable);
+        return Err(ConnectionError::NoBackendAvailable);
       }
+      let rnd = random::<usize>();
+      let mut instances:Vec<&mut Backend> = app_instances.iter_mut().filter(|backend| backend.can_open()).collect();
+      let idx = rnd % instances.len();
+      info!("{}\tConnecting {} -> {:?}", client.log_ctx, app_id, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
+      instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut backend| {
+        let conn: Result<TcpStream, ConnectionError> = TcpStream::connect(&backend.address).map_err(|_| ConnectionError::NoBackendAvailable);
+        if conn.is_ok() {
+          backend.inc_connections();
+        }
+        conn
+      })
     } else {
-      Err(ConnectionError::HostNotFound)
+      Err(ConnectionError::NoBackendAvailable)
     }
   }
-
 }
 
 impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
-  fn connect_to_backend(&mut self, client: &mut Client<TcpStream>) -> Result<(),ConnectionError> {
-      let host   = try!(client.state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
-      let rl     = try!(client.state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-      let conn   = self.backend_from_request(client, &host, &rl.uri);
+  fn connect_to_backend(&mut self, event_loop: &mut EventLoop<HttpServer>, client: &mut Client<TcpStream>) -> Result<BackendConnectAction,ConnectionError> {
+    let host   = try!(client.state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
+    let rl     = try!(client.state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
+    if let Some(app_id) = self.frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
+      if client.app_id.as_ref() == Some(&app_id) {
+        //matched on keepalive
+        return Ok(BackendConnectAction::Reuse)
+      }
 
+      let reused = client.app_id.is_some();
+      if reused {
+        let sock = client.backend.as_ref().unwrap();
+        event_loop.deregister(sock);
+        sock.shutdown(Shutdown::Both);
+      }
+      //FIXME: deregister back socket, since it is the wrong one
+
+      let conn   = self.backend_from_app_id(client, &app_id);
       match conn {
         Ok(socket) => {
-        socket.set_nodelay(true);
-        client.set_back_socket(socket);
-        client.readiness().back_interest.insert(EventSet::writable());
-        client.readiness().back_interest.insert(EventSet::hup());
-        client.readiness().back_interest.insert(EventSet::error());
-        Ok(())
+          socket.set_nodelay(true);
+          client.set_back_socket(socket);
+          client.readiness().back_interest.insert(EventSet::writable());
+          client.readiness().back_interest.insert(EventSet::hup());
+          client.readiness().back_interest.insert(EventSet::error());
+          if reused {
+            Ok(BackendConnectAction::Replace)
+          } else {
+            Ok(BackendConnectAction::New)
+          }
+          //Ok(())
         },
         Err(ConnectionError::NoBackendAvailable) => {
           client.set_answer(&self.answers.ServiceUnavailable);
@@ -888,6 +902,11 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
         }
         e => panic!(e)
       }
+    } else {
+      client.set_answer(&self.answers.NotFound);
+      client.readiness().front_interest.insert(EventSet::writable());
+      Err(ConnectionError::HostNotFound)
+    }
   }
 
   fn notify(&mut self, event_loop: &mut EventLoop<HttpServer>, message: ProxyOrder) {

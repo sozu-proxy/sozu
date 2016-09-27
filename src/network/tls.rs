@@ -30,7 +30,7 @@ use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_req
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder};
-use network::proxy::{Server,ProxyConfiguration,ProxyClient,Readiness};
+use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness};
 use messages::{Command,TlsFront};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -491,7 +491,7 @@ impl ProxyConfiguration<TlsServer,TlsClient> for ServerConfiguration {
     None
   }
 
-  fn connect_to_backend(&mut self, client: &mut TlsClient) -> Result<(),ConnectionError> {
+  fn connect_to_backend(&mut self, event_loop: &mut EventLoop<TlsServer>, client: &mut TlsClient) -> Result<BackendConnectAction,ConnectionError> {
     // FIXME: should check the host corresponds to SNI here
     let host   = try!(client.http.as_mut().unwrap().state().get_host().ok_or(ConnectionError::NoHostGiven));
     let rl:RRequestLine = try!(client.http.as_mut().unwrap().state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
@@ -516,7 +516,8 @@ impl ProxyConfiguration<TlsServer,TlsClient> for ServerConfiguration {
         });
 
         client.set_back_socket(socket);
-        Ok(())
+        //FIXME: implement keepalive
+        Ok(BackendConnectAction::New)
       },
       Err(ConnectionError::NoBackendAvailable) => {
         client.http.as_mut().unwrap().set_answer(&self.answers.ServiceUnavailable);
