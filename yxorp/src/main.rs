@@ -2,6 +2,7 @@
 #![plugin(serde_macros)]
 #[macro_use] extern crate nom;
 #[macro_use] extern crate log;
+#[macro_use] extern crate clap;
 extern crate env_logger;
 extern crate mio;
 extern crate yxorp;
@@ -25,6 +26,7 @@ use yxorp::network;
 use yxorp::network::metrics::{METRICS,ProxyMetrics};
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
+use clap::{App,Arg};
 
 use command::{Listener,ListenerType};
 
@@ -52,8 +54,21 @@ fn main() {
   builder.init().unwrap();
   info!("starting up");
 
-  // FIXME: should load configuration from a CLI argument
-  if let Ok(config) = config::Config::load_from_path("./config.toml") {
+  let matches = App::new("I will not name this thing yxorp")
+                        .version(crate_version!())
+                        .about("hot reconfigurable proxy")
+                        .arg(Arg::with_name("config")
+                                    .short("c")
+                                    .long("config")
+                                    .value_name("FILE")
+                                    .help("Sets a custom config file")
+                                    .takes_value(true)
+                                    .required(true))
+                        .get_matches();
+
+  let config_file = matches.value_of("config").unwrap();
+
+  if let Ok(config) = config::Config::load_from_path(config_file) {
     let metrics_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
     let metrics_host   = (&config.metrics.address[..], config.metrics.port).to_socket_addrs().unwrap().next().unwrap();
     METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
