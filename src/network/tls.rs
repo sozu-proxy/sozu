@@ -99,7 +99,11 @@ impl ProxyClient for TlsClient {
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
-    self.http.as_ref().unwrap().back_socket()
+    if let Some(ref http) = self.http.as_ref() {
+      http.back_socket()
+    } else {
+      None
+    }
   }
 
   fn front_token(&self)  -> Option<Token> {
@@ -111,7 +115,11 @@ impl ProxyClient for TlsClient {
   }
 
   fn back_token(&self)   -> Option<Token> {
-    self.http.as_ref().unwrap().back_token()
+    if let Some(ref http) = self.http.as_ref() {
+      http.back_token()
+    } else {
+      None
+    }
   }
 
   fn close(&mut self) {
