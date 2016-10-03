@@ -362,11 +362,11 @@ struct CommandClient {
 }
 
 impl CommandClient {
-  fn new(sock: UnixStream) -> CommandClient {
+  fn new(sock: UnixStream, buffer_size: usize) -> CommandClient {
     CommandClient {
       sock:        sock,
-      buf:         Buffer::with_capacity(10000),
-      back_buf:    Buffer::with_capacity(10000),
+      buf:         Buffer::with_capacity(buffer_size),
+      back_buf:    Buffer::with_capacity(buffer_size),
       token:       None,
       message_ids: Vec::new(),
       write_timeout: None,
@@ -500,6 +500,7 @@ fn parse(input: &[u8]) -> IResult<&[u8], Vec<ConfigMessage>> {
 
 struct CommandServer {
   sock:  UnixListener,
+  buffer_size: usize,
   conns: Slab<CommandClient>,
   listeners: HashMap<String, Listener>,
 }
@@ -509,7 +510,7 @@ impl CommandServer {
     debug!("server accepting socket");
 
     let sock = self.sock.accept().unwrap().unwrap();
-    let conn = CommandClient::new(sock);
+    let conn = CommandClient::new(sock, self.buffer_size);
     let tok = self.conns.insert(conn)
       .ok().expect("could not add connection to slab");
 
@@ -580,9 +581,10 @@ impl CommandServer {
     }
   }
 
-  fn new(srv: UnixListener, listeners: HashMap<String, Listener>) -> CommandServer {
+  fn new(srv: UnixListener, listeners: HashMap<String, Listener>, buffer_size: usize) -> CommandServer {
     CommandServer {
       sock:  srv,
+      buffer_size: buffer_size,
       conns: Slab::new_starting_at(Token(1), 128),
       listeners: listeners,
     }
@@ -676,7 +678,7 @@ impl Handler for CommandServer {
 
 }
 
-pub fn start(path: String, mut listeners: HashMap<String, Listener>, saved_state: Option<String>) {
+pub fn start(path: String, mut listeners: HashMap<String, Listener>, saved_state: Option<String>, buffer_size: usize) {
   thread::spawn(move || {
     saved_state.as_ref().map(|state_path| {
       fs::File::open(state_path).map(|mut f| {
@@ -717,7 +719,7 @@ pub fn start(path: String, mut listeners: HashMap<String, Listener>, saved_state
         event_loop.register(&srv, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
         event_loop.timeout_ms(0, 700);
 
-        event_loop.run(&mut CommandServer::new(srv, listeners)).unwrap()
+        event_loop.run(&mut CommandServer::new(srv, listeners, buffer_size)).unwrap()
       },
       Err(e) => {
         log!(log::LogLevel::Error, "could not create unix socket: {:?}", e);

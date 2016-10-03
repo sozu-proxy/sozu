@@ -24,6 +24,7 @@ pub struct MetricsConfig {
 #[derive(Debug,Clone,PartialEq,Eq, RustcDecodable, RustcEncodable)]
 pub struct Config {
   pub command_socket: String,
+  pub command_buffer_size: Option<usize>,
   pub saved_state:    Option<String>,
   pub metrics:        MetricsConfig,
   pub listeners:      HashMap<String, ListenerConfig>,
