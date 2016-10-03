@@ -27,6 +27,7 @@ pub struct Config {
   pub saved_state:    Option<String>,
   pub metrics:        MetricsConfig,
   pub listeners:      HashMap<String, ListenerConfig>,
+  pub log_level:      Option<String>,
 }
 
 impl Config {

@@ -47,13 +47,6 @@ fn main() {
   let mut builder = LogBuilder::new();
   builder.format(format).filter(None, LogLevelFilter::Info);
 
-  if env::var("RUST_LOG").is_ok() {
-   builder.parse(&env::var("RUST_LOG").unwrap());
-  }
-
-  builder.init().unwrap();
-  info!("starting up");
-
   let matches = App::new("I will not name this thing yxorp")
                         .version(crate_version!())
                         .about("hot reconfigurable proxy")
@@ -69,6 +62,13 @@ fn main() {
   let config_file = matches.value_of("config").unwrap();
 
   if let Ok(config) = config::Config::load_from_path(config_file) {
+    if let Some(log_level) = config.log_level {
+     builder.parse(&log_level);
+    }
+
+    builder.init().unwrap();
+    info!("starting up");
+
     let metrics_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
     let metrics_host   = (&config.metrics.address[..], config.metrics.port).to_socket_addrs().unwrap().next().unwrap();
     METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
@@ -107,7 +107,7 @@ fn main() {
       info!("good bye");
     }
   } else {
-    println!("could not load configuration, stopping");
+    println!("could not load configuration file at '{}', stopping", config_file);
   }
 }
 
