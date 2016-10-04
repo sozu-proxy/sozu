@@ -101,7 +101,9 @@ fn main() {
       }
     };
 
-    command::start(config.command_socket, listeners, config.saved_state, config.command_buffer_size.unwrap_or(10000));
+    let buffer_size     = config.command_buffer_size.unwrap_or(10000);
+    let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
+    command::start(config.command_socket, listeners, config.saved_state, buffer_size, max_buffer_size);
     if let Some(jh) = jh_opt {
       let _ = jh.join();
       info!("good bye");

@@ -25,6 +25,7 @@ pub struct MetricsConfig {
 pub struct Config {
   pub command_socket: String,
   pub command_buffer_size: Option<usize>,
+  pub max_command_buffer_size: Option<usize>,
   pub saved_state:    Option<String>,
   pub metrics:        MetricsConfig,
   pub listeners:      HashMap<String, ListenerConfig>,

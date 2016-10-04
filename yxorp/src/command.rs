@@ -10,6 +10,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::collections::HashMap;
 use std::sync::mpsc;
+use std::cmp::min;
 use log;
 use nom::{IResult,HexDisplay};
 use serde;
@@ -506,6 +507,7 @@ fn parse(input: &[u8]) -> IResult<&[u8], Vec<ConfigMessage>> {
 struct CommandServer {
   sock:  UnixListener,
   buffer_size: usize,
+  max_buffer_size: usize,
   conns: Slab<CommandClient>,
   listeners: HashMap<String, Listener>,
 }
@@ -561,7 +563,7 @@ impl CommandServer {
             listeners: v,
           };
           let encoded = serde_json::to_string(&conf).unwrap().into_bytes();
-          if self.conns[token].back_buf.grow(encoded.len() + 10) {
+          if self.conns[token].back_buf.grow(min(encoded.len() + 10, self.max_buffer_size)) {
             log!(log::LogLevel::Info, "write buffer was not large enough, growing to {} bytes", encoded.len());
           }
           self.conns[token].back_buf.write(&encoded);
@@ -586,10 +588,11 @@ impl CommandServer {
     }
   }
 
-  fn new(srv: UnixListener, listeners: HashMap<String, Listener>, buffer_size: usize) -> CommandServer {
+  fn new(srv: UnixListener, listeners: HashMap<String, Listener>, buffer_size: usize, max_buffer_size: usize) -> CommandServer {
     CommandServer {
       sock:  srv,
       buffer_size: buffer_size,
+      max_buffer_size: max_buffer_size,
       conns: Slab::new_starting_at(Token(1), 128),
       listeners: listeners,
     }
@@ -618,7 +621,7 @@ impl Handler for CommandServer {
               }
               Err(ConnReadError::FullBufferError) => {
                 //FIXME: automatically growing by 5kB every time may not be the best idea
-                let new_size = self.conns[token].buf.capacity()+5000;
+                let new_size = min(self.conns[token].buf.capacity()+5000, self.max_buffer_size);
                 log!(log::LogLevel::Error, "buffer not large enough, growing to {}", new_size);
                 self.conns[token].buf.grow(new_size);
               }
@@ -683,7 +686,8 @@ impl Handler for CommandServer {
 
 }
 
-pub fn start(path: String, mut listeners: HashMap<String, Listener>, saved_state: Option<String>, buffer_size: usize) {
+pub fn start(path: String, mut listeners: HashMap<String, Listener>, saved_state: Option<String>, buffer_size: usize,
+  max_buffer_size: usize) {
   thread::spawn(move || {
     saved_state.as_ref().map(|state_path| {
       fs::File::open(state_path).map(|mut f| {
@@ -724,7 +728,7 @@ pub fn start(path: String, mut listeners: HashMap<String, Listener>, saved_state
         event_loop.register(&srv, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
         event_loop.timeout_ms(0, 700);
 
-        event_loop.run(&mut CommandServer::new(srv, listeners, buffer_size)).unwrap()
+        event_loop.run(&mut CommandServer::new(srv, listeners, buffer_size, max_buffer_size)).unwrap()
       },
       Err(e) => {
         log!(log::LogLevel::Error, "could not create unix socket: {:?}", e);
