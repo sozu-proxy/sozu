@@ -2,7 +2,8 @@
 
 command_socket = "./command_folder/sock"
 saved_state    = "./conf_dump.json"
-log_level      = info
+log_level      = "info"
+command_buffer_size = 12000
 
 [metrics]
 address = "192.168.59.103"
