@@ -439,8 +439,13 @@ impl CommandClient {
       },
       IResult::Done(i, v)    => {
         if self.buf.available_data() == i.len() && v.len() == 0 {
-          log!(log::LogLevel::Error, "UNIX CLIENT[{}] buffer full, cannot parse", tok.as_usize());
-          return Err(ConnReadError::FullBufferError);
+          if self.buf.available_space() == 0 {
+            log!(log::LogLevel::Error, "UNIX CLIENT[{}] buffer full, cannot parse", tok.as_usize());
+            return Err(ConnReadError::FullBufferError);
+          } else {
+            log!(log::LogLevel::Error, "UNIX CLIENT[{}] parse error", tok.as_usize());
+            return Err(ConnReadError::ParseError);
+          }
         }
         offset = self.buf.data().offset(i);
         res = Ok(v);
