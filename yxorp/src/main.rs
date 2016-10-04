@@ -86,7 +86,9 @@ fn main() {
       if let Ok(addr) = address.parse() {
         let (tx, jg) = match ls.listener_type {
           ListenerType::HTTP => {
-            network::http::start_listener(addr, ls.max_connections, ls.buffer_size, sender)
+            //FIXME: make safer
+            let conf = ls.to_http().unwrap();
+            network::http::start_listener(conf, sender)
           },
           ListenerType::HTTPS => {
             network::tls::start_listener(addr, ls.max_connections, ls.buffer_size, None, sender)

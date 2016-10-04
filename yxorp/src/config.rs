@@ -4,15 +4,40 @@ use std::fs::File;
 use command::ListenerType;
 use toml;
 
+use yxorp::messages::HttpProxyConfiguration;
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct ListenerConfig {
   pub listener_type:   ListenerType,
   pub address:         String,
+  pub public_address:  Option<String>,
   pub port:            u16,
   pub max_connections: usize,
   pub buffer_size:     usize,
   pub answer_404:      Option<String>,
   pub answer_503:      Option<String>,
+}
+
+impl ListenerConfig {
+  pub fn to_http(&self) -> Option<HttpProxyConfiguration> {
+    let mut address = self.address.clone();
+    address.push(':');
+    address.push_str(&self.port.to_string());
+
+    //FIXME: error message when we cannot parse the address
+    address.parse().ok().map(|addr| {
+    HttpProxyConfiguration {
+      front: addr,
+      public_address: self.public_address.clone(),
+      max_connections: self.max_connections,
+      buffer_size: self.buffer_size,
+      //FIXME: handle the default case,
+      answer_404: String::from(""),
+      answer_503: String::from(""),
+      ..Default::default()
+    }
+    })
+  }
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]

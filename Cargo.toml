@@ -19,6 +19,7 @@ serde_macros = "^0.8.0"
 #serde_json = "~0.7.0"
 #serde_macros = "~0.7.0"
 lazy_static = "0.1.15"
+libc = "^0.2"
 
 [dev-dependencies]
 tiny_http= "0.4"

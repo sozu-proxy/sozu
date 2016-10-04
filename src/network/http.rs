@@ -26,7 +26,7 @@ use network::socket::{SocketHandler,SocketResult,server_bind};
 use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop, BufferMove, RequestState, ResponseState, Chunk};
 use nom::HexDisplay;
 
-use messages::{Command,HttpFront};
+use messages::{Command,HttpFront,HttpProxyConfiguration};
 
 type BackendToken = Token;
 
@@ -737,31 +737,34 @@ pub struct ServerConfiguration {
   answers:   DefaultAnswers,
   front_timeout:   u64,
   back_timeout:    u64,
+  config: HttpProxyConfiguration,
 }
 
 impl ServerConfiguration {
-  pub fn new(address: SocketAddr, tx: mpsc::Sender<ServerMessage>, max_connections: usize, buffer_size: usize, event_loop: &mut EventLoop<HttpServer>) -> io::Result<ServerConfiguration> {
-    match server_bind(&address) {
+  pub fn new(config: HttpProxyConfiguration, tx: mpsc::Sender<ServerMessage>, event_loop: &mut EventLoop<HttpServer>) -> io::Result<ServerConfiguration> {
+    let front = config.front;
+    match server_bind(&config.front) {
       Ok(sock) => {
         event_loop.register(&sock, Token(0), EventSet::readable(), PollOpt::level());
         Ok(ServerConfiguration {
           listener:  sock,
-          address:   address,
+          address:   config.front,
           instances: HashMap::new(),
           fronts:    HashMap::new(),
           tx:        tx,
-          pool:      Pool::with_capacity(2*max_connections, 0, || BufferQueue::with_capacity(buffer_size)),
+          pool:      Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size)),
           //FIXME: make the timeout values configurable
           front_timeout: 5000,
           back_timeout:  5000,
           answers:   DefaultAnswers {
             NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
             ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
-          }
+          },
+          config: config,
         })
       },
       Err(e) => {
-        error!("HTTP\tcould not create listener {:?}: {:?}", address, e);
+        error!("HTTP\tcould not create listener {:?}: {:?}", front, e);
         Err(e)
       }
     }
@@ -1005,12 +1008,13 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
 
 pub type HttpServer = Server<ServerConfiguration,Client<TcpStream>>;
 
-pub fn start_listener(front: SocketAddr, max_connections: usize, buffer_size: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
+pub fn start_listener(config: HttpProxyConfiguration, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
 
-  let configuration = ServerConfiguration::new(front, tx, max_connections, buffer_size, &mut event_loop).unwrap();
+  let max_connections = config.max_connections;
+  let configuration = ServerConfiguration::new(config, tx, &mut event_loop).unwrap();
   let mut server = HttpServer::new(1, max_connections, configuration);
 
   let join_guard = thread::spawn(move|| {
@@ -1036,7 +1040,7 @@ mod tests {
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
-  use messages::{Command,HttpFront,Instance};
+  use messages::{Command,HttpFront,Instance,HttpProxyConfiguration};
   use network::{ProxyOrder,ServerMessage};
   use network::buffer_queue::BufferQueue;
   use pool::Pool;
@@ -1047,7 +1051,13 @@ mod tests {
     start_server(1025);
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").unwrap();
     let (tx,rx) = channel::<ServerMessage>();
-    let (sender, jg) = start_listener(front, 10, 12000, tx.clone());
+    let config = HttpProxyConfiguration {
+      front: front,
+      max_connections: 10,
+      buffer_size: 12000,
+      ..Default::default()
+    };
+    let (sender, jg) = start_listener(config, tx.clone());
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
     sender.send(ProxyOrder::Command(String::from("ID_ABCD"), Command::AddHttpFront(front)));
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
@@ -1088,7 +1098,13 @@ mod tests {
     start_server(1028);
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1031").unwrap();
     let (tx,rx) = channel::<ServerMessage>();
-    let (sender, jg) = start_listener(front, 10, 12000, tx.clone());
+    let config = HttpProxyConfiguration {
+      front: front,
+      max_connections: 10,
+      buffer_size: 12000,
+      ..Default::default()
+    };
+    let (sender, jg) = start_listener(config, tx.clone());
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1031"), path_begin: String::from("/") };
     sender.send(ProxyOrder::Command(String::from("ID_ABCD"), Command::AddHttpFront(front)));
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1028 };
@@ -1206,7 +1222,8 @@ mod tests {
       answers:   DefaultAnswers {
         NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
-      }
+      },
+      config: Default::default(),
     };
 
     let frontend1 = server_config.frontend_from_request("lolcatho.st", "/");

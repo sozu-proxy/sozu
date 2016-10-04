@@ -1,5 +1,9 @@
 use serde;
 use serde_json;
+use openssl::ssl::SslContextOptions;
+use libc::c_long;
+use std::net::SocketAddr;
+use std::default::Default;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpFront {
@@ -35,10 +39,43 @@ pub struct Instance {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpProxyConfiguration {
-    pub front_timeout: u64,
-    pub back_timeout:  u64,
-    pub answer_404:    String,
-    pub answer_503:    String,
+    pub front:           SocketAddr,
+    pub front_timeout:   u64,
+    pub back_timeout:    u64,
+    pub max_connections: usize,
+    pub buffer_size:     usize,
+    pub public_address:  Option<String>,
+    pub answer_404:      String,
+    pub answer_503:      String,
+}
+
+impl Default for HttpProxyConfiguration {
+  fn default() -> HttpProxyConfiguration {
+    HttpProxyConfiguration {
+      front:           "127.0.0.1:8080".parse().unwrap(),
+      front_timeout:   5000,
+      back_timeout:    5000,
+      max_connections: 1000,
+      buffer_size:     12000,
+      public_address:  None,
+      answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
+      answer_503:      String::from("HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
+    }
+  }
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct TlsProxyConfiguration {
+    pub front:           SocketAddr,
+    pub front_timeout:   u64,
+    pub back_timeout:    u64,
+    pub max_connections: usize,
+    pub buffer_size:     usize,
+    pub public_address:  Option<String>,
+    pub answer_404:      String,
+    pub answer_503:      String,
+    pub options:         c_long,
+    pub cipher_list:     String,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize)]
@@ -56,6 +93,7 @@ pub enum Command {
     RemoveInstance(Instance),
 
     HttpProxy(HttpProxyConfiguration),
+    TlsProxy(TlsProxyConfiguration),
 }
 
 impl Command {
@@ -69,7 +107,8 @@ impl Command {
       Command::RemoveTcpFront(_)  => vec![Topic::TcpProxyConfig                        ],
       Command::AddInstance(_)     => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
       Command::RemoveInstance(_)  => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
-      Command::HttpProxy(_)       => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig],
+      Command::HttpProxy(_)       => vec![Topic::HttpProxyConfig],
+      Command::TlsProxy(_)        => vec![Topic::TlsProxyConfig],
     }
   }
 }
