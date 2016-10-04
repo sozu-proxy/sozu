@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::{self,Error,ErrorKind,Read};
 use std::fs::File;
 use command::ListenerType;
-use toml::decode_str;
+use toml;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct ListenerConfig {
@@ -37,10 +37,11 @@ impl Config {
     let mut data = String::new();
     try!(f.read_to_string(&mut data));
 
-    if let Some(config) = decode_str(&data[..]) {
+    let mut parser = toml::Parser::new(&data[..]);
+    if let Some(config) = parser.parse().and_then(|t| toml::decode(toml::Value::Table(t))) {
       Ok(config)
     } else {
-      Err(Error::new(ErrorKind::InvalidData, "could not parse the configuration file"))
+      Err(Error::new(ErrorKind::InvalidData, format!("could not parse the configuration file: {:?}", parser.errors)))
     }
   }
 }
