@@ -31,7 +31,7 @@ use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder};
 use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness};
-use messages::{Command,TlsFront};
+use messages::{Command,TlsFront,TlsProxyConfiguration};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 
@@ -282,16 +282,17 @@ pub struct ServerConfiguration {
   answers:         DefaultAnswers,
   front_timeout:   u64,
   back_timeout:    u64,
+  config:          TlsProxyConfiguration,
 }
 
 impl ServerConfiguration {
-  pub fn new(address: SocketAddr, tx: mpsc::Sender<ServerMessage>, max_connections: usize, buffer_size: usize, options: Option<(SslContextOptions, String)>, event_loop: &mut EventLoop<TlsServer>) -> io::Result<ServerConfiguration> {
+  pub fn new(config: TlsProxyConfiguration, tx: mpsc::Sender<ServerMessage>, event_loop: &mut EventLoop<TlsServer>) -> io::Result<ServerConfiguration> {
     let contexts = HashMap::new();
 
     let mut context = SslContext::new(SslMethod::Tlsv1_2).unwrap();
-    if let Some((tls_options, ciphers)) = options {
+    context.set_cipher_list(&config.cipher_list);
+    if let Some(tls_options) = SslContextOptions::from_bits(config.options) {
       context.set_options(tls_options);
-      context.set_cipher_list(&ciphers);
     }
 
     let dh = DH::get_2048_256().unwrap();
@@ -321,29 +322,30 @@ impl ServerConfiguration {
 
 
 
-    match server_bind(&address) {
+    match server_bind(&config.front) {
       Ok(listener) => {
         event_loop.register(&listener, Token(0), EventSet::readable(), PollOpt::level());
         Ok(ServerConfiguration {
           listener:        listener,
-          address:         address,
+          address:         config.front.clone(),
           instances:       HashMap::new(),
           fronts:          HashMap::new(),
           default_cert:    String::from("lolcatho.st"),
           default_context: context,
           contexts:        rc_ctx,
           tx:              tx,
-          pool:            Pool::with_capacity(2*max_connections, 0, || BufferQueue::with_capacity(buffer_size)),
+          pool:            Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size)),
           front_timeout:   50000,
           back_timeout:    50000,
           answers:         DefaultAnswers {
             NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
             ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
-          }
+          },
+          config:          config,
         })
       },
       Err(e) => {
-        error!("TLS\tcould not create listener {:?}: {:?}", address, e);
+        error!("TLS\tcould not create listener {:?}: {:?}", config.front, e);
         Err(e)
       }
     }
@@ -614,13 +616,14 @@ impl ProxyConfiguration<TlsServer,TlsClient> for ServerConfiguration {
 
 pub type TlsServer = Server<ServerConfiguration,TlsClient>;
 
-pub fn start_listener(front: SocketAddr, max_connections: usize, buffer_size: usize, options: Option<(SslContextOptions, String)>, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
+pub fn start_listener(config: TlsProxyConfiguration, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
   let mut event_loop = EventLoop::new().unwrap();
   let channel = event_loop.channel();
   let notify_tx = tx.clone();
 
+  let max_connections = config.max_connections;
   let join_guard = thread::spawn(move|| {
-    let configuration = ServerConfiguration::new(front, tx, max_connections, buffer_size, options, &mut event_loop).unwrap();
+    let configuration = ServerConfiguration::new(config, tx, &mut event_loop).unwrap();
     let mut server = TlsServer::new(1, max_connections, configuration);
 
     info!("TLS\tstarting event loop");
@@ -777,6 +780,7 @@ mod tests {
         NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
       },
+      config: Default::default()
     };
 
     let frontend1 = server_config.frontend_from_request("lolcatho.st", "/");

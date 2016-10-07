@@ -4,7 +4,7 @@ use std::fs::File;
 use command::ListenerType;
 use toml;
 
-use yxorp::messages::HttpProxyConfiguration;
+use yxorp::messages::{HttpProxyConfiguration,TlsProxyConfiguration};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct ListenerConfig {
@@ -16,6 +16,7 @@ pub struct ListenerConfig {
   pub buffer_size:     usize,
   pub answer_404:      Option<String>,
   pub answer_503:      Option<String>,
+  pub cipher_list:     Option<String>,
 }
 
 impl ListenerConfig {
@@ -34,6 +35,28 @@ impl ListenerConfig {
       //FIXME: handle the default case,
       answer_404: String::from(""),
       answer_503: String::from(""),
+      ..Default::default()
+    }
+    })
+  }
+
+  pub fn to_tls(&self) -> Option<TlsProxyConfiguration> {
+    let mut address = self.address.clone();
+    address.push(':');
+    address.push_str(&self.port.to_string());
+
+    let cipher_list:String = self.cipher_list.clone().unwrap_or(String::from(""));
+    //FIXME: error message when we cannot parse the address
+    address.parse().ok().map(|addr| {
+    TlsProxyConfiguration {
+      front: addr,
+      public_address: self.public_address.clone(),
+      max_connections: self.max_connections,
+      buffer_size: self.buffer_size,
+      //FIXME: handle the default case,
+      answer_404: String::from(""),
+      answer_503: String::from(""),
+      cipher_list: cipher_list,
       ..Default::default()
     }
     })

@@ -65,10 +65,14 @@ fn main() {
 
   let (sender2, rec2) = channel::<network::ServerMessage>();
 
-  let options = ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |
+  let config = messages::TlsProxyConfiguration {
+    front: "127.0.0.1:8443".parse().unwrap(),
+    max_connections: 500,
+    buffer_size: 12000,
+    options: (ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |
                ssl::SSL_OP_NO_TICKET | ssl::SSL_OP_NO_SSLV2 |
-               ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1;
-  let cipher_list = String::from("ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
+               ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1).bits(),
+    cipher_list: String::from("ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
                               ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
                               ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
                               DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:\
@@ -80,9 +84,11 @@ fn main() {
                               ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:\
                               EDH-RSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:\
                               AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:\
-                              !DSS");
+                              !DSS"),
 
-  let (tx2, jg2) = network::tls::start_listener("127.0.0.1:8443".parse().unwrap(), 500, 12000, Some((options, cipher_list)), sender2);
+    ..Default::default()
+  };
+  let (tx2, jg2) = network::tls::start_listener(config, sender2);
 
   let cert1 = include_str!("../assets/certificate.pem");
   let key1  = include_str!("../assets/key.pem");

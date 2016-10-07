@@ -83,7 +83,7 @@ fn main() {
       address.push(':');
       address.push_str(&ls.port.to_string());
 
-      if let Ok(addr) = address.parse() {
+      //if address.parse().is_ok() {
         let (tx, jg) = match ls.listener_type {
           ListenerType::HTTP => {
             //FIXME: make safer
@@ -91,16 +91,17 @@ fn main() {
             network::http::start_listener(conf, sender)
           },
           ListenerType::HTTPS => {
-            network::tls::start_listener(addr, ls.max_connections, ls.buffer_size, None, sender)
+            let conf = ls.to_tls().unwrap();
+            network::tls::start_listener(conf, sender)
           },
           _ => unimplemented!()
         };
         let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
         listeners.insert(tag.clone(), l);
         jh_opt = Some(jg);
-      } else {
-        error!("could not parse address: {}", address);
-      }
+      //} else {
+      //  error!("could not parse address: {}", address);
+      //}
     };
 
     let buffer_size     = config.command_buffer_size.unwrap_or(10000);

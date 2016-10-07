@@ -1,6 +1,6 @@
 use serde;
 use serde_json;
-use openssl::ssl::SslContextOptions;
+use openssl::ssl::{self,SslContextOptions};
 use libc::c_long;
 use std::net::SocketAddr;
 use std::default::Default;
@@ -74,8 +74,27 @@ pub struct TlsProxyConfiguration {
     pub public_address:  Option<String>,
     pub answer_404:      String,
     pub answer_503:      String,
-    pub options:         c_long,
+    pub options:         i64,
     pub cipher_list:     String,
+}
+
+impl Default for TlsProxyConfiguration {
+  fn default() -> TlsProxyConfiguration {
+    TlsProxyConfiguration {
+      front:           "127.0.0.1:8443".parse().unwrap(),
+      front_timeout:   5000,
+      back_timeout:    5000,
+      max_connections: 1000,
+      buffer_size:     12000,
+      public_address:  None,
+      answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
+      answer_503:      String::from("HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
+      cipher_list:     String::from("ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305"),
+      options:         (ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |
+                         ssl::SSL_OP_NO_TICKET | ssl::SSL_OP_NO_SSLV2 |
+                         ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1).bits(),
+    }
+  }
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize)]
