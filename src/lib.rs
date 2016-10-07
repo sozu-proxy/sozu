@@ -1,5 +1,4 @@
-#![feature(custom_derive, plugin)]
-#![plugin(serde_macros)]
+#![feature(custom_derive, plugin, rustc_macro)]
 #![cfg_attr(test, feature(test))]
 #[cfg(test)]
 extern crate test;
@@ -7,6 +6,7 @@ extern crate test;
 #[macro_use] extern crate nom;
 #[macro_use] extern crate log;
 #[macro_use] extern crate lazy_static;
+#[macro_use] extern crate serde_derive;
 extern crate mio;
 extern crate bytes;
 extern crate time;

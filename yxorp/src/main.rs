@@ -1,8 +1,8 @@
-#![feature(custom_derive, plugin, libc)]
-#![plugin(serde_macros)]
+#![feature(custom_derive, plugin, libc, rustc_macro)]
 #[macro_use] extern crate nom;
 #[macro_use] extern crate log;
 #[macro_use] extern crate clap;
+#[macro_use] extern crate serde_derive;
 extern crate env_logger;
 extern crate mio;
 extern crate yxorp;
