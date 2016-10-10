@@ -233,7 +233,6 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     &mut self.readiness
   }
 
-  //FIXME: too much cloning in there, should optimize
   //FIXME: unwrap bad, bad rust coder
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
     debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.log_ctx, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
@@ -638,7 +637,6 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         _                   => {
           match self.state.as_ref().unwrap().response {
             Some(ResponseState::Response(_,_)) => {
-              //FIXME: this keeps happening, why? Readable event already in queue when parsing ended?
               error!("{}\tshould not go back in back_readable if the whole response was parsed", self.log_ctx);
               self.readiness.back_interest.remove(EventSet::readable());
               return  ClientResult::Continue;
@@ -778,6 +776,7 @@ impl ServerConfiguration {
     }
 
     // FIXME: check that http front port matches the listener's port
+    // FIXME: separate the port and hostname, match the hostname separately
 
     if self.fronts.get(&http_front.hostname).is_none() {
       self.fronts.insert(http_front.hostname, vec![front3]);
@@ -837,7 +836,7 @@ impl ServerConfiguration {
     // FIXME: the app id clone here is probably very inefficient
     //if let Some(app_id) = self.frontend_from_request(host, uri).map(|ref front| front.app_id.clone()) {
     client.app_id = Some(String::from(app_id));
-    // ToDo round-robin on instances
+    //FIXME: round-robin on instances
     if let Some(ref mut app_instances) = self.instances.get_mut(app_id) {
       if app_instances.len() == 0 {
         client.set_answer(&self.answers.ServiceUnavailable);

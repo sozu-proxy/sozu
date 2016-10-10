@@ -392,6 +392,7 @@ impl ServerConfiguration {
       }
 
       //FIXME: this is blocking
+      //this lock is only obtained from this thread, so is it alright?
       {
         let mut contexts = self.contexts.lock().unwrap();
         contexts.insert(hostname, ctx);

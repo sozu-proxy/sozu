@@ -143,7 +143,6 @@ impl ProxyClient for Client {
     self.back_timeout = Some(timeout)
   }
 
-  //FIXME: too much cloning in there, should optimize
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
     debug!("{}\tTCP\tPROXY [{} -> {}] CLOSED BACKEND", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
     let addr = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
