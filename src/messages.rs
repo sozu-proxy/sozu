@@ -32,9 +32,8 @@ pub struct TcpFront {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct Instance {
-    pub app_id: String,
-    pub ip_address: String,
-    pub port: u16
+    pub app_id:  String,
+    pub address: String,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -271,25 +270,23 @@ mod tests {
 
   #[test]
   fn add_instance_test() {
-    let raw_json = r#"{"type": "ADD_INSTANCE", "data": {"app_id": "xxx", "ip_address": "yyy", "port": 8080}}"#;
+    let raw_json = r#"{"type": "ADD_INSTANCE", "data": {"app_id": "xxx", "address": "yyy:8080"}}"#;
     let command: Command = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", command);
     assert!(command == Command::AddInstance(Instance{
       app_id: String::from("xxx"),
-      ip_address: String::from("yyy"),
-      port: 8080
+      address: String::from("yyy:8080"),
     }));
   }
 
   #[test]
   fn remove_instance_test() {
-    let raw_json = r#"{"type": "REMOVE_INSTANCE", "data": {"app_id": "xxx", "ip_address": "yyy", "port": 8080}}"#;
+    let raw_json = r#"{"type": "REMOVE_INSTANCE", "data": {"app_id": "xxx", "address": "yyy:8080"}}"#;
     let command: Command = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", command);
     assert!(command == Command::RemoveInstance(Instance{
       app_id: String::from("xxx"),
-      ip_address: String::from("yyy"),
-      port: 8080
+      address: String::from("yyy:8080"),
     }));
   }
 

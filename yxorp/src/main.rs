@@ -79,29 +79,22 @@ fn main() {
 
     for (ref tag, ref ls) in config.listeners {
       let (sender, receiver) = channel::<network::ServerMessage>();
-      let mut address = ls.address.clone();
-      address.push(':');
-      address.push_str(&ls.port.to_string());
 
-      //if address.parse().is_ok() {
-        let (tx, jg) = match ls.listener_type {
-          ListenerType::HTTP => {
-            //FIXME: make safer
-            let conf = ls.to_http().unwrap();
-            network::http::start_listener(conf, sender)
-          },
-          ListenerType::HTTPS => {
-            let conf = ls.to_tls().unwrap();
-            network::tls::start_listener(conf, sender)
-          },
-          _ => unimplemented!()
-        };
-        let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
-        listeners.insert(tag.clone(), l);
-        jh_opt = Some(jg);
-      //} else {
-      //  error!("could not parse address: {}", address);
-      //}
+      let (tx, jg) = match ls.listener_type {
+        ListenerType::HTTP => {
+          //FIXME: make safer
+          let conf = ls.to_http().unwrap();
+          network::http::start_listener(conf, sender)
+        },
+        ListenerType::HTTPS => {
+          let conf = ls.to_tls().unwrap();
+          network::tls::start_listener(conf, sender)
+        },
+        _ => unimplemented!()
+      };
+      let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
+      listeners.insert(tag.clone(), l);
+      jh_opt = Some(jg);
     };
 
     let buffer_size     = config.command_buffer_size.unwrap_or(10000);

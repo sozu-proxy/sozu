@@ -556,9 +556,7 @@ impl ProxyConfiguration<TlsServer,TlsClient> for ServerConfiguration {
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
         info!("TLS\t{} add instance {:?}", id, instance);
-        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
-        let parsed:Option<SocketAddr> = addr_string.parse().ok();
-        if let Some(addr) = parsed {
+        if let Some(ref addr) = instance.address.parse().ok() {
           self.add_instance(&instance.app_id, &addr, event_loop);
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
         } else {
@@ -567,9 +565,7 @@ impl ProxyConfiguration<TlsServer,TlsClient> for ServerConfiguration {
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
         info!("TLS\t{} remove instance {:?}", id, instance);
-        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
-        let parsed:Option<SocketAddr> = addr_string.parse().ok();
-        if let Some(addr) = parsed {
+        if let Some(ref addr) = instance.address.parse().ok() {
           self.remove_instance(&instance.app_id, &addr, event_loop);
           self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
         } else {

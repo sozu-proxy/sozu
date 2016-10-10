@@ -11,7 +11,6 @@ pub struct ListenerConfig {
   pub listener_type:   ListenerType,
   pub address:         String,
   pub public_address:  Option<String>,
-  pub port:            u16,
   pub max_connections: usize,
   pub buffer_size:     usize,
   pub answer_404:      Option<String>,
@@ -21,12 +20,9 @@ pub struct ListenerConfig {
 
 impl ListenerConfig {
   pub fn to_http(&self) -> Option<HttpProxyConfiguration> {
-    let mut address = self.address.clone();
-    address.push(':');
-    address.push_str(&self.port.to_string());
 
     //FIXME: error message when we cannot parse the address
-    address.parse().ok().map(|addr| {
+    self.address.parse().ok().map(|addr| {
     HttpProxyConfiguration {
       front: addr,
       public_address: self.public_address.clone(),
@@ -41,13 +37,10 @@ impl ListenerConfig {
   }
 
   pub fn to_tls(&self) -> Option<TlsProxyConfiguration> {
-    let mut address = self.address.clone();
-    address.push(':');
-    address.push_str(&self.port.to_string());
 
     let cipher_list:String = self.cipher_list.clone().unwrap_or(String::from(""));
     //FIXME: error message when we cannot parse the address
-    address.parse().ok().map(|addr| {
+    self.address.parse().ok().map(|addr| {
     TlsProxyConfiguration {
       front: addr,
       public_address: self.public_address.clone(),

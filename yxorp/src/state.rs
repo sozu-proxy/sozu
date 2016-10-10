@@ -1,12 +1,12 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use serde;
 
 use yxorp::messages::{Command,HttpFront,TlsFront,Instance};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpProxyInstance {
-  ip_address: String,
-  port:       u16,
+  address: String,
 }
 
 pub type AppId = String;
@@ -20,8 +20,7 @@ pub struct HttpProxyFront {
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
 pub struct HttpProxy {
-  ip_address: String,
-  port:       u16,
+  address: String,
   fronts:     HashMap<AppId, Vec<HttpProxyFront>>,
   instances:  HashMap<AppId, Vec<HttpProxyInstance>>,
 }
@@ -38,8 +37,7 @@ pub struct TlsProxyFront {
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize, Deserialize)]
 pub struct TlsProxy {
-  ip_address: String,
-  port:       u16,
+  address: String,
   fronts:     HashMap<AppId, Vec<TlsProxyFront>>,
   instances:  HashMap<AppId, Vec<HttpProxyInstance>>,
 }
@@ -82,10 +80,9 @@ impl serde::Serialize for ConfigState {
 }
 
 impl HttpProxy {
-  pub fn new(ip: String, port: u16) -> HttpProxy {
+  pub fn new(address: String) -> HttpProxy {
     HttpProxy {
-      ip_address: ip,
-      port:       port,
+      address: address,
       fronts:     HashMap::new(),
       instances:  HashMap::new(),
     }
@@ -112,8 +109,7 @@ impl HttpProxy {
       },
       &Command::AddInstance(ref instance)  => {
         let inst = HttpProxyInstance {
-          ip_address: instance.ip_address.clone(),
-          port:       instance.port,
+          address: instance.address.clone(),
         };
         if self.instances.contains_key(&instance.app_id) {
           self.instances.get_mut(&instance.app_id).unwrap().push(inst);
@@ -123,7 +119,7 @@ impl HttpProxy {
       },
       &Command::RemoveInstance(ref instance) => {
         if let Some(instance_list) = self.instances.get_mut(&instance.app_id) {
-          instance_list.retain(|el| el.ip_address != instance.ip_address || el.port != instance.port);
+          instance_list.retain(|el| el.address != instance.address);
           /*let mut v = Vec::new();
           for el in front.instances.iter() {
             if el.ip_address != instance.ip_address || el.port != instance.port {
@@ -152,8 +148,7 @@ impl HttpProxy {
         for instance in instance_list {
           v.push(Command::AddInstance(Instance {
             app_id:     app_id.clone(),
-            ip_address: instance.ip_address.clone(),
-            port:       instance.port.clone(),
+            address:    instance.address.clone(),
           }));
         }
       }
@@ -164,10 +159,9 @@ impl HttpProxy {
 }
 
 impl TlsProxy {
-  pub fn new(ip: String, port: u16) -> TlsProxy {
+  pub fn new(address: String) -> TlsProxy {
     TlsProxy {
-      ip_address: ip,
-      port:       port,
+      address:    address,
       fronts:     HashMap::new(),
       instances:  HashMap::new(),
     }
@@ -195,8 +189,7 @@ impl TlsProxy {
       },
       &Command::AddInstance(ref instance)  => {
         let inst = HttpProxyInstance {
-          ip_address: instance.ip_address.clone(),
-          port:       instance.port,
+          address: instance.address.clone(),
         };
         if self.instances.contains_key(&instance.app_id) {
           self.instances.get_mut(&instance.app_id).unwrap().push(inst);
@@ -206,7 +199,7 @@ impl TlsProxy {
       },
       &Command::RemoveInstance(ref instance) => {
         if let Some(instance_list) = self.instances.get_mut(&instance.app_id) {
-          instance_list.retain(|el| el.ip_address != instance.ip_address || el.port != instance.port);
+          instance_list.retain(|el| el.address != instance.address);
           /*let mut v = Vec::new();
           for el in instance_list.iter() {
             if el.ip_address != instance.ip_address || el.port != instance.port {
@@ -238,8 +231,7 @@ impl TlsProxy {
       for instance in instance_list {
         v.push(Command::AddInstance(Instance {
           app_id:     app_id.clone(),
-          ip_address: instance.ip_address.clone(),
-          port:       instance.port.clone(),
+          address:    instance.address.clone(),
         }));
       }
     }
