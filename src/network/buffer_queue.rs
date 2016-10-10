@@ -370,12 +370,12 @@ impl BufferQueue {
   }
 
   pub fn print_unparsed(&self) {
-    println!("{}", str::from_utf8(self.unparsed_data()).unwrap());
+    println!("{:?}", str::from_utf8(self.unparsed_data()));
   }
 
   pub fn print_and_consume_output(&mut self) {
     while self.output_data_size() > 0 {
-      println!("{}", str::from_utf8(self.next_output_data()).unwrap());
+      println!("{:?}", str::from_utf8(self.next_output_data()));
       let len = self.next_output_data().len();
       self.consume_output_data(len);
     }

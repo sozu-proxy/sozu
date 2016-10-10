@@ -516,22 +516,27 @@ impl CommandServer {
   fn accept(&mut self, event_loop: &mut EventLoop<CommandServer>) -> io::Result<()> {
     debug!("server accepting socket");
 
-    let sock = self.sock.accept().unwrap().unwrap();
-    let conn = CommandClient::new(sock, self.buffer_size);
-    let tok = self.conns.insert(conn)
-      .ok().expect("could not add connection to slab");
+    let acc = self.sock.accept();
+    if let Ok(Some(sock)) = acc {
+      let conn = CommandClient::new(sock, self.buffer_size);
+      let tok = self.conns.insert(conn)
+        .ok().expect("could not add connection to slab");
 
-    // Register the connection
-    self.conns[tok].token = Some(tok);
-    let mut interest = EventSet::hup();
-    interest.insert(EventSet::readable());
-    interest.insert(EventSet::writable());
-    event_loop.register(&self.conns[tok].sock, tok, interest, PollOpt::edge())
-      .ok().expect("could not register socket with event loop");
+      // Register the connection
+      self.conns[tok].token = Some(tok);
+      let mut interest = EventSet::hup();
+      interest.insert(EventSet::readable());
+      interest.insert(EventSet::writable());
+      event_loop.register(&self.conns[tok].sock, tok, interest, PollOpt::edge())
+        .ok().expect("could not register socket with event loop");
 
-    let accept_interest = EventSet::readable();
-    event_loop.reregister(&self.sock, SERVER, accept_interest, PollOpt::edge());
-    Ok(())
+      let accept_interest = EventSet::readable();
+      event_loop.reregister(&self.sock, SERVER, accept_interest, PollOpt::edge());
+      Ok(())
+    } else {
+      //FIXME: what do other cases mean, like Ok(None)?
+      acc.map(|_| ())
+    }
   }
 
   fn conn<'a>(&'a mut self, tok: Token) -> &'a mut CommandClient {
@@ -545,7 +550,7 @@ impl CommandServer {
         ConfigCommand::SaveState(path) => {
           if let Ok(mut f) = fs::File::create(&path) {
             for listener in self.listeners.values() {
-              if let Ok(()) = f.write_all(&serde_json::to_string(&listener).unwrap().into_bytes()) {
+              if let Ok(()) = f.write_all(&serde_json::to_string(&listener).map(|s| s.into_bytes()).unwrap_or(vec!())) {
                 f.write(&b"\n"[..]);
                 f.sync_all();
               }
@@ -562,7 +567,7 @@ impl CommandServer {
             id: message.id.clone(),
             listeners: v,
           };
-          let encoded = serde_json::to_string(&conf).unwrap().into_bytes();
+          let encoded = serde_json::to_string(&conf).map(|s| s.into_bytes()).unwrap_or(vec!());
           if self.conns[token].back_buf.grow(min(encoded.len() + 10, self.max_buffer_size)) {
             log!(log::LogLevel::Info, "write buffer was not large enough, growing to {} bytes", encoded.len());
           }
@@ -663,7 +668,7 @@ impl Handler for CommandServer {
           //println!("got msg: {:?}", msg);
           for client in self.conns.iter_mut() {
             if let Some(index) = client.has_message_id(&msg.id) {
-              client.back_buf.write(&serde_json::to_string(&msg).unwrap().into_bytes());
+              client.back_buf.write(&serde_json::to_string(&msg).map(|s| s.into_bytes()).unwrap_or(vec!()));
               client.back_buf.write(&b"\0"[..]);
               client.remove_message_id(index);
             }

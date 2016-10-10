@@ -289,14 +289,23 @@ impl ServerConfiguration {
   pub fn new(config: TlsProxyConfiguration, tx: mpsc::Sender<ServerMessage>, event_loop: &mut EventLoop<TlsServer>) -> io::Result<ServerConfiguration> {
     let contexts = HashMap::new();
 
-    let mut context = SslContext::new(SslMethod::Tlsv1_2).unwrap();
+    let mut ctx = SslContext::new(SslMethod::Tlsv1_2);
+    if let Err(e) = ctx {
+      return Err(io::Error::new(io::ErrorKind::Other, e.description()));
+    }
+
+    let mut context = ctx.unwrap();
+
     context.set_cipher_list(&config.cipher_list);
     if let Some(tls_options) = SslContextOptions::from_bits(config.options) {
       context.set_options(tls_options);
     }
 
-    let dh = DH::get_2048_256().unwrap();
-    context.set_tmp_dh(&dh);
+    match DH::get_2048_256() {
+      Ok(dh) => context.set_tmp_dh(&dh),
+      Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e.description()))
+    };
+
     context.set_ecdh_auto(true);
 
     //FIXME: get the default cert and key from the configuration
@@ -353,7 +362,9 @@ impl ServerConfiguration {
 
   pub fn add_http_front(&mut self, http_front: TlsFront, event_loop: &mut EventLoop<TlsServer>) -> bool {
     //FIXME: insert some error management with a Result here
-    let mut ctx = SslContext::new(SslMethod::Tlsv1).unwrap();
+    let mut c = SslContext::new(SslMethod::Tlsv1);
+    if c.is_err() { return false; }
+    let mut ctx = c.unwrap();
 
     let mut cert_read  = &http_front.certificate.as_bytes()[..];
     let mut key_read   = &http_front.key.as_bytes()[..];

@@ -109,7 +109,7 @@ impl<Front:SocketHandler> Client<Front> {
   pub fn reset(&mut self) {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     info!("{} RESET TO {}", self.log_ctx, request_id);
-    self.state.as_mut().unwrap().reset();
+    self.state.as_mut().map(|state| state.reset());
     let req_header = self.added_request_header();
     let res_header = self.added_response_header();
     self.state.as_mut().map(|ref mut state| state.added_req_header = req_header);
@@ -120,7 +120,7 @@ impl<Front:SocketHandler> Client<Front> {
     self.back_buf.reset();
     //self.readiness = Readiness::new();
     self.request_id = request_id;
-    self.log_ctx = format!("{}\t{}\t{}\t", self.server_context, self.request_id, self.app_id.as_ref().unwrap());
+    self.log_ctx = format!("{}\t{}\t{}\t", self.server_context, self.request_id, self.app_id.as_ref().unwrap_or(&String::from("unknown")));
   }
 
   fn tokens(&self) -> Option<(Token,Token)> {
