@@ -78,28 +78,48 @@ fn main() {
     let mut jh_opt: Option<JoinHandle<()>> = None;
 
     for (ref tag, ref ls) in config.listeners {
-      let (sender, receiver) = channel::<network::ServerMessage>();
 
-      let (tx, jg) = match ls.listener_type {
+      let jg = match ls.listener_type {
         ListenerType::HTTP => {
           //FIXME: make safer
           let conf = ls.to_http().unwrap();
-          network::http::start_listener(conf, sender)
+          for _ in 1..ls.worker_count.unwrap_or(1) {
+            let (sender, receiver) = channel::<network::ServerMessage>();
+            let (tx, _) = network::http::start_listener(conf.clone(), sender);
+            let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
+            listeners.insert(tag.clone(), l);
+          }
+          let (sender, receiver) = channel::<network::ServerMessage>();
+          //FIXME: keep this to get a join guard
+          let (tx, jg) = network::http::start_listener(conf, sender);
+          let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
+          listeners.insert(tag.clone(), l);
+          jg
         },
         ListenerType::HTTPS => {
           let conf = ls.to_tls().unwrap();
-          network::tls::start_listener(conf, sender)
+          for _ in 1..ls.worker_count.unwrap_or(1) {
+            let (sender, receiver) = channel::<network::ServerMessage>();
+            let (tx, _) = network::tls::start_listener(conf.clone(), sender);
+            let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
+            listeners.insert(tag.clone(), l);
+          }
+          let (sender, receiver) = channel::<network::ServerMessage>();
+          //FIXME: keep this to get a join guard
+          let (tx, jg) = network::tls::start_listener(conf, sender);
+          let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
+          listeners.insert(tag.clone(), l);
+          jg
         },
         _ => unimplemented!()
       };
-      let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
-      listeners.insert(tag.clone(), l);
       jh_opt = Some(jg);
     };
 
     let buffer_size     = config.command_buffer_size.unwrap_or(10000);
     let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
     command::start(config.command_socket, listeners, config.saved_state, buffer_size, max_buffer_size);
+    //FIXME: really join on all threads?
     if let Some(jh) = jh_opt {
       let _ = jh.join();
       info!("good bye");

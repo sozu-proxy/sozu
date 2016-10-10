@@ -16,6 +16,7 @@ pub struct ListenerConfig {
   pub answer_404:      Option<String>,
   pub answer_503:      Option<String>,
   pub cipher_list:     Option<String>,
+  pub worker_count:    Option<u16>,
 }
 
 impl ListenerConfig {
