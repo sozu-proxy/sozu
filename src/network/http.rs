@@ -1003,23 +1003,16 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
 
 pub type HttpServer = Server<ServerConfiguration,Client<TcpStream>>;
 
-pub fn start_listener(config: HttpProxyConfiguration, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
-  let mut event_loop = EventLoop::new().unwrap();
-  let channel = event_loop.channel();
+pub fn start_listener(config: HttpProxyConfiguration, tx: mpsc::Sender<ServerMessage>, mut event_loop: EventLoop<HttpServer>) {
   let notify_tx = tx.clone();
 
   let max_connections = config.max_connections;
   let configuration = ServerConfiguration::new(config, tx, &mut event_loop).unwrap();
   let mut server = HttpServer::new(1, max_connections, configuration);
 
-  let join_guard = thread::spawn(move|| {
-    info!("HTTP\tstarting event loop");
-    event_loop.run(&mut server).unwrap();
-    info!("HTTP\tending event loop");
-    //notify_tx.send(ServerMessage::Stopped);
-  });
-
-  (channel, join_guard)
+  info!("HTTP\tstarting event loop");
+  event_loop.run(&mut server).unwrap();
+  info!("HTTP\tending event loop");
 }
 
 #[cfg(test)]
@@ -1027,6 +1020,7 @@ mod tests {
   extern crate tiny_http;
   use super::*;
   use mio::util::Slab;
+  use mio::EventLoop;
   use std::collections::HashMap;
   use std::net::{TcpListener, TcpStream, Shutdown};
   use std::io::{Read,Write};
@@ -1052,7 +1046,13 @@ mod tests {
       buffer_size: 12000,
       ..Default::default()
     };
-    let (sender, jg) = start_listener(config, tx.clone());
+
+    let mut event_loop = EventLoop::new().unwrap();
+    let sender = event_loop.channel();
+    let jg = thread::spawn(move || {
+      start_listener(config, tx.clone(), event_loop);
+    });
+
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
     sender.send(ProxyOrder::Command(String::from("ID_ABCD"), Command::AddHttpFront(front)));
     let instance = Instance { app_id: String::from("app_1"), address: String::from("127.0.0.1:1025") };
@@ -1099,7 +1099,11 @@ mod tests {
       buffer_size: 12000,
       ..Default::default()
     };
-    let (sender, jg) = start_listener(config, tx.clone());
+    let mut event_loop = EventLoop::new().unwrap();
+    let sender = event_loop.channel();
+    let jg = thread::spawn(move|| {
+      start_listener(config, tx.clone(), event_loop);
+    });
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1031"), path_begin: String::from("/") };
     sender.send(ProxyOrder::Command(String::from("ID_ABCD"), Command::AddHttpFront(front)));
     let instance = Instance { app_id: String::from("app_1"), address: String::from("127.0.0.1:1028") };

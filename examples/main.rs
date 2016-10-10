@@ -5,9 +5,11 @@ extern crate yxorp;
 extern crate openssl;
 extern crate time;
 extern crate libc;
+extern crate mio;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
+use std::thread;
 use std::env;
 use yxorp::network;
 use yxorp::messages;
@@ -15,6 +17,7 @@ use yxorp::network::metrics::{METRICS,ProxyMetrics};
 use openssl::ssl;
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
+use mio::EventLoop;
 
 fn main() {
   //env_logger::init().unwrap();
@@ -54,7 +57,12 @@ fn main() {
     buffer_size: 12000,
     ..Default::default()
   };
-  let (tx, jg) = network::http::start_listener(config, sender);
+
+  let mut event_loop = EventLoop::new().unwrap();
+  let tx = event_loop.channel();
+  let jg = thread::spawn(move || {
+    network::http::start_listener(config, sender, event_loop);
+  });
 
   let http_front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") };
   let http_instance = messages::Instance { app_id: String::from("app_1"), address: String::from("127.0.0.1:1026") };
@@ -88,7 +96,12 @@ fn main() {
 
     ..Default::default()
   };
-  let (tx2, jg2) = network::tls::start_listener(config, sender2);
+
+  let mut event_loop2 = EventLoop::new().unwrap();
+  let tx2 = event_loop2.channel();
+  let jg2 = thread::spawn(move || {
+    network::tls::start_listener(config, sender2, event_loop2);
+  });
 
   let cert1 = include_str!("../assets/certificate.pem");
   let key1  = include_str!("../assets/key.pem");

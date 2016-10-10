@@ -574,23 +574,16 @@ pub fn start() {
   });
 }
 
-pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
-  let mut event_loop = EventLoop::new().unwrap();
-  let channel = event_loop.channel();
-  let notify_tx = tx.clone();
+pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>, mut event_loop: EventLoop<TcpServer>) {
+  //let notify_tx = tx.clone();
   let configuration = ServerConfiguration::new(max_listeners, tx);
   let mut server = TcpServer::new(max_listeners, max_connections, configuration);
   let front: SocketAddr = FromStr::from_str("127.0.0.1:8443").unwrap();
   server.configuration().add_tcp_front("yolo", &front, &mut event_loop);
 
-  let join_guard = thread::spawn(move|| {
-    info!("TCP\tstarting event loop");
-    event_loop.run(&mut server).unwrap();
-    info!("TCP\tending event loop");
-    //notify_tx.send(ServerMessage::Stopped);
-  });
-
-  (channel, join_guard)
+  info!("TCP\tstarting event loop");
+  event_loop.run(&mut server).unwrap();
+  info!("TCP\tending event loop");
 }
 
 

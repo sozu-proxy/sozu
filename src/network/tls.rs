@@ -624,23 +624,16 @@ impl ProxyConfiguration<TlsServer,TlsClient> for ServerConfiguration {
 
 pub type TlsServer = Server<ServerConfiguration,TlsClient>;
 
-pub fn start_listener(config: TlsProxyConfiguration, tx: mpsc::Sender<ServerMessage>) -> (Sender<ProxyOrder>,thread::JoinHandle<()>)  {
-  let mut event_loop = EventLoop::new().unwrap();
-  let channel = event_loop.channel();
-  let notify_tx = tx.clone();
+pub fn start_listener(config: TlsProxyConfiguration, tx: mpsc::Sender<ServerMessage>, mut event_loop: EventLoop<TlsServer>) {
+  //let notify_tx = tx.clone();
 
   let max_connections = config.max_connections;
-  let join_guard = thread::spawn(move|| {
-    let configuration = ServerConfiguration::new(config, tx, &mut event_loop).unwrap();
-    let mut server = TlsServer::new(1, max_connections, configuration);
+  let configuration = ServerConfiguration::new(config, tx, &mut event_loop).unwrap();
+  let mut server = TlsServer::new(1, max_connections, configuration);
 
-    info!("TLS\tstarting event loop");
-    event_loop.run(&mut server).unwrap();
-    info!("TLS\tending event loop");
-    //notify_tx.send(ServerMessage::Stopped);
-  });
-
-  (channel, join_guard)
+  info!("TLS\tstarting event loop");
+  event_loop.run(&mut server).unwrap();
+  info!("TLS\tending event loop");
 }
 
 #[cfg(test)]
