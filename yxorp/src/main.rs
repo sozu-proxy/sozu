@@ -80,59 +80,64 @@ fn main() {
 
     for (ref tag, ref ls) in config.listeners {
 
-      let jg = match ls.listener_type {
+      let jh_opt = match ls.listener_type {
         ListenerType::HTTP => {
           //FIXME: make safer
-          let conf = ls.to_http().unwrap();
-          for _ in 1..ls.worker_count.unwrap_or(1) {
+          if let Some(conf) = ls.to_http() {
+            for _ in 1..ls.worker_count.unwrap_or(1) {
+              let (sender, receiver) = channel::<network::ServerMessage>();
+              let event_loop = EventLoop::new().unwrap();
+              let tx = event_loop.channel();
+              let config = conf.clone();
+              thread::spawn(move || {
+                network::http::start_listener(config, sender, event_loop);
+              });
+              let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
+              listeners.insert(tag.clone(), l);
+            }
             let (sender, receiver) = channel::<network::ServerMessage>();
             let event_loop = EventLoop::new().unwrap();
             let tx = event_loop.channel();
-            let config = conf.clone();
-            thread::spawn(move || {
-              network::http::start_listener(config, sender, event_loop);
+            //FIXME: keep this to get a join guard
+            let jg = thread::spawn(move || {
+              network::http::start_listener(conf, sender, event_loop);
             });
             let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
             listeners.insert(tag.clone(), l);
+            Some(jg)
+          } else {
+            None
           }
-          let (sender, receiver) = channel::<network::ServerMessage>();
-          let event_loop = EventLoop::new().unwrap();
-          let tx = event_loop.channel();
-          //FIXME: keep this to get a join guard
-          let jg = thread::spawn(move || {
-            network::http::start_listener(conf, sender, event_loop);
-          });
-          let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
-          listeners.insert(tag.clone(), l);
-          jg
         },
         ListenerType::HTTPS => {
-          let conf = ls.to_tls().unwrap();
-          for _ in 1..ls.worker_count.unwrap_or(1) {
+          if let Some(conf) = ls.to_tls() {
+            for _ in 1..ls.worker_count.unwrap_or(1) {
+              let (sender, receiver) = channel::<network::ServerMessage>();
+              let event_loop = EventLoop::new().unwrap();
+              let tx = event_loop.channel();
+              let config = conf.clone();
+              thread::spawn(move || {
+                network::tls::start_listener(config, sender, event_loop);
+              });
+              let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
+              listeners.insert(tag.clone(), l);
+            }
             let (sender, receiver) = channel::<network::ServerMessage>();
             let event_loop = EventLoop::new().unwrap();
             let tx = event_loop.channel();
-            let config = conf.clone();
-            thread::spawn(move || {
-              network::tls::start_listener(config, sender, event_loop);
+            //FIXME: keep this to get a join guard
+            let jg = thread::spawn(move || {
+              network::tls::start_listener(conf, sender, event_loop);
             });
             let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
             listeners.insert(tag.clone(), l);
+            Some(jg)
+          } else {
+            None
           }
-          let (sender, receiver) = channel::<network::ServerMessage>();
-          let event_loop = EventLoop::new().unwrap();
-          let tx = event_loop.channel();
-          //FIXME: keep this to get a join guard
-          let jg = thread::spawn(move || {
-            network::tls::start_listener(conf, sender, event_loop);
-          });
-          let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
-          listeners.insert(tag.clone(), l);
-          jg
         },
         _ => unimplemented!()
       };
-      jh_opt = Some(jg);
     };
 
     let buffer_size     = config.command_buffer_size.unwrap_or(10000);
