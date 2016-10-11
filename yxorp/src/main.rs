@@ -79,7 +79,6 @@ fn main() {
     let mut jh_opt: Option<JoinHandle<()>> = None;
 
     for (ref tag, ref ls) in config.listeners {
-
       let jh_opt = match ls.listener_type {
         ListenerType::HTTP => {
           //FIXME: make safer
@@ -92,7 +91,7 @@ fn main() {
               thread::spawn(move || {
                 network::http::start_listener(config, sender, event_loop);
               });
-              let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
+              let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
               listeners.insert(tag.clone(), l);
             }
             let (sender, receiver) = channel::<network::ServerMessage>();
@@ -102,7 +101,7 @@ fn main() {
             let jg = thread::spawn(move || {
               network::http::start_listener(conf, sender, event_loop);
             });
-            let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
+            let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
             listeners.insert(tag.clone(), l);
             Some(jg)
           } else {
@@ -119,7 +118,7 @@ fn main() {
               thread::spawn(move || {
                 network::tls::start_listener(config, sender, event_loop);
               });
-              let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
+              let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
               listeners.insert(tag.clone(), l);
             }
             let (sender, receiver) = channel::<network::ServerMessage>();
@@ -129,7 +128,7 @@ fn main() {
             let jg = thread::spawn(move || {
               network::tls::start_listener(conf, sender, event_loop);
             });
-            let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
+            let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
             listeners.insert(tag.clone(), l);
             Some(jg)
           } else {

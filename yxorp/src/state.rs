@@ -1,12 +1,12 @@
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use serde;
 
 use yxorp::messages::{Command,HttpFront,TlsFront,Instance};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpProxyInstance {
-  address: String,
+  ip_address: String,
+  port:       u16,
 }
 
 pub type AppId = String;
@@ -20,7 +20,8 @@ pub struct HttpProxyFront {
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
 pub struct HttpProxy {
-  address: String,
+  ip_address: String,
+  port:       u16,
   fronts:     HashMap<AppId, Vec<HttpProxyFront>>,
   instances:  HashMap<AppId, Vec<HttpProxyInstance>>,
 }
@@ -37,7 +38,8 @@ pub struct TlsProxyFront {
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize, Deserialize)]
 pub struct TlsProxy {
-  address: String,
+  ip_address: String,
+  port:       u16,
   fronts:     HashMap<AppId, Vec<TlsProxyFront>>,
   instances:  HashMap<AppId, Vec<HttpProxyInstance>>,
 }
@@ -80,9 +82,10 @@ impl serde::Serialize for ConfigState {
 }
 
 impl HttpProxy {
-  pub fn new(address: String) -> HttpProxy {
+  pub fn new(ip: String, port: u16) -> HttpProxy {
     HttpProxy {
-      address: address,
+      ip_address: ip,
+      port:       port,
       fronts:     HashMap::new(),
       instances:  HashMap::new(),
     }
@@ -109,7 +112,8 @@ impl HttpProxy {
       },
       &Command::AddInstance(ref instance)  => {
         let inst = HttpProxyInstance {
-          address: instance.address.clone(),
+          ip_address: instance.ip_address.clone(),
+          port:       instance.port,
         };
         if self.instances.contains_key(&instance.app_id) {
           self.instances.get_mut(&instance.app_id).map(|instance| instance.push(inst));
@@ -119,7 +123,7 @@ impl HttpProxy {
       },
       &Command::RemoveInstance(ref instance) => {
         if let Some(instance_list) = self.instances.get_mut(&instance.app_id) {
-          instance_list.retain(|el| el.address != instance.address);
+          instance_list.retain(|el| el.ip_address != instance.ip_address || el.port != instance.port);
           /*let mut v = Vec::new();
           for el in front.instances.iter() {
             if el.ip_address != instance.ip_address || el.port != instance.port {
@@ -148,7 +152,8 @@ impl HttpProxy {
         for instance in instance_list {
           v.push(Command::AddInstance(Instance {
             app_id:     app_id.clone(),
-            address:    instance.address.clone(),
+            ip_address: instance.ip_address.clone(),
+            port:       instance.port.clone(),
           }));
         }
       }
@@ -159,9 +164,10 @@ impl HttpProxy {
 }
 
 impl TlsProxy {
-  pub fn new(address: String) -> TlsProxy {
+  pub fn new(ip: String, port: u16) -> TlsProxy {
     TlsProxy {
-      address:    address,
+      ip_address: ip,
+      port:       port,
       fronts:     HashMap::new(),
       instances:  HashMap::new(),
     }
@@ -189,7 +195,8 @@ impl TlsProxy {
       },
       &Command::AddInstance(ref instance)  => {
         let inst = HttpProxyInstance {
-          address: instance.address.clone(),
+          ip_address: instance.ip_address.clone(),
+          port:       instance.port,
         };
         if self.instances.contains_key(&instance.app_id) {
           self.instances.get_mut(&instance.app_id).map(|instance| instance.push(inst));
@@ -199,7 +206,7 @@ impl TlsProxy {
       },
       &Command::RemoveInstance(ref instance) => {
         if let Some(instance_list) = self.instances.get_mut(&instance.app_id) {
-          instance_list.retain(|el| el.address != instance.address);
+          instance_list.retain(|el| el.ip_address != instance.ip_address || el.port != instance.port);
           /*let mut v = Vec::new();
           for el in instance_list.iter() {
             if el.ip_address != instance.ip_address || el.port != instance.port {
@@ -231,7 +238,8 @@ impl TlsProxy {
       for instance in instance_list {
         v.push(Command::AddInstance(Instance {
           app_id:     app_id.clone(),
-          address:    instance.address.clone(),
+          ip_address: instance.ip_address.clone(),
+          port:       instance.port.clone(),
         }));
       }
     }

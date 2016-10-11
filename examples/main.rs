@@ -65,7 +65,7 @@ fn main() {
   });
 
   let http_front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") };
-  let http_instance = messages::Instance { app_id: String::from("app_1"), address: String::from("127.0.0.1:1026") };
+  let http_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
   tx.send(network::ProxyOrder::Command(String::from("ID_ABCD"), messages::Command::AddHttpFront(http_front)));
   tx.send(network::ProxyOrder::Command(String::from("ID_EFGH"), messages::Command::AddInstance(http_instance)));
   info!("MAIN\tHTTP -> {:?}", rec.recv().unwrap());
@@ -108,7 +108,7 @@ fn main() {
 
   let tls_front = messages::TlsFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st"), path_begin: String::from("/"), certificate: String::from(cert1), key: String::from(key1), certificate_chain: vec!() };
   tx2.send(network::ProxyOrder::Command(String::from("ID_IJKL"), messages::Command::AddTlsFront(tls_front)));
-  let tls_instance = messages::Instance { app_id: String::from("app_1"), address: String::from("127.0.0.1:1026") };
+  let tls_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
   tx2.send(network::ProxyOrder::Command(String::from("ID_MNOP"), messages::Command::AddInstance(tls_instance)));
 
   let cert2 = include_str!("../assets/cert_test.pem");
@@ -116,7 +116,7 @@ fn main() {
 
   let tls_front2 = messages::TlsFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/"), certificate: String::from(cert2), key: String::from(key2), certificate_chain: vec!() };
   tx2.send(network::ProxyOrder::Command(String::from("ID_QRST"), messages::Command::AddTlsFront(tls_front2)));
-  let tls_instance2 = messages::Instance { app_id: String::from("app_2"), address: String::from("127.0.0.1:1026") };
+  let tls_instance2 = messages::Instance { app_id: String::from("app_2"), ip_address: String::from("127.0.0.1"), port: 1026 };
   tx2.send(network::ProxyOrder::Command(String::from("ID_UVWX"), messages::Command::AddInstance(tls_instance2)));
 
   info!("MAIN\tTLS -> {:?}", rec2.recv().unwrap());

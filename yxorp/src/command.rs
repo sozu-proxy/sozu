@@ -203,10 +203,10 @@ pub struct Listener {
 }
 
 impl Listener {
-  pub fn new(tag: String, listener_type: ListenerType, address: String, sender: Sender<ProxyOrder>, receiver: mpsc::Receiver<ServerMessage>) -> Listener {
+  pub fn new(tag: String, listener_type: ListenerType, ip_address: String, port: u16, sender: Sender<ProxyOrder>, receiver: mpsc::Receiver<ServerMessage>) -> Listener {
     let state = match listener_type {
-      ListenerType::HTTP  => ConfigState::Http(HttpProxy::new(address)),
-      ListenerType::HTTPS => ConfigState::Tls(TlsProxy::new(address)),
+      ListenerType::HTTP  => ConfigState::Http(HttpProxy::new(ip_address, port)),
+      ListenerType::HTTPS => ConfigState::Tls(TlsProxy::new(ip_address, port)),
       _                   => unimplemented!(),
     };
 

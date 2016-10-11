@@ -472,30 +472,24 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
         trace!("TCP\t{:?}", instance);
-        if let Some(ref addr) = (&instance.address).parse().ok() {
-          if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
-            self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
-          } else {
-            error!("TCP\tCouldn't add tcp instance");
-            self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot add tcp instance"))});
-          }
+        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+        let addr = &addr_string.parse().unwrap();
+        if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
         } else {
-            error!("TCP\tCouldn't parse address");
-            self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("could not parse address"))});
+          error!("TCP\tCouldn't add tcp instance");
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot add tcp instance"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
         trace!("TCP\t{:?}", instance);
-        if let Some(ref addr) = (&instance.address).parse().ok() {
-          if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
-            self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
-          } else {
-            error!("TCP\tCouldn't remove tcp instance");
-            self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot remove tcp instance"))});
-          }
+        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+        let addr = &addr_string.parse().unwrap();
+        if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
         } else {
-            error!("TCP\tCouldn't parse address");
-            self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("could not parse address"))});
+          error!("TCP\tCouldn't remove tcp instance");
+          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot remove tcp instance"))});
         }
       },
       ProxyOrder::Stop(id)                   => {
