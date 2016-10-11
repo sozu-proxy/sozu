@@ -20,13 +20,14 @@ mod state;
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
 use std::collections::HashMap;
-use std::thread::JoinHandle;
+use std::thread::{self,JoinHandle};
 use std::env;
 use yxorp::network;
 use yxorp::network::metrics::{METRICS,ProxyMetrics};
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
 use clap::{App,Arg};
+use mio::EventLoop;
 
 use command::{Listener,ListenerType};
 
@@ -85,13 +86,22 @@ fn main() {
           let conf = ls.to_http().unwrap();
           for _ in 1..ls.worker_count.unwrap_or(1) {
             let (sender, receiver) = channel::<network::ServerMessage>();
-            let (tx, _) = network::http::start_listener(conf.clone(), sender);
+            let event_loop = EventLoop::new().unwrap();
+            let tx = event_loop.channel();
+            let config = conf.clone();
+            thread::spawn(move || {
+              network::http::start_listener(config, sender, event_loop);
+            });
             let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
             listeners.insert(tag.clone(), l);
           }
           let (sender, receiver) = channel::<network::ServerMessage>();
+          let event_loop = EventLoop::new().unwrap();
+          let tx = event_loop.channel();
           //FIXME: keep this to get a join guard
-          let (tx, jg) = network::http::start_listener(conf, sender);
+          let jg = thread::spawn(move || {
+            network::http::start_listener(conf, sender, event_loop);
+          });
           let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
           listeners.insert(tag.clone(), l);
           jg
@@ -100,13 +110,22 @@ fn main() {
           let conf = ls.to_tls().unwrap();
           for _ in 1..ls.worker_count.unwrap_or(1) {
             let (sender, receiver) = channel::<network::ServerMessage>();
-            let (tx, _) = network::tls::start_listener(conf.clone(), sender);
+            let event_loop = EventLoop::new().unwrap();
+            let tx = event_loop.channel();
+            let config = conf.clone();
+            thread::spawn(move || {
+              network::tls::start_listener(config, sender, event_loop);
+            });
             let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
             listeners.insert(tag.clone(), l);
           }
           let (sender, receiver) = channel::<network::ServerMessage>();
+          let event_loop = EventLoop::new().unwrap();
+          let tx = event_loop.channel();
           //FIXME: keep this to get a join guard
-          let (tx, jg) = network::tls::start_listener(conf, sender);
+          let jg = thread::spawn(move || {
+            network::tls::start_listener(conf, sender, event_loop);
+          });
           let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), tx, receiver);
           listeners.insert(tag.clone(), l);
           jg
