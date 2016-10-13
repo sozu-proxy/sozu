@@ -6,7 +6,7 @@ authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 [dependencies]
 log = "0.3"
 env_logger = "0.3"
-mio = "~0.5.0"
+mio = "~0.6.0"
 rustc-serialize = "^0.3.15"
 serde = "~0.8"
 serde_json = "~0.8"
@@ -15,6 +15,7 @@ nom = "~1.2.0"
 toml = "~0.1"
 time = "^0.1.34"
 clap = "^2.13.0"
+slab = "^0.3.0"
 
 [dependencies.yxorp]
 path = ".."

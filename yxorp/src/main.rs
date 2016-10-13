@@ -12,6 +12,7 @@ extern crate serde;
 extern crate serde_json;
 extern crate time;
 extern crate libc;
+extern crate slab;
 
 mod config;
 mod command;
@@ -22,12 +23,12 @@ use std::sync::mpsc::{channel};
 use std::collections::HashMap;
 use std::thread::{self,JoinHandle};
 use std::env;
-use yxorp::network;
+use yxorp::network::{self,ProxyOrder};
 use yxorp::network::metrics::{METRICS,ProxyMetrics};
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
 use clap::{App,Arg};
-use mio::EventLoop;
+use mio::{channel,Poll};
 
 use command::{Listener,ListenerType};
 
@@ -85,21 +86,21 @@ fn main() {
           if let Some(conf) = ls.to_http() {
             for _ in 1..ls.worker_count.unwrap_or(1) {
               let (sender, receiver) = channel::<network::ServerMessage>();
-              let event_loop = EventLoop::new().unwrap();
-              let tx = event_loop.channel();
+              let mut poll = Poll::new().unwrap();
+              let (tx, rx) = channel::channel::<ProxyOrder>();
               let config = conf.clone();
               thread::spawn(move || {
-                network::http::start_listener(config, sender, event_loop);
+                network::http::start_listener(config, sender, poll, rx);
               });
               let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
               listeners.insert(tag.clone(), l);
             }
             let (sender, receiver) = channel::<network::ServerMessage>();
-            let event_loop = EventLoop::new().unwrap();
-            let tx = event_loop.channel();
+            let mut poll = Poll::new().unwrap();
+            let (tx, rx) = channel::channel::<ProxyOrder>();
             //FIXME: keep this to get a join guard
             let jg = thread::spawn(move || {
-              network::http::start_listener(conf, sender, event_loop);
+              network::http::start_listener(conf, sender, poll, rx);
             });
             let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
             listeners.insert(tag.clone(), l);
@@ -112,21 +113,21 @@ fn main() {
           if let Some(conf) = ls.to_tls() {
             for _ in 1..ls.worker_count.unwrap_or(1) {
               let (sender, receiver) = channel::<network::ServerMessage>();
-              let event_loop = EventLoop::new().unwrap();
-              let tx = event_loop.channel();
+              let mut poll = Poll::new().unwrap();
+              let (tx, rx) = channel::channel::<ProxyOrder>();
               let config = conf.clone();
               thread::spawn(move || {
-                network::tls::start_listener(config, sender, event_loop);
+                network::tls::start_listener(config, sender, poll, rx);
               });
               let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
               listeners.insert(tag.clone(), l);
             }
             let (sender, receiver) = channel::<network::ServerMessage>();
-            let event_loop = EventLoop::new().unwrap();
-            let tx = event_loop.channel();
+            let mut poll = Poll::new().unwrap();
+            let (tx, rx) = channel::channel::<ProxyOrder>();
             //FIXME: keep this to get a join guard
             let jg = thread::spawn(move || {
-              network::tls::start_listener(conf, sender, event_loop);
+              network::tls::start_listener(conf, sender, poll, rx);
             });
             let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
             listeners.insert(tag.clone(), l);

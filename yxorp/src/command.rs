@@ -1,6 +1,7 @@
 use mio::*;
-use mio::unix::*;
-use mio::util::Slab;
+use mio::deprecated::unix::*;
+use mio::timer::{Timer,Timeout};
+use slab::Slab;
 use std::path::PathBuf;
 use std::io::{self,BufRead,BufReader,Read,Write,ErrorKind};
 use std::iter::repeat;
@@ -17,6 +18,7 @@ use serde;
 use serde_json;
 use serde_json::from_str;
 use rustc_serialize::{Decodable,Decoder,Encodable,Encoder};
+use std::time::Duration;
 
 use yxorp::network::{ProxyOrder,ServerMessage};
 use yxorp::network::buffer::Buffer;
@@ -25,6 +27,21 @@ use yxorp::messages::Command;
 use state::{HttpProxy,TlsProxy,ConfigState};
 
 const SERVER: Token = Token(0);
+
+#[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
+pub struct FrontToken(pub usize);
+
+impl From<usize> for FrontToken {
+    fn from(val: usize) -> FrontToken {
+        FrontToken(val)
+    }
+}
+
+impl From<FrontToken> for usize {
+    fn from(val: FrontToken) -> usize {
+        val.0
+    }
+}
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]
 pub enum ListenerType {
@@ -196,14 +213,14 @@ pub struct Listener {
   pub tag:           String,
   pub listener_type: ListenerType,
   #[serde(skip_serializing)]
-  pub sender:        Sender<ProxyOrder>,
+  pub sender:        channel::Sender<ProxyOrder>,
   #[serde(skip_serializing)]
   pub receiver:      mpsc::Receiver<ServerMessage>,
   pub state:         ConfigState,
 }
 
 impl Listener {
-  pub fn new(tag: String, listener_type: ListenerType, ip_address: String, port: u16, sender: Sender<ProxyOrder>, receiver: mpsc::Receiver<ServerMessage>) -> Listener {
+  pub fn new(tag: String, listener_type: ListenerType, ip_address: String, port: u16, sender: channel::Sender<ProxyOrder>, receiver: mpsc::Receiver<ServerMessage>) -> Listener {
     let state = match listener_type {
       ListenerType::HTTP  => ConfigState::Http(HttpProxy::new(ip_address, port)),
       ListenerType::HTTPS => ConfigState::Tls(TlsProxy::new(ip_address, port)),
@@ -387,14 +404,14 @@ impl CommandClient {
     self.message_ids.remove(index);
   }
 
-  fn reregister(&self,  event_loop: &mut EventLoop<CommandServer>, tok: Token) {
-    let mut interest = EventSet::hup();
-    interest.insert(EventSet::readable());
-    interest.insert(EventSet::writable());
+  fn reregister(&self,  event_loop: &mut Poll, tok: Token) {
+    let mut interest = Ready::hup();
+    interest.insert(Ready::readable());
+    interest.insert(Ready::writable());
     event_loop.register(&self.sock, tok, interest, PollOpt::edge() | PollOpt::oneshot());
   }
 
-  fn conn_readable(&mut self, event_loop: &mut EventLoop<CommandServer>, tok: Token) -> Result<Vec<ConfigMessage>,ConnReadError>{
+  fn conn_readable(&mut self, tok: Token) -> Result<Vec<ConfigMessage>,ConnReadError>{
     trace!("server conn readable; tok={:?}", tok);
     loop {
       let size = self.buf.available_space();
@@ -402,7 +419,7 @@ impl CommandClient {
 
       match self.sock.read(self.buf.space()) {
         Ok(0) => {
-          self.reregister(event_loop, tok);
+          //self.reregister(event_loop, tok);
           break;
           //return None;
         },
@@ -412,14 +429,14 @@ impl CommandClient {
               break;
             },
             code => {
-              log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error (kind: {:?}): {:?}", tok.as_usize(), code, e);
+              log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error (kind: {:?}): {:?}", tok.0, code, e);
               return Err(ConnReadError::SocketError);
             }
           }
         },
         Ok(r) => {
           self.buf.fill(r);
-          debug!("UNIX CLIENT[{}] sent {} bytes: {:?}", tok.as_usize(), r, from_utf8(self.buf.data()));
+          debug!("UNIX CLIENT[{}] sent {} bytes: {:?}", tok.0, r, from_utf8(self.buf.data()));
         },
       };
     }
@@ -429,22 +446,22 @@ impl CommandClient {
     match parse(self.buf.data()) {
       IResult::Incomplete(_) => {
         if self.buf.available_space() == 0 {
-          log!(log::LogLevel::Error, "UNIX CLIENT[{}] buffer full, but not enough data: {:?}", tok.as_usize(), from_utf8(self.buf.data()));
+          log!(log::LogLevel::Error, "UNIX CLIENT[{}] buffer full, but not enough data: {:?}", tok.0, from_utf8(self.buf.data()));
           return Err(ConnReadError::FullBufferError);
         }
         return Ok(Vec::new());
       },
       IResult::Error(e)      => {
-        log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error: {:?}", tok.as_usize(), e);
+        log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error: {:?}", tok.0, e);
         return Err(ConnReadError::ParseError);
       },
       IResult::Done(i, v)    => {
         if self.buf.available_data() == i.len() && v.len() == 0 {
           if self.buf.available_space() == 0 {
-            log!(log::LogLevel::Error, "UNIX CLIENT[{}] buffer full, cannot parse", tok.as_usize());
+            log!(log::LogLevel::Error, "UNIX CLIENT[{}] buffer full, cannot parse", tok.0);
             return Err(ConnReadError::FullBufferError);
           } else {
-            log!(log::LogLevel::Error, "UNIX CLIENT[{}] parse error", tok.as_usize());
+            log!(log::LogLevel::Error, "UNIX CLIENT[{}] parse error", tok.0);
             return Err(ConnReadError::ParseError);
           }
         }
@@ -457,9 +474,9 @@ impl CommandClient {
     return res;
   }
 
-  fn conn_writable(&mut self, event_loop: &mut EventLoop<CommandServer>, tok: Token) {
+  fn conn_writable(&mut self, tok: Token) {
     if self.write_timeout.is_some() {
-      trace!("server conn writable; tok={:?}; waiting for timeout", tok.as_usize());
+      trace!("server conn writable; tok={:?}; waiting for timeout", tok.0);
       return;
     }
 
@@ -470,8 +487,10 @@ impl CommandClient {
 
       match self.sock.write(self.back_buf.data()) {
         Ok(0) => {
-          //println!("[{}] setting timeout!", tok.as_usize());
-          self.write_timeout = event_loop.timeout_ms(self.token.unwrap().as_usize(), 700).ok();
+          //println!("[{}] setting timeout!", tok.0);
+          /*FIXME: timeout
+          self.write_timeout = event_loop.timeout_ms(self.token.unwrap().0, 700).ok();
+          */
           break;
         },
         Ok(r) => {
@@ -483,7 +502,7 @@ impl CommandClient {
               break;
             },
             code => {
-              log!(log::LogLevel::Error,"UNIX CLIENT[{}] write error: (kind: {:?}): {:?}", tok.as_usize(), code, e);
+              log!(log::LogLevel::Error,"UNIX CLIENT[{}] write error: (kind: {:?}): {:?}", tok.0, code, e);
               return;
             }
           }
@@ -491,10 +510,10 @@ impl CommandClient {
       }
     }
 
-    let mut interest = EventSet::hup();
-    interest.insert(EventSet::readable());
-    interest.insert(EventSet::writable());
-    event_loop.register(&self.sock, tok, interest, PollOpt::edge() | PollOpt::oneshot());
+    //let mut interest = Ready::hup();
+    //interest.insert(Ready::readable());
+    //interest.insert(Ready::writable());
+    //event_loop.register(&self.sock, tok, interest, PollOpt::edge() | PollOpt::oneshot());
   }
 }
 
@@ -505,33 +524,36 @@ fn parse(input: &[u8]) -> IResult<&[u8], Vec<ConfigMessage>> {
 }
 
 struct CommandServer {
-  sock:  UnixListener,
-  buffer_size: usize,
+  sock:            UnixListener,
+  buffer_size:     usize,
   max_buffer_size: usize,
-  conns: Slab<CommandClient>,
-  listeners: HashMap<String, Listener>,
+  conns:           Slab<CommandClient,FrontToken>,
+  listeners:       HashMap<String, Listener>,
+  pub poll:        Poll,
+  timer:           Timer<Token>,
 }
 
 impl CommandServer {
-  fn accept(&mut self, event_loop: &mut EventLoop<CommandServer>) -> io::Result<()> {
+  fn accept(&mut self) -> io::Result<()> {
     debug!("server accepting socket");
 
     let acc = self.sock.accept();
-    if let Ok(Some(sock)) = acc {
+    if let Ok(sock) = acc {
       let conn = CommandClient::new(sock, self.buffer_size);
       let tok = self.conns.insert(conn)
         .ok().expect("could not add connection to slab");
 
       // Register the connection
-      self.conns[tok].token = Some(tok);
-      let mut interest = EventSet::hup();
-      interest.insert(EventSet::readable());
-      interest.insert(EventSet::writable());
-      event_loop.register(&self.conns[tok].sock, tok, interest, PollOpt::edge())
+      let token = self.from_front(tok);
+      self.conns[tok].token = Some(token);
+      let mut interest = Ready::hup();
+      interest.insert(Ready::readable());
+      interest.insert(Ready::writable());
+      self.poll.register(&self.conns[tok].sock, token, interest, PollOpt::edge())
         .ok().expect("could not register socket with event loop");
 
-      let accept_interest = EventSet::readable();
-      event_loop.reregister(&self.sock, SERVER, accept_interest, PollOpt::edge());
+      let accept_interest = Ready::readable();
+      self.poll.reregister(&self.sock, SERVER, accept_interest, PollOpt::edge());
       Ok(())
     } else {
       //FIXME: what do other cases mean, like Ok(None)?
@@ -539,11 +561,11 @@ impl CommandServer {
     }
   }
 
-  fn conn<'a>(&'a mut self, tok: Token) -> &'a mut CommandClient {
+  fn conn<'a>(&'a mut self, tok: FrontToken) -> &'a mut CommandClient {
     &mut self.conns[tok]
   }
 
-  fn dispatch(&mut self, token: Token, v: Vec<ConfigMessage>) {
+  fn dispatch(&mut self, token: FrontToken, v: Vec<ConfigMessage>) {
     for message in &v {
       let config_command = message.data.clone();
       match config_command {
@@ -593,42 +615,100 @@ impl CommandServer {
     }
   }
 
-  fn new(srv: UnixListener, listeners: HashMap<String, Listener>, buffer_size: usize, max_buffer_size: usize) -> CommandServer {
+  fn new(srv: UnixListener, listeners: HashMap<String, Listener>, buffer_size: usize, max_buffer_size: usize, poll: Poll) -> CommandServer {
+    //FIXME: verify this
+    poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+    let mut timer = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
+    poll.register(&timer, Token(1), Ready::readable(), PollOpt::edge()).unwrap();
+    timer.set_timeout(Duration::from_millis(700), Token(0));
     CommandServer {
-      sock:  srv,
-      buffer_size: buffer_size,
+      sock:            srv,
+      buffer_size:     buffer_size,
       max_buffer_size: max_buffer_size,
-      conns: Slab::new_starting_at(Token(1), 128),
-      listeners: listeners,
+      conns:           Slab::with_capacity(128),
+      listeners:       listeners,
+      poll:            poll,
+      timer:           timer,
     }
   }
+
+  pub fn to_front(&self, token: Token) -> FrontToken {
+    FrontToken(token.0 - 2)
+  }
+
+  pub fn from_front(&self, token: FrontToken) -> Token {
+    Token(token.0 + 2)
+  }
+
 }
 
-impl Handler for CommandServer {
-	type Timeout = usize;
-	type Message = ();
+type Message = ();
 
-	fn ready(&mut self, event_loop: &mut EventLoop<CommandServer>, token: Token, events: EventSet) {
+impl CommandServer {
+  pub fn run(&mut self) {
+    let mut events = Events::with_capacity(1024);
+    loop {
+      self.poll.poll(&mut events, None).unwrap();
+      for event in events.iter() {
+        self.ready(event.token(), event.kind());
+      }
+    }
+  }
+
+  fn ready(&mut self, token: Token, events: Ready) {
     //trace!("ready: {:?} -> {:?}", token, events);
     if events.is_readable() {
       match token {
-        SERVER => self.accept(event_loop).unwrap(),
+        Token(0) => self.accept().unwrap(),
+        Token(1) => {
+          /*FIXME: timeout */
+          while let Some(timeout_token) = self.timer.poll() {
+            println!("got timeout for token: {:?}", timeout_token);
+            if timeout_token.0 == 0 {
+              for listener in self.listeners.values() {
+                while let Ok(msg) = listener.receiver.try_recv() {
+                  //println!("got msg: {:?}", msg);
+                  for client in self.conns.iter_mut() {
+                    if let Some(index) = client.has_message_id(&msg.id) {
+                      client.back_buf.write(&serde_json::to_string(&msg).map(|s| s.into_bytes()).unwrap_or(vec!()));
+                      client.back_buf.write(&b"\0"[..]);
+                      client.remove_message_id(index);
+                    }
+                  }
+                }
+              }
+              self.timer.set_timeout(Duration::from_millis(700), Token(0));
+            } else {
+              let conn_token = self.to_front(timeout_token);
+              if self.conns.contains(conn_token) {
+                //FIXME: is it still needed?
+                //println!("[{}] timeout ended, registering for writes", timeout);
+                self.conns[conn_token].write_timeout = None;
+                //let mut interest = Ready::hup();
+                //interest.insert(Ready::readable());
+                //interest.insert(Ready::writable());
+                //event_loop.register(&self.conns[token].sock, token, interest, PollOpt::edge() | PollOpt::oneshot());
+              }
+            }
+          }
+        },
         _      => {
-          if self.conns.contains(token) {
-            let opt_v = self.conns[token].conn_readable(event_loop, token);
+          let conn_token = self.to_front(token);
+          if self.conns.contains(conn_token) {
+            let opt_v = self.conns[conn_token].conn_readable(token);
             match opt_v {
-              Ok(v) => self.dispatch(token, v),
+              Ok(v) => self.dispatch(conn_token, v),
               Err(ConnReadError::Continue) => {},
               Err(ConnReadError::ParseError) | Err(ConnReadError::SocketError) => {
-                event_loop.deregister(&self.conns[token].sock);
-                self.conns.remove(token);
-                trace!("closed client [{}]", token.as_usize());
+                self.poll.deregister(&self.conns[conn_token].sock);
+                self.conns.remove(conn_token);
+                trace!("closed client [{}]", token.0);
               }
               Err(ConnReadError::FullBufferError) => {
                 //FIXME: automatically growing by 5kB every time may not be the best idea
-                let new_size = min(self.conns[token].buf.capacity()+5000, self.max_buffer_size);
+                let new_size = min(self.conns[conn_token].buf.capacity()+5000, self.max_buffer_size);
                 log!(log::LogLevel::Error, "buffer not large enough, growing to {}", new_size);
-                self.conns[token].buf.grow(new_size);
+                self.conns[conn_token].buf.grow(new_size);
               }
             }
           }
@@ -638,30 +718,41 @@ impl Handler for CommandServer {
 
     if events.is_writable() {
       match token {
-        SERVER => panic!("received writable for token 0"),
+        Token(0) => panic!("received writable for token 0"),
+        Token(1) => panic!("received writable for token 1"),
         _      => {
-          if self.conns.contains(token) {
-            self.conns[token].conn_writable(event_loop, token)
+          let conn_token = self.to_front(token);
+          if self.conns.contains(conn_token) {
+            if let Some(ref timeout) = self.conns[conn_token].write_timeout {
+              self.timer.cancel_timeout(&timeout);
+            }
+            let res = self.conns[conn_token].conn_writable(token);
+            if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(700), token) {
+              self.conns[conn_token].write_timeout = Some(timeout);
+            }
+            res
           }
         }
       };
     }
 
     if events.is_hup() {
-      if self.conns.contains(token) {
-        event_loop.deregister(&self.conns[token].sock);
-        self.conns.remove(token);
-        trace!("closed client [{}]", token.as_usize());
+      let conn_token = self.to_front(token);
+      if self.conns.contains(conn_token) {
+        self.poll.deregister(&self.conns[conn_token].sock);
+        self.conns.remove(conn_token);
+        trace!("closed client [{}]", token.0);
       }
     }
   }
 
-  fn notify(&mut self, event_loop: &mut EventLoop<Self>, message: Self::Message) {
+  /* FIXME: timeout, notify
+  fn notify(&mut self, event_loop: &mut Poll, message: Self::Message) {
     // TODO: dispatch here to clients the list of messages you want to display
     info!("notify");
   }
 
-  fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {
+  fn timeout(&mut self, event_loop: &mut Poll, timeout: Self::Timeout) {
     if timeout == 0 {
       for listener in self.listeners.values() {
         while let Ok(msg) = listener.receiver.try_recv() {
@@ -681,65 +772,67 @@ impl Handler for CommandServer {
       if self.conns.contains(token) {
         //println!("[{}] timeout ended, registering for writes", timeout);
         self.conns[token].write_timeout = None;
-        let mut interest = EventSet::hup();
-        interest.insert(EventSet::readable());
-        interest.insert(EventSet::writable());
+        let mut interest = Ready::hup();
+        interest.insert(Ready::readable());
+        interest.insert(Ready::writable());
         event_loop.register(&self.conns[token].sock, token, interest, PollOpt::edge() | PollOpt::oneshot());
       }
     }
   }
+  */
 
 }
 
 pub fn start(path: String, mut listeners: HashMap<String, Listener>, saved_state: Option<String>, buffer_size: usize,
-  max_buffer_size: usize) {
-  thread::spawn(move || {
-    saved_state.as_ref().map(|state_path| {
-      fs::File::open(state_path).map(|mut f| {
-        let mut reader = BufReader::new(f);
-        reader.lines().map(|line_res| {
-          line_res.map(|line| {
-            if let Ok(listener_state) = from_str::<ListenerDeserializer>(&line) {
-              listeners.get_mut(&listener_state.tag).as_mut().map(|ref mut listener| {
-                println!("setting listener {} state at {:?}", listener_state.tag, listener_state.state);
-                listener.state = listener_state.state.clone();
-              });
-            }
-          })
-        }).count();
+    max_buffer_size: usize) {
+  saved_state.as_ref().map(|state_path| {
+    fs::File::open(state_path).map(|mut f| {
+      let mut reader = BufReader::new(f);
+      reader.lines().map(|line_res| {
+        line_res.map(|line| {
+          if let Ok(listener_state) = from_str::<ListenerDeserializer>(&line) {
+            listeners.get_mut(&listener_state.tag).as_mut().map(|ref mut listener| {
+              println!("setting listener {} state at {:?}", listener_state.tag, listener_state.state);
+              listener.state = listener_state.state.clone();
+            });
+          }
+        })
+      }).count();
 
-      });
     });
+  });
 
-    let mut event_loop = EventLoop::new().unwrap();
-    let addr = PathBuf::from(path);
-    if let Err(e) = fs::remove_file(&addr) {
-      match e.kind() {
-        ErrorKind::NotFound => {},
-        _ => {
-          log!(log::LogLevel::Error, "could not delete previous socket at {:?}: {:?}", addr, e);
-          return;
-        }
+  let mut event_loop = Poll::new().unwrap();
+  let addr = PathBuf::from(path);
+  if let Err(e) = fs::remove_file(&addr) {
+    match e.kind() {
+      ErrorKind::NotFound => {},
+      _ => {
+        log!(log::LogLevel::Error, "could not delete previous socket at {:?}: {:?}", addr, e);
+        return;
       }
     }
-    match UnixListener::bind(&addr) {
-      Ok(srv) => {
-        if let Err(e) =  fs::set_permissions(&addr, fs::Permissions::from_mode(0o600)) {
-          log!( log::LogLevel::Error, "could not set the unix socket permissions: {:?}", e);
-          fs::remove_file(&addr);
-          return;
-        }
-        info!("listen for connections");
-        event_loop.register(&srv, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-        event_loop.timeout_ms(0, 700);
-
-        event_loop.run(&mut CommandServer::new(srv, listeners, buffer_size, max_buffer_size)).unwrap()
-      },
+  }
+  match UnixListener::bind(&addr) {
+    Ok(srv) => {
+      if let Err(e) =  fs::set_permissions(&addr, fs::Permissions::from_mode(0o600)) {
+        log!( log::LogLevel::Error, "could not set the unix socket permissions: {:?}", e);
+        fs::remove_file(&addr);
+        return;
+      }
+      info!("listen for connections");
+      //event_loop.register(&srv, SERVER, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+      /*FIXME: timeout
+       * event_loop.timeout_ms(0, 700);
+       */
+      let mut server = CommandServer::new(srv, listeners, buffer_size, max_buffer_size, event_loop);
+      server.run();
+      //event_loop.run(&mut CommandServer::new(srv, listeners, buffer_size, max_buffer_size)).unwrap()
+    },
       Err(e) => {
         log!(log::LogLevel::Error, "could not create unix socket: {:?}", e);
       }
-    }
-  });
+  }
 }
 
 #[cfg(test)]
