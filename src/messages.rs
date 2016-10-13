@@ -29,7 +29,6 @@ pub struct TcpFront {
     pub port: u16
 }
 
-
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct Instance {
     pub app_id: String,

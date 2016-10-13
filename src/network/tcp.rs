@@ -4,19 +4,20 @@ use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
 use mio::tcp::*;
 use mio::*;
+use mio::timer::Timeout;
 use bytes::{ByteBuf,MutByteBuf};
 use std::collections::HashMap;
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
 use std::error::Error;
-use mio::util::Slab;
+use slab::Slab;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use time::{Duration,precise_time_s};
 use rand::random;
 use uuid::Uuid;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents};
-use network::proxy::{BackendConnectAction,Server,ProxyClient,ProxyConfiguration,Readiness};
+use network::proxy::{BackendConnectAction,Server,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -43,9 +44,9 @@ pub struct Client {
   back_buf:       Checkout<BufferQueue>,
   token:          Option<Token>,
   backend_token:  Option<Token>,
-  accept_token:   Token,
-  back_interest:  EventSet,
-  front_interest: EventSet,
+  accept_token:   ListenToken,
+  back_interest:  Ready,
+  front_interest: Ready,
   front_timeout:  Option<Timeout>,
   back_timeout:   Option<Timeout>,
   status:         ConnectionStatus,
@@ -57,7 +58,7 @@ pub struct Client {
 }
 
 impl Client {
-  fn new(sock: TcpStream, accept_token: Token, front_buf: Checkout<BufferQueue>,
+  fn new(sock: TcpStream, accept_token: ListenToken, front_buf: Checkout<BufferQueue>,
     back_buf: Checkout<BufferQueue>) -> Option<Client> {
     Some(Client {
       sock:           sock,
@@ -67,8 +68,8 @@ impl Client {
       token:          None,
       backend_token:  None,
       accept_token:   accept_token,
-      back_interest:  EventSet::all(),
-      front_interest: EventSet::all(),
+      back_interest:  Ready::all(),
+      front_interest: Ready::all(),
       front_timeout:  None,
       back_timeout:   None,
       status:         ConnectionStatus::Connected,
@@ -144,7 +145,7 @@ impl ProxyClient for Client {
   }
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    debug!("{}\tTCP\tPROXY [{} -> {}] CLOSED BACKEND", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
+    debug!("{}\tTCP\tPROXY [{} -> {}] CLOSED BACKEND", self.request_id, self.token.unwrap().0, self.backend_token.unwrap().0);
     let addr = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
     self.backend       = None;
     self.backend_token = None;
@@ -175,7 +176,7 @@ impl ProxyClient for Client {
 
   fn readable(&mut self) -> ClientResult {
     if self.front_buf.buffer.available_space() == 0 {
-      self.readiness.front_interest.remove(EventSet::readable());
+      self.readiness.front_interest.remove(Ready::readable());
       return ClientResult::Continue;
     }
 
@@ -186,9 +187,9 @@ impl ProxyClient for Client {
       self.front_buf.consume_parsed_data(sz);
       self.front_buf.slice_output(sz);
     } else {
-      self.readiness.front_readiness.remove(EventSet::readable());
+      self.readiness.front_readiness.remove(Ready::readable());
     }
-    trace!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
+    trace!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, self.token.unwrap().0, self.backend_token.unwrap().0, sz);
 
     match res {
       SocketResult::Error => {
@@ -197,9 +198,9 @@ impl ProxyClient for Client {
       },
       _                   => {
         if res == SocketResult::WouldBlock {
-          self.readiness.front_readiness.remove(EventSet::readable());
+          self.readiness.front_readiness.remove(Ready::readable());
         }
-        self.readiness.back_interest.insert(EventSet::writable());
+        self.readiness.back_interest.insert(Ready::writable());
         return ClientResult::Continue;
       }
     }
@@ -207,7 +208,7 @@ impl ProxyClient for Client {
 
   fn writable(&mut self) -> ClientResult {
     if self.back_buf.buffer.available_data() == 0 {
-      self.readiness.front_interest.remove(EventSet::writable());
+      self.readiness.front_interest.remove(Ready::writable());
       return ClientResult::Continue;
     }
 
@@ -220,7 +221,7 @@ impl ProxyClient for Client {
        self.back_buf.consume_output_data(current_sz);
        sz += current_sz;
      }
-     trace!("{}\tTCP\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
+     trace!("{}\tTCP\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, self.token.unwrap().0, self.backend_token.unwrap().0, sz);
 
      match socket_res {
        SocketResult::Error => {
@@ -228,12 +229,12 @@ impl ProxyClient for Client {
          ClientResult::CloseBothFailure
        },
        SocketResult::WouldBlock => {
-         self.readiness.front_readiness.remove(EventSet::writable());
-         self.readiness.back_interest.insert(EventSet::readable());
+         self.readiness.front_readiness.remove(Ready::writable());
+         self.readiness.back_interest.insert(Ready::readable());
          ClientResult::Continue
        },
        SocketResult::Continue => {
-         self.readiness.back_interest.insert(EventSet::readable());
+         self.readiness.back_interest.insert(Ready::readable());
          ClientResult::Continue
        }
      }
@@ -241,7 +242,7 @@ impl ProxyClient for Client {
 
   fn back_readable(&mut self) -> ClientResult {
     if self.back_buf.buffer.available_space() == 0 {
-      self.readiness.back_interest.remove(EventSet::readable());
+      self.readiness.back_interest.remove(Ready::readable());
       return ClientResult::Continue;
     }
 
@@ -251,7 +252,7 @@ impl ProxyClient for Client {
       self.back_buf.sliced_input(sz);
       self.back_buf.consume_parsed_data(sz);
       self.back_buf.slice_output(sz);
-      trace!("{}\tTCP\tBACK  [{}<-{}]: read {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
+      trace!("{}\tTCP\tBACK  [{}<-{}]: read {} bytes", self.request_id, self.token.unwrap().0, self.backend_token.unwrap().0, sz);
 
       match res {
         SocketResult::Error => {
@@ -260,9 +261,9 @@ impl ProxyClient for Client {
         },
         _                   => {
           if res == SocketResult::WouldBlock {
-            self.readiness.back_readiness.remove(EventSet::readable());
+            self.readiness.back_readiness.remove(Ready::readable());
           }
-          self.readiness.front_interest.insert(EventSet::writable());
+          self.readiness.front_interest.insert(Ready::writable());
           return ClientResult::Continue;
         }
       }
@@ -274,8 +275,8 @@ impl ProxyClient for Client {
 
   fn back_writable(&mut self) -> ClientResult {
      if self.front_buf.buffer.available_data() == 0 {
-        self.readiness.back_interest.remove(EventSet::writable());
-        self.readiness.front_interest.insert(EventSet::readable());
+        self.readiness.back_interest.remove(Ready::writable());
+        self.readiness.front_interest.insert(Ready::readable());
         return ClientResult::Continue;
      }
 
@@ -290,7 +291,7 @@ impl ProxyClient for Client {
          sz += current_sz;
        }
      }
-    trace!("{}\tTCP\tBACK [{}->{}]: wrote {} bytes", self.request_id, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize(), sz);
+    trace!("{}\tTCP\tBACK [{}->{}]: wrote {} bytes", self.request_id, self.token.unwrap().0, self.backend_token.unwrap().0, sz);
 
      match socket_res {
        SocketResult::Error => {
@@ -298,12 +299,12 @@ impl ProxyClient for Client {
          ClientResult::CloseBothFailure
        },
        SocketResult::WouldBlock => {
-         self.readiness.back_readiness.remove(EventSet::writable());
-         self.readiness.front_interest.insert(EventSet::readable());
+         self.readiness.back_readiness.remove(Ready::writable());
+         self.readiness.front_interest.insert(Ready::readable());
          ClientResult::Continue
        },
        SocketResult::Continue => {
-         self.readiness.front_interest.insert(EventSet::readable());
+         self.readiness.front_interest.insert(Ready::readable());
          ClientResult::Continue
        }
      }
@@ -326,9 +327,9 @@ pub struct ApplicationListener {
 type ClientToken = Token;
 
 pub struct ServerConfiguration {
-  fronts:          HashMap<String, Token>,
+  fronts:          HashMap<String, ListenToken>,
   instances:       HashMap<String, Vec<Backend>>,
-  listeners:       Slab<ApplicationListener>,
+  listeners:       Slab<ApplicationListener,ListenToken>,
   tx:              mpsc::Sender<ServerMessage>,
   pool:            Pool<BufferQueue>,
   front_timeout:   u64,
@@ -336,10 +337,10 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(max_listeners: usize,  tx: mpsc::Sender<ServerMessage>) -> ServerConfiguration {
+  pub fn new(max_listeners: usize, tx: mpsc::Sender<ServerMessage>) -> ServerConfiguration {
     ServerConfiguration {
       instances:     HashMap::new(),
-      listeners:     Slab::new_starting_at(Token(0), max_listeners),
+      listeners:     Slab::with_capacity(max_listeners),
       fronts:        HashMap::new(),
       tx:            tx,
       pool:          Pool::with_capacity(2*max_listeners, 0, || BufferQueue::with_capacity(2048)),
@@ -348,7 +349,7 @@ impl ServerConfiguration {
     }
   }
 
-  fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, event_loop: &mut EventLoop<TcpServer>) -> Option<Token> {
+  fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken> {
     if let Ok(listener) = server_bind(front) {
       let addresses: Vec<SocketAddr> = if let Some(ads) = self.instances.get(app_id) {
         let v: Vec<SocketAddr> = ads.iter().map(|backend| backend.address).collect();
@@ -366,9 +367,9 @@ impl ServerConfiguration {
       };
 
       if let Ok(tok) = self.listeners.insert(al) {
-        self.listeners[tok].token = Some(tok);
+        self.listeners[tok].token = Some(Token(2+tok.0));
         self.fronts.insert(String::from(app_id), tok);
-        event_loop.register(&self.listeners[tok].sock, tok, EventSet::readable(), PollOpt::level());
+        event_loop.register(&self.listeners[tok].sock, Token(2+tok.0), Ready::readable(), PollOpt::level());
         info!("TCP\tregistered listener for app {} on port {}", app_id, front.port());
         Some(tok)
       } else {
@@ -382,7 +383,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn remove_tcp_front(&mut self, app_id: String, event_loop: &mut EventLoop<TcpServer>) -> Option<Token>{
+  pub fn remove_tcp_front(&mut self, app_id: String, event_loop: &mut Poll) -> Option<ListenToken>{
     info!("TCP\tremoving tcp_front {:?}", app_id);
     // ToDo
     // Removes all listeners for the given app_id
@@ -402,7 +403,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<TcpServer>) -> Option<Token> {
+  pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken> {
     if let Some(addrs) = self.instances.get_mut(app_id) {
       let backend = Backend::new(*instance_address);
       addrs.push(backend);
@@ -424,16 +425,16 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<TcpServer>) -> Option<Token>{
+  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken>{
       // ToDo
       None
   }
 
 }
 
-impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
+impl ProxyConfiguration<Client> for ServerConfiguration {
 
-  fn connect_to_backend(&mut self, event_loop: &mut EventLoop<TcpServer>, client:&mut Client) ->Result<BackendConnectAction,ConnectionError> {
+  fn connect_to_backend(&mut self, event_loop: &mut Poll, client:&mut Client) ->Result<BackendConnectAction,ConnectionError> {
     let rnd = random::<usize>();
     let idx = rnd % self.listeners[client.accept_token].back_addresses.len();
 
@@ -443,16 +444,15 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
     stream.set_nodelay(true);
 
     client.set_back_socket(stream);
-    client.readiness().front_interest.insert(EventSet::readable() | EventSet::writable());
-    client.readiness().back_interest.insert(EventSet::readable() | EventSet::writable());
+    client.readiness().front_interest.insert(Ready::readable() | Ready::writable());
+    client.readiness().back_interest.insert(Ready::readable() | Ready::writable());
     Ok(BackendConnectAction::New)
   }
 
-  fn notify(&mut self, event_loop: &mut EventLoop<TcpServer>, message: ProxyOrder) {
+  fn notify(&mut self, event_loop: &mut Poll, message: ProxyOrder) {
     match message {
       ProxyOrder::Command(id, Command::AddTcpFront(tcp_front)) => {
-        trace!("TCP\t{:?}", tcp_front);
-        let addr_string = tcp_front.ip_address + &tcp_front.port.to_string();
+        let addr_string = tcp_front.ip_address + ":" + &tcp_front.port.to_string();
         if let Ok(front) = addr_string.parse() {
           if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, event_loop) {
             self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
@@ -493,8 +493,9 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
         }
       },
       ProxyOrder::Stop(id)                   => {
-        event_loop.shutdown();
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
+        //FIXME: handle shutdown
+        //event_loop.shutdown();
+        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
       ProxyOrder::Command(id, _) => {
         error!("TCP\tunsupported message, ignoring");
@@ -503,14 +504,15 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: Token) -> Option<(Client, bool)> {
+  fn accept(&mut self, token: ListenToken) -> Option<(Client, bool)> {
     if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
-      if self.listeners.contains(token) {
-        let accepted = self.listeners[token].sock.accept();
+      let internal_token = ListenToken(token.0 - 2);
+      if self.listeners.contains(internal_token) {
+        let accepted = self.listeners[internal_token].sock.accept();
 
-        if let Ok(Some((frontend_sock, _))) = accepted {
+        if let Ok((frontend_sock, _)) = accepted {
           frontend_sock.set_nodelay(true);
-          if let Some(c) = Client::new(frontend_sock, token, front_buf, back_buf) {
+          if let Some(c) = Client::new(frontend_sock, internal_token, front_buf, back_buf) {
             return Some((c, true));
           }
         }
@@ -540,43 +542,63 @@ impl ProxyConfiguration<TcpServer, Client> for ServerConfiguration {
 
 pub type TcpServer = Server<ServerConfiguration,Client>;
 
-pub fn start() {
-  let mut event_loop = EventLoop::new().unwrap();
+pub fn start() -> channel::Sender<ProxyOrder> {
+  let mut poll = Poll::new().unwrap();
 
 
   info!("TCP\tlisten for connections");
-  //event_loop.register(&listener, SERVER, EventSet::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+  //event_loop.register(&listener, SERVER, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
   let (tx,rx) = channel::<ServerMessage>();
+  let (mtx,mrx) = channel::channel::<ProxyOrder>();
   let configuration = ServerConfiguration::new(10, tx);
-  let mut s = TcpServer::new(10, 500, configuration);
-  {
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1234").unwrap();
-    let back: SocketAddr  = FromStr::from_str("127.0.0.1:5678").unwrap();
-    s.configuration().add_tcp_front("yolo", &front, &mut event_loop);
-    s.configuration().add_instance("yolo", &back, &mut event_loop);
-  }
-  {
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1235").unwrap();
-    let back: SocketAddr  = FromStr::from_str("127.0.0.1:5678").unwrap();
-    s.configuration().add_tcp_front("yolo", &front, &mut event_loop);
-    s.configuration().add_instance("yolo", &back, &mut event_loop);
-  }
+  let mut s = TcpServer::new(10, 500, configuration, poll, mrx);
   thread::spawn(move|| {
     info!("TCP\tstarting event loop");
-    event_loop.run(&mut s).unwrap();
+    //event_loop.run(&mut s).unwrap();
+    s.run();
     info!("TCP\tending event loop");
   });
+  {
+    let front = TcpFront {
+      app_id: String::from("yolo"),
+      ip_address: String::from("127.0.0.1"),
+      port: 1234,
+    };
+    let instance = Instance {
+      app_id: String::from("yolo"),
+      ip_address: String::from("127.0.0.1"),
+      port: 5678,
+    };
+    mtx.send(ProxyOrder::Command(String::from("ID_YOLO1"), Command::AddTcpFront(front)));
+    mtx.send(ProxyOrder::Command(String::from("ID_YOLO2"), Command::AddInstance(instance)));
+  }
+  {
+    let front = TcpFront {
+      app_id: String::from("yolo"),
+      ip_address: String::from("127.0.0.1"),
+      port: 1235,
+    };
+    let instance = Instance {
+      app_id: String::from("yolo"),
+      ip_address: String::from("127.0.0.1"),
+      port: 5678,
+    };
+    mtx.send(ProxyOrder::Command(String::from("ID_YOLO3"), Command::AddTcpFront(front)));
+    mtx.send(ProxyOrder::Command(String::from("ID_YOLO4"), Command::AddInstance(instance)));
+  }
+  mtx
 }
 
-pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>, mut event_loop: EventLoop<TcpServer>) {
+pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>, mut poll: Poll, rx: channel::Receiver<ProxyOrder>) {
   //let notify_tx = tx.clone();
   let configuration = ServerConfiguration::new(max_listeners, tx);
-  let mut server = TcpServer::new(max_listeners, max_connections, configuration);
+  let mut server = TcpServer::new(max_listeners, max_connections, configuration, poll, rx);
   let front: SocketAddr = FromStr::from_str("127.0.0.1:8443").unwrap();
-  server.configuration().add_tcp_front("yolo", &front, &mut event_loop);
+  //server.configuration().add_tcp_front("yolo", &front, &mut event_loop);
 
   info!("TCP\tstarting event loop");
-  event_loop.run(&mut server).unwrap();
+  //event_loop.run(&mut server).unwrap();
+  server.run();
   info!("TCP\tending event loop");
 }
 
@@ -593,7 +615,7 @@ mod tests {
   #[test]
   fn mi() {
     thread::spawn(|| { start_server(); });
-    start();
+    let tx = start();
     thread::sleep(Duration::from_millis(300));
 
     let mut s1 = TcpStream::connect("127.0.0.1:1234").unwrap();

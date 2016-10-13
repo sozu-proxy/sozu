@@ -7,9 +7,8 @@ authors = ["Clément Delafargue <clement@delafargue.name>", "Geoffroy Couprie <g
 rand = "^0.3.14"
 nom = "~1.2.0"
 net2 = "^0.2"
-slab = "^0.1.3"
 time = "^0.1.34"
-mio = "~0.5.0"
+mio = "~0.6.0"
 bytes = "~0.3.0"
 log = "0.3"
 serde = "^0.8.0"
@@ -21,6 +20,7 @@ serde_derive = "^0.8.0"
 #serde_macros = "~0.7.0"
 lazy_static = "0.1.15"
 libc = "^0.2"
+slab = "^0.3.0"
 
 [dev-dependencies]
 tiny_http= "0.4"

@@ -160,15 +160,15 @@ pub enum ConnectionError {
 pub enum SocketType {
   Listener,
   FrontClient,
-  BackClient
+  BackClient,
 }
 
 pub fn socket_type(token: Token, max_listeners: usize, max_connections: usize) -> Option<SocketType> {
-  if token.as_usize() < max_listeners {
+  if token.0 < 2 + max_listeners {
     Some(SocketType::Listener)
-  } else if token.as_usize() < max_listeners + max_connections {
+  } else if token.0 < 2 + max_listeners + max_connections {
     Some(SocketType::FrontClient)
-  } else if token.as_usize() < max_listeners + 2 * max_connections {
+  } else if token.0 < 2 + max_listeners + 2 * max_connections {
     Some(SocketType::BackClient)
   } else {
     None

@@ -18,6 +18,7 @@ extern crate pool;
 extern crate uuid;
 extern crate net2;
 extern crate libc;
+extern crate slab;
 
 pub mod network;
 pub mod parser;

@@ -13,11 +13,12 @@ use std::thread;
 use std::env;
 use yxorp::network;
 use yxorp::messages;
+use yxorp::network::ProxyOrder;
 use yxorp::network::metrics::{METRICS,ProxyMetrics};
 use openssl::ssl;
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
-use mio::EventLoop;
+use mio::{channel,Poll};
 
 fn main() {
   //env_logger::init().unwrap();
@@ -58,10 +59,10 @@ fn main() {
     ..Default::default()
   };
 
-  let mut event_loop = EventLoop::new().unwrap();
-  let tx = event_loop.channel();
+  let mut poll = Poll::new().unwrap();
+  let (tx, rx) = channel::channel::<ProxyOrder>();
   let jg = thread::spawn(move || {
-    network::http::start_listener(config, sender, event_loop);
+    network::http::start_listener(config, sender, poll, rx);
   });
 
   let http_front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") };
@@ -97,10 +98,10 @@ fn main() {
     ..Default::default()
   };
 
-  let mut event_loop2 = EventLoop::new().unwrap();
-  let tx2 = event_loop2.channel();
+  let mut poll2 = Poll::new().unwrap();
+  let (tx2, rx2) = channel::channel::<ProxyOrder>();
   let jg2 = thread::spawn(move || {
-    network::tls::start_listener(config, sender2, event_loop2);
+    network::tls::start_listener(config, sender2, poll2, rx2);
   });
 
   let cert1 = include_str!("../assets/certificate.pem");

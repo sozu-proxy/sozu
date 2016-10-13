@@ -1,21 +1,25 @@
 #![allow(dead_code, unused_must_use, unused_variables, unused_imports)]
 
 use std::thread::{self,Thread,Builder};
-use std::sync::mpsc::{self,channel,Receiver};
+//use std::sync::mpsc::{self,channel,Receiver};
+use std::sync::mpsc::TryRecvError;
 use std::net::SocketAddr;
 use mio::tcp::*;
 use mio::*;
+use mio::timer::{Timer,Timeout};
+use mio::channel::Receiver;
 use bytes::{ByteBuf,MutByteBuf};
 use std::collections::HashMap;
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
 use std::error::Error;
-use mio::util::Slab;
+use slab::Slab;
 use std::io::Write;
 use std::str::FromStr;
 use std::marker::PhantomData;
 use std::fmt::Debug;
 use time::precise_time_ns;
+use std::time::Duration;
 use rand::random;
 
 use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socket_type,ProxyOrder,RequiredEvents};
@@ -24,31 +28,73 @@ use messages::{TcpFront,Command,Instance};
 const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
 const DEFAULT_BACK_TIMEOUT:  u64 = 50000;
-type ClientToken = Token;
+
+#[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
+pub struct ListenToken(pub usize);
+#[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
+pub struct FrontToken(pub usize);
+#[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
+pub struct BackToken(pub usize);
+
+impl From<usize> for ListenToken {
+    fn from(val: usize) -> ListenToken {
+        ListenToken(val)
+    }
+}
+
+impl From<ListenToken> for usize {
+    fn from(val: ListenToken) -> usize {
+        val.0
+    }
+}
+
+impl From<usize> for FrontToken {
+    fn from(val: usize) -> FrontToken {
+        FrontToken(val)
+    }
+}
+
+impl From<FrontToken> for usize {
+    fn from(val: FrontToken) -> usize {
+        val.0
+    }
+}
+
+impl From<usize> for BackToken {
+    fn from(val: usize) -> BackToken {
+        BackToken(val)
+    }
+}
+
+impl From<BackToken> for usize {
+    fn from(val: BackToken) -> usize {
+        val.0
+    }
+}
 
 #[derive(Debug)]
 pub struct Readiness {
-  pub front_interest:  EventSet,
-  pub back_interest:   EventSet,
-  pub front_readiness: EventSet,
-  pub back_readiness:  EventSet,
+  pub front_interest:  Ready,
+  pub back_interest:   Ready,
+  pub front_readiness: Ready,
+  pub back_readiness:  Ready,
 }
 
 impl Readiness {
   pub fn new() -> Readiness {
     Readiness {
-      front_interest:  EventSet::none(),
-      back_interest:   EventSet::none(),
-      front_readiness: EventSet::none(),
-      back_readiness:  EventSet::none(),
+      front_interest:  Ready::none(),
+      back_interest:   Ready::none(),
+      front_readiness: Ready::none(),
+      back_readiness:  Ready::none(),
     }
   }
 
   pub fn reset(&mut self) {
-    self.front_interest  = EventSet::none();
-    self.back_interest   = EventSet::none();
-    self.front_readiness = EventSet::none();
-    self.back_readiness  = EventSet::none();
+    self.front_interest  = Ready::none();
+    self.back_interest   = Ready::none();
+    self.front_readiness = Ready::none();
+    self.back_readiness  = Ready::none();
   }
 }
 
@@ -84,10 +130,10 @@ pub enum BackendConnectAction {
   Replace,
 }
 
-pub trait ProxyConfiguration<Server:Handler,Client> {
-  fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Server>, client:&mut Client) ->Result<BackendConnectAction,ConnectionError>;
-  fn notify(&mut self, event_loop: &mut EventLoop<Server>, message: ProxyOrder);
-  fn accept(&mut self, token: Token) -> Option<(Client, bool)>;
+pub trait ProxyConfiguration<Client> {
+  fn connect_to_backend(&mut self, event_loop: &mut Poll, client:&mut Client) ->Result<BackendConnectAction,ConnectionError>;
+  fn notify(&mut self, event_loop: &mut Poll, message: ProxyOrder);
+  fn accept(&mut self, token: ListenToken) -> Option<(Client, bool)>;
   fn front_timeout(&self) -> u64;
   fn back_timeout(&self)  -> u64;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
@@ -95,21 +141,48 @@ pub trait ProxyConfiguration<Server:Handler,Client> {
 
 pub struct Server<ServerConfiguration,Client> {
   configuration:   ServerConfiguration,
-  clients:         Slab<Client>,
-  backend:         Slab<ClientToken>,
+  clients:         Slab<Client,FrontToken>,
+  backend:         Slab<FrontToken,BackToken>,
   max_listeners:   usize,
   max_connections: usize,
+  pub poll:        Poll,
+  rx:              Receiver<ProxyOrder>,
+  timer:           Timer<Token>,
 }
 
-impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, Client>,Client:ProxyClient> Server<ServerConfiguration,Client> {
-  pub fn new(max_listeners: usize, max_connections: usize, configuration: ServerConfiguration) -> Self {
+impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<ServerConfiguration,Client> {
+  pub fn new(max_listeners: usize, max_connections: usize, configuration: ServerConfiguration, poll: Poll, rx: Receiver<ProxyOrder>) -> Self {
+    poll.register(&rx, Token(0), Ready::readable(), PollOpt::edge()).unwrap();
+    let clients = Slab::with_capacity(max_connections);
+    let backend = Slab::with_capacity(max_connections);
+    let timer   = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
+    poll.register(&timer, Token(1), Ready::readable(), PollOpt::edge()).unwrap();
     Server {
       configuration:   configuration,
-      clients:         Slab::new_starting_at(Token(max_listeners), max_connections),
-      backend:         Slab::new_starting_at(Token(max_listeners+max_connections), max_connections),
+      clients:         clients,
+      backend:         backend,
       max_listeners:   max_listeners,
       max_connections: max_connections,
+      poll:            poll,
+      rx:              rx,
+      timer:           timer,
     }
+  }
+
+  pub fn to_front(&self, token: Token) -> FrontToken {
+    FrontToken(token.0 - 2 - self.max_listeners)
+  }
+
+  pub fn to_back(&self, token: Token) -> BackToken {
+    BackToken(token.0 - 2 - self.max_listeners - self.max_connections)
+  }
+
+  pub fn from_front(&self, token: FrontToken) -> Token {
+    Token(token.0 + 2 + self.max_listeners )
+  }
+
+  pub fn from_back(&self, token: BackToken) -> Token {
+    Token(token.0 + 2 + self.max_listeners + self.max_connections)
   }
 
 
@@ -117,21 +190,22 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
     &mut self.configuration
   }
 
-  pub fn close_client(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
+  pub fn close_client(&mut self, token: FrontToken) {
     self.clients[token].front_socket().shutdown(Shutdown::Both);
-    event_loop.deregister(self.clients[token].front_socket());
+    self.poll.deregister(self.clients[token].front_socket());
     if let Some(sock) = self.clients[token].back_socket() {
       sock.shutdown(Shutdown::Both);
-      event_loop.deregister(sock);
+      self.poll.deregister(sock);
     }
 
-    self.close_backend(event_loop, token);
+    self.close_backend(token);
     self.clients[token].close();
     self.clients.remove(token);
   }
 
-  pub fn close_backend(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
-    if let Some(backend_token) = self.clients[token].back_token() {
+  pub fn close_backend(&mut self, token: FrontToken) {
+    if let Some(backend_tk) = self.clients[token].back_token() {
+      let backend_token = self.to_back(backend_tk);
       if self.backend.contains(backend_token) {
         self.backend.remove(backend_token);
         if let (Some(app_id), Some(addr)) = self.clients[token].remove_backend() {
@@ -141,18 +215,21 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
     }
   }
 
-  pub fn accept(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
+  pub fn accept(&mut self, token: ListenToken) {
     if let Some((client, should_connect)) = self.configuration.accept(token) {
       if let Ok(client_token) = self.clients.insert(client) {
-        self.clients[client_token].readiness().front_interest = EventSet::readable() | EventSet::hup() | EventSet::error();
-        event_loop.register(self.clients[client_token].front_socket(), client_token, EventSet::all(), PollOpt::edge() );
-        &self.clients[client_token].set_front_token(client_token);
-        if let Ok(timeout) = event_loop.timeout_ms(client_token.as_usize(), self.configuration.front_timeout()) {
+        self.clients[client_token].readiness().front_interest = Ready::readable() | Ready::hup() | Ready::error();
+        self.poll.register(self.clients[client_token].front_socket(), self.from_front(client_token), Ready::all(), PollOpt::edge() );
+        let front = self.from_front(client_token);
+        &self.clients[client_token].set_front_token(front);
+
+        let front = self.from_front(client_token);
+        if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.front_timeout()), front) {
           &self.clients[client_token].set_front_timeout(timeout);
         }
         gauge!("accept", 1);
         if should_connect {
-          self.connect_to_backend(event_loop, client_token);
+          self.connect_to_backend(client_token);
         }
       } else {
         error!("PROXY\tcould not add client to slab");
@@ -162,17 +239,18 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
     }
   }
 
-  pub fn connect_to_backend(&mut self, event_loop: &mut EventLoop<Self>, token: Token) {
-    match self.configuration.connect_to_backend(event_loop, &mut self.clients[token]) {
+  pub fn connect_to_backend(&mut self, token: FrontToken) {
+    match self.configuration.connect_to_backend(&mut self.poll, &mut self.clients[token]) {
       Ok(BackendConnectAction::Reuse) => {
         info!("keepalive, reusing backend connection");
       }
       Ok(BackendConnectAction::Replace) => {
         if let Some(backend_token) = self.clients[token].back_token() {
           if let Some(sock) = self.clients[token].back_socket() {
-            event_loop.register(sock, backend_token, EventSet::all(), PollOpt::edge());
+            self.poll.register(sock, backend_token, Ready::all(), PollOpt::edge());
           }
-          if let Ok(timeout) = event_loop.timeout_ms(backend_token.as_usize(), self.configuration.back_timeout()) {
+
+          if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.back_timeout()), backend_token) {
             &self.clients[token].set_back_timeout(timeout);
           }
           return;
@@ -180,38 +258,41 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
       },
       Ok(BackendConnectAction::New) => {
         if let Ok(backend_token) = self.backend.insert(token) {
-          self.clients[token].set_back_token(backend_token);
+          let back = self.from_back(backend_token);
+          self.clients[token].set_back_token(back);
 
-          //self.clients[token].readiness().back_interest = EventSet::writable() | EventSet::hup() | EventSet::error();
+          //self.clients[token].readiness().back_interest = Ready::writable() | Ready::hup() | Ready::error();
           if let Some(sock) = self.clients[token].back_socket() {
-            event_loop.register(sock, backend_token, EventSet::all(), PollOpt::edge());
+            self.poll.register(sock, back, Ready::all(), PollOpt::edge());
           }
-          if let Ok(timeout) = event_loop.timeout_ms(backend_token.as_usize(), self.configuration.back_timeout()) {
+
+          let back = self.from_back(backend_token);
+          if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.back_timeout()), back) {
             &self.clients[token].set_back_timeout(timeout);
           }
           return;
         }
       },
       Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) => {
-        self.clients[token].readiness().front_interest = EventSet::writable() | EventSet::hup() | EventSet::error();
-        //let mut front_interest = EventSet::hup();
-        //front_interest.insert(EventSet::writable());
+        self.clients[token].readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
+        //let mut front_interest = Ready::hup();
+        //front_interest.insert(Ready::writable());
         //let client = &self.clients[token];
 
         //event_loop.reregister(client.front_socket(), token, front_interest, PollOpt::level() | PollOpt::oneshot());
       },
-      _ => self.close_client(event_loop, token),
+      _ => self.close_client(token),
     }
   }
 
-  pub fn get_client_token(&self, token: Token) -> Option<Token> {
-    if token.as_usize() < self.max_listeners {
+  pub fn get_client_token(&self, token: Token) -> Option<FrontToken> {
+    if token.0 < 2 + self.max_listeners {
       None
-    } else if token.as_usize() < self.max_listeners + self.max_connections && self.clients.contains(token) {
-      Some(token)
-    } else if token.as_usize() < self.max_listeners + 2 * self.max_connections && self.backend.contains(token) {
-      if self.clients.contains(self.backend[token]) {
-        Some(self.backend[token])
+    } else if token.0 < 2 + self.max_listeners + self.max_connections && self.clients.contains(self.to_front(token)) {
+      Some(self.to_front(token))
+    } else if token.0 < 2 + self.max_listeners + 2 * self.max_connections && self.backend.contains(self.to_back(token)) {
+      if self.clients.contains(self.backend[self.to_back(token)]) {
+        Some(self.backend[self.to_back(token)])
       } else {
         None
       }
@@ -220,43 +301,112 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
     }
   }
 
-  pub fn interpret_client_order(&mut self, event_loop: &mut EventLoop<Self>, token: Token, order: ClientResult) {
+  pub fn interpret_client_order(&mut self, token: FrontToken, order: ClientResult) {
     //println!("INTERPRET ORDER: {:?}", order);
     match order {
-      ClientResult::CloseClient      => self.close_client(event_loop, token),
-      ClientResult::CloseBackend     => self.close_backend(event_loop, token),
-      ClientResult::CloseBothSuccess => self.close_client(event_loop, token),
-      ClientResult::CloseBothFailure => self.close_client(event_loop, token),
-      ClientResult::ConnectBackend   => self.connect_to_backend(event_loop, token),
+      ClientResult::CloseClient      => self.close_client(token),
+      ClientResult::CloseBackend     => self.close_backend(token),
+      ClientResult::CloseBothSuccess => self.close_client(token),
+      ClientResult::CloseBothFailure => self.close_client(token),
+      ClientResult::ConnectBackend   => self.connect_to_backend(token),
       ClientResult::Continue         => {}
     }
   }
 
-  fn reregister(&self, event_loop: &mut EventLoop<Self>, token: Token, front_interest: EventSet, back_interest: EventSet) {
+/*
+  fn reregister(&self, token: Token, front_interest: Ready, back_interest: Ready) {
     let client = &self.clients[token];
 
     if let Some(frontend_token) = client.front_token() {
-      event_loop.reregister(client.front_socket(), frontend_token, front_interest, PollOpt::level() | PollOpt::oneshot());
+      self.poll.reregister(client.front_socket(), frontend_token, front_interest, PollOpt::level() | PollOpt::oneshot());
     }
      if let Some(backend_token) = client.back_token() {
        if let Some(sock) = client.back_socket() {
-         event_loop.reregister(sock, backend_token, back_interest, PollOpt::level() | PollOpt::oneshot());
+         self.poll.reregister(sock, backend_token, back_interest, PollOpt::level() | PollOpt::oneshot());
        }
      }
   }
+*/
 }
 
-impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, Client>,Client:ProxyClient> Handler for Server<ServerConfiguration,Client> {
-  type Timeout = usize;
-  type Message = ProxyOrder;
+//type Timeout = usize;
+type Message = ProxyOrder;
 
-  fn ready(&mut self, event_loop: &mut EventLoop<Self>, token: Token, events: EventSet) {
+impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<ServerConfiguration,Client> {
+  pub fn run(&mut self) {
+    let mut events = Events::with_capacity(1024);
+    loop {
+      self.poll.poll(&mut events, None).unwrap();
+
+      for event in events.iter() {
+        if event.token() == Token(0) {
+          //FIXME: should not unwrap
+          let kind = event.kind();
+          if kind.is_error() {
+            error!("error reading channel");
+            continue;
+          }
+          if kind.is_hup() {
+            error!("channel was closed");
+            continue;
+          }
+          if kind.is_readable() {
+            loop {
+              match self.rx.try_recv() {
+                Ok(msg) => {
+                  if let ProxyOrder::Stop(id) = msg {
+                    self.notify(ProxyOrder::Stop(id));
+                    //FIXME: it's a bit brutal
+                    return;
+                  } else {
+                    //println!("got msg: {:?}", msg);
+                    self.notify(msg);
+                  }
+                },
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                  error!("channel disconnected");
+                  break;
+                }
+              }
+            }
+          }
+        } else if event.token() == Token(1) {
+          while let Some(token) = self.timer.poll() {
+            match socket_type(token, self.max_listeners, self.max_connections) {
+              Some(SocketType::Listener) => {
+                error!("PROXY\tthe listener socket should have no timeout set");
+              },
+              Some(SocketType::FrontClient) => {
+                let front_token = self.to_front(token);
+                if self.clients.contains(front_token) {
+                  debug!("PROXY\tfrontend [{:?}] got timeout, closing", token);
+                  self.close_client(front_token);
+                }
+              },
+              Some(SocketType::BackClient) => {
+                if let Some(tok) = self.get_client_token(token) {
+                  debug!("PROXY\tbackend [{:?}] got timeout, closing", token);
+                  self.close_client(tok);
+                }
+              }
+              None => {}
+            }
+          }
+        } else {
+          self.ready(event.token(), event.kind());
+        }
+      }
+    }
+  }
+
+  fn ready(&mut self, token: Token, events: Ready) {
     //println!("PROXY\t{:?} got events: {:?}", token, events);
 
-    let client_token:Token = match socket_type(token, self.max_listeners, self.max_connections) {
+    let client_token:FrontToken = match socket_type(token, self.max_listeners, self.max_connections) {
       Some(SocketType::Listener) => {
         if events.is_readable() {
-          self.accept(event_loop, token);
+          self.accept(ListenToken(token.0));
           return;
         }
 
@@ -272,9 +422,10 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         unreachable!();
       },
       Some(SocketType::FrontClient) => {
-        if self.clients.contains(token) {
-          self.clients[token].readiness().front_readiness = self.clients[token].readiness().front_readiness | events;
-          token
+        let front_token = self.to_front(token);
+        if self.clients.contains(front_token) {
+          self.clients[front_token].readiness().front_readiness = self.clients[front_token].readiness().front_readiness | events;
+          front_token
         } else {
           return;
         }
@@ -300,7 +451,7 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
       //info!("PROXY\t{:?} {:?} | {:?} front: {:?} | back: {:?} ", client_token, events, self.clients[client_token].readiness(), front_interest, back_interest);
 
-      if front_interest == EventSet::none() && back_interest == EventSet::none() {
+      if front_interest == Ready::none() && back_interest == Ready::none() {
         break;
       }
 
@@ -310,25 +461,27 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
       if front_interest.is_readable() {
         let order = self.clients[client_token].readable();
+        trace!("PROXY\tfront readable\tinterpreting client order {:?}", order);
 
         // FIXME: should clear the timeout only if data was consumed
         if let Some(timeout) = self.clients[client_token].front_timeout() {
           //println!("[{}] clearing timeout", token.as_usize());
-          event_loop.clear_timeout(timeout);
+          self.timer.cancel_timeout(&timeout);
         }
-        if let Ok(timeout) = event_loop.timeout_ms(token.as_usize(), self.configuration.front_timeout()) {
-          //println!("[{}] resetting timeout", token.as_usize());
+        let front = self.from_front(client_token);
+        if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.front_timeout()), front) {
+          //println!("[{}] resetting timeout", front);
           &self.clients[client_token].set_front_timeout(timeout);
         }
 
-        self.interpret_client_order(event_loop, client_token, order);
-        //self.clients[client_token].readiness().front_readiness.remove(EventSet::readable());
+        self.interpret_client_order(client_token, order);
+        //self.clients[client_token].readiness().front_readiness.remove(Ready::readable());
       }
 
       if back_interest.is_writable() {
         let order = self.clients[client_token].back_writable();
-        self.interpret_client_order(event_loop, client_token, order);
-        //self.clients[client_token].readiness().back_readiness.remove(EventSet::writable());
+        self.interpret_client_order(client_token, order);
+        //self.clients[client_token].readiness().back_readiness.remove(Ready::writable());
       }
 
       if back_interest.is_readable() {
@@ -337,22 +490,24 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
         // FIXME: should clear the timeout only if data was consumed
         if let Some(timeout) = self.clients[client_token].back_timeout() {
           //println!("[{}] clearing timeout", token.as_usize());
-          event_loop.clear_timeout(timeout);
+          self.timer.cancel_timeout(&timeout);
         }
-        if let Ok(timeout) = event_loop.timeout_ms(token.as_usize(), self.configuration.back_timeout()) {
-          //println!("[{}] resetting timeout", token.as_usize());
-          &self.clients[client_token].set_back_timeout(timeout);
+        if let Some(back) = self.clients[client_token].back_token() {
+          if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.back_timeout()), back) {
+            //println!("[{}] resetting timeout", back);
+            &self.clients[client_token].set_back_timeout(timeout);
+          }
         }
 
-        self.interpret_client_order(event_loop, client_token, order);
-        //self.clients[client_token].readiness().back_readiness.remove(EventSet::readable());
+        self.interpret_client_order(client_token, order);
+        //self.clients[client_token].readiness().back_readiness.remove(Ready::readable());
       }
 
       if front_interest.is_writable() {
         let order = self.clients[client_token].writable();
-        trace!("PROXY\tinterpreting client order {:?}", order);
-        self.interpret_client_order(event_loop, client_token, order);
-        //self.clients[client_token].readiness().front_readiness.remove(EventSet::writable());
+        trace!("PROXY\tfront writable\tinterpreting client order {:?}", order);
+        self.interpret_client_order(client_token, order);
+        //self.clients[client_token].readiness().front_readiness.remove(Ready::writable());
       }
 
       if !self.clients.contains(client_token) {
@@ -361,67 +516,40 @@ impl<ServerConfiguration:ProxyConfiguration<Server<ServerConfiguration,Client>, 
 
       if front_interest.is_hup() {
         if self.clients[client_token].front_hup() == ClientResult::CloseClient {
-          self.clients[client_token].readiness().front_interest = EventSet::none();
-          self.clients[client_token].readiness().back_interest  = EventSet::none();
-          self.clients[client_token].readiness().back_readiness.remove(EventSet::hup());
-          self.close_client(event_loop, client_token);
+          self.clients[client_token].readiness().front_interest = Ready::none();
+          self.clients[client_token].readiness().back_interest  = Ready::none();
+          self.clients[client_token].readiness().back_readiness.remove(Ready::hup());
+          self.close_client(client_token);
           break;
         } else {
-          self.clients[client_token].readiness().front_readiness.remove(EventSet::hup());
+          self.clients[client_token].readiness().front_readiness.remove(Ready::hup());
         }
       }
 
       if back_interest.is_hup() {
         if self.clients[client_token].front_hup() == ClientResult::CloseClient {
-          self.clients[client_token].readiness().front_interest = EventSet::none();
-          self.clients[client_token].readiness().back_interest  = EventSet::none();
-          self.clients[client_token].readiness().front_readiness.remove(EventSet::hup());
-          self.close_client(event_loop, client_token);
+          self.clients[client_token].readiness().front_interest = Ready::none();
+          self.clients[client_token].readiness().back_interest  = Ready::none();
+          self.clients[client_token].readiness().front_readiness.remove(Ready::hup());
+          self.close_client(client_token);
           break;
         } else {
-          self.clients[client_token].readiness().back_readiness.remove(EventSet::hup());
+          self.clients[client_token].readiness().back_readiness.remove(Ready::hup());
         }
       }
 
       if front_interest.is_error() || back_interest.is_error() {
         error!("PROXY client {:?} got an error: front: {:?} back: {:?}", client_token, front_interest,
           back_interest);
-        self.clients[client_token].readiness().front_interest = EventSet::none();
-        self.clients[client_token].readiness().back_interest  = EventSet::none();
-        self.close_client(event_loop, client_token);
+        self.clients[client_token].readiness().front_interest = Ready::none();
+        self.clients[client_token].readiness().back_interest  = Ready::none();
+        self.close_client(client_token);
         break;
       }
     }
   }
 
-  fn notify(&mut self, event_loop: &mut EventLoop<Self>, message: Self::Message) {
-    self.configuration.notify(event_loop, message);
-  }
-
-  fn timeout(&mut self, event_loop: &mut EventLoop<Self>, timeout: Self::Timeout) {
-    let token = Token(timeout);
-    match socket_type(token, self.max_listeners, self.max_connections) {
-      Some(SocketType::Listener) => {
-        error!("PROXY\tthe listener socket should have no timeout set");
-      },
-      Some(SocketType::FrontClient) => {
-        if self.clients.contains(token) {
-          debug!("PROXY\tfrontend [{}] got timeout, closing", timeout);
-          self.close_client(event_loop, token);
-        }
-      },
-      Some(SocketType::BackClient) => {
-        if let Some(tok) = self.get_client_token(token) {
-          debug!("PROXY\tbackend [{}] got timeout, closing", timeout);
-          self.close_client(event_loop, tok);
-        }
-      }
-      None => {}
-    }
-  }
-
-  fn interrupted(&mut self, event_loop: &mut EventLoop<Self>) {
-    warn!("PROXY\tinterrupted");
+  fn notify(&mut self, message: Message) {
+    self.configuration.notify(&mut self.poll, message);
   }
 }
-

@@ -6,20 +6,21 @@ use std::sync::{Arc,Mutex};
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
 use std::mem;
-use mio::tcp::*;
-use std::io::{self,Read,Write,ErrorKind,BufReader};
 use mio::*;
+use mio::tcp::*;
+use mio::timer::Timeout;
+use std::io::{self,Read,Write,ErrorKind,BufReader};
 use bytes::{Buf,ByteBuf,MutByteBuf};
 use bytes::buf::MutBuf;
 use std::collections::HashMap;
 use std::error::Error;
-use mio::util::Slab;
+use slab::Slab;
 use pool::{Pool,Checkout};
 use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
 use time::{precise_time_s, precise_time_ns};
 use rand::random;
-use openssl::ssl::{HandshakeError,MidHandshakeSslStream,
+use openssl::ssl::{self,HandshakeError,MidHandshakeSslStream,
                    SslContext, SslContextOptions, SslMethod,
                    Ssl, SslRef, SslStream, SniError};
 use openssl::x509::{X509,X509FileType};
@@ -30,7 +31,7 @@ use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_req
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder};
-use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness};
+use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness,ListenToken,FrontToken,BackToken};
 use messages::{Command,TlsFront,TlsProxyConfiguration};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -80,10 +81,10 @@ impl TlsClient {
       http:  None,
       state: TlsState::Initial,
       handshake_readiness: Readiness {
-        front_interest:  EventSet::readable() | EventSet::hup() | EventSet::error(),
-        back_interest:   EventSet::none(),
-        front_readiness: EventSet::none(),
-        back_readiness:  EventSet::none(),
+        front_interest:  Ready::readable() | Ready::hup() | Ready::error(),
+        back_interest:   Ready::none(),
+        front_readiness: Ready::none(),
+        back_readiness:  Ready::none(),
       }
     })
   }
@@ -151,7 +152,7 @@ impl ProxyClient for TlsClient {
     if let Some(ref mut state) = self.http.as_mut() {
       state.front_timeout()
     } else {
-      self.front_timeout
+      self.front_timeout.clone()
     }
   }
 
@@ -187,8 +188,9 @@ impl ProxyClient for TlsClient {
     match self.state {
       TlsState::Error   => return ClientResult::CloseClient,
       TlsState::Initial => {
-        let ssl = self.ssl.take().unwrap();
-        let sock = self.front.as_ref().map(|f| f.try_clone().unwrap()).unwrap();
+        let ssl     = self.ssl.take().unwrap();
+        let sock    = self.front.as_ref().map(|f| f.try_clone().unwrap()).unwrap();
+        let version = ssl.version();
         match SslStream::accept(ssl, sock) {
           Ok(stream) => {
             let temp   = self.temp.take().unwrap();
@@ -201,7 +203,8 @@ impl ProxyClient for TlsClient {
             self.state = TlsState::Established;
           },
           Err(HandshakeError::Failure(e)) => {
-            println!("handshake failed: {:?}", e);
+            println!("accept: handshake failed: {:?}", e);
+            println!("version: {:?}", version);
             self.state = TlsState::Error;
             return ClientResult::CloseClient;
           },
@@ -214,6 +217,7 @@ impl ProxyClient for TlsClient {
       },
       TlsState::Handshake => {
         let mid = self.mid.take().unwrap();
+        let version = mid.ssl().version();
         match mid.handshake() {
           Ok(stream) => {
             let temp   = self.temp.take().unwrap();
@@ -226,7 +230,8 @@ impl ProxyClient for TlsClient {
             self.state = TlsState::Established;
           },
           Err(HandshakeError::Failure(e)) => {
-            println!("handshake failed: {:?}", e);
+            println!("mid handshake failed: {:?}", e);
+            println!("version: {:?}", version);
             self.state = TlsState::Error;
             return ClientResult::CloseClient;
           },
@@ -286,10 +291,10 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(config: TlsProxyConfiguration, tx: mpsc::Sender<ServerMessage>, event_loop: &mut EventLoop<TlsServer>) -> io::Result<ServerConfiguration> {
+  pub fn new(config: TlsProxyConfiguration, tx: mpsc::Sender<ServerMessage>, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
     let contexts = HashMap::new();
 
-    let mut ctx = SslContext::new(SslMethod::Tlsv1_2);
+    let mut ctx = SslContext::new(SslMethod::Sslv23);
     if let Err(e) = ctx {
       return Err(io::Error::new(io::ErrorKind::Other, e.description()));
     }
@@ -333,7 +338,7 @@ impl ServerConfiguration {
 
     match server_bind(&config.front) {
       Ok(listener) => {
-        event_loop.register(&listener, Token(0), EventSet::readable(), PollOpt::level());
+        event_loop.register(&listener, Token(start_at), Ready::readable(), PollOpt::level());
         Ok(ServerConfiguration {
           listener:        listener,
           address:         config.front.clone(),
@@ -360,7 +365,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_http_front(&mut self, http_front: TlsFront, event_loop: &mut EventLoop<TlsServer>) -> bool {
+  pub fn add_http_front(&mut self, http_front: TlsFront, event_loop: &mut Poll) -> bool {
     //FIXME: insert some error management with a Result here
     let mut c = SslContext::new(SslMethod::Tlsv1);
     if c.is_err() { return false; }
@@ -403,14 +408,14 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn remove_http_front(&mut self, front: TlsFront, event_loop: &mut EventLoop<TlsServer>) {
+  pub fn remove_http_front(&mut self, front: TlsFront, event_loop: &mut Poll) {
     info!("TLS\tremoving http_front {:?}", front);
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
       fronts.retain(|f| f != &front);
     }
   }
 
-  pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<TlsServer>) {
+  pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
     if let Some(addrs) = self.instances.get_mut(app_id) {
       let backend = Backend::new(*instance_address);
       addrs.push(backend);
@@ -422,7 +427,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<TlsServer>) {
+  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
       if let Some(instances) = self.instances.get_mut(app_id) {
         instances.retain(|backend| &backend.address != instance_address);
       } else {
@@ -490,12 +495,12 @@ impl ServerConfiguration {
   }
 }
 
-impl ProxyConfiguration<TlsServer,TlsClient> for ServerConfiguration {
-  fn accept(&mut self, token: Token) -> Option<(TlsClient,bool)> {
+impl ProxyConfiguration<TlsClient> for ServerConfiguration {
+  fn accept(&mut self, token: ListenToken) -> Option<(TlsClient,bool)> {
     if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
       let accepted = self.listener.accept();
 
-      if let Ok(Some((frontend_sock, _))) = accepted {
+      if let Ok((frontend_sock, _)) = accepted {
         frontend_sock.set_nodelay(true);
         if let Ok(ssl) = Ssl::new(&self.default_context) {
           if let Some(c) = TlsClient::new("TLS", ssl, frontend_sock, front_buf, back_buf) {
@@ -513,7 +518,7 @@ impl ProxyConfiguration<TlsServer,TlsClient> for ServerConfiguration {
     None
   }
 
-  fn connect_to_backend(&mut self, event_loop: &mut EventLoop<TlsServer>, client: &mut TlsClient) -> Result<BackendConnectAction,ConnectionError> {
+  fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut TlsClient) -> Result<BackendConnectAction,ConnectionError> {
     // FIXME: should check the host corresponds to SNI here
     let host   = try!(client.http.as_mut().unwrap().state().get_host().ok_or(ConnectionError::NoHostGiven));
     let rl:RRequestLine = try!(client.http.as_mut().unwrap().state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
@@ -553,7 +558,7 @@ impl ProxyConfiguration<TlsServer,TlsClient> for ServerConfiguration {
     }
   }
 
-  fn notify(&mut self, event_loop: &mut EventLoop<TlsServer>, message: ProxyOrder) {
+  fn notify(&mut self, event_loop: &mut Poll, message: ProxyOrder) {
     trace!("TLS\t{} notified", message);
     match message {
       ProxyOrder::Command(id, Command::AddTlsFront(front)) => {
@@ -599,7 +604,8 @@ impl ProxyConfiguration<TlsServer,TlsClient> for ServerConfiguration {
       },
       ProxyOrder::Stop(id)                   => {
         info!("HTTP\t{} shutdown", id);
-        event_loop.shutdown();
+        //FIXME: handle shutdown
+        //event_loop.shutdown();
         self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
       ProxyOrder::Command(id, msg) => {
@@ -628,15 +634,18 @@ impl ProxyConfiguration<TlsServer,TlsClient> for ServerConfiguration {
 
 pub type TlsServer = Server<ServerConfiguration,TlsClient>;
 
-pub fn start_listener(config: TlsProxyConfiguration, tx: mpsc::Sender<ServerMessage>, mut event_loop: EventLoop<TlsServer>) {
+pub fn start_listener(config: TlsProxyConfiguration, tx: mpsc::Sender<ServerMessage>, mut event_loop: Poll, receiver: channel::Receiver<ProxyOrder>) {
   //let notify_tx = tx.clone();
 
   let max_connections = config.max_connections;
-  let configuration = ServerConfiguration::new(config, tx, &mut event_loop).unwrap();
-  let mut server = TlsServer::new(1, max_connections, configuration);
+  let max_listeners   = 1;
+  // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
+  let configuration = ServerConfiguration::new(config, tx, &mut event_loop, 1 + max_listeners).unwrap();
+  let mut server = TlsServer::new(max_listeners, max_connections, configuration, event_loop, receiver);
 
   info!("TLS\tstarting event loop");
-  event_loop.run(&mut server).unwrap();
+  server.run();
+  //event_loop.run(&mut server).unwrap();
   info!("TLS\tending event loop");
 }
 
@@ -656,7 +665,7 @@ mod tests {
   use std::sync::{Arc,Mutex};
   use std::cell::RefCell;
   use messages::{Command,TlsFront,Instance};
-  use mio::util::Slab;
+  use slab::Slab;
   use pool::Pool;
   use network::buffer::Buffer;
   use network::buffer_queue::BufferQueue;

@@ -6,19 +6,20 @@ use std::cmp::min;
 use mio::tcp::*;
 use std::io::{self,Read,Write,ErrorKind};
 use mio::*;
+use mio::timer::Timeout;
 use bytes::{ByteBuf,MutByteBuf};
 use bytes::buf::MutBuf;
 use pool::{Pool,Checkout,Reset};
 use std::collections::HashMap;
 use std::error::Error;
-use mio::util::Slab;
+use slab::Slab;
 use std::net::SocketAddr;
 use std::str::{FromStr, from_utf8};
 use time::{Duration, precise_time_s, precise_time_ns};
 use rand::random;
 use uuid::Uuid;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents};
-use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness};
+use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness,ListenToken,FrontToken,BackToken};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -235,7 +236,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
   //FIXME: unwrap bad, bad rust coder
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.log_ctx, self.token.unwrap().as_usize(), self.backend_token.unwrap().as_usize());
+    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.log_ctx, self.token.unwrap().0, self.backend_token.unwrap().0);
     let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
     self.backend       = None;
     self.backend_token = None;
@@ -261,9 +262,9 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   // Read content from the client
   fn readable(&mut self) -> ClientResult {
     if self.status == ClientStatus::DefaultAnswer {
-      self.readiness.front_interest.insert(EventSet::writable());
-      self.readiness.back_interest.remove(EventSet::readable());
-      self.readiness.back_interest.remove(EventSet::writable());
+      self.readiness.front_interest.insert(Ready::writable());
+      self.readiness.back_interest.remove(Ready::readable());
+      self.readiness.back_interest.remove(Ready::writable());
       return ClientResult::Continue;
     }
 
@@ -274,12 +275,12 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       if self.backend_token == None {
         // We don't have a backend to empty the buffer into, close the connection
         error!("{}\t[{:?}] front buffer full, no backend, closing the connection", self.log_ctx, self.token);
-        self.readiness.front_interest = EventSet::none();
-        self.readiness.back_interest  = EventSet::none();
+        self.readiness.front_interest = Ready::none();
+        self.readiness.back_interest  = Ready::none();
         return ClientResult::CloseClient;
       } else {
-        self.readiness.front_interest.remove(EventSet::readable());
-        self.readiness.back_interest.insert(EventSet::writable());
+        self.readiness.front_interest.remove(Ready::readable());
+        self.readiness.back_interest.insert(Ready::writable());
         return ClientResult::Continue;
       }
     }
@@ -300,11 +301,11 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
 
     if self.front_buf.buffer.available_space() == 0 {
-      self.readiness.front_interest.remove(EventSet::readable());
+      self.readiness.front_interest.remove(Ready::readable());
     }
 
     if sz == 0 {
-      self.readiness.front_readiness.remove(EventSet::readable());
+      self.readiness.front_readiness.remove(Ready::readable());
     }
 
     match res {
@@ -313,7 +314,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         return ClientResult::CloseClient;
       },
       SocketResult::WouldBlock => {
-        self.readiness.front_readiness.remove(EventSet::readable());
+        self.readiness.front_readiness.remove(Ready::readable());
       },
       SocketResult::Continue => {}
     };
@@ -325,29 +326,29 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         &mut self.front_buf));
       if self.state.as_ref().unwrap().is_front_error() {
         time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
-        self.readiness.front_interest.remove(EventSet::readable());
+        self.readiness.front_interest.remove(Ready::readable());
         return ClientResult::CloseClient;
       }
 
       if self.state.as_ref().unwrap().has_host() {
-        self.readiness.back_interest.insert(EventSet::writable());
+        self.readiness.back_interest.insert(Ready::writable());
         return ClientResult::ConnectBackend;
       } else {
         return ClientResult::Continue;
       }
     } else {
-      self.readiness.back_interest.insert(EventSet::writable());
+      self.readiness.back_interest.insert(Ready::writable());
       match self.state.as_ref().unwrap().request {
         Some(RequestState::Request(_,_,_)) | Some(RequestState::RequestWithBody(_,_,_,_)) => {
           if ! self.front_buf.needs_input() {
-            self.readiness.front_interest.remove(EventSet::readable());
+            self.readiness.front_interest.remove(Ready::readable());
           }
           return ClientResult::Continue;
         },
         Some(RequestState::RequestWithBodyChunks(_,_,_,ch)) => {
           if ch == Chunk::Ended {
             error!("{}\tfront read should have stopped on chunk ended", self.log_ctx,);
-            self.readiness.front_interest.remove(EventSet::readable());
+            self.readiness.front_interest.remove(Ready::readable());
             return ClientResult::Continue;
           } else if ch == Chunk::Error {
             error!("{}\tfront read should have stopped on chunk error", self.log_ctx,);
@@ -366,7 +367,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               }
 
               if let Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) = self.state.as_ref().unwrap().request {
-                self.readiness.front_interest.remove(EventSet::readable());
+                self.readiness.front_interest.remove(Ready::readable());
                 return ClientResult::Continue;
               } else {
                 return ClientResult::Continue;
@@ -387,11 +388,11 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           }
 
           if let Some(RequestState::Request(_,_,_)) = self.state.as_ref().unwrap().request {
-            self.readiness.front_interest.remove(EventSet::readable());
-            self.readiness.back_interest.insert(EventSet::writable());
+            self.readiness.front_interest.remove(Ready::readable());
+            self.readiness.back_interest.insert(Ready::writable());
             return ClientResult::Continue;
           } else {
-            self.readiness.back_interest.insert(EventSet::writable());
+            self.readiness.back_interest.insert(Ready::writable());
             return ClientResult::Continue;
           }
         }
@@ -405,7 +406,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     let output_size = self.back_buf.output_data_size();
     if self.status == ClientStatus::DefaultAnswer {
       if self.back_buf.output_data_size() == 0 {
-        self.readiness.front_interest.remove(EventSet::writable());
+        self.readiness.front_interest.remove(Ready::writable());
       }
 
       let mut sz = 0usize;
@@ -419,7 +420,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       }
 
       if res != SocketResult::Continue {
-        self.readiness.front_readiness.remove(EventSet::writable());
+        self.readiness.front_readiness.remove(Ready::writable());
       }
 
       if self.back_buf.buffer.available_data() == 0 {
@@ -437,8 +438,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
 
     if self.back_buf.output_data_size() == 0 {
-      self.readiness.back_interest.insert(EventSet::readable());
-      self.readiness.front_interest.remove(EventSet::writable());
+      self.readiness.back_interest.insert(Ready::readable());
+      self.readiness.front_interest.remove(Ready::writable());
       return ClientResult::Continue;
     }
 
@@ -454,7 +455,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
 
     if let Some((front,back)) = self.tokens() {
-      debug!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}, buffer position {} restart position {}", self.log_ctx, front.as_usize(), back.as_usize(), sz, output_size, self.back_buf.buffer_position, self.back_buf.start_parsing_position);
+      debug!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}, buffer position {} restart position {}", self.log_ctx, front.0, back.0, sz, output_size, self.back_buf.buffer_position, self.back_buf.start_parsing_position);
       //debug!("{}\tFRONT [{}<-{}]: back buf: {:?}", self.log_ctx, front.as_usize(), back.as_usize(), *self.back_buf);
     }
 
@@ -464,7 +465,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         return ClientResult::CloseClient;
       },
       SocketResult::WouldBlock => {
-        self.readiness.front_readiness.remove(EventSet::writable());
+        self.readiness.front_readiness.remove(Ready::writable());
       },
       SocketResult::Continue => {},
     }
@@ -484,16 +485,16 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
             // a pool of connections
             if front_keep_alive && back_keep_alive {
               self.reset();
-              self.readiness.front_interest = EventSet::readable() | EventSet::hup() | EventSet::error();
-              self.readiness.back_interest  = EventSet::writable() | EventSet::hup() | EventSet::error();
+              self.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
+              self.readiness.back_interest  = Ready::writable() | Ready::hup() | Ready::error();
               ClientResult::Continue
               //FIXME: issues reusing the backend socket
-              //self.readiness.back_interest  = EventSet::hup() | EventSet::error();
+              //self.readiness.back_interest  = Ready::hup() | Ready::error();
               //ClientResult::CloseBackend
             } else if front_keep_alive && !back_keep_alive {
               self.reset();
-              self.readiness.front_interest = EventSet::readable() | EventSet::hup() | EventSet::error();
-              self.readiness.back_interest  = EventSet::hup() | EventSet::error();
+              self.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
+              self.readiness.back_interest  = Ready::hup() | Ready::error();
               ClientResult::CloseBackend
             } else {
               info!("keepalive front: {}, back: {}, closing connections", front_keep_alive, back_keep_alive);
@@ -503,7 +504,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           },
           // restart parsing, since there will be other chunks next
           Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
-            self.readiness.back_interest.insert(EventSet::readable());
+            self.readiness.back_interest.insert(Ready::readable());
             ClientResult::Continue
           },
           _ => {
@@ -512,7 +513,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           }
       }
     } else {
-      self.readiness.back_interest.insert(EventSet::readable());
+      self.readiness.back_interest.insert(Ready::readable());
       ClientResult::Continue
     }
   }
@@ -520,16 +521,16 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   // Forward content to application
   fn back_writable(&mut self) -> ClientResult {
     if self.status == ClientStatus::DefaultAnswer {
-      self.readiness.back_interest.remove(EventSet::writable());
-      self.readiness.front_interest.insert(EventSet::writable());
+      self.readiness.back_interest.remove(Ready::writable());
+      self.readiness.front_interest.insert(Ready::writable());
       return ClientResult::Continue;
     }
 
     //trace!("{}\twritable back pos: {}, buf pos: {}, available: {}", self.log_ctx, self.state.req_position, self.front_buf_position, self.front_buf.buffer.available_data());
     //assert!(self.front_buf_position + self.front_buf.available_data() <= self.state.req_position);
     if self.front_buf.output_data_size() == 0 {
-      self.readiness.front_interest.insert(EventSet::readable());
-      self.readiness.back_interest.remove(EventSet::writable());
+      self.readiness.front_interest.insert(Ready::readable());
+      self.readiness.back_interest.remove(Ready::writable());
       return ClientResult::Continue;
     }
 
@@ -550,7 +551,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       }
 
       if let Some((front,back)) = tokens {
-        debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", self.log_ctx, front.as_usize(), back.as_usize(), sz, output_size);
+        debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", self.log_ctx, front.0, back.0, sz, output_size);
       }
       match socket_res {
         SocketResult::Error => {
@@ -558,7 +559,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           return ClientResult::CloseBothFailure;
         },
         SocketResult::WouldBlock => {
-          self.readiness.back_readiness.remove(EventSet::writable());
+          self.readiness.back_readiness.remove(Ready::writable());
 
         },
         SocketResult::Continue => {}
@@ -571,13 +572,13 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           Some(RequestState::Request(_,_,_))                            |
           Some(RequestState::RequestWithBody(_,_,_,_))                  |
           Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
-            self.readiness.front_interest.remove(EventSet::readable());
-            self.readiness.back_interest.insert(EventSet::readable());
-            self.readiness.back_interest.remove(EventSet::writable());
+            self.readiness.front_interest.remove(Ready::readable());
+            self.readiness.back_interest.insert(Ready::readable());
+            self.readiness.back_interest.remove(Ready::writable());
             ClientResult::Continue
           },
           Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
-            self.readiness.front_interest.insert(EventSet::readable());
+            self.readiness.front_interest.insert(Ready::readable());
             ClientResult::Continue
           },
           _ => {
@@ -586,8 +587,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           }
         }
       } else {
-        self.readiness.front_interest.insert(EventSet::readable());
-        self.readiness.back_interest.insert(EventSet::writable());
+        self.readiness.front_interest.insert(Ready::readable());
+        self.readiness.back_interest.insert(Ready::writable());
         ClientResult::Continue
       }
     } else {
@@ -601,7 +602,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   // Read content from application
   fn back_readable(&mut self) -> ClientResult {
     if self.status == ClientStatus::DefaultAnswer {
-      self.readiness.back_interest.remove(EventSet::readable());
+      self.readiness.back_interest.remove(Ready::readable());
       return ClientResult::Continue;
     }
 
@@ -610,7 +611,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
     if self.back_buf.buffer.available_space() == 0 {
       //println!("BACK BUFFER FULL({} bytes): TOKENS {:?} {:?}", self.back_buf.available_data(), self.token, self.backend_token);
-      self.readiness.back_interest.remove(EventSet::readable());
+      self.readiness.back_interest.remove(Ready::readable());
       return ClientResult::Continue;
     }
 
@@ -622,11 +623,11 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       self.back_buf.sliced_input(sz);
       //println!("BACK_READABLE[{}]\ndata:\n{}unparsed data:\n{}", line!(), self.back_buf.buffer.data().to_hex(16), self.back_buf.unparsed_data().to_hex(16));
       if let Some((front,back)) = tokens {
-        debug!("{}\tBACK  [{}<-{}]: read {} bytes", self.log_ctx, front.as_usize(), back.as_usize(), sz);
+        debug!("{}\tBACK  [{}<-{}]: read {} bytes", self.log_ctx, front.0, back.0, sz);
       }
 
       if r != SocketResult::Continue || sz == 0 {
-        self.readiness.back_readiness.remove(EventSet::readable());
+        self.readiness.back_readiness.remove(Ready::readable());
       }
 
       match r {
@@ -638,13 +639,13 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           match self.state.as_ref().unwrap().response {
             Some(ResponseState::Response(_,_)) => {
               error!("{}\tshould not go back in back_readable if the whole response was parsed", self.log_ctx);
-              self.readiness.back_interest.remove(EventSet::readable());
+              self.readiness.back_interest.remove(Ready::readable());
               return  ClientResult::Continue;
             },
             Some(ResponseState::ResponseWithBody(_,_,_)) => {
-              self.readiness.front_interest.insert(EventSet::writable());
+              self.readiness.front_interest.insert(Ready::writable());
               if ! self.back_buf.needs_input() {
-                self.readiness.back_interest.remove(EventSet::readable());
+                self.readiness.back_interest.remove(Ready::readable());
                 return ClientResult::Continue;
               } else {
                 return ClientResult::Continue;
@@ -653,7 +654,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
             Some(ResponseState::ResponseWithBodyChunks(_,_,ch)) => {
               if ch == Chunk::Ended {
                 error!("{}\tback read should have stopped on chunk ended", self.log_ctx);
-                self.readiness.back_interest.remove(EventSet::readable());
+                self.readiness.back_interest.remove(Ready::readable());
                 return ClientResult::Continue;
               } else if ch == Chunk::Error {
                 error!("{}\tback read should have stopped on chunk error", self.log_ctx);
@@ -672,10 +673,10 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                   }
 
                   if let Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) = self.state.as_ref().unwrap().response {
-                    self.readiness.back_interest.remove(EventSet::readable());
+                    self.readiness.back_interest.remove(Ready::readable());
                     return ClientResult::Continue;
                   } else {
-                    self.readiness.front_interest.insert(EventSet::writable());
+                    self.readiness.front_interest.insert(Ready::writable());
                     return ClientResult::Continue;
                   }
                 } else {
@@ -695,11 +696,11 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               }
 
               if let Some(ResponseState::Response(_,_)) = self.state.as_ref().unwrap().response {
-                self.readiness.front_interest.insert(EventSet::writable());
-                self.readiness.back_interest.remove(EventSet::readable());
+                self.readiness.front_interest.insert(Ready::writable());
+                self.readiness.back_interest.remove(Ready::readable());
                 return ClientResult::Continue;
               } else {
-                self.readiness.front_interest.insert(EventSet::writable());
+                self.readiness.front_interest.insert(Ready::writable());
                 return ClientResult::Continue;
               }
             }
@@ -739,11 +740,11 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(config: HttpProxyConfiguration, tx: mpsc::Sender<ServerMessage>, event_loop: &mut EventLoop<HttpServer>) -> io::Result<ServerConfiguration> {
+  pub fn new(config: HttpProxyConfiguration, tx: mpsc::Sender<ServerMessage>, event_loop: &mut Poll, start_at:usize) -> io::Result<ServerConfiguration> {
     let front = config.front;
     match server_bind(&config.front) {
       Ok(sock) => {
-        event_loop.register(&sock, Token(0), EventSet::readable(), PollOpt::level());
+        event_loop.register(&sock, Token(start_at), Ready::readable(), PollOpt::level());
         Ok(ServerConfiguration {
           listener:  sock,
           address:   config.front,
@@ -768,7 +769,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_http_front(&mut self, http_front: HttpFront, event_loop: &mut EventLoop<HttpServer>) {
+  pub fn add_http_front(&mut self, http_front: HttpFront, event_loop: &mut Poll) {
     let front2 = http_front.clone();
     let front3 = http_front.clone();
     if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
@@ -783,14 +784,14 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn remove_http_front(&mut self, front: HttpFront, event_loop: &mut EventLoop<HttpServer>) {
+  pub fn remove_http_front(&mut self, front: HttpFront, event_loop: &mut Poll) {
     info!("HTTP\tremoving http_front {:?}", front);
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
       fronts.retain(|f| f != &front);
     }
   }
 
-  pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<HttpServer>) {
+  pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
     if let Some(addrs) = self.instances.get_mut(app_id) {
       let backend = Backend::new(*instance_address);
       addrs.push(backend);
@@ -802,7 +803,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut EventLoop<HttpServer>) {
+  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
       if let Some(instances) = self.instances.get_mut(app_id) {
         instances.retain(|backend| &backend.address != instance_address);
       } else {
@@ -859,8 +860,8 @@ impl ServerConfiguration {
   }
 }
 
-impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
-  fn connect_to_backend(&mut self, event_loop: &mut EventLoop<HttpServer>, client: &mut Client<TcpStream>) -> Result<BackendConnectAction,ConnectionError> {
+impl ProxyConfiguration<Client<TcpStream>> for ServerConfiguration {
+  fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut Client<TcpStream>) -> Result<BackendConnectAction,ConnectionError> {
     let host   = try!(client.state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
     let rl     = try!(client.state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
     if let Some(app_id) = self.frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
@@ -882,9 +883,9 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
         Ok(socket) => {
           socket.set_nodelay(true);
           client.set_back_socket(socket);
-          client.readiness().back_interest.insert(EventSet::writable());
-          client.readiness().back_interest.insert(EventSet::hup());
-          client.readiness().back_interest.insert(EventSet::error());
+          client.readiness().back_interest.insert(Ready::writable());
+          client.readiness().back_interest.insert(Ready::hup());
+          client.readiness().back_interest.insert(Ready::error());
           if reused {
             Ok(BackendConnectAction::Replace)
           } else {
@@ -894,24 +895,24 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
         },
         Err(ConnectionError::NoBackendAvailable) => {
           client.set_answer(&self.answers.ServiceUnavailable);
-          client.readiness().front_interest.insert(EventSet::writable());
+          client.readiness().front_interest.insert(Ready::writable());
           Err(ConnectionError::NoBackendAvailable)
         }
         Err(ConnectionError::HostNotFound) => {
           client.set_answer(&self.answers.NotFound);
-          client.readiness().front_interest.insert(EventSet::writable());
+          client.readiness().front_interest.insert(Ready::writable());
           Err(ConnectionError::HostNotFound)
         }
         e => panic!(e)
       }
     } else {
       client.set_answer(&self.answers.NotFound);
-      client.readiness().front_interest.insert(EventSet::writable());
+      client.readiness().front_interest.insert(Ready::writable());
       Err(ConnectionError::HostNotFound)
     }
   }
 
-  fn notify(&mut self, event_loop: &mut EventLoop<HttpServer>, message: ProxyOrder) {
+  fn notify(&mut self, event_loop: &mut Poll, message: ProxyOrder) {
   // ToDo temporary
     trace!("HTTP\t{} notified", message);
     match message {
@@ -958,7 +959,8 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
       },
       ProxyOrder::Stop(id)                   => {
         info!("HTTP\t{} shutdown", id);
-        event_loop.shutdown();
+        //FIXME: handle shutdown
+        //event_loop.shutdown();
         self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
       ProxyOrder::Command(id, msg) => {
@@ -968,15 +970,15 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: Token) -> Option<(Client<TcpStream>, bool)> {
+  fn accept(&mut self, token: ListenToken) -> Option<(Client<TcpStream>, bool)> {
     if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
       let accepted = self.listener.accept();
 
-      if let Ok(Some((frontend_sock, _))) = accepted {
+      if let Ok((frontend_sock, _)) = accepted {
         frontend_sock.set_nodelay(true);
         if let Some(mut c) = Client::new("HTTP", frontend_sock, front_buf, back_buf) {
-          c.readiness().front_interest.insert(EventSet::readable());
-          c.readiness().back_interest.remove(EventSet::readable() | EventSet::writable());
+          c.readiness().front_interest.insert(Ready::readable());
+          c.readiness().back_interest.remove(Ready::readable() | Ready::writable());
           return Some((c, false))
         }
       } else {
@@ -1007,15 +1009,18 @@ impl ProxyConfiguration<HttpServer,Client<TcpStream>> for ServerConfiguration {
 
 pub type HttpServer = Server<ServerConfiguration,Client<TcpStream>>;
 
-pub fn start_listener(config: HttpProxyConfiguration, tx: mpsc::Sender<ServerMessage>, mut event_loop: EventLoop<HttpServer>) {
+pub fn start_listener(config: HttpProxyConfiguration, tx: mpsc::Sender<ServerMessage>, mut event_loop: Poll, receiver: channel::Receiver<ProxyOrder>) {
   let notify_tx = tx.clone();
 
   let max_connections = config.max_connections;
-  let configuration = ServerConfiguration::new(config, tx, &mut event_loop).unwrap();
-  let mut server = HttpServer::new(1, max_connections, configuration);
+  let max_listeners   = 1;
+  // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
+  let configuration = ServerConfiguration::new(config, tx, &mut event_loop, 1 + max_listeners).unwrap();
+  let mut server = HttpServer::new(max_listeners, max_connections, configuration, event_loop, receiver);
 
   info!("HTTP\tstarting event loop");
-  event_loop.run(&mut server).unwrap();
+  server.run();
+  //event_loop.run(&mut server).unwrap();
   info!("HTTP\tending event loop");
 }
 
@@ -1023,8 +1028,8 @@ pub fn start_listener(config: HttpProxyConfiguration, tx: mpsc::Sender<ServerMes
 mod tests {
   extern crate tiny_http;
   use super::*;
-  use mio::util::Slab;
-  use mio::EventLoop;
+  use slab::Slab;
+  use mio::{channel,Poll};
   use std::collections::HashMap;
   use std::net::{TcpListener, TcpStream, Shutdown};
   use std::io::{Read,Write};
@@ -1051,10 +1056,10 @@ mod tests {
       ..Default::default()
     };
 
-    let mut event_loop = EventLoop::new().unwrap();
-    let sender = event_loop.channel();
+    let mut poll = Poll::new().unwrap();
+    let (sender, receiver) = channel::channel::<ProxyOrder>();
     let jg = thread::spawn(move || {
-      start_listener(config, tx.clone(), event_loop);
+      start_listener(config, tx.clone(), poll, receiver);
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
@@ -1103,10 +1108,10 @@ mod tests {
       buffer_size: 12000,
       ..Default::default()
     };
-    let mut event_loop = EventLoop::new().unwrap();
-    let sender = event_loop.channel();
+    let mut poll = Poll::new().unwrap();
+    let (sender, receiver) = channel::channel::<ProxyOrder>();
     let jg = thread::spawn(move|| {
-      start_listener(config, tx.clone(), event_loop);
+      start_listener(config, tx.clone(), poll, receiver);
     });
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1031"), path_begin: String::from("/") };
     sender.send(ProxyOrder::Command(String::from("ID_ABCD"), Command::AddHttpFront(front)));
