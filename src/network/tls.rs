@@ -196,10 +196,11 @@ impl ProxyClient for TlsClient {
             let temp   = self.temp.take().unwrap();
             self.http  = http::Client::new(&temp.server_context, stream, temp.front_buf, temp.back_buf);
             let front_token = self.front_token.take().unwrap();
-            let timeout     = self.front_timeout.take().unwrap();
             self.set_front_token(front_token);
-            self.set_front_timeout(timeout);
-            self.readiness().front_interest = EventSet::readable() | EventSet::hup() | EventSet::error();
+            if let Some(timeout) = self.front_timeout.take() {
+              self.set_front_timeout(timeout);
+            }
+            self.readiness().front_interest = Ready::readable() | Ready::hup() | Ready::error();
             self.state = TlsState::Established;
           },
           Err(HandshakeError::Failure(e)) => {
@@ -223,10 +224,11 @@ impl ProxyClient for TlsClient {
             let temp   = self.temp.take().unwrap();
             self.http  = http::Client::new(&temp.server_context, stream, temp.front_buf, temp.back_buf);
             let front_token = self.front_token.take().unwrap();
-            let timeout     = self.front_timeout.take().unwrap();
             self.set_front_token(front_token);
-            self.set_front_timeout(timeout);
-            self.readiness().front_interest = EventSet::readable() | EventSet::hup() | EventSet::error();
+            if let Some(timeout) = self.front_timeout.take() {
+              self.set_front_timeout(timeout);
+            }
+            self.readiness().front_interest = Ready::readable() | Ready::hup() | Ready::error();
             self.state = TlsState::Established;
           },
           Err(HandshakeError::Failure(e)) => {
