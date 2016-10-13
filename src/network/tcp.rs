@@ -100,7 +100,7 @@ impl ProxyClient for Client {
   }
 
   fn close(&mut self) {
-    println!("TCP closing[{:?}] front: {:?}, back: {:?}", self.token, *self.front_buf, *self.back_buf);
+    //println!("TCP closing[{:?}] front: {:?}, back: {:?}", self.token, *self.front_buf, *self.back_buf);
   }
 
   fn log_context(&self) -> String {
@@ -471,7 +471,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
-        trace!("TCP\t{:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
