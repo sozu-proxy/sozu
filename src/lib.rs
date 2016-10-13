@@ -1,4 +1,4 @@
-#![feature(custom_derive, plugin, rustc_macro)]
+#![feature(custom_derive, plugin, rustc_macro, proc_macro)]
 #![cfg_attr(test, feature(test))]
 #[cfg(test)]
 extern crate test;
