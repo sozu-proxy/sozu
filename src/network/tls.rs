@@ -776,8 +776,8 @@ mod tests {
     let context = SslContext::new(SslMethod::Tlsv1).unwrap();
     let (tx,rx) = channel::<ServerMessage>();
 
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1031").unwrap();
-    let listener = tcp::TcpListener::bind(&front).unwrap();
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1032").expect("test address 127.0.0.1:1032 should be parsed");
+    let listener = tcp::TcpListener::bind(&front).expect("test address 127.0.0.1:1032 should be available");
     let server_config = ServerConfiguration {
       listener:  listener,
       address:   front,
