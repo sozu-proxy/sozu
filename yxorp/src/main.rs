@@ -1,4 +1,4 @@
-#![feature(custom_derive, plugin, libc, rustc_macro)]
+#![feature(custom_derive, plugin, libc, rustc_macro, proc_macro)]
 #[macro_use] extern crate nom;
 #[macro_use] extern crate log;
 #[macro_use] extern crate clap;
