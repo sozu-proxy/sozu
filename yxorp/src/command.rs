@@ -618,8 +618,10 @@ impl CommandServer {
   fn new(srv: UnixListener, listeners: HashMap<String, Listener>, buffer_size: usize, max_buffer_size: usize, poll: Poll) -> CommandServer {
     //FIXME: verify this
     poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-    let mut timer = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
-    poll.register(&timer, Token(1), Ready::readable(), PollOpt::edge()).unwrap();
+    //let mut timer = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
+    //FIXME: registering the timer makes the timer thread spin too much
+    let mut timer = timer::Timer::default();
+    //poll.register(&timer, Token(1), Ready::readable(), PollOpt::edge()).unwrap();
     timer.set_timeout(Duration::from_millis(700), Token(0));
     CommandServer {
       sock:            srv,
@@ -647,10 +649,16 @@ type Message = ();
 impl CommandServer {
   pub fn run(&mut self) {
     let mut events = Events::with_capacity(1024);
+    let poll_timeout = Some(Duration::from_millis(1000));
     loop {
-      self.poll.poll(&mut events, None).unwrap();
+      self.poll.poll(&mut events, poll_timeout).unwrap();
       for event in events.iter() {
         self.ready(event.token(), event.kind());
+      }
+
+      //FIXME: manually call the timer instead of relying on a separate thread
+      while let Some(timeout_token) = self.timer.poll() {
+        self.timeout(timeout_token);
       }
     }
   }
@@ -661,35 +669,8 @@ impl CommandServer {
       match token {
         Token(0) => self.accept().unwrap(),
         Token(1) => {
-          /*FIXME: timeout */
           while let Some(timeout_token) = self.timer.poll() {
-            println!("got timeout for token: {:?}", timeout_token);
-            if timeout_token.0 == 0 {
-              for listener in self.listeners.values() {
-                while let Ok(msg) = listener.receiver.try_recv() {
-                  //println!("got msg: {:?}", msg);
-                  for client in self.conns.iter_mut() {
-                    if let Some(index) = client.has_message_id(&msg.id) {
-                      client.back_buf.write(&serde_json::to_string(&msg).map(|s| s.into_bytes()).unwrap_or(vec!()));
-                      client.back_buf.write(&b"\0"[..]);
-                      client.remove_message_id(index);
-                    }
-                  }
-                }
-              }
-              self.timer.set_timeout(Duration::from_millis(700), Token(0));
-            } else {
-              let conn_token = self.to_front(timeout_token);
-              if self.conns.contains(conn_token) {
-                //FIXME: is it still needed?
-                //println!("[{}] timeout ended, registering for writes", timeout);
-                self.conns[conn_token].write_timeout = None;
-                //let mut interest = Ready::hup();
-                //interest.insert(Ready::readable());
-                //interest.insert(Ready::writable());
-                //event_loop.register(&self.conns[token].sock, token, interest, PollOpt::edge() | PollOpt::oneshot());
-              }
-            }
+            self.timeout(timeout_token);
           }
         },
         _      => {
@@ -746,14 +727,9 @@ impl CommandServer {
     }
   }
 
-  /* FIXME: timeout, notify
-  fn notify(&mut self, event_loop: &mut Poll, message: Self::Message) {
-    // TODO: dispatch here to clients the list of messages you want to display
-    info!("notify");
-  }
-
-  fn timeout(&mut self, event_loop: &mut Poll, timeout: Self::Timeout) {
-    if timeout == 0 {
+  fn timeout(&mut self, token: Token) {
+    println!("got timeout for token: {:?}", token);
+    if token.0 == 0 {
       for listener in self.listeners.values() {
         while let Ok(msg) = listener.receiver.try_recv() {
           //println!("got msg: {:?}", msg);
@@ -766,20 +742,20 @@ impl CommandServer {
           }
         }
       }
-      event_loop.timeout_ms(0, 700);
+      self.timer.set_timeout(Duration::from_millis(700), Token(0));
     } else {
-      let token = Token(timeout);
-      if self.conns.contains(token) {
+      let conn_token = self.to_front(token);
+      if self.conns.contains(conn_token) {
+        //FIXME: is it still needed?
         //println!("[{}] timeout ended, registering for writes", timeout);
-        self.conns[token].write_timeout = None;
-        let mut interest = Ready::hup();
-        interest.insert(Ready::readable());
-        interest.insert(Ready::writable());
-        event_loop.register(&self.conns[token].sock, token, interest, PollOpt::edge() | PollOpt::oneshot());
+        self.conns[conn_token].write_timeout = None;
+        //let mut interest = Ready::hup();
+        //interest.insert(Ready::readable());
+        //interest.insert(Ready::writable());
+        //event_loop.register(&self.conns[token].sock, token, interest, PollOpt::edge() | PollOpt::oneshot());
       }
     }
   }
-  */
 
 }
 
