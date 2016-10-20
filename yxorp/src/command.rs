@@ -728,7 +728,6 @@ impl CommandServer {
   }
 
   fn timeout(&mut self, token: Token) {
-    println!("got timeout for token: {:?}", token);
     if token.0 == 0 {
       for listener in self.listeners.values() {
         while let Ok(msg) = listener.receiver.try_recv() {

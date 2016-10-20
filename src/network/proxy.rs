@@ -347,11 +347,11 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
           //FIXME: should not unwrap
           let kind = event.kind();
           if kind.is_error() {
-            error!("error reading channel");
+            error!("error reading from command channel");
             continue;
           }
           if kind.is_hup() {
-            error!("channel was closed");
+            error!("command channel was closed");
             continue;
           }
           if kind.is_readable() {
@@ -369,7 +369,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
                 },
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                  error!("channel disconnected");
+                  error!("command channel disconnected");
                   break;
                 }
               }
