@@ -83,6 +83,7 @@ fn main() {
         ListenerType::HTTP => {
           //FIXME: make safer
           if let Some(conf) = ls.to_http() {
+            let mut http_listeners = Vec::new();
             for index in 1..ls.worker_count.unwrap_or(1) {
               let (sender, receiver) = channel::<network::ServerMessage>();
               let poll = Poll::new().unwrap();
@@ -92,8 +93,8 @@ fn main() {
                 network::http::start_listener(config, sender, poll, rx);
               });
               let t = format!("{}-{}", tag, index);
-              let l =  Listener::new(t.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
-              listeners.insert(t, l);
+              let l =  Listener::new(t, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
+              http_listeners.push(l);
             }
             let (sender, receiver) = channel::<network::ServerMessage>();
             let poll = Poll::new().unwrap();
@@ -103,8 +104,9 @@ fn main() {
               network::http::start_listener(conf, sender, poll, rx);
             });
             let t = format!("{}-{}", tag, 0);
-            let l =  Listener::new(t.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
-            listeners.insert(t, l);
+            let l =  Listener::new(t, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
+            http_listeners.push(l);
+            listeners.insert(tag.clone(), http_listeners);
             Some(jg)
           } else {
             None
@@ -112,6 +114,7 @@ fn main() {
         },
         ListenerType::HTTPS => {
           if let Some(conf) = ls.to_tls() {
+            let mut tls_listeners = Vec::new();
             for index in 1..ls.worker_count.unwrap_or(1) {
               let (sender, receiver) = channel::<network::ServerMessage>();
               let poll = Poll::new().unwrap();
@@ -122,7 +125,7 @@ fn main() {
               });
               let t = format!("{}-{}", tag, index);
               let l =  Listener::new(t.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
-              listeners.insert(t, l);
+              tls_listeners.push(l);
             }
             let (sender, receiver) = channel::<network::ServerMessage>();
             let poll = Poll::new().unwrap();
@@ -132,8 +135,9 @@ fn main() {
               network::tls::start_listener(conf, sender, poll, rx);
             });
             let t = format!("{}-{}", tag, 0);
-            let l =  Listener::new(t.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
-            listeners.insert(t, l);
+            let l =  Listener::new(t, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
+            tls_listeners.push(l);
+            listeners.insert(tag.clone(), tls_listeners);
             Some(jg)
           } else {
             None

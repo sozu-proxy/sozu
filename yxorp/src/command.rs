@@ -238,7 +238,7 @@ impl Listener {
 #[derive(Serialize)]
 pub struct ListenerConfiguration<'a> {
   id:       String,
-  listeners: Vec<&'a Listener>,
+  listeners: &'a Vec<Listener>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize)]
@@ -519,7 +519,7 @@ struct CommandServer {
   buffer_size:     usize,
   max_buffer_size: usize,
   conns:           Slab<CommandClient,FrontToken>,
-  listeners:       HashMap<String, Listener>,
+  listeners:       HashMap<String, Vec<Listener>>,
   pub poll:        Poll,
   timer:           Timer<Token>,
 }
@@ -575,7 +575,8 @@ impl CommandServer {
           }
         },
         ConfigCommand::DumpState => {
-          let v: Vec<&Listener> = self.listeners.values().collect();
+          //FIXME:
+          let v: &Vec<Listener> = self.listeners.values().next().unwrap();
           let conf = ListenerConfiguration {
             id: message.id.clone(),
             listeners: v,
@@ -589,10 +590,13 @@ impl CommandServer {
         },
         ConfigCommand::ProxyConfiguration(command) => {
           if let Some(ref tag) = message.listener {
-            if let Some(ref mut listener) = self.listeners.get_mut (tag) {
-              self.conns[token].add_message_id(message.id.clone());
-              listener.state.handle_command(&command);
-              listener.sender.send(ProxyOrder::Command(message.id.clone(), command));
+            if let Some(ref mut listener_vec) = self.listeners.get_mut (tag) {
+              for listener in listener_vec.iter_mut() {
+                let cl = command.clone();
+                self.conns[token].add_message_id(message.id.clone());
+                listener.state.handle_command(&cl);
+                listener.sender.send(ProxyOrder::Command(message.id.clone(), cl));
+              }
             } else {
               // FIXME: should send back error here
               log!(log::LogLevel::Error, "no listener found for tag: {}", tag);
@@ -606,7 +610,7 @@ impl CommandServer {
     }
   }
 
-  fn new(srv: UnixListener, listeners: HashMap<String, Listener>, buffer_size: usize, max_buffer_size: usize, poll: Poll) -> CommandServer {
+  fn new(srv: UnixListener, listeners: HashMap<String, Vec<Listener>>, buffer_size: usize, max_buffer_size: usize, poll: Poll) -> CommandServer {
     //FIXME: verify this
     poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
     //let mut timer = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
@@ -720,14 +724,16 @@ impl CommandServer {
 
   fn timeout(&mut self, token: Token) {
     if token.0 == 0 {
-      for listener in self.listeners.values() {
-        while let Ok(msg) = listener.receiver.try_recv() {
-          //println!("got msg: {:?}", msg);
-          for client in self.conns.iter_mut() {
-            if let Some(index) = client.has_message_id(&msg.id) {
-              client.back_buf.write(&serde_json::to_string(&msg).map(|s| s.into_bytes()).unwrap_or(vec!()));
-              client.back_buf.write(&b"\0"[..]);
-              client.remove_message_id(index);
+      for listener_vec in self.listeners.values() {
+        for listener in listener_vec {
+          while let Ok(msg) = listener.receiver.try_recv() {
+            //println!("got msg: {:?}", msg);
+            for client in self.conns.iter_mut() {
+              if let Some(index) = client.has_message_id(&msg.id) {
+                client.back_buf.write(&serde_json::to_string(&msg).map(|s| s.into_bytes()).unwrap_or(vec!()));
+                client.back_buf.write(&b"\0"[..]);
+                client.remove_message_id(index);
+              }
             }
           }
         }
@@ -749,7 +755,7 @@ impl CommandServer {
 
 }
 
-pub fn start(path: String, mut listeners: HashMap<String, Listener>, saved_state: Option<String>, buffer_size: usize,
+pub fn start(path: String, mut listeners: HashMap<String, Vec<Listener>>, saved_state: Option<String>, buffer_size: usize,
     max_buffer_size: usize) {
   saved_state.as_ref().map(|state_path| {
     fs::File::open(state_path).map(|f| {
@@ -757,9 +763,11 @@ pub fn start(path: String, mut listeners: HashMap<String, Listener>, saved_state
       reader.lines().map(|line_res| {
         line_res.map(|line| {
           if let Ok(listener_state) = from_str::<ListenerDeserializer>(&line) {
-            listeners.get_mut(&listener_state.tag).as_mut().map(|ref mut listener| {
-              println!("setting listener {} state at {:?}", listener_state.tag, listener_state.state);
-              listener.state = listener_state.state.clone();
+            listeners.get_mut(&listener_state.tag).as_mut().map(|listener_vec| {
+              for listener in listener_vec.iter_mut() {
+                println!("setting listener {} state at {:?}", listener_state.tag, listener_state.state);
+                listener.state = listener_state.state.clone();
+              }
             });
           }
         })
