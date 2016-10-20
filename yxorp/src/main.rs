@@ -1,4 +1,4 @@
-#![feature(custom_derive, plugin, libc, rustc_macro, proc_macro)]
+#![feature(custom_derive, plugin, libc, proc_macro)]
 #[macro_use] extern crate nom;
 #[macro_use] extern crate log;
 #[macro_use] extern crate clap;
@@ -22,7 +22,6 @@ use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
 use std::collections::HashMap;
 use std::thread::{self,JoinHandle};
-use std::env;
 use yxorp::network::{self,ProxyOrder};
 use yxorp::network::metrics::{METRICS,ProxyMetrics};
 use log::{LogRecord,LogLevelFilter,LogLevel};
@@ -86,7 +85,7 @@ fn main() {
           if let Some(conf) = ls.to_http() {
             for index in 1..ls.worker_count.unwrap_or(1) {
               let (sender, receiver) = channel::<network::ServerMessage>();
-              let mut poll = Poll::new().unwrap();
+              let poll = Poll::new().unwrap();
               let (tx, rx) = channel::channel::<ProxyOrder>();
               let config = conf.clone();
               thread::spawn(move || {
@@ -97,7 +96,7 @@ fn main() {
               listeners.insert(t, l);
             }
             let (sender, receiver) = channel::<network::ServerMessage>();
-            let mut poll = Poll::new().unwrap();
+            let poll = Poll::new().unwrap();
             let (tx, rx) = channel::channel::<ProxyOrder>();
             //FIXME: keep this to get a join guard
             let jg = thread::spawn(move || {
@@ -115,7 +114,7 @@ fn main() {
           if let Some(conf) = ls.to_tls() {
             for index in 1..ls.worker_count.unwrap_or(1) {
               let (sender, receiver) = channel::<network::ServerMessage>();
-              let mut poll = Poll::new().unwrap();
+              let poll = Poll::new().unwrap();
               let (tx, rx) = channel::channel::<ProxyOrder>();
               let config = conf.clone();
               thread::spawn(move || {
@@ -126,7 +125,7 @@ fn main() {
               listeners.insert(t, l);
             }
             let (sender, receiver) = channel::<network::ServerMessage>();
-            let mut poll = Poll::new().unwrap();
+            let poll = Poll::new().unwrap();
             let (tx, rx) = channel::channel::<ProxyOrder>();
             //FIXME: keep this to get a join guard
             let jg = thread::spawn(move || {

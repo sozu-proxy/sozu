@@ -542,7 +542,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 pub type TcpServer = Server<ServerConfiguration,Client>;
 
 pub fn start() -> channel::Sender<ProxyOrder> {
-  let mut poll = Poll::new().unwrap();
+  let poll = Poll::new().unwrap();
 
 
   info!("TCP\tlisten for connections");
@@ -588,7 +588,7 @@ pub fn start() -> channel::Sender<ProxyOrder> {
   mtx
 }
 
-pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>, mut poll: Poll, rx: channel::Receiver<ProxyOrder>) {
+pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>, poll: Poll, rx: channel::Receiver<ProxyOrder>) {
   //let notify_tx = tx.clone();
   let configuration = ServerConfiguration::new(max_listeners, tx);
   let mut server = TcpServer::new(max_listeners, max_connections, configuration, poll, rx);

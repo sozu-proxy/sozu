@@ -4,8 +4,6 @@ use mio::timer::{Timer,Timeout};
 use slab::Slab;
 use std::path::PathBuf;
 use std::io::{self,BufRead,BufReader,Read,Write,ErrorKind};
-use std::iter::repeat;
-use std::thread;
 use std::str::from_utf8;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -404,13 +402,6 @@ impl CommandClient {
     self.message_ids.remove(index);
   }
 
-  fn reregister(&self,  event_loop: &mut Poll, tok: Token) {
-    let mut interest = Ready::hup();
-    interest.insert(Ready::readable());
-    interest.insert(Ready::writable());
-    event_loop.register(&self.sock, tok, interest, PollOpt::edge() | PollOpt::oneshot());
-  }
-
   fn conn_readable(&mut self, tok: Token) -> Result<Vec<ConfigMessage>,ConnReadError>{
     trace!("server conn readable; tok={:?}", tok);
     loop {
@@ -761,8 +752,8 @@ impl CommandServer {
 pub fn start(path: String, mut listeners: HashMap<String, Listener>, saved_state: Option<String>, buffer_size: usize,
     max_buffer_size: usize) {
   saved_state.as_ref().map(|state_path| {
-    fs::File::open(state_path).map(|mut f| {
-      let mut reader = BufReader::new(f);
+    fs::File::open(state_path).map(|f| {
+      let reader = BufReader::new(f);
       reader.lines().map(|line_res| {
         line_res.map(|line| {
           if let Ok(listener_state) = from_str::<ListenerDeserializer>(&line) {
@@ -777,7 +768,7 @@ pub fn start(path: String, mut listeners: HashMap<String, Listener>, saved_state
     });
   });
 
-  let mut event_loop = Poll::new().unwrap();
+  let event_loop = Poll::new().unwrap();
   let addr = PathBuf::from(path);
   if let Err(e) = fs::remove_file(&addr) {
     match e.kind() {

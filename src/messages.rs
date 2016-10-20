@@ -1,7 +1,6 @@
 use serde;
 use serde_json;
-use openssl::ssl::{self,SslContextOptions};
-use libc::c_long;
+use openssl::ssl;
 use std::net::SocketAddr;
 use std::default::Default;
 

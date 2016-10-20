@@ -1,4 +1,3 @@
-#![feature(libc)]
 #[macro_use] extern crate log;
 extern crate env_logger;
 extern crate yxorp;
@@ -59,7 +58,7 @@ fn main() {
     ..Default::default()
   };
 
-  let mut poll = Poll::new().unwrap();
+  let poll = Poll::new().unwrap();
   let (tx, rx) = channel::channel::<ProxyOrder>();
   let jg = thread::spawn(move || {
     network::http::start_listener(config, sender, poll, rx);
@@ -98,7 +97,7 @@ fn main() {
     ..Default::default()
   };
 
-  let mut poll2 = Poll::new().unwrap();
+  let poll2 = Poll::new().unwrap();
   let (tx2, rx2) = channel::channel::<ProxyOrder>();
   let jg2 = thread::spawn(move || {
     network::tls::start_listener(config, sender2, poll2, rx2);
