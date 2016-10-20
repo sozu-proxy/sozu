@@ -104,8 +104,8 @@ fn main() {
               network::http::start_listener(conf, sender, poll, rx);
             });
             let t = format!("{}-{}", tag, 0);
-            let l =  Listener::new(tag.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
-            listeners.insert(tag.clone(), l);
+            let l =  Listener::new(t.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
+            listeners.insert(t, l);
             Some(jg)
           } else {
             None
