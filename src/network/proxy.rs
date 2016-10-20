@@ -244,7 +244,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
   pub fn connect_to_backend(&mut self, token: FrontToken) {
     match self.configuration.connect_to_backend(&mut self.poll, &mut self.clients[token]) {
       Ok(BackendConnectAction::Reuse) => {
-        info!("keepalive, reusing backend connection");
+        debug!("keepalive, reusing backend connection");
       }
       Ok(BackendConnectAction::Replace) => {
         if let Some(backend_token) = self.clients[token].back_token() {
@@ -384,9 +384,8 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
         }
       }
 
-      //FIXME: manually call the timer instead of relying on a separate thread
+      //FIXM: manually call the timer instead of relying on a separate thread
       while let Some(token) = self.timer.poll() {
-        println!("GOT TIMEOUT EVENT FOR {:?}", token);
         self.timeout(token);
       }
     }

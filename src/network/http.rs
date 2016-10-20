@@ -109,7 +109,7 @@ impl<Front:SocketHandler> Client<Front> {
 
   pub fn reset(&mut self) {
     let request_id = Uuid::new_v4().hyphenated().to_string();
-    info!("{} RESET TO {}", self.log_ctx, request_id);
+    debug!("{} RESET TO {}", self.log_ctx, request_id);
     self.state.as_mut().map(|state| state.reset());
     let req_header = self.added_request_header();
     let res_header = self.added_response_header();
