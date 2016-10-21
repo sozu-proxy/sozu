@@ -32,7 +32,7 @@ use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder};
 use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness,ListenToken,FrontToken,BackToken};
-use messages::{Command,TlsFront,TlsProxyConfiguration};
+use messages::{self,Command,TlsFront,TlsProxyConfiguration};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 
@@ -276,7 +276,7 @@ impl ProxyClient for TlsClient {
   }
 }
 
-pub struct ServerConfiguration {
+pub struct ServerConfiguration<Tx> {
   listener:        TcpListener,
   address:         SocketAddr,
   instances:       HashMap<String, Vec<Backend>>,
@@ -284,7 +284,7 @@ pub struct ServerConfiguration {
   default_cert:    String,
   default_context: SslContext,
   contexts:        Arc<Mutex<HashMap<String, SslContext>>>,
-  tx:              mpsc::Sender<ServerMessage>,
+  tx:              Tx,
   pool:            Pool<BufferQueue>,
   answers:         DefaultAnswers,
   front_timeout:   u64,
@@ -292,8 +292,8 @@ pub struct ServerConfiguration {
   config:          TlsProxyConfiguration,
 }
 
-impl ServerConfiguration {
-  pub fn new(config: TlsProxyConfiguration, tx: mpsc::Sender<ServerMessage>, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
+impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
+  pub fn new(config: TlsProxyConfiguration, tx: Tx, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration<Tx>> {
     let contexts = HashMap::new();
 
     let mut ctx = SslContext::new(SslMethod::Sslv23);
@@ -497,7 +497,7 @@ impl ServerConfiguration {
   }
 }
 
-impl ProxyConfiguration<TlsClient> for ServerConfiguration {
+impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for ServerConfiguration<Tx> {
   fn accept(&mut self, token: ListenToken) -> Option<(TlsClient,bool)> {
     if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
       let accepted = self.listener.accept();
@@ -566,12 +566,12 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       ProxyOrder::Command(id, Command::AddTlsFront(front)) => {
         info!("TLS\t{} add front {:?}", id, front);
           self.add_http_front(front, event_loop);
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
       },
       ProxyOrder::Command(id, Command::RemoveTlsFront(front)) => {
         info!("TLS\t{} remove front {:?}", id, front);
         self.remove_http_front(front, event_loop);
-        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
+        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
         info!("TLS\t{} add instance {:?}", id, instance);
@@ -579,9 +579,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
         } else {
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
@@ -590,9 +590,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
         } else {
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::HttpProxy(configuration)) => {
@@ -608,11 +608,11 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         info!("HTTP\t{} shutdown", id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
+        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
       ProxyOrder::Command(id, msg) => {
         error!("TLS\t{} unsupported message, ignoring {:?}", id, msg);
-        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
+        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
       }
     }
   }
@@ -634,10 +634,11 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   }
 }
 
-pub type TlsServer = Server<ServerConfiguration,TlsClient>;
+pub type TlsServer<Tx,Rx> = Server<ServerConfiguration<Tx>,TlsClient,Rx>;
 
-pub fn start_listener(config: TlsProxyConfiguration, tx: mpsc::Sender<ServerMessage>, mut event_loop: Poll, receiver: channel::Receiver<ProxyOrder>) {
-  //let notify_tx = tx.clone();
+pub fn start_listener<Tx,Rx>(config: TlsProxyConfiguration, tx: Tx, mut event_loop: Poll, receiver: Rx)
+  where Tx: messages::Sender<ServerMessage>,
+        Rx: Evented+messages::Receiver<ProxyOrder> {
 
   let max_connections = config.max_connections;
   let max_listeners   = 1;

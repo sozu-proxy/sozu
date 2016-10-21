@@ -23,7 +23,7 @@ use std::time::Duration;
 use rand::random;
 
 use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socket_type,ProxyOrder,RequiredEvents};
-use messages::{TcpFront,Command,Instance};
+use messages::{self,TcpFront,Command,Instance};
 
 const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
@@ -139,19 +139,19 @@ pub trait ProxyConfiguration<Client> {
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
 }
 
-pub struct Server<ServerConfiguration,Client> {
+pub struct Server<ServerConfiguration,Client, R> {
   configuration:   ServerConfiguration,
   clients:         Slab<Client,FrontToken>,
   backend:         Slab<FrontToken,BackToken>,
   max_listeners:   usize,
   max_connections: usize,
   pub poll:        Poll,
-  rx:              Receiver<ProxyOrder>,
+  rx:              R,
   timer:           Timer<Token>,
 }
 
-impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<ServerConfiguration,Client> {
-  pub fn new(max_listeners: usize, max_connections: usize, configuration: ServerConfiguration, poll: Poll, rx: Receiver<ProxyOrder>) -> Self {
+impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented+messages::Receiver<ProxyOrder>> Server<ServerConfiguration,Client,R> {
+  pub fn new(max_listeners: usize, max_connections: usize, configuration: ServerConfiguration, poll: Poll, rx: R) -> Self {
     poll.register(&rx, Token(0), Ready::readable(), PollOpt::edge()).unwrap();
     let clients = Slab::with_capacity(max_connections);
     let backend = Slab::with_capacity(max_connections);
@@ -334,7 +334,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
 //type Timeout = usize;
 type Message = ProxyOrder;
 
-impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<ServerConfiguration,Client> {
+impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented+messages::Receiver<ProxyOrder>> Server<ServerConfiguration,Client,R> {
   pub fn run(&mut self) {
     //FIXME: make those parameters configurable?
     let mut events = Events::with_capacity(1024);
@@ -356,7 +356,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
           }
           if kind.is_readable() {
             loop {
-              match self.rx.try_recv() {
+              match self.rx.recv_message() {
                 Ok(msg) => {
                   if let ProxyOrder::Stop(id) = msg {
                     self.notify(ProxyOrder::Stop(id));
@@ -367,10 +367,20 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
                     self.notify(msg);
                   }
                 },
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                  error!("command channel disconnected");
-                  break;
+                Err(e) => {
+                  match e.kind() {
+                    ErrorKind::WouldBlock => break,
+                    ErrorKind::BrokenPipe => {
+                      //FIXME: deregister here
+                      error!("command channel disconnected");
+                      break;
+                    },
+                    k => {
+                      //FIXME: deregister here
+                      error!("unknown command channel error: {:?}", k);
+                      break;
+                    }
+                  }
                 }
               }
             }

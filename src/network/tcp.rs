@@ -23,7 +23,7 @@ use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use pool::{Pool,Checkout,Reset};
 
-use messages::{TcpFront,Command,Instance};
+use messages::{self,TcpFront,Command,Instance};
 
 const SERVER: Token = Token(0);
 
@@ -326,18 +326,18 @@ pub struct ApplicationListener {
 
 type ClientToken = Token;
 
-pub struct ServerConfiguration {
+pub struct ServerConfiguration<Tx> {
   fronts:          HashMap<String, ListenToken>,
   instances:       HashMap<String, Vec<Backend>>,
   listeners:       Slab<ApplicationListener,ListenToken>,
-  tx:              mpsc::Sender<ServerMessage>,
+  tx:              Tx,
   pool:            Pool<BufferQueue>,
   front_timeout:   u64,
   back_timeout:    u64,
 }
 
-impl ServerConfiguration {
-  pub fn new(max_listeners: usize, tx: mpsc::Sender<ServerMessage>) -> ServerConfiguration {
+impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
+  pub fn new(max_listeners: usize, tx: Tx) -> ServerConfiguration<Tx> {
     ServerConfiguration {
       instances:     HashMap::new(),
       listeners:     Slab::with_capacity(max_listeners),
@@ -432,7 +432,7 @@ impl ServerConfiguration {
 
 }
 
-impl ProxyConfiguration<Client> for ServerConfiguration {
+impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerConfiguration<Tx> {
 
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client:&mut Client) ->Result<BackendConnectAction,ConnectionError> {
     let rnd = random::<usize>();
@@ -455,29 +455,29 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let addr_string = tcp_front.ip_address + ":" + &tcp_front.port.to_string();
         if let Ok(front) = addr_string.parse() {
           if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, event_loop) {
-            self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
+            self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
           } else {
             error!("TCP\tCouldn't add tcp front");
-            self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot add tcp front"))});
+            self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot add tcp front"))});
           }
         } else {
           error!("TCP\tCouldn't parse tcp front address");
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveTcpFront(front)) => {
         trace!("TCP\t{:?}", front);
         let _ = self.remove_tcp_front(front.app_id, event_loop);
-        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
+        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
         } else {
           error!("TCP\tCouldn't add tcp instance");
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot add tcp instance"))});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot add tcp instance"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
@@ -485,20 +485,20 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
         } else {
           error!("TCP\tCouldn't remove tcp instance");
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot remove tcp instance"))});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot remove tcp instance"))});
         }
       },
       ProxyOrder::Stop(id)                   => {
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
+        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
       ProxyOrder::Command(id, _) => {
         error!("TCP\tunsupported message, ignoring");
-        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
+        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
       }
     }
   }
@@ -539,7 +539,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   }
 }
 
-pub type TcpServer = Server<ServerConfiguration,Client>;
+pub type TcpServer<Tx,Rx> = Server<ServerConfiguration<Tx>,Client,Rx>;
 
 pub fn start() -> channel::Sender<ProxyOrder> {
   let poll = Poll::new().unwrap();
@@ -588,7 +588,9 @@ pub fn start() -> channel::Sender<ProxyOrder> {
   mtx
 }
 
-pub fn start_listener(max_listeners: usize, max_connections: usize, tx: mpsc::Sender<ServerMessage>, poll: Poll, rx: channel::Receiver<ProxyOrder>) {
+pub fn start_listener<Tx,Rx>(max_listeners: usize, max_connections: usize, tx: Tx, poll: Poll, rx: Rx)
+  where Tx: messages::Sender<ServerMessage>,
+        Rx: Evented+messages::Receiver<ProxyOrder> {
   //let notify_tx = tx.clone();
   let configuration = ServerConfiguration::new(max_listeners, tx);
   let mut server = TcpServer::new(max_listeners, max_connections, configuration, poll, rx);

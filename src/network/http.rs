@@ -23,6 +23,7 @@ use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
+use messages;
 
 use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop, BufferMove, RequestState, ResponseState, Chunk};
 use nom::HexDisplay;
@@ -726,12 +727,12 @@ pub struct DefaultAnswers {
 pub type AppId    = String;
 pub type Hostname = String;
 
-pub struct ServerConfiguration {
+pub struct ServerConfiguration<Tx> {
   listener:  TcpListener,
   address:   SocketAddr,
   instances: HashMap<AppId, Vec<Backend>>,
   fronts:    HashMap<Hostname, Vec<HttpFront>>,
-  tx:        mpsc::Sender<ServerMessage>,
+  tx:        Tx,
   pool:      Pool<BufferQueue>,
   answers:   DefaultAnswers,
   front_timeout:   u64,
@@ -739,8 +740,8 @@ pub struct ServerConfiguration {
   config: HttpProxyConfiguration,
 }
 
-impl ServerConfiguration {
-  pub fn new(config: HttpProxyConfiguration, tx: mpsc::Sender<ServerMessage>, event_loop: &mut Poll, start_at:usize) -> io::Result<ServerConfiguration> {
+impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
+  pub fn new(config: HttpProxyConfiguration, tx: Tx, event_loop: &mut Poll, start_at:usize) -> io::Result<ServerConfiguration<Tx>> {
     let front = config.front;
     match server_bind(&config.front) {
       Ok(sock) => {
@@ -860,7 +861,7 @@ impl ServerConfiguration {
   }
 }
 
-impl ProxyConfiguration<Client<TcpStream>> for ServerConfiguration {
+impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client<TcpStream>> for ServerConfiguration<Tx> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut Client<TcpStream>) -> Result<BackendConnectAction,ConnectionError> {
     let host   = try!(client.state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
     let rl     = try!(client.state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
@@ -919,12 +920,12 @@ impl ProxyConfiguration<Client<TcpStream>> for ServerConfiguration {
       ProxyOrder::Command(id, Command::AddHttpFront(front)) => {
         info!("HTTP\t{} add front {:?}", id, front);
           self.add_http_front(front, event_loop);
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
       },
       ProxyOrder::Command(id, Command::RemoveHttpFront(front)) => {
         info!("HTTP\t{} front {:?}", id, front);
         self.remove_http_front(front, event_loop);
-        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
+        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
         info!("HTTP\t{} add instance {:?}", id, instance);
@@ -932,9 +933,9 @@ impl ProxyConfiguration<Client<TcpStream>> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
         } else {
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
@@ -943,9 +944,9 @@ impl ProxyConfiguration<Client<TcpStream>> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
         } else {
-          self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
+          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::HttpProxy(configuration)) => {
@@ -961,11 +962,11 @@ impl ProxyConfiguration<Client<TcpStream>> for ServerConfiguration {
         info!("HTTP\t{} shutdown", id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Stopped});
+        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
       ProxyOrder::Command(id, msg) => {
         debug!("HTTP\t{} unsupported message, ignoring: {:?}", id, msg);
-        self.tx.send(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
+        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
       }
     }
   }
@@ -1007,10 +1008,11 @@ impl ProxyConfiguration<Client<TcpStream>> for ServerConfiguration {
   }
 }
 
-pub type HttpServer = Server<ServerConfiguration,Client<TcpStream>>;
+pub type HttpServer<Tx,Rx> = Server<ServerConfiguration<Tx>,Client<TcpStream>,Rx>;
 
-pub fn start_listener(config: HttpProxyConfiguration, tx: mpsc::Sender<ServerMessage>, mut event_loop: Poll, receiver: channel::Receiver<ProxyOrder>) {
-  let notify_tx = tx.clone();
+pub fn start_listener<Tx,Rx>(config: HttpProxyConfiguration, tx: Tx, mut event_loop: Poll, receiver: Rx)
+  where Tx: messages::Sender<ServerMessage>,
+        Rx: Evented+messages::Receiver<ProxyOrder> {
 
   let max_connections = config.max_connections;
   let max_listeners   = 1;

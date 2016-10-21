@@ -1,8 +1,12 @@
 use serde;
 use serde_json;
 use openssl::ssl;
+use mio::channel;
+use std::io;
 use std::net::SocketAddr;
 use std::default::Default;
+use std::convert::{From,Into};
+use std::sync::mpsc;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpFront {
@@ -236,6 +240,42 @@ pub enum Topic {
     TcpProxyConfig
 }
 
+pub trait Sender<T> {
+  fn send_message(&self, t:T) -> Result<(), io::Error>;
+}
+
+pub trait Receiver<T> {
+  fn recv_message(&self) -> Result<T, io::Error>;
+}
+
+impl<T> Sender<T> for mpsc::Sender<T> {
+  fn send_message(&self, t:T) -> Result<(), io::Error> {
+    match self.send(t) {
+      Ok(()) => Ok(()),
+      Err(mpsc::SendError(_)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "receiver disconnected"))
+    }
+  }
+}
+
+impl<T> Sender<T> for channel::Sender<T> {
+  fn send_message(&self, t:T) -> Result<(), io::Error> {
+    match self.send(t) {
+      Ok(()) => Ok(()),
+      Err(channel::SendError::Io(e)) => Err(e),
+      Err(channel::SendError::Disconnected(_)) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "receiver disconnected"))
+    }
+  }
+}
+
+impl<T> Receiver<T> for channel::Receiver<T> {
+  fn recv_message(&self) -> Result<T, io::Error> {
+    match self.try_recv() {
+      Ok(t) => Ok(t),
+      Err(mpsc::TryRecvError::Empty) => Err(io::Error::new(io::ErrorKind::WouldBlock, "no data")),
+      Err(mpsc::TryRecvError::Disconnected) => Err(io::Error::new(io::ErrorKind::BrokenPipe, "receiver disconnected"))
+    }
+  }
+}
 
 #[cfg(test)]
 mod tests {
