@@ -298,7 +298,6 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         self.front_buf.start_parsing_position - self.front_buf.parsed_position);
         self.front_buf.consume_parsed_data(to_consume);
       }
-
     }
 
     if self.front_buf.buffer.available_space() == 0 {
@@ -311,6 +310,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
     match res {
       SocketResult::Error => {
+        error!("{}\t[{:?}] front socket error, closing the connection", self.log_ctx, self.token);
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
@@ -326,6 +326,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
         &mut self.front_buf));
       if self.state.as_ref().unwrap().is_front_error() {
+        error!("{}\t[{:?}] front parsing error, closing the connection", self.log_ctx, self.token);
         time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
         self.readiness.front_interest.remove(Ready::readable());
         return ClientResult::CloseClient;
@@ -342,17 +343,18 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       match self.state.as_ref().unwrap().request {
         Some(RequestState::Request(_,_,_)) | Some(RequestState::RequestWithBody(_,_,_,_)) => {
           if ! self.front_buf.needs_input() {
+            // stop reading
             self.readiness.front_interest.remove(Ready::readable());
           }
           return ClientResult::Continue;
         },
         Some(RequestState::RequestWithBodyChunks(_,_,_,ch)) => {
           if ch == Chunk::Ended {
-            error!("{}\tfront read should have stopped on chunk ended", self.log_ctx,);
+            error!("{}\t[{:?}] front read should have stopped on chunk ended", self.log_ctx, self.token);
             self.readiness.front_interest.remove(Ready::readable());
             return ClientResult::Continue;
           } else if ch == Chunk::Error {
-            error!("{}\tfront read should have stopped on chunk error", self.log_ctx,);
+            error!("{}\t[{:?}] front read should have stopped on chunk error", self.log_ctx, self.token);
             self.readiness.reset();
             return ClientResult::CloseClient;
           } else {
@@ -362,6 +364,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                 &mut self.front_buf));
               //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_ctx, self.state, self.state.req_position);
               if self.state.as_ref().unwrap().is_front_error() {
+                error!("{}\t[{:?}] front chunk parsing error, closing the connection", self.log_ctx, self.token);
                 time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
                 self.readiness.reset();
                 return ClientResult::CloseClient;
@@ -383,6 +386,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
             &mut self.front_buf));
           //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_ctx, self.state, self.state.req_position);
           if self.state.as_ref().unwrap().is_front_error() {
+            error!("{}\t[{:?}] front parsing error, closing the connection", self.log_ctx, self.token);
             time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             self.readiness.reset();
             return ClientResult::CloseClient;
@@ -426,12 +430,13 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
       if self.back_buf.buffer.available_data() == 0 {
         self.readiness.reset();
-        println!("FIXME: should not close until the write ended");
+        error!("{}\t[{:?}] cannot write, back buffer was empty", self.log_ctx, self.token);
         return ClientResult::CloseClient;
       }
 
       if res == SocketResult::Error {
         self.readiness.reset();
+        error!("{}\t[{:?}] error writing to front socket, closing", self.log_ctx, self.token);
         return ClientResult::CloseClient;
       } else {
         return ClientResult::Continue;
@@ -462,6 +467,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
     match res {
       SocketResult::Error => {
+        error!("{}\t[{:?}] error writing to front socket, closing", self.log_ctx, self.token);
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
@@ -488,6 +494,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               self.reset();
               self.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
               self.readiness.back_interest  = Ready::writable() | Ready::hup() | Ready::error();
+
+              info!("{}\t[{:?}] request ended successfully, keep alive for front and back", self.log_ctx, self.token);
               ClientResult::Continue
               //FIXME: issues reusing the backend socket
               //self.readiness.back_interest  = Ready::hup() | Ready::error();
@@ -496,9 +504,10 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               self.reset();
               self.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
               self.readiness.back_interest  = Ready::hup() | Ready::error();
+              info!("{}\t[{:?}] request ended successfully, keepalive for front", self.log_ctx, self.token);
               ClientResult::CloseBackend
             } else {
-              info!("keepalive front: {}, back: {}, closing connections", front_keep_alive, back_keep_alive);
+              info!("{}\t[{:?}] request ended successfully, closing front and back connections", self.log_ctx, self.token);
               self.readiness.reset();
               ClientResult::CloseBothSuccess
             }
@@ -522,6 +531,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   // Forward content to application
   fn back_writable(&mut self) -> ClientResult {
     if self.status == ClientStatus::DefaultAnswer {
+      error!("{}\tsending default answer, should not write to back", self.log_ctx);
       self.readiness.back_interest.remove(Ready::writable());
       self.readiness.front_interest.insert(Ready::writable());
       return ClientResult::Continue;
@@ -556,6 +566,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       }
       match socket_res {
         SocketResult::Error => {
+        error!("{}\tback socket write error, closing connection", self.log_ctx);
           self.readiness.reset();
           return ClientResult::CloseBothFailure;
         },
@@ -582,7 +593,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
             self.readiness.front_interest.insert(Ready::readable());
             ClientResult::Continue
           },
-          _ => {
+          ref s => {
+            error!("{}\tinvalid state, closing connection: {:?}", self.log_ctx, s);
             self.readiness.reset();
             ClientResult::CloseBothFailure
           }
@@ -593,6 +605,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         ClientResult::Continue
       }
     } else {
+      error!("{}\tback socket not found, closing connection", self.log_ctx);
       self.readiness.reset();
       return ClientResult::CloseBothFailure;
     };
@@ -603,6 +616,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   // Read content from application
   fn back_readable(&mut self) -> ClientResult {
     if self.status == ClientStatus::DefaultAnswer {
+      error!("{}\tsending default answer, should not read from back socket", self.log_ctx);
       self.readiness.back_interest.remove(Ready::readable());
       return ClientResult::Continue;
     }
@@ -633,6 +647,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
       match r {
         SocketResult::Error => {
+        error!("{}\tback socket read error, closing connection", self.log_ctx);
           self.readiness.reset();
           ClientResult::CloseBothFailure
         },
@@ -668,6 +683,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                     &mut self.back_buf));
                   //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
                   if self.state.as_ref().unwrap().is_back_error() {
+                    error!("{}\tback socket chunk parse error, closing connection", self.log_ctx);
                     time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
                     self.readiness.reset();
                     return ClientResult::CloseBothFailure;
@@ -691,6 +707,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
                 &mut self.back_buf));
               //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
               if self.state.as_ref().unwrap().is_back_error() {
+                error!("{}\tback socket parse error, closing connection", self.log_ctx);
                 time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
                 self.readiness.reset();
                 return ClientResult::CloseBothFailure;
@@ -709,6 +726,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         }
       }
     } else {
+      error!("{}\tback socket not found, closing connection", self.log_ctx);
       self.readiness.reset();
       return ClientResult::CloseBothFailure;
     }
