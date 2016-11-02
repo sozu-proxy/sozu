@@ -226,9 +226,11 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
         &self.clients[client_token].set_front_token(front);
 
         let front = self.from_front(client_token);
+        /*
         if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.front_timeout()), front) {
           &self.clients[client_token].set_front_timeout(timeout);
         }
+        */
         gauge!("accept", 1);
         if should_connect {
           self.connect_to_backend(client_token);
@@ -252,9 +254,11 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
             self.poll.register(sock, backend_token, Ready::all(), PollOpt::edge());
           }
 
+          /*
           if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.back_timeout()), backend_token) {
             &self.clients[token].set_back_timeout(timeout);
           }
+          */
           return;
         }
       },
@@ -269,9 +273,11 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
           }
 
           let back = self.from_back(backend_token);
+          /*
           if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.back_timeout()), back) {
             &self.clients[token].set_back_timeout(timeout);
           }
+          */
           return;
         }
       },
@@ -470,10 +476,12 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
           self.timer.cancel_timeout(&timeout);
         }
         let front = self.from_front(client_token);
+        /*
         if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.front_timeout()), front) {
           //println!("[{}] resetting timeout", front);
           &self.clients[client_token].set_front_timeout(timeout);
         }
+        */
 
         self.interpret_client_order(client_token, order);
         //self.clients[client_token].readiness().front_readiness.remove(Ready::readable());
@@ -493,12 +501,14 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
           //println!("[{}] clearing timeout", token.as_usize());
           self.timer.cancel_timeout(&timeout);
         }
+        /*
         if let Some(back) = self.clients[client_token].back_token() {
           if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.back_timeout()), back) {
             //println!("[{}] resetting timeout", back);
             &self.clients[client_token].set_back_timeout(timeout);
           }
         }
+        */
 
         self.interpret_client_order(client_token, order);
         //self.clients[client_token].readiness().back_readiness.remove(Ready::readable());
