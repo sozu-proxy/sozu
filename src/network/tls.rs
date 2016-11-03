@@ -296,7 +296,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
   pub fn new(config: TlsProxyConfiguration, tx: Tx, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration<Tx>> {
     let contexts = HashMap::new();
 
-    let mut ctx = SslContext::new(SslMethod::Sslv23);
+    let ctx = SslContext::new(SslMethod::Sslv23);
     if let Err(e) = ctx {
       return Err(io::Error::new(io::ErrorKind::Other, e.description()));
     }
@@ -369,7 +369,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
 
   pub fn add_http_front(&mut self, http_front: TlsFront, event_loop: &mut Poll) -> bool {
     //FIXME: insert some error management with a Result here
-    let mut c = SslContext::new(SslMethod::Tlsv1);
+    let c = SslContext::new(SslMethod::Sslv23);
     if c.is_err() { return false; }
     let mut ctx = c.unwrap();
 
