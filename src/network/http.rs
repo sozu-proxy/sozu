@@ -271,6 +271,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
     //trace!("{}\treadable front pos: {}, buf pos: {}, available: {}", self.log_ctx, self.state.req_position, self.front_buf_position, self.front_buf.buffer.available_data());
     assert!(!self.state.as_ref().unwrap().is_front_error());
+    assert!(self.back_buf.empty(), "investigating single buffer usage: the back->front buffer should not be used while parsing and forwarding the request");
 
     if self.front_buf.buffer.available_space() == 0 {
       if self.backend_token == None {
@@ -408,6 +409,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   // Forward content to client
   fn writable(&mut self) -> ClientResult {
 
+    assert!(self.front_buf.empty(), "investigating single buffer usage: the front->back buffer should not be used while parsing and forwarding the response");
     let output_size = self.back_buf.output_data_size();
     if self.status == ClientStatus::DefaultAnswer {
       if self.back_buf.output_data_size() == 0 {
@@ -537,6 +539,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       return ClientResult::Continue;
     }
 
+    assert!(self.back_buf.empty(), "investigating single buffer usage: the back->front buffer should not be used while parsing and forwarding the request");
     //trace!("{}\twritable back pos: {}, buf pos: {}, available: {}", self.log_ctx, self.state.req_position, self.front_buf_position, self.front_buf.buffer.available_data());
     //assert!(self.front_buf_position + self.front_buf.available_data() <= self.state.req_position);
     if self.front_buf.output_data_size() == 0 {
@@ -621,6 +624,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       return ClientResult::Continue;
     }
 
+    assert!(self.front_buf.empty(), "investigating single buffer usage: the front->back buffer should not be used while parsing and forwarding the response");
     //trace!("{}\treadable back pos: {}, buf pos: {}, available: {}", self.log_ctx, self.state.res_position, self.back_buf_position, self.back_buf.buffer.available_data());
     //assert!(self.back_buf_position + self.back_buf.available_data() <= self.state.res_position);
 
