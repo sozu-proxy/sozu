@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use slab::Slab;
 use std::net::SocketAddr;
-use std::str::{FromStr, from_utf8};
+use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{Duration, precise_time_s, precise_time_ns};
 use rand::random;
 use uuid::Uuid;
@@ -25,8 +25,8 @@ use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use messages;
 
-use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop, BufferMove, RequestState, ResponseState, Chunk};
-use nom::HexDisplay;
+use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop, hostname_and_port, BufferMove, RequestState, ResponseState, Chunk};
+use nom::{HexDisplay,IResult};
 
 use messages::{Command,HttpFront,HttpProxyConfiguration};
 
@@ -881,7 +881,30 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
 
 impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client<TcpStream>> for ServerConfiguration<Tx> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut Client<TcpStream>) -> Result<BackendConnectAction,ConnectionError> {
-    let host   = try!(client.state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
+    let h = try!(client.state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
+
+    let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
+      if i != &b""[..] {
+        error!("invalid remaining chars after hostname");
+        return Err(ConnectionError::ToBeDefined);
+      }
+
+
+      //FIXME: we should check that the port is right too
+
+      if port == Some(&b"80"[..]) {
+      // it is alright to call from_utf8_unchecked,
+      // we already verified that there are only ascii
+      // chars in there
+        unsafe { from_utf8_unchecked(hostname) }
+      } else {
+        &h
+      }
+    } else {
+      error!("hostname parsing failed");
+      return Err(ConnectionError::ToBeDefined);
+    };
+
     let rl     = try!(client.state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
     if let Some(app_id) = self.frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
       if client.app_id.as_ref() == Some(&app_id) {

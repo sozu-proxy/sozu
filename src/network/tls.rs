@@ -544,7 +544,7 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
 
       //FIXME: we should check that the port is right too
 
-      if port.is_some() {
+      if port == Some(&b"443"[..]) {
         hostname_str
       } else {
         &h
