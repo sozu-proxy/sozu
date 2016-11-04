@@ -216,6 +216,19 @@ pub fn comma_separated_header_value(input:&[u8]) -> Option<Vec<&[u8]>> {
 
 named!(pub headers< Vec<Header> >, terminated!(many0!(message_header), opt!(crlf)));
 
+fn is_hostname_char(i: u8) -> bool {
+  is_alphanumeric(i) ||
+  // the domain name should not start with a hyphen or dot
+  // but is it important here, since we will match this to
+  // the list of accepted applications?
+  // BTW each label between dots has a max of 63 chars,
+  // and the whole domain shuld not be larger than 253 chars
+  b"-.".contains(&i)
+}
+
+named!(pub hostname_and_port<(&[u8],Option<&[u8]>)>, pair!(take_while!(is_hostname_char), opt!(preceded!(tag!(":"), digit))));
+
+
 use std::str::{from_utf8, FromStr};
 use nom::{Err,ErrorKind,Needed};
 

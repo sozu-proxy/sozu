@@ -17,7 +17,7 @@ use std::error::Error;
 use slab::Slab;
 use pool::{Pool,Checkout};
 use std::net::SocketAddr;
-use std::str::{FromStr, from_utf8};
+use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{precise_time_s, precise_time_ns};
 use rand::random;
 use openssl::ssl::{self,HandshakeError,MidHandshakeSslStream,
@@ -26,8 +26,9 @@ use openssl::ssl::{self,HandshakeError,MidHandshakeSslStream,
 use openssl::x509::{X509,X509FileType};
 use openssl::dh::DH;
 use openssl::crypto::pkey::PKey;
+use nom::IResult;
 
-use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop};
+use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder};
@@ -521,8 +522,38 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
   }
 
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut TlsClient) -> Result<BackendConnectAction,ConnectionError> {
-    // FIXME: should check the host corresponds to SNI here
-    let host   = try!(client.http.as_mut().unwrap().state().get_host().ok_or(ConnectionError::NoHostGiven));
+    let h = try!(client.http.as_mut().unwrap().state().get_host().ok_or(ConnectionError::NoHostGiven));
+
+    let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
+      if i != &b""[..] {
+        error!("invalid remaining chars after hostname");
+        return Err(ConnectionError::ToBeDefined);
+      }
+
+      // it is alright to call from_utf8_unchecked,
+      // we already verified that there are only ascii
+      // chars in there
+      let hostname_str =  unsafe { from_utf8_unchecked(hostname) };
+
+      //FIXME: what if we don't use SNI?
+      let servername: Option<String> = client.http.as_ref().unwrap().frontend.ssl().servername();
+      if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
+        error!("TLS SNI hostname and Host header don't match");
+        return Err(ConnectionError::HostNotFound);
+      }
+
+      //FIXME: we should check that the port is right too
+
+      if port.is_some() {
+        hostname_str
+      } else {
+        &h
+      }
+    } else {
+      error!("hostname parsing failed");
+      return Err(ConnectionError::ToBeDefined);
+    };
+
     let rl:RRequestLine = try!(client.http.as_mut().unwrap().state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
     let conn   = try!(client.http.as_mut().unwrap().state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
     let conn   = self.backend_from_request(client, &host, &rl.uri);
