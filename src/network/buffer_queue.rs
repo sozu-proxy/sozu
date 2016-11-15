@@ -112,6 +112,10 @@ impl BufferQueue {
     self.start_parsing_position == self.buffer_position
   }
 
+  pub fn empty(&self) -> bool {
+    self.input_queue.is_empty() && self.output_queue.is_empty() && self.buffer.empty()
+  }
+
   pub fn merge_input_slices(&self) -> usize {
     let mut acc = 0usize;
     for el in self.input_queue.iter() {

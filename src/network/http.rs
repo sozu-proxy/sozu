@@ -39,7 +39,7 @@ pub enum ClientStatus {
 }
 
 pub struct Client<Front:SocketHandler> {
-  frontend:       Front,
+  pub frontend:       Front,
   backend:        Option<TcpStream>,
   token:          Option<Token>,
   backend_token:  Option<Token>,
