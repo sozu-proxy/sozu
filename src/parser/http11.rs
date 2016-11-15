@@ -226,7 +226,7 @@ fn is_hostname_char(i: u8) -> bool {
   b"-.".contains(&i)
 }
 
-named!(pub hostname_and_port<(&[u8],Option<&[u8]>)>, pair!(take_while!(is_hostname_char), opt!(preceded!(tag!(":"), digit))));
+named!(pub hostname_and_port<(&[u8],Option<&[u8]>)>, pair!(take_while!(is_hostname_char), opt!(complete!(preceded!(tag!(":"), digit)))));
 
 
 use std::str::{from_utf8, FromStr};
@@ -2374,29 +2374,14 @@ mod tests {
       }
     );
   }
-  /*
-  use std::str::from_utf8;
-  use std::io::Write;
 
   #[test]
-  fn handle_request_line_test() {
-     let input =
-          b"GET /index.html HTTP/1.1\r\n\
-            Host: localhost:8888\r\n\
-            User-Agent: curl/7.43.0\r\n\
-            Content-Length: 8\r\n\
-            \r\nabcdefgj";
-      let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
-      let start_state = RequestState::Initial;
-
-      let next_state = handle_request_partial(&start_state, &mut buf, 0);
-
-      println!("next state: {:?}", next_state);
-      println!("remaining: {}", from_utf8(buf.data()).unwrap());
-      assert!(false);
+  fn hostname_parsing_test() {
+    assert_eq!(
+      hostname_and_port(&b"rust-test.cleverapps.io"[..]),
+      Done(&b""[..], (&b"rust-test.cleverapps.io"[..], None))
+    );
   }
-  */
 }
 
 #[cfg(test)]
