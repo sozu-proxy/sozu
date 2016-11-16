@@ -36,10 +36,27 @@ use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,
 use messages::{self,Command,TlsFront,TlsProxyConfiguration};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
+use network::trie::*;
 
 type BackendToken = Token;
 
 type ClientToken = Token;
+
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub struct TlsApp {
+  pub app_id:           String,
+  pub hostname:         String,
+  pub path_begin:       String,
+  pub cert_fingerprint: CertFingerprint,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub struct TlsData {
+  pub certificate:       String,
+  pub certificate_chain: String,
+  pub key:               String,
+  pub refcount:          u32,
+}
 
 pub enum TlsState {
   Initial,
@@ -277,11 +294,17 @@ impl ProxyClient for TlsClient {
   }
 }
 
+pub type AppId    = String;
+pub type HostName = String;
+//maybe not the most efficient type for that
+pub type CertFingerprint = Vec<u8>;
+
 pub struct ServerConfiguration<Tx> {
   listener:        TcpListener,
   address:         SocketAddr,
-  instances:       HashMap<String, Vec<Backend>>,
-  fronts:          HashMap<String, Vec<TlsFront>>,
+  instances:       HashMap<AppId, Vec<Backend>>,
+  fronts:          HashMap<HostName, Vec<TlsFront>>,
+  domains:         TrieNode<CertFingerprint>,
   default_cert:    String,
   default_context: SslContext,
   contexts:        Arc<Mutex<HashMap<String, SslContext>>>,
@@ -347,6 +370,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
           address:         config.front.clone(),
           instances:       HashMap::new(),
           fronts:          HashMap::new(),
+          domains:         TrieNode::root(),
           default_cert:    String::from("lolcatho.st"),
           default_context: context,
           contexts:        rc_ctx,
@@ -648,7 +672,7 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
     }
   }
 
-  fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {
+  fn close_backend(&mut self, app_id: AppId, addr: &SocketAddr) {
     if let Some(app_instances) = self.instances.get_mut(&app_id) {
       if let Some(ref mut backend) = app_instances.iter_mut().find(|backend| &backend.address == addr) {
         backend.dec_connections();
@@ -705,6 +729,7 @@ mod tests {
   use network::buffer_queue::BufferQueue;
   use network::{ProxyOrder,ServerMessage};
   use network::http::DefaultAnswers;
+  use network::trie::TrieNode;
   use openssl::ssl::{SslContext, SslMethod, Ssl, SslStream};
 
   /*
@@ -817,6 +842,7 @@ mod tests {
       address:   front,
       instances: HashMap::new(),
       fronts:    fronts,
+      domains:   TrieNode::root(),
       default_cert: "".to_owned(),
       default_context: context,
       contexts: rc_ctx,
