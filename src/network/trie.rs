@@ -101,7 +101,7 @@ impl<V:Clone+Debug> TrieNode<V> {
 
           self.children.push(new_child);
           InsertResult::Ok
-        } else {
+        } else if partial_key.len() == self.partial_key.len() {
           // the partial key is the same as ours
           if self.key_value.is_some() {
             InsertResult::Existing
@@ -109,6 +109,19 @@ impl<V:Clone+Debug> TrieNode<V> {
             self.key_value = Some((key.clone(), value.clone()));
             InsertResult::Ok
           }
+        } else {
+          // self.partial_key is larger
+          self.split(partial_key.len());
+          let new_child = TrieNode {
+            partial_key: (self.partial_key[partial_key.len()..]).to_vec(),
+            key_value:   self.key_value.take(),
+            children:    vec!(),
+          };
+
+          self.children.push(new_child);
+          self.partial_key = partial_key.to_vec();
+          self.key_value = Some((key.clone(), value.clone()));
+          InsertResult::Ok
         }
       }
     }
@@ -142,23 +155,28 @@ impl<V:Clone+Debug> TrieNode<V> {
       };
     }
 
-    if let Some(index ) = found_child {
-      self.children.remove(index);
-      if self.key_value.is_some() {
+    if let Some(index) = found_child {
+      if self.children[index].children.len() > 0 && self.children[index].key_value.is_some() {
+        self.children[index].key_value = None;
         return RemoveResult::Ok;
       } else {
-        //merging with the child
-        if self.children.len() == 1 {
-          let mut ch     = self.children.remove(0);
-          self.key_value = ch.key_value.take();
-          self.children  = ch.children;
-          self.partial_key.extend(ch.partial_key);
+        self.children.remove(index);
+        if self.key_value.is_some() {
+          return RemoveResult::Ok;
+        } else {
+          //merging with the child
+          if self.children.len() == 1 {
+            let mut ch     = self.children.remove(0);
+            self.key_value = ch.key_value.take();
+            self.children  = ch.children;
+            self.partial_key.extend(ch.partial_key);
+          }
+          // not handling the case of empty children vec
+          // this case should only happen if it is the root node
+          // otherwise, when we get to one last node and there is
+          // no key_value, it is merged with the child node
+          return RemoveResult::Ok
         }
-        // not handling the case of empty children vec
-        // this case should only happen if it is the root node
-        // otherwise, when we get to one last node and there is
-        // no key_value, it is merged with the child node
-        return RemoveResult::Ok
       }
     } else {
       RemoveResult::NotFound
@@ -186,8 +204,63 @@ impl<V:Clone+Debug> TrieNode<V> {
   }
 
   // specific version that will handle wildcard domains
-  pub fn domain_lookup(&self, key: Key) -> Option<KeyValue<Key,V>> {
-    None
+  pub fn domain_insert(&mut self, key: Key, value: V) -> InsertResult {
+    let mut partial_key = key.clone();
+    partial_key.reverse();
+    self.insert_recursive(&partial_key, &key, &value)
+  }
+
+  // specific version that will handle wildcard domains
+  pub fn domain_remove(&mut self, key: &Key) -> RemoveResult {
+    let mut partial_key = key.clone();
+    partial_key.reverse();
+    self.remove_recursive(&partial_key)
+  }
+
+  // specific version that will handle wildcard domains
+  pub fn domain_lookup(&self, key: &[u8]) -> Option<&KeyValue<Key,V>> {
+    let mut partial_key = key.to_vec();
+    partial_key.reverse();
+    self.domain_lookup_recursive(&partial_key)
+  }
+
+  // specific version that will handle wildcard domains
+  pub fn domain_lookup_recursive(&self, partial_key: &[u8]) -> Option<&KeyValue<Key,V>> {
+    assert_ne!(partial_key, &b""[..]);
+    let pos = partial_key.iter().zip(self.partial_key.iter()).position(|(&a,&b)| a != b);
+
+    match pos {
+      Some(0) => return None,
+      Some(i) => {
+        // check for wildcard
+        if i+1 == self.partial_key.len() && self.partial_key[i] == '*' as u8 {
+          let c = '.' as u8;
+          if (&partial_key[i..]).contains(&c) {
+            None
+          } else {
+            self.key_value.as_ref()
+          }
+        } else {
+          None
+        }
+      },
+      None    => {
+        if partial_key.len() > self.partial_key.len() {
+          for child in self.children.iter() {
+            let res = child.domain_lookup_recursive(&partial_key[self.partial_key.len()..]);
+            if res.is_some() {
+              return res
+            }
+          }
+          None
+        } else if partial_key.len() == self.partial_key.len() {
+          self.key_value.as_ref()
+        } else {
+          None
+        }
+
+      }
+    }
   }
 
   pub fn print(&self) {
@@ -195,7 +268,7 @@ impl<V:Clone+Debug> TrieNode<V> {
   }
 
   pub fn print_recursive(&self, indent:u8) {
-    let raw_prefix:Vec<u8> = iter::repeat(' ' as u8).take(indent as usize).collect();
+    let raw_prefix:Vec<u8> = iter::repeat(' ' as u8).take(2*indent as usize).collect();
     let prefix = str::from_utf8(&raw_prefix).unwrap();
 
     if let Some((ref key, ref value)) = self.key_value {
@@ -260,7 +333,69 @@ mod tests {
     assert_eq!(root3.insert(Vec::from(&b"abcd"[..]), 1), InsertResult::Ok);
     root3.print();
     assert_eq!(root, root3);
+  }
 
-    assert!(false);
+  #[test]
+  fn add_child_to_leaf() {
+    let mut root: TrieNode<u8> = TrieNode::root();
+
+    assert_eq!(root.insert(Vec::from(&b"abcd"[..]), 1), InsertResult::Ok);
+    assert_eq!(root.insert(Vec::from(&b"abce"[..]), 2), InsertResult::Ok);
+    assert_eq!(root.insert(Vec::from(&b"abc"[..]), 3), InsertResult::Ok);
+
+    root.print();
+
+    let mut root2: TrieNode<u8> = TrieNode::root();
+
+    assert_eq!(root2.insert(Vec::from(&b"abc"[..]), 3), InsertResult::Ok);
+    assert_eq!(root2.insert(Vec::from(&b"abcd"[..]), 1), InsertResult::Ok);
+    assert_eq!(root2.insert(Vec::from(&b"abce"[..]), 2), InsertResult::Ok);
+
+    root2.print();
+    assert_eq!(root2.remove(&Vec::from(&b"abc"[..])), RemoveResult::Ok);
+
+    let mut expected: TrieNode<u8> = TrieNode::root();
+
+    assert_eq!(expected.insert(Vec::from(&b"abcd"[..]), 1), InsertResult::Ok);
+    assert_eq!(expected.insert(Vec::from(&b"abce"[..]), 2), InsertResult::Ok);
+
+    println!("after remove");
+    root2.print();
+    println!("expected");
+    expected.print();
+    assert_eq!(root2, expected);
+
+  }
+
+  #[test]
+  fn domains() {
+    let mut root: TrieNode<u8> = TrieNode::root();
+
+    assert_eq!(root.domain_insert(Vec::from(&b"www.example.com"[..]), 1), InsertResult::Ok);
+    root.print();
+    assert_eq!(root.domain_insert(Vec::from(&b"test.example.com"[..]), 2), InsertResult::Ok);
+    root.print();
+    assert_eq!(root.domain_insert(Vec::from(&b"*.alldomains.org"[..]), 3), InsertResult::Ok);
+    root.print();
+    assert_eq!(root.domain_insert(Vec::from(&b"alldomains.org"[..]), 4), InsertResult::Ok);
+    root.print();
+    assert_eq!(root.domain_insert(Vec::from(&b"hello.com"[..]), 5), InsertResult::Ok);
+    root.print();
+
+    assert_eq!(root.domain_lookup(&b"example.com"[..]), None);
+    assert_eq!(root.domain_lookup(&b"blah.test.example.com"[..]), None);
+    assert_eq!(root.domain_lookup(&b"www.example.com"[..]), Some(&((&b"www.example.com"[..]).to_vec(), 1)));
+    assert_eq!(root.domain_lookup(&b"alldomains.org"[..]), Some(&((&b"alldomains.org"[..]).to_vec(), 4)));
+    assert_eq!(root.domain_lookup(&b"test.alldomains.org"[..]), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
+    assert_eq!(root.domain_lookup(&b"hello.alldomains.org"[..]), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
+    assert_eq!(root.domain_lookup(&b"blah.test.alldomains.org"[..]), None);
+
+    assert_eq!(root.domain_remove(&Vec::from(&b"alldomains.org"[..])), RemoveResult::Ok);
+    println!("after remove");
+    root.print();
+    assert_eq!(root.domain_lookup(&b"alldomains.org"[..]), None);
+    assert_eq!(root.domain_lookup(&b"test.alldomains.org"[..]), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
+    assert_eq!(root.domain_lookup(&b"hello.alldomains.org"[..]), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
+    assert_eq!(root.domain_lookup(&b"blah.test.alldomains.org"[..]), None);
   }
 }
