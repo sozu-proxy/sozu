@@ -797,12 +797,12 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
     trace!("TLS\t{} notified", message);
     match message {
       ProxyOrder::Command(id, Command::AddTlsFront(front)) => {
-        info!("TLS\t{} add front {:?}", id, front);
+        //info!("TLS\t{} add front {:?}", id, front);
           self.add_http_front(front, event_loop);
           self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
       },
       ProxyOrder::Command(id, Command::RemoveTlsFront(front)) => {
-        info!("TLS\t{} remove front {:?}", id, front);
+        //info!("TLS\t{} remove front {:?}", id, front);
         self.remove_http_front(front, event_loop);
         self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
       },
