@@ -36,7 +36,7 @@ impl SocketHandler for TcpStream {
             return (size, SocketResult::Error)
           },
           _ => {
-            debug!("SOCKET\tsocket_write not implemented; client err={:?}", e);
+            error!("SOCKET\tsocket_read error={:?}", e);
             return (size, SocketResult::Error)
           },
         }
@@ -60,7 +60,8 @@ impl SocketHandler for TcpStream {
             return (size, SocketResult::Error)
           },
           _ => {
-            debug!("SOCKET\tsocket_write not implemented; client err={:?}", e);
+            //FIXME: timeout and other common errors should be sent up
+            error!("SOCKET\tsocket_write error={:?}", e);
             return (size, SocketResult::Error)
           },
         }
