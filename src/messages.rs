@@ -178,7 +178,7 @@ impl serde::de::Visitor for CommandVisitor {
       }
     }
 
-    println!("decoded type = {:?}, value= {:?}", command_type, data);
+    //println!("decoded type = {:?}, value= {:?}", command_type, data);
     let command_type = match command_type {
       Some(command) => command,
       None => try!(visitor.missing_field("type")),
@@ -192,7 +192,7 @@ impl serde::de::Visitor for CommandVisitor {
 
     if &command_type == "ADD_HTTP_FRONT" {
       let res = serde_json::from_value(data).or(Err(serde::de::Error::custom("add_http_front")));
-      println!("ADD_HTTP_FRONT => {:?}", res);
+      //println!("ADD_HTTP_FRONT => {:?}", res);
       let acl = try!(res);
       Ok(Command::AddHttpFront(acl))
     } else if &command_type == "REMOVE_HTTP_FRONT" {
