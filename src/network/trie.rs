@@ -26,7 +26,7 @@ pub enum RemoveResult {
   NotFound,
 }
 
-impl<V:Clone+Debug> TrieNode<V> {
+impl<V:Debug> TrieNode<V> {
   pub fn new(partial: &[u8], key: Key, value: V) -> TrieNode<V> {
     TrieNode {
       partial_key:    Vec::from(partial),
@@ -58,73 +58,63 @@ impl<V:Clone+Debug> TrieNode<V> {
   }
 
   pub fn insert(&mut self, key: Key, value: V) -> InsertResult {
-    let res = self.insert_recursive(&key, &key, &value);
+    println!("adding {}", str::from_utf8(&key).unwrap());
+    let res = self.insert_recursive(&key, &key, value);
     assert_ne!(res, InsertResult::Failed);
     res
   }
 
-  pub fn insert_recursive(&mut self, partial_key: &[u8], key: &Key, value: &V) -> InsertResult {
+  pub fn insert_recursive(&mut self, partial_key: &[u8], key: &Key, value: V) -> InsertResult {
     assert_ne!(partial_key, &b""[..]);
 
-    let pos = partial_key.iter().zip(self.partial_key.iter()).position(|(&a,&b)| a != b);
+    println!("at level: {}, testing {}", str::from_utf8(&self.partial_key).unwrap(),
+      str::from_utf8(partial_key).unwrap());
 
-    match pos {
-      Some(0) => InsertResult::Failed,
-      Some(index) => {
-        self.split(index);
-        let new_child = TrieNode {
-          partial_key: (&partial_key[index..]).to_vec(),
-          key_value:   Some((key.clone(), value.clone())),
-          children:    vec!(),
-        };
+    // checking directly the children
+    for (index, child) in self.children.iter_mut().enumerate() {
+      let pos = partial_key.iter().zip(child.partial_key.iter()).position(|(&a,&b)| a != b);
+      match pos {
+        Some(0) => continue,
+        Some(i) => {
+          child.split(i);
+          let new_child = TrieNode {
+            partial_key: (&partial_key[i..]).to_vec(),
+            key_value:   Some((key.clone(), value)),
+            children:    vec!(),
+          };
 
-        self.children.push(new_child);
-        InsertResult::Ok
-      },
-      None    => {
-        // we consumed the whole local partial key
-        if partial_key.len() > self.partial_key.len() {
-          for child in self.children.iter_mut() {
-            match child.insert_recursive(&partial_key[self.partial_key.len()..], key, value) {
-              InsertResult::Ok       => return InsertResult::Ok,
-              InsertResult::Existing => return InsertResult::Existing,
-              _ => {}
+          child.children.push(new_child);
+          return InsertResult::Ok;
+        },
+        None    => {
+          if partial_key.len() > child.partial_key.len()  {
+            let i = child.partial_key.len();
+            return child.insert_recursive(&partial_key[i..], key, value);
+          } else if partial_key.len() == child.partial_key.len() {
+            if child.key_value.is_some() {
+              return InsertResult::Existing;
+            } else {
+              child.key_value = Some((key.clone(), value));
+              return InsertResult::Ok;
             }
-          }
-
-          // we could not insert in children
-          let new_child = TrieNode {
-            partial_key: (&partial_key[self.partial_key.len()..]).to_vec(),
-            key_value:   Some((key.clone(), value.clone())),
-            children:    vec!(),
-          };
-
-          self.children.push(new_child);
-          InsertResult::Ok
-        } else if partial_key.len() == self.partial_key.len() {
-          // the partial key is the same as ours
-          if self.key_value.is_some() {
-            InsertResult::Existing
           } else {
-            self.key_value = Some((key.clone(), value.clone()));
-            InsertResult::Ok
+            // the partial key is smaller, insert as parent
+            child.split(partial_key.len());
+            child.key_value = Some((key.clone(), value));
+            return InsertResult::Ok;
           }
-        } else {
-          // self.partial_key is larger
-          self.split(partial_key.len());
-          let new_child = TrieNode {
-            partial_key: (self.partial_key[partial_key.len()..]).to_vec(),
-            key_value:   self.key_value.take(),
-            children:    vec!(),
-          };
-
-          self.children.push(new_child);
-          self.partial_key = partial_key.to_vec();
-          self.key_value = Some((key.clone(), value.clone()));
-          InsertResult::Ok
         }
-      }
+      };
     }
+
+    let new_child = TrieNode {
+      partial_key: partial_key.to_vec(),
+      key_value:   Some((key.clone(), value)),
+      children:    vec!(),
+    };
+
+    self.children.push(new_child);
+    InsertResult::Ok
   }
 
   pub fn remove(&mut self, key: &Key) -> RemoveResult {
@@ -207,7 +197,7 @@ impl<V:Clone+Debug> TrieNode<V> {
   pub fn domain_insert(&mut self, key: Key, value: V) -> InsertResult {
     let mut partial_key = key.clone();
     partial_key.reverse();
-    self.insert_recursive(&partial_key, &key, &value)
+    self.insert_recursive(&partial_key, &key, value)
   }
 
   // specific version that will handle wildcard domains
