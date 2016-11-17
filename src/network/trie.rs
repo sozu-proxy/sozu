@@ -67,9 +67,6 @@ impl<V:Debug> TrieNode<V> {
   pub fn insert_recursive(&mut self, partial_key: &[u8], key: &Key, value: V) -> InsertResult {
     assert_ne!(partial_key, &b""[..]);
 
-    println!("at level: {}, testing {}", str::from_utf8(&self.partial_key).unwrap(),
-      str::from_utf8(partial_key).unwrap());
-
     // checking directly the children
     for (index, child) in self.children.iter_mut().enumerate() {
       let pos = partial_key.iter().zip(child.partial_key.iter()).position(|(&a,&b)| a != b);
@@ -218,9 +215,10 @@ impl<V:Debug> TrieNode<V> {
   pub fn domain_lookup_recursive(&self, partial_key: &[u8]) -> Option<&KeyValue<Key,V>> {
     assert_ne!(partial_key, &b""[..]);
     let pos = partial_key.iter().zip(self.partial_key.iter()).position(|(&a,&b)| a != b);
+    //info!("lookup at level: {}, testing {}", str::from_utf8(&self.partial_key).unwrap(),
+    //  str::from_utf8(partial_key).unwrap());
 
     match pos {
-      Some(0) => return None,
       Some(i) => {
         // check for wildcard
         if i+1 == self.partial_key.len() && self.partial_key[i] == '*' as u8 {
