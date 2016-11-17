@@ -296,7 +296,7 @@ pub type CertFingerprint = Vec<u8>;
 pub struct TlsData {
   context:     SslContext,
   certificate: Vec<u8>,
-  refcount:    u8,
+  refcount:    usize,
 }
 
 pub struct ServerConfiguration<Tx> {
