@@ -5,7 +5,7 @@ use mio::channel;
 use std::io;
 use std::net::SocketAddr;
 use std::default::Default;
-use std::convert::{From,Into};
+use std::convert::From;
 use std::sync::mpsc;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
