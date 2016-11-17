@@ -26,6 +26,8 @@ use openssl::ssl::{self,HandshakeError,MidHandshakeSslStream,
 use openssl::x509::{X509,X509FileType};
 use openssl::dh::DH;
 use openssl::crypto::pkey::PKey;
+use openssl::crypto::hash::Type;
+use openssl::nid::Nid;
 use nom::IResult;
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
@@ -48,14 +50,6 @@ pub struct TlsApp {
   pub hostname:         String,
   pub path_begin:       String,
   pub cert_fingerprint: CertFingerprint,
-}
-
-#[derive(Debug,Clone,PartialEq,Eq)]
-pub struct TlsData {
-  pub certificate:       String,
-  pub certificate_chain: String,
-  pub key:               String,
-  pub refcount:          u32,
 }
 
 pub enum TlsState {
@@ -294,20 +288,26 @@ impl ProxyClient for TlsClient {
   }
 }
 
-pub type AppId    = String;
-pub type HostName = String;
+pub type AppId     = String;
+pub type HostName  = String;
+pub type PathBegin = String;
 //maybe not the most efficient type for that
 pub type CertFingerprint = Vec<u8>;
+pub struct TlsData {
+  context:     SslContext,
+  certificate: Vec<u8>,
+  refcount:    u8,
+}
 
 pub struct ServerConfiguration<Tx> {
   listener:        TcpListener,
   address:         SocketAddr,
   instances:       HashMap<AppId, Vec<Backend>>,
-  fronts:          HashMap<HostName, Vec<TlsFront>>,
-  domains:         TrieNode<CertFingerprint>,
+  fronts:          HashMap<HostName, Vec<TlsApp>>,
+  domains:         Arc<Mutex<TrieNode<CertFingerprint>>>,
   default_cert:    String,
-  default_context: SslContext,
-  contexts:        Arc<Mutex<HashMap<String, SslContext>>>,
+  default_context: TlsData,
+  contexts:        Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
   tx:              Tx,
   pool:            Pool<BufferQueue>,
   answers:         DefaultAnswers,
@@ -318,9 +318,10 @@ pub struct ServerConfiguration<Tx> {
 
 impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
   pub fn new(config: TlsProxyConfiguration, tx: Tx, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration<Tx>> {
-    let contexts = HashMap::new();
+    let mut contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
+    let mut domains  = TrieNode::root();
 
-    let ctx = SslContext::new(SslMethod::Sslv23);
+    /*let ctx = SslContext::new(SslMethod::Sslv23);
     if let Err(e) = ctx {
       return Err(io::Error::new(io::ErrorKind::Other, e.description()));
     }
@@ -328,9 +329,25 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     let mut context = ctx.unwrap();
 
     context.set_cipher_list(&config.cipher_list);
-    if let Some(tls_options) = SslContextOptions::from_bits(config.options) {
-      context.set_options(tls_options);
-    }
+    context.set_cipher_list("ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
+                               ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
+                               ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
+                               DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:\
+                               ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:\
+                               ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:\
+                               ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA384:\
+                               ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA256:\
+                               DHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA:\
+                               ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:\
+                               EDH-RSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:\
+                               AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:\
+                               !DSS");
+    //context.set_options(ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |
+    //                                      ssl::SSL_OP_NO_TICKET | ssl::SSL_OP_NO_SSLV2);// |
+                                          //ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1);
+    //if let Some(tls_options) = SslContextOptions::from_bits(config.options) {
+    //  context.set_options(tls_options);
+    //}
 
     match DH::get_2048_256() {
       Ok(dh) => context.set_tmp_dh(&dh),
@@ -342,24 +359,46 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     //FIXME: get the default cert and key from the configuration
     context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
     context.set_private_key_file("assets/key.pem", X509FileType::PEM);
+    */
+    let (fingerprint, mut tls_data):(Vec<u8>,TlsData) = Self::create_default_context(&config.cipher_list).unwrap();
 
     let rc_ctx = Arc::new(Mutex::new(contexts));
     let ref_ctx = rc_ctx.clone();
-    context.set_servername_callback(move |ssl: &mut SslRef| {
-      let contexts = ref_ctx.lock().unwrap();
+    let rc_domains  = Arc::new(Mutex::new(domains));
+    let ref_domains = rc_domains.clone();
 
+    tls_data.context.set_servername_callback(move |ssl: &mut SslRef| {
+      let contexts = ref_ctx.lock().unwrap();
+      let domains  = ref_domains.lock().unwrap();
+
+      info!("TLS ref: {:?}", ssl);
       if let Some(servername) = ssl.servername() {
-        trace!("TLS\tlooking for context for {:?}", servername);
-        if let Some(ref ctx) = contexts.get(&servername) {
-          let context: &SslContext = ctx;
-          if let Ok(()) = ssl.set_ssl_context(context.clone()) {
-            return Ok(());
+        info!("TLS\tlooking for fingerprint for {:?}", servername);
+        if let Some(kv) = domains.domain_lookup(servername.as_bytes()) {
+          info!("TLS\tlooking for context for {:?} with fingerprint {:?}", servername, kv.0);
+          if let Some(ref tls_data) = contexts.get(&kv.0) {
+            info!("TLS\tfound context for {:?}", servername);
+            let context: &SslContext = &tls_data.context;
+            if let Ok(()) = ssl.set_ssl_context(context) {
+              info!("TLS\tservername is now {:?}", ssl.servername());
+              return Ok(());
+            } else {
+              error!("no context found for {:?}", servername);
+            }
           }
         }
+      } else {
+        error!("got no server name from ssl");
       }
       Err(SniError::Fatal(0))
     });
 
+    /*
+    {
+      let mut ctxts = rc_ctx.lock().unwrap();
+      ctxts.insert("lolcatho.st", context);
+    }
+    */
 
 
     match server_bind(&config.front) {
@@ -370,9 +409,9 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
           address:         config.front.clone(),
           instances:       HashMap::new(),
           fronts:          HashMap::new(),
-          domains:         TrieNode::root(),
+          domains:         rc_domains,
           default_cert:    String::from("lolcatho.st"),
-          default_context: context,
+          default_context: tls_data,
           contexts:        rc_ctx,
           tx:              tx,
           pool:            Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size)),
@@ -392,6 +431,70 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     }
   }
 
+  pub fn create_default_context(cipher_list: &str) -> Option<(CertFingerprint,TlsData)> {
+    let ctx = SslContext::new(SslMethod::Sslv23);
+    if let Err(e) = ctx {
+      //return Err(io::Error::new(io::ErrorKind::Other, e.description()));
+      return None
+    }
+
+    let mut context = ctx.unwrap();
+
+    context.set_cipher_list(cipher_list);
+    context.set_cipher_list("ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
+                               ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
+                               ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:\
+                               DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:\
+                               ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:\
+                               ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES256-SHA384:\
+                               ECDHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-SHA384:\
+                               ECDHE-ECDSA-AES256-SHA:ECDHE-RSA-AES256-SHA:DHE-RSA-AES128-SHA256:\
+                               DHE-RSA-AES128-SHA:DHE-RSA-AES256-SHA256:DHE-RSA-AES256-SHA:\
+                               ECDHE-ECDSA-DES-CBC3-SHA:ECDHE-RSA-DES-CBC3-SHA:\
+                               EDH-RSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:\
+                               AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:\
+                               !DSS");
+    //context.set_options(ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |
+    //                                      ssl::SSL_OP_NO_TICKET | ssl::SSL_OP_NO_SSLV2);// |
+                                          //ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1);
+    /*if let Some(tls_options) = SslContextOptions::from_bits(config.options) {
+      context.set_options(tls_options);
+    }*/
+
+    match DH::get_2048_256() {
+      Ok(dh) => context.set_tmp_dh(&dh),
+      Err(e) => {
+        //return Err(io::Error::new(io::ErrorKind::Other, e.description()))
+        return None
+      }
+    };
+
+    context.set_ecdh_auto(true);
+
+    //FIXME: get the default cert and key from the configuration
+    //context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
+    //context.set_private_key_file("assets/key.pem", X509FileType::PEM);
+    let cert_read = include_bytes!("../../assets/certificate.pem");
+    let key_read  = include_bytes!("../../assets/key.pem");
+    if let (Ok(cert), Ok(key)) = (X509::from_pem(&cert_read[..]), PKey::private_key_from_pem(&key_read[..])) {
+      if let Ok(fingerprint) = cert.fingerprint(Type::SHA256) {
+        context.set_certificate(&cert);
+        context.set_private_key(&key);
+
+        let tls_data = TlsData {
+          context:     context,
+          certificate: cert_read.to_vec(),
+          refcount:    0,
+        };
+        Some((fingerprint, tls_data))
+      } else {
+        None
+      }
+    } else {
+      None
+    }
+  }
+
   pub fn add_http_front(&mut self, http_front: TlsFront, event_loop: &mut Poll) -> bool {
     //FIXME: insert some error management with a Result here
     let c = SslContext::new(SslMethod::Sslv23);
@@ -407,28 +510,68 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     if let (Ok(cert), Ok(key)) = (X509::from_pem(&mut cert_read), PKey::private_key_from_pem(&mut key_read)) {
       //FIXME: would need more logs here
 
+      //FIXME
+      let fingerprint = cert.fingerprint(Type::SHA256).unwrap();
+      let common_name: Option<String> = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name));
+      info!("got common name: {:?}", common_name);
+
+      let names: Vec<String> = cert.subject_alt_names().map(|names| {
+        names.iter().filter_map(|general_name|
+          general_name.dnsname().map(|name| String::from(name))
+        ).collect()
+      }).unwrap_or(vec!());
+      info!("got subject alt names: {:?}", names);
+
       ctx.set_certificate(&cert);
       ctx.set_private_key(&key);
       cert_chain.iter().map(|ref cert| ctx.add_extra_chain_cert(cert));
 
-      let hostname = http_front.hostname.clone();
-
-      let front2 = http_front.clone();
-      let front3 = http_front.clone();
-      if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
-          fronts.push(front2);
-      }
-
-      if self.fronts.get(&http_front.hostname).is_none() {
-        self.fronts.insert(http_front.hostname, vec![front3]);
-      }
-
+      let tls_data = TlsData {
+        context:     ctx,
+        certificate: cert_read.to_vec(),
+        refcount:    1,
+      };
+      // if the name or the fingerprint are already used,
+      // those insertions should fail, because it would be
+      // from the same certificate
+      // Add a refcount?
       //FIXME: this is blocking
       //this lock is only obtained from this thread, so is it alright?
       {
         let mut contexts = self.contexts.lock().unwrap();
-        contexts.insert(hostname, ctx);
+
+        if contexts.contains_key(&fingerprint) {
+          contexts.get_mut(&fingerprint).map(|data| {
+            data.refcount += 1;
+          });
+        }  else {
+          contexts.insert(fingerprint.clone(), tls_data);
+        }
       }
+      {
+        let mut domains = self.domains.lock().unwrap();
+        if let Some(name) = common_name {
+          domains.domain_insert(name.into_bytes(), fingerprint.clone());
+        }
+        for name in names {
+          domains.domain_insert(name.into_bytes(), fingerprint.clone());
+        }
+      }
+
+      let app = TlsApp {
+        app_id:           http_front.app_id.clone(),
+        hostname:         http_front.hostname.clone(),
+        path_begin:       http_front.path_begin.clone(),
+        cert_fingerprint: fingerprint.clone(),
+      };
+
+      if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
+          fronts.push(app.clone());
+      }
+      if self.fronts.get(&http_front.hostname).is_none() {
+        self.fronts.insert(http_front.hostname, vec![app]);
+      }
+
       true
     } else {
       false
@@ -437,8 +580,41 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
 
   pub fn remove_http_front(&mut self, front: TlsFront, event_loop: &mut Poll) {
     info!("TLS\tremoving http_front {:?}", front);
+
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
-      fronts.retain(|f| f != &front);
+      if let Some(pos) = fronts.iter().position(|f| &f.app_id == &front.app_id) {
+        let front = fronts.remove(pos);
+
+        {
+          let mut contexts = self.contexts.lock().unwrap();
+          let mut domains  = self.domains.lock().unwrap();
+          let must_delete = contexts.get_mut(&front.cert_fingerprint).map(|tls_data| {
+            tls_data.refcount -= 1;
+            tls_data.refcount == 0
+          });
+
+          if must_delete == Some(true) {
+            if let Some(data) = contexts.remove(&front.cert_fingerprint) {
+              if let Ok(cert) = X509::from_pem(&data.certificate) {
+                let common_name: Option<String> = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name));
+                //info!("got common name: {:?}", common_name);
+                if let Some(name) = common_name {
+                  domains.domain_remove(&name.into_bytes());
+                }
+
+                let names: Vec<String> = cert.subject_alt_names().map(|names| {
+                  names.iter().filter_map(|general_name|
+                                          general_name.dnsname().map(|name| String::from(name))
+                                         ).collect()
+                }).unwrap_or(vec!());
+                for name in names {
+                  domains.domain_remove(&name.into_bytes());
+                }
+              }
+            }
+          }
+        }
+      }
     }
   }
 
@@ -463,7 +639,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
   }
 
   // ToDo factor out with http.rs
-  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&TlsFront> {
+  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&TlsApp> {
     if let Some(http_fronts) = self.fronts.get(host) {
       let matching_fronts = http_fronts.iter().filter(|f| uri.starts_with(&f.path_begin)); // ToDo match on uri
       let mut front = None;
@@ -529,7 +705,7 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
 
       if let Ok((frontend_sock, _)) = accepted {
         frontend_sock.set_nodelay(true);
-        if let Ok(ssl) = Ssl::new(&self.default_context) {
+        if let Ok(ssl) = Ssl::new(&self.default_context.context) {
           if let Some(c) = TlsClient::new("TLS", ssl, frontend_sock, front_buf, back_buf) {
             return Some((c, false))
           }
@@ -731,6 +907,7 @@ mod tests {
   use network::http::DefaultAnswers;
   use network::trie::TrieNode;
   use openssl::ssl::{SslContext, SslMethod, Ssl, SslStream};
+  use openssl::x509::X509;
 
   /*
   #[allow(unused_mut, unused_must_use, unused_variables)]
@@ -809,31 +986,39 @@ mod tests {
 
     let mut fronts = HashMap::new();
     fronts.insert("lolcatho.st".to_owned(), vec![
-      TlsFront {
+      TlsApp {
         app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1,
-        key: String::new(), certificate: String::new(), certificate_chain: vec!()
+        cert_fingerprint: vec!()
       },
-      TlsFront {
+      TlsApp {
         app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2,
-        key: String::new(), certificate: String::new(), certificate_chain: vec!()
+        cert_fingerprint: vec!()
       },
-      TlsFront {
+      TlsApp {
         app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3,
-        key: String::new(), certificate: String::new(), certificate_chain: vec!()
+        cert_fingerprint: vec!()
       }
     ]);
     fronts.insert("other.domain".to_owned(), vec![
-      TlsFront {
+      TlsApp {
         app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(),
-        key: String::new(), certificate: String::new(), certificate_chain: vec!()
+        cert_fingerprint: vec!()
       },
     ]);
 
-    let contexts = HashMap::new();
-    let rc_ctx = Arc::new(Mutex::new(contexts));
+    let contexts   = HashMap::new();
+    let rc_ctx     = Arc::new(Mutex::new(contexts));
+    let domains    = TrieNode::root();
+    let rc_domains = Arc::new(Mutex::new(domains));
 
-    let context = SslContext::new(SslMethod::Tlsv1).unwrap();
-    let (tx,rx) = channel::<ServerMessage>();
+    let context    = SslContext::new(SslMethod::Tlsv1).unwrap();
+    let (tx,rx)    = channel::<ServerMessage>();
+
+    let tls_data = TlsData {
+      context:     context,
+      certificate: vec!(),
+      refcount:    0,
+    };
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1032").expect("test address 127.0.0.1:1032 should be parsed");
     let listener = tcp::TcpListener::bind(&front).expect("test address 127.0.0.1:1032 should be available");
@@ -842,9 +1027,9 @@ mod tests {
       address:   front,
       instances: HashMap::new(),
       fronts:    fronts,
-      domains:   TrieNode::root(),
+      domains:   rc_domains,
       default_cert: "".to_owned(),
-      default_context: context,
+      default_context: tls_data,
       contexts: rc_ctx,
       tx:        tx,
       pool:      Pool::with_capacity(1, 0, || BufferQueue::with_capacity(12000)),
@@ -857,15 +1042,21 @@ mod tests {
       config: Default::default()
     };
 
+    println!("TEST {}", line!());
     let frontend1 = server_config.frontend_from_request("lolcatho.st", "/");
-    let frontend2 = server_config.frontend_from_request("lolcatho.st", "/test");
-    let frontend3 = server_config.frontend_from_request("lolcatho.st", "/yolo/test");
-    let frontend4 = server_config.frontend_from_request("lolcatho.st", "/yolo/swag");
-    let frontend5 = server_config.frontend_from_request("domain", "/");
     assert_eq!(frontend1.unwrap().app_id, "app_1");
+    println!("TEST {}", line!());
+    let frontend2 = server_config.frontend_from_request("lolcatho.st", "/test");
     assert_eq!(frontend2.unwrap().app_id, "app_1");
+    println!("TEST {}", line!());
+    let frontend3 = server_config.frontend_from_request("lolcatho.st", "/yolo/test");
     assert_eq!(frontend3.unwrap().app_id, "app_2");
+    println!("TEST {}", line!());
+    let frontend4 = server_config.frontend_from_request("lolcatho.st", "/yolo/swag");
     assert_eq!(frontend4.unwrap().app_id, "app_3");
+    println!("TEST {}", line!());
+    let frontend5 = server_config.frontend_from_request("domain", "/");
     assert_eq!(frontend5, None);
+   // assert!(false);
   }
 }
