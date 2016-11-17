@@ -373,10 +373,13 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
 
       info!("TLS ref: {:?}", ssl);
       if let Some(servername) = ssl.servername() {
+        if servername == "lolcatho.st" {
+          return Ok(());
+        }
         info!("TLS\tlooking for fingerprint for {:?}", servername);
         if let Some(kv) = domains.domain_lookup(servername.as_bytes()) {
-          info!("TLS\tlooking for context for {:?} with fingerprint {:?}", servername, kv.0);
-          if let Some(ref tls_data) = contexts.get(&kv.0) {
+          info!("TLS\tlooking for context for {:?} with fingerprint {:?}", servername, kv.1);
+          if let Some(ref tls_data) = contexts.get(&kv.1) {
             info!("TLS\tfound context for {:?}", servername);
             let context: &SslContext = &tls_data.context;
             if let Ok(()) = ssl.set_ssl_context(context) {
@@ -395,11 +398,10 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
 
     /*
     {
-      let mut ctxts = rc_ctx.lock().unwrap();
-      ctxts.insert("lolcatho.st", context);
+      let contexts = ref_ctx.lock().unwrap();
+      contexts.insert(fingerprint, tls_data);
     }
     */
-
 
     match server_bind(&config.front) {
       Ok(listener) => {
