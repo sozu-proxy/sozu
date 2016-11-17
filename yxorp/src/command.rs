@@ -590,6 +590,12 @@ impl CommandServer {
         },
         ConfigCommand::ProxyConfiguration(command) => {
           if let Some(ref tag) = message.listener {
+            if let &Command::AddTlsFront(ref data) = &command {
+              log!(log::LogLevel::Info, "received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
+                data.app_id, data.hostname, data.path_begin, tag);
+            } else {
+              log!(log::LogLevel::Info, "received {:?} with tag {:?}", command, tag);
+            }
             if let Some(ref mut listener_vec) = self.listeners.get_mut (tag) {
               for listener in listener_vec.iter_mut() {
                 let cl = command.clone();
