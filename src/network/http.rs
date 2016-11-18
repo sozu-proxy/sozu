@@ -269,7 +269,6 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       return ClientResult::Continue;
     }
 
-    //trace!("{}\treadable front pos: {}, buf pos: {}, available: {}", self.log_ctx, self.state.req_position, self.front_buf_position, self.front_buf.buffer.available_data());
     assert!(!self.state.as_ref().unwrap().is_front_error());
     assert!(self.back_buf.empty(), "investigating single buffer usage: the back->front buffer should not be used while parsing and forwarding the request");
 
@@ -360,11 +359,10 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           ClientResult::CloseClient
         },
         Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
-          //if self.front_buf_position + self.front_buf.buffer.available_data() >= self.state.req_position {
           if ! self.front_buf.needs_input() {
             self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
             &mut self.front_buf));
-            //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_ctx, self.state, self.state.req_position);
+
             if self.state.as_ref().unwrap().is_front_error() {
               error!("{}\t[{:?}] front chunk parsing error, closing the connection", self.log_ctx, self.token);
               time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
@@ -381,7 +379,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       _ => {
           self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
             &mut self.front_buf));
-          //debug!("{}\tparse_request_until_stop returned {:?} => advance: {}", self.log_ctx, self.state, self.state.req_position);
+
           if self.state.as_ref().unwrap().is_front_error() {
             error!("{}\t[{:?}] front parsing error, closing the connection", self.log_ctx, self.token);
             time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
@@ -403,6 +401,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
   fn writable(&mut self) -> ClientResult {
 
     assert!(self.front_buf.empty(), "investigating single buffer usage: the front->back buffer should not be used while parsing and forwarding the response");
+
     let output_size = self.back_buf.output_data_size();
     if self.status == ClientStatus::DefaultAnswer {
       if self.back_buf.output_data_size() == 0 {
@@ -449,7 +448,6 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     while res == SocketResult::Continue && self.back_buf.output_data_size() > 0 {
       let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
       res = current_res;
-      //println!("FRONT_WRITABLE[{}] wrote {} bytes:\n{}\nres={:?}", line!(), sz, self.back_buf.next_output_data().to_hex(16), res);
       self.back_buf.consume_output_data(current_sz);
       self.back_buf_position += current_sz;
       sz += current_sz;
@@ -457,7 +455,6 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
     if let Some((front,back)) = self.tokens() {
       debug!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}, buffer position {} restart position {}", self.log_ctx, front.0, back.0, sz, output_size, self.back_buf.buffer_position, self.back_buf.start_parsing_position);
-      //debug!("{}\tFRONT [{}<-{}]: back buf: {:?}", self.log_ctx, front.as_usize(), back.as_usize(), *self.back_buf);
     }
 
     match res {
@@ -533,8 +530,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
 
     assert!(self.back_buf.empty(), "investigating single buffer usage: the back->front buffer should not be used while parsing and forwarding the request");
-    //trace!("{}\twritable back pos: {}, buf pos: {}, available: {}", self.log_ctx, self.state.req_position, self.front_buf_position, self.front_buf.buffer.available_data());
-    //assert!(self.front_buf_position + self.front_buf.available_data() <= self.state.req_position);
+
     if self.front_buf.output_data_size() == 0 {
       self.readiness.front_interest.insert(Ready::readable());
       self.readiness.back_interest.remove(Ready::writable());
@@ -550,14 +546,12 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
 
     let sock = self.backend.as_mut().unwrap();
-    //let (sz, socket_res) = sock.socket_write(&(self.front_buf.next_buffer_unwrap())[..to_copy]);
     let mut sz = 0usize;
     let mut socket_res = SocketResult::Continue;
 
     while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
       let (current_sz, current_res) = sock.socket_write(self.front_buf.next_output_data());
       socket_res = current_res;
-      //println!("BACK_WRITABLE[{}] wrote {} bytes:\n{}\nres={:?}", line!(), current_sz, self.front_buf.next_output_data().to_hex(16), socket_res);
       self.front_buf.consume_output_data(current_sz);
       self.front_buf_position += current_sz;
       sz += current_sz;
@@ -617,11 +611,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     }
 
     assert!(self.front_buf.empty(), "investigating single buffer usage: the front->back buffer should not be used while parsing and forwarding the response");
-    //trace!("{}\treadable back pos: {}, buf pos: {}, available: {}", self.log_ctx, self.state.res_position, self.back_buf_position, self.back_buf.buffer.available_data());
-    //assert!(self.back_buf_position + self.back_buf.available_data() <= self.state.res_position);
 
     if self.back_buf.buffer.available_space() == 0 {
-      //println!("BACK BUFFER FULL({} bytes): TOKENS {:?} {:?}", self.back_buf.available_data(), self.token, self.backend_token);
       self.readiness.back_interest.remove(Ready::readable());
       return ClientResult::Continue;
     }
@@ -638,7 +629,6 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     let (sz, r) = sock.socket_read(&mut self.back_buf.buffer.space());
     self.back_buf.buffer.fill(sz);
     self.back_buf.sliced_input(sz);
-    //println!("BACK_READABLE[{}]\ndata:\n{}unparsed data:\n{}", line!(), self.back_buf.buffer.data().to_hex(16), self.back_buf.unparsed_data().to_hex(16));
 
     if let Some((front,back)) = tokens {
       debug!("{}\tBACK  [{}<-{}]: read {} bytes", self.log_ctx, front.0, back.0, sz);
@@ -678,11 +668,10 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         ClientResult::CloseClient
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
-        //if self.back_buf_position + self.back_buf.buffer.available_data() >= self.state.res_position {
         if ! self.back_buf.needs_input() {
           self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id,
           &mut self.back_buf));
-          //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
+
           if self.state.as_ref().unwrap().is_back_error() {
             error!("{}\tback socket chunk parse error, closing connection", self.log_ctx);
             time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
@@ -701,7 +690,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       _ => {
         self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id,
         &mut self.back_buf));
-        //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
+
         if self.state.as_ref().unwrap().is_back_error() {
           error!("{}\tback socket parse error, closing connection", self.log_ctx);
           time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
