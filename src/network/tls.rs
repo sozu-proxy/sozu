@@ -869,10 +869,11 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
 
 pub type TlsServer<Tx,Rx> = Server<ServerConfiguration<Tx>,TlsClient,Rx>;
 
-pub fn start_listener<Tx,Rx>(config: TlsProxyConfiguration, tx: Tx, mut event_loop: Poll, receiver: Rx)
+pub fn start_listener<Tx,Rx>(config: TlsProxyConfiguration, tx: Tx, receiver: Rx)
   where Tx: messages::Sender<ServerMessage>,
         Rx: Evented+messages::Receiver<ProxyOrder> {
 
+  let mut event_loop  = Poll::new().unwrap();
   let max_connections = config.max_connections;
   let max_listeners   = 1;
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer

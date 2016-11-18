@@ -27,12 +27,11 @@
 //!   ..Default::default()
 //! };
 //!
-//! let poll          = mio::Poll::new().unwrap();
 //! let (tx, rx)      = mio::channel::channel::<ProxyOrder>();
 //! let (sender, rec) = mpsc::channel::<network::ServerMessage>();
 //!
 //! let jg            = thread::spawn(move || {
-//!   network::http::start_listener(config, sender, poll, rx);
+//!   network::http::start_listener(config, sender, rx);
 //! });
 //! ```
 //!
@@ -114,12 +113,11 @@
 //!     ..Default::default()
 //!   };
 //!
-//!   let poll          = mio::Poll::new().unwrap();
 //!   let (tx, rx)      = mio::channel::channel::<ProxyOrder>();
 //!   let (sender, rec) = mpsc::channel::<network::ServerMessage>();
 //!
 //!   let jg            = thread::spawn(move || {
-//!     network::http::start_listener(config, sender, poll, rx);
+//!     network::http::start_listener(config, sender, rx);
 //!   });
 //!
 //!   let http_front = messages::HttpFront {

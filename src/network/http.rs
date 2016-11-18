@@ -1023,10 +1023,11 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client<TcpStream>> 
 
 pub type HttpServer<Tx,Rx> = Server<ServerConfiguration<Tx>,Client<TcpStream>,Rx>;
 
-pub fn start_listener<Tx,Rx>(config: HttpProxyConfiguration, tx: Tx, mut event_loop: Poll, receiver: Rx)
+pub fn start_listener<Tx,Rx>(config: HttpProxyConfiguration, tx: Tx, receiver: Rx)
   where Tx: messages::Sender<ServerMessage>,
         Rx: Evented+messages::Receiver<ProxyOrder> {
 
+  let mut event_loop  = Poll::new().unwrap();
   let max_connections = config.max_connections;
   let max_listeners   = 1;
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
@@ -1071,10 +1072,9 @@ mod tests {
       ..Default::default()
     };
 
-    let mut poll = Poll::new().unwrap();
     let (sender, receiver) = channel::channel::<ProxyOrder>();
     let jg = thread::spawn(move || {
-      start_listener(config, tx.clone(), poll, receiver);
+      start_listener(config, tx.clone(), receiver);
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
@@ -1123,10 +1123,9 @@ mod tests {
       buffer_size: 12000,
       ..Default::default()
     };
-    let mut poll = Poll::new().unwrap();
     let (sender, receiver) = channel::channel::<ProxyOrder>();
     let jg = thread::spawn(move|| {
-      start_listener(config, tx.clone(), poll, receiver);
+      start_listener(config, tx.clone(), receiver);
     });
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1031"), path_begin: String::from("/") };
     sender.send(ProxyOrder::Command(String::from("ID_ABCD"), Command::AddHttpFront(front)));

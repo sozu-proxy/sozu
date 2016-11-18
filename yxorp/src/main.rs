@@ -27,7 +27,7 @@ use yxorp::network::metrics::{METRICS,ProxyMetrics};
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
 use clap::{App,Arg};
-use mio::{channel,Poll};
+use mio::channel;
 
 use command::Listener;
 use command::data::ListenerType;
@@ -87,22 +87,20 @@ fn main() {
             let mut http_listeners = Vec::new();
             for index in 1..ls.worker_count.unwrap_or(1) {
               let (sender, receiver) = channel::<network::ServerMessage>();
-              let poll = Poll::new().unwrap();
               let (tx, rx) = channel::channel::<ProxyOrder>();
               let config = conf.clone();
               thread::spawn(move || {
-                network::http::start_listener(config, sender, poll, rx);
+                network::http::start_listener(config, sender, rx);
               });
               let t = format!("{}-{}", tag, index);
               let l =  Listener::new(t, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
               http_listeners.push(l);
             }
             let (sender, receiver) = channel::<network::ServerMessage>();
-            let poll = Poll::new().unwrap();
             let (tx, rx) = channel::channel::<ProxyOrder>();
             //FIXME: keep this to get a join guard
             let jg = thread::spawn(move || {
-              network::http::start_listener(conf, sender, poll, rx);
+              network::http::start_listener(conf, sender, rx);
             });
             let t = format!("{}-{}", tag, 0);
             let l =  Listener::new(t, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
@@ -118,22 +116,20 @@ fn main() {
             let mut tls_listeners = Vec::new();
             for index in 1..ls.worker_count.unwrap_or(1) {
               let (sender, receiver) = channel::<network::ServerMessage>();
-              let poll = Poll::new().unwrap();
               let (tx, rx) = channel::channel::<ProxyOrder>();
               let config = conf.clone();
               thread::spawn(move || {
-                network::tls::start_listener(config, sender, poll, rx);
+                network::tls::start_listener(config, sender, rx);
               });
               let t = format!("{}-{}", tag, index);
               let l =  Listener::new(t.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
               tls_listeners.push(l);
             }
             let (sender, receiver) = channel::<network::ServerMessage>();
-            let poll = Poll::new().unwrap();
             let (tx, rx) = channel::channel::<ProxyOrder>();
             //FIXME: keep this to get a join guard
             let jg = thread::spawn(move || {
-              network::tls::start_listener(conf, sender, poll, rx);
+              network::tls::start_listener(conf, sender, rx);
             });
             let t = format!("{}-{}", tag, 0);
             let l =  Listener::new(t, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);

@@ -588,12 +588,12 @@ pub fn start() -> channel::Sender<ProxyOrder> {
   mtx
 }
 
-pub fn start_listener<Tx,Rx>(max_listeners: usize, max_connections: usize, tx: Tx, poll: Poll, rx: Rx)
+pub fn start_listener<Tx,Rx>(max_listeners: usize, max_connections: usize, tx: Tx, rx: Rx)
   where Tx: messages::Sender<ServerMessage>,
         Rx: Evented+messages::Receiver<ProxyOrder> {
-  //let notify_tx = tx.clone();
-  let configuration = ServerConfiguration::new(max_listeners, tx);
-  let mut server = TcpServer::new(max_listeners, max_connections, configuration, poll, rx);
+  let poll              = Poll::new().unwrap();
+  let configuration     = ServerConfiguration::new(max_listeners, tx);
+  let mut server        = TcpServer::new(max_listeners, max_connections, configuration, poll, rx);
   let front: SocketAddr = FromStr::from_str("127.0.0.1:8443").unwrap();
   //server.configuration().add_tcp_front("yolo", &front, &mut event_loop);
 
