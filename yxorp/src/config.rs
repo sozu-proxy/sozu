@@ -99,9 +99,8 @@ impl Config {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use rustc_serialize::Encodable;
   use std::collections::HashMap;
-  use toml::{encode_str,decode_str};
+  use toml::encode_str;
   use command::data::ListenerType;
 
   #[test]

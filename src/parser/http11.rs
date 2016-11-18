@@ -1172,6 +1172,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8]) -> (BufferMove, Response
   }
 }
 
+#[allow(unused_variables)]
 pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue) -> HttpState {
   let mut current_state  = rs.request.take().expect("the request state should never be None outside of this function");
   let mut header_end     = rs.req_header_end;
@@ -1258,6 +1259,7 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
   rs
 }
 
+#[allow(unused_variables)]
 pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue) -> HttpState {
   let mut current_state = rs.response.take().expect("the response state should never be None outside of this function");
   let mut header_end    = rs.res_header_end;
@@ -2394,6 +2396,7 @@ mod bench {
   use nom::HexDisplay;
 
   #[bench]
+  #[allow(unused_must_use)]
   fn req_bench(b: &mut Bencher) {
     let data = b"GET /reddit-init.en-us.O1zuMqOOQvY.js HTTP/1.1\r\n\
                  Host: www.redditstatic.com\r\n\

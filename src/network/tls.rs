@@ -318,8 +318,8 @@ pub struct ServerConfiguration<Tx> {
 
 impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
   pub fn new(config: TlsProxyConfiguration, tx: Tx, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration<Tx>> {
-    let mut contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
-    let mut domains  = TrieNode::root();
+    let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
+    let domains  = TrieNode::root();
 
     /*let ctx = SslContext::new(SslMethod::Sslv23);
     if let Err(e) = ctx {

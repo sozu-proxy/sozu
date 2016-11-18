@@ -23,7 +23,7 @@ use state::{HttpProxy,TlsProxy,ConfigState};
 
 pub mod data;
 pub mod orders;
-use self::data::{ConfigCommand,ConfigMessage,ListenerDeserializer,ListenerType};
+use self::data::{ConfigMessage,ListenerDeserializer,ListenerType};
 
 const SERVER: Token = Token(0);
 
@@ -267,10 +267,6 @@ impl CommandServer {
       //FIXME: what do other cases mean, like Ok(None)?
       acc.map(|_| ())
     }
-  }
-
-  fn conn<'a>(&'a mut self, tok: FrontToken) -> &'a mut CommandClient {
-    &mut self.conns[tok]
   }
 
   fn dispatch(&mut self, token: FrontToken, v: Vec<ConfigMessage>) {

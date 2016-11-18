@@ -77,7 +77,7 @@ fn main() {
     let metrics_guard = ProxyMetrics::run();
 
     let mut listeners = HashMap::new();
-    let mut jh_opt: Option<JoinHandle<()>> = None;
+    let jh_opt: Option<JoinHandle<()>> = None;
 
     for (ref tag, ref ls) in config.listeners {
       let jh_opt = match ls.listener_type {

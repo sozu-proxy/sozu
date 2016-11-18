@@ -1,3 +1,4 @@
+#![allow(unused_variables,unused_must_use)]
 #[macro_use] extern crate log;
 extern crate env_logger;
 extern crate yxorp;
