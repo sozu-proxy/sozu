@@ -335,9 +335,9 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
       if self.state.as_ref().unwrap().has_host() {
         self.readiness.back_interest.insert(Ready::writable());
-        return ClientResult::ConnectBackend;
+        ClientResult::ConnectBackend
       } else {
-        return ClientResult::Continue;
+        ClientResult::Continue
       }
     } else {
       self.readiness.back_interest.insert(Ready::writable());
@@ -347,17 +347,17 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
             // stop reading
             self.readiness.front_interest.remove(Ready::readable());
           }
-          return ClientResult::Continue;
+          ClientResult::Continue
         },
         Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
           error!("{}\t[{:?}] front read should have stopped on chunk ended", self.log_ctx, self.token);
           self.readiness.front_interest.remove(Ready::readable());
-          return ClientResult::Continue;
+          ClientResult::Continue
         },
         Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Error)) => {
           error!("{}\t[{:?}] front read should have stopped on chunk error", self.log_ctx, self.token);
           self.readiness.reset();
-          return ClientResult::CloseClient;
+          ClientResult::CloseClient
         },
         Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
           //if self.front_buf_position + self.front_buf.buffer.available_data() >= self.state.req_position {
@@ -376,7 +376,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
               self.readiness.front_interest.remove(Ready::readable());
             }
           }
-          return ClientResult::Continue;
+          ClientResult::Continue
         },
       _ => {
           self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
@@ -393,7 +393,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
             self.readiness.front_interest.remove(Ready::readable());
           }
           self.readiness.back_interest.insert(Ready::writable());
-          return ClientResult::Continue;
+          ClientResult::Continue
         }
       }
     }
@@ -658,24 +658,24 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       Some(ResponseState::Response(_,_)) => {
         error!("{}\tshould not go back in back_readable if the whole response was parsed", self.log_ctx);
         self.readiness.back_interest.remove(Ready::readable());
-        return  ClientResult::Continue;
+        ClientResult::Continue
       },
       Some(ResponseState::ResponseWithBody(_,_,_)) => {
         self.readiness.front_interest.insert(Ready::writable());
         if ! self.back_buf.needs_input() {
           self.readiness.back_interest.remove(Ready::readable());
         }
-        return ClientResult::Continue;
+        ClientResult::Continue
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
         error!("{}\tback read should have stopped on chunk ended", self.log_ctx);
         self.readiness.back_interest.remove(Ready::readable());
-        return ClientResult::Continue;
+        ClientResult::Continue
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Error)) => {
         error!("{}\tback read should have stopped on chunk error", self.log_ctx);
         self.readiness.reset();
-        return ClientResult::CloseClient;
+        ClientResult::CloseClient
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
         //if self.back_buf_position + self.back_buf.buffer.available_data() >= self.state.res_position {
@@ -695,7 +695,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           }
           self.readiness.front_interest.insert(Ready::writable());
         }
-        return ClientResult::Continue;
+        ClientResult::Continue
       },
       Some(ResponseState::Error(_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
       _ => {
@@ -713,7 +713,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           self.readiness.back_interest.remove(Ready::readable());
         }
         self.readiness.front_interest.insert(Ready::writable());
-        return ClientResult::Continue;
+        ClientResult::Continue
       }
     }
   }
