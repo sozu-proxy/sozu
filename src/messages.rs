@@ -10,33 +10,33 @@ use std::sync::mpsc;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpFront {
-    pub app_id: String,
-    pub hostname: String,
+    pub app_id:     String,
+    pub hostname:   String,
     pub path_begin: String,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct TlsFront {
-    pub app_id: String,
-    pub hostname: String,
-    pub path_begin: String,
-    pub certificate: String,
+    pub app_id:            String,
+    pub hostname:          String,
+    pub path_begin:        String,
+    pub certificate:       String,
     pub certificate_chain: Vec<String>,
-    pub key:         String,
+    pub key:               String,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct TcpFront {
-    pub app_id: String,
+    pub app_id:     String,
     pub ip_address: String,
-    pub port: u16
+    pub port:       u16
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct Instance {
-    pub app_id: String,
+    pub app_id:     String,
     pub ip_address: String,
-    pub port: u16
+    pub port:       u16
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
