@@ -373,13 +373,9 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
               if let Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) = self.state.as_ref().unwrap().request {
                 self.readiness.front_interest.remove(Ready::readable());
-                return ClientResult::Continue;
-              } else {
-                return ClientResult::Continue;
               }
-            } else {
-              return ClientResult::Continue;
             }
+            return ClientResult::Continue;
           }
         },
       _ => {
@@ -395,12 +391,9 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
           if let Some(RequestState::Request(_,_,_)) = self.state.as_ref().unwrap().request {
             self.readiness.front_interest.remove(Ready::readable());
-            self.readiness.back_interest.insert(Ready::writable());
-            return ClientResult::Continue;
-          } else {
-            self.readiness.back_interest.insert(Ready::writable());
-            return ClientResult::Continue;
           }
+          self.readiness.back_interest.insert(Ready::writable());
+          return ClientResult::Continue;
         }
       }
     }
@@ -479,54 +472,54 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       SocketResult::Continue => {},
     }
 
-    if self.back_buf.can_restart_parsing() {
-      match self.state.as_ref().unwrap().response {
-        // FIXME: should only restart parsing if we are using keepalive
-        Some(ResponseState::Response(_,_))                              |
-          Some(ResponseState::ResponseWithBody(_,_,_))                  |
-          Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
-            let front_keep_alive = self.state.as_ref().map(|st| st.request.as_ref().map(|r| r.should_keep_alive()).unwrap_or(false)).unwrap_or(false);
-            let back_keep_alive  = self.state.as_ref().map(|st| st.response.as_ref().map(|r| r.should_keep_alive()).unwrap_or(false)).unwrap_or(false);
-
-            //FIXME: we could get smarter about this
-            // with no keepalive on backend, we could open a new backend ConnectionError
-            // with no keepalive on front but keepalive on backend, we could have
-            // a pool of connections
-            if front_keep_alive && back_keep_alive {
-              self.reset();
-              self.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
-              self.readiness.back_interest  = Ready::writable() | Ready::hup() | Ready::error();
-
-              info!("{}\t[{:?}] request ended successfully, keep alive for front and back", self.log_ctx, self.token);
-              ClientResult::Continue
-              //FIXME: issues reusing the backend socket
-              //self.readiness.back_interest  = Ready::hup() | Ready::error();
-              //ClientResult::CloseBackend
-            } else if front_keep_alive && !back_keep_alive {
-              self.reset();
-              self.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
-              self.readiness.back_interest  = Ready::hup() | Ready::error();
-              info!("{}\t[{:?}] request ended successfully, keepalive for front", self.log_ctx, self.token);
-              ClientResult::CloseBackend
-            } else {
-              info!("{}\t[{:?}] request ended successfully, closing front and back connections", self.log_ctx, self.token);
-              self.readiness.reset();
-              ClientResult::CloseBothSuccess
-            }
-          },
-          // restart parsing, since there will be other chunks next
-          Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
-            self.readiness.back_interest.insert(Ready::readable());
-            ClientResult::Continue
-          },
-          _ => {
-            self.readiness.reset();
-            ClientResult::CloseBothFailure
-          }
-      }
-    } else {
+    if !self.back_buf.can_restart_parsing() {
       self.readiness.back_interest.insert(Ready::readable());
-      ClientResult::Continue
+      return ClientResult::Continue;
+    }
+
+    match self.state.as_ref().unwrap().response {
+      // FIXME: should only restart parsing if we are using keepalive
+      Some(ResponseState::Response(_,_))                            |
+      Some(ResponseState::ResponseWithBody(_,_,_))                  |
+      Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
+        let front_keep_alive = self.state.as_ref().map(|st| st.request.as_ref().map(|r| r.should_keep_alive()).unwrap_or(false)).unwrap_or(false);
+        let back_keep_alive  = self.state.as_ref().map(|st| st.response.as_ref().map(|r| r.should_keep_alive()).unwrap_or(false)).unwrap_or(false);
+
+        //FIXME: we could get smarter about this
+        // with no keepalive on backend, we could open a new backend ConnectionError
+        // with no keepalive on front but keepalive on backend, we could have
+        // a pool of connections
+        if front_keep_alive && back_keep_alive {
+          self.reset();
+          self.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
+          self.readiness.back_interest  = Ready::writable() | Ready::hup() | Ready::error();
+
+          info!("{}\t[{:?}] request ended successfully, keep alive for front and back", self.log_ctx, self.token);
+          ClientResult::Continue
+          //FIXME: issues reusing the backend socket
+          //self.readiness.back_interest  = Ready::hup() | Ready::error();
+          //ClientResult::CloseBackend
+        } else if front_keep_alive && !back_keep_alive {
+          self.reset();
+          self.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
+          self.readiness.back_interest  = Ready::hup() | Ready::error();
+          info!("{}\t[{:?}] request ended successfully, keepalive for front", self.log_ctx, self.token);
+          ClientResult::CloseBackend
+        } else {
+          info!("{}\t[{:?}] request ended successfully, closing front and back connections", self.log_ctx, self.token);
+          self.readiness.reset();
+          ClientResult::CloseBothSuccess
+        }
+      },
+      // restart parsing, since there will be other chunks next
+      Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
+        self.readiness.back_interest.insert(Ready::readable());
+        ClientResult::Continue
+      },
+      _ => {
+        self.readiness.reset();
+        ClientResult::CloseBothFailure
+      }
     }
   }
 
@@ -665,10 +658,8 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           self.readiness.front_interest.insert(Ready::writable());
           if ! self.back_buf.needs_input() {
             self.readiness.back_interest.remove(Ready::readable());
-            return ClientResult::Continue;
-          } else {
-            return ClientResult::Continue;
           }
+          return ClientResult::Continue;
         },
         Some(ResponseState::ResponseWithBodyChunks(_,_,ch)) => {
           if ch == Chunk::Ended {
@@ -694,14 +685,10 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
               if let Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) = self.state.as_ref().unwrap().response {
                 self.readiness.back_interest.remove(Ready::readable());
-                return ClientResult::Continue;
-              } else {
-                self.readiness.front_interest.insert(Ready::writable());
-                return ClientResult::Continue;
               }
-            } else {
-              return ClientResult::Continue;
+              self.readiness.front_interest.insert(Ready::writable());
             }
+            return ClientResult::Continue;
           }
         },
         Some(ResponseState::Error(_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
@@ -717,13 +704,10 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
           }
 
           if let Some(ResponseState::Response(_,_)) = self.state.as_ref().unwrap().response {
-            self.readiness.front_interest.insert(Ready::writable());
             self.readiness.back_interest.remove(Ready::readable());
-            return ClientResult::Continue;
-          } else {
-            self.readiness.front_interest.insert(Ready::writable());
-            return ClientResult::Continue;
           }
+          self.readiness.front_interest.insert(Ready::writable());
+          return ClientResult::Continue;
         }
       }
     } else {
@@ -732,7 +716,6 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       return ClientResult::CloseBothFailure;
     }
   }
-
 }
 
 type ClientToken = Token;
