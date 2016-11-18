@@ -15,7 +15,7 @@ fn main() {
   info!("starting up");
 
   let config = messages::HttpProxyConfiguration {
-    front: "198.51.100.0:80".parse().unwrap(),
+    front: "127.0.0.1:8080".parse().unwrap(),
     ..Default::default()
   };
 
@@ -34,8 +34,8 @@ fn main() {
   };
   let http_instance = messages::Instance {
     app_id:     String::from("test"),
-    ip_address: String::from("192.0.2.1"),
-    port:       8080
+    ip_address: String::from("127.0.0.1"),
+    port:       8000
   };
 
   tx.send(network::ProxyOrder::Command(
