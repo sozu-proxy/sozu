@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self,Error,ErrorKind,Read};
 use std::fs::File;
-use command::ListenerType;
+use command::data::ListenerType;
 use toml;
 
 use yxorp::messages::{HttpProxyConfiguration,TlsProxyConfiguration};
@@ -102,7 +102,7 @@ mod tests {
   use rustc_serialize::Encodable;
   use std::collections::HashMap;
   use toml::{encode_str,decode_str};
-  use command::ListenerType;
+  use command::data::ListenerType;
 
   #[test]
   fn serialize() {

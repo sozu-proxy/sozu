@@ -29,7 +29,8 @@ use env_logger::LogBuilder;
 use clap::{App,Arg};
 use mio::{channel,Poll};
 
-use command::{Listener,ListenerType};
+use command::Listener;
+use command::data::ListenerType;
 
 fn main() {
   let pid = unsafe { libc::getpid() };
