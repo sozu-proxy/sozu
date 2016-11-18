@@ -115,6 +115,9 @@ mod tests {
       buffer_size: 12000,
       answer_404: Some(String::from("404.html")),
       answer_503: None,
+      public_address: None,
+      cipher_list: None,
+      worker_count: None,
     });
     map.insert(String::from("TLS"), ListenerConfig {
       listener_type: ListenerType::HTTPS,
@@ -124,10 +127,16 @@ mod tests {
       buffer_size: 12000,
       answer_404: Some(String::from("404.html")),
       answer_503: None,
+      public_address: None,
+      cipher_list: None,
+      worker_count: None,
     });
     let config = Config {
       command_socket: String::from("./command_folder/sock"),
       saved_state: None,
+      command_buffer_size: None,
+      max_command_buffer_size: None,
+      log_level: None,
       metrics: MetricsConfig {
         address: String::from("192.168.59.103"),
         port:    8125,
