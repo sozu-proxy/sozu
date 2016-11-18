@@ -2,25 +2,22 @@ use mio::*;
 use mio::deprecated::unix::*;
 use mio::timer::{Timer,Timeout};
 use slab::Slab;
+use std::fs;
 use std::path::PathBuf;
 use std::io::{self,BufRead,BufReader,Read,Write,ErrorKind};
 use std::str::from_utf8;
-use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::cmp::min;
+use std::time::Duration;
 use log;
 use nom::{IResult,HexDisplay};
-use serde;
 use serde_json;
 use serde_json::from_str;
-use rustc_serialize::{Decodable,Decoder,Encodable,Encoder};
-use std::time::Duration;
 
 use yxorp::network::{ProxyOrder,ServerMessage};
 use yxorp::network::buffer::Buffer;
-use yxorp::messages::Command;
 
 use state::{HttpProxy,TlsProxy,ConfigState};
 
