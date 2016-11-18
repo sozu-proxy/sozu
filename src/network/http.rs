@@ -649,83 +649,80 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         self.readiness.back_readiness.remove(Ready::readable());
       }
 
-      match r {
-        SocketResult::Error => {
+      if r == SocketResult::Error {
         error!("{}\tback socket read error, closing connection", self.log_ctx);
-          self.readiness.reset();
-          ClientResult::CloseBothFailure
-        },
-        _                   => {
-          match self.state.as_ref().unwrap().response {
-            Some(ResponseState::Response(_,_)) => {
-              error!("{}\tshould not go back in back_readable if the whole response was parsed", self.log_ctx);
-              self.readiness.back_interest.remove(Ready::readable());
-              return  ClientResult::Continue;
-            },
-            Some(ResponseState::ResponseWithBody(_,_,_)) => {
-              self.readiness.front_interest.insert(Ready::writable());
-              if ! self.back_buf.needs_input() {
-                self.readiness.back_interest.remove(Ready::readable());
-                return ClientResult::Continue;
-              } else {
-                return ClientResult::Continue;
-              }
-            },
-            Some(ResponseState::ResponseWithBodyChunks(_,_,ch)) => {
-              if ch == Chunk::Ended {
-                error!("{}\tback read should have stopped on chunk ended", self.log_ctx);
-                self.readiness.back_interest.remove(Ready::readable());
-                return ClientResult::Continue;
-              } else if ch == Chunk::Error {
-                error!("{}\tback read should have stopped on chunk error", self.log_ctx);
-                self.readiness.reset();
-                return ClientResult::CloseClient;
-              } else {
-                //if self.back_buf_position + self.back_buf.buffer.available_data() >= self.state.res_position {
-                if ! self.back_buf.needs_input() {
-                  self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id,
-                    &mut self.back_buf));
-                  //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
-                  if self.state.as_ref().unwrap().is_back_error() {
-                    error!("{}\tback socket chunk parse error, closing connection", self.log_ctx);
-                    time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
-                    self.readiness.reset();
-                    return ClientResult::CloseBothFailure;
-                  }
+        self.readiness.reset();
+        return ClientResult::CloseBothFailure;
+      }
 
-                  if let Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) = self.state.as_ref().unwrap().response {
-                    self.readiness.back_interest.remove(Ready::readable());
-                    return ClientResult::Continue;
-                  } else {
-                    self.readiness.front_interest.insert(Ready::writable());
-                    return ClientResult::Continue;
-                  }
-                } else {
-                  return ClientResult::Continue;
-                }
-              }
-            },
-            Some(ResponseState::Error(_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
-            _ => {
+      match self.state.as_ref().unwrap().response {
+        Some(ResponseState::Response(_,_)) => {
+          error!("{}\tshould not go back in back_readable if the whole response was parsed", self.log_ctx);
+          self.readiness.back_interest.remove(Ready::readable());
+          return  ClientResult::Continue;
+        },
+        Some(ResponseState::ResponseWithBody(_,_,_)) => {
+          self.readiness.front_interest.insert(Ready::writable());
+          if ! self.back_buf.needs_input() {
+            self.readiness.back_interest.remove(Ready::readable());
+            return ClientResult::Continue;
+          } else {
+            return ClientResult::Continue;
+          }
+        },
+        Some(ResponseState::ResponseWithBodyChunks(_,_,ch)) => {
+          if ch == Chunk::Ended {
+            error!("{}\tback read should have stopped on chunk ended", self.log_ctx);
+            self.readiness.back_interest.remove(Ready::readable());
+            return ClientResult::Continue;
+          } else if ch == Chunk::Error {
+            error!("{}\tback read should have stopped on chunk error", self.log_ctx);
+            self.readiness.reset();
+            return ClientResult::CloseClient;
+          } else {
+            //if self.back_buf_position + self.back_buf.buffer.available_data() >= self.state.res_position {
+            if ! self.back_buf.needs_input() {
               self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id,
                 &mut self.back_buf));
               //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
               if self.state.as_ref().unwrap().is_back_error() {
-                error!("{}\tback socket parse error, closing connection", self.log_ctx);
+                error!("{}\tback socket chunk parse error, closing connection", self.log_ctx);
                 time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
                 self.readiness.reset();
                 return ClientResult::CloseBothFailure;
               }
 
-              if let Some(ResponseState::Response(_,_)) = self.state.as_ref().unwrap().response {
-                self.readiness.front_interest.insert(Ready::writable());
+              if let Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) = self.state.as_ref().unwrap().response {
                 self.readiness.back_interest.remove(Ready::readable());
                 return ClientResult::Continue;
               } else {
                 self.readiness.front_interest.insert(Ready::writable());
                 return ClientResult::Continue;
               }
+            } else {
+              return ClientResult::Continue;
             }
+          }
+        },
+        Some(ResponseState::Error(_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
+        _ => {
+          self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id,
+            &mut self.back_buf));
+          //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
+          if self.state.as_ref().unwrap().is_back_error() {
+            error!("{}\tback socket parse error, closing connection", self.log_ctx);
+            time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+            self.readiness.reset();
+            return ClientResult::CloseBothFailure;
+          }
+
+          if let Some(ResponseState::Response(_,_)) = self.state.as_ref().unwrap().response {
+            self.readiness.front_interest.insert(Ready::writable());
+            self.readiness.back_interest.remove(Ready::readable());
+            return ClientResult::Continue;
+          } else {
+            self.readiness.front_interest.insert(Ready::writable());
+            return ClientResult::Continue;
           }
         }
       }
