@@ -543,70 +543,69 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
     let tokens = self.tokens().clone();
     let output_size = self.front_buf.output_data_size();
-    let res = if let Some(ref mut sock) = self.backend {
-      //let (sz, socket_res) = sock.socket_write(&(self.front_buf.next_buffer_unwrap())[..to_copy]);
-      let mut sz = 0usize;
-      let mut socket_res = SocketResult::Continue;
-
-      while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
-        let (current_sz, current_res) = sock.socket_write(self.front_buf.next_output_data());
-        socket_res = current_res;
-        //println!("BACK_WRITABLE[{}] wrote {} bytes:\n{}\nres={:?}", line!(), current_sz, self.front_buf.next_output_data().to_hex(16), socket_res);
-        self.front_buf.consume_output_data(current_sz);
-        self.front_buf_position += current_sz;
-        sz += current_sz;
-      }
-
-      if let Some((front,back)) = tokens {
-        debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", self.log_ctx, front.0, back.0, sz, output_size);
-      }
-      match socket_res {
-        SocketResult::Error => {
-        error!("{}\tback socket write error, closing connection", self.log_ctx);
-          self.readiness.reset();
-          return ClientResult::CloseBothFailure;
-        },
-        SocketResult::WouldBlock => {
-          self.readiness.back_readiness.remove(Ready::writable());
-
-        },
-        SocketResult::Continue => {}
-      }
-
-      // FIXME/ should read exactly as much data as needed
-      //if self.front_buf_position >= self.state.req_position {
-      if self.front_buf.can_restart_parsing() {
-        match self.state.as_ref().unwrap().request {
-          Some(RequestState::Request(_,_,_))                            |
-          Some(RequestState::RequestWithBody(_,_,_,_))                  |
-          Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
-            self.readiness.front_interest.remove(Ready::readable());
-            self.readiness.back_interest.insert(Ready::readable());
-            self.readiness.back_interest.remove(Ready::writable());
-            ClientResult::Continue
-          },
-          Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
-            self.readiness.front_interest.insert(Ready::readable());
-            ClientResult::Continue
-          },
-          ref s => {
-            error!("{}\tinvalid state, closing connection: {:?}", self.log_ctx, s);
-            self.readiness.reset();
-            ClientResult::CloseBothFailure
-          }
-        }
-      } else {
-        self.readiness.front_interest.insert(Ready::readable());
-        self.readiness.back_interest.insert(Ready::writable());
-        ClientResult::Continue
-      }
-    } else {
+    if self.backend.is_none() {
       error!("{}\tback socket not found, closing connection", self.log_ctx);
       self.readiness.reset();
       return ClientResult::CloseBothFailure;
-    };
+    }
 
-    res
+    let sock = self.backend.as_mut().unwrap();
+    //let (sz, socket_res) = sock.socket_write(&(self.front_buf.next_buffer_unwrap())[..to_copy]);
+    let mut sz = 0usize;
+    let mut socket_res = SocketResult::Continue;
+
+    while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
+      let (current_sz, current_res) = sock.socket_write(self.front_buf.next_output_data());
+      socket_res = current_res;
+      //println!("BACK_WRITABLE[{}] wrote {} bytes:\n{}\nres={:?}", line!(), current_sz, self.front_buf.next_output_data().to_hex(16), socket_res);
+      self.front_buf.consume_output_data(current_sz);
+      self.front_buf_position += current_sz;
+      sz += current_sz;
+    }
+
+    if let Some((front,back)) = tokens {
+      debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", self.log_ctx, front.0, back.0, sz, output_size);
+    }
+    match socket_res {
+      SocketResult::Error => {
+        error!("{}\tback socket write error, closing connection", self.log_ctx);
+        self.readiness.reset();
+        return ClientResult::CloseBothFailure;
+      },
+      SocketResult::WouldBlock => {
+        self.readiness.back_readiness.remove(Ready::writable());
+
+      },
+      SocketResult::Continue => {}
+    }
+
+    // FIXME/ should read exactly as much data as needed
+    //if self.front_buf_position >= self.state.req_position {
+    if self.front_buf.can_restart_parsing() {
+      match self.state.as_ref().unwrap().request {
+        Some(RequestState::Request(_,_,_))                            |
+        Some(RequestState::RequestWithBody(_,_,_,_))                  |
+        Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
+          self.readiness.front_interest.remove(Ready::readable());
+          self.readiness.back_interest.insert(Ready::readable());
+          self.readiness.back_interest.remove(Ready::writable());
+          ClientResult::Continue
+        },
+        Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
+          self.readiness.front_interest.insert(Ready::readable());
+          ClientResult::Continue
+        },
+        ref s => {
+          error!("{}\tinvalid state, closing connection: {:?}", self.log_ctx, s);
+          self.readiness.reset();
+          ClientResult::CloseBothFailure
+        }
+      }
+    } else {
+      self.readiness.front_interest.insert(Ready::readable());
+      self.readiness.back_interest.insert(Ready::writable());
+      ClientResult::Continue
+    }
   }
 
   // Read content from application
@@ -629,91 +628,93 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
     let tokens     = self.tokens().clone();
 
-    if let Some(ref mut sock) = self.backend {
-      let (sz, r) = sock.socket_read(&mut self.back_buf.buffer.space());
-      self.back_buf.buffer.fill(sz);
-      self.back_buf.sliced_input(sz);
-      //println!("BACK_READABLE[{}]\ndata:\n{}unparsed data:\n{}", line!(), self.back_buf.buffer.data().to_hex(16), self.back_buf.unparsed_data().to_hex(16));
-      if let Some((front,back)) = tokens {
-        debug!("{}\tBACK  [{}<-{}]: read {} bytes", self.log_ctx, front.0, back.0, sz);
-      }
-
-      if r != SocketResult::Continue || sz == 0 {
-        self.readiness.back_readiness.remove(Ready::readable());
-      }
-
-      if r == SocketResult::Error {
-        error!("{}\tback socket read error, closing connection", self.log_ctx);
-        self.readiness.reset();
-        return ClientResult::CloseBothFailure;
-      }
-
-      match self.state.as_ref().unwrap().response {
-        Some(ResponseState::Response(_,_)) => {
-          error!("{}\tshould not go back in back_readable if the whole response was parsed", self.log_ctx);
-          self.readiness.back_interest.remove(Ready::readable());
-          return  ClientResult::Continue;
-        },
-        Some(ResponseState::ResponseWithBody(_,_,_)) => {
-          self.readiness.front_interest.insert(Ready::writable());
-          if ! self.back_buf.needs_input() {
-            self.readiness.back_interest.remove(Ready::readable());
-          }
-          return ClientResult::Continue;
-        },
-        Some(ResponseState::ResponseWithBodyChunks(_,_,ch)) => {
-          if ch == Chunk::Ended {
-            error!("{}\tback read should have stopped on chunk ended", self.log_ctx);
-            self.readiness.back_interest.remove(Ready::readable());
-            return ClientResult::Continue;
-          } else if ch == Chunk::Error {
-            error!("{}\tback read should have stopped on chunk error", self.log_ctx);
-            self.readiness.reset();
-            return ClientResult::CloseClient;
-          } else {
-            //if self.back_buf_position + self.back_buf.buffer.available_data() >= self.state.res_position {
-            if ! self.back_buf.needs_input() {
-              self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id,
-                &mut self.back_buf));
-              //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
-              if self.state.as_ref().unwrap().is_back_error() {
-                error!("{}\tback socket chunk parse error, closing connection", self.log_ctx);
-                time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
-                self.readiness.reset();
-                return ClientResult::CloseBothFailure;
-              }
-
-              if let Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) = self.state.as_ref().unwrap().response {
-                self.readiness.back_interest.remove(Ready::readable());
-              }
-              self.readiness.front_interest.insert(Ready::writable());
-            }
-            return ClientResult::Continue;
-          }
-        },
-        Some(ResponseState::Error(_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
-        _ => {
-          self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id,
-            &mut self.back_buf));
-          //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
-          if self.state.as_ref().unwrap().is_back_error() {
-            error!("{}\tback socket parse error, closing connection", self.log_ctx);
-            time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
-            self.readiness.reset();
-            return ClientResult::CloseBothFailure;
-          }
-
-          if let Some(ResponseState::Response(_,_)) = self.state.as_ref().unwrap().response {
-            self.readiness.back_interest.remove(Ready::readable());
-          }
-          self.readiness.front_interest.insert(Ready::writable());
-          return ClientResult::Continue;
-        }
-      }
-    } else {
+    if self.backend.is_none() {
       error!("{}\tback socket not found, closing connection", self.log_ctx);
       self.readiness.reset();
       return ClientResult::CloseBothFailure;
+    }
+
+    let sock = self.backend.as_mut().unwrap();
+    let (sz, r) = sock.socket_read(&mut self.back_buf.buffer.space());
+    self.back_buf.buffer.fill(sz);
+    self.back_buf.sliced_input(sz);
+    //println!("BACK_READABLE[{}]\ndata:\n{}unparsed data:\n{}", line!(), self.back_buf.buffer.data().to_hex(16), self.back_buf.unparsed_data().to_hex(16));
+
+    if let Some((front,back)) = tokens {
+      debug!("{}\tBACK  [{}<-{}]: read {} bytes", self.log_ctx, front.0, back.0, sz);
+    }
+
+    if r != SocketResult::Continue || sz == 0 {
+      self.readiness.back_readiness.remove(Ready::readable());
+    }
+
+    if r == SocketResult::Error {
+      error!("{}\tback socket read error, closing connection", self.log_ctx);
+      self.readiness.reset();
+      return ClientResult::CloseBothFailure;
+    }
+
+    match self.state.as_ref().unwrap().response {
+      Some(ResponseState::Response(_,_)) => {
+        error!("{}\tshould not go back in back_readable if the whole response was parsed", self.log_ctx);
+        self.readiness.back_interest.remove(Ready::readable());
+        return  ClientResult::Continue;
+      },
+      Some(ResponseState::ResponseWithBody(_,_,_)) => {
+        self.readiness.front_interest.insert(Ready::writable());
+        if ! self.back_buf.needs_input() {
+          self.readiness.back_interest.remove(Ready::readable());
+        }
+        return ClientResult::Continue;
+      },
+      Some(ResponseState::ResponseWithBodyChunks(_,_,ch)) => {
+        if ch == Chunk::Ended {
+          error!("{}\tback read should have stopped on chunk ended", self.log_ctx);
+          self.readiness.back_interest.remove(Ready::readable());
+          return ClientResult::Continue;
+        } else if ch == Chunk::Error {
+          error!("{}\tback read should have stopped on chunk error", self.log_ctx);
+          self.readiness.reset();
+          return ClientResult::CloseClient;
+        } else {
+          //if self.back_buf_position + self.back_buf.buffer.available_data() >= self.state.res_position {
+          if ! self.back_buf.needs_input() {
+            self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id,
+            &mut self.back_buf));
+            //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
+            if self.state.as_ref().unwrap().is_back_error() {
+              error!("{}\tback socket chunk parse error, closing connection", self.log_ctx);
+              time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+              self.readiness.reset();
+              return ClientResult::CloseBothFailure;
+            }
+
+            if let Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) = self.state.as_ref().unwrap().response {
+              self.readiness.back_interest.remove(Ready::readable());
+            }
+            self.readiness.front_interest.insert(Ready::writable());
+          }
+          return ClientResult::Continue;
+        }
+      },
+      Some(ResponseState::Error(_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
+      _ => {
+        self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id,
+        &mut self.back_buf));
+        //debug!("{}\tparse_response_until_stop returned {:?} => advance: {}", context, self.state, self.state.res_position);
+        if self.state.as_ref().unwrap().is_back_error() {
+          error!("{}\tback socket parse error, closing connection", self.log_ctx);
+          time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+          self.readiness.reset();
+          return ClientResult::CloseBothFailure;
+        }
+
+        if let Some(ResponseState::Response(_,_)) = self.state.as_ref().unwrap().response {
+          self.readiness.back_interest.remove(Ready::readable());
+        }
+        self.readiness.front_interest.insert(Ready::writable());
+        return ClientResult::Continue;
+      }
     }
   }
 }
