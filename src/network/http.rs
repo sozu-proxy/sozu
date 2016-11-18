@@ -298,13 +298,11 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
         self.front_buf.start_parsing_position - self.front_buf.parsed_position);
         self.front_buf.consume_parsed_data(to_consume);
       }
-    }
 
-    if self.front_buf.buffer.available_space() == 0 {
-      self.readiness.front_interest.remove(Ready::readable());
-    }
-
-    if sz == 0 {
+      if self.front_buf.buffer.available_space() == 0 {
+        self.readiness.front_interest.remove(Ready::readable());
+      }
+    } else {
       self.readiness.front_readiness.remove(Ready::readable());
     }
 
@@ -320,7 +318,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       SocketResult::Continue => {}
     };
 
-    // Looking for the host header
+    // if there's no host, continue parsing until we find it
     let has_host = self.state.as_ref().unwrap().has_host();
     if !has_host {
       self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
@@ -334,65 +332,65 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
       if self.state.as_ref().unwrap().has_host() {
         self.readiness.back_interest.insert(Ready::writable());
-        ClientResult::ConnectBackend
+        return ClientResult::ConnectBackend;
       } else {
-        ClientResult::Continue
+        return ClientResult::Continue;
       }
-    } else {
-      self.readiness.back_interest.insert(Ready::writable());
-      match self.state.as_ref().unwrap().request {
-        Some(RequestState::Request(_,_,_)) | Some(RequestState::RequestWithBody(_,_,_,_)) => {
-          if ! self.front_buf.needs_input() {
-            // stop reading
-            self.readiness.front_interest.remove(Ready::readable());
-          }
-          ClientResult::Continue
-        },
-        Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
-          error!("{}\t[{:?}] front read should have stopped on chunk ended", self.log_ctx, self.token);
+    }
+
+    self.readiness.back_interest.insert(Ready::writable());
+    match self.state.as_ref().unwrap().request {
+      Some(RequestState::Request(_,_,_)) | Some(RequestState::RequestWithBody(_,_,_,_)) => {
+        if ! self.front_buf.needs_input() {
+          // stop reading
           self.readiness.front_interest.remove(Ready::readable());
-          ClientResult::Continue
-        },
-        Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Error)) => {
-          error!("{}\t[{:?}] front read should have stopped on chunk error", self.log_ctx, self.token);
-          self.readiness.reset();
-          ClientResult::CloseClient
-        },
-        Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
-          if ! self.front_buf.needs_input() {
-            self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
-            &mut self.front_buf));
-
-            if self.state.as_ref().unwrap().is_front_error() {
-              error!("{}\t[{:?}] front chunk parsing error, closing the connection", self.log_ctx, self.token);
-              time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
-              self.readiness.reset();
-              return ClientResult::CloseClient;
-            }
-
-            if let Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) = self.state.as_ref().unwrap().request {
-              self.readiness.front_interest.remove(Ready::readable());
-            }
-          }
-          ClientResult::Continue
-        },
-      _ => {
+        }
+        ClientResult::Continue
+      },
+      Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
+        error!("{}\t[{:?}] front read should have stopped on chunk ended", self.log_ctx, self.token);
+        self.readiness.front_interest.remove(Ready::readable());
+        ClientResult::Continue
+      },
+      Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Error)) => {
+        error!("{}\t[{:?}] front read should have stopped on chunk error", self.log_ctx, self.token);
+        self.readiness.reset();
+        ClientResult::CloseClient
+      },
+      Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
+        if ! self.front_buf.needs_input() {
           self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
-            &mut self.front_buf));
+          &mut self.front_buf));
 
           if self.state.as_ref().unwrap().is_front_error() {
-            error!("{}\t[{:?}] front parsing error, closing the connection", self.log_ctx, self.token);
+            error!("{}\t[{:?}] front chunk parsing error, closing the connection", self.log_ctx, self.token);
             time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             self.readiness.reset();
             return ClientResult::CloseClient;
           }
 
-          if let Some(RequestState::Request(_,_,_)) = self.state.as_ref().unwrap().request {
+          if let Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) = self.state.as_ref().unwrap().request {
             self.readiness.front_interest.remove(Ready::readable());
           }
-          self.readiness.back_interest.insert(Ready::writable());
-          ClientResult::Continue
         }
+        ClientResult::Continue
+      },
+    _ => {
+        self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
+          &mut self.front_buf));
+
+        if self.state.as_ref().unwrap().is_front_error() {
+          error!("{}\t[{:?}] front parsing error, closing the connection", self.log_ctx, self.token);
+          time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+          self.readiness.reset();
+          return ClientResult::CloseClient;
+        }
+
+        if let Some(RequestState::Request(_,_,_)) = self.state.as_ref().unwrap().request {
+          self.readiness.front_interest.remove(Ready::readable());
+        }
+        self.readiness.back_interest.insert(Ready::writable());
+        ClientResult::Continue
       }
     }
   }
