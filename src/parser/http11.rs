@@ -4,9 +4,8 @@
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 
-use nom::{HexDisplay,IResult};
+use nom::{HexDisplay,IResult,Offset};
 use nom::IResult::*;
-use nom::Err::*;
 
 use nom::{digit,is_alphanumeric};
 
@@ -244,7 +243,7 @@ pub fn chunk_size(input: &[u8]) -> IResult<&[u8], usize> {
   }
   match usize::from_str_radix(s, 16) {
     Ok(sz) => IResult::Done(i, sz),
-    Err(_) => IResult::Error(::nom::Err::Code(::nom::ErrorKind::MapRes))
+    Err(_) => IResult::Error(error_code!(::nom::ErrorKind::MapRes))
   }
 }
 
@@ -1354,7 +1353,6 @@ mod tests {
   use super::*;
   use nom::IResult::*;
   use nom::HexDisplay;
-  use nom::Err::*;
   use network::buffer::Buffer;
   use network::buffer_queue::{BufferQueue,OutputElement};
   use std::str;

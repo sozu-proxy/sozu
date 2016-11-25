@@ -5,7 +5,7 @@ authors = ["Clément Delafargue <clement@delafargue.name>", "Geoffroy Couprie <g
 
 [dependencies]
 rand = "^0.3.14"
-nom = "~1.2.0"
+nom = "^2.0"
 net2 = "^0.2"
 time = "^0.1.34"
 mio = "~0.6.0"

@@ -12,7 +12,7 @@ use std::sync::mpsc;
 use std::cmp::min;
 use std::time::Duration;
 use log;
-use nom::{IResult,HexDisplay};
+use nom::{IResult,HexDisplay,Offset};
 use serde_json;
 use serde_json::from_str;
 
