@@ -143,6 +143,7 @@ impl<Front:SocketHandler> Client<Front> {
   }
 
   pub fn set_answer(&mut self, buf: &[u8])  {
+    self.front_buf.reset();
     self.back_buf.reset();
     self.back_buf.write(buf);
     self.status = ClientStatus::DefaultAnswer;
@@ -909,19 +910,19 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client<TcpStream>> 
         },
         Err(ConnectionError::NoBackendAvailable) => {
           client.set_answer(&self.answers.ServiceUnavailable);
-          client.readiness().front_interest.insert(Ready::writable());
+          client.readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
           Err(ConnectionError::NoBackendAvailable)
         }
         Err(ConnectionError::HostNotFound) => {
           client.set_answer(&self.answers.NotFound);
-          client.readiness().front_interest.insert(Ready::writable());
+          client.readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
           Err(ConnectionError::HostNotFound)
         }
         e => panic!(e)
       }
     } else {
       client.set_answer(&self.answers.NotFound);
-      client.readiness().front_interest.insert(Ready::writable());
+      client.readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
       Err(ConnectionError::HostNotFound)
     }
   }
