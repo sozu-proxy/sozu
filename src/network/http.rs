@@ -146,6 +146,8 @@ impl<Front:SocketHandler> Client<Front> {
     self.front_buf.reset();
     self.back_buf.reset();
     self.back_buf.write(buf);
+    self.back_buf.consume_parsed_data(buf.len());
+    self.back_buf.slice_output(buf.len());
     self.status = ClientStatus::DefaultAnswer;
   }
 

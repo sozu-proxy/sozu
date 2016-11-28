@@ -284,6 +284,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
       },
       Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) => {
         self.clients[token].readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
+        self.clients[token].readiness().back_interest  = Ready::hup() | Ready::error();
         //let mut front_interest = Ready::hup();
         //front_interest.insert(Ready::writable());
         //let client = &self.clients[token];
