@@ -22,6 +22,13 @@ use messages::Command;
 
 pub type MessageId = String;
 
+#[derive(Debug)]
+pub enum Protocol {
+  HTTP,
+  TLS,
+  TCP
+}
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct ServerMessage {
   pub id:      MessageId,

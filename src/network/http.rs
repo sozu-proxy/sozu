@@ -18,7 +18,7 @@ use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{Duration, precise_time_s, precise_time_ns};
 use rand::random;
 use uuid::Uuid;
-use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents};
+use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
 use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness,ListenToken,FrontToken,BackToken};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
@@ -155,11 +155,30 @@ impl<Front:SocketHandler> Client<Front> {
       self.front_socket().peer_addr().map(|addr| addr.ip()),
       self.front_socket().local_addr().map(|addr| addr.ip())
     ) {
+      let proto = match self.protocol() {
+        Protocol::HTTP => "http",
+        Protocol::TLS  => "https",
+        _              => unreachable!()
+      };
+
+      //FIXME: in the "for", we don't put the other values we could get from a preexisting forward header
       match (peer, front) {
-        (IpAddr::V4(p), IpAddr::V4(f)) => format!("Forwarded: for={};by={}\r\nRequest-id: {}\r\n", peer, front, self.request_id),
-        (IpAddr::V4(p), IpAddr::V6(f)) => format!("Forwarded: for={};by=\"{}\"\r\nRequest-id: {}\r\n", peer, front, self.request_id),
-        (IpAddr::V6(p), IpAddr::V4(f)) => format!("Forwarded: for=\"{}\";by={}\r\nRequest-id: {}\r\n", peer, front, self.request_id),
-        (IpAddr::V6(p), IpAddr::V6(f)) => format!("Forwarded: for=\"{}\";by=\"{}\"\r\nRequest-id: {}\r\n", peer, front, self.request_id),
+        (IpAddr::V4(p), IpAddr::V4(f)) => {
+          format!("Forwarded: proto={};for={};by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nRequest-id: {}\r\n",
+            proto, peer, front, proto, peer, self.request_id)
+        },
+        (IpAddr::V4(p), IpAddr::V6(f)) => {
+          format!("Forwarded: proto={};for={};by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nRequest-id: {}\r\n",
+            proto, peer, front, proto, peer, self.request_id)
+        },
+        (IpAddr::V6(p), IpAddr::V4(f)) => {
+          format!("Forwarded: proto={};for=\"{}\";by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nRequest-id: {}\r\n",
+            proto, peer, front, proto, peer, self.request_id)
+        },
+        (IpAddr::V6(p), IpAddr::V6(f)) => {
+          format!("Forwarded: proto={};for=\"{}\";by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nRequest-id: {}\r\n",
+            proto, peer, front, proto, peer, self.request_id)
+        },
       }
     } else {
       format!("Request-id: {}\r\n", self.request_id)
@@ -234,6 +253,10 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
   fn readiness(&mut self) -> &mut Readiness {
     &mut self.readiness
+  }
+
+  fn protocol(&self)           -> Protocol {
+    Protocol::HTTP
   }
 
   //FIXME: unwrap bad, bad rust coder

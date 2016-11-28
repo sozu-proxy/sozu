@@ -16,7 +16,7 @@ use std::str::FromStr;
 use time::{Duration,precise_time_s};
 use rand::random;
 use uuid::Uuid;
-use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents};
+use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
 use network::proxy::{BackendConnectAction,Server,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
@@ -142,6 +142,10 @@ impl ProxyClient for Client {
 
   fn set_back_timeout(&mut self, timeout: Timeout) {
     self.back_timeout = Some(timeout)
+  }
+
+  fn protocol(&self)           -> Protocol {
+    Protocol::TCP
   }
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {

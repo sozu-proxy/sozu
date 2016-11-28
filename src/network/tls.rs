@@ -33,7 +33,7 @@ use nom::IResult;
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
-use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder};
+use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,Protocol};
 use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness,ListenToken,FrontToken,BackToken};
 use messages::{self,Command,TlsFront,TlsProxyConfiguration};
 use network::http::{self,DefaultAnswers};
@@ -285,6 +285,10 @@ impl ProxyClient for TlsClient {
     } else {
       &mut self.handshake_readiness
     }
+  }
+
+  fn protocol(&self)           -> Protocol {
+    Protocol::TLS
   }
 }
 

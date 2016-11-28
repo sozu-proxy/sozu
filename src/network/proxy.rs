@@ -22,7 +22,7 @@ use time::precise_time_ns;
 use std::time::Duration;
 use rand::random;
 
-use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socket_type,ProxyOrder,RequiredEvents};
+use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socket_type,Protocol,ProxyOrder,RequiredEvents};
 use messages::{self,TcpFront,Command,Instance};
 
 const SERVER: Token = Token(0);
@@ -121,6 +121,7 @@ pub trait ProxyClient {
   fn back_writable(&mut self) -> ClientResult;
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>);
   fn readiness(&mut self)      -> &mut Readiness;
+  fn protocol(&self)           -> Protocol;
 }
 
 #[derive(Debug,PartialEq)]
