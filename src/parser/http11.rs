@@ -1190,7 +1190,7 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
         if header_end.is_none() {
           match current_state {
             RequestState::Request(_,_,_) |
-            RequestState::RequestWithBodyChunks(_,_,_,_) => {
+            RequestState::RequestWithBodyChunks(_,_,_,Chunk::Initial) => {
               //println!("FOUND HEADER END (advance):{}", buf.start_parsing_position);
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_req_header.as_bytes()));
@@ -1211,6 +1211,8 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
               buf.slice_output(sz);
             }
           }
+        } else {
+          buf.slice_output(sz);
         }
       },
       BufferMove::Delete(length) => {
@@ -1239,6 +1241,8 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
               buf.delete_output(length);
             }
           }
+        } else {
+          buf.delete_output(length);
         }
       },
       _ => break
@@ -1298,6 +1302,8 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
               buf.slice_output(sz);
             }
           }
+        } else {
+          buf.slice_output(sz);
         }
         //FIXME: if we add a slice here, we will get a first large slice, then a long list of buffer size slices added by the slice_input function
       },
@@ -1327,6 +1333,8 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
               buf.delete_output(length);
             }
           }
+        } else {
+          buf.delete_output(length);
         }
       },
       _ => break
