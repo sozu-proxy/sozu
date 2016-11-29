@@ -31,16 +31,26 @@ impl ListenerConfig {
     let public_address = self.public_address.as_ref().and_then(|addr| FromStr::from_str(&addr).ok());
     //FIXME: error message when we cannot parse the address
     address.parse().ok().map(|addr| {
-    HttpProxyConfiguration {
-      front: addr,
-      public_address: public_address,
-      max_connections: self.max_connections,
-      buffer_size: self.buffer_size,
-      //FIXME: handle the default case,
-      answer_404: String::from(""),
-      answer_503: String::from(""),
-      ..Default::default()
-    }
+      let mut configuration = HttpProxyConfiguration {
+        front: addr,
+        public_address: public_address,
+        max_connections: self.max_connections,
+        buffer_size: self.buffer_size,
+        ..Default::default()
+      };
+
+      //FIXME: error messages if file not found?
+      let mut answer_404 = String::new();
+      if self.answer_404.as_ref().and_then(|path| File::open(path).ok())
+        .and_then(|mut file| file.read_to_string(&mut answer_404).ok()).is_some() {
+        configuration.answer_404 = answer_404;
+      }
+      let mut answer_503 = String::new();
+      if self.answer_503.as_ref().and_then(|path| File::open(path).ok())
+        .and_then(|mut file| file.read_to_string(&mut answer_503).ok()).is_some() {
+        configuration.answer_503 = answer_503;
+      }
+      configuration
     })
   }
 
@@ -53,17 +63,29 @@ impl ListenerConfig {
     let cipher_list:String = self.cipher_list.clone().unwrap_or(String::from(""));
     //FIXME: error message when we cannot parse the address
     address.parse().ok().map(|addr| {
-    TlsProxyConfiguration {
-      front: addr,
-      public_address: public_address,
-      max_connections: self.max_connections,
-      buffer_size: self.buffer_size,
-      //FIXME: handle the default case,
-      answer_404: String::from(""),
-      answer_503: String::from(""),
-      cipher_list: cipher_list,
-      ..Default::default()
-    }
+      let mut configuration = TlsProxyConfiguration {
+        front: addr,
+        public_address: public_address,
+        max_connections: self.max_connections,
+        buffer_size: self.buffer_size,
+        ..Default::default()
+      };
+      //FIXME: error messages if file not found?
+      let mut answer_404 = String::new();
+      if self.answer_404.as_ref().and_then(|path| File::open(path).ok())
+        .and_then(|mut file| file.read_to_string(&mut answer_404).ok()).is_some() {
+        configuration.answer_404 = answer_404;
+      }
+      let mut answer_503 = String::new();
+      if self.answer_503.as_ref().and_then(|path| File::open(path).ok())
+        .and_then(|mut file| file.read_to_string(&mut answer_503).ok()).is_some() {
+        configuration.answer_503 = answer_503;
+      }
+      if let Some(cipher_list) = self.cipher_list.as_ref() {
+        configuration.cipher_list = cipher_list.clone();
+      }
+      configuration
+
     })
   }
 }
