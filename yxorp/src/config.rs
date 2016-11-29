@@ -1,6 +1,8 @@
+//! parsing data from the configuration file
 use std::collections::HashMap;
 use std::io::{self,Error,ErrorKind,Read};
 use std::fs::File;
+use std::str::FromStr;
 use command::data::ListenerType;
 use toml;
 
@@ -26,11 +28,12 @@ impl ListenerConfig {
     address.push(':');
     address.push_str(&self.port.to_string());
 
+    let public_address = self.public_address.as_ref().and_then(|addr| FromStr::from_str(&addr).ok());
     //FIXME: error message when we cannot parse the address
     address.parse().ok().map(|addr| {
     HttpProxyConfiguration {
       front: addr,
-      public_address: self.public_address.clone(),
+      public_address: public_address,
       max_connections: self.max_connections,
       buffer_size: self.buffer_size,
       //FIXME: handle the default case,
@@ -46,12 +49,13 @@ impl ListenerConfig {
     address.push(':');
     address.push_str(&self.port.to_string());
 
+    let public_address     = self.public_address.as_ref().and_then(|addr| FromStr::from_str(&addr).ok());
     let cipher_list:String = self.cipher_list.clone().unwrap_or(String::from(""));
     //FIXME: error message when we cannot parse the address
     address.parse().ok().map(|addr| {
     TlsProxyConfiguration {
       front: addr,
-      public_address: self.public_address.clone(),
+      public_address: public_address,
       max_connections: self.max_connections,
       buffer_size: self.buffer_size,
       //FIXME: handle the default case,

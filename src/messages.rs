@@ -3,7 +3,7 @@ use serde_json;
 use openssl::ssl;
 use mio::channel;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr,SocketAddr};
 use std::default::Default;
 use std::convert::From;
 use std::sync::mpsc;
@@ -46,7 +46,7 @@ pub struct HttpProxyConfiguration {
     pub back_timeout:    u64,
     pub max_connections: usize,
     pub buffer_size:     usize,
-    pub public_address:  Option<String>,
+    pub public_address:  Option<IpAddr>,
     pub answer_404:      String,
     pub answer_503:      String,
 }
@@ -73,7 +73,7 @@ pub struct TlsProxyConfiguration {
     pub back_timeout:    u64,
     pub max_connections: usize,
     pub buffer_size:     usize,
-    pub public_address:  Option<String>,
+    pub public_address:  Option<IpAddr>,
     pub answer_404:      String,
     pub answer_503:      String,
     pub options:         i64,

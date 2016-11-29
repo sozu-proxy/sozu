@@ -13,7 +13,7 @@ use pool::{Pool,Checkout,Reset};
 use std::collections::HashMap;
 use std::error::Error;
 use slab::Slab;
-use std::net::SocketAddr;
+use std::net::{SocketAddr,IpAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{Duration, precise_time_s, precise_time_ns};
 use rand::random;
@@ -39,7 +39,7 @@ pub enum ClientStatus {
 }
 
 pub struct Client<Front:SocketHandler> {
-  pub frontend:       Front,
+  pub frontend:   Front,
   backend:        Option<TcpStream>,
   token:          Option<Token>,
   backend_token:  Option<Token>,
@@ -62,6 +62,7 @@ pub struct Client<Front:SocketHandler> {
   server_context:     String,
   readiness:          Readiness,
   log_ctx:            String,
+  public_address:     Option<IpAddr>,
 }
 
 impl<Front:SocketHandler> Client<Front> {
@@ -72,7 +73,7 @@ impl<Front:SocketHandler> Client<Front> {
 }
 
 impl<Front:SocketHandler> Client<Front> {
-  pub fn new(server_context: &str, sock: Front, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>) -> Option<Client<Front>> {
+  pub fn new(server_context: &str, sock: Front, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<Client<Front>> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{}\t{}\tunknown\t", server_context, &request_id);
     let mut client = Client {
@@ -99,8 +100,9 @@ impl<Front:SocketHandler> Client<Front> {
       server_context:     String::from(server_context),
       readiness:          Readiness::new(),
       log_ctx:            log_ctx,
+      public_address:     public_address,
     };
-    let req_header = client.added_request_header();
+    let req_header = client.added_request_header(public_address);
     let res_header = client.added_response_header();
     client.state.as_mut().map(|ref mut state| state.added_req_header = req_header);
     client.state.as_mut().map(|ref mut state| state.added_res_header = res_header);
@@ -112,7 +114,7 @@ impl<Front:SocketHandler> Client<Front> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     debug!("{} RESET TO {}", self.log_ctx, request_id);
     self.state.as_mut().map(|state| state.reset());
-    let req_header = self.added_request_header();
+    let req_header = self.added_request_header(self.public_address);
     let res_header = self.added_response_header();
     self.state.as_mut().map(|ref mut state| state.added_req_header = req_header);
     self.state.as_mut().map(|ref mut state| state.added_res_header = res_header);
@@ -151,11 +153,10 @@ impl<Front:SocketHandler> Client<Front> {
     self.status = ClientStatus::DefaultAnswer;
   }
 
-  pub fn added_request_header(&self) -> String {
-    use std::net::IpAddr;
-    if let (Ok(peer), Ok(front)) = (
-      self.front_socket().peer_addr().map(|addr| addr.ip()),
-      self.front_socket().local_addr().map(|addr| addr.ip())
+  pub fn added_request_header(&self, public_address: Option<IpAddr>) -> String {
+    if let (Some(peer), Some(front)) = (
+      self.front_socket().peer_addr().map(|addr| addr.ip()).ok(),
+      public_address.or(self.front_socket().local_addr().map(|addr| addr.ip()).ok())
     ) {
       let proto = match self.protocol() {
         Protocol::HTTP => "http",
@@ -1016,7 +1017,7 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client<TcpStream>> 
 
       if let Ok((frontend_sock, _)) = accepted {
         frontend_sock.set_nodelay(true);
-        if let Some(mut c) = Client::new("HTTP", frontend_sock, front_buf, back_buf) {
+        if let Some(mut c) = Client::new("HTTP", frontend_sock, front_buf, back_buf, self.config.public_address) {
           c.readiness().front_interest.insert(Ready::readable());
           c.readiness().back_interest.remove(Ready::readable() | Ready::writable());
           return Some((c, false))

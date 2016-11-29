@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use slab::Slab;
 use pool::{Pool,Checkout};
-use std::net::SocketAddr;
+use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{precise_time_s, precise_time_ns};
 use rand::random;
@@ -75,10 +75,11 @@ pub struct TlsClient {
   http:  Option<http::Client<SslStream<TcpStream>>>,
   state: TlsState,
   handshake_readiness: Readiness,
+  public_address: Option<IpAddr>,
 }
 
 impl TlsClient {
-  pub fn new(server_context: &str, ssl:Ssl, sock: TcpStream, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>) -> Option<TlsClient> {
+  pub fn new(server_context: &str, ssl:Ssl, sock: TcpStream, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<TlsClient> {
     Some(TlsClient {
       front: Some(sock),
       front_token: None,
@@ -97,7 +98,8 @@ impl TlsClient {
         back_interest:   Ready::none(),
         front_readiness: Ready::none(),
         back_readiness:  Ready::none(),
-      }
+      },
+      public_address: public_address,
     })
   }
 }
@@ -206,7 +208,7 @@ impl ProxyClient for TlsClient {
         match SslStream::accept(ssl, sock) {
           Ok(stream) => {
             let temp   = self.temp.take().unwrap();
-            self.http  = http::Client::new(&temp.server_context, stream, temp.front_buf, temp.back_buf);
+            self.http  = http::Client::new(&temp.server_context, stream, temp.front_buf, temp.back_buf, self.public_address);
             let front_token = self.front_token.take().unwrap();
             self.set_front_token(front_token);
             if let Some(timeout) = self.front_timeout.take() {
@@ -234,7 +236,7 @@ impl ProxyClient for TlsClient {
         match mid.handshake() {
           Ok(stream) => {
             let temp   = self.temp.take().unwrap();
-            self.http  = http::Client::new(&temp.server_context, stream, temp.front_buf, temp.back_buf);
+            self.http  = http::Client::new(&temp.server_context, stream, temp.front_buf, temp.back_buf, self.public_address);
             let front_token = self.front_token.take().unwrap();
             self.set_front_token(front_token);
             if let Some(timeout) = self.front_timeout.take() {
@@ -712,7 +714,7 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
       if let Ok((frontend_sock, _)) = accepted {
         frontend_sock.set_nodelay(true);
         if let Ok(ssl) = Ssl::new(&self.default_context.context) {
-          if let Some(c) = TlsClient::new("TLS", ssl, frontend_sock, front_buf, back_buf) {
+          if let Some(c) = TlsClient::new("TLS", ssl, frontend_sock, front_buf, back_buf, self.config.public_address) {
             return Some((c, false))
           }
         } else {
