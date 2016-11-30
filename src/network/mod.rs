@@ -183,13 +183,14 @@ pub fn socket_type(token: Token, max_listeners: usize, max_connections: usize) -
   }
 }
 
-#[derive(PartialEq,Eq)]
+#[derive(Debug,PartialEq,Eq)]
 pub enum BackendStatus {
   Normal,
   Closing,
   Closed,
 }
 
+#[derive(Debug,PartialEq,Eq)]
 pub struct Backend {
   pub address:            SocketAddr,
   pub status:             BackendStatus,

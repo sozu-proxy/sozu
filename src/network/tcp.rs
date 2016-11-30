@@ -410,7 +410,9 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
   pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken> {
     if let Some(addrs) = self.instances.get_mut(app_id) {
       let backend = Backend::new(*instance_address);
-      addrs.push(backend);
+      if !addrs.contains(&backend) {
+        addrs.push(backend);
+      }
     }
 
     if self.instances.get(app_id).is_none() {

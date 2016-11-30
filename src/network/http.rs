@@ -805,7 +805,9 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     let front2 = http_front.clone();
     let front3 = http_front.clone();
     if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
-        fronts.push(front2);
+        if !fronts.contains(&front2) {
+          fronts.push(front2);
+        }
     }
 
     // FIXME: check that http front port matches the listener's port
@@ -826,7 +828,9 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
   pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
     if let Some(addrs) = self.instances.get_mut(app_id) {
       let backend = Backend::new(*instance_address);
-      addrs.push(backend);
+      if !addrs.contains(&backend) {
+        addrs.push(backend);
+      }
     }
 
     if self.instances.get(app_id).is_none() {

@@ -577,7 +577,9 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
       };
 
       if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
-          fronts.push(app.clone());
+          if ! fronts.contains(&app) {
+            fronts.push(app.clone());
+          }
       }
       if self.fronts.get(&http_front.hostname).is_none() {
         self.fronts.insert(http_front.hostname, vec![app]);
@@ -632,7 +634,9 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
   pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
     if let Some(addrs) = self.instances.get_mut(app_id) {
       let backend = Backend::new(*instance_address);
-      addrs.push(backend);
+      if !addrs.contains(&backend) {
+        addrs.push(backend);
+      }
     }
 
     if self.instances.get(app_id).is_none() {

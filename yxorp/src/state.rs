@@ -87,7 +87,11 @@ impl HttpProxy {
           path_begin: front.path_begin.clone(),
         };
         if self.fronts.contains_key(&front.app_id) {
-          self.fronts.get_mut(&front.app_id).map(|front| front.push(f));
+          self.fronts.get_mut(&front.app_id).map(|front| {
+            if !front.contains(&f) {
+              front.push(f);
+            }
+          });
         } else {
           self.fronts.insert(front.app_id.clone(), vec!(f));
         }
@@ -103,7 +107,11 @@ impl HttpProxy {
           port:       instance.port,
         };
         if self.instances.contains_key(&instance.app_id) {
-          self.instances.get_mut(&instance.app_id).map(|instance| instance.push(inst));
+          self.instances.get_mut(&instance.app_id).map(|instance| {
+            if !instance.contains(&inst) {
+              instance.push(inst);
+            }
+          });
         } else {
           self.instances.insert(instance.app_id.clone(), vec!(inst));
         }
@@ -172,7 +180,11 @@ impl TlsProxy {
           key:         front.key.clone(),
         };
         if self.fronts.contains_key(&front.app_id) {
-          self.fronts.get_mut(&front.app_id).map(|front| front.push(f));
+          self.fronts.get_mut(&front.app_id).map(|front| {
+            if !front.contains(&f) {
+              front.push(f);
+            }
+          });
         } else {
           self.fronts.insert(front.app_id.clone(), vec!(f));
         }
@@ -186,7 +198,11 @@ impl TlsProxy {
           port:       instance.port,
         };
         if self.instances.contains_key(&instance.app_id) {
-          self.instances.get_mut(&instance.app_id).map(|instance| instance.push(inst));
+          self.instances.get_mut(&instance.app_id).map(|instance| {
+            if !instance.contains(&inst) {
+              instance.push(inst);
+            }
+          });
         } else {
           self.instances.insert(instance.app_id.clone(), vec!(inst));
         }
