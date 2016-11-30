@@ -61,7 +61,7 @@ fn main() {
 
   let (tx, rx) = channel::channel::<ProxyOrder>();
   let jg = thread::spawn(move || {
-    network::http::start_listener(config, sender, rx);
+    network::http::start_listener(String::from("HTTP"), config, sender, rx);
   });
 
   let http_front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") };
@@ -99,7 +99,7 @@ fn main() {
 
   let (tx2, rx2) = channel::channel::<ProxyOrder>();
   let jg2 = thread::spawn(move || {
-    network::tls::start_listener(config, sender2, rx2);
+    network::tls::start_listener(String::from("TLS"), config, sender2, rx2);
   });
 
   let cert1 = include_str!("../assets/certificate.pem");

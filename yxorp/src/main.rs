@@ -89,21 +89,21 @@ fn main() {
               let (sender, receiver) = channel::<network::ServerMessage>();
               let (tx, rx) = channel::channel::<ProxyOrder>();
               let config = conf.clone();
-              thread::spawn(move || {
-                network::http::start_listener(config, sender, rx);
-              });
               let t = format!("{}-{}", tag, index);
-              let l =  Listener::new(t, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
+              thread::spawn(move || {
+                network::http::start_listener(t, config, sender, rx);
+              });
+              let l =  Listener::new(tag.clone(), index as u8, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
               http_listeners.push(l);
             }
             let (sender, receiver) = channel::<network::ServerMessage>();
             let (tx, rx) = channel::channel::<ProxyOrder>();
+            let t = format!("{}-{}", tag, 0);
             //FIXME: keep this to get a join guard
             let jg = thread::spawn(move || {
-              network::http::start_listener(conf, sender, rx);
+              network::http::start_listener(t, conf, sender, rx);
             });
-            let t = format!("{}-{}", tag, 0);
-            let l =  Listener::new(t, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
+            let l =  Listener::new(tag.clone(), 0, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
             http_listeners.push(l);
             listeners.insert(tag.clone(), http_listeners);
             Some(jg)
@@ -118,21 +118,21 @@ fn main() {
               let (sender, receiver) = channel::<network::ServerMessage>();
               let (tx, rx) = channel::channel::<ProxyOrder>();
               let config = conf.clone();
-              thread::spawn(move || {
-                network::tls::start_listener(config, sender, rx);
-              });
               let t = format!("{}-{}", tag, index);
-              let l =  Listener::new(t.clone(), ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
+              thread::spawn(move || {
+                network::tls::start_listener(t, config, sender, rx);
+              });
+              let l =  Listener::new(tag.clone(), index as u8, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
               tls_listeners.push(l);
             }
             let (sender, receiver) = channel::<network::ServerMessage>();
             let (tx, rx) = channel::channel::<ProxyOrder>();
+              let t = format!("{}-{}", tag, 0);
             //FIXME: keep this to get a join guard
             let jg = thread::spawn(move || {
-              network::tls::start_listener(conf, sender, rx);
+              network::tls::start_listener(t, conf, sender, rx);
             });
-            let t = format!("{}-{}", tag, 0);
-            let l =  Listener::new(t, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
+            let l =  Listener::new(tag.clone(), 0, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
             tls_listeners.push(l);
             listeners.insert(tag.clone(), tls_listeners);
             Some(jg)

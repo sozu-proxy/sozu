@@ -23,7 +23,7 @@ fn main() {
   let (sender, rec) = mpsc::channel::<network::ServerMessage>();
 
   let jg            = thread::spawn(move || {
-    network::http::start_listener(config, sender, rx);
+    network::http::start_listener(String::from("HTTP"), config, sender, rx);
   });
 
   let http_front = messages::HttpFront {

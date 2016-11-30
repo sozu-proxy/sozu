@@ -42,19 +42,20 @@ impl From<FrontToken> for usize {
     }
 }
 
-#[derive(Serialize)]
+//#[derive(Serialize)]
 pub struct Listener {
   pub tag:           String,
+  pub id:            u8,
   pub listener_type: ListenerType,
-  #[serde(skip_serializing)]
+  //#[serde(skip_serializing)]
   pub sender:        channel::Sender<ProxyOrder>,
-  #[serde(skip_serializing)]
+  //#[serde(skip_serializing)]
   pub receiver:      mpsc::Receiver<ServerMessage>,
   pub state:         ConfigState,
 }
 
 impl Listener {
-  pub fn new(tag: String, listener_type: ListenerType, ip_address: String, port: u16, sender: channel::Sender<ProxyOrder>, receiver: mpsc::Receiver<ServerMessage>) -> Listener {
+  pub fn new(tag: String, id: u8, listener_type: ListenerType, ip_address: String, port: u16, sender: channel::Sender<ProxyOrder>, receiver: mpsc::Receiver<ServerMessage>) -> Listener {
     let state = match listener_type {
       ListenerType::HTTP  => ConfigState::Http(HttpProxy::new(ip_address, port)),
       ListenerType::HTTPS => ConfigState::Tls(TlsProxy::new(ip_address, port)),
@@ -63,6 +64,7 @@ impl Listener {
 
     Listener {
       tag:           tag,
+      id:            id,
       listener_type: listener_type,
       sender:        sender,
       receiver:      receiver,

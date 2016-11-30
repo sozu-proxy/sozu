@@ -767,10 +767,11 @@ pub struct ServerConfiguration<Tx> {
   front_timeout:   u64,
   back_timeout:    u64,
   config: HttpProxyConfiguration,
+  tag:    String,
 }
 
 impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
-  pub fn new(config: HttpProxyConfiguration, tx: Tx, event_loop: &mut Poll, start_at:usize) -> io::Result<ServerConfiguration<Tx>> {
+  pub fn new(tag: String, config: HttpProxyConfiguration, tx: Tx, event_loop: &mut Poll, start_at:usize) -> io::Result<ServerConfiguration<Tx>> {
     let front = config.front;
     match server_bind(&config.front) {
       Ok(sock) => {
@@ -790,10 +791,11 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
             ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
           },
           config: config,
+          tag:    tag,
         })
       },
       Err(e) => {
-        error!("HTTP\tcould not create listener {:?}: {:?}", front, e);
+        error!("{}\tcould not create listener {:?}: {:?}", tag, front, e);
         Err(e)
       }
     }
@@ -815,7 +817,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
   }
 
   pub fn remove_http_front(&mut self, front: HttpFront, event_loop: &mut Poll) {
-    info!("HTTP\tremoving http_front {:?}", front);
+    info!("{}\tremoving http_front {:?}", self.tag, front);
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
       fronts.retain(|f| f != &front);
     }
@@ -837,7 +839,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
       if let Some(instances) = self.instances.get_mut(app_id) {
         instances.retain(|backend| &backend.address != instance_address);
       } else {
-        error!("HTTP\tInstance was already removed");
+        error!("{}\tInstance was already removed", self.tag);
       }
   }
 
@@ -896,7 +898,7 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client<TcpStream>> 
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
-        error!("invalid remaining chars after hostname");
+        error!("{}\tinvalid remaining chars after hostname", self.tag);
         return Err(ConnectionError::ToBeDefined);
       }
 
@@ -912,7 +914,7 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client<TcpStream>> 
         &h
       }
     } else {
-      error!("hostname parsing failed");
+      error!("{}\thostname parsing failed", self.tag);
       return Err(ConnectionError::ToBeDefined);
     };
 
@@ -967,20 +969,20 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client<TcpStream>> 
 
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyOrder) {
   // ToDo temporary
-    trace!("HTTP\t{} notified", message);
+    trace!("{}\t{} notified", self.tag, message);
     match message {
       ProxyOrder::Command(id, Command::AddHttpFront(front)) => {
-        info!("HTTP\t{} add front {:?}", id, front);
+        info!("{}\t{} add front {:?}", self.tag, id, front);
           self.add_http_front(front, event_loop);
           self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
       },
       ProxyOrder::Command(id, Command::RemoveHttpFront(front)) => {
-        info!("HTTP\t{} front {:?}", id, front);
+        info!("{}\t{} front {:?}", self.tag, id, front);
         self.remove_http_front(front, event_loop);
         self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
-        info!("HTTP\t{} add instance {:?}", id, instance);
+        info!("{}\t{} add instance {:?}", self.tag, id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -991,7 +993,7 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client<TcpStream>> 
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
-        info!("HTTP\t{} remove instance {:?}", id, instance);
+        info!("{}\t{} remove instance {:?}", self.tag, id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -1002,7 +1004,7 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client<TcpStream>> 
         }
       },
       ProxyOrder::Command(id, Command::HttpProxy(configuration)) => {
-        info!("HTTP\t{} modifying proxy configuration: {:?}", id, configuration);
+        info!("{}\t{} modifying proxy configuration: {:?}", self.tag, id, configuration);
         self.front_timeout = configuration.front_timeout;
         self.back_timeout  = configuration.back_timeout;
         self.answers = DefaultAnswers {
@@ -1011,13 +1013,13 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client<TcpStream>> 
         };
       },
       ProxyOrder::Stop(id)                   => {
-        info!("HTTP\t{} shutdown", id);
+        info!("{}\t{} shutdown", self.tag, id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
         self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Stopped});
       },
       ProxyOrder::Command(id, msg) => {
-        debug!("HTTP\t{} unsupported message, ignoring: {:?}", id, msg);
+        debug!("{}\t{} unsupported message, ignoring: {:?}", self.tag, id, msg);
         self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
       }
     }
@@ -1029,16 +1031,16 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client<TcpStream>> 
 
       if let Ok((frontend_sock, _)) = accepted {
         frontend_sock.set_nodelay(true);
-        if let Some(mut c) = Client::new("HTTP", frontend_sock, front_buf, back_buf, self.config.public_address) {
+        if let Some(mut c) = Client::new(&self.tag, frontend_sock, front_buf, back_buf, self.config.public_address) {
           c.readiness().front_interest.insert(Ready::readable());
           c.readiness().back_interest.remove(Ready::readable() | Ready::writable());
           return Some((c, false))
         }
       } else {
-        error!("HTTP\tcould not accept: {:?}", accepted);
+        error!("{}\tcould not accept: {:?}", self.tag, accepted);
       }
     } else {
-      error!("HTTP\tcould not get buffers from pool");
+      error!("{}\tcould not get buffers from pool", self.tag);
     }
     None
   }
@@ -1062,7 +1064,7 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client<TcpStream>> 
 
 pub type HttpServer<Tx,Rx> = Server<ServerConfiguration<Tx>,Client<TcpStream>,Rx>;
 
-pub fn start_listener<Tx,Rx>(config: HttpProxyConfiguration, tx: Tx, receiver: Rx)
+pub fn start_listener<Tx,Rx>(tag:String, config: HttpProxyConfiguration, tx: Tx, receiver: Rx)
   where Tx: messages::Sender<ServerMessage>,
         Rx: Evented+messages::Receiver<ProxyOrder> {
 
@@ -1070,13 +1072,13 @@ pub fn start_listener<Tx,Rx>(config: HttpProxyConfiguration, tx: Tx, receiver: R
   let max_connections = config.max_connections;
   let max_listeners   = 1;
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  let configuration = ServerConfiguration::new(config, tx, &mut event_loop, 1 + max_listeners).unwrap();
+  let configuration = ServerConfiguration::new(tag.clone(), config, tx, &mut event_loop, 1 + max_listeners).unwrap();
   let mut server = HttpServer::new(max_listeners, max_connections, configuration, event_loop, receiver);
 
-  info!("HTTP\tstarting event loop");
+  info!("{}\tstarting event loop", &tag);
   server.run();
   //event_loop.run(&mut server).unwrap();
-  info!("HTTP\tending event loop");
+  info!("{}\tending event loop", &tag);
 }
 
 #[cfg(test)]
@@ -1113,7 +1115,7 @@ mod tests {
 
     let (sender, receiver) = channel::channel::<ProxyOrder>();
     let jg = thread::spawn(move || {
-      start_listener(config, tx.clone(), receiver);
+      start_listener(String::from("HTTP"), config, tx.clone(), receiver);
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
@@ -1164,7 +1166,7 @@ mod tests {
     };
     let (sender, receiver) = channel::channel::<ProxyOrder>();
     let jg = thread::spawn(move|| {
-      start_listener(config, tx.clone(), receiver);
+      start_listener(String::from("HTTP"), config, tx.clone(), receiver);
     });
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1031"), path_begin: String::from("/") };
     sender.send(ProxyOrder::Command(String::from("ID_ABCD"), Command::AddHttpFront(front)));
@@ -1285,6 +1287,7 @@ mod tests {
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
       },
       config: Default::default(),
+      tag:  String::from("HTTP"),
     };
 
     let frontend1 = server_config.frontend_from_request("lolcatho.st", "/");
