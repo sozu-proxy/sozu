@@ -3,6 +3,7 @@ use mio::deprecated::unix::*;
 use mio::timer::{Timer,Timeout};
 use slab::Slab;
 use std::fs;
+use std::fmt;
 use std::path::PathBuf;
 use std::io::{self,BufRead,BufReader,Read,Write,ErrorKind};
 use std::str::from_utf8;
@@ -73,10 +74,33 @@ impl Listener {
   }
 }
 
-#[derive(Serialize)]
-pub struct ListenerConfiguration<'a> {
-  id:       String,
-  listeners: &'a Vec<Listener>,
+impl fmt::Debug for Listener {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    write!(f, "Listener {{ tag: {}, listener_type: {:?}, state: {:?} }}", self.tag, self.listener_type, self.state)
+  }
+}
+
+#[derive(Deserialize,Serialize,Debug)]
+pub struct StoredListener {
+  pub tag:           String,
+  pub listener_type: ListenerType,
+  pub state:         ConfigState,
+}
+
+impl StoredListener {
+  pub fn from_listener(listener: &Listener) -> StoredListener {
+    StoredListener {
+      tag:           listener.tag.clone(),
+      listener_type: listener.listener_type.clone(),
+      state:         listener.state.clone(),
+    }
+  }
+}
+
+#[derive(Deserialize,Serialize,Debug)]
+pub struct ListenerConfiguration {
+  id:        String,
+  listeners: Vec<StoredListener>,
 }
 
 #[derive(Debug,PartialEq)]

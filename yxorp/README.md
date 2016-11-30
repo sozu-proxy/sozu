@@ -37,7 +37,7 @@ will write it back to the unix socket.
 The dump state message is defined like this:
 
 ```json
-{ 
+{
   "id":   "ID_TEST",
   "type": "DUMP_STATE"
 }

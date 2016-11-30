@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use serde;
 
 use yxorp::messages::{Command,HttpFront,TlsFront,Instance};
 
@@ -44,7 +43,7 @@ pub struct TlsProxy {
   instances:  HashMap<AppId, Vec<HttpProxyInstance>>,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq)]
+#[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub enum ConfigState {
   Http(HttpProxy),
   Tls(TlsProxy),
@@ -65,18 +64,6 @@ impl ConfigState {
       ConfigState::Http(ref state) => state.generate_commands(),
       ConfigState::Tls(ref state)  => state.generate_commands(),
       ConfigState::Tcp             => vec!(),
-    }
-  }
-}
-
-impl serde::Serialize for ConfigState {
-  fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
-      where S: serde::Serializer,
-  {
-    match *self {
-      ConfigState::Http(ref state) => state.serialize(serializer),
-      ConfigState::Tls(ref state)  => state.serialize(serializer),
-      ConfigState::Tcp             => Ok(())
     }
   }
 }

@@ -173,6 +173,7 @@ impl serde::Deserialize for ListenerDeserializer {
 pub enum ConfigCommand {
   ProxyConfiguration(Command),
   SaveState(String),
+  LoadState(String),
   DumpState,
 }
 
@@ -267,6 +268,13 @@ impl serde::de::Visitor for ConfigMessageVisitor {
       ConfigCommand::SaveState(state.path)
     } else if &config_type == &"DUMP_STATE" {
       ConfigCommand::DumpState
+    } else if &config_type == &"LOAD_STATE" {
+      let data = match data {
+        Some(data) => data,
+        None => try!(visitor.missing_field("data")),
+      };
+      let state: SaveStateData = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("save state"))));
+      ConfigCommand::LoadState(state.path)
     } else {
       return Err(serde::de::Error::custom("unrecognized command"));
     };
