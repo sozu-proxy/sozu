@@ -1199,12 +1199,7 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
             RequestState::RequestWithBody(_,_,_,content_length) => {
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_req_header.as_bytes()));
-              buf.slice_output(sz);
-
-              let len = min(content_length, buf.unparsed_data().len());
-              if len > 0 {
-                buf.slice_output(len);
-              }
+              buf.slice_output(sz+content_length);
               buf.consume_parsed_data(content_length);
             },
             _ => {
@@ -1231,10 +1226,7 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
               buf.insert_output(Vec::from(rs.added_req_header.as_bytes()));
               buf.delete_output(length);
 
-              let len = min(content_length, buf.unparsed_data().len());
-              if len > 0 {
-                buf.slice_output(len);
-              }
+              buf.slice_output(content_length);
               buf.consume_parsed_data(content_length);
             },
             _ => {
@@ -1289,13 +1281,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
             ResponseState::ResponseWithBody(_,_,content_length) => {
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
-              buf.slice_output(sz);
-
-              // consume whatever data is left in the buffer if needed
-              let len = min(content_length, buf.unparsed_data().len());
-              if len > 0 {
-                buf.slice_output(len);
-              }
+              buf.slice_output(sz+content_length);
               buf.consume_parsed_data(content_length);
             },
             _ => {
@@ -1323,10 +1309,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
               buf.delete_output(length);
 
-              let len = min(content_length, buf.unparsed_data().len());
-              if len > 0 {
-                buf.slice_output(len);
-              }
+              buf.slice_output(content_length);
               buf.consume_parsed_data(content_length);
             },
             _ => {
@@ -1502,7 +1485,7 @@ mod tests {
       assert_eq!(buf.output_queue, vec!(
         OutputElement::Slice(26), OutputElement::Slice(22), OutputElement::Slice(25),
         OutputElement::Slice(13), OutputElement::Slice(21),
-        OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+        OutputElement::Insert(vec!()), OutputElement::Slice(202)));
       assert_eq!(buf.start_parsing_position, 309);
       assert_eq!(
         result,
@@ -1567,7 +1550,7 @@ mod tests {
         OutputElement::Slice(26), OutputElement::Slice(22),
         OutputElement::Slice(25), OutputElement::Slice(13),
         OutputElement::Slice(21), OutputElement::Insert(vec!()),
-        OutputElement::Slice(2)));
+        OutputElement::Slice(202)));
       assert_eq!(buf.start_parsing_position, 309);
       assert_eq!(
         result,
@@ -1854,7 +1837,7 @@ mod tests {
       assert_eq!(buf.output_queue, vec!(
         OutputElement::Slice(26), OutputElement::Slice(22), OutputElement::Slice(25),
         OutputElement::Slice(13), OutputElement::Slice(21), OutputElement::Insert(Vec::from(&new_header[..])),
-      OutputElement::Slice(2)));
+      OutputElement::Slice(202)));
       println!("buf:\n{}", buf.buffer.data().to_hex(16));
       assert_eq!(buf.start_parsing_position, 309);
       assert_eq!(

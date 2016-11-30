@@ -462,7 +462,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
       }
     }
 
-    if self.back_buf.output_data_size() == 0 {
+    if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
       self.readiness.back_interest.insert(Ready::readable());
       self.readiness.front_interest.remove(Ready::writable());
       return ClientResult::Continue;
@@ -471,6 +471,12 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     let mut sz = 0usize;
     let mut res = SocketResult::Continue;
     while res == SocketResult::Continue && self.back_buf.output_data_size() > 0 {
+      // no more data in buffer, stop here
+      if self.back_buf.next_output_data().len() == 0 {
+        self.readiness.back_interest.insert(Ready::readable());
+        self.readiness.front_interest.remove(Ready::writable());
+        return ClientResult::Continue;
+      }
       let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
       res = current_res;
       self.back_buf.consume_output_data(current_sz);
@@ -556,7 +562,7 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
 
     assert!(self.back_buf.empty(), "investigating single buffer usage: the back->front buffer should not be used while parsing and forwarding the request");
 
-    if self.front_buf.output_data_size() == 0 {
+    if self.front_buf.output_data_size() == 0 || self.front_buf.next_output_data().len() == 0 {
       self.readiness.front_interest.insert(Ready::readable());
       self.readiness.back_interest.remove(Ready::writable());
       return ClientResult::Continue;
@@ -575,6 +581,12 @@ impl<Front:SocketHandler> ProxyClient for Client<Front> {
     let mut socket_res = SocketResult::Continue;
 
     while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
+      // no more data in buffer, stop here
+      if self.front_buf.next_output_data().len() == 0 {
+        self.readiness.front_interest.insert(Ready::readable());
+        self.readiness.back_interest.remove(Ready::writable());
+        return ClientResult::Continue;
+      }
       let (current_sz, current_res) = sock.socket_write(self.front_buf.next_output_data());
       socket_res = current_res;
       self.front_buf.consume_output_data(current_sz);
