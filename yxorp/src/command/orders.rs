@@ -50,35 +50,8 @@ impl CommandServer {
         self.conns[token].back_buf.write(&b"\0"[..]);
       },
       ConfigCommand::LoadState(path) => {
-        let mut saved_state = String::new();
-        //if fs::File::open(path).and_then(|file| file.read_to_string(&mut saved_state)).is_ok() {
-        match fs::File::open(&path) {
-          Err(e)   => error!("cannot open file at path '{}': {:?}", path, e),
-          Ok(file) => {
-            let conf_res: serde_json::error::Result<Vec<StoredListener>> = serde_json::from_reader(file);
-            match conf_res {
-              Err(e)   => error!("error loading configuration from file: {:?}", e),
-              Ok(conf) => {
-                //info!("loaded the configuration: {:?}", conf);
-                self.conns[token].back_buf.write(b"loaded the configuration\0");
-                for stored_listener in conf {
-                  let commands = stored_listener.state.generate_commands();
-                  //info!("saved listener '{}' (type {:?}) commands: {:?}", stored_listener.tag,
-                  stored_listener.listener_type, commands);
-                  if let Some(ref mut listener_vec) = self.listeners.get_mut (&stored_listener.tag) {
-                    for listener in listener_vec.iter_mut() {
-                      for command in &commands {
-                        self.conns[token].add_message_id(message.id.clone());
-                        listener.state.handle_command(&command);
-                        listener.sender.send(ProxyOrder::Command(message.id.clone(), command.clone()));
-                      }
-                    }
-                  }
-                }
-              },
-            }
-          }
-        }
+        self.load_state(&message.id, &path);
+        self.conns[token].back_buf.write(b"loaded the configuration\0");
       },
       ConfigCommand::ProxyConfiguration(command) => {
         if let Some(ref tag) = message.listener {
@@ -102,6 +75,35 @@ impl CommandServer {
         } else {
           // FIXME: should send back error here
           log!(log::LogLevel::Error, "expecting listener tag");
+        }
+      }
+    }
+  }
+
+  pub fn load_state(&mut self, message_id: &str, path: &str) {
+    match fs::File::open(&path) {
+      Err(e)   => error!("cannot open file at path '{}': {:?}", path, e),
+      Ok(file) => {
+        let conf_res: serde_json::error::Result<Vec<StoredListener>> = serde_json::from_reader(file);
+        match conf_res {
+          Err(e)   => error!("error loading configuration from file: {:?}", e),
+          Ok(conf) => {
+            //info!("loaded the configuration: {:?}", conf);
+            for stored_listener in conf {
+              let commands = stored_listener.state.generate_commands();
+              //info!("saved listener '{}' (type {:?}) commands: {:?}", stored_listener.tag,
+              //stored_listener.listener_type, commands);
+              if let Some(ref mut listener_vec) = self.listeners.get_mut (&stored_listener.tag) {
+                for listener in listener_vec.iter_mut() {
+                  for command in &commands {
+                    //self.conns[token].add_message_id(message_id.clone());
+                    listener.state.handle_command(&command);
+                    listener.sender.send(ProxyOrder::Command(String::from(message_id), command.clone()));
+                  }
+                }
+              }
+            }
+          },
         }
       }
     }

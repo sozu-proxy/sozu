@@ -448,25 +448,6 @@ impl CommandServer {
 
 pub fn start(path: String, mut listeners: HashMap<String, Vec<Listener>>, saved_state: Option<String>, buffer_size: usize,
     max_buffer_size: usize) {
-  saved_state.as_ref().map(|state_path| {
-    fs::File::open(state_path).map(|f| {
-      let reader = BufReader::new(f);
-      reader.lines().map(|line_res| {
-        line_res.map(|line| {
-          if let Ok(listener_state) = from_str::<ListenerDeserializer>(&line) {
-            listeners.get_mut(&listener_state.tag).as_mut().map(|listener_vec| {
-              for listener in listener_vec.iter_mut() {
-                println!("setting listener {} state at {:?}", listener_state.tag, listener_state.state);
-                listener.state = listener_state.state.clone();
-              }
-            });
-          }
-        })
-      }).count();
-
-    });
-  });
-
   let event_loop = Poll::new().unwrap();
   let addr = PathBuf::from(path);
   if let Err(e) = fs::remove_file(&addr) {
@@ -491,6 +472,10 @@ pub fn start(path: String, mut listeners: HashMap<String, Vec<Listener>>, saved_
        * event_loop.timeout_ms(0, 700);
        */
       let mut server = CommandServer::new(srv, listeners, buffer_size, max_buffer_size, event_loop);
+      saved_state.as_ref().map(|state_path| {
+        server.load_state("INITIALIZATION", state_path);
+      });
+
       server.run();
       //event_loop.run(&mut CommandServer::new(srv, listeners, buffer_size, max_buffer_size)).unwrap()
     },
