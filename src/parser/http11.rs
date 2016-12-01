@@ -74,7 +74,7 @@ impl RRequestLine {
         if let Ok(version1) = str::from_utf8(r.version[0]) {
           if let Ok(version2) = str::from_utf8(r.version[1]) {
             Some(RRequestLine {
-              method:  String::from(method),
+              method:  method.to_uppercase(),
               uri:     String::from(uri),
               version: String::from(version1) + version2
             })
