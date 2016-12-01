@@ -1,7 +1,7 @@
 # yxorp test config file
 
 command_socket = "./command_folder/sock"
-saved_state    = "./conf_dump.json"
+saved_state    = "./state.json"
 log_level      = "info"
 command_buffer_size = 12000
 
