@@ -582,6 +582,17 @@ impl RequestState {
     }
   }
 
+  pub fn is_head(&self) -> bool {
+    match *self {
+      RequestState::Request(ref rl, _, _)            |
+      RequestState::RequestWithBody(ref rl, _, _, _) |
+      RequestState::RequestWithBodyChunks(ref rl, _, _, _) => {
+        &rl.method == "HEAD"
+      },
+      _                                                => false
+    }
+  }
+
   pub fn get_host(&self) -> Option<String> {
     match *self {
       RequestState::HasHost(_, _, ref host)            |
@@ -875,14 +886,14 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
       match state {
         RequestState::HasRequestLine(rl, conn) => RequestState::HasHost(rl, conn, host),
         RequestState::HasLength(rl, conn, l)   => RequestState::HasHostAndLength(rl, conn, host, l),
-        _                                   => RequestState::Error(ErrorState::InvalidHttp)
+        _                                      => RequestState::Error(ErrorState::InvalidHttp)
       }
     },
     HeaderValue::ContentLength(sz) => {
       match state {
         RequestState::HasRequestLine(rl, conn) => RequestState::HasLength(rl, conn, LengthInformation::Length(sz)),
         RequestState::HasHost(rl, conn, host)  => RequestState::HasHostAndLength(rl, conn, host, LengthInformation::Length(sz)),
-        _                                   => RequestState::Error(ErrorState::InvalidHttp)
+        _                                      => RequestState::Error(ErrorState::InvalidHttp)
       }
     },
     HeaderValue::Encoding(TransferEncodingValue::Chunked) => {
@@ -1042,11 +1053,17 @@ pub fn default_response_result<O>(state: ResponseState, res: IResult<&[u8], O>) 
   }
 }
 
-pub fn validate_response_header(state: ResponseState, header: &Header) -> ResponseState {
+pub fn validate_response_header(state: ResponseState, header: &Header, is_head: bool) -> ResponseState {
   match header.value() {
     HeaderValue::ContentLength(sz) => {
       match state {
-        ResponseState::HasStatusLine(sl, conn) => ResponseState::HasLength(sl, conn, LengthInformation::Length(sz)),
+        // if the request has a HEAD method, we don't count the content length
+        // FIXME: what happens if multiple content lengths appear?
+        ResponseState::HasStatusLine(sl, conn) => if is_head {
+          ResponseState::HasStatusLine(sl, conn)
+        } else {
+          ResponseState::HasLength(sl, conn, LengthInformation::Length(sz))
+        },
         _                                      => ResponseState::Error(ErrorState::InvalidHttp)
       }
     },
@@ -1089,7 +1106,7 @@ pub fn validate_response_header(state: ResponseState, header: &Header) -> Respon
   }
 }
 
-pub fn parse_response(state: ResponseState, buf: &[u8]) -> (BufferMove, ResponseState) {
+pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool) -> (BufferMove, ResponseState) {
   match state {
     ResponseState::Initial => {
       match status_line(buf) {
@@ -1113,9 +1130,9 @@ pub fn parse_response(state: ResponseState, buf: &[u8]) -> (BufferMove, Response
       match message_header(buf) {
         IResult::Done(i, header) => {
           if header.should_delete() {
-            (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header))
+            (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header, is_head))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header))
+            (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header, is_head))
           }
         },
         IResult::Incomplete(_) => (BufferMove::None, ResponseState::HasStatusLine(sl, conn)),
@@ -1137,9 +1154,9 @@ pub fn parse_response(state: ResponseState, buf: &[u8]) -> (BufferMove, Response
       match message_header(buf) {
         IResult::Done(i, header) => {
           if header.should_delete() {
-            (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header))
+            (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header, is_head))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header))
+            (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header, is_head))
           }
         },
         IResult::Incomplete(_) => (BufferMove::None, ResponseState::HasLength(sl, conn, length)),
@@ -1258,9 +1275,10 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
 pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue) -> HttpState {
   let mut current_state = rs.response.take().expect("the response state should never be None outside of this function");
   let mut header_end    = rs.res_header_end;
+  let is_head = rs.request.as_ref().map(|request| request.is_head()).unwrap_or(false);
   loop {
     //trace!("PARSER\t{}\tpos[{}]: {:?}", request_id, position, current_state);
-    let (mv, new_state) = parse_response(current_state, buf.unparsed_data());
+    let (mv, new_state) = parse_response(current_state, buf.unparsed_data(), is_head);
     //trace!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
     current_state = new_state;
@@ -1376,7 +1394,7 @@ mod tests {
   }
 
   #[test]
-  fn request_head_test() {
+  fn request_get_test() {
       let input =
           b"GET /index.html HTTP/1.1\r\n\
             Host: localhost:8888\r\n\
@@ -1490,7 +1508,6 @@ mod tests {
       assert_eq!(
         result,
         HttpState {
-          //FIXME: wrong header end here, should be 109
           req_header_end: Some(109),
           res_header_end: None,
           request: Some(RequestState::RequestWithBody(
@@ -1569,7 +1586,6 @@ mod tests {
         }
       );
   }
-
 
   #[test]
   fn parse_state_chunked_test() {
@@ -2372,6 +2388,58 @@ mod tests {
       hostname_and_port(&b"rust-test.cleverapps.io"[..]),
       Done(&b""[..], (&b"rust-test.cleverapps.io"[..], None))
     );
+  }
+
+  #[test]
+  fn parse_state_head_with_content_length_test() {
+      let input =
+          b"HTTP/1.1 200 Ok\r\n\
+            Content-Length: 200\r\n\
+            \r\n";
+      let initial = HttpState {
+        req_header_end: Some(110),
+        res_header_end: None,
+        request:  Some(RequestState::Request(
+            RRequestLine { method: String::from("HEAD"), uri: String::from("/index.html"), version: String::from("11") },
+          Connection::KeepAlive,
+          String::from("localhost:8888")
+        )),
+        response: Some(ResponseState::Initial),
+        added_req_header: String::from(""),
+        added_res_header: String::from(""),
+      };
+      let mut buf = BufferQueue::with_capacity(2048);
+      buf.write(&input[..]);
+      println!("buffer input: {:?}", buf.input_queue);
+
+      //let result = parse_request(initial, input);
+      let result = parse_response_until_stop(initial, "", &mut buf);
+      println!("result: {:?}", result);
+      println!("input length: {}", input.len());
+      println!("buffer input: {:?}", buf.input_queue);
+      println!("buffer output: {:?}", buf.output_queue);
+      assert_eq!(buf.output_queue, vec!(
+        OutputElement::Slice(17), OutputElement::Slice(21),
+        OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+      assert_eq!(buf.start_parsing_position, 40);
+      assert_eq!(
+        result,
+        HttpState {
+          req_header_end: Some(110),
+          res_header_end: Some(40),
+          request:  Some(RequestState::Request(
+              RRequestLine { method: String::from("HEAD"), uri: String::from("/index.html"), version: String::from("11") },
+            Connection::KeepAlive,
+            String::from("localhost:8888")
+          )),
+          response: Some(ResponseState::Response(
+            RStatusLine { version: String::from("11"), status: 200, reason: String::from("Ok") },
+            Connection::KeepAlive
+          )),
+          added_req_header: String::from(""),
+          added_res_header: String::from(""),
+        }
+      );
   }
 }
 
