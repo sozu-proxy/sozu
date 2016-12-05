@@ -458,6 +458,7 @@ impl<'a> Header<'a> {
           None         => HeaderValue::Error
         }
       },
+      b"upgrade" => HeaderValue::Upgrade(self.value),
       b"forwarded" | b"x-forwarded-for" | b"x-forwarded-proto" | b"x-forwarded-port" => {
         HeaderValue::Forwarded
       },
@@ -495,7 +496,7 @@ impl<'a> Header<'a> {
 
   pub fn should_delete(&self) -> bool {
     let lowercase = self.name.to_ascii_lowercase();
-    &lowercase[..] == b"connection"        ||
+    &lowercase[..] == b"connection" && &self.value.to_ascii_lowercase()[..] != b"upgrade" ||
     &lowercase[..] == b"forwarded"         ||
     &lowercase[..] == b"x-forwarded-for"   ||
     &lowercase[..] == b"x-forwarded-proto" ||
@@ -515,6 +516,7 @@ pub enum HeaderValue<'a> {
   Encoding(TransferEncodingValue),
   //FIXME: are the references in Connection still valid after we delete that part of the headers?
   Connection(Vec<&'a [u8]>),
+  Upgrade(&'a[u8]),
   Other(&'a[u8],&'a[u8]),
   Forwarded,
   /*
@@ -545,7 +547,8 @@ pub enum LengthInformation {
 #[derive(Debug,Clone,PartialEq)]
 pub enum Connection {
   KeepAlive,
-  Close
+  Close,
+  Upgrade
 }
 
 #[derive(Debug,Clone,PartialEq)]
@@ -669,13 +672,17 @@ impl RequestState {
   }
 }
 
+pub type UpgradeProtocol = String;
+
 #[derive(Debug,Clone,PartialEq)]
 pub enum ResponseState {
   Initial,
   Error(ErrorState),
   HasStatusLine(RStatusLine, Connection),
+  HasUpgrade(RStatusLine, Connection, UpgradeProtocol),
   HasLength(RStatusLine, Connection, LengthInformation),
   Response(RStatusLine, Connection),
+  ResponseUpgrade(RStatusLine, Connection, UpgradeProtocol),
   ResponseWithBody(RStatusLine, Connection, usize),
   ResponseWithBodyChunks(RStatusLine, Connection, Chunk),
 }
@@ -692,7 +699,9 @@ impl ResponseState {
     match *self {
       ResponseState::HasStatusLine(ref sl, _)             |
       ResponseState::HasLength(ref sl, _, _)              |
+      ResponseState::HasUpgrade(ref sl, _, _)             |
       ResponseState::Response(ref sl, _)                  |
+      ResponseState::ResponseUpgrade(ref sl, _, _)        |
       ResponseState::ResponseWithBody(ref sl, _, _)       |
       ResponseState::ResponseWithBodyChunks(ref sl, _, _) => Some(sl.clone()),
       _                                                   => None
@@ -703,7 +712,9 @@ impl ResponseState {
     match *self {
       ResponseState::HasStatusLine(_, ref conn)             |
       ResponseState::HasLength(_, ref conn, _)              |
+      ResponseState::HasUpgrade(_, ref conn, _)             |
       ResponseState::Response(_, ref conn)                  |
+      ResponseState::ResponseUpgrade(_, ref conn, _)        |
       ResponseState::ResponseWithBody(_, ref conn, _)       |
       ResponseState::ResponseWithBodyChunks(_, ref conn, _) => Some(conn.clone()),
       _                                                     => None
@@ -915,6 +926,7 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
         match value {
           b"close"      => conn = Connection::Close,
           b"keep-alive" => conn = Connection::KeepAlive,
+          b"upgrade"    => conn = Connection::Upgrade,
           _             => {}
         }
       }
@@ -939,6 +951,8 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
     HeaderValue::Encoding(_) => RequestState::Error(ErrorState::InvalidHttp),
     HeaderValue::Forwarded   => state,
     HeaderValue::Other(_,_)  => state,
+    //FIXME: for now, we don't look at what is asked in upgrade since the backend is the one deciding
+    HeaderValue::Upgrade(_)  => state,
     HeaderValue::Error       => RequestState::Error(ErrorState::InvalidHttp)
   }
 }
@@ -1078,18 +1092,36 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
       let mut conn = state.get_keep_alive().unwrap_or(Connection::KeepAlive);
       for value in c {
       trace!("PARSER\tgot Connection header: {:?}", str::from_utf8(value).unwrap());
-        match value {
+        match &value.to_ascii_lowercase()[..] {
           b"close"      => conn = Connection::Close,
           b"keep-alive" => conn = Connection::KeepAlive,
+          b"upgrade"    => conn = Connection::Upgrade,
           _             => {}
         }
       }
       match state {
         ResponseState::HasStatusLine(rl, _)     => ResponseState::HasStatusLine(rl, conn),
         ResponseState::HasLength(rl, _, length) => ResponseState::HasLength(rl, conn, length),
+        ResponseState::HasUpgrade(rl, _, proto) => {
+          info!("has upgrade, got conn: {:?}", conn);
+          if conn == Connection::Upgrade {
+            ResponseState::HasUpgrade(rl, conn, proto)
+          } else {
+            ResponseState::Error(ErrorState::InvalidHttp)
+          }
+        }
         _                                       => ResponseState::Error(ErrorState::InvalidHttp)
       }
     },
+    HeaderValue::Upgrade(protocol) => {
+      let proto = str::from_utf8(protocol).unwrap().to_string();
+      info!("parsed a protocol: {:?}", proto);
+      info!("state is {:?}", state);
+      match state {
+        ResponseState::HasStatusLine(sl, conn) => ResponseState::HasUpgrade(sl, conn, proto),
+        _                                      => ResponseState::Error(ErrorState::InvalidHttp)
+      }
+    }
 
     // FIXME: there should be an error for unsupported encoding
     HeaderValue::Encoding(_) => ResponseState::Error(ErrorState::InvalidHttp),
@@ -1172,6 +1204,30 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool) -> (Buffe
             res => {
               error!("PARSER\tHasResponseLine could not parse header for input:\n{}\n", buf.to_hex(16));
               default_response_result(ResponseState::HasLength(sl, conn, length), res)
+            }
+          }
+        }
+      }
+    },
+    ResponseState::HasUpgrade(sl, conn, protocol) => {
+      match message_header(buf) {
+        IResult::Done(i, header) => {
+          if header.should_delete() {
+            (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasUpgrade(sl, conn, protocol), &header, is_head))
+          } else {
+            (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasUpgrade(sl, conn, protocol), &header, is_head))
+          }
+        },
+        IResult::Incomplete(_) => (BufferMove::None, ResponseState::HasUpgrade(sl, conn, protocol)),
+        IResult::Error(_)      => {
+          match crlf(buf) {
+            IResult::Done(i, _) => {
+              debug!("PARSER\theaders parsed, stopping");
+              (BufferMove::Advance(buf.offset(i)), ResponseState::ResponseUpgrade(sl, conn, protocol))
+            },
+            res => {
+              error!("PARSER\tHasResponseLine could not parse header for input:\n{}\n", buf.to_hex(16));
+              default_response_result(ResponseState::HasUpgrade(sl, conn, protocol), res)
             }
           }
         }
@@ -1291,6 +1347,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
         if header_end.is_none() {
           match current_state {
             ResponseState::Response(_,_) |
+            ResponseState::ResponseUpgrade(_,_,_) |
             ResponseState::ResponseWithBodyChunks(_,_,_) => {
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
@@ -1316,6 +1373,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
         if header_end.is_none() {
           match current_state {
             ResponseState::Response(_,_) |
+            ResponseState::ResponseUpgrade(_,_,_) |
             ResponseState::ResponseWithBodyChunks(_,_,_) => {
               //println!("FOUND HEADER END (delete):{}", buf.start_parsing_position);
               header_end = Some(buf.start_parsing_position);
@@ -1343,6 +1401,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
 
     match current_state {
       ResponseState::Response(_,_) | ResponseState::ResponseWithBody(_,_,_) |
+        ResponseState::ResponseUpgrade(_,_,_) |
         ResponseState::Error(_) | ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended) => break,
       _ => ()
     }
