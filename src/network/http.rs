@@ -14,7 +14,7 @@ use rand::random;
 
 use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
 use network::buffer_queue::BufferQueue;
-use network::protocol::{ProtocolResult,TlsHandshake,Http};
+use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
 use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness,ListenToken,FrontToken,BackToken};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use messages::{self,Command,HttpFront,HttpProxyConfiguration};
@@ -26,6 +26,11 @@ type BackendToken = Token;
 pub enum ClientStatus {
   Normal,
   DefaultAnswer,
+}
+
+pub enum State {
+  Http(Http<TcpStream>),
+  WebSocket(Pipe<TcpStream>)
 }
 
 pub struct Client {

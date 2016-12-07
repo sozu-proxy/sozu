@@ -1,0 +1,297 @@
+use std::cmp::min;
+use std::net::{SocketAddr,IpAddr};
+use std::io::Write;
+use mio::*;
+use mio::tcp::TcpStream;
+use pool::{Pool,Checkout,Reset};
+use time::{Duration, precise_time_s, precise_time_ns};
+use uuid::Uuid;
+use network::{ClientResult,Protocol};
+use network::buffer_queue::BufferQueue;
+use network::proxy::Readiness;
+use network::socket::{SocketHandler,SocketResult};
+
+type BackendToken = Token;
+
+#[derive(PartialEq)]
+pub enum ClientStatus {
+  Normal,
+  DefaultAnswer,
+}
+
+pub struct Pipe<Front:SocketHandler> {
+  pub frontend:       Front,
+  backend:            TcpStream,
+  token:              Option<Token>,
+  backend_token:      Option<Token>,
+  pub front_buf:      Checkout<BufferQueue>,
+  back_buf:           Checkout<BufferQueue>,
+  front_buf_position: usize,
+  back_buf_position:  usize,
+  pub app_id:         Option<String>,
+  pub request_id:     String,
+  pub server_context: String,
+  pub readiness:      Readiness,
+  pub log_ctx:        String,
+  public_address:     Option<IpAddr>,
+}
+
+impl<Front:SocketHandler> Pipe<Front> {
+  pub fn new(server_context: &str, frontend: Front, backend: TcpStream, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<Pipe<Front>> {
+    let request_id = Uuid::new_v4().hyphenated().to_string();
+    let log_ctx    = format!("{}\t{}\tunknown\t", server_context, &request_id);
+    let mut client = Pipe {
+      frontend:           frontend,
+      backend:            backend,
+      token:              None,
+      backend_token:      None,
+      front_buf:          front_buf,
+      back_buf:           back_buf,
+      front_buf_position: 0,
+      back_buf_position:  0,
+      app_id:             None,
+      request_id:         request_id,
+      server_context:     String::from(server_context),
+      readiness:          Readiness {
+                            front_interest:  Ready::readable() | Ready::hup() | Ready::error(),
+                            back_interest:   Ready::readable() | Ready::hup() | Ready::error(),
+                            front_readiness: Ready::none(),
+                            back_readiness:  Ready::none(),
+      },
+      log_ctx:            log_ctx,
+      public_address:     public_address,
+    };
+
+    Some(client)
+  }
+
+  fn tokens(&self) -> Option<(Token,Token)> {
+    if let Some(front) = self.token {
+      if let Some(back) = self.backend_token {
+        return Some((front, back))
+      }
+    }
+    None
+  }
+
+  pub fn front_socket(&self) -> &TcpStream {
+    self.frontend.socket_ref()
+  }
+
+  pub fn back_socket(&self)  -> Option<&TcpStream> {
+    Some(&self.backend)
+  }
+
+  pub fn front_token(&self)  -> Option<Token> {
+    self.token
+  }
+
+  pub fn back_token(&self)   -> Option<Token> {
+    self.backend_token
+  }
+
+  pub fn close(&mut self) {
+  }
+
+  pub fn log_context(&self) -> String {
+    if let Some(ref app_id) = self.app_id {
+      format!("{}\t{}\t{}\t", self.server_context, self.request_id, app_id)
+    } else {
+      format!("{}\t{}\tunknown\t", self.server_context, self.request_id)
+    }
+  }
+
+  pub fn set_front_token(&mut self, token: Token) {
+    self.token         = Some(token);
+  }
+
+  pub fn set_back_token(&mut self, token: Token) {
+    self.backend_token = Some(token);
+  }
+
+  pub fn readiness(&mut self) -> &mut Readiness {
+    &mut self.readiness
+  }
+
+  pub fn front_hup(&mut self) -> ClientResult {
+    if self.backend_token == None {
+      ClientResult::CloseClient
+    } else {
+      ClientResult::Continue
+    }
+  }
+
+  pub fn back_hup(&mut self) -> ClientResult {
+    if self.token == None {
+      ClientResult::CloseClient
+    } else {
+      ClientResult::Continue
+    }
+  }
+
+  // Read content from the client
+  pub fn readable(&mut self) -> ClientResult {
+    if self.front_buf.buffer.available_space() == 0 {
+      self.readiness.front_interest.remove(Ready::readable());
+      self.readiness.back_interest.insert(Ready::writable());
+      return ClientResult::Continue;
+    }
+
+    let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
+    debug!("{}\tFRONT [{:?}]: read {} bytes", self.log_ctx, self.token, sz);
+
+    if sz > 0 {
+      self.front_buf.buffer.fill(sz);
+      self.front_buf.sliced_input(sz);
+      self.front_buf.consume_parsed_data(sz);
+
+      if self.front_buf.buffer.available_space() == 0 {
+        self.readiness.front_interest.remove(Ready::readable());
+        self.readiness.back_interest.insert(Ready::writable());
+      }
+    } else {
+      self.readiness.front_readiness.remove(Ready::readable());
+    }
+
+    match res {
+      SocketResult::Error => {
+        error!("{}\t[{:?}] front socket error, closing the connection", self.log_ctx, self.token);
+        self.readiness.reset();
+        return ClientResult::CloseClient;
+      },
+      SocketResult::WouldBlock => {
+        self.readiness.front_readiness.remove(Ready::readable());
+      },
+      SocketResult::Continue => {}
+    };
+
+    self.readiness.back_interest.insert(Ready::writable());
+    ClientResult::Continue
+  }
+
+  // Forward content to client
+  pub fn writable(&mut self) -> ClientResult {
+    if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
+      self.readiness.back_interest.insert(Ready::readable());
+      self.readiness.front_interest.remove(Ready::writable());
+      return ClientResult::Continue;
+    }
+
+    let mut sz = 0usize;
+    let mut res = SocketResult::Continue;
+    while res == SocketResult::Continue && self.back_buf.output_data_size() > 0 {
+      // no more data in buffer, stop here
+      if self.back_buf.next_output_data().len() == 0 {
+        self.readiness.back_interest.insert(Ready::readable());
+        self.readiness.front_interest.remove(Ready::writable());
+        return ClientResult::Continue;
+      }
+      let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
+      res = current_res;
+      self.back_buf.consume_output_data(current_sz);
+      self.back_buf_position += current_sz;
+      sz += current_sz;
+    }
+
+    if sz > 0 {
+      self.readiness.back_interest.insert(Ready::readable());
+    }
+
+    if let Some((front,back)) = self.tokens() {
+      debug!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}, buffer position {} restart position {}",
+        self.log_ctx, front.0, back.0, sz, self.back_buf.output_data_size(),
+        self.back_buf.buffer_position, self.back_buf.start_parsing_position);
+    }
+
+    match res {
+      SocketResult::Error => {
+        error!("{}\t[{:?}] error writing to front socket, closing", self.log_ctx, self.token);
+        self.readiness.reset();
+        return ClientResult::CloseClient;
+      },
+      SocketResult::WouldBlock => {
+        self.readiness.front_readiness.remove(Ready::writable());
+      },
+      SocketResult::Continue => {},
+    }
+
+    ClientResult::Continue
+  }
+
+  // Forward content to application
+  pub fn back_writable(&mut self) -> ClientResult {
+    if self.front_buf.output_data_size() == 0 || self.front_buf.next_output_data().len() == 0 {
+      self.readiness.front_interest.insert(Ready::readable());
+      self.readiness.back_interest.remove(Ready::writable());
+      return ClientResult::Continue;
+    }
+
+    let tokens = self.tokens().clone();
+    let output_size = self.front_buf.output_data_size();
+
+    let mut sz = 0usize;
+    let mut socket_res = SocketResult::Continue;
+
+    while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
+      // no more data in buffer, stop here
+      if self.front_buf.next_output_data().len() == 0 {
+        self.readiness.front_interest.insert(Ready::readable());
+        self.readiness.back_interest.remove(Ready::writable());
+        return ClientResult::Continue;
+      }
+      let (current_sz, current_res) = self.backend.socket_write(self.front_buf.next_output_data());
+      socket_res = current_res;
+      self.front_buf.consume_output_data(current_sz);
+      self.front_buf_position += current_sz;
+      sz += current_sz;
+    }
+
+    if let Some((front,back)) = tokens {
+      debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", self.log_ctx, front.0, back.0, sz, output_size);
+    }
+    match socket_res {
+      SocketResult::Error => {
+        error!("{}\tback socket write error, closing connection", self.log_ctx);
+        self.readiness.reset();
+        return ClientResult::CloseBothFailure;
+      },
+      SocketResult::WouldBlock => {
+        self.readiness.back_readiness.remove(Ready::writable());
+
+      },
+      SocketResult::Continue => {}
+    }
+    ClientResult::Continue
+  }
+
+  // Read content from application
+  pub fn back_readable(&mut self) -> ClientResult {
+    if self.back_buf.buffer.available_space() == 0 {
+      self.readiness.back_interest.remove(Ready::readable());
+      return ClientResult::Continue;
+    }
+
+    let tokens     = self.tokens().clone();
+    let (sz, r) = self.backend.socket_read(&mut self.back_buf.buffer.space());
+    self.back_buf.buffer.fill(sz);
+    self.back_buf.sliced_input(sz);
+    self.back_buf.consume_parsed_data(sz);
+
+    if let Some((front,back)) = tokens {
+      debug!("{}\tBACK  [{}<-{}]: read {} bytes", self.log_ctx, front.0, back.0, sz);
+    }
+
+    if r != SocketResult::Continue || sz == 0 {
+      self.readiness.back_readiness.remove(Ready::readable());
+    }
+
+    if r == SocketResult::Error {
+      error!("{}\tback socket read error, closing connection", self.log_ctx);
+      self.readiness.reset();
+      return ClientResult::CloseBothFailure;
+    }
+
+    ClientResult::Continue
+  }
+}
+
