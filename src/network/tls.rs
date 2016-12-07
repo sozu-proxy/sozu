@@ -36,7 +36,7 @@ use messages::{self,Command,TlsFront,TlsProxyConfiguration};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
-use network::protocol::{ProtocolResult,TlsHandshake,Http};
+use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
 
 type BackendToken = Token;
 
@@ -53,6 +53,7 @@ pub struct TlsApp {
 pub enum State {
   Handshake(TlsHandshake),
   Http(Http<SslStream<TcpStream>>),
+  WebSocket(Pipe<SslStream<TcpStream>>)
 }
 
 pub struct TlsClient {
@@ -101,6 +102,20 @@ impl TlsClient {
       http.set_front_token(self.front_token.as_ref().unwrap().clone());
       self.ssl = handshake.ssl;
       self.protocol = Some(State::Http(http));
+    } else if let State::Http(http) = protocol {
+      info!("https switching to wss");
+      let front_token = http.front_token().unwrap();
+      let back_token  = http.back_token().unwrap();
+
+      let mut pipe = Pipe::new(&http.server_context, http.frontend, http.backend.unwrap(),
+        http.front_buf, http.back_buf, http.public_address).unwrap();
+
+      pipe.readiness.front_readiness = http.readiness.front_readiness;
+      pipe.readiness.back_readiness  = http.readiness.back_readiness;
+      pipe.set_front_token(front_token);
+      pipe.set_back_token(back_token);
+
+      self.protocol = Some(State::WebSocket(pipe));
     } else {
       self.protocol = Some(protocol);
     }
@@ -116,6 +131,7 @@ impl ProxyClient for TlsClient {
     match *self.protocol.as_ref().unwrap() {
       State::Handshake(ref handshake) => None,
       State::Http(ref http)           => http.back_socket(),
+      State::WebSocket(ref pipe)      => pipe.back_socket(),
     }
   }
 
@@ -187,10 +203,8 @@ impl ProxyClient for TlsClient {
   fn readable(&mut self)      -> ClientResult {
     let (upgrade, result) = match *self.protocol.as_mut().unwrap() {
       State::Handshake(ref mut handshake) => handshake.readable(),
-      State::Http(ref mut http)           => {
-        let r = (ProtocolResult::Continue, http.readable());
-        r
-      },
+      State::Http(ref mut http)           => (ProtocolResult::Continue, http.readable()),
+      State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.readable()),
     };
 
     if upgrade == ProtocolResult::Continue {
@@ -205,18 +219,28 @@ impl ProxyClient for TlsClient {
   }
 
   fn writable(&mut self)      -> ClientResult {
-    //self.http().unwrap().writable()
     match *self.protocol.as_mut().unwrap() {
       State::Handshake(ref mut handshake) => ClientResult::CloseClient,
       State::Http(ref mut http)           => http.writable(),
+      State::WebSocket(ref mut pipe)      => pipe.writable(),
     }
   }
 
   fn back_readable(&mut self) -> ClientResult {
-    //self.http().unwrap().back_readable()
-    match *self.protocol.as_mut().unwrap() {
-      State::Handshake(ref mut handshake) => ClientResult::CloseClient,
+    let (upgrade, result) = match *self.protocol.as_mut().unwrap() {
       State::Http(ref mut http)           => http.back_readable(),
+      State::Handshake(ref mut handshake) => (ProtocolResult::Continue, ClientResult::CloseClient),
+      State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.back_readable()),
+    };
+
+    if upgrade == ProtocolResult::Continue {
+      result
+    } else {
+      self.upgrade();
+      match *self.protocol.as_mut().unwrap() {
+        State::WebSocket(ref mut pipe) => pipe.back_readable(),
+        _ => result
+      }
     }
   }
 
@@ -225,6 +249,7 @@ impl ProxyClient for TlsClient {
     match *self.protocol.as_mut().unwrap() {
       State::Handshake(ref mut handshake) => ClientResult::CloseClient,
       State::Http(ref mut http)           => http.back_writable(),
+      State::WebSocket(ref mut pipe)      => pipe.back_writable(),
     }
   }
 
@@ -236,6 +261,7 @@ impl ProxyClient for TlsClient {
     let r = match *self.protocol.as_mut().unwrap() {
       State::Handshake(ref mut handshake) => &mut handshake.readiness,
       State::Http(ref mut http)           => http.readiness(),
+      State::WebSocket(ref mut pipe)      => &mut pipe.readiness,
     };
     //info!("current readiness: {:?}", r);
     r
