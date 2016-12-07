@@ -10,6 +10,7 @@ use network::{ClientResult,Protocol};
 use network::buffer_queue::BufferQueue;
 use network::proxy::Readiness;
 use network::socket::{SocketHandler,SocketResult};
+use nom::HexDisplay;
 
 type BackendToken = Token;
 
@@ -53,8 +54,8 @@ impl<Front:SocketHandler> Pipe<Front> {
       request_id:         request_id,
       server_context:     String::from(server_context),
       readiness:          Readiness {
-                            front_interest:  Ready::readable() | Ready::hup() | Ready::error(),
-                            back_interest:   Ready::readable() | Ready::hup() | Ready::error(),
+                            front_interest:  Ready::readable() | Ready::writable() |Ready::hup() | Ready::error(),
+                            back_interest:   Ready::readable() | Ready::writable() |Ready::hup() | Ready::error(),
                             front_readiness: Ready::none(),
                             back_readiness:  Ready::none(),
       },
@@ -143,14 +144,16 @@ impl<Front:SocketHandler> Pipe<Front> {
     debug!("{}\tFRONT [{:?}]: read {} bytes", self.log_ctx, self.token, sz);
 
     if sz > 0 {
+      //FIXME: replace with copy()
       self.front_buf.buffer.fill(sz);
       self.front_buf.sliced_input(sz);
       self.front_buf.consume_parsed_data(sz);
+      self.front_buf.slice_output(sz);
 
       if self.front_buf.buffer.available_space() == 0 {
         self.readiness.front_interest.remove(Ready::readable());
-        self.readiness.back_interest.insert(Ready::writable());
       }
+      self.readiness.back_interest.insert(Ready::writable());
     } else {
       self.readiness.front_readiness.remove(Ready::readable());
     }
@@ -281,6 +284,7 @@ impl<Front:SocketHandler> Pipe<Front> {
     self.back_buf.buffer.fill(sz);
     self.back_buf.sliced_input(sz);
     self.back_buf.consume_parsed_data(sz);
+    self.back_buf.slice_output(sz);
 
     if let Some((front,back)) = tokens {
       debug!("{}\tBACK  [{}<-{}]: read {} bytes", self.log_ctx, front.0, back.0, sz);
@@ -288,6 +292,9 @@ impl<Front:SocketHandler> Pipe<Front> {
 
     if r != SocketResult::Continue || sz == 0 {
       self.readiness.back_readiness.remove(Ready::readable());
+    }
+    if sz > 0 {
+      self.readiness.front_interest.insert(Ready::writable());
     }
 
     if r == SocketResult::Error {
