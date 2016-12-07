@@ -36,7 +36,7 @@ use messages::{self,Command,TlsFront,TlsProxyConfiguration};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
-use network::protocol::{ProtocolResult,TlsHandshake};
+use network::protocol::{ProtocolResult,TlsHandshake,Http};
 
 type BackendToken = Token;
 
@@ -52,7 +52,7 @@ pub struct TlsApp {
 
 pub enum State {
   Handshake(TlsHandshake),
-  Http(http::Client<SslStream<TcpStream>>),
+  Http(Http<SslStream<TcpStream>>),
 }
 
 pub struct TlsClient {
@@ -78,7 +78,7 @@ impl TlsClient {
     })
   }
 
-  pub fn http(&mut self) -> Option<&mut http::Client<SslStream<TcpStream>>> {
+  pub fn http(&mut self) -> Option<&mut Http<SslStream<TcpStream>>> {
     if let State::Http(ref mut http) = *self.protocol.as_mut().unwrap() {
       Some(http)
     } else {
@@ -90,7 +90,7 @@ impl TlsClient {
     let protocol = self.protocol.take().unwrap();
 
     if let State::Handshake(handshake) = protocol {
-      let mut http = http::Client::new(&handshake.server_context, handshake.stream.unwrap(), handshake.front_buf,
+      let mut http = Http::new(&handshake.server_context, handshake.stream.unwrap(), handshake.front_buf,
         handshake.back_buf, self.public_address.clone()).unwrap();
       http.readiness = handshake.readiness;
       http.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
