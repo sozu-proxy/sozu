@@ -35,9 +35,6 @@ pub struct Client {
   backend_token:  Option<Token>,
   front_timeout:  Option<Timeout>,
   back_timeout:   Option<Timeout>,
-  rx_count:       usize,
-  tx_count:       usize,
-  status:         ClientStatus,
   http:           Http<TcpStream>,
 }
 
@@ -51,9 +48,6 @@ impl Client {
       backend_token:  None,
       front_timeout:  None,
       back_timeout:   None,
-      rx_count:       0,
-      tx_count:       0,
-      status:         ClientStatus::Normal,
       http:           Http::new(server_context, sock.try_clone().unwrap(), front_buf, back_buf, public_address).unwrap(),
       frontend:       sock,
     };
@@ -202,17 +196,17 @@ pub type AppId    = String;
 pub type Hostname = String;
 
 pub struct ServerConfiguration<Tx> {
-  listener:  TcpListener,
-  address:   SocketAddr,
-  instances: HashMap<AppId, Vec<Backend>>,
-  fronts:    HashMap<Hostname, Vec<HttpFront>>,
-  tx:        Tx,
-  pool:      Pool<BufferQueue>,
-  answers:   DefaultAnswers,
+  listener:        TcpListener,
+  address:         SocketAddr,
+  instances:       HashMap<AppId, Vec<Backend>>,
+  fronts:          HashMap<Hostname, Vec<HttpFront>>,
+  tx:              Tx,
+  pool:            Pool<BufferQueue>,
+  answers:         DefaultAnswers,
   front_timeout:   u64,
   back_timeout:    u64,
-  config: HttpProxyConfiguration,
-  tag:    String,
+  config:          HttpProxyConfiguration,
+  tag:             String,
 }
 
 impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
@@ -222,21 +216,21 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
       Ok(sock) => {
         event_loop.register(&sock, Token(start_at), Ready::readable(), PollOpt::level());
         Ok(ServerConfiguration {
-          listener:  sock,
-          address:   config.front,
-          instances: HashMap::new(),
-          fronts:    HashMap::new(),
-          tx:        tx,
-          pool:      Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size)),
+          listener:      sock,
+          address:       config.front,
+          instances:     HashMap::new(),
+          fronts:        HashMap::new(),
+          tx:            tx,
+          pool:          Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size)),
           //FIXME: make the timeout values configurable
           front_timeout: 5000,
           back_timeout:  5000,
-          answers:   DefaultAnswers {
-            NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
-            ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
+          answers:       DefaultAnswers {
+                           NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
+                           ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
           },
-          config: config,
-          tag:    tag,
+          config:        config,
+          tag:           tag,
         })
       },
       Err(e) => {
