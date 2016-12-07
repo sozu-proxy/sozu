@@ -123,11 +123,6 @@ impl ProxyClient for Client {
     self.backend_token = Some(token);
   }
 
-  fn set_tokens(&mut self, token: Token, backend: Token) {
-    self.token         = Some(token);
-    self.backend_token = Some(backend);
-  }
-
   fn front_timeout(&mut self) -> Option<Timeout> {
     self.front_timeout.take()
   }

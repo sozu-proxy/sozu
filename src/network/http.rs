@@ -123,13 +123,6 @@ impl ProxyClient for Client {
     self.http.set_back_token(token);
   }
 
-  fn set_tokens(&mut self, token: Token, backend: Token) {
-    self.token         = Some(token);
-    self.backend_token = Some(backend);
-    self.http.set_front_token(token);
-    self.http.set_back_token(backend);
-  }
-
   fn readiness(&mut self) -> &mut Readiness {
     &mut self.http.readiness
   }

@@ -201,11 +201,6 @@ impl<Front:SocketHandler> Http<Front> {
     self.backend_token = Some(token);
   }
 
-  pub fn set_tokens(&mut self, token: Token, backend: Token) {
-    self.token         = Some(token);
-    self.backend_token = Some(backend);
-  }
-
   pub fn readiness(&mut self) -> &mut Readiness {
     &mut self.readiness
   }

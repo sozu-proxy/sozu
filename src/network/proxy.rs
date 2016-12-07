@@ -112,7 +112,6 @@ pub trait ProxyClient {
   fn back_timeout(&mut self)  -> Option<Timeout>;
   fn set_front_timeout(&mut self, timeout: Timeout);
   fn set_back_timeout(&mut self, timeout: Timeout);
-  fn set_tokens(&mut self, token: Token, backend: Token);
   fn front_hup(&mut self)     -> ClientResult;
   fn back_hup(&mut self)      -> ClientResult;
   fn readable(&mut self)      -> ClientResult;

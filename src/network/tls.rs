@@ -176,10 +176,6 @@ impl ProxyClient for TlsClient {
     self.back_timeout = Some(timeout);
   }
 
-  fn set_tokens(&mut self, token: Token, backend: Token) {
-    self.http().unwrap().set_tokens(token, backend)
-  }
-
   fn front_hup(&mut self)     -> ClientResult {
     self.http().unwrap().front_hup()
   }
