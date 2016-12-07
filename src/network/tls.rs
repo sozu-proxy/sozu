@@ -57,7 +57,9 @@ pub enum State {
 
 pub struct TlsClient {
   front:          Option<TcpStream>,
+  front_token:    Option<Token>,
   front_timeout:  Option<Timeout>,
+  back_timeout:   Option<Timeout>,
   protocol:       Option<State>,
   public_address: Option<IpAddr>,
   ssl:            Option<Ssl>,
@@ -71,7 +73,9 @@ impl TlsClient {
     let handshake = TlsHandshake::new(server_context, ssl, s, front_buf, back_buf);
     Some(TlsClient {
       front:          Some(sock),
+      front_token:    None,
       front_timeout:  None,
+      back_timeout:   None,
       protocol:       Some(State::Handshake(handshake)),
       public_address: public_address,
       ssl:            None,
@@ -94,11 +98,7 @@ impl TlsClient {
         handshake.back_buf, self.public_address.clone()).unwrap();
       http.readiness = handshake.readiness;
       http.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
-      let front_token = handshake.front_token.as_ref().unwrap();
-      http.set_front_token(front_token.clone());
-      if let Some(timeout) = self.front_timeout.take() {
-        http.set_front_timeout(timeout);
-      }
+      http.set_front_token(self.front_token.as_ref().unwrap().clone());
       self.ssl = handshake.ssl;
       self.protocol = Some(State::Http(http));
     } else {
@@ -109,10 +109,7 @@ impl TlsClient {
 
 impl ProxyClient for TlsClient {
   fn front_socket(&self) -> &TcpStream {
-    match *self.protocol.as_ref().unwrap() {
-      State::Handshake(ref handshake) => handshake.front.as_ref().unwrap(),
-      State::Http(ref http)           => http.front_socket(),
-    }
+    self.front.as_ref().unwrap()
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
@@ -123,10 +120,7 @@ impl ProxyClient for TlsClient {
   }
 
   fn front_token(&self)  -> Option<Token> {
-    match *self.protocol.as_ref().unwrap() {
-      State::Handshake(ref handshake) => handshake.front_token,
-      State::Http(ref http)           => http.front_token(),
-    }
+    self.front_token
   }
 
   fn back_token(&self)   -> Option<Token> {
@@ -155,10 +149,11 @@ impl ProxyClient for TlsClient {
   }
 
   fn set_front_token(&mut self, token: Token) {
-    match *self.protocol.as_mut().unwrap() {
-      State::Handshake(ref mut handshake) => handshake.front_token = Some(token),
-      State::Http(ref mut http)           => http.set_front_token(token),
-    }
+    self.front_token = Some(token);
+    self.protocol.as_mut().map(|p| match *p {
+      State::Http(ref mut http) => http.set_front_token(token),
+      _                         => {}
+    });
   }
 
   fn set_back_token(&mut self, token: Token) {
@@ -166,27 +161,19 @@ impl ProxyClient for TlsClient {
   }
 
   fn front_timeout(&mut self) -> Option<Timeout> {
-    if self.http().is_some() {
-      self.http().unwrap().front_timeout()
-    } else {
-      self.front_timeout.clone()
-    }
+    self.front_timeout.clone()
   }
 
   fn back_timeout(&mut self)  -> Option<Timeout> {
-    self.http().unwrap().back_timeout()
+    self.back_timeout.clone()
   }
 
   fn set_front_timeout(&mut self, timeout: Timeout) {
-    if self.http().is_some() {
-      self.http().unwrap().set_front_timeout(timeout);
-    } else {
-      self.front_timeout = Some(timeout)
-    }
+    self.front_timeout = Some(timeout)
   }
 
   fn set_back_timeout(&mut self, timeout: Timeout) {
-    self.http().unwrap().set_back_timeout(timeout)
+    self.back_timeout = Some(timeout);
   }
 
   fn set_tokens(&mut self, token: Token, backend: Token) {

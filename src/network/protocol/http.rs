@@ -39,18 +39,15 @@ pub enum ClientStatus {
 }
 
 pub struct Http<Front:SocketHandler> {
-  pub frontend:   Front,
-  backend:        Option<TcpStream>,
-  token:          Option<Token>,
-  backend_token:  Option<Token>,
-  front_timeout:  Option<Timeout>,
-  back_timeout:   Option<Timeout>,
-  rx_count:       usize,
-  tx_count:       usize,
-  status:         ClientStatus,
-
+  pub frontend:       Front,
+  backend:            Option<TcpStream>,
+  token:              Option<Token>,
+  backend_token:      Option<Token>,
+  rx_count:           usize,
+  tx_count:           usize,
+  status:             ClientStatus,
   state:              Option<HttpState>,
-  pub front_buf:          Checkout<BufferQueue>,
+  pub front_buf:      Checkout<BufferQueue>,
   back_buf:           Checkout<BufferQueue>,
   front_buf_position: usize,
   back_buf_position:  usize,
@@ -77,16 +74,13 @@ impl<Front:SocketHandler> Http<Front> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{}\t{}\tunknown\t", server_context, &request_id);
     let mut client = Http {
-      frontend:       sock,
-      backend:        None,
-      token:          None,
-      backend_token:  None,
-      front_timeout:  None,
-      back_timeout:   None,
-      rx_count:       0,
-      tx_count:       0,
-      status:         ClientStatus::Normal,
-
+      frontend:           sock,
+      backend:            None,
+      token:              None,
+      backend_token:      None,
+      rx_count:           0,
+      tx_count:           0,
+      status:             ClientStatus::Normal,
       state:              Some(HttpState::new()),
       front_buf:          front_buf,
       back_buf:           back_buf,
@@ -217,22 +211,6 @@ impl<Front:SocketHandler> Http<Front> {
     } else {
       format!("{}\t{}\tunknown\t", self.server_context, self.request_id)
     }
-  }
-
-  pub fn front_timeout(&mut self) -> Option<Timeout> {
-    self.front_timeout.take()
-  }
-
-  pub fn back_timeout(&mut self) -> Option<Timeout> {
-    self.back_timeout.take()
-  }
-
-  pub fn set_front_timeout(&mut self, timeout: Timeout) {
-    self.front_timeout = Some(timeout)
-  }
-
-  pub fn set_back_timeout(&mut self, timeout: Timeout) {
-    self.back_timeout = Some(timeout)
   }
 
   pub fn set_back_socket(&mut self, socket: TcpStream) {

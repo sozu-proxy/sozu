@@ -16,7 +16,6 @@ pub enum TlsState {
 
 pub struct TlsHandshake {
   pub readiness:       Readiness,
-  pub front_token:     Option<Token>,
   pub front:           Option<TcpStream>,
   pub front_buf:       Checkout<BufferQueue>,
   pub back_buf:        Checkout<BufferQueue>,
@@ -31,7 +30,6 @@ impl TlsHandshake {
   pub fn new(server_context: &str, ssl:Ssl, sock: TcpStream, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>) -> TlsHandshake {
     TlsHandshake {
       front:          Some(sock),
-      front_token:    None,
       server_context: String::from(server_context),
       front_buf:      front_buf,
       back_buf:       back_buf,
