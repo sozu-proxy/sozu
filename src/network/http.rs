@@ -50,7 +50,7 @@ pub struct Client<Front:SocketHandler> {
   status:         ClientStatus,
 
   state:              Option<HttpState>,
-  front_buf:          Checkout<BufferQueue>,
+  pub front_buf:          Checkout<BufferQueue>,
   back_buf:           Checkout<BufferQueue>,
   front_buf_position: usize,
   back_buf_position:  usize,
@@ -60,7 +60,7 @@ pub struct Client<Front:SocketHandler> {
   pub app_id:         Option<String>,
   request_id:         String,
   server_context:     String,
-  readiness:          Readiness,
+  pub readiness:      Readiness,
   log_ctx:            String,
   public_address:     Option<IpAddr>,
 }

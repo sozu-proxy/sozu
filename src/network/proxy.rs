@@ -410,7 +410,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
   }
 
   fn ready(&mut self, token: Token, events: Ready) {
-    //println!("PROXY\t{:?} got events: {:?}", token, events);
+    //info!("PROXY\t{:?} got events: {:?}", token, events);
 
     let client_token:FrontToken = match socket_type(token, self.max_listeners, self.max_connections) {
       Some(SocketType::Listener) => {
