@@ -40,7 +40,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   pub fn new(server_context: &str, frontend: Front, backend: TcpStream, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<Pipe<Front>> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{}\t{}\tunknown\t", server_context, &request_id);
-    let mut client = Pipe {
+    let client = Pipe {
       frontend:           frontend,
       backend:            backend,
       token:              None,
@@ -62,6 +62,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       public_address:     public_address,
     };
 
+    info!("created pipe");
     Some(client)
   }
 
@@ -131,6 +132,7 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   // Read content from the client
   pub fn readable(&mut self) -> ClientResult {
+    info!("pipe readable");
     if self.front_buf.buffer.available_space() == 0 {
       self.readiness.front_interest.remove(Ready::readable());
       self.readiness.back_interest.insert(Ready::writable());
@@ -171,6 +173,7 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   // Forward content to client
   pub fn writable(&mut self) -> ClientResult {
+    info!("pipe writable");
     if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
       self.readiness.back_interest.insert(Ready::readable());
       self.readiness.front_interest.remove(Ready::writable());
@@ -220,6 +223,7 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   // Forward content to application
   pub fn back_writable(&mut self) -> ClientResult {
+    info!("pipe back_writable");
     if self.front_buf.output_data_size() == 0 || self.front_buf.next_output_data().len() == 0 {
       self.readiness.front_interest.insert(Ready::readable());
       self.readiness.back_interest.remove(Ready::writable());
@@ -266,6 +270,7 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   // Read content from application
   pub fn back_readable(&mut self) -> ClientResult {
+    info!("pipe back_readable");
     if self.back_buf.buffer.available_space() == 0 {
       self.readiness.back_interest.remove(Ready::readable());
       return ClientResult::Continue;

@@ -40,7 +40,7 @@ pub struct Client {
   backend_token:  Option<Token>,
   front_timeout:  Option<Timeout>,
   back_timeout:   Option<Timeout>,
-  http:           Http<TcpStream>,
+  protocol:       Option<State>,
 }
 
 impl Client {
@@ -53,19 +53,49 @@ impl Client {
       backend_token:  None,
       front_timeout:  None,
       back_timeout:   None,
-      http:           Http::new(server_context, sock.try_clone().unwrap(), front_buf, back_buf, public_address).unwrap(),
+      protocol:          Some(State::Http(
+        Http::new(server_context, sock.try_clone().unwrap(), front_buf, back_buf, public_address).unwrap()
+      )),
       frontend:       sock,
     };
 
     Some(client)
   }
 
-  pub fn reset(&mut self) {
-    self.http.reset()
+  pub fn upgrade(&mut self) {
+    info!("HTTP::upgrade");
+    let protocol = self.protocol.take().unwrap();
+    if let State::Http(http) = protocol {
+      info!("switching to pipe");
+      let front_token = http.front_token().unwrap();
+      let back_token  = http.back_token().unwrap();
+
+      let mut pipe = Pipe::new(&http.server_context, http.frontend, http.backend.unwrap(),
+        http.front_buf, http.back_buf, http.public_address).unwrap();
+
+      pipe.readiness.front_readiness = http.readiness.front_readiness;
+      pipe.readiness.back_readiness  = http.readiness.back_readiness;
+      pipe.set_front_token(front_token);
+      pipe.set_back_token(back_token);
+
+      self.protocol = Some(State::WebSocket(pipe));
+    } else {
+      self.protocol = Some(protocol);
+    }
   }
 
   pub fn set_answer(&mut self, buf: &[u8])  {
-    self.http.set_answer(buf);
+    match *self.protocol.as_mut().unwrap() {
+      State::Http(ref mut http) => http.set_answer(buf),
+      _ => {}
+    }
+  }
+
+  pub fn http(&mut self) -> Option<&mut Http<TcpStream>> {
+    match *self.protocol.as_mut().unwrap() {
+      State::Http(ref mut http) => Some(http),
+      _ => None
+    }
   }
 }
 
@@ -90,10 +120,16 @@ impl ProxyClient for Client {
   }
 
   fn log_context(&self) -> String {
-    if let Some(ref app_id) = self.http.app_id {
-      format!("{}\t{}\t{}\t", self.http.server_context, self.http.request_id, app_id)
-    } else {
-      format!("{}\t{}\tunknown\t", self.http.server_context, self.http.request_id)
+    match *self.protocol.as_ref().unwrap() {
+      State::Http(ref http) => {
+        if let Some(ref app_id) = http.app_id {
+          format!("{}\t{}\t{}\t", http.server_context, http.request_id, app_id)
+        } else {
+          format!("{}\t{}\tunknown\t", http.server_context, http.request_id)
+        }
+
+      },
+      _ => "".to_string()
     }
   }
 
@@ -114,22 +150,34 @@ impl ProxyClient for Client {
   }
 
   fn set_back_socket(&mut self, socket: TcpStream) {
-    self.http.set_back_socket(socket.try_clone().unwrap());
+    match *self.protocol.as_mut().unwrap() {
+      State::Http(ref mut http)      => http.set_back_socket(socket.try_clone().unwrap()),
+      State::WebSocket(ref mut pipe) => {} /*pipe.set_back_socket(socket.try_clone().unwrap())*/
+    }
     self.backend         = Some(socket);
   }
 
   fn set_front_token(&mut self, token: Token) {
     self.token         = Some(token);
-    self.http.set_front_token(token);
+    match *self.protocol.as_mut().unwrap() {
+      State::Http(ref mut http)      => http.set_front_token(token),
+      State::WebSocket(ref mut pipe) => pipe.set_front_token(token)
+    }
   }
 
   fn set_back_token(&mut self, token: Token) {
     self.backend_token = Some(token);
-    self.http.set_back_token(token);
+    match *self.protocol.as_mut().unwrap() {
+      State::Http(ref mut http)      => http.set_back_token(token),
+      State::WebSocket(ref mut pipe) => pipe.set_back_token(token)
+    }
   }
 
   fn readiness(&mut self) -> &mut Readiness {
-    &mut self.http.readiness
+    match *self.protocol.as_mut().unwrap() {
+      State::Http(ref mut http)      => &mut http.readiness,
+      State::WebSocket(ref mut pipe) => &mut pipe.readiness
+    }
   }
 
   fn protocol(&self)           -> Protocol {
@@ -138,11 +186,11 @@ impl ProxyClient for Client {
 
   //FIXME: unwrap bad, bad rust coder
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.http.log_ctx, self.token.unwrap().0, self.backend_token.unwrap().0);
+    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.http().unwrap().log_ctx.clone(), self.token.unwrap().0, self.backend_token.unwrap().0);
     let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
     self.backend       = None;
     self.backend_token = None;
-    (self.http.app_id.clone(), addr)
+    (self.http().unwrap().app_id.clone(), addr)
   }
 
   fn front_hup(&mut self) -> ClientResult {
@@ -163,22 +211,44 @@ impl ProxyClient for Client {
 
   // Read content from the client
   fn readable(&mut self) -> ClientResult {
-    self.http.readable()
+    match *self.protocol.as_mut().unwrap() {
+      State::Http(ref mut http)      => http.readable(),
+      State::WebSocket(ref mut pipe) => pipe.readable()
+    }
   }
 
   // Forward content to client
   fn writable(&mut self) -> ClientResult {
-    self.http.writable()
+    match  *self.protocol.as_mut().unwrap() {
+      State::Http(ref mut http)      => http.writable(),
+      State::WebSocket(ref mut pipe) => pipe.writable()
+    }
   }
 
   // Forward content to application
   fn back_writable(&mut self) -> ClientResult {
-    self.http.back_writable()
+    match *self.protocol.as_mut().unwrap()  {
+      State::Http(ref mut http)      => http.back_writable(),
+      State::WebSocket(ref mut pipe) => pipe.back_writable()
+    }
   }
 
   // Read content from application
   fn back_readable(&mut self) -> ClientResult {
-    self.http.back_readable()
+    let (upgrade, result) = match  *self.protocol.as_mut().unwrap()  {
+      State::Http(ref mut http)      => http.back_readable(),
+      State::WebSocket(ref mut pipe) => (ProtocolResult::Continue, pipe.back_readable())
+    };
+
+    if upgrade == ProtocolResult::Continue {
+      result
+    } else {
+      self.upgrade();
+      match *self.protocol.as_mut().unwrap() {
+        State::WebSocket(ref mut pipe) => pipe.back_readable(),
+        _ => result
+      }
+    }
   }
 }
 
@@ -309,7 +379,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
   pub fn backend_from_app_id(&mut self, client: &mut Client, app_id: &str) -> Result<TcpStream,ConnectionError> {
     // FIXME: the app id clone here is probably very inefficient
     //if let Some(app_id) = self.frontend_from_request(host, uri).map(|ref front| front.http.app_id.clone()) {
-    client.http.app_id = Some(String::from(app_id));
+    client.http().map(|h| h.app_id = Some(String::from(app_id)));
     //FIXME: round-robin on instances
     if let Some(ref mut app_instances) = self.instances.get_mut(app_id) {
       if app_instances.len() == 0 {
@@ -319,7 +389,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
       let rnd = random::<usize>();
       let mut instances:Vec<&mut Backend> = app_instances.iter_mut().filter(|backend| backend.can_open()).collect();
       let idx = rnd % instances.len();
-      info!("{}\tConnecting {} -> {:?}", client.http.log_ctx, app_id, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
+      info!("{}\tConnecting {} -> {:?}", client.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), app_id, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
       instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut backend| {
         let conn: Result<TcpStream, ConnectionError> = TcpStream::connect(&backend.address).map_err(|_| ConnectionError::NoBackendAvailable);
         if conn.is_ok() {
@@ -335,7 +405,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
 
 impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerConfiguration<Tx> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut Client) -> Result<BackendConnectAction,ConnectionError> {
-    let h = try!(client.http.state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
+    let h = try!(client.http().unwrap().state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
@@ -359,14 +429,15 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerC
       return Err(ConnectionError::ToBeDefined);
     };
 
-    let rl     = try!(client.http.state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
+    //FIXME: too many unwraps here
+    let rl     = try!(client.http().unwrap().state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
     if let Some(app_id) = self.frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
-      if client.http.app_id.as_ref() == Some(&app_id) {
+      if client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id) {
         //matched on keepalive
         return Ok(BackendConnectAction::Reuse)
       }
 
-      let reused = client.http.app_id.is_some();
+      let reused = client.http().map(|http| http.app_id.is_some()).unwrap_or(false);
       if reused {
         let sock = client.backend.as_ref().unwrap();
         event_loop.deregister(sock);

@@ -12,6 +12,7 @@ use network::{ClientResult,Protocol};
 use network::buffer_queue::BufferQueue;
 use network::proxy::Readiness;
 use network::socket::{SocketHandler,SocketResult};
+use network::protocol::ProtocolResult;
 
 type BackendToken = Token;
 
@@ -23,7 +24,7 @@ pub enum ClientStatus {
 
 pub struct Http<Front:SocketHandler> {
   pub frontend:       Front,
-  backend:            Option<TcpStream>,
+  pub backend:        Option<TcpStream>,
   token:              Option<Token>,
   backend_token:      Option<Token>,
   rx_count:           usize,
@@ -31,7 +32,7 @@ pub struct Http<Front:SocketHandler> {
   pub status:         ClientStatus,
   pub state:          Option<HttpState>,
   pub front_buf:      Checkout<BufferQueue>,
-  back_buf:           Checkout<BufferQueue>,
+  pub back_buf:       Checkout<BufferQueue>,
   front_buf_position: usize,
   back_buf_position:  usize,
   start:              u64,
@@ -42,7 +43,7 @@ pub struct Http<Front:SocketHandler> {
   pub server_context: String,
   pub readiness:      Readiness,
   pub log_ctx:        String,
-  public_address:     Option<IpAddr>,
+  pub public_address: Option<IpAddr>,
 }
 
 impl<Front:SocketHandler> Http<Front> {
@@ -587,18 +588,18 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   // Read content from application
-  pub fn back_readable(&mut self) -> ClientResult {
+  pub fn back_readable(&mut self) -> (ProtocolResult, ClientResult) {
     if self.status == ClientStatus::DefaultAnswer {
       error!("{}\tsending default answer, should not read from back socket", self.log_ctx);
       self.readiness.back_interest.remove(Ready::readable());
-      return ClientResult::Continue;
+      return (ProtocolResult::Continue, ClientResult::Continue);
     }
 
     assert!(self.front_buf.empty(), "investigating single buffer usage: the front->back buffer should not be used while parsing and forwarding the response");
 
     if self.back_buf.buffer.available_space() == 0 {
       self.readiness.back_interest.remove(Ready::readable());
-      return ClientResult::Continue;
+      return (ProtocolResult::Continue, ClientResult::Continue);
     }
 
     let tokens     = self.tokens().clone();
@@ -606,7 +607,7 @@ impl<Front:SocketHandler> Http<Front> {
     if self.backend.is_none() {
       error!("{}\tback socket not found, closing connection", self.log_ctx);
       self.readiness.reset();
-      return ClientResult::CloseBothFailure;
+      return (ProtocolResult::Continue, ClientResult::CloseBothFailure);
     }
 
     let sock = self.backend.as_mut().unwrap();
@@ -625,31 +626,42 @@ impl<Front:SocketHandler> Http<Front> {
     if r == SocketResult::Error {
       error!("{}\tback socket read error, closing connection", self.log_ctx);
       self.readiness.reset();
-      return ClientResult::CloseBothFailure;
+      return (ProtocolResult::Continue, ClientResult::CloseBothFailure);
+    }
+
+    // isolate that here because the "ref protocol" and the self.state = " make borrowing conflicts
+    if let Some(ResponseState::ResponseUpgrade(_,_, ref protocol)) = self.state.as_ref().unwrap().response {
+      info!("got an upgrade state[{}]: {:?}", line!(), protocol);
+      if protocol == "websocket" {
+        return (ProtocolResult::Upgrade, ClientResult::Continue);
+      } else {
+        //FIXME: should we upgrade to a pipe or send an error?
+        return (ProtocolResult::Continue, ClientResult::Continue);
+      }
     }
 
     match self.state.as_ref().unwrap().response {
       Some(ResponseState::Response(_,_)) => {
         error!("{}\tshould not go back in back_readable if the whole response was parsed", self.log_ctx);
         self.readiness.back_interest.remove(Ready::readable());
-        ClientResult::Continue
+        (ProtocolResult::Continue, ClientResult::Continue)
       },
       Some(ResponseState::ResponseWithBody(_,_,_)) => {
         self.readiness.front_interest.insert(Ready::writable());
         if ! self.back_buf.needs_input() {
           self.readiness.back_interest.remove(Ready::readable());
         }
-        ClientResult::Continue
+        (ProtocolResult::Continue, ClientResult::Continue)
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
         error!("{}\tback read should have stopped on chunk ended", self.log_ctx);
         self.readiness.back_interest.remove(Ready::readable());
-        ClientResult::Continue
+        (ProtocolResult::Continue, ClientResult::Continue)
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Error)) => {
         error!("{}\tback read should have stopped on chunk error", self.log_ctx);
         self.readiness.reset();
-        ClientResult::CloseClient
+        (ProtocolResult::Continue, ClientResult::CloseClient)
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
         if ! self.back_buf.needs_input() {
@@ -660,7 +672,7 @@ impl<Front:SocketHandler> Http<Front> {
             error!("{}\tback socket chunk parse error, closing connection", self.log_ctx);
             time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             self.readiness.reset();
-            return ClientResult::CloseBothFailure;
+            return (ProtocolResult::Continue, ClientResult::CloseBothFailure);
           }
 
           if let Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) = self.state.as_ref().unwrap().response {
@@ -668,7 +680,7 @@ impl<Front:SocketHandler> Http<Front> {
           }
           self.readiness.front_interest.insert(Ready::writable());
         }
-        ClientResult::Continue
+        (ProtocolResult::Continue, ClientResult::Continue)
       },
       Some(ResponseState::Error(_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
       _ => {
@@ -679,14 +691,25 @@ impl<Front:SocketHandler> Http<Front> {
           error!("{}\tback socket parse error, closing connection", self.log_ctx);
           time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
           self.readiness.reset();
-          return ClientResult::CloseBothFailure;
+          return (ProtocolResult::Continue, ClientResult::CloseBothFailure);
         }
 
         if let Some(ResponseState::Response(_,_)) = self.state.as_ref().unwrap().response {
           self.readiness.back_interest.remove(Ready::readable());
         }
+
+        if let Some(ResponseState::ResponseUpgrade(_,_, ref protocol)) = self.state.as_ref().unwrap().response {
+          info!("got an upgrade state[{}]: {:?}", line!(), protocol);
+          if protocol == "websocket" {
+            return (ProtocolResult::Upgrade, ClientResult::Continue);
+          } else {
+            //FIXME: should we upgrade to a pipe or send an error?
+            return (ProtocolResult::Continue, ClientResult::Continue);
+          }
+        }
+
         self.readiness.front_interest.insert(Ready::writable());
-        ClientResult::Continue
+        (ProtocolResult::Continue, ClientResult::Continue)
       }
     }
   }
