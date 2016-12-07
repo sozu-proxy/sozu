@@ -1,5 +1,3 @@
-#![allow(unused_imports)]
-
 use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
 use std::sync::{Arc,Mutex};
@@ -20,8 +18,7 @@ use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{precise_time_s, precise_time_ns};
 use rand::random;
-use openssl::ssl::{self,HandshakeError,MidHandshakeSslStream,
-                   SslContext, SslContextOptions, SslMethod,
+use openssl::ssl::{self, SslContext, SslContextOptions, SslMethod,
                    Ssl, SslRef, SslStream, SniError};
 use openssl::x509::{X509,X509FileType};
 use openssl::dh::DH;
