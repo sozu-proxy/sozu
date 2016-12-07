@@ -1,35 +1,24 @@
-#![allow(unused_imports)]
-
+use std::collections::HashMap;
+use std::io::{self,Read,Write,ErrorKind};
 use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
-use std::cmp::min;
-use mio::tcp::*;
-use std::io::{self,Read,Write,ErrorKind};
-use mio::*;
-use mio::timer::Timeout;
-use bytes::{ByteBuf,MutByteBuf};
-use bytes::buf::MutBuf;
-use pool::{Pool,Checkout,Reset};
-use std::collections::HashMap;
-use std::error::Error;
-use slab::Slab;
 use std::net::{SocketAddr,IpAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
-use time::{Duration, precise_time_s, precise_time_ns};
-use rand::random;
+use mio::*;
+use mio::tcp::*;
+use mio::timer::Timeout;
+use pool::{Pool,Checkout,Reset};
 use uuid::Uuid;
-use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
-use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness,ListenToken,FrontToken,BackToken};
-use network::buffer::Buffer;
-use network::buffer_queue::BufferQueue;
-use network::socket::{SocketHandler,SocketResult,server_bind};
-use network::protocol::{ProtocolResult,TlsHandshake,Http};
-use messages;
-
-use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop, hostname_and_port, BufferMove, RequestState, ResponseState, Chunk};
 use nom::{HexDisplay,IResult};
+use rand::random;
 
-use messages::{Command,HttpFront,HttpProxyConfiguration};
+use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
+use network::buffer_queue::BufferQueue;
+use network::protocol::{ProtocolResult,TlsHandshake,Http};
+use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness,ListenToken,FrontToken,BackToken};
+use network::socket::{SocketHandler,SocketResult,server_bind};
+use messages::{self,Command,HttpFront,HttpProxyConfiguration};
+use parser::http11::hostname_and_port;
 
 type BackendToken = Token;
 
@@ -50,30 +39,9 @@ pub struct Client {
   tx_count:       usize,
   status:         ClientStatus,
   http:           Http<TcpStream>,
-
-  /*state:              Option<HttpState>,
-  pub front_buf:          Checkout<BufferQueue>,
-  back_buf:           Checkout<BufferQueue>,
-  front_buf_position: usize,
-  back_buf_position:  usize,
-  start:              u64,
-  req_size:           usize,
-  res_size:           usize,
-  pub app_id:         Option<String>,
-  request_id:         String,
-  server_context:     String,
-  pub readiness:      Readiness,
-  log_ctx:            String,
-  public_address:     Option<IpAddr>,
-  */
 }
 
 impl Client {
-  pub fn set_app_id(&mut self, app_id: &str) {
-    self.http.app_id = Some(String::from(app_id));
-    self.http.log_ctx = format!("{}\t{}\t{}\t", self.http.server_context, self.http.request_id, app_id);
-  }
-
   pub fn new(server_context: &str, sock: TcpStream, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<Client> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{}\t{}\tunknown\t", server_context, &request_id);
@@ -88,28 +56,7 @@ impl Client {
       status:         ClientStatus::Normal,
       http:           Http::new(server_context, sock.try_clone().unwrap(), front_buf, back_buf, public_address).unwrap(),
       frontend:       sock,
-
-      /*state:              Some(HttpState::new()),
-      front_buf:          front_buf,
-      back_buf:           back_buf,
-      front_buf_position: 0,
-      back_buf_position:  0,
-      start:              precise_time_ns(),
-      req_size:           0,
-      res_size:           0,
-      app_id:             None,
-      request_id:         request_id,
-      server_context:     String::from(server_context),
-      readiness:          Readiness::new(),
-      log_ctx:            log_ctx,
-      public_address:     public_address,
-        */
     };
-    /*let req_header = client.added_request_header(public_address);
-    let res_header = client.added_response_header();
-    client.state.as_mut().map(|ref mut state| state.added_req_header = req_header);
-    client.state.as_mut().map(|ref mut state| state.added_res_header = res_header);
-    */
 
     Some(client)
   }
@@ -118,64 +65,8 @@ impl Client {
     self.http.reset()
   }
 
-  fn tokens(&self) -> Option<(Token,Token)> {
-    if let Some(front) = self.token {
-      if let Some(back) = self.backend_token {
-        return Some((front, back))
-      }
-    }
-    None
-  }
-
-  pub fn state(&mut self) -> &mut HttpState {
-    self.http.state.as_mut().unwrap()
-  }
-
-  pub fn set_state(&mut self, state: HttpState) {
-    self.http.state = Some(state);
-  }
-
   pub fn set_answer(&mut self, buf: &[u8])  {
     self.http.set_answer(buf);
-  }
-
-  pub fn added_request_header(&self, public_address: Option<IpAddr>) -> String {
-    if let (Some(peer), Some(front)) = (
-      self.front_socket().peer_addr().map(|addr| addr.ip()).ok(),
-      public_address.or(self.front_socket().local_addr().map(|addr| addr.ip()).ok())
-    ) {
-      let proto = match self.protocol() {
-        Protocol::HTTP => "http",
-        Protocol::TLS  => "https",
-        _              => unreachable!()
-      };
-
-      //FIXME: in the "for", we don't put the other values we could get from a preexisting forward header
-      match (peer, front) {
-        (IpAddr::V4(p), IpAddr::V4(f)) => {
-          format!("Forwarded: proto={};for={};by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nRequest-id: {}\r\n",
-            proto, peer, front, proto, peer, self.http.request_id)
-        },
-        (IpAddr::V4(p), IpAddr::V6(f)) => {
-          format!("Forwarded: proto={};for={};by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nRequest-id: {}\r\n",
-            proto, peer, front, proto, peer, self.http.request_id)
-        },
-        (IpAddr::V6(p), IpAddr::V4(f)) => {
-          format!("Forwarded: proto={};for=\"{}\";by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nRequest-id: {}\r\n",
-            proto, peer, front, proto, peer, self.http.request_id)
-        },
-        (IpAddr::V6(p), IpAddr::V6(f)) => {
-          format!("Forwarded: proto={};for=\"{}\";by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nRequest-id: {}\r\n",
-            proto, peer, front, proto, peer, self.http.request_id)
-        },
-      }
-    } else {
-      format!("Request-id: {}\r\n", self.http.request_id)
-    }
-  }
-
-  pub fn added_response_header(&self) -> String {
-    format!("Request-id: {}\r\n", self.http.request_id)
   }
 }
 
@@ -230,15 +121,19 @@ impl ProxyClient for Client {
 
   fn set_front_token(&mut self, token: Token) {
     self.token         = Some(token);
+    self.http.set_front_token(token);
   }
 
   fn set_back_token(&mut self, token: Token) {
     self.backend_token = Some(token);
+    self.http.set_back_token(token);
   }
 
   fn set_tokens(&mut self, token: Token, backend: Token) {
     self.token         = Some(token);
     self.backend_token = Some(backend);
+    self.http.set_front_token(token);
+    self.http.set_back_token(backend);
   }
 
   fn readiness(&mut self) -> &mut Readiness {

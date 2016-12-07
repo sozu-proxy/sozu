@@ -1,34 +1,17 @@
-#![allow(unused_imports)]
-
-use std::thread::{self,Thread,Builder};
-use std::sync::mpsc::{self,channel,Receiver};
 use std::cmp::min;
-use mio::tcp::*;
-use std::io::{self,Read,Write,ErrorKind};
-use mio::*;
-use mio::timer::Timeout;
-use bytes::{ByteBuf,MutByteBuf};
-use bytes::buf::MutBuf;
-use pool::{Pool,Checkout,Reset};
-use std::collections::HashMap;
-use std::error::Error;
-use slab::Slab;
 use std::net::{SocketAddr,IpAddr};
-use std::str::{FromStr, from_utf8, from_utf8_unchecked};
+use std::io::Write;
+use mio::*;
+use mio::tcp::TcpStream;
+use pool::{Pool,Checkout,Reset};
 use time::{Duration, precise_time_s, precise_time_ns};
-use rand::random;
 use uuid::Uuid;
-use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
-use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness,ListenToken,FrontToken,BackToken};
-use network::buffer::Buffer;
+use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop,
+  BufferMove, RequestState, ResponseState, Chunk};
+use network::{ClientResult,Protocol};
 use network::buffer_queue::BufferQueue;
-use network::socket::{SocketHandler,SocketResult,server_bind};
-use messages;
-
-use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop, hostname_and_port, BufferMove, RequestState, ResponseState, Chunk};
-use nom::{HexDisplay,IResult};
-
-use messages::{Command,HttpFront,HttpProxyConfiguration};
+use network::proxy::Readiness;
+use network::socket::{SocketHandler,SocketResult};
 
 type BackendToken = Token;
 
@@ -58,15 +41,8 @@ pub struct Http<Front:SocketHandler> {
   pub request_id:     String,
   pub server_context: String,
   pub readiness:      Readiness,
-pub log_ctx:        String,
+  pub log_ctx:        String,
   public_address:     Option<IpAddr>,
-}
-
-impl<Front:SocketHandler> Http<Front> {
-  pub fn set_app_id(&mut self, app_id: &str) {
-    self.app_id = Some(String::from(app_id));
-    self.log_ctx = format!("{}\t{}\t{}\t", self.server_context, self.request_id, app_id);
-  }
 }
 
 impl<Front:SocketHandler> Http<Front> {
