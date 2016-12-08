@@ -64,14 +64,15 @@ pub struct TlsClient {
   protocol:       Option<State>,
   public_address: Option<IpAddr>,
   ssl:            Option<Ssl>,
+  pool:           Weak<RefCell<Pool<BufferQueue>>>,
 }
 
 impl TlsClient {
-  pub fn new(server_context: &str, ssl:Ssl, sock: TcpStream, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<TlsClient> {
+  pub fn new(server_context: &str, ssl:Ssl, sock: TcpStream, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> Option<TlsClient> {
     //FIXME: we should not need to clone the socket. Maybe do the accept here instead of
     // in TlsHandshake?
     let s = sock.try_clone().unwrap();
-    let handshake = TlsHandshake::new(server_context, ssl, s, front_buf, back_buf);
+    let handshake = TlsHandshake::new(server_context, ssl, s);
     Some(TlsClient {
       front:          Some(sock),
       front_token:    None,
@@ -80,6 +81,7 @@ impl TlsClient {
       protocol:       Some(State::Handshake(handshake)),
       public_address: public_address,
       ssl:            None,
+      pool:           pool,
     })
   }
 
@@ -91,17 +93,29 @@ impl TlsClient {
     }
   }
 
-  pub fn upgrade(&mut self) {
+  pub fn upgrade(&mut self) -> bool {
     let protocol = self.protocol.take().unwrap();
 
     if let State::Handshake(handshake) = protocol {
-      let mut http = Http::new(&handshake.server_context, handshake.stream.unwrap(), handshake.front_buf,
-        handshake.back_buf, self.public_address.clone()).unwrap();
-      http.readiness = handshake.readiness;
-      http.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
-      http.set_front_token(self.front_token.as_ref().unwrap().clone());
-      self.ssl = handshake.ssl;
-      self.protocol = Some(State::Http(http));
+      if let Some(pool) = self.pool.upgrade() {
+        let mut p = pool.borrow_mut();
+
+        if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
+          let mut http = Http::new(&handshake.server_context, handshake.stream.unwrap(), front_buf,
+            back_buf, self.public_address.clone()).unwrap();
+
+          http.readiness = handshake.readiness;
+          http.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
+          http.set_front_token(self.front_token.as_ref().unwrap().clone());
+          self.ssl = handshake.ssl;
+          self.protocol = Some(State::Http(http));
+          return true;
+        } else {
+          error!("could not get buffers");
+          //FIXME: must return an error and stop the connection here
+        }
+      }
+      false
     } else if let State::Http(http) = protocol {
       info!("https switching to wss");
       let front_token = http.front_token().unwrap();
@@ -116,8 +130,10 @@ impl TlsClient {
       pipe.set_back_token(back_token);
 
       self.protocol = Some(State::WebSocket(pipe));
+      true
     } else {
       self.protocol = Some(protocol);
+      true
     }
   }
 }
@@ -210,10 +226,13 @@ impl ProxyClient for TlsClient {
     if upgrade == ProtocolResult::Continue {
       result
     } else {
-      self.upgrade();
-      match *self.protocol.as_mut().unwrap() {
-        State::Http(ref mut http) => http.readable(),
-        _ => result
+        if self.upgrade() {
+        match *self.protocol.as_mut().unwrap() {
+          State::Http(ref mut http) => http.readable(),
+          _ => result
+        }
+      } else {
+        ClientResult::CloseClient
       }
     }
   }
@@ -236,10 +255,13 @@ impl ProxyClient for TlsClient {
     if upgrade == ProtocolResult::Continue {
       result
     } else {
-      self.upgrade();
+      if self.upgrade() {
       match *self.protocol.as_mut().unwrap() {
         State::WebSocket(ref mut pipe) => pipe.back_readable(),
         _ => result
+      }
+      } else {
+        ClientResult::CloseBothFailure
       }
     }
   }
@@ -293,7 +315,7 @@ pub struct ServerConfiguration<Tx> {
   default_context: TlsData,
   contexts:        Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
   tx:              Tx,
-  pool:            Pool<BufferQueue>,
+  pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
   front_timeout:   u64,
   back_timeout:    u64,
@@ -402,7 +424,9 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
           default_context: tls_data,
           contexts:        rc_ctx,
           tx:              tx,
-          pool:            Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size)),
+          pool:            Rc::new(RefCell::new(
+                             Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size))
+          )),
           front_timeout:   50000,
           back_timeout:    50000,
           answers:         DefaultAnswers {
@@ -693,23 +717,19 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
 
 impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for ServerConfiguration<Tx> {
   fn accept(&mut self, token: ListenToken) -> Option<(TlsClient,bool)> {
-    if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
-      let accepted = self.listener.accept();
+    let accepted = self.listener.accept();
 
-      if let Ok((frontend_sock, _)) = accepted {
-        frontend_sock.set_nodelay(true);
-        if let Ok(ssl) = Ssl::new(&self.default_context.context) {
-          if let Some(c) = TlsClient::new("TLS", ssl, frontend_sock, front_buf, back_buf, self.config.public_address) {
-            return Some((c, false))
-          }
-        } else {
-          error!("{}\tcould not create ssl context", self.tag);
+    if let Ok((frontend_sock, _)) = accepted {
+      frontend_sock.set_nodelay(true);
+      if let Ok(ssl) = Ssl::new(&self.default_context.context) {
+        if let Some(c) = TlsClient::new("TLS", ssl, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address) {
+          return Some((c, false))
         }
       } else {
-        error!("{}\tcould not accept connection: {:?}", self.tag, accepted);
+        error!("{}\tcould not create ssl context", self.tag);
       }
     } else {
-      error!("{}\tcould not get buffers from pool", self.tag);
+      error!("{}\tcould not accept connection: {:?}", self.tag, accepted);
     }
     None
   }
@@ -1026,7 +1046,7 @@ mod tests {
       default_context: tls_data,
       contexts: rc_ctx,
       tx:        tx,
-      pool:      Pool::with_capacity(1, 0, || BufferQueue::with_capacity(12000)),
+      pool:      Rc::new(RefCell::new(Pool::with_capacity(1, 0, || BufferQueue::with_capacity(12000)))),
       front_timeout: 5000,
       back_timeout:  5000,
       answers:   DefaultAnswers {

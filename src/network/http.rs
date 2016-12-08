@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self,Read,Write,ErrorKind};
+use std::rc::{Rc,Weak};
+use std::cell::RefCell;
 use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
 use std::net::{SocketAddr,IpAddr};
@@ -41,25 +43,34 @@ pub struct Client {
   front_timeout:  Option<Timeout>,
   back_timeout:   Option<Timeout>,
   protocol:       Option<State>,
+  pool:           Weak<RefCell<Pool<BufferQueue>>>,
 }
 
 impl Client {
-  pub fn new(server_context: &str, sock: TcpStream, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<Client> {
-    let request_id = Uuid::new_v4().hyphenated().to_string();
-    let log_ctx    = format!("{}\t{}\tunknown\t", server_context, &request_id);
-    let client = Client {
-      backend:        None,
-      token:          None,
-      backend_token:  None,
-      front_timeout:  None,
-      back_timeout:   None,
-      protocol:          Some(State::Http(
-        Http::new(server_context, sock.try_clone().unwrap(), front_buf, back_buf, public_address).unwrap()
-      )),
-      frontend:       sock,
-    };
+  pub fn new(server_context: &str, sock: TcpStream, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> Option<Client> {
+    let protocol = if let Some(pool) = pool.upgrade() {
+      let mut p = pool.borrow_mut();
+      if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
+        Some(Http::new(server_context, sock.try_clone().unwrap(), front_buf, back_buf, public_address).unwrap())
+      } else { None }
+    } else { None };
 
-    Some(client)
+    protocol.map(|http| {
+      let request_id = Uuid::new_v4().hyphenated().to_string();
+      let log_ctx    = format!("{}\t{}\tunknown\t", server_context, &request_id);
+      let client = Client {
+        backend:        None,
+        token:          None,
+        backend_token:  None,
+        front_timeout:  None,
+        back_timeout:   None,
+        protocol:       Some(State::Http(http)),
+        frontend:       sock,
+        pool:           pool,
+      };
+
+    client
+    })
   }
 
   pub fn upgrade(&mut self) {
@@ -269,7 +280,7 @@ pub struct ServerConfiguration<Tx> {
   instances:       HashMap<AppId, Vec<Backend>>,
   fronts:          HashMap<Hostname, Vec<HttpFront>>,
   tx:              Tx,
-  pool:            Pool<BufferQueue>,
+  pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
   front_timeout:   u64,
   back_timeout:    u64,
@@ -289,7 +300,9 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
           instances:     HashMap::new(),
           fronts:        HashMap::new(),
           tx:            tx,
-          pool:          Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size)),
+          pool:          Rc::new(RefCell::new(
+                           Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size))
+          )),
           //FIXME: make the timeout values configurable
           front_timeout: 5000,
           back_timeout:  5000,
@@ -538,21 +551,17 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerC
   }
 
   fn accept(&mut self, token: ListenToken) -> Option<(Client, bool)> {
-    if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
-      let accepted = self.listener.accept();
+    let accepted = self.listener.accept();
 
-      if let Ok((frontend_sock, _)) = accepted {
-        frontend_sock.set_nodelay(true);
-        if let Some(mut c) = Client::new(&self.tag, frontend_sock, front_buf, back_buf, self.config.public_address) {
-          c.readiness().front_interest.insert(Ready::readable());
-          c.readiness().back_interest.remove(Ready::readable() | Ready::writable());
-          return Some((c, false))
-        }
-      } else {
-        error!("{}\tcould not accept: {:?}", self.tag, accepted);
+    if let Ok((frontend_sock, _)) = accepted {
+      frontend_sock.set_nodelay(true);
+      if let Some(mut c) = Client::new(&self.tag, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address) {
+        c.readiness().front_interest.insert(Ready::readable());
+        c.readiness().back_interest.remove(Ready::readable() | Ready::writable());
+        return Some((c, false))
       }
     } else {
-      error!("{}\tcould not get buffers from pool", self.tag);
+      error!("{}\tcould not accept: {:?}", self.tag, accepted);
     }
     None
   }
@@ -791,7 +800,7 @@ mod tests {
       instances: HashMap::new(),
       fronts:    fronts,
       tx:        tx,
-      pool:      Pool::with_capacity(1,0, || BufferQueue::with_capacity(12000)),
+      pool:      Rc::new(RefCell::new(Pool::with_capacity(1,0, || BufferQueue::with_capacity(12000)))),
       front_timeout: 50000,
       back_timeout:  50000,
       answers:   DefaultAnswers {
