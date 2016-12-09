@@ -177,7 +177,7 @@ pub enum ConfigCommand {
   DumpState,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub struct ConfigMessage {
   pub id:       String,
   pub data:     ConfigCommand,
@@ -292,6 +292,58 @@ impl serde::Deserialize for ConfigMessage {
     where D: serde::de::Deserializer {
     static FIELDS: &'static [&'static str] = &["id", "listener", "type", "data"];
     deserializer.deserialize_struct("ConfigMessage", FIELDS, ConfigMessageVisitor)
+  }
+}
+
+#[derive(Serialize)]
+struct StatePath {
+  path: String
+}
+
+impl serde::Serialize for ConfigMessage {
+  fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
+      where S: serde::Serializer,
+  {
+    let mut state = if self.listener.is_some() {
+      try!(serializer.serialize_map(Some(4)))
+    } else {
+      try!(serializer.serialize_map(Some(3)))
+    };
+
+    try!(serializer.serialize_map_key(&mut state, "id"));
+    try!(serializer.serialize_map_value(&mut state, &self.id));
+
+    if self.listener.is_some() {
+      try!(serializer.serialize_map_key(&mut state, "listener"));
+      try!(serializer.serialize_map_value(&mut state, self.listener.as_ref().unwrap()));
+    }
+
+    match self.data {
+      ConfigCommand::ProxyConfiguration(ref command) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "PROXY"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, command));
+      },
+      ConfigCommand::SaveState(ref path) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "SAVE_STATE"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, StatePath { path: path.to_string() }));
+      },
+      ConfigCommand::LoadState(ref path) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "LOAD_STATE"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, StatePath { path: path.to_string() }));
+      },
+      ConfigCommand::DumpState => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "DUMP_STATE"));
+      }
+    };
+
+    serializer.serialize_map_end(state)
   }
 }
 

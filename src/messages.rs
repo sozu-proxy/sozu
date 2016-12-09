@@ -99,7 +99,7 @@ impl Default for TlsProxyConfiguration {
   }
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub enum Command {
     AddHttpFront(HttpFront),
     RemoveHttpFront(HttpFront),
@@ -230,6 +230,79 @@ impl serde::Deserialize for Command {
         where D: serde::de::Deserializer {
     static FIELDS: &'static [&'static str] = &["type", "data"];
     deserializer.deserialize_struct("Command", FIELDS, CommandVisitor)
+  }
+}
+
+impl serde::Serialize for Command {
+  fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
+      where S: serde::Serializer,
+  {
+    let mut state = try!(serializer.serialize_map(Some(2)));
+
+    match self {
+      &Command::AddHttpFront(ref front) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "ADD_HTTP_FRONT"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, front));
+      },
+      &Command::RemoveHttpFront(ref front) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "REMOVE_HTTP_FRONT"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, front));
+      },
+      &Command::AddTlsFront(ref front) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "ADD_TLS_FRONT"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, front));
+      },
+      &Command::RemoveTlsFront(ref front) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "REMOVE_TLS_FRONT"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, front));
+      },
+      &Command::AddTcpFront(ref front) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "ADD_TCP_FRONT"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, front));
+      },
+      &Command::RemoveTcpFront(ref front) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "REMOVE_TCP_FRONT"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, front));
+      },
+      &Command::AddInstance(ref instance) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "ADD_INSTANCE"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, instance));
+      },
+      &Command::RemoveInstance(ref instance) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "REMOVE_INSTANCE"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, instance));
+      },
+      &Command::HttpProxy(ref config) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "CONFIGURE_HTTP_PROXY"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, config));
+      },
+      &Command::TlsProxy(ref config) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "CONFIGURE_HTTP_PROXY"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, config));
+      }
+    }
+
+    serializer.serialize_map_end(state)
   }
 }
 
