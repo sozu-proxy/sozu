@@ -251,7 +251,7 @@ impl CommandClient {
   }
 }
 
-fn parse(input: &[u8]) -> IResult<&[u8], Vec<ConfigMessage>> {
+pub fn parse(input: &[u8]) -> IResult<&[u8], Vec<ConfigMessage>> {
   many0!(input,
     complete!(terminated!(map_res!(map_res!(is_not!("\0"), from_utf8), from_str), char!('\0')))
   )

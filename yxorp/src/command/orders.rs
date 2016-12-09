@@ -2,12 +2,14 @@ use std::io::Write;
 use std::fs;
 use std::str;
 use std::cmp::min;
+use std::io::Read;
 use log;
 use serde_json;
+use nom::IResult;
 use yxorp::messages::Command;
 use yxorp::network::ProxyOrder;
 
-use super::{CommandServer,FrontToken,Listener,ListenerConfiguration,StoredListener};
+use super::{CommandServer,FrontToken,Listener,ListenerConfiguration,StoredListener,parse};
 use super::data::{ConfigCommand,ConfigMessage};
 
 impl CommandServer {
@@ -18,12 +20,22 @@ impl CommandServer {
         if let Ok(mut f) = fs::File::create(&path) {
           let stored_listeners: Vec<StoredListener> = self.listeners.values()
             .map(|listener_list| StoredListener::from_listener(listener_list.first().unwrap())).collect();
-          if let Ok(()) = f.write_all(&serde_json::to_string(&stored_listeners).map(|s| s.into_bytes()).unwrap_or(vec!())) {
+
+          let mut counter = 0usize;
+          for listener in stored_listeners {
+            println!("saved commands: {:?}", listener.state.generate_commands());
+            for command in listener.state.generate_commands() {
+              let message = ConfigMessage {
+                id:       format!("SAVE-{}", counter),
+                listener: Some(listener.tag.to_string()),
+                data:     ConfigCommand::ProxyConfiguration(command)
+              };
+              println!("command: {}", serde_json::to_string(&message).unwrap());
+              f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()));
+              f.write_all(&b"\n\0"[..]);
+              counter += 1;
+            }
             f.sync_all();
-            //FIXME: define proper answer format
-            self.conns[token].back_buf.write(b"OK\0");
-          } else {
-            self.conns[token].back_buf.write(b"could not parse configuration\0");
           }
           // FIXME: should send back a DONE message here
         } else {
@@ -83,27 +95,43 @@ impl CommandServer {
   pub fn load_state(&mut self, message_id: &str, path: &str) {
     match fs::File::open(&path) {
       Err(e)   => error!("cannot open file at path '{}': {:?}", path, e),
-      Ok(file) => {
-        let conf_res: serde_json::error::Result<Vec<StoredListener>> = serde_json::from_reader(file);
-        match conf_res {
-          Err(e)   => error!("error loading configuration from file: {:?}", e),
-          Ok(conf) => {
-            //info!("loaded the configuration: {:?}", conf);
-            for stored_listener in conf {
-              let commands = stored_listener.state.generate_commands();
-              //info!("saved listener '{}' (type {:?}) commands: {:?}", stored_listener.tag,
-              //stored_listener.listener_type, commands);
-              if let Some(ref mut listener_vec) = self.listeners.get_mut (&stored_listener.tag) {
-                for listener in listener_vec.iter_mut() {
-                  for command in &commands {
-                    //self.conns[token].add_message_id(message_id.clone());
-                    listener.state.handle_command(&command);
-                    listener.sender.send(ProxyOrder::Command(String::from(message_id), command.clone()));
+      Ok(mut file) => {
+        let mut data = vec!();
+        //FIXME: we should read in streaming here
+        file.read_to_end(&mut data);
+        match parse(&data) {
+          IResult::Done(i, o) => {
+            if i.len() > 0 {
+              info!("could not parse {} bytes", i.len());
+            }
+
+            for message in o {
+              if let ConfigCommand::ProxyConfiguration(command) = message.data {
+                if let Some(ref tag) = message.listener {
+                  if let &Command::AddTlsFront(ref data) = &command {
+                    log!(log::LogLevel::Info, "received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
+                    data.app_id, data.hostname, data.path_begin, tag);
+                  } else {
+                    log!(log::LogLevel::Info, "received {:?} with tag {:?}", command, tag);
                   }
+                  if let Some(ref mut listener_vec) = self.listeners.get_mut(tag) {
+                    for listener in listener_vec.iter_mut() {
+                      let cl = command.clone();
+                      listener.state.handle_command(&cl);
+                      listener.sender.send(ProxyOrder::Command(message.id.clone(), cl));
+                    }
+                  } else {
+                    // FIXME: should send back error here
+                    log!(log::LogLevel::Error, "no listener found for tag: {}", tag);
+                  }
+                } else {
+                  // FIXME: should send back error here
+                  log!(log::LogLevel::Error, "expecting listener tag");
                 }
               }
             }
           },
+          e => error!("saved state parse error: {:?}", e),
         }
       }
     }
