@@ -23,14 +23,12 @@ impl CommandServer {
 
           let mut counter = 0usize;
           for listener in stored_listeners {
-            println!("saved commands: {:?}", listener.state.generate_commands());
             for command in listener.state.generate_commands() {
               let message = ConfigMessage {
                 id:       format!("SAVE-{}", counter),
                 listener: Some(listener.tag.to_string()),
                 data:     ConfigCommand::ProxyConfiguration(command)
               };
-              println!("command: {}", serde_json::to_string(&message).unwrap());
               f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()));
               f.write_all(&b"\n\0"[..]);
               counter += 1;
