@@ -143,14 +143,15 @@ impl HttpProxy {
           path_begin: front.path_begin.clone(),
         }));
       }
-      for (app_id,instance_list) in self.instances.iter() {
-        for instance in instance_list {
-          v.push(Command::AddInstance(Instance {
-            app_id:     app_id.clone(),
-            ip_address: instance.ip_address.clone(),
-            port:       instance.port.clone(),
-          }));
-        }
+    }
+
+    for (app_id,instance_list) in self.instances.iter() {
+      for instance in instance_list {
+        v.push(Command::AddInstance(Instance {
+          app_id:     app_id.clone(),
+          ip_address: instance.ip_address.clone(),
+          port:       instance.port.clone(),
+        }));
       }
     }
 
