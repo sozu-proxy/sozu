@@ -5,9 +5,10 @@ use std::cmp::min;
 use std::io::Read;
 use log;
 use serde_json;
-use nom::IResult;
+use nom::{HexDisplay,IResult,Offset};
 use yxorp::messages::Command;
 use yxorp::network::ProxyOrder;
+use yxorp::network::buffer::Buffer;
 
 use super::{CommandServer,FrontToken,Listener,ListenerConfiguration,StoredListener,parse};
 use super::data::{ConfigCommand,ConfigMessage};
@@ -94,42 +95,63 @@ impl CommandServer {
     match fs::File::open(&path) {
       Err(e)   => error!("cannot open file at path '{}': {:?}", path, e),
       Ok(mut file) => {
-        let mut data = vec!();
+        //let mut data = vec!();
+        loop {
+        let mut buffer = Buffer::with_capacity(12000);
         //FIXME: we should read in streaming here
-        file.read_to_end(&mut data);
-        match parse(&data) {
-          IResult::Done(i, o) => {
-            if i.len() > 0 {
-              info!("could not parse {} bytes", i.len());
-            }
+          if let Ok(sz) = file.read(buffer.space()) {
+            buffer.fill(sz);
+          } else {
+            error!("error reading state file");
+            break;
+          }
 
-            for message in o {
-              if let ConfigCommand::ProxyConfiguration(command) = message.data {
-                if let Some(ref tag) = message.listener {
-                  if let &Command::AddTlsFront(ref data) = &command {
-                    log!(log::LogLevel::Info, "received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
-                    data.app_id, data.hostname, data.path_begin, tag);
-                  } else {
-                    log!(log::LogLevel::Info, "received {:?} with tag {:?}", command, tag);
-                  }
-                  if let Some(ref mut listener_vec) = self.listeners.get_mut(tag) {
-                    for listener in listener_vec.iter_mut() {
-                      let cl = command.clone();
-                      listener.state.handle_command(&cl);
-                      listener.sender.send(ProxyOrder::Command(message.id.clone(), cl));
+          let mut offset = 0;
+          match parse(buffer.data()) {
+            IResult::Done(i, o) => {
+              if i.len() > 0 {
+                info!("could not parse {} bytes", i.len());
+              }
+              offset = buffer.data().offset(i);
+
+              for message in o {
+                if let ConfigCommand::ProxyConfiguration(command) = message.data {
+                  if let Some(ref tag) = message.listener {
+                    if let &Command::AddTlsFront(ref data) = &command {
+                      log!(log::LogLevel::Info, "received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
+                      data.app_id, data.hostname, data.path_begin, tag);
+                    } else {
+                      log!(log::LogLevel::Info, "received {:?} with tag {:?}", command, tag);
+                    }
+                    if let Some(ref mut listener_vec) = self.listeners.get_mut(tag) {
+                      for listener in listener_vec.iter_mut() {
+                        let cl = command.clone();
+                        listener.state.handle_command(&cl);
+                        listener.sender.send(ProxyOrder::Command(message.id.clone(), cl));
+                      }
+                    } else {
+                      // FIXME: should send back error here
+                      log!(log::LogLevel::Error, "no listener found for tag: {}", tag);
                     }
                   } else {
                     // FIXME: should send back error here
-                    log!(log::LogLevel::Error, "no listener found for tag: {}", tag);
+                    log!(log::LogLevel::Error, "expecting listener tag");
                   }
-                } else {
-                  // FIXME: should send back error here
-                  log!(log::LogLevel::Error, "expecting listener tag");
                 }
               }
+            },
+            IResult::Incomplete(_) => {
+              if buffer.available_data() == buffer.capacity() {
+                error!("message too big, stopping parsing:\n{}", buffer.data().to_hex(16));
+                break;
+              }
             }
-          },
-          e => error!("saved state parse error: {:?}", e),
+            IResult::Error(e) => {
+              error!("saved state parse error: {:?}", e);
+              break;
+            },
+          }
+          buffer.consume(offset);
         }
       }
     }
