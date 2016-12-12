@@ -6,9 +6,9 @@ use std::io::Read;
 use log;
 use serde_json;
 use nom::{HexDisplay,IResult,Offset};
-use yxorp::messages::Command;
-use yxorp::network::ProxyOrder;
-use yxorp::network::buffer::Buffer;
+use sozu::messages::Command;
+use sozu::network::ProxyOrder;
+use sozu::network::buffer::Buffer;
 
 use super::{CommandServer,FrontToken,Listener,ListenerConfiguration,StoredListener,parse};
 use super::data::{ConfigCommand,ConfigMessage};

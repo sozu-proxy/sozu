@@ -8,7 +8,7 @@ use std::str;
 use network::buffer::Buffer;
 
 lazy_static! {
-  pub static ref METRICS: Mutex<ProxyMetrics> = Mutex::new(ProxyMetrics::new(String::from("yxorp")));
+  pub static ref METRICS: Mutex<ProxyMetrics> = Mutex::new(ProxyMetrics::new(String::from("sozu")));
 }
 
 pub struct ProxyMetrics {

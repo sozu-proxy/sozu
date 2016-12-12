@@ -5,7 +5,7 @@
 #[macro_use] extern crate serde_derive;
 extern crate env_logger;
 extern crate mio;
-extern crate yxorp;
+extern crate sozu_lib as sozu;
 extern crate toml;
 extern crate rustc_serialize;
 extern crate serde;
@@ -22,8 +22,8 @@ use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
 use std::collections::HashMap;
 use std::thread::{self,JoinHandle};
-use yxorp::network::{self,ProxyOrder};
-use yxorp::network::metrics::{METRICS,ProxyMetrics};
+use sozu::network::{self,ProxyOrder};
+use sozu::network::metrics::{METRICS,ProxyMetrics};
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
 use clap::{App,Arg};
@@ -49,7 +49,7 @@ fn main() {
   let mut builder = LogBuilder::new();
   builder.format(format).filter(None, LogLevelFilter::Info);
 
-  let matches = App::new("I will not name this thing yxorp")
+  let matches = App::new("sozu")
                         .version(crate_version!())
                         .about("hot reconfigurable proxy")
                         .arg(Arg::with_name("config")

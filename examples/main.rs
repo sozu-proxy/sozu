@@ -1,7 +1,7 @@
 #![allow(unused_variables,unused_must_use)]
 #[macro_use] extern crate log;
 extern crate env_logger;
-extern crate yxorp;
+extern crate sozu_lib as sozu;
 extern crate openssl;
 extern crate time;
 extern crate libc;
@@ -11,10 +11,10 @@ use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
 use std::thread;
 use std::env;
-use yxorp::network;
-use yxorp::messages;
-use yxorp::network::ProxyOrder;
-use yxorp::network::metrics::{METRICS,ProxyMetrics};
+use sozu::network;
+use sozu::messages;
+use sozu::network::ProxyOrder;
+use sozu::network::metrics::{METRICS,ProxyMetrics};
 use openssl::ssl;
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;

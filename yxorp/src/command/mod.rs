@@ -17,8 +17,8 @@ use nom::{IResult,HexDisplay,Offset};
 use serde_json;
 use serde_json::from_str;
 
-use yxorp::network::{ProxyOrder,ServerMessage};
-use yxorp::network::buffer::Buffer;
+use sozu::network::{ProxyOrder,ServerMessage};
+use sozu::network::buffer::Buffer;
 
 use state::{HttpProxy,TlsProxy,ConfigState};
 

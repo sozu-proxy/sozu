@@ -1,5 +1,5 @@
 [root]
-name = "yxorp-bin"
+name = "sozu"
 version = "0.1.0"
 dependencies = [
  "clap 2.19.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -12,9 +12,9 @@ dependencies = [
  "serde_derive 0.8.19 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_json 0.8.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "slab 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sozu-lib 0.1.0",
  "time 0.1.35 (registry+https://github.com/rust-lang/crates.io-index)",
  "toml 0.1.30 (registry+https://github.com/rust-lang/crates.io-index)",
- "yxorp 0.1.0",
 ]
 
 [[package]]
@@ -342,6 +342,28 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
+name = "sozu-lib"
+version = "0.1.0"
+dependencies = [
+ "bytes 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "lazy_static 0.1.16 (registry+https://github.com/rust-lang/crates.io-index)",
+ "libc 0.2.17 (registry+https://github.com/rust-lang/crates.io-index)",
+ "log 0.3.6 (registry+https://github.com/rust-lang/crates.io-index)",
+ "mio 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "net2 0.2.26 (registry+https://github.com/rust-lang/crates.io-index)",
+ "nom 2.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "openssl 0.8.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "pool 0.1.3 (git+https://github.com/Geal/pool.git)",
+ "rand 0.3.15 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde 0.8.19 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde_derive 0.8.19 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde_json 0.8.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "slab 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "time 0.1.35 (registry+https://github.com/rust-lang/crates.io-index)",
+ "uuid 0.2.3 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
 name = "strsim"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -472,28 +494,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
  "winapi 0.2.8 (registry+https://github.com/rust-lang/crates.io-index)",
  "winapi-build 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
-]
-
-[[package]]
-name = "yxorp"
-version = "0.1.0"
-dependencies = [
- "bytes 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "lazy_static 0.1.16 (registry+https://github.com/rust-lang/crates.io-index)",
- "libc 0.2.17 (registry+https://github.com/rust-lang/crates.io-index)",
- "log 0.3.6 (registry+https://github.com/rust-lang/crates.io-index)",
- "mio 0.6.1 (registry+https://github.com/rust-lang/crates.io-index)",
- "net2 0.2.26 (registry+https://github.com/rust-lang/crates.io-index)",
- "nom 2.0.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "openssl 0.8.3 (registry+https://github.com/rust-lang/crates.io-index)",
- "pool 0.1.3 (git+https://github.com/Geal/pool.git)",
- "rand 0.3.15 (registry+https://github.com/rust-lang/crates.io-index)",
- "serde 0.8.19 (registry+https://github.com/rust-lang/crates.io-index)",
- "serde_derive 0.8.19 (registry+https://github.com/rust-lang/crates.io-index)",
- "serde_json 0.8.3 (registry+https://github.com/rust-lang/crates.io-index)",
- "slab 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "time 0.1.35 (registry+https://github.com/rust-lang/crates.io-index)",
- "uuid 0.2.3 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [metadata]

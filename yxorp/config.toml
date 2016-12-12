@@ -1,4 +1,4 @@
-# yxorp test config file
+# sozu proxy test config file
 
 command_socket = "./command_folder/sock"
 saved_state    = "./state.json"

@@ -2,7 +2,7 @@ use serde;
 use serde_json;
 use rustc_serialize::{Decodable,Decoder,Encodable,Encoder};
 use state::{HttpProxy,TlsProxy,ConfigState};
-use yxorp::messages::Command;
+use sozu::messages::Command;
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]
 pub enum ListenerType {
@@ -352,7 +352,7 @@ impl serde::Serialize for ConfigMessage {
 mod tests {
   use super::*;
   use serde_json;
-  use yxorp::messages::{Command,HttpFront};
+  use sozu::messages::{Command,HttpFront};
 
   #[test]
   fn config_message_test() {

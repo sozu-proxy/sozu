@@ -95,14 +95,14 @@
 //! #![allow(unused_variables,unused_must_use)]
 //! #[macro_use] extern crate log;
 //! extern crate env_logger;
-//! extern crate yxorp;
+//! extern crate sozu_lib as sozu;
 //! extern crate openssl;
 //! extern crate mio;
 //!
 //! use std::thread;
 //! use std::sync::mpsc;
-//! use yxorp::messages;
-//! use yxorp::network::{self,ProxyOrder};
+//! use sozu::messages;
+//! use sozu::network::{self,ProxyOrder};
 
 //! fn main() {
 //!   env_logger::init().unwrap();

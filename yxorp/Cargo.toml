@@ -1,5 +1,5 @@
 [package]
-name = "yxorp-bin"
+name = "sozu"
 version = "0.1.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 
@@ -17,5 +17,5 @@ time = "^0.1.34"
 clap = "^2.13.0"
 slab = "^0.3.0"
 
-[dependencies.yxorp]
+[dependencies.sozu-lib]
 path = ".."

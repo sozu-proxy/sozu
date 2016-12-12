@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use yxorp::messages::{Command,HttpFront,TlsFront,Instance};
+use sozu::messages::{Command,HttpFront,TlsFront,Instance};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpProxyInstance {
@@ -255,7 +255,7 @@ impl TlsProxy {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use yxorp::messages::{Command,HttpFront,Instance};
+  use sozu::messages::{Command,HttpFront,Instance};
 
   #[test]
   fn serialize() {

@@ -1,5 +1,5 @@
 [package]
-name = "yxorp"
+name = "sozu-lib"
 version = "0.1.0"
 authors = ["Clément Delafargue <clement@delafargue.name>", "Geoffroy Couprie <geo.couprie@gmail.com>"]
 
@@ -14,10 +14,6 @@ log = "0.3"
 serde = "^0.8.0"
 serde_json = "^0.8.0"
 serde_derive = "^0.8.0"
-#serde_macros = "^0.8.0"
-#serde = "~0.7.0"
-#serde_json = "~0.7.0"
-#serde_macros = "~0.7.0"
 lazy_static = "0.1.15"
 libc = "^0.2"
 slab = "^0.3.0"

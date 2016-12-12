@@ -6,7 +6,7 @@ use std::str::FromStr;
 use command::data::ListenerType;
 use toml;
 
-use yxorp::messages::{HttpProxyConfiguration,TlsProxyConfiguration};
+use sozu::messages::{HttpProxyConfiguration,TlsProxyConfiguration};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
 pub struct ListenerConfig {
