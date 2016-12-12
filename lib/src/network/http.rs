@@ -294,6 +294,20 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     match server_bind(&config.front) {
       Ok(sock) => {
         event_loop.register(&sock, Token(start_at), Ready::readable(), PollOpt::level());
+
+        let default = DefaultAnswers {
+          NotFound: Vec::from(if config.answer_404.len() > 0 {
+              config.answer_404.as_bytes()
+            } else {
+              &b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+            }),
+          ServiceUnavailable: Vec::from(if config.answer_503.len() > 0 {
+              config.answer_503.as_bytes()
+            } else {
+              &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+            }),
+        };
+
         Ok(ServerConfiguration {
           listener:      sock,
           address:       config.front,
@@ -306,10 +320,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
           //FIXME: make the timeout values configurable
           front_timeout: 5000,
           back_timeout:  5000,
-          answers:       DefaultAnswers {
-                           NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
-                           ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
-          },
+          answers:       default,
           config:        config,
           tag:           tag,
         })
