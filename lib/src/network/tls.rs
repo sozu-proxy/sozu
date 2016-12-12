@@ -365,9 +365,10 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
           }
         }
       } else {
-        error!("{}\tgot no server name from ssl", cl_tag);
+        error!("{}\tgot no server name from ssl, answering with default one", cl_tag);
       }
-      Err(SniError::Fatal(0))
+      //answer ok because we use the default certificate
+      Ok(())
     });
 
     match server_bind(&config.front) {
