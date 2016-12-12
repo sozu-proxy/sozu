@@ -98,7 +98,8 @@ impl CommandServer {
         //let mut data = vec!();
         let mut buffer = Buffer::with_capacity(16384);
         loop {
-        //FIXME: we should read in streaming here
+          let previous = buffer.available_data();
+          //FIXME: we should read in streaming here
           if let Ok(sz) = file.read(buffer.space()) {
             buffer.fill(sz);
           } else {
@@ -110,11 +111,15 @@ impl CommandServer {
             break;
           }
 
+
           let mut offset = 0;
           match parse(buffer.data()) {
             IResult::Done(i, o) => {
               if i.len() > 0 {
                 info!("could not parse {} bytes", i.len());
+                if previous == buffer.available_data() {
+                  break;
+                }
               }
               offset = buffer.data().offset(i);
 
