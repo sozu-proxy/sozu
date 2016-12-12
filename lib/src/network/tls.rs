@@ -349,12 +349,6 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
                                EDH-RSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:\
                                AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:\
                                !DSS");
-    //context.set_options(ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |
-    //                                      ssl::SSL_OP_NO_TICKET | ssl::SSL_OP_NO_SSLV2);// |
-                                          //ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1);
-    //if let Some(tls_options) = SslContextOptions::from_bits(config.options) {
-    //  context.set_options(tls_options);
-    //}
 
     match DH::get_2048_256() {
       Ok(dh) => context.set_tmp_dh(&dh),
@@ -453,6 +447,15 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
 
     let mut context = ctx.unwrap();
 
+    let mut options = context.options();
+    options.insert(ssl::SSL_OP_NO_SSLV2);
+    options.insert(ssl::SSL_OP_NO_SSLV3);
+    options.insert(ssl::SSL_OP_NO_TLSV1);
+    options.insert(ssl::SSL_OP_NO_COMPRESSION);
+    options.insert(ssl::SSL_OP_NO_TICKET);
+    options.insert(ssl::SSL_OP_CIPHER_SERVER_PREFERENCE);
+    let opt = context.set_options(options);
+
     context.set_cipher_list(cipher_list);
     context.set_cipher_list("ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
                                ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
@@ -467,12 +470,6 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
                                EDH-RSA-DES-CBC3-SHA:AES128-GCM-SHA256:AES256-GCM-SHA384:\
                                AES128-SHA256:AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:\
                                !DSS");
-    //context.set_options(ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |
-    //                                      ssl::SSL_OP_NO_TICKET | ssl::SSL_OP_NO_SSLV2);// |
-                                          //ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1);
-    /*if let Some(tls_options) = SslContextOptions::from_bits(config.options) {
-      context.set_options(tls_options);
-    }*/
 
     match DH::get_2048_256() {
       Ok(dh) => context.set_tmp_dh(&dh),
@@ -485,8 +482,6 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     context.set_ecdh_auto(true);
 
     //FIXME: get the default cert and key from the configuration
-    //context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
-    //context.set_private_key_file("assets/key.pem", X509FileType::PEM);
     let cert_read = include_bytes!("../../../assets/certificate.pem");
     let key_read  = include_bytes!("../../../assets/key.pem");
     if let (Ok(cert), Ok(key)) = (X509::from_pem(&cert_read[..]), PKey::private_key_from_pem(&key_read[..])) {
@@ -513,6 +508,15 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     let c = SslContext::new(SslMethod::Sslv23);
     if c.is_err() { return false; }
     let mut ctx = c.unwrap();
+    let mut options = ctx.options();
+    options.insert(ssl::SSL_OP_NO_SSLV2);
+    options.insert(ssl::SSL_OP_NO_SSLV3);
+    options.insert(ssl::SSL_OP_NO_TLSV1);
+    options.insert(ssl::SSL_OP_NO_COMPRESSION);
+    options.insert(ssl::SSL_OP_NO_TICKET);
+    options.insert(ssl::SSL_OP_CIPHER_SERVER_PREFERENCE);
+    let opt = ctx.set_options(options);
+
 
     let mut cert_read  = &http_front.certificate.as_bytes()[..];
     let mut key_read   = &http_front.key.as_bytes()[..];
