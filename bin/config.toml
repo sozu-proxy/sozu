@@ -26,6 +26,11 @@ listener_type = "HTTPS"
 max_connections = 500
 port = 8443
 buffer_size = 16384
+#default_app_id = "xxx"
+#default_certificate = "../assets/cert_test.pem"
+#default_certificate_chain = "../assets/cert__chain_test.pem"
+#default_key = "../assets/key_test.pem"
+
 #answer_404 = "./404.html"
 #answer_503 = "./503.html"
 

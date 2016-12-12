@@ -11,16 +11,22 @@ use sozu::messages::{HttpProxyConfiguration,TlsProxyConfiguration};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct ListenerConfig {
-  pub listener_type:   ListenerType,
-  pub address:         String,
-  pub public_address:  Option<String>,
-  pub port:            u16,
-  pub max_connections: usize,
-  pub buffer_size:     usize,
-  pub answer_404:      Option<String>,
-  pub answer_503:      Option<String>,
-  pub cipher_list:     Option<String>,
-  pub worker_count:    Option<u16>,
+  pub listener_type:             ListenerType,
+  pub address:                   String,
+  pub public_address:            Option<String>,
+  pub port:                      u16,
+  pub max_connections:           usize,
+  pub buffer_size:               usize,
+  pub answer_404:                Option<String>,
+  pub answer_503:                Option<String>,
+  pub cipher_list:               Option<String>,
+  pub worker_count:              Option<u16>,
+  pub default_name:              Option<String>,
+  pub default_app_id:            Option<String>,
+  pub default_certificate:       Option<String>,
+  pub default_certificate_chain: Option<String>,
+  pub default_key:               Option<String>,
+
 }
 
 impl ListenerConfig {
@@ -80,26 +86,46 @@ impl ListenerConfig {
     //FIXME: error message when we cannot parse the address
     address.parse().ok().map(|addr| {
       let mut configuration = TlsProxyConfiguration {
-        front: addr,
-        public_address: public_address,
+        front:           addr,
+        public_address:  public_address,
         max_connections: self.max_connections,
-        buffer_size: self.buffer_size,
+        buffer_size:     self.buffer_size,
         ..Default::default()
       };
+
       //FIXME: error messages if file not found?
       let mut answer_404 = String::new();
       if self.answer_404.as_ref().and_then(|path| File::open(path).ok())
         .and_then(|mut file| file.read_to_string(&mut answer_404).ok()).is_some() {
         configuration.answer_404 = answer_404;
+      } else {
+        error!("error loading default 404 answer file: {:?}", self.answer_404);
       }
       let mut answer_503 = String::new();
       if self.answer_503.as_ref().and_then(|path| File::open(path).ok())
         .and_then(|mut file| file.read_to_string(&mut answer_503).ok()).is_some() {
         configuration.answer_503 = answer_503;
+      } else {
+        error!("error loading default 503 answer file: {:?}", self.answer_503);
       }
       if let Some(cipher_list) = self.cipher_list.as_ref() {
         configuration.cipher_list = cipher_list.clone();
       }
+      let mut default_cert: Vec<u8> = vec!();
+      if self.default_certificate.as_ref().and_then(|path| File::open(path).ok())
+        .and_then(|mut file| file.read_to_end(&mut default_cert).ok()).is_some() {
+        configuration.default_certificate = Some(default_cert);
+      }
+
+      configuration.default_app_id            = self.default_app_id.clone();
+      configuration.default_certificate_chain = self.default_certificate_chain.clone();
+
+      let mut default_key: Vec<u8> = vec!();
+      if self.default_key.as_ref().and_then(|path| File::open(path).ok())
+        .and_then(|mut file| file.read_to_end(&mut default_key).ok()).is_some() {
+        configuration.default_key = Some(default_key);
+      }
+
       configuration
 
     })

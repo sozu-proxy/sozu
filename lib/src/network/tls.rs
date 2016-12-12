@@ -311,7 +311,6 @@ pub struct ServerConfiguration<Tx> {
   instances:       HashMap<AppId, Vec<Backend>>,
   fronts:          HashMap<HostName, Vec<TlsApp>>,
   domains:         Arc<Mutex<TrieNode<CertFingerprint>>>,
-  default_cert:    String,
   default_context: TlsData,
   contexts:        Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
   tx:              Tx,
@@ -326,20 +325,42 @@ pub struct ServerConfiguration<Tx> {
 impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
   pub fn new(tag: String, config: TlsProxyConfiguration, tx: Tx, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration<Tx>> {
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
-    let domains  = TrieNode::root();
+    let mut domains = TrieNode::root();
+    let mut fronts  = HashMap::new();
 
-    /*
-    //FIXME: get the default cert and key from the configuration
-    context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
-    context.set_private_key_file("assets/key.pem", X509FileType::PEM);
-    */
-    let (fingerprint, mut tls_data):(Vec<u8>,TlsData) = Self::create_default_context(&config.cipher_list).unwrap();
+    let (fingerprint, mut tls_data, names):(Vec<u8>,TlsData, Vec<String>) = Self::create_default_context(&config).unwrap();
+    let cert = X509::from_pem(&tls_data.certificate).unwrap();
 
-    let rc_ctx = Arc::new(Mutex::new(contexts));
-    let ref_ctx = rc_ctx.clone();
-    let rc_domains  = Arc::new(Mutex::new(domains));
-    let ref_domains = rc_domains.clone();
-    let cl_tag      = tag.clone();
+    let common_name: Option<String> = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name));
+    info!("{}\tgot common name: {:?}", &tag, common_name);
+
+    let names: Vec<String> = cert.subject_alt_names().map(|names| {
+      names.iter().filter_map(|general_name|
+                              general_name.dnsname().map(|name| String::from(name))
+                             ).collect()
+    }).unwrap_or(vec!());
+    info!("{}\tgot subject alt names: {:?}", &tag, names);
+    {
+      for name in names {
+        domains.domain_insert(name.into_bytes(), fingerprint.clone());
+      }
+    }
+
+    let app = TlsApp {
+      app_id:           config.default_app_id.clone().unwrap_or(String::new()),
+      hostname:         config.default_name.clone().unwrap_or(String::new()),
+      path_begin:       String::new(),
+      cert_fingerprint: fingerprint.clone(),
+    };
+    fronts.insert(config.default_name.clone().unwrap_or(String::from("")), vec![app]);
+
+
+    let rc_ctx       = Arc::new(Mutex::new(contexts));
+    let ref_ctx      = rc_ctx.clone();
+    let rc_domains   = Arc::new(Mutex::new(domains));
+    let ref_domains  = rc_domains.clone();
+    let cl_tag       = tag.clone();
+    let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
 
     tls_data.context.set_servername_callback(move |ssl: &mut SslRef| {
       let contexts = ref_ctx.lock().unwrap();
@@ -347,7 +368,8 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
 
       info!("{}\tref: {:?}", cl_tag, ssl);
       if let Some(servername) = ssl.servername() {
-        if servername == "lolcatho.st" {
+        info!("checking servername: {}", servername);
+        if &servername == &default_name {
           return Ok(());
         }
         info!("{}\tlooking for fingerprint for {:?}", cl_tag, servername);
@@ -391,9 +413,8 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
           listener:        listener,
           address:         config.front.clone(),
           instances:       HashMap::new(),
-          fronts:          HashMap::new(),
+          fronts:          fronts,
           domains:         rc_domains,
-          default_cert:    String::from("lolcatho.st"),
           default_context: tls_data,
           contexts:        rc_ctx,
           tx:              tx,
@@ -414,7 +435,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     }
   }
 
-  pub fn create_default_context(cipher_list: &str) -> Option<(CertFingerprint,TlsData)> {
+  pub fn create_default_context(config: &TlsProxyConfiguration) -> Option<(CertFingerprint,TlsData,Vec<String>)> {
     let ctx = SslContext::new(SslMethod::Sslv23);
     if let Err(e) = ctx {
       //return Err(io::Error::new(io::ErrorKind::Other, e.description()));
@@ -432,7 +453,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     options.insert(ssl::SSL_OP_CIPHER_SERVER_PREFERENCE);
     let opt = context.set_options(options);
 
-    context.set_cipher_list(cipher_list);
+    context.set_cipher_list(&config.cipher_list);
 
     match DH::get_2048_256() {
       Ok(dh) => context.set_tmp_dh(&dh),
@@ -445,19 +466,36 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     context.set_ecdh_auto(true);
 
     //FIXME: get the default cert and key from the configuration
-    let cert_read = include_bytes!("../../../assets/certificate.pem");
-    let key_read  = include_bytes!("../../../assets/key.pem");
+    let cert_read = config.default_certificate.as_ref().map(|vec| &vec[..]).unwrap_or(&include_bytes!("../../../assets/certificate.pem")[..]);
+    let key_read = config.default_key.as_ref().map(|vec| &vec[..]).unwrap_or(&include_bytes!("../../../assets/key.pem")[..]);
+    if let Some(path) = config.default_certificate_chain.as_ref() {
+      context.set_certificate_chain_file(path, X509FileType::PEM);
+    }
+
     if let (Ok(cert), Ok(key)) = (X509::from_pem(&cert_read[..]), PKey::private_key_from_pem(&key_read[..])) {
       if let Ok(fingerprint) = cert.fingerprint(Type::SHA256) {
         context.set_certificate(&cert);
         context.set_private_key(&key);
 
+
+        let mut names: Vec<String> = cert.subject_alt_names().map(|names| {
+          names.iter().filter_map(|general_name|
+            general_name.dnsname().map(|name| String::from(name))
+          ).collect()
+        }).unwrap_or(vec!());
+
+        if let Some(common_name) = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name)) {
+        info!("got common name: {:?}", common_name);
+          names.push(common_name);
+        }
+
+
         let tls_data = TlsData {
           context:     context,
           certificate: cert_read.to_vec(),
-          refcount:    0,
+          refcount:    1,
         };
-        Some((fingerprint, tls_data))
+        Some((fingerprint, tls_data, names))
       } else {
         None
       }

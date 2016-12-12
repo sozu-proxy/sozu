@@ -68,16 +68,21 @@ impl Default for HttpProxyConfiguration {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct TlsProxyConfiguration {
-    pub front:           SocketAddr,
-    pub front_timeout:   u64,
-    pub back_timeout:    u64,
-    pub max_connections: usize,
-    pub buffer_size:     usize,
-    pub public_address:  Option<IpAddr>,
-    pub answer_404:      String,
-    pub answer_503:      String,
-    pub options:         i64,
-    pub cipher_list:     String,
+    pub front:                     SocketAddr,
+    pub front_timeout:             u64,
+    pub back_timeout:              u64,
+    pub max_connections:           usize,
+    pub buffer_size:               usize,
+    pub public_address:            Option<IpAddr>,
+    pub answer_404:                String,
+    pub answer_503:                String,
+    pub options:                   i64,
+    pub cipher_list:               String,
+    pub default_name:              Option<String>,
+    pub default_app_id:            Option<String>,
+    pub default_certificate:       Option<Vec<u8>>,
+    pub default_key:               Option<Vec<u8>>,
+    pub default_certificate_chain: Option<String>,
 }
 
 impl Default for TlsProxyConfiguration {
@@ -108,6 +113,12 @@ impl Default for TlsProxyConfiguration {
       options:         (ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |
                          ssl::SSL_OP_NO_TICKET | ssl::SSL_OP_NO_SSLV2 |
                          ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1).bits(),
+      default_name:        Some(String::from("lolcatho.st")),
+      default_app_id:      None,
+
+      default_certificate: Some(Vec::from(&include_bytes!("../../assets/certificate.pem")[..])),
+      default_key:         Some(Vec::from(&include_bytes!("../../assets/key.pem")[..])),
+      default_certificate_chain: None,
     }
   }
 }
