@@ -102,16 +102,16 @@ fn main() {
     network::tls::start_listener(String::from("TLS"), config, sender2, rx2);
   });
 
-  let cert1 = include_str!("../assets/certificate.pem");
-  let key1  = include_str!("../assets/key.pem");
+  let cert1 = include_str!("../../assets/certificate.pem");
+  let key1  = include_str!("../../assets/key.pem");
 
   let tls_front = messages::TlsFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st"), path_begin: String::from("/"), certificate: String::from(cert1), key: String::from(key1), certificate_chain: vec!() };
   tx2.send(network::ProxyOrder::Command(String::from("ID_IJKL"), messages::Command::AddTlsFront(tls_front)));
   let tls_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
   tx2.send(network::ProxyOrder::Command(String::from("ID_MNOP"), messages::Command::AddInstance(tls_instance)));
 
-  let cert2 = include_str!("../assets/cert_test.pem");
-  let key2  = include_str!("../assets/key_test.pem");
+  let cert2 = include_str!("../../assets/cert_test.pem");
+  let key2  = include_str!("../../assets/key_test.pem");
 
   let tls_front2 = messages::TlsFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/"), certificate: String::from(cert2), key: String::from(key2), certificate_chain: vec!() };
   tx2.send(network::ProxyOrder::Command(String::from("ID_QRST"), messages::Command::AddTlsFront(tls_front2)));

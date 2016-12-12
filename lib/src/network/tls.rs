@@ -487,8 +487,8 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     //FIXME: get the default cert and key from the configuration
     //context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
     //context.set_private_key_file("assets/key.pem", X509FileType::PEM);
-    let cert_read = include_bytes!("../../assets/certificate.pem");
-    let key_read  = include_bytes!("../../assets/key.pem");
+    let cert_read = include_bytes!("../../../assets/certificate.pem");
+    let key_read  = include_bytes!("../../../assets/key.pem");
     if let (Ok(cert), Ok(key)) = (X509::from_pem(&cert_read[..]), PKey::private_key_from_pem(&key_read[..])) {
       if let Ok(fingerprint) = cert.fingerprint(Type::SHA256) {
         context.set_certificate(&cert);

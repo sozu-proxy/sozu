@@ -18,4 +18,4 @@ clap = "^2.13.0"
 slab = "^0.3.0"
 
 [dependencies.sozu-lib]
-path = ".."
+path = "../lib"
