@@ -106,6 +106,10 @@ impl CommandServer {
             break;
           }
 
+          if buffer.available_data() == 0 {
+            break;
+          }
+
           let mut offset = 0;
           match parse(buffer.data()) {
             IResult::Done(i, o) => {
