@@ -1,4 +1,0 @@
-- ./docker_tests/run_nginx.sh
-- RUST_LOG=info cargo run &
-- curl -v http://lolcatho.st:8080/
-- curl -vk https://lolcatho.st:8443/
