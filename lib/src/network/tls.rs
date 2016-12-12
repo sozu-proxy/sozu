@@ -1046,7 +1046,7 @@ mod tests {
       default_context: tls_data,
       contexts: rc_ctx,
       tx:        tx,
-      pool:      Rc::new(RefCell::new(Pool::with_capacity(1, 0, || BufferQueue::with_capacity(12000)))),
+      pool:      Rc::new(RefCell::new(Pool::with_capacity(1, 0, || BufferQueue::with_capacity(16384)))),
       front_timeout: 5000,
       back_timeout:  5000,
       answers:   DefaultAnswers {

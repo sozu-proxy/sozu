@@ -55,7 +55,7 @@ fn main() {
   let config = messages::HttpProxyConfiguration {
     front: "127.0.0.1:8080".parse().unwrap(),
     max_connections: 500,
-    buffer_size: 12000,
+    buffer_size: 16384,
     ..Default::default()
   };
 
@@ -76,7 +76,7 @@ fn main() {
   let config = messages::TlsProxyConfiguration {
     front: "127.0.0.1:8443".parse().unwrap(),
     max_connections: 500,
-    buffer_size: 12000,
+    buffer_size: 16384,
     options: (ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |
                ssl::SSL_OP_NO_TICKET | ssl::SSL_OP_NO_SSLV2 |
                ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1).bits(),

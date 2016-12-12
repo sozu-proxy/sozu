@@ -3,7 +3,7 @@
 command_socket = "./command_folder/sock"
 saved_state    = "./state.json"
 log_level      = "info"
-command_buffer_size = 12000
+command_buffer_size = 16384
 
 [metrics]
 address = "192.168.59.103"
@@ -16,7 +16,7 @@ address = "127.0.0.1"
 listener_type = "HTTP"
 max_connections = 500
 port = 8080
-buffer_size = 12000
+buffer__size = 16384
 
 #answers configuration is not active yet
 #answer_404 = "./404.html"
@@ -27,7 +27,7 @@ address = "127.0.0.1"
 listener_type = "HTTPS"
 max_connections = 500
 port = 8443
-buffer_size = 12000
+buffer_size = 16384
 #answer_404 = "./404.html"
 #answer_503 = "./503.html"
 

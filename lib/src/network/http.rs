@@ -630,7 +630,7 @@ mod tests {
     let config = HttpProxyConfiguration {
       front: front,
       max_connections: 10,
-      buffer_size: 12000,
+      buffer_size: 16384,
       ..Default::default()
     };
 
@@ -682,7 +682,7 @@ mod tests {
     let config = HttpProxyConfiguration {
       front: front,
       max_connections: 10,
-      buffer_size: 12000,
+      buffer_size: 16384,
       ..Default::default()
     };
     let (sender, receiver) = channel::channel::<ProxyOrder>();
@@ -800,7 +800,7 @@ mod tests {
       instances: HashMap::new(),
       fronts:    fronts,
       tx:        tx,
-      pool:      Rc::new(RefCell::new(Pool::with_capacity(1,0, || BufferQueue::with_capacity(12000)))),
+      pool:      Rc::new(RefCell::new(Pool::with_capacity(1,0, || BufferQueue::with_capacity(16384)))),
       front_timeout: 50000,
       back_timeout:  50000,
       answers:   DefaultAnswers {

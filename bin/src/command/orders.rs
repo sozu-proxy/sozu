@@ -96,7 +96,7 @@ impl CommandServer {
       Err(e)   => error!("cannot open file at path '{}': {:?}", path, e),
       Ok(mut file) => {
         //let mut data = vec!();
-        let mut buffer = Buffer::with_capacity(12000);
+        let mut buffer = Buffer::with_capacity(16384);
         loop {
         //FIXME: we should read in streaming here
           if let Ok(sz) = file.read(buffer.space()) {
