@@ -482,8 +482,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     match DH::get_2048_256() {
       Ok(dh) => ctx.set_tmp_dh(&dh),
       Err(e) => {
-        //return Err(io::Error::new(io::ErrorKind::Other, e.description()))
-        return None
+        return false;
       }
     };
 
