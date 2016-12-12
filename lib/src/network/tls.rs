@@ -328,22 +328,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let domains  = TrieNode::root();
 
-    /*let ctx = SslContext::new(SslMethod::Sslv23);
-    if let Err(e) = ctx {
-      return Err(io::Error::new(io::ErrorKind::Other, e.description()));
-    }
-
-    let mut context = ctx.unwrap();
-
-    context.set_cipher_list(&config.cipher_list);
-
-    match DH::get_2048_256() {
-      Ok(dh) => context.set_tmp_dh(&dh),
-      Err(e) => return Err(io::Error::new(io::ErrorKind::Other, e.description()))
-    };
-
-    context.set_ecdh_auto(true);
-
+    /*
     //FIXME: get the default cert and key from the configuration
     context.set_certificate_file("assets/certificate.pem", X509FileType::PEM);
     context.set_private_key_file("assets/key.pem", X509FileType::PEM);
@@ -384,13 +369,6 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
       }
       Err(SniError::Fatal(0))
     });
-
-    /*
-    {
-      let contexts = ref_ctx.lock().unwrap();
-      contexts.insert(fingerprint, tls_data);
-    }
-    */
 
     match server_bind(&config.front) {
       Ok(listener) => {
@@ -491,6 +469,15 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
     options.insert(ssl::SSL_OP_CIPHER_SERVER_PREFERENCE);
     let opt = ctx.set_options(options);
 
+    match DH::get_2048_256() {
+      Ok(dh) => ctx.set_tmp_dh(&dh),
+      Err(e) => {
+        //return Err(io::Error::new(io::ErrorKind::Other, e.description()))
+        return None
+      }
+    };
+
+    ctx.set_ecdh_auto(true);
 
     let mut cert_read  = &http_front.certificate.as_bytes()[..];
     let mut key_read   = &http_front.key.as_bytes()[..];
