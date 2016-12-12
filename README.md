@@ -1,4 +1,4 @@
-# Pipe
+# sozu proxy
 
 ## Building
 
