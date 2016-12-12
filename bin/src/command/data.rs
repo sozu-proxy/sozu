@@ -1,6 +1,5 @@
 use serde;
 use serde_json;
-use rustc_serialize::{Decodable,Decoder,Encodable,Encoder};
 use state::{HttpProxy,TlsProxy,ConfigState};
 use sozu::messages::Command;
 
@@ -9,28 +8,6 @@ pub enum ListenerType {
   HTTP,
   HTTPS,
   TCP
-}
-
-impl Encodable for ListenerType {
-  fn encode<E: Encoder>(&self, e: &mut E) -> Result<(), E::Error> {
-    match *self {
-      ListenerType::HTTP  => e.emit_str("HTTP"),
-      ListenerType::HTTPS => e.emit_str("HTTPS"),
-      ListenerType::TCP   => e.emit_str("TCP"),
-    }
-  }
-}
-
-impl Decodable for ListenerType {
-  fn decode<D: Decoder>(decoder: &mut D) -> Result<ListenerType, D::Error> {
-    let tag = try!(decoder.read_str());
-    match &tag[..] {
-      "HTTP"  => Ok(ListenerType::HTTP),
-      "HTTPS" => Ok(ListenerType::HTTPS),
-      "TCP"   => Ok(ListenerType::TCP),
-      _       => Err(decoder.error("unrecognized listener type"))
-    }
-  }
 }
 
 impl serde::Serialize for ListenerType {

@@ -3,13 +3,13 @@ use std::collections::HashMap;
 use std::io::{self,Error,ErrorKind,Read};
 use std::fs::File;
 use std::str::FromStr;
-use command::data::ListenerType;
-use rustc_serialize::{Decodable,Decoder};
+use serde::{Serialize,Deserialize};
 use toml;
 
+use command::data::ListenerType;
 use sozu::messages::{HttpProxyConfiguration,TlsProxyConfiguration};
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct ListenerConfig {
   pub listener_type:   ListenerType,
   pub address:         String,
@@ -91,13 +91,13 @@ impl ListenerConfig {
   }
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct MetricsConfig {
   pub address: String,
   pub port:    u16,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq, RustcDecodable, RustcEncodable)]
+#[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct Config {
   pub command_socket: String,
   pub command_buffer_size: Option<usize>,
@@ -116,7 +116,7 @@ impl Config {
 
     let mut parser = toml::Parser::new(&data[..]);
     if let Some(table) = parser.parse() {
-      match Decodable::decode(&mut toml::Decoder::new(toml::Value::Table(table))) {
+      match Deserialize::deserialize(&mut toml::Decoder::new(toml::Value::Table(table))) {
         Ok(config) => Ok(config),
         Err(e)     => {
           println!("decoding error: {:?}", e);

@@ -7,7 +7,6 @@ extern crate env_logger;
 extern crate mio;
 extern crate sozu_lib as sozu;
 extern crate toml;
-extern crate rustc_serialize;
 extern crate serde;
 extern crate serde_json;
 extern crate time;
