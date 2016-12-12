@@ -10,7 +10,7 @@ use sozu::messages::Command;
 use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
 
-use super::{CommandServer,FrontToken,Listener,ListenerConfiguration,StoredListener,parse};
+use super::{CommandServer,FrontToken,ListenerConfiguration,StoredListener,parse};
 use super::data::{ConfigCommand,ConfigMessage};
 
 impl CommandServer {

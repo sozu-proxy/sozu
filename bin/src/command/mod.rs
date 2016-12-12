@@ -5,7 +5,7 @@ use slab::Slab;
 use std::fs;
 use std::fmt;
 use std::path::PathBuf;
-use std::io::{self,BufRead,BufReader,Read,Write,ErrorKind};
+use std::io::{self,Read,Write,ErrorKind};
 use std::str::from_utf8;
 use std::os::unix::fs::PermissionsExt;
 use std::collections::HashMap;
@@ -13,7 +13,7 @@ use std::sync::mpsc;
 use std::cmp::min;
 use std::time::Duration;
 use log;
-use nom::{IResult,HexDisplay,Offset};
+use nom::{IResult,Offset};
 use serde_json;
 use serde_json::from_str;
 
@@ -24,7 +24,7 @@ use state::{HttpProxy,TlsProxy,ConfigState};
 
 pub mod data;
 pub mod orders;
-use self::data::{ConfigMessage,ListenerDeserializer,ListenerType};
+use self::data::{ConfigMessage,ListenerType};
 
 const SERVER: Token = Token(0);
 
@@ -446,7 +446,7 @@ impl CommandServer {
 
 }
 
-pub fn start(path: String, mut listeners: HashMap<String, Vec<Listener>>, saved_state: Option<String>, buffer_size: usize,
+pub fn start(path: String,  listeners: HashMap<String, Vec<Listener>>, saved_state: Option<String>, buffer_size: usize,
     max_buffer_size: usize) {
   let event_loop = Poll::new().unwrap();
   let addr = PathBuf::from(path);
