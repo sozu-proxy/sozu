@@ -4,6 +4,7 @@ use std::io::{self,Error,ErrorKind,Read};
 use std::fs::File;
 use std::str::FromStr;
 use command::data::ListenerType;
+use rustc_serialize::{Decodable,Decoder};
 use toml;
 
 use sozu::messages::{HttpProxyConfiguration,TlsProxyConfiguration};
@@ -114,9 +115,30 @@ impl Config {
     try!(f.read_to_string(&mut data));
 
     let mut parser = toml::Parser::new(&data[..]);
-    if let Some(config) = parser.parse().and_then(|t| toml::decode(toml::Value::Table(t))) {
-      Ok(config)
+    if let Some(table) = parser.parse() {
+      match Decodable::decode(&mut toml::Decoder::new(toml::Value::Table(table))) {
+        Ok(config) => Ok(config),
+        Err(e)     => {
+          println!("decoding error: {:?}", e);
+          Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("decoding error: {:?}", e))
+          )
+        }
+      }
     } else {
+      println!("error parsing file:");
+      let mut offset = 0usize;
+      let mut index  = 0usize;
+      for line in data.lines() {
+        for error in &parser.errors {
+          if error.lo >= offset && error.lo <= offset + line.len() {
+            println!("line {}: {}", index, error.desc);
+          }
+        }
+        offset += line.len();
+        index  += 1;
+      }
       Err(Error::new(ErrorKind::InvalidData, format!("could not parse the configuration file: {:?}", parser.errors)))
     }
   }
