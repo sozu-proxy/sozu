@@ -149,7 +149,7 @@
 //! }
 //! ```
 //!
-#![feature(custom_derive, plugin, proc_macro)]
+#![feature(proc_macro)]
 #![cfg_attr(test, feature(test))]
 #[cfg(test)]
 extern crate test;

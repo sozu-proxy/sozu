@@ -1,4 +1,4 @@
-#![feature(custom_derive, plugin, libc, proc_macro)]
+#![feature(proc_macro)]
 #[macro_use] extern crate nom;
 #[macro_use] extern crate log;
 #[macro_use] extern crate clap;
