@@ -1055,7 +1055,6 @@ mod tests {
       instances: HashMap::new(),
       fronts:    fronts,
       domains:   rc_domains,
-      default_cert: "".to_owned(),
       default_context: tls_data,
       contexts: rc_ctx,
       tx:        tx,
