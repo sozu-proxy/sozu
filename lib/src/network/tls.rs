@@ -817,57 +817,58 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
 
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyOrder) {
     trace!("{}\t{} notified", self.tag, message);
-    match message {
-      ProxyOrder::Command(id, Command::AddTlsFront(front)) => {
+    match message.command {
+      Command::AddTlsFront(front) => {
         //info!("TLS\t{} add front {:?}", id, front);
           self.add_http_front(front, event_loop);
-          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
+          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
-      ProxyOrder::Command(id, Command::RemoveTlsFront(front)) => {
+      Command::RemoveTlsFront(front) => {
         //info!("TLS\t{} remove front {:?}", id, front);
         self.remove_http_front(front, event_loop);
-        self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
+        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
-      ProxyOrder::Command(id, Command::AddInstance(instance)) => {
-        info!("{}\t{} add instance {:?}", self.tag, id, instance);
+      Command::AddInstance(instance) => {
+        info!("{}\t{} add instance {:?}", self.tag, message.id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
+          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
-          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
-      ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
-        info!("{}\t{} remove instance {:?}", self.tag, id, instance);
+      Command::RemoveInstance(instance) => {
+        info!("{}\t{} remove instance {:?}", self.tag, message.id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
+          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
-          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
-      ProxyOrder::Command(id, Command::HttpProxy(configuration)) => {
-        info!("{}\t{} modifying proxy configuration: {:?}", self.tag, id, configuration);
+      Command::HttpProxy(configuration) => {
+        info!("{}\t{} modifying proxy configuration: {:?}", self.tag, message.id, configuration);
         self.front_timeout = configuration.front_timeout;
         self.back_timeout  = configuration.back_timeout;
         self.answers = DefaultAnswers {
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
         };
+        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
-      ProxyOrder::Stop(id)                   => {
-        info!("{}\t{} shutdown", self.tag, id);
+      Command::HardStop | Command::SoftStop => {
+        info!("{}\t{} shutdown", self.tag, message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
+        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
-      ProxyOrder::Command(id, msg) => {
-        error!("{}\t{} unsupported message, ignoring {:?}", self.tag, id, msg);
-        self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
+      command => {
+        error!("{}\t{} unsupported message, ignoring {:?}", self.tag, message.id, command);
+        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
       }
     }
   }

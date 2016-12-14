@@ -364,8 +364,8 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
             loop {
               match self.rx.recv_message() {
                 Ok(msg) => {
-                  if let ProxyOrder::Stop(id) = msg {
-                    self.notify(ProxyOrder::Stop(id));
+                  if let Command::HardStop = msg.command {
+                    self.notify(msg);
                     //FIXME: it's a bit brutal
                     return;
                   } else {

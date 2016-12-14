@@ -49,17 +49,14 @@ pub enum ServerMessageStatus {
 }
 
 #[derive(Debug)]
-pub enum ProxyOrder {
-  Command(MessageId,Command),
-  Stop(MessageId)
+pub struct ProxyOrder {
+  pub id:      MessageId,
+  pub command: Command,
 }
 
 impl fmt::Display for ProxyOrder {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    match *self {
-      ProxyOrder::Command(ref id, ref msg) => write!(f, "{}-{:?}", id, msg),
-      ProxyOrder::Stop(ref id)             => write!(f, "{}-Stop", id)
-    }
+    write!(f, "{}-{:?}", self.id, self.command)
   }
 }
 

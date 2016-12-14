@@ -139,6 +139,9 @@ pub enum Command {
 
     HttpProxy(HttpProxyConfiguration),
     TlsProxy(TlsProxyConfiguration),
+
+    SoftStop,
+    HardStop,
 }
 
 impl Command {
@@ -154,6 +157,8 @@ impl Command {
       Command::RemoveInstance(_)  => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
       Command::HttpProxy(_)       => vec![Topic::HttpProxyConfig],
       Command::TlsProxy(_)        => vec![Topic::TlsProxyConfig],
+      Command::SoftStop           => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
+      Command::HardStop           => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
     }
   }
 }
@@ -323,7 +328,15 @@ impl serde::Serialize for Command {
         try!(serializer.serialize_map_value(&mut state, "CONFIGURE_HTTP_PROXY"));
         try!(serializer.serialize_map_key(&mut state, "data"));
         try!(serializer.serialize_map_value(&mut state, config));
-      }
+      },
+      &Command::SoftStop => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "SOFT_STOP"));
+      },
+      &Command::HardStop => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "HARD_STOP"));
+      },
     }
 
     serializer.serialize_map_end(state)

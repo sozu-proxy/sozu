@@ -77,7 +77,7 @@ impl CommandServer {
               let cl = command.clone();
               self.conns[token].add_message_id(message.id.clone());
               listener.state.handle_command(&cl);
-              listener.sender.send(ProxyOrder::Command(message.id.clone(), cl));
+              listener.sender.send(ProxyOrder { id: message.id.clone(), command: cl });
             }
           } else {
             // FIXME: should send back error here
@@ -136,7 +136,7 @@ impl CommandServer {
                       for listener in listener_vec.iter_mut() {
                         let cl = command.clone();
                         listener.state.handle_command(&cl);
-                        listener.sender.send(ProxyOrder::Command(message.id.clone(), cl));
+                        listener.sender.send(ProxyOrder { id: message.id.clone(), command: cl });
                       }
                     } else {
                       // FIXME: should send back error here

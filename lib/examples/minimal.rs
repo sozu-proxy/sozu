@@ -37,15 +37,15 @@ fn main() {
     port:       8000
   };
 
-  tx.send(network::ProxyOrder::Command(
-    String::from("ID_ABCD"),
-    messages::Command::AddHttpFront(http_front)
-  ));
+  tx.send(network::ProxyOrder {
+    id:      String::from("ID_ABCD"),
+    command: messages::Command::AddHttpFront(http_front)
+  });
 
-  tx.send(network::ProxyOrder::Command(
-    String::from("ID_EFGH"),
-    messages::Command::AddInstance(http_instance)
-  ));
+  tx.send(network::ProxyOrder {
+    id:      String::from("ID_EFGH"),
+    command: messages::Command::AddInstance(http_instance)
+  });
 
   println!("HTTP -> {:?}", rec.recv().unwrap());
   println!("HTTP -> {:?}", rec.recv().unwrap());
