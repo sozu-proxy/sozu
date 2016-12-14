@@ -14,7 +14,7 @@ use uuid::Uuid;
 use nom::{HexDisplay,IResult};
 use rand::random;
 
-use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
+use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
 use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
 use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness,ListenToken,FrontToken,BackToken};
@@ -510,12 +510,12 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerC
       ProxyOrder::Command(id, Command::AddHttpFront(front)) => {
         info!("{}\t{} add front {:?}", self.tag, id, front);
           self.add_http_front(front, event_loop);
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
       },
       ProxyOrder::Command(id, Command::RemoveHttpFront(front)) => {
         info!("{}\t{} front {:?}", self.tag, id, front);
         self.remove_http_front(front, event_loop);
-        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
+        self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
         info!("{}\t{} add instance {:?}", self.tag, id, instance);
@@ -523,9 +523,9 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerC
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
         } else {
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
@@ -534,9 +534,9 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerC
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
         } else {
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::HttpProxy(configuration)) => {
@@ -552,11 +552,11 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerC
         info!("{}\t{} shutdown", self.tag, id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Stopped});
+        self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
       },
       ProxyOrder::Command(id, msg) => {
         debug!("{}\t{} unsupported message, ignoring: {:?}", self.tag, id, msg);
-        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
+        self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
       }
     }
   }

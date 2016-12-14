@@ -161,6 +161,20 @@ pub struct ConfigMessage {
   pub listener: Option<String>,
 }
 
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+pub enum ConfigMessageStatus {
+  Ok,
+  Error
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+pub struct ConfigMessageAnswer {
+  pub id:      String,
+  pub status:  ConfigMessageStatus,
+  pub message: String
+}
+
 #[derive(Deserialize)]
 struct SaveStateData {
   path : String

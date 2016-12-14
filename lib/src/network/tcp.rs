@@ -16,7 +16,7 @@ use std::str::FromStr;
 use time::{Duration,precise_time_s};
 use rand::random;
 use uuid::Uuid;
-use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
+use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
 use network::proxy::{BackendConnectAction,Server,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
@@ -456,29 +456,29 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerC
         let addr_string = tcp_front.ip_address + ":" + &tcp_front.port.to_string();
         if let Ok(front) = addr_string.parse() {
           if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, event_loop) {
-            self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
+            self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
           } else {
             error!("TCP\tCouldn't add tcp front");
-            self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot add tcp front"))});
+            self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Error(String::from("cannot add tcp front"))});
           }
         } else {
           error!("TCP\tCouldn't parse tcp front address");
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveTcpFront(front)) => {
         trace!("TCP\t{:?}", front);
         let _ = self.remove_tcp_front(front.app_id, event_loop);
-        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
+        self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
         } else {
           error!("TCP\tCouldn't add tcp instance");
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot add tcp instance"))});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Error(String::from("cannot add tcp instance"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
@@ -486,20 +486,20 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerC
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
         } else {
           error!("TCP\tCouldn't remove tcp instance");
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot remove tcp instance"))});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Error(String::from("cannot remove tcp instance"))});
         }
       },
       ProxyOrder::Stop(id)                   => {
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Stopped});
+        self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
       },
       ProxyOrder::Command(id, _) => {
         error!("TCP\tunsupported message, ignoring");
-        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
+        self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
       }
     }
   }

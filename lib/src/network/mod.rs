@@ -32,23 +32,19 @@ pub enum Protocol {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct ServerMessage {
-  pub id:      MessageId,
-  pub message: ServerMessageType,
+  pub id:     MessageId,
+  pub status: ServerMessageStatus,
 }
 
 impl fmt::Display for ServerMessage {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    write!(f, "{}-{:?}", self.id, self.message)
+    write!(f, "{}-{:?}", self.id, self.status)
   }
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub enum ServerMessageType {
-  AddedFront,
-  RemovedFront,
-  AddedInstance,
-  RemovedInstance,
-  Stopped,
+pub enum ServerMessageStatus {
+  Ok,
   Error(String),
 }
 

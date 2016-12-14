@@ -30,7 +30,7 @@ use nom::IResult;
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
-use network::{Backend,ClientResult,ServerMessage,ServerMessageType,ConnectionError,ProxyOrder,Protocol};
+use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,Protocol};
 use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness,ListenToken,FrontToken,BackToken};
 use messages::{self,Command,TlsFront,TlsProxyConfiguration};
 use network::http::{self,DefaultAnswers};
@@ -823,12 +823,12 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
       ProxyOrder::Command(id, Command::AddTlsFront(front)) => {
         //info!("TLS\t{} add front {:?}", id, front);
           self.add_http_front(front, event_loop);
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::AddedFront});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
       },
       ProxyOrder::Command(id, Command::RemoveTlsFront(front)) => {
         //info!("TLS\t{} remove front {:?}", id, front);
         self.remove_http_front(front, event_loop);
-        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::RemovedFront});
+        self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
       },
       ProxyOrder::Command(id, Command::AddInstance(instance)) => {
         info!("{}\t{} add instance {:?}", self.tag, id, instance);
@@ -836,9 +836,9 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::AddedInstance});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
         } else {
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::RemoveInstance(instance)) => {
@@ -847,9 +847,9 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::RemovedInstance});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
         } else {
-          self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("cannot parse the address"))});
+          self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       ProxyOrder::Command(id, Command::HttpProxy(configuration)) => {
@@ -865,11 +865,11 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
         info!("{}\t{} shutdown", self.tag, id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Stopped});
+        self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Ok});
       },
       ProxyOrder::Command(id, msg) => {
         error!("{}\t{} unsupported message, ignoring {:?}", self.tag, id, msg);
-        self.tx.send_message(ServerMessage{ id: id, message: ServerMessageType::Error(String::from("unsupported message"))});
+        self.tx.send_message(ServerMessage{ id: id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
       }
     }
   }

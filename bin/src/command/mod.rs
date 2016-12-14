@@ -17,14 +17,14 @@ use nom::{IResult,Offset};
 use serde_json;
 use serde_json::from_str;
 
-use sozu::network::{ProxyOrder,ServerMessage};
+use sozu::network::{ProxyOrder,ServerMessage,ServerMessageStatus};
 use sozu::network::buffer::Buffer;
 
 use state::{HttpProxy,TlsProxy,ConfigState};
 
 pub mod data;
 pub mod orders;
-use self::data::{ConfigMessage,ListenerType};
+use self::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,ListenerType};
 
 const SERVER: Token = Token(0);
 
@@ -415,13 +415,28 @@ impl CommandServer {
 
   fn timeout(&mut self, token: Token) {
     if token.0 == 0 {
+      info!("timeout!");
       for listener_vec in self.listeners.values() {
         for listener in listener_vec {
           while let Ok(msg) = listener.receiver.try_recv() {
-            //println!("got msg: {:?}", msg);
+            println!("got answer msg: {:?}", msg);
+            let answer = ConfigMessageAnswer {
+              id: msg.id.clone(),
+              status: if let ServerMessageStatus::Error(_) = msg.status {
+                ConfigMessageStatus::Error
+              } else {
+                ConfigMessageStatus::Ok
+              },
+              message: if let  ServerMessageStatus::Error(ref s) = msg.status {
+                s.clone()
+              } else {
+                String::new()
+              }
+            };
+            info!("sending: {:?}", answer);
             for client in self.conns.iter_mut() {
               if let Some(index) = client.has_message_id(&msg.id) {
-                client.back_buf.write(&serde_json::to_string(&msg).map(|s| s.into_bytes()).unwrap_or(vec!()));
+                client.back_buf.write(&serde_json::to_string(&answer).map(|s| s.into_bytes()).unwrap_or(vec!()));
                 client.back_buf.write(&b"\0"[..]);
                 client.remove_message_id(index);
               }
