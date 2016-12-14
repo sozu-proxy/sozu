@@ -8,8 +8,6 @@ use mio::*;
 use mio::tcp::*;
 use mio::timer::Timeout;
 use std::io::{self,Read,Write,ErrorKind,BufReader};
-use bytes::{Buf,ByteBuf,MutByteBuf};
-use bytes::buf::MutBuf;
 use std::collections::HashMap;
 use std::error::Error;
 use slab::Slab;

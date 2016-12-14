@@ -8,7 +8,6 @@ use mio::tcp::*;
 use mio::*;
 use mio::timer::{Timer,Timeout};
 use mio::channel::Receiver;
-use bytes::{ByteBuf,MutByteBuf};
 use std::collections::HashMap;
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;

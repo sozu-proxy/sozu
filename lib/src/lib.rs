@@ -159,7 +159,6 @@ extern crate test;
 #[macro_use] extern crate lazy_static;
 #[macro_use] extern crate serde_derive;
 extern crate mio;
-extern crate bytes;
 extern crate time;
 extern crate serde;
 extern crate serde_json;

@@ -9,7 +9,6 @@ nom = "^2.0"
 net2 = "^0.2"
 time = "^0.1.34"
 mio = "~0.6.0"
-bytes = "~0.3.0"
 log = "0.3"
 serde = "^0.8.0"
 serde_json = "^0.8.0"
@@ -19,7 +18,7 @@ libc = "^0.2"
 slab = "^0.3.0"
 
 [dev-dependencies]
-tiny_http= "0.4"
+tiny_http = "0.4"
 env_logger = "0.3"
 
 [dependencies.openssl]

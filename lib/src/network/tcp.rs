@@ -5,7 +5,6 @@ use std::sync::mpsc::{self,channel,Receiver};
 use mio::tcp::*;
 use mio::*;
 use mio::timer::Timeout;
-use bytes::{ByteBuf,MutByteBuf};
 use std::collections::HashMap;
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
