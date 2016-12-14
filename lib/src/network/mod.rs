@@ -45,6 +45,7 @@ impl fmt::Display for ServerMessage {
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub enum ServerMessageStatus {
   Ok,
+  Processing,
   Error(String),
 }
 

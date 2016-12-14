@@ -165,6 +165,7 @@ pub struct ConfigMessage {
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub enum ConfigMessageStatus {
   Ok,
+  Processing,
   Error
 }
 

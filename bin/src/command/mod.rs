@@ -422,16 +422,15 @@ impl CommandServer {
             println!("got answer msg: {:?}", msg);
             let answer = ConfigMessageAnswer {
               id: msg.id.clone(),
-              status: if let ServerMessageStatus::Error(_) = msg.status {
-                ConfigMessageStatus::Error
-              } else {
-                ConfigMessageStatus::Ok
+              status: match msg.status {
+                ServerMessageStatus::Error(_)   => ConfigMessageStatus::Error,
+                ServerMessageStatus::Ok         => ConfigMessageStatus::Ok,
+                ServerMessageStatus::Processing => ConfigMessageStatus::Processing,
               },
-              message: if let  ServerMessageStatus::Error(ref s) = msg.status {
-                s.clone()
-              } else {
-                String::new()
-              }
+              message: match msg.status {
+                ServerMessageStatus::Error(s) => s.clone(),
+                _                             => String::new(),
+              },
             };
             info!("sending: {:?}", answer);
             for client in self.conns.iter_mut() {
