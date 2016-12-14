@@ -21,7 +21,8 @@ use time::precise_time_ns;
 use std::time::Duration;
 use rand::random;
 
-use network::{ClientResult,ServerMessage,ConnectionError,SocketType,socket_type,Protocol,ProxyOrder,RequiredEvents};
+use network::{ClientResult,MessageId,ServerMessage,ServerMessageStatus,ConnectionError,
+  SocketType,socket_type,Protocol,ProxyOrder,RequiredEvents};
 use messages::{self,TcpFront,Command,Instance};
 
 const SERVER: Token = Token(0);
@@ -136,6 +137,7 @@ pub trait ProxyConfiguration<Client> {
   fn front_timeout(&self) -> u64;
   fn back_timeout(&self)  -> u64;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
+  fn sender(&mut self) -> &mut messages::Sender<ServerMessage>;
 }
 
 pub struct Server<ServerConfiguration,Client, R> {
@@ -147,6 +149,7 @@ pub struct Server<ServerConfiguration,Client, R> {
   pub poll:        Poll,
   rx:              R,
   timer:           Timer<Token>,
+  shutting_down:   Option<MessageId>,
 }
 
 impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented+messages::Receiver<ProxyOrder>> Server<ServerConfiguration,Client,R> {
@@ -167,6 +170,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
       poll:            poll,
       rx:              rx,
       timer:           timer,
+      shutting_down:   None,
     }
   }
 
@@ -368,6 +372,9 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
                     self.notify(msg);
                     //FIXME: it's a bit brutal
                     return;
+                  } else if let Command::SoftStop = msg.command {
+                    self.shutting_down = Some(msg.id.clone());
+                    self.notify(msg);
                   } else {
                     //println!("got msg: {:?}", msg);
                     self.notify(msg);
@@ -400,9 +407,15 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
         }
       }
 
-      //FIXM: manually call the timer instead of relying on a separate thread
+      //FIXME: manually call the timer instead of relying on a separate thread
       while let Some(token) = self.timer.poll() {
         self.timeout(token);
+      }
+
+      if self.shutting_down.is_some() && self.clients.len() == 0 {
+        info!("last client stopped, shutting down!");
+        self.configuration.sender().send_message(ServerMessage{ id: self.shutting_down.take().unwrap(), status: ServerMessageStatus::Ok});
+        return;
       }
     }
   }

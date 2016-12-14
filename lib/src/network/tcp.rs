@@ -491,9 +491,15 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerC
           self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot remove tcp instance"))});
         }
       },
-      Command::HardStop | Command::SoftStop => {
-        //FIXME: handle shutdown
-        //event_loop.shutdown();
+      Command::SoftStop => {
+        info!("{}\t{} processing soft shutdown", "TCP", message.id);
+        for listener in self.listeners.iter() {
+          event_loop.deregister(&listener.sock);
+        }
+        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
+      },
+      Command::HardStop => {
+        info!("{}\t{} hard shutdown", "TCP", message.id);
         self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       _ => {
@@ -536,6 +542,10 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerC
 
   fn back_timeout(&self)  -> u64 {
     self.back_timeout
+  }
+
+  fn sender(&mut self) -> &mut messages::Sender<ServerMessage> {
+    &mut self.tx
   }
 }
 

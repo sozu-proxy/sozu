@@ -860,10 +860,13 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
         };
         self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
-      Command::HardStop | Command::SoftStop => {
-        info!("{}\t{} shutdown", self.tag, message.id);
-        //FIXME: handle shutdown
-        //event_loop.shutdown();
+      Command::SoftStop => {
+        info!("{}\t{} processing soft shutdown", self.tag, message.id);
+        event_loop.deregister(&self.listener);
+        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
+      },
+      Command::HardStop => {
+        info!("{}\t{} hard shutdown", self.tag, message.id);
         self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       command => {
@@ -887,6 +890,10 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
 
   fn back_timeout(&self)  -> u64 {
     self.back_timeout
+  }
+
+  fn sender(&mut self) -> &mut messages::Sender<ServerMessage> {
+    &mut self.tx
   }
 }
 
