@@ -24,7 +24,10 @@ use state::{HttpProxy,TlsProxy,ConfigState};
 
 pub mod data;
 pub mod orders;
+pub mod client;
+
 use self::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,ListenerType};
+use self::client::{ConnReadError,CommandClient};
 
 const SERVER: Token = Token(0);
 
@@ -103,160 +106,6 @@ pub struct ListenerConfiguration {
   listeners: Vec<StoredListener>,
 }
 
-#[derive(Debug,PartialEq)]
-pub enum ConnReadError {
-  Continue,
-  FullBufferError,
-  ParseError,
-  SocketError,
-}
-
-struct CommandClient {
-  sock:        UnixStream,
-  buf:         Buffer,
-  back_buf:    Buffer,
-  token:       Option<Token>,
-  message_ids: Vec<String>,
-  write_timeout: Option<Timeout>,
-}
-
-impl CommandClient {
-  fn new(sock: UnixStream, buffer_size: usize) -> CommandClient {
-    CommandClient {
-      sock:        sock,
-      buf:         Buffer::with_capacity(buffer_size),
-      back_buf:    Buffer::with_capacity(buffer_size),
-      token:       None,
-      message_ids: Vec::new(),
-      write_timeout: None,
-    }
-  }
-
-  fn add_message_id(&mut self, id: String) {
-    self.message_ids.push(id);
-    self.message_ids.sort();
-  }
-
-  fn has_message_id(&self, id: &String) ->Option<usize> {
-    self.message_ids.binary_search(&id).ok()
-  }
-
-  fn remove_message_id(&mut self, index: usize) {
-    self.message_ids.remove(index);
-  }
-
-  fn conn_readable(&mut self, tok: Token) -> Result<Vec<ConfigMessage>,ConnReadError>{
-    trace!("server conn readable; tok={:?}", tok);
-    loop {
-      let size = self.buf.available_space();
-      if size == 0 { break; }
-
-      match self.sock.read(self.buf.space()) {
-        Ok(0) => {
-          //self.reregister(event_loop, tok);
-          break;
-          //return None;
-        },
-        Err(e) => {
-          match e.kind() {
-            ErrorKind::WouldBlock => {
-              break;
-            },
-            code => {
-              log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error (kind: {:?}): {:?}", tok.0, code, e);
-              return Err(ConnReadError::SocketError);
-            }
-          }
-        },
-        Ok(r) => {
-          self.buf.fill(r);
-          debug!("UNIX CLIENT[{}] sent {} bytes: {:?}", tok.0, r, from_utf8(self.buf.data()));
-        },
-      };
-    }
-
-    let mut res: Result<Vec<ConfigMessage>,ConnReadError> = Err(ConnReadError::Continue);
-    let mut offset = 0usize;
-    match parse(self.buf.data()) {
-      IResult::Incomplete(_) => {
-        if self.buf.available_space() == 0 {
-          log!(log::LogLevel::Error, "UNIX CLIENT[{}] buffer full, but not enough data: {:?}", tok.0, from_utf8(self.buf.data()));
-          return Err(ConnReadError::FullBufferError);
-        }
-        return Ok(Vec::new());
-      },
-      IResult::Error(e)      => {
-        log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error: {:?}", tok.0, e);
-        return Err(ConnReadError::ParseError);
-      },
-      IResult::Done(i, v)    => {
-        if self.buf.available_data() == i.len() && v.len() == 0 {
-          if self.buf.available_space() == 0 {
-            log!(log::LogLevel::Error, "UNIX CLIENT[{}] buffer full, cannot parse", tok.0);
-            return Err(ConnReadError::FullBufferError);
-          } else {
-            log!(log::LogLevel::Error, "UNIX CLIENT[{}] parse error", tok.0);
-            return Err(ConnReadError::ParseError);
-          }
-        }
-        offset = self.buf.data().offset(i);
-        res = Ok(v);
-      }
-    }
-    debug!("parsed {} bytes, result: {:?}", offset, res);
-    self.buf.consume(offset);
-    return res;
-  }
-
-  fn conn_writable(&mut self, tok: Token) {
-    if self.write_timeout.is_some() {
-      trace!("server conn writable; tok={:?}; waiting for timeout", tok.0);
-      return;
-    }
-
-    trace!("server conn writable; tok={:?}", tok);
-    loop {
-      let size = self.back_buf.available_data();
-      if size == 0 { break; }
-
-      match self.sock.write(self.back_buf.data()) {
-        Ok(0) => {
-          //println!("[{}] setting timeout!", tok.0);
-          /*FIXME: timeout
-          self.write_timeout = event_loop.timeout_ms(self.token.unwrap().0, 700).ok();
-          */
-          break;
-        },
-        Ok(r) => {
-          self.back_buf.consume(r);
-        },
-        Err(e) => {
-          match e.kind() {
-            ErrorKind::WouldBlock => {
-              break;
-            },
-            code => {
-              log!(log::LogLevel::Error,"UNIX CLIENT[{}] write error: (kind: {:?}): {:?}", tok.0, code, e);
-              return;
-            }
-          }
-        }
-      }
-    }
-
-    //let mut interest = Ready::hup();
-    //interest.insert(Ready::readable());
-    //interest.insert(Ready::writable());
-    //event_loop.register(&self.sock, tok, interest, PollOpt::edge() | PollOpt::oneshot());
-  }
-}
-
-pub fn parse(input: &[u8]) -> IResult<&[u8], Vec<ConfigMessage>> {
-  many0!(input,
-    complete!(terminated!(map_res!(map_res!(is_not!("\0"), from_utf8), from_str), char!('\0')))
-  )
-}
-
 struct CommandServer {
   sock:            UnixListener,
   buffer_size:     usize,
@@ -273,7 +122,7 @@ impl CommandServer {
 
     let acc = self.sock.accept();
     if let Ok(Some((sock, addr))) = acc {
-      let conn = CommandClient::new(sock, self.buffer_size);
+      let conn = CommandClient::new(sock, self.buffer_size, self.max_buffer_size);
       let tok = self.conns.insert(conn)
         .ok().expect("could not add connection to slab");
 
@@ -371,12 +220,6 @@ impl CommandServer {
                 self.conns.remove(conn_token);
                 trace!("closed client [{}]", token.0);
               }
-              Err(ConnReadError::FullBufferError) => {
-                //FIXME: automatically growing by 5kB every time may not be the best idea
-                let new_size = min(self.conns[conn_token].buf.capacity()+5000, self.max_buffer_size);
-                log!(log::LogLevel::Error, "buffer not large enough, growing to {}", new_size);
-                self.conns[conn_token].buf.grow(new_size);
-              }
             }
           }
         }
@@ -435,8 +278,7 @@ impl CommandServer {
             info!("sending: {:?}", answer);
             for client in self.conns.iter_mut() {
               if let Some(index) = client.has_message_id(&msg.id) {
-                client.back_buf.write(&serde_json::to_string(&answer).map(|s| s.into_bytes()).unwrap_or(vec!()));
-                client.back_buf.write(&b"\0"[..]);
+                client.write_message(&serde_json::to_string(&answer).map(|s| s.into_bytes()).unwrap_or(vec!()));
                 client.remove_message_id(index);
               }
             }

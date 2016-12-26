@@ -10,8 +10,9 @@ use sozu::messages::Command;
 use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
 
-use super::{CommandServer,FrontToken,ListenerConfiguration,StoredListener,parse};
+use super::{CommandServer,FrontToken,ListenerConfiguration,StoredListener};
 use super::data::{ConfigCommand,ConfigMessage};
+use super::client::parse;
 
 impl CommandServer {
   pub fn handle_message(&mut self, token: FrontToken, message: &ConfigMessage) {
@@ -40,7 +41,7 @@ impl CommandServer {
         } else {
           // FIXME: should send back error here
           log!(log::LogLevel::Error, "could not open file: {}", &path);
-          self.conns[token].back_buf.write(b"could not open file\0");
+          self.conns[token].write_message(b"could not open file");
         }
       },
       ConfigCommand::DumpState => {
@@ -53,16 +54,11 @@ impl CommandServer {
           listeners: stored_listeners,
         };
         let encoded = serde_json::to_string(&conf).map(|s| s.into_bytes()).unwrap_or(vec!());
-        if self.conns[token].back_buf.grow(min(encoded.len() + 10, self.max_buffer_size)) {
-          log!(log::LogLevel::Info, "write buffer was not large enough, growing to {} bytes", encoded.len());
-        }
-        info!("dumping state to {:?}:\n{}", token, str::from_utf8(&encoded).unwrap());
-        self.conns[token].back_buf.write(&encoded);
-        self.conns[token].back_buf.write(&b"\0"[..]);
+        self.conns[token].write_message(&encoded);
       },
       ConfigCommand::LoadState(path) => {
         self.load_state(&message.id, &path);
-        self.conns[token].back_buf.write(b"loaded the configuration\0");
+        self.conns[token].write_message(b"loaded the configuration");
       },
       ConfigCommand::ProxyConfiguration(command) => {
         if let Some(ref tag) = message.listener {
