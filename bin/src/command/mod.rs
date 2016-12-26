@@ -1,6 +1,6 @@
 use mio::*;
-use mio::deprecated::unix::*;
 use mio::timer::{Timer,Timeout};
+use mio_uds::{UnixListener,UnixStream};
 use slab::Slab;
 use std::fs;
 use std::fmt;
@@ -272,7 +272,7 @@ impl CommandServer {
     debug!("server accepting socket");
 
     let acc = self.sock.accept();
-    if let Ok(sock) = acc {
+    if let Ok(Some((sock, addr))) = acc {
       let conn = CommandClient::new(sock, self.buffer_size);
       let tok = self.conns.insert(conn)
         .ok().expect("could not add connection to slab");

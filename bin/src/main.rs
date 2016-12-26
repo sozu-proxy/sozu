@@ -5,13 +5,14 @@
 #[macro_use] extern crate serde_derive;
 extern crate env_logger;
 extern crate mio;
-extern crate sozu_lib as sozu;
+extern crate mio_uds;
 extern crate toml;
 extern crate serde;
 extern crate serde_json;
 extern crate time;
 extern crate libc;
 extern crate slab;
+extern crate sozu_lib as sozu;
 
 mod config;
 mod command;

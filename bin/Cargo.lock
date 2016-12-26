@@ -7,6 +7,7 @@ dependencies = [
  "libc 0.2.18 (registry+https://github.com/rust-lang/crates.io-index)",
  "log 0.3.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "mio 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "mio-uds 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "nom 2.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde 0.8.21 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_derive 0.8.21 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -152,6 +153,15 @@ dependencies = [
  "nix 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "slab 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "winapi 0.2.8 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "mio-uds"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+dependencies = [
+ "libc 0.2.18 (registry+https://github.com/rust-lang/crates.io-index)",
+ "mio 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -505,6 +515,7 @@ dependencies = [
 "checksum log 0.3.6 (registry+https://github.com/rust-lang/crates.io-index)" = "ab83497bf8bf4ed2a74259c1c802351fcd67a65baa86394b6ba73c36f4838054"
 "checksum memchr 0.1.11 (registry+https://github.com/rust-lang/crates.io-index)" = "d8b629fb514376c675b98c1421e80b151d3817ac42d7c667717d282761418d20"
 "checksum mio 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)" = "5b493dc9fd96bd2077f2117f178172b0765db4dfda3ea4d8000401e6d65d3e80"
+"checksum mio-uds 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)" = "3b6bd83b05675b13929d3c3add6c8cabf0067a63e8bb56bf231b8203946e0aa7"
 "checksum miow 0.1.5 (registry+https://github.com/rust-lang/crates.io-index)" = "3e690c5df6b2f60acd45d56378981e827ff8295562fc8d34f573deb267a59cd1"
 "checksum net2 0.2.26 (registry+https://github.com/rust-lang/crates.io-index)" = "5edf9cb6be97212423aed9413dd4729d62b370b5e1c571750e882cebbbc1e3e2"
 "checksum nix 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)" = "a0d95c5fa8b641c10ad0b8887454ebaafa3c92b5cd5350f8fc693adafd178e7b"
