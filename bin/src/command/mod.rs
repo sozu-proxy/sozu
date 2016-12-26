@@ -200,65 +200,72 @@ impl CommandServer {
 
   fn ready(&mut self, token: Token, events: Ready) {
     //trace!("ready: {:?} -> {:?}", token, events);
-    if events.is_readable() {
-      match token {
-        Token(0) => self.accept().unwrap(),
-        Token(1) => {
+    match token {
+      Token(0) => {
+        if events.is_readable() {
+          self.accept().unwrap();
+        } else {
+          error!("received writable for token 0");
+        }
+      },
+      Token(1) => {
+        if events.is_readable() {
           while let Some(timeout_token) = self.timer.poll() {
             self.timeout(timeout_token);
           }
-        },
-        _      => {
-          let conn_token = self.to_front(token);
-          if self.conns.contains(conn_token) {
-            let opt_v = self.conns[conn_token].conn_readable(token);
-            match opt_v {
-              Ok(v) => self.dispatch(conn_token, v),
-              Err(ConnReadError::Continue) => {},
-              Err(ConnReadError::ParseError) | Err(ConnReadError::SocketError) => {
-                self.poll.deregister(&self.conns[conn_token].sock);
-                self.conns.remove(conn_token);
-                trace!("closed client [{}]", token.0);
+        } else {
+          error!("received writable for token 0");
+        }
+      },
+      _ => {
+        let conn_token = self.to_front(token);
+        if self.conns.contains(conn_token) {
+          self.conns[conn_token].readiness = self.conns[conn_token].readiness | events;
+
+          loop {
+            info!("UNIX\t{:?}\t readiness: {:?}", conn_token, self.conns[conn_token].readiness);
+            if self.conns[conn_token].readiness.is_none() {
+              break;
+            }
+
+            if self.conns[conn_token].readiness.is_readable() {
+              let opt_v = self.conns[conn_token].conn_readable(token);
+              match opt_v {
+                Ok(v) => self.dispatch(conn_token, v),
+                Err(ConnReadError::Continue) => {},
+                Err(ConnReadError::ParseError) | Err(ConnReadError::SocketError) => {
+                  self.poll.deregister(&self.conns[conn_token].sock);
+                  self.conns.remove(conn_token);
+                  trace!("closed client [{}]", token.0);
+                  break;
+                }
               }
             }
+
+            if self.conns[conn_token].readiness.is_writable() {
+              if let Some(ref timeout) = self.conns[conn_token].write_timeout {
+                self.timer.cancel_timeout(&timeout);
+              }
+              let res = self.conns[conn_token].conn_writable(token);
+              if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(700), token) {
+                self.conns[conn_token].write_timeout = Some(timeout);
+              }
+            }
+
+            if self.conns[conn_token].readiness.is_hup() {
+              self.poll.deregister(&self.conns[conn_token].sock);
+              self.conns.remove(conn_token);
+              trace!("closed client [{}]", token.0);
+              break;
+            }
           }
         }
-      };
-    }
-
-    if events.is_writable() {
-      match token {
-        Token(0) => panic!("received writable for token 0"),
-        Token(1) => panic!("received writable for token 1"),
-        _      => {
-          let conn_token = self.to_front(token);
-          if self.conns.contains(conn_token) {
-            if let Some(ref timeout) = self.conns[conn_token].write_timeout {
-              self.timer.cancel_timeout(&timeout);
-            }
-            let res = self.conns[conn_token].conn_writable(token);
-            if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(700), token) {
-              self.conns[conn_token].write_timeout = Some(timeout);
-            }
-            res
-          }
-        }
-      };
-    }
-
-    if events.is_hup() {
-      let conn_token = self.to_front(token);
-      if self.conns.contains(conn_token) {
-        self.poll.deregister(&self.conns[conn_token].sock);
-        self.conns.remove(conn_token);
-        trace!("closed client [{}]", token.0);
       }
     }
   }
 
   fn timeout(&mut self, token: Token) {
     if token.0 == 0 {
-      info!("timeout!");
       for listener_vec in self.listeners.values() {
         for listener in listener_vec {
           while let Ok(msg) = listener.receiver.try_recv() {

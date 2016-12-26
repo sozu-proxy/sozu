@@ -32,13 +32,14 @@ pub enum ConnReadError {
 }
 
 pub struct CommandClient {
-  pub sock:        UnixStream,
-  buf:         Buffer,
-  back_buf:    Buffer,
-  pub token:       Option<Token>,
-  message_ids: Vec<String>,
+  pub sock:         UnixStream,
+  buf:               Buffer,
+  back_buf:          Buffer,
+  pub token:         Option<Token>,
+  message_ids:       Vec<String>,
   pub write_timeout: Option<Timeout>,
-  pub max_buffer_size: usize,
+  max_buffer_size:   usize,
+  pub readiness:     Ready,
 }
 
 impl CommandClient {
@@ -50,7 +51,8 @@ impl CommandClient {
       token:           None,
       message_ids:     Vec::new(),
       write_timeout:   None,
-      max_buffer_size: max_buffer_size
+      max_buffer_size: max_buffer_size,
+      readiness:       Ready::none(),
     }
   }
 
@@ -103,10 +105,12 @@ impl CommandClient {
         Err(e) => {
           match e.kind() {
             ErrorKind::WouldBlock => {
+              self.readiness.remove(Ready::readable());
               break;
             },
             code => {
               log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error (kind: {:?}): {:?}", tok.0, code, e);
+              self.readiness = Ready::none();
               return Err(ConnReadError::SocketError);
             }
           }
@@ -164,13 +168,17 @@ impl CommandClient {
   pub fn conn_writable(&mut self, tok: Token) {
     if self.write_timeout.is_some() {
       trace!("server conn writable; tok={:?}; waiting for timeout", tok.0);
+      self.readiness.remove(Ready::writable());
       return;
     }
 
-    trace!("server conn writable; tok={:?}", tok);
+    trace!("server conn writable; tok={:?}, readiness={:?}", tok, self.readiness);
     loop {
       let size = self.back_buf.available_data();
-      if size == 0 { break; }
+      if size == 0 {
+        self.readiness.remove(Ready::writable());
+        break;
+      }
 
       match self.sock.write(self.back_buf.data()) {
         Ok(0) => {
@@ -186,9 +194,11 @@ impl CommandClient {
         Err(e) => {
           match e.kind() {
             ErrorKind::WouldBlock => {
+              self.readiness.remove(Ready::writable());
               break;
             },
             code => {
+              self.readiness = Ready::none();
               log!(log::LogLevel::Error,"UNIX CLIENT[{}] write error: (kind: {:?}): {:?}", tok.0, code, e);
               return;
             }
