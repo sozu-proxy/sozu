@@ -22,16 +22,19 @@ mod worker;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::collections::HashMap;
-use std::thread::JoinHandle;
+use std::thread::{self,JoinHandle};
+use std::os::unix::net::UnixStream;
+use std::os::unix::io::FromRawFd;
 use sozu::network::metrics::{METRICS,ProxyMetrics};
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
 use clap::{App,Arg,SubCommand};
 
 use command::Listener;
-use worker::start_workers;
+use worker::{get_executable_path,start_worker_process,start_workers};
 
 fn main() {
+  println!("got path: {}", unsafe { get_executable_path().to_str().unwrap() });
   let pid = unsafe { libc::getpid() };
   let format = move |record: &LogRecord| {
     match record.level() {
@@ -70,8 +73,13 @@ fn main() {
     if let Some(matches) = matches.subcommand_matches("worker") {
       let fd = matches.value_of("fd").expect("needs a file descriptor")
         .parse::<i32>().expect("the file descriptor must be a number");
-      println!("will start a worker with file descriptor: {}", fd);
+      println!("worker started with with file descriptor: {}", fd);
+      let mut client = unsafe { UnixStream::from_raw_fd(fd) };
+      thread::sleep_ms(10000);
       return;
+    } else {
+      let (pid, server) = start_worker_process(&config_file);
+      println!("launching worker with pid {:?}", pid);
     }
 
     if let Some(log_level) = config.log_level {

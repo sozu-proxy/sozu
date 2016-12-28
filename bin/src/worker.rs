@@ -1,9 +1,17 @@
-use libc::{self,c_char,uint8_t,uint32_t,int32_t};
+use libc::{self,c_char,uint8_t,uint32_t,int32_t,pid_t};
 use std::ffi::CString;
 use std::iter::repeat;
 use std::ptr::null_mut;
+use std::io::{Read,Write};
+use std::process::Command;
 use std::sync::mpsc::{channel};
 use std::thread::{self,JoinHandle};
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
+use std::os::unix::io::{AsRawFd,FromRawFd,RawFd};
+use nix::unistd::*;
+use nix::sys::signal::*;
+use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 use mio::channel;
 
 use sozu::network::{self,ProxyOrder};
@@ -78,6 +86,41 @@ pub fn start_workers(tag: &str, ls: &ListenerConfig) -> Option<(JoinHandle<()>, 
       }
     },
     _ => unimplemented!()
+  }
+}
+
+pub fn start_worker_process(config_path: &str) -> (pid_t,UnixStream) {
+  println!("parent({})", unsafe { libc::getpid() });
+  let capacity = 2000usize;
+
+  let (mut server, mut client) = UnixStream::pair().unwrap();
+
+  // FD_CLOEXEC is set by default on every fd in Rust standard lib,
+  // so we need to remove the flag on the client, otherwise
+  // it won't be accessible
+  let cl_flags = fcntl(client.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
+  let mut new_cl_flags = FdFlag::from_bits(cl_flags).unwrap();
+  new_cl_flags.remove(FD_CLOEXEC);
+  fcntl(client.as_raw_fd(), FcntlArg::F_SETFD(new_cl_flags));
+
+  let path = unsafe { get_executable_path() };
+
+  match fork().expect("fork failed") {
+    ForkResult::Parent{ child } => {
+      return (child, server);
+    }
+    ForkResult::Child => {
+      println!("child({}):\twill spawn a child", unsafe { libc::getpid() });
+      Command::new(path.to_str().unwrap())
+        .arg("-c")
+        .arg(config_path)
+        .arg("worker")
+        .arg("--fd")
+        .arg(client.as_raw_fd().to_string())
+        .exec();
+
+      unreachable!();
+    }
   }
 }
 
