@@ -17,20 +17,18 @@ extern crate sozu_lib as sozu;
 mod config;
 mod command;
 mod state;
+mod worker;
 
 use std::net::{UdpSocket,ToSocketAddrs};
-use std::sync::mpsc::{channel};
 use std::collections::HashMap;
-use std::thread::{self,JoinHandle};
-use sozu::network::{self,ProxyOrder};
+use std::thread::JoinHandle;
 use sozu::network::metrics::{METRICS,ProxyMetrics};
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
 use clap::{App,Arg};
-use mio::channel;
 
 use command::Listener;
-use command::data::ListenerType;
+use worker::start_workers;
 
 fn main() {
   let pid = unsafe { libc::getpid() };
@@ -76,72 +74,14 @@ fn main() {
     METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
     let metrics_guard = ProxyMetrics::run();
 
-    let mut listeners = HashMap::new();
-    let jh_opt: Option<JoinHandle<()>> = None;
+    let mut listeners:HashMap<String,Vec<Listener>> = HashMap::new();
+    let mut jh_opt: Option<JoinHandle<()>> = None;
 
     for (ref tag, ref ls) in config.listeners {
-      let jh_opt = match ls.listener_type {
-        ListenerType::HTTP => {
-          //FIXME: make safer
-          if let Some(conf) = ls.to_http() {
-            let mut http_listeners = Vec::new();
-            for index in 1..ls.worker_count.unwrap_or(1) {
-              let (sender, receiver) = channel::<network::ServerMessage>();
-              let (tx, rx) = channel::channel::<ProxyOrder>();
-              let config = conf.clone();
-              let t = format!("{}-{}", tag, index);
-              thread::spawn(move || {
-                network::http::start_listener(t, config, sender, rx);
-              });
-              let l =  Listener::new(tag.clone(), index as u8, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
-              http_listeners.push(l);
-            }
-            let (sender, receiver) = channel::<network::ServerMessage>();
-            let (tx, rx) = channel::channel::<ProxyOrder>();
-            let t = format!("{}-{}", tag, 0);
-            //FIXME: keep this to get a join guard
-            let jg = thread::spawn(move || {
-              network::http::start_listener(t, conf, sender, rx);
-            });
-            let l =  Listener::new(tag.clone(), 0, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
-            http_listeners.push(l);
-            listeners.insert(tag.clone(), http_listeners);
-            Some(jg)
-          } else {
-            None
-          }
-        },
-        ListenerType::HTTPS => {
-          if let Some(conf) = ls.to_tls() {
-            let mut tls_listeners = Vec::new();
-            for index in 1..ls.worker_count.unwrap_or(1) {
-              let (sender, receiver) = channel::<network::ServerMessage>();
-              let (tx, rx) = channel::channel::<ProxyOrder>();
-              let config = conf.clone();
-              let t = format!("{}-{}", tag, index);
-              thread::spawn(move || {
-                network::tls::start_listener(t, config, sender, rx);
-              });
-              let l =  Listener::new(tag.clone(), index as u8, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
-              tls_listeners.push(l);
-            }
-            let (sender, receiver) = channel::<network::ServerMessage>();
-            let (tx, rx) = channel::channel::<ProxyOrder>();
-              let t = format!("{}-{}", tag, 0);
-            //FIXME: keep this to get a join guard
-            let jg = thread::spawn(move || {
-              network::tls::start_listener(t, conf, sender, rx);
-            });
-            let l =  Listener::new(tag.clone(), 0, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
-            tls_listeners.push(l);
-            listeners.insert(tag.clone(), tls_listeners);
-            Some(jg)
-          } else {
-            None
-          }
-        },
-        _ => unimplemented!()
-      };
+      if let Some((jg, workers)) = start_workers(&tag, ls) {
+        listeners.insert(tag.clone(), workers);
+        jh_opt = Some(jg);
+      }
     };
 
     let buffer_size     = config.command_buffer_size.unwrap_or(10000);
