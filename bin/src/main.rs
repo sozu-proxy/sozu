@@ -25,7 +25,7 @@ use std::thread::JoinHandle;
 use sozu::network::metrics::{METRICS,ProxyMetrics};
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
-use clap::{App,Arg};
+use clap::{App,Arg,SubCommand};
 
 use command::Listener;
 use worker::start_workers;
@@ -57,11 +57,22 @@ fn main() {
                                     .help("Sets a custom config file")
                                     .takes_value(true)
                                     .required(true))
+                        .subcommand(SubCommand::with_name("worker")
+                                    .about("start a worker (internal command, should not be used directly)")
+                                    .arg(Arg::with_name("fd").long("fd")
+                                         .takes_value(true).required(true).help("IPC file descriptor")))
                         .get_matches();
 
   let config_file = matches.value_of("config").unwrap();
 
   if let Ok(config) = config::Config::load_from_path(config_file) {
+    if let Some(matches) = matches.subcommand_matches("worker") {
+      let fd = matches.value_of("fd").expect("needs a file descriptor")
+        .parse::<i32>().expect("the file descriptor must be a number");
+      println!("will start a worker with file descriptor: {}", fd);
+      return;
+    }
+
     if let Some(log_level) = config.log_level {
      builder.parse(&log_level);
     }
