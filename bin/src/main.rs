@@ -12,6 +12,7 @@ extern crate serde_json;
 extern crate time;
 extern crate libc;
 extern crate slab;
+extern crate nix;
 extern crate sozu_lib as sozu;
 
 mod config;

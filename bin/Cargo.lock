@@ -8,6 +8,7 @@ dependencies = [
  "log 0.3.6 (registry+https://github.com/rust-lang/crates.io-index)",
  "mio 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "mio-uds 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "nix 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "nom 2.0.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde 0.8.21 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_derive 0.8.21 (registry+https://github.com/rust-lang/crates.io-index)",
