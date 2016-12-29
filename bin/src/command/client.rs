@@ -32,7 +32,7 @@ pub enum ConnReadError {
 }
 
 pub struct CommandClient {
-  pub sock:         UnixStream,
+  pub sock:          UnixStream,
   buf:               Buffer,
   back_buf:          Buffer,
   pub token:         Option<Token>,

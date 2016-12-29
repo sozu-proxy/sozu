@@ -1,10 +1,11 @@
+use mio;
 use libc::{self,c_char,uint8_t,uint32_t,int32_t,pid_t};
 use std::ffi::CString;
 use std::iter::repeat;
 use std::ptr::null_mut;
 use std::io::{Read,Write};
 use std::process::Command;
-use std::sync::mpsc::{channel};
+use std::sync::mpsc;
 use std::thread::{self,JoinHandle};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -12,7 +13,6 @@ use std::os::unix::io::{AsRawFd,FromRawFd,RawFd};
 use nix::unistd::*;
 use nix::sys::signal::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
-use mio::channel;
 
 use sozu::network::{self,ProxyOrder};
 use command::Listener;
@@ -27,8 +27,8 @@ pub fn start_workers(tag: &str, ls: &ListenerConfig) -> Option<(JoinHandle<()>, 
         let mut http_listeners = Vec::new();
 
         for index in 1..ls.worker_count.unwrap_or(1) {
-          let (sender, receiver) = channel::<network::ServerMessage>();
-          let (tx, rx) = channel::channel::<ProxyOrder>();
+          let (sender, receiver) = mpsc::channel::<network::ServerMessage>();
+          let (tx, rx) = mio::channel::channel::<ProxyOrder>();
           let config = conf.clone();
           let t = format!("{}-{}", tag, index);
           thread::spawn(move || {
@@ -38,8 +38,8 @@ pub fn start_workers(tag: &str, ls: &ListenerConfig) -> Option<(JoinHandle<()>, 
           http_listeners.push(l);
         }
 
-        let (sender, receiver) = channel::<network::ServerMessage>();
-        let (tx, rx) = channel::channel::<ProxyOrder>();
+        let (sender, receiver) = mpsc::channel::<network::ServerMessage>();
+        let (tx, rx) = mio::channel::channel::<ProxyOrder>();
         let t = format!("{}-{}", tag, 0);
         //FIXME: keep this to get a join guard
         let jg = thread::spawn(move || {
@@ -58,8 +58,8 @@ pub fn start_workers(tag: &str, ls: &ListenerConfig) -> Option<(JoinHandle<()>, 
         let mut tls_listeners = Vec::new();
 
         for index in 1..ls.worker_count.unwrap_or(1) {
-          let (sender, receiver) = channel::<network::ServerMessage>();
-          let (tx, rx) = channel::channel::<ProxyOrder>();
+          let (sender, receiver) = mpsc::channel::<network::ServerMessage>();
+          let (tx, rx) = mio::channel::channel::<ProxyOrder>();
           let config = conf.clone();
           let t = format!("{}-{}", tag, index);
           thread::spawn(move || {
@@ -70,8 +70,8 @@ pub fn start_workers(tag: &str, ls: &ListenerConfig) -> Option<(JoinHandle<()>, 
           tls_listeners.push(l);
         }
 
-        let (sender, receiver) = channel::<network::ServerMessage>();
-        let (tx, rx) = channel::channel::<ProxyOrder>();
+        let (sender, receiver) = mpsc::channel::<network::ServerMessage>();
+        let (tx, rx) = mio::channel::channel::<ProxyOrder>();
           let t = format!("{}-{}", tag, 0);
         //FIXME: keep this to get a join guard
         let jg = thread::spawn(move || {
