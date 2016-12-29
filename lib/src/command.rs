@@ -1,5 +1,6 @@
 use mio::Ready;
 use mio_uds::UnixStream;
+use std::iter::Iterator;
 use std::str::from_utf8;
 use std::marker::PhantomData;
 use std::io::{self,Read,Write,ErrorKind};
@@ -18,7 +19,7 @@ pub enum ConnError {
   SocketError,
 }
 
-pub struct CommandClient<Tx,Rx> {
+pub struct CommandChannel<Tx,Rx> {
   pub sock:        UnixStream,
   front_buf:       Buffer,
   back_buf:        Buffer,
@@ -29,9 +30,9 @@ pub struct CommandClient<Tx,Rx> {
   phantom_rx:      PhantomData<Rx>,
 }
 
-impl<Tx: Serialize, Rx: Deserialize> CommandClient<Tx,Rx> {
-  pub fn new(sock: UnixStream, buffer_size: usize, max_buffer_size: usize) -> CommandClient<Tx,Rx> {
-    CommandClient {
+impl<Tx: Serialize, Rx: Deserialize> CommandChannel<Tx,Rx> {
+  pub fn new(sock: UnixStream, buffer_size: usize, max_buffer_size: usize) -> CommandChannel<Tx,Rx> {
+    CommandChannel {
       sock:            sock,
       front_buf:       Buffer::with_capacity(buffer_size),
       back_buf:        Buffer::with_capacity(buffer_size),
@@ -199,3 +200,9 @@ impl<Tx: Serialize, Rx: Deserialize> CommandClient<Tx,Rx> {
   }
 }
 
+impl<Tx: Serialize, Rx: Deserialize> Iterator for CommandChannel<Tx,Rx> {
+  type Item = Rx;
+  fn next(&mut self) -> Option<Self::Item> {
+    self.read_message()
+  }
+}

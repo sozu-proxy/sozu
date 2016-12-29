@@ -169,7 +169,9 @@ extern crate uuid;
 extern crate net2;
 extern crate libc;
 extern crate slab;
+extern crate mio_uds;
 
 pub mod network;
 pub mod parser;
 pub mod messages;
+pub mod command;
