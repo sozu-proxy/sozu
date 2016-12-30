@@ -34,6 +34,7 @@ pub struct CommandChannel<Tx,Rx> {
   phantom_rx:      PhantomData<Rx>,
 }
 
+
 impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
   pub fn new(sock: UnixStream, buffer_size: usize, max_buffer_size: usize) -> CommandChannel<Tx,Rx> {
     CommandChannel {
@@ -60,13 +61,11 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
   }
 
   pub fn handle_events(&mut self, events: Ready) {
-    println!("handle_events: readiness = {:?}, events= {:?}, result = {:?}", self.readiness, events, self.readiness | events);
     self.readiness = self.readiness | events;
   }
 
   pub fn run(&mut self) {
     let interest = self.interest & self.readiness;
-    println!("run: interest = {:?}", interest);
 
     if interest.is_readable() {
       self.readable();
@@ -78,15 +77,12 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
   }
 
   pub fn readable(&mut self) -> Result<usize,ConnError> {
-    println!("readable[{}]", line!());
     if !(self.interest & self.readiness).is_readable() {
       return Err(ConnError::Continue);
     }
 
-    println!("readable[{}]", line!());
     let mut count = 0usize;
     loop {
-      println!("readable[{}]", line!());
       let size = self.front_buf.available_space();
       if size == 0 {
         self.interest.remove(Ready::readable());
@@ -123,15 +119,12 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
   }
 
   pub fn writable(&mut self) -> Result<usize,ConnError> {
-    println!("writable[{}]", line!());
     if !(self.interest & self.readiness).is_writable() {
       return Err(ConnError::Continue);
     }
 
-    println!("writable[{}]", line!());
     let mut count = 0usize;
     loop {
-    println!("writable[{}]", line!());
       let size = self.back_buf.available_data();
       if size == 0 {
         self.interest.remove(Ready::writable());
@@ -259,7 +252,6 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
   }
 
   pub fn write_message_nonblocking(&mut self, message: Tx) -> bool {
-    println!("write_message: {:?}", message);
     let message = &serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!());
 
     let msg_len = message.len() + 1;
@@ -285,7 +277,6 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
   }
 
   pub fn write_message_blocking(&mut self, message: Tx) -> bool {
-    println!("write_message: {:?}", message);
     let message = &serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!());
 
     let msg_len = message.len() + 1;
