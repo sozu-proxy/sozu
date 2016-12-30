@@ -316,6 +316,16 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
   }
 }
 
+impl<Tx: Debug+Deserialize+Serialize, Rx: Debug+Deserialize+Serialize> CommandChannel<Tx,Rx> {
+  pub fn generate(buffer_size: usize, max_buffer_size: usize) -> io::Result<(CommandChannel<Tx,Rx>, CommandChannel<Rx,Tx>)> {
+    let     (command,proxy) = try!(UnixStream::pair());
+    let     proxy_channel   = CommandChannel::new(proxy, buffer_size, max_buffer_size);
+    let mut command_channel = CommandChannel::new(command, buffer_size, max_buffer_size);
+    command_channel.set_nonblocking(false);
+    Ok((command_channel, proxy_channel))
+  }
+}
+
 impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Iterator for CommandChannel<Tx,Rx> {
   type Item = Rx;
   fn next(&mut self) -> Option<Self::Item> {
