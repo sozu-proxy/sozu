@@ -1,9 +1,12 @@
-use mio::Ready;
+use mio::{Evented,Poll,PollOpt,Ready,Token};
 use mio_uds::UnixStream;
+use std::fmt::Debug;
 use std::iter::Iterator;
 use std::str::from_utf8;
 use std::marker::PhantomData;
 use std::io::{self,Read,Write,ErrorKind};
+use std::os::unix::net;
+use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd};
 use std::cmp::min;
 use log;
 use serde_json;
@@ -26,11 +29,12 @@ pub struct CommandChannel<Tx,Rx> {
   max_buffer_size: usize,
   pub readiness:   Ready,
   pub interest:    Ready,
+  blocking:        bool,
   phantom_tx:      PhantomData<Tx>,
   phantom_rx:      PhantomData<Rx>,
 }
 
-impl<Tx: Serialize, Rx: Deserialize> CommandChannel<Tx,Rx> {
+impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
   pub fn new(sock: UnixStream, buffer_size: usize, max_buffer_size: usize) -> CommandChannel<Tx,Rx> {
     CommandChannel {
       sock:            sock,
@@ -39,17 +43,30 @@ impl<Tx: Serialize, Rx: Deserialize> CommandChannel<Tx,Rx> {
       max_buffer_size: max_buffer_size,
       readiness:       Ready::none(),
       interest:        Ready::readable(),
+      blocking:        false,
       phantom_tx:      PhantomData,
       phantom_rx:      PhantomData,
     }
   }
 
-  fn handle_events(&mut self, events: Ready) {
+  pub fn set_nonblocking(&mut self, nonblocking: bool) {
+    unsafe {
+      let fd = self.sock.as_raw_fd();
+      let mut stream = net::UnixStream::from_raw_fd(fd);
+      stream.set_nonblocking(nonblocking);
+      let fd = stream.into_raw_fd();
+    }
+    self.blocking = !nonblocking;
+  }
+
+  pub fn handle_events(&mut self, events: Ready) {
+    println!("handle_events: readiness = {:?}, events= {:?}, result = {:?}", self.readiness, events, self.readiness | events);
     self.readiness = self.readiness | events;
   }
 
-  fn run(&mut self) {
+  pub fn run(&mut self) {
     let interest = self.interest & self.readiness;
+    println!("run: interest = {:?}", interest);
 
     if interest.is_readable() {
       self.readable();
@@ -60,13 +77,16 @@ impl<Tx: Serialize, Rx: Deserialize> CommandChannel<Tx,Rx> {
     }
   }
 
-  fn readable(&mut self) -> Result<usize,ConnError> {
+  pub fn readable(&mut self) -> Result<usize,ConnError> {
+    println!("readable[{}]", line!());
     if !(self.interest & self.readiness).is_readable() {
       return Err(ConnError::Continue);
     }
 
+    println!("readable[{}]", line!());
     let mut count = 0usize;
     loop {
+      println!("readable[{}]", line!());
       let size = self.front_buf.available_space();
       if size == 0 {
         self.interest.remove(Ready::readable());
@@ -102,13 +122,16 @@ impl<Tx: Serialize, Rx: Deserialize> CommandChannel<Tx,Rx> {
     Ok(count)
   }
 
-  fn writable(&mut self) -> Result<usize,ConnError> {
+  pub fn writable(&mut self) -> Result<usize,ConnError> {
+    println!("writable[{}]", line!());
     if !(self.interest & self.readiness).is_writable() {
       return Err(ConnError::Continue);
     }
 
+    println!("writable[{}]", line!());
     let mut count = 0usize;
     loop {
+    println!("writable[{}]", line!());
       let size = self.back_buf.available_data();
       if size == 0 {
         self.interest.remove(Ready::writable());
@@ -142,7 +165,15 @@ impl<Tx: Serialize, Rx: Deserialize> CommandChannel<Tx,Rx> {
     Ok(count)
   }
 
-  fn read_message(&mut self) -> Option<Rx> {
+  pub fn read_message(&mut self) -> Option<Rx> {
+    if self.blocking {
+      self.read_message_blocking()
+    } else {
+      self.read_message_nonblocking()
+    }
+  }
+
+  pub fn read_message_nonblocking(&mut self) -> Option<Rx> {
     let mut offset = 0usize;
     let mut grow   = false;
 
@@ -176,7 +207,59 @@ impl<Tx: Serialize, Rx: Deserialize> CommandChannel<Tx,Rx> {
     }
   }
 
+  pub fn read_message_blocking(&mut self) -> Option<Rx> {
+    let mut offset = 0usize;
+    let mut grow   = false;
+
+    loop {
+      if let Some(pos) = self.front_buf.data().iter().position(|&x| x == 0) {
+        let mut res = None;
+
+        if let Ok(s) = from_utf8(&self.front_buf.data()[..pos]) {
+          if let Ok(message) = serde_json::from_str(s) {
+            res = Some(message);
+          } else {
+            error!("could not parse message, ignoring:\n{}", s);
+          }
+        } else {
+          error!("invalid utf-8 encoding in command message, ignoring");
+        }
+
+        self.front_buf.consume(pos+1);
+        return res;
+      } else {
+        if self.front_buf.available_space() == 0 {
+          if self.front_buf.capacity() == self.max_buffer_size {
+            error!("command buffer full, cannot grow more, ignoring");
+            return None;
+          } else {
+            let new_size = min(self.front_buf.capacity()+5000, self.max_buffer_size);
+            self.front_buf.grow(new_size);
+          }
+        }
+
+        match self.sock.read(self.front_buf.space()) {
+          Ok(0) => {
+          },
+          Err(e) => { return None; },
+          Ok(r) => {
+            self.front_buf.fill(r);
+          },
+        };
+      }
+    }
+  }
+
   pub fn write_message(&mut self, message: Tx) -> bool {
+    if self.blocking {
+      self.write_message_blocking(message)
+    } else {
+      self.write_message_nonblocking(message)
+    }
+  }
+
+  pub fn write_message_nonblocking(&mut self, message: Tx) -> bool {
+    println!("write_message: {:?}", message);
     let message = &serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!());
 
     let msg_len = message.len() + 1;
@@ -196,13 +279,79 @@ impl<Tx: Serialize, Rx: Deserialize> CommandChannel<Tx,Rx> {
 
     self.back_buf.write(message);
     self.back_buf.write(&b"\0"[..]);
+    self.interest.insert(Ready::writable());
+
+    true
+  }
+
+  pub fn write_message_blocking(&mut self, message: Tx) -> bool {
+    println!("write_message: {:?}", message);
+    let message = &serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!());
+
+    let msg_len = message.len() + 1;
+    if msg_len > self.back_buf.available_space() {
+      self.back_buf.shift();
+    }
+
+    if msg_len > self.back_buf.available_space() {
+      if msg_len - self.back_buf.available_space() + self.back_buf.capacity() > self.max_buffer_size {
+        error!("message is too large to write to back buffer");
+        return false;
+      }
+
+      let new_len = msg_len - self.back_buf.available_space() + self.back_buf.capacity();
+      self.back_buf.grow( new_len );
+    }
+
+    self.back_buf.write(message);
+    self.back_buf.write(&b"\0"[..]);
+
+    loop {
+      let size = self.back_buf.available_data();
+      if size == 0 {
+        break;
+      }
+
+      match self.sock.write(self.back_buf.data()) {
+        Ok(r) => {
+          self.back_buf.consume(r);
+        },
+        Err(e) => {
+          return true;
+        }
+      }
+    }
     true
   }
 }
 
-impl<Tx: Serialize, Rx: Deserialize> Iterator for CommandChannel<Tx,Rx> {
+impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Iterator for CommandChannel<Tx,Rx> {
   type Item = Rx;
   fn next(&mut self) -> Option<Self::Item> {
     self.read_message()
+  }
+}
+
+impl<Tx,Rx> Evented for CommandChannel<Tx,Rx> {
+  fn register(&self,
+              poll: &Poll,
+              token: Token,
+              interest: Ready,
+              opts: PollOpt)
+              -> io::Result<()> {
+    self.sock.register(poll, token, interest, opts)
+  }
+
+  fn reregister(&self,
+                poll: &Poll,
+                token: Token,
+                interest: Ready,
+                opts: PollOpt)
+                -> io::Result<()> {
+    self.sock.reregister(poll, token, interest, opts)
+  }
+
+  fn deregister(&self, poll: &Poll) -> io::Result<()> {
+    self.sock.deregister(poll)
   }
 }
