@@ -6,15 +6,19 @@ extern crate openssl;
 extern crate time;
 extern crate libc;
 extern crate mio;
+extern crate mio_uds;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::sync::mpsc::{channel};
 use std::thread;
 use std::env;
+use mio_uds::UnixStream;
 use sozu::network;
 use sozu::messages;
-use sozu::network::ProxyOrder;
+use sozu::network::{ProxyOrder,ServerMessage};
 use sozu::network::metrics::{METRICS,ProxyMetrics};
+use sozu::network::proxy::Channel;
+use sozu::command::CommandChannel;
 use openssl::ssl;
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
@@ -51,7 +55,6 @@ fn main() {
   let metrics_guard = ProxyMetrics::run();
   METRICS.lock().unwrap().gauge("TEST", 42);
 
-  let (sender, rec) = channel::<network::ServerMessage>();
   let config = messages::HttpProxyConfiguration {
     front: "127.0.0.1:8080".parse().unwrap(),
     max_connections: 500,
@@ -59,19 +62,18 @@ fn main() {
     ..Default::default()
   };
 
-  let (tx, rx) = channel::channel::<ProxyOrder>();
+  let (mut command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
   let jg = thread::spawn(move || {
-    network::http::start_listener(String::from("HTTP"), config, sender, rx);
+    network::http::start_listener(String::from("HTTP"), config, channel);
   });
 
   let http_front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") };
   let http_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
-  tx.send(network::ProxyOrder { id: String::from("ID_ABCD"), command: messages::Command::AddHttpFront(http_front) });
-  tx.send(network::ProxyOrder { id: String::from("ID_EFGH"), command: messages::Command::AddInstance(http_instance) });
-  info!("MAIN\tHTTP -> {:?}", rec.recv().unwrap());
-  info!("MAIN\tHTTP -> {:?}", rec.recv().unwrap());
+  command.write_message(network::ProxyOrder { id: String::from("ID_ABCD"), command: messages::Command::AddHttpFront(http_front) });
+  command.write_message(network::ProxyOrder { id: String::from("ID_EFGH"), command: messages::Command::AddInstance(http_instance) });
+  info!("MAIN\tHTTP -> {:?}", command.read_message());
+  info!("MAIN\tHTTP -> {:?}", command.read_message());
 
-  let (sender2, rec2) = channel::<network::ServerMessage>();
 
   let config = messages::TlsProxyConfiguration {
     front: "127.0.0.1:8443".parse().unwrap(),
@@ -97,31 +99,31 @@ fn main() {
     ..Default::default()
   };
 
-  let (tx2, rx2) = channel::channel::<ProxyOrder>();
+  let (mut command2, channel2) = CommandChannel::generate(1000, 10000).expect("should create a channel");
   let jg2 = thread::spawn(move || {
-    network::tls::start_listener(String::from("TLS"), config, sender2, rx2);
+    network::tls::start_listener(String::from("TLS"), config, channel2);
   });
 
   let cert1 = include_str!("../../assets/certificate.pem");
   let key1  = include_str!("../../assets/key.pem");
 
   let tls_front = messages::TlsFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st"), path_begin: String::from("/"), certificate: String::from(cert1), key: String::from(key1), certificate_chain: vec!() };
-  tx2.send(network::ProxyOrder { id: String::from("ID_IJKL"), command: messages::Command::AddTlsFront(tls_front) });
+  command2.write_message(network::ProxyOrder { id: String::from("ID_IJKL"), command: messages::Command::AddTlsFront(tls_front) });
   let tls_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
-  tx2.send(network::ProxyOrder { id: String::from("ID_MNOP"), command: messages::Command::AddInstance(tls_instance) });
+  command2.write_message(network::ProxyOrder { id: String::from("ID_MNOP"), command: messages::Command::AddInstance(tls_instance) });
 
   let cert2 = include_str!("../../assets/cert_test.pem");
   let key2  = include_str!("../../assets/key_test.pem");
 
   let tls_front2 = messages::TlsFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/"), certificate: String::from(cert2), key: String::from(key2), certificate_chain: vec!() };
-  tx2.send(network::ProxyOrder { id: String::from("ID_QRST"), command: messages::Command::AddTlsFront(tls_front2) });
+  command2.write_message(network::ProxyOrder { id: String::from("ID_QRST"), command: messages::Command::AddTlsFront(tls_front2) });
   let tls_instance2 = messages::Instance { app_id: String::from("app_2"), ip_address: String::from("127.0.0.1"), port: 1026 };
-  tx2.send(network::ProxyOrder { id: String::from("ID_UVWX"), command: messages::Command::AddInstance(tls_instance2) });
+  command2.write_message(network::ProxyOrder { id: String::from("ID_UVWX"), command: messages::Command::AddInstance(tls_instance2) });
 
-  info!("MAIN\tTLS -> {:?}", rec2.recv().unwrap());
-  info!("MAIN\tTLS -> {:?}", rec2.recv().unwrap());
-  info!("MAIN\tTLS -> {:?}", rec2.recv().unwrap());
-  info!("MAIN\tTLS -> {:?}", rec2.recv().unwrap());
+  info!("MAIN\tTLS -> {:?}", command2.read_message());
+  info!("MAIN\tTLS -> {:?}", command2.read_message());
+  info!("MAIN\tTLS -> {:?}", command2.read_message());
+  info!("MAIN\tTLS -> {:?}", command2.read_message());
 
   let _ = jg.join();
   info!("MAIN\tgood bye");

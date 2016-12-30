@@ -7,6 +7,7 @@ use std::mem;
 use mio::*;
 use mio::tcp::*;
 use mio::timer::Timeout;
+use mio_uds::UnixStream;
 use std::io::{self,Read,Write,ErrorKind,BufReader};
 use std::collections::HashMap;
 use std::error::Error;
@@ -29,12 +30,15 @@ use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_req
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,Protocol};
-use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,Readiness,ListenToken,FrontToken,BackToken};
+use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,
+  Readiness,ListenToken,FrontToken,BackToken,Channel};
 use messages::{self,Command,TlsFront,TlsProxyConfiguration};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
+
+use command::CommandChannel;
 
 type BackendToken = Token;
 
@@ -303,7 +307,7 @@ pub struct TlsData {
   refcount:    usize,
 }
 
-pub struct ServerConfiguration<Tx> {
+pub struct ServerConfiguration {
   listener:        TcpListener,
   address:         SocketAddr,
   instances:       HashMap<AppId, Vec<Backend>>,
@@ -311,7 +315,7 @@ pub struct ServerConfiguration<Tx> {
   domains:         Arc<Mutex<TrieNode<CertFingerprint>>>,
   default_context: TlsData,
   contexts:        Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
-  tx:              Tx,
+  channel:         Channel,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
   front_timeout:   u64,
@@ -320,8 +324,8 @@ pub struct ServerConfiguration<Tx> {
   tag:             String,
 }
 
-impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
-  pub fn new(tag: String, config: TlsProxyConfiguration, tx: Tx, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration<Tx>> {
+impl ServerConfiguration {
+  pub fn new(tag: String, config: TlsProxyConfiguration, channel: Channel, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let mut domains = TrieNode::root();
     let mut fronts  = HashMap::new();
@@ -415,7 +419,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
           domains:         rc_domains,
           default_context: tls_data,
           contexts:        rc_ctx,
-          tx:              tx,
+          channel:         channel,
           pool:            Rc::new(RefCell::new(
                              Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size))
           )),
@@ -726,7 +730,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
   }
 }
 
-impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for ServerConfiguration<Tx> {
+impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   fn accept(&mut self, token: ListenToken) -> Option<(TlsClient,bool)> {
     let accepted = self.listener.accept();
 
@@ -821,12 +825,12 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
       Command::AddTlsFront(front) => {
         //info!("TLS\t{} add front {:?}", id, front);
           self.add_http_front(front, event_loop);
-          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Command::RemoveTlsFront(front) => {
         //info!("TLS\t{} remove front {:?}", id, front);
         self.remove_http_front(front, event_loop);
-        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Command::AddInstance(instance) => {
         info!("{}\t{} add instance {:?}", self.tag, message.id, instance);
@@ -834,9 +838,9 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
-          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Command::RemoveInstance(instance) => {
@@ -845,9 +849,9 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
-          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Command::HttpProxy(configuration) => {
@@ -858,20 +862,20 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
         };
-        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Command::SoftStop => {
         info!("{}\t{} processing soft shutdown", self.tag, message.id);
         event_loop.deregister(&self.listener);
-        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
+        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
       },
       Command::HardStop => {
         info!("{}\t{} hard shutdown", self.tag, message.id);
-        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       command => {
         error!("{}\t{} unsupported message, ignoring {:?}", self.tag, message.id, command);
-        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
+        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
       }
     }
   }
@@ -892,23 +896,21 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<TlsClient> for Serv
     self.back_timeout
   }
 
-  fn sender(&mut self) -> &mut messages::Sender<ServerMessage> {
-    &mut self.tx
+  fn channel(&mut self) -> &mut Channel {
+    &mut self.channel
   }
 }
 
-pub type TlsServer<Tx,Rx> = Server<ServerConfiguration<Tx>,TlsClient,Rx>;
+pub type TlsServer = Server<ServerConfiguration,TlsClient>;
 
-pub fn start_listener<Tx,Rx>(tag: String, config: TlsProxyConfiguration, tx: Tx, receiver: Rx)
-  where Tx: messages::Sender<ServerMessage>,
-        Rx: Evented+messages::Receiver<ProxyOrder> {
+pub fn start_listener(tag: String, config: TlsProxyConfiguration, channel: Channel) {
 
   let mut event_loop  = Poll::new().unwrap();
   let max_connections = config.max_connections;
   let max_listeners   = 1;
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  let configuration = ServerConfiguration::new(tag.clone(), config, tx, &mut event_loop, 1 + max_listeners).unwrap();
-  let mut server = TlsServer::new(max_listeners, max_connections, configuration, event_loop, receiver);
+  let configuration = ServerConfiguration::new(tag.clone(), config, channel, &mut event_loop, 1 + max_listeners).unwrap();
+  let mut server = TlsServer::new(max_listeners, max_connections, configuration, event_loop);
 
   info!("{}\tstarting event loop", &tag);
   server.run();
@@ -1045,7 +1047,7 @@ mod tests {
     let rc_domains = Arc::new(Mutex::new(domains));
 
     let context    = SslContext::new(SslMethod::Tlsv1).unwrap();
-    let (tx,rx)    = channel::<ServerMessage>();
+    let (mut command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
 
     let tls_data = TlsData {
       context:     context,
@@ -1063,7 +1065,7 @@ mod tests {
       domains:   rc_domains,
       default_context: tls_data,
       contexts: rc_ctx,
-      tx:        tx,
+      channel:   channel,
       pool:      Rc::new(RefCell::new(Pool::with_capacity(1, 0, || BufferQueue::with_capacity(16384)))),
       front_timeout: 5000,
       back_timeout:  5000,

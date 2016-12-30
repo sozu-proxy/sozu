@@ -4,11 +4,15 @@ extern crate env_logger;
 extern crate sozu_lib as sozu;
 extern crate openssl;
 extern crate mio;
+extern crate mio_uds;
 
 use std::thread;
 use std::sync::mpsc;
+use mio_uds::UnixStream;
 use sozu::messages;
-use sozu::network::{self,ProxyOrder};
+use sozu::network::{self,ProxyOrder,ServerMessage};
+use sozu::network::proxy::Channel;
+use sozu::command::CommandChannel;
 
 fn main() {
   env_logger::init().unwrap();
@@ -19,11 +23,10 @@ fn main() {
     ..Default::default()
   };
 
-  let (tx, rx)      = mio::channel::channel::<ProxyOrder>();
-  let (sender, rec) = mpsc::channel::<network::ServerMessage>();
+  let (mut command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
 
   let jg            = thread::spawn(move || {
-    network::http::start_listener(String::from("HTTP"), config, sender, rx);
+    network::http::start_listener(String::from("HTTP"), config, channel);
   });
 
   let http_front = messages::HttpFront {
@@ -37,18 +40,18 @@ fn main() {
     port:       8000
   };
 
-  tx.send(network::ProxyOrder {
+  command.write_message(network::ProxyOrder {
     id:      String::from("ID_ABCD"),
     command: messages::Command::AddHttpFront(http_front)
   });
 
-  tx.send(network::ProxyOrder {
+  command.write_message(network::ProxyOrder {
     id:      String::from("ID_EFGH"),
     command: messages::Command::AddInstance(http_instance)
   });
 
-  println!("HTTP -> {:?}", rec.recv().unwrap());
-  println!("HTTP -> {:?}", rec.recv().unwrap());
+  println!("HTTP -> {:?}", command.read_message());
+  println!("HTTP -> {:?}", command.read_message());
 
   let _ = jg.join();
   info!("good bye");

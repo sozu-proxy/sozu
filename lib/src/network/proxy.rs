@@ -24,10 +24,13 @@ use rand::random;
 use network::{ClientResult,MessageId,ServerMessage,ServerMessageStatus,ConnectionError,
   SocketType,socket_type,Protocol,ProxyOrder,RequiredEvents};
 use messages::{self,TcpFront,Command,Instance};
+use command::CommandChannel;
 
 const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
 const DEFAULT_BACK_TIMEOUT:  u64 = 50000;
+
+pub type Channel = CommandChannel<ServerMessage,ProxyOrder>;
 
 #[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
 pub struct ListenToken(pub usize);
@@ -137,24 +140,24 @@ pub trait ProxyConfiguration<Client> {
   fn front_timeout(&self) -> u64;
   fn back_timeout(&self)  -> u64;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
-  fn sender(&mut self) -> &mut messages::Sender<ServerMessage>;
+  fn channel(&mut self) -> &mut Channel;
 }
 
-pub struct Server<ServerConfiguration,Client, R> {
+pub struct Server<ServerConfiguration,Client> {
   configuration:   ServerConfiguration,
   clients:         Slab<Client,FrontToken>,
   backend:         Slab<FrontToken,BackToken>,
   max_listeners:   usize,
   max_connections: usize,
   pub poll:        Poll,
-  rx:              R,
   timer:           Timer<Token>,
   shutting_down:   Option<MessageId>,
 }
 
-impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented+messages::Receiver<ProxyOrder>> Server<ServerConfiguration,Client,R> {
-  pub fn new(max_listeners: usize, max_connections: usize, configuration: ServerConfiguration, poll: Poll, rx: R) -> Self {
-    poll.register(&rx, Token(0), Ready::readable(), PollOpt::edge()).unwrap();
+impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<ServerConfiguration,Client> {
+  pub fn new(max_listeners: usize, max_connections: usize, configuration: ServerConfiguration, poll: Poll) -> Self {
+    let mut configuration = configuration;
+    poll.register(configuration.channel(), Token(0), Ready::all(), PollOpt::edge()).unwrap();
     let clients = Slab::with_capacity(max_connections);
     let backend = Slab::with_capacity(max_connections);
     //let timer   = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
@@ -168,7 +171,6 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
       max_listeners:   max_listeners,
       max_connections: max_connections,
       poll:            poll,
-      rx:              rx,
       timer:           timer,
       shutting_down:   None,
     }
@@ -344,7 +346,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
 //type Timeout = usize;
 type Message = ProxyOrder;
 
-impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented+messages::Receiver<ProxyOrder>> Server<ServerConfiguration,Client,R> {
+impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<ServerConfiguration,Client> {
   pub fn run(&mut self) {
     //FIXME: make those parameters configurable?
     let mut events = Events::with_capacity(1024);
@@ -364,40 +366,31 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
             error!("command channel was closed");
             continue;
           }
-          if kind.is_readable() {
-            loop {
-              match self.rx.recv_message() {
-                Ok(msg) => {
-                  if let Command::HardStop = msg.command {
-                    self.notify(msg);
-                    //FIXME: it's a bit brutal
-                    return;
-                  } else if let Command::SoftStop = msg.command {
-                    self.shutting_down = Some(msg.id.clone());
-                    self.notify(msg);
-                  } else {
-                    //println!("got msg: {:?}", msg);
-                    self.notify(msg);
-                  }
-                },
-                Err(e) => {
-                  match e.kind() {
-                    ErrorKind::WouldBlock => break,
-                    ErrorKind::BrokenPipe => {
-                      //FIXME: deregister here
-                      error!("command channel disconnected");
-                      break;
-                    },
-                    k => {
-                      //FIXME: deregister here
-                      error!("unknown command channel error: {:?}", k);
-                      break;
-                    }
-                  }
-                }
-              }
+          self.configuration.channel().handle_events(kind);
+          self.configuration.channel().run();
+
+          // loop here because iterations has borrow issues
+          loop {
+            let msg = self.configuration.channel().read_message();
+            if msg.is_none() {
+              break;
+            }
+
+            let msg = msg.unwrap();
+            if let Command::HardStop = msg.command {
+              self.notify(msg);
+              self.configuration.channel().run();
+              //FIXME: it's a bit brutal
+              return;
+            } else if let Command::SoftStop = msg.command {
+              self.shutting_down = Some(msg.id.clone());
+              self.notify(msg);
+            } else {
+              self.notify(msg);
             }
           }
+
+          self.configuration.channel().run();
         } else if event.token() == Token(1) {
           while let Some(token) = self.timer.poll() {
             self.timeout(token);
@@ -414,7 +407,8 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient,R:Evented
 
       if self.shutting_down.is_some() && self.clients.len() == 0 {
         info!("last client stopped, shutting down!");
-        self.configuration.sender().send_message(ServerMessage{ id: self.shutting_down.take().unwrap(), status: ServerMessageStatus::Ok});
+        self.configuration.channel().write_message(ServerMessage{ id: self.shutting_down.take().unwrap(), status: ServerMessageStatus::Ok});
+        self.configuration.channel().run();
         return;
       }
     }

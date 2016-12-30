@@ -4,6 +4,7 @@ use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
 use mio::tcp::*;
 use mio::*;
+use mio_uds::UnixStream;
 use mio::timer::Timeout;
 use std::collections::HashMap;
 use std::io::{self,Read,ErrorKind};
@@ -16,13 +17,16 @@ use time::{Duration,precise_time_s};
 use rand::random;
 use uuid::Uuid;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
-use network::proxy::{BackendConnectAction,Server,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken};
+use network::proxy::{BackendConnectAction,Server,ProxyClient,ProxyConfiguration,
+  Readiness,ListenToken,FrontToken,BackToken,Channel};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use pool::{Pool,Checkout,Reset};
 
 use messages::{self,TcpFront,Command,Instance};
+use command::CommandChannel;
+
 
 const SERVER: Token = Token(0);
 
@@ -324,23 +328,23 @@ pub struct ApplicationListener {
 
 type ClientToken = Token;
 
-pub struct ServerConfiguration<Tx> {
+pub struct ServerConfiguration {
   fronts:          HashMap<String, ListenToken>,
   instances:       HashMap<String, Vec<Backend>>,
   listeners:       Slab<ApplicationListener,ListenToken>,
-  tx:              Tx,
+  channel:         Channel,
   pool:            Pool<BufferQueue>,
   front_timeout:   u64,
   back_timeout:    u64,
 }
 
-impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
-  pub fn new(max_listeners: usize, tx: Tx) -> ServerConfiguration<Tx> {
+impl ServerConfiguration {
+  pub fn new(max_listeners: usize, channel: Channel) -> ServerConfiguration {
     ServerConfiguration {
       instances:     HashMap::new(),
       listeners:     Slab::with_capacity(max_listeners),
       fronts:        HashMap::new(),
-      tx:            tx,
+      channel:       channel,
       pool:          Pool::with_capacity(2*max_listeners, 0, || BufferQueue::with_capacity(2048)),
       front_timeout: 5000,
       back_timeout:  5000,
@@ -432,7 +436,7 @@ impl<Tx: messages::Sender<ServerMessage>> ServerConfiguration<Tx> {
 
 }
 
-impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerConfiguration<Tx> {
+impl ProxyConfiguration<Client> for ServerConfiguration {
 
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client:&mut Client) ->Result<BackendConnectAction,ConnectionError> {
     let rnd = random::<usize>();
@@ -455,29 +459,29 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerC
         let addr_string = tcp_front.ip_address + ":" + &tcp_front.port.to_string();
         if let Ok(front) = addr_string.parse() {
           if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, event_loop) {
-            self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+            self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
           } else {
             error!("TCP\tCouldn't add tcp front");
-            self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot add tcp front"))});
+            self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot add tcp front"))});
           }
         } else {
           error!("TCP\tCouldn't parse tcp front address");
-          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Command::RemoveTcpFront(front) => {
         trace!("TCP\t{:?}", front);
         let _ = self.remove_tcp_front(front.app_id, event_loop);
-        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Command::AddInstance(instance) => {
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
-          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
           error!("TCP\tCouldn't add tcp instance");
-          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot add tcp instance"))});
+          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot add tcp instance"))});
         }
       },
       Command::RemoveInstance(instance) => {
@@ -485,10 +489,10 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerC
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
-          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
           error!("TCP\tCouldn't remove tcp instance");
-          self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot remove tcp instance"))});
+          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot remove tcp instance"))});
         }
       },
       Command::SoftStop => {
@@ -496,15 +500,15 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerC
         for listener in self.listeners.iter() {
           event_loop.deregister(&listener.sock);
         }
-        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
+        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
       },
       Command::HardStop => {
         info!("{}\t{} hard shutdown", "TCP", message.id);
-        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       _ => {
         error!("TCP\tunsupported message, ignoring");
-        self.tx.send_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
+        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
       }
     }
   }
@@ -544,23 +548,23 @@ impl<Tx: messages::Sender<ServerMessage>> ProxyConfiguration<Client> for ServerC
     self.back_timeout
   }
 
-  fn sender(&mut self) -> &mut messages::Sender<ServerMessage> {
-    &mut self.tx
+  fn channel(&mut self) -> &mut Channel {
+    &mut self.channel
   }
+
 }
 
-pub type TcpServer<Tx,Rx> = Server<ServerConfiguration<Tx>,Client,Rx>;
+pub type TcpServer = Server<ServerConfiguration,Client>;
 
-pub fn start() -> channel::Sender<ProxyOrder> {
+pub fn start() -> CommandChannel<ProxyOrder,ServerMessage> {
   let poll = Poll::new().unwrap();
 
 
   info!("TCP\tlisten for connections");
   //event_loop.register(&listener, SERVER, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-  let (tx,rx) = channel::<ServerMessage>();
-  let (mtx,mrx) = channel::channel::<ProxyOrder>();
-  let configuration = ServerConfiguration::new(10, tx);
-  let mut s = TcpServer::new(10, 500, configuration, poll, mrx);
+  let (mut command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
+  let configuration = ServerConfiguration::new(10, channel);
+  let mut s = TcpServer::new(10, 500, configuration, poll);
   thread::spawn(move|| {
     info!("TCP\tstarting event loop");
     //event_loop.run(&mut s).unwrap();
@@ -578,8 +582,9 @@ pub fn start() -> channel::Sender<ProxyOrder> {
       ip_address: String::from("127.0.0.1"),
       port: 5678,
     };
-    mtx.send(ProxyOrder { id: String::from("ID_YOLO1"), command: Command::AddTcpFront(front) });
-    mtx.send(ProxyOrder { id: String::from("ID_YOLO2"), command: Command::AddInstance(instance) });
+
+    command.write_message(ProxyOrder { id: String::from("ID_YOLO1"), command: Command::AddTcpFront(front) });
+    command.write_message(ProxyOrder { id: String::from("ID_YOLO2"), command: Command::AddInstance(instance) });
   }
   {
     let front = TcpFront {
@@ -592,18 +597,16 @@ pub fn start() -> channel::Sender<ProxyOrder> {
       ip_address: String::from("127.0.0.1"),
       port: 5678,
     };
-    mtx.send(ProxyOrder { id: String::from("ID_YOLO3"), command: Command::AddTcpFront(front) });
-    mtx.send(ProxyOrder { id: String::from("ID_YOLO4"), command: Command::AddInstance(instance) });
+    command.write_message(ProxyOrder { id: String::from("ID_YOLO3"), command: Command::AddTcpFront(front) });
+    command.write_message(ProxyOrder { id: String::from("ID_YOLO4"), command: Command::AddInstance(instance) });
   }
-  mtx
+  command
 }
 
-pub fn start_listener<Tx,Rx>(max_listeners: usize, max_connections: usize, tx: Tx, rx: Rx)
-  where Tx: messages::Sender<ServerMessage>,
-        Rx: Evented+messages::Receiver<ProxyOrder> {
+pub fn start_listener(max_listeners: usize, max_connections: usize, channel: Channel) {
   let poll              = Poll::new().unwrap();
-  let configuration     = ServerConfiguration::new(max_listeners, tx);
-  let mut server        = TcpServer::new(max_listeners, max_connections, configuration, poll, rx);
+  let configuration     = ServerConfiguration::new(max_listeners, channel);
+  let mut server        = TcpServer::new(max_listeners, max_connections, configuration, poll);
   let front: SocketAddr = FromStr::from_str("127.0.0.1:8443").unwrap();
   //server.configuration().add_tcp_front("yolo", &front, &mut event_loop);
 

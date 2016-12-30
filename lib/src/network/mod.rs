@@ -49,7 +49,7 @@ pub enum ServerMessageStatus {
   Error(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug,Serialize,Deserialize)]
 pub struct ProxyOrder {
   pub id:      MessageId,
   pub command: Command,
