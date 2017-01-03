@@ -1,11 +1,13 @@
-use std::io::Write;
 use std::fs;
 use std::str;
 use std::cmp::min;
 use std::io::Read;
+use std::io::Write;
+use std::collections::HashSet;
 use log;
 use serde_json;
 use nom::{HexDisplay,IResult,Offset};
+
 use sozu::messages::Command;
 use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
@@ -20,8 +22,15 @@ impl CommandServer {
     match config_command {
       ConfigCommand::SaveState(path) => {
         if let Ok(mut f) = fs::File::create(&path) {
-          let stored_listeners: Vec<StoredListener> = self.listeners.values()
-            .map(|listener_list| StoredListener::from_listener(listener_list.first().unwrap())).collect();
+          let mut seen = HashSet::new();
+          let mut stored_listeners: Vec<StoredListener> = Vec::new();
+
+          for &(ref tag, ref listener) in  self.listeners.values() {
+            if !seen.contains(&tag) {
+              seen.insert(tag);
+              stored_listeners.push( StoredListener::from_listener(&listener) );
+            }
+          }
 
           let mut counter = 0usize;
           for listener in stored_listeners {
@@ -45,10 +54,16 @@ impl CommandServer {
         }
       },
       ConfigCommand::DumpState => {
-        //FIXME:
-        //let v: &Vec<Listener> = self.listeners.values().next().unwrap();
-        let stored_listeners = self.listeners.values()
-          .map(|listener_list| StoredListener::from_listener(listener_list.first().unwrap())).collect();
+        let mut seen = HashSet::new();
+        let mut stored_listeners: Vec<StoredListener> = Vec::new();
+
+        for &(ref tag, ref listener) in  self.listeners.values() {
+          if !seen.contains(&tag) {
+            seen.insert(tag);
+            stored_listeners.push( StoredListener::from_listener(&listener) );
+          }
+        }
+
         let conf = ListenerConfiguration {
           id:        message.id.clone(),
           listeners: stored_listeners,
@@ -68,17 +83,24 @@ impl CommandServer {
           } else {
             log!(log::LogLevel::Info, "received {:?} with tag {:?}", command, tag);
           }
-          if let Some(ref mut listener_vec) = self.listeners.get_mut (tag) {
-            for listener in listener_vec.iter_mut() {
+
+          let mut found = false;
+          for &mut (ref listener_tag, ref mut listener) in self.listeners.values_mut() {
+            if tag == listener_tag {
               let cl = command.clone();
               self.conns[token].add_message_id(message.id.clone());
               listener.state.handle_command(&cl);
-              listener.sender.send(ProxyOrder { id: message.id.clone(), command: cl });
+              listener.channel.write_message(ProxyOrder { id: message.id.clone(), command: cl });
+              listener.channel.run();
+              found = true;
             }
-          } else {
+          }
+
+          if !found {
             // FIXME: should send back error here
             log!(log::LogLevel::Error, "no listener found for tag: {}", tag);
           }
+
         } else {
           // FIXME: should send back error here
           log!(log::LogLevel::Error, "expecting listener tag");
@@ -128,16 +150,22 @@ impl CommandServer {
                     } else {
                       log!(log::LogLevel::Info, "received {:?} with tag {:?}", command, tag);
                     }
-                    if let Some(ref mut listener_vec) = self.listeners.get_mut(tag) {
-                      for listener in listener_vec.iter_mut() {
+                    let mut found = false;
+                    for &mut (ref listener_tag, ref mut listener) in self.listeners.values_mut() {
+                      if tag == listener_tag {
                         let cl = command.clone();
                         listener.state.handle_command(&cl);
-                        listener.sender.send(ProxyOrder { id: message.id.clone(), command: cl });
+                        listener.channel.write_message(ProxyOrder { id: message.id.clone(), command: cl });
+                        listener.channel.run();
+                        found = true;
                       }
-                    } else {
+                    }
+
+                    if !found {
                       // FIXME: should send back error here
                       log!(log::LogLevel::Error, "no listener found for tag: {}", tag);
                     }
+
                   } else {
                     // FIXME: should send back error here
                     log!(log::LogLevel::Error, "expecting listener tag");

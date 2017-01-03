@@ -6,7 +6,7 @@ use std::str::from_utf8;
 use std::marker::PhantomData;
 use std::io::{self,Read,Write,ErrorKind};
 use std::os::unix::net;
-use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd};
+use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd,RawFd};
 use std::cmp::min;
 use log;
 use serde_json;
@@ -58,6 +58,10 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
       let fd = stream.into_raw_fd();
     }
     self.blocking = !nonblocking;
+  }
+
+  pub fn fd(&self) -> RawFd {
+    self.sock.as_raw_fd()
   }
 
   pub fn handle_events(&mut self, events: Ready) {
@@ -322,6 +326,13 @@ impl<Tx: Debug+Deserialize+Serialize, Rx: Debug+Deserialize+Serialize> CommandCh
     let     proxy_channel   = CommandChannel::new(proxy, buffer_size, max_buffer_size);
     let mut command_channel = CommandChannel::new(command, buffer_size, max_buffer_size);
     command_channel.set_nonblocking(false);
+    Ok((command_channel, proxy_channel))
+  }
+
+  pub fn generate_nonblocking(buffer_size: usize, max_buffer_size: usize) -> io::Result<(CommandChannel<Tx,Rx>, CommandChannel<Rx,Tx>)> {
+    let     (command,proxy) = try!(UnixStream::pair());
+    let     proxy_channel   = CommandChannel::new(proxy, buffer_size, max_buffer_size);
+    let mut command_channel = CommandChannel::new(command, buffer_size, max_buffer_size);
     Ok((command_channel, proxy_channel))
   }
 }

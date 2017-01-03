@@ -1,20 +1,21 @@
 use mio;
+use mio_uds::UnixStream;
 use libc::{self,c_char,uint8_t,uint32_t,int32_t,pid_t};
 use std::ffi::CString;
 use std::iter::repeat;
 use std::ptr::null_mut;
-use std::io::{Read,Write};
+use std::io::{self,Read,Write};
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread::{self,JoinHandle};
-use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::os::unix::io::{AsRawFd,FromRawFd,RawFd};
 use nix::unistd::*;
 use nix::sys::signal::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 
-use sozu::network::{self,ProxyOrder};
+use sozu::network::{self,ProxyOrder,ServerMessage};
+use sozu::command::CommandChannel;
 use command::Listener;
 use command::data::ListenerType;
 use config::ListenerConfig;
@@ -27,26 +28,24 @@ pub fn start_workers(tag: &str, ls: &ListenerConfig) -> Option<(JoinHandle<()>, 
         let mut http_listeners = Vec::new();
 
         for index in 1..ls.worker_count.unwrap_or(1) {
-          let (sender, receiver) = mpsc::channel::<network::ServerMessage>();
-          let (tx, rx) = mio::channel::channel::<ProxyOrder>();
+          let (command, proxy_channel) = generate_channels().unwrap();
           let config = conf.clone();
           let t = format!("{}-{}", tag, index);
           thread::spawn(move || {
-            network::http::start_listener(t, config, sender, rx);
+            network::http::start_listener(t, config, proxy_channel);
           });
-          let l =  Listener::new(tag.to_string(), index as u8, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
+          let l =  Listener::new(tag.to_string(), index as u8, ls.listener_type, ls.address.clone(), ls.port, command);
           http_listeners.push(l);
         }
 
-        let (sender, receiver) = mpsc::channel::<network::ServerMessage>();
-        let (tx, rx) = mio::channel::channel::<ProxyOrder>();
+        let (command, proxy_channel) = generate_channels().unwrap();
         let t = format!("{}-{}", tag, 0);
         //FIXME: keep this to get a join guard
         let jg = thread::spawn(move || {
-          network::http::start_listener(t, conf, sender, rx);
+          network::http::start_listener(t, conf, proxy_channel);
         });
 
-        let l =  Listener::new(tag.to_string(), 0, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
+        let l =  Listener::new(tag.to_string(), 0, ls.listener_type, ls.address.clone(), ls.port, command);
         http_listeners.push(l);
         Some((jg, http_listeners))
       } else {
@@ -58,27 +57,25 @@ pub fn start_workers(tag: &str, ls: &ListenerConfig) -> Option<(JoinHandle<()>, 
         let mut tls_listeners = Vec::new();
 
         for index in 1..ls.worker_count.unwrap_or(1) {
-          let (sender, receiver) = mpsc::channel::<network::ServerMessage>();
-          let (tx, rx) = mio::channel::channel::<ProxyOrder>();
+          let (command, proxy_channel) = generate_channels().unwrap();
           let config = conf.clone();
           let t = format!("{}-{}", tag, index);
           thread::spawn(move || {
-            network::tls::start_listener(t, config, sender, rx);
+            network::tls::start_listener(t, config, proxy_channel);
           });
 
-          let l =  Listener::new(tag.to_string(), index as u8, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
+          let l =  Listener::new(tag.to_string(), index as u8, ls.listener_type, ls.address.clone(), ls.port, command);
           tls_listeners.push(l);
         }
 
-        let (sender, receiver) = mpsc::channel::<network::ServerMessage>();
-        let (tx, rx) = mio::channel::channel::<ProxyOrder>();
+        let (command, proxy_channel) = generate_channels().unwrap();
           let t = format!("{}-{}", tag, 0);
         //FIXME: keep this to get a join guard
         let jg = thread::spawn(move || {
-          network::tls::start_listener(t, conf, sender, rx);
+          network::tls::start_listener(t, conf, proxy_channel);
         });
 
-        let l =  Listener::new(tag.to_string(), 0, ls.listener_type, ls.address.clone(), ls.port, tx, receiver);
+        let l =  Listener::new(tag.to_string(), 0, ls.listener_type, ls.address.clone(), ls.port, command);
         tls_listeners.push(l);
         Some((jg, tls_listeners))
       } else {
@@ -87,6 +84,14 @@ pub fn start_workers(tag: &str, ls: &ListenerConfig) -> Option<(JoinHandle<()>, 
     },
     _ => unimplemented!()
   }
+}
+
+fn generate_channels() -> io::Result<(CommandChannel<ProxyOrder,ServerMessage>, CommandChannel<ServerMessage,ProxyOrder>)> {
+  let (command,proxy) = try!(UnixStream::pair());
+  //FIXME: configurable buffer size
+  let proxy_channel   = CommandChannel::new(proxy, 10000, 20000);
+  let command_channel = CommandChannel::new(command, 10000, 20000);
+  Ok((command_channel, proxy_channel))
 }
 
 pub fn start_worker_process(config_path: &str) -> (pid_t,UnixStream) {

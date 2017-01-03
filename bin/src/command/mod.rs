@@ -18,7 +18,7 @@ use serde_json;
 use serde_json::from_str;
 
 use sozu::network::{ProxyOrder,ServerMessage,ServerMessageStatus};
-use sozu::network::buffer::Buffer;
+use sozu::command::CommandChannel;
 
 use state::{HttpProxy,TlsProxy,ConfigState};
 
@@ -51,15 +51,13 @@ pub struct Listener {
   pub tag:           String,
   pub id:            u8,
   pub listener_type: ListenerType,
-  //#[serde(skip_serializing)]
-  pub sender:        channel::Sender<ProxyOrder>,
-  //#[serde(skip_serializing)]
-  pub receiver:      mpsc::Receiver<ServerMessage>,
+  pub channel:       CommandChannel<ProxyOrder,ServerMessage>,
   pub state:         ConfigState,
+  pub token:         Option<Token>,
 }
 
 impl Listener {
-  pub fn new(tag: String, id: u8, listener_type: ListenerType, ip_address: String, port: u16, sender: channel::Sender<ProxyOrder>, receiver: mpsc::Receiver<ServerMessage>) -> Listener {
+  pub fn new(tag: String, id: u8, listener_type: ListenerType, ip_address: String, port: u16, channel: CommandChannel<ProxyOrder,ServerMessage>) -> Listener {
     let state = match listener_type {
       ListenerType::HTTP  => ConfigState::Http(HttpProxy::new(ip_address, port)),
       ListenerType::HTTPS => ConfigState::Tls(TlsProxy::new(ip_address, port)),
@@ -70,9 +68,9 @@ impl Listener {
       tag:           tag,
       id:            id,
       listener_type: listener_type,
-      sender:        sender,
-      receiver:      receiver,
+      channel:       channel,
       state:         state,
+      token:         None,
     }
   }
 }
@@ -106,12 +104,15 @@ pub struct ListenerConfiguration {
   listeners: Vec<StoredListener>,
 }
 
+pub type Tag = String;
+
 struct CommandServer {
   sock:            UnixListener,
   buffer_size:     usize,
   max_buffer_size: usize,
   conns:           Slab<CommandClient,FrontToken>,
-  listeners:       HashMap<String, Vec<Listener>>,
+  listeners:       HashMap<Token, (Tag, Listener)>,
+  listener_count:  usize,
   pub poll:        Poll,
   timer:           Timer<Token>,
 }
@@ -150,9 +151,20 @@ impl CommandServer {
     }
   }
 
-  fn new(srv: UnixListener, listeners: HashMap<String, Vec<Listener>>, buffer_size: usize, max_buffer_size: usize, poll: Poll) -> CommandServer {
+  fn new(srv: UnixListener, listeners_map: HashMap<String, Vec<Listener>>, buffer_size: usize, max_buffer_size: usize, poll: Poll) -> CommandServer {
     //FIXME: verify this
     poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+
+    let mut listeners = HashMap::new();
+
+    let mut token_count = 0;
+    for (tag, mut listener_list) in listeners_map {
+      for listener in listener_list.drain(..) {
+        token_count += 1;
+        poll.register(&listener.channel.sock, Token(token_count), Ready::all(), PollOpt::edge()).unwrap();
+        listeners.insert(Token(token_count), (tag.clone(), listener));
+      }
+    }
     //let mut timer = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
     //FIXME: registering the timer makes the timer thread spin too much
     let mut timer = timer::Timer::default();
@@ -164,17 +176,18 @@ impl CommandServer {
       max_buffer_size: max_buffer_size,
       conns:           Slab::with_capacity(128),
       listeners:       listeners,
+      listener_count:  token_count,
       poll:            poll,
       timer:           timer,
     }
   }
 
   pub fn to_front(&self, token: Token) -> FrontToken {
-    FrontToken(token.0 - 2)
+    FrontToken(token.0 - self.listener_count - 1)
   }
 
   pub fn from_front(&self, token: FrontToken) -> Token {
-    Token(token.0 + 2)
+    Token(token.0 + self.listener_count + 1)
   }
 
 }
@@ -190,11 +203,6 @@ impl CommandServer {
       for event in events.iter() {
         self.ready(event.token(), event.kind());
       }
-
-      //FIXME: manually call the timer instead of relying on a separate thread
-      while let Some(timeout_token) = self.timer.poll() {
-        self.timeout(timeout_token);
-      }
     }
   }
 
@@ -208,14 +216,37 @@ impl CommandServer {
           error!("received writable for token 0");
         }
       },
-      Token(1) => {
-        if events.is_readable() {
-          while let Some(timeout_token) = self.timer.poll() {
-            self.timeout(timeout_token);
+      Token(i) if i < self.listener_count + 1 => {
+        info!("token({}) worker got event {:?}", i, events);
+        //println!("listeners:\n{:?}", self.listeners);
+
+        let mut messages = {
+          let &mut (ref tag, ref mut listener) =  self.listeners.get_mut(&Token(i)).unwrap();
+          listener.channel.handle_events(events);
+          listener.channel.run();
+
+          let mut messages = Vec::new();
+          loop {
+            let msg = listener.channel.read_message();
+            if msg.is_none() {
+              break;
+            } else {
+              messages.push(msg.unwrap());
+            }
           }
-        } else {
-          error!("received writable for token 0");
+
+          messages
+        };
+
+        for msg in messages.drain(..) {
+          self.listener_handle_message(Token(i), msg);
         }
+
+        {
+          let &mut (ref tag, ref mut listener) =  self.listeners.get_mut(&Token(i)).unwrap();
+          listener.channel.run();
+        }
+
       },
       _ => {
         let conn_token = self.to_front(token);
@@ -264,45 +295,25 @@ impl CommandServer {
     }
   }
 
-  fn timeout(&mut self, token: Token) {
-    if token.0 == 0 {
-      for listener_vec in self.listeners.values() {
-        for listener in listener_vec {
-          while let Ok(msg) = listener.receiver.try_recv() {
-            println!("got answer msg: {:?}", msg);
-            let answer = ConfigMessageAnswer {
-              id: msg.id.clone(),
-              status: match msg.status {
-                ServerMessageStatus::Error(_)   => ConfigMessageStatus::Error,
-                ServerMessageStatus::Ok         => ConfigMessageStatus::Ok,
-                ServerMessageStatus::Processing => ConfigMessageStatus::Processing,
-              },
-              message: match msg.status {
-                ServerMessageStatus::Error(s) => s.clone(),
-                _                             => String::new(),
-              },
-            };
-            info!("sending: {:?}", answer);
-            for client in self.conns.iter_mut() {
-              if let Some(index) = client.has_message_id(&msg.id) {
-                client.write_message(&serde_json::to_string(&answer).map(|s| s.into_bytes()).unwrap_or(vec!()));
-                client.remove_message_id(index);
-              }
-            }
-          }
-        }
-      }
-      self.timer.set_timeout(Duration::from_millis(700), Token(0));
-    } else {
-      let conn_token = self.to_front(token);
-      if self.conns.contains(conn_token) {
-        //FIXME: is it still needed?
-        //println!("[{}] timeout ended, registering for writes", timeout);
-        self.conns[conn_token].write_timeout = None;
-        //let mut interest = Ready::hup();
-        //interest.insert(Ready::readable());
-        //interest.insert(Ready::writable());
-        //event_loop.register(&self.conns[token].sock, token, interest, PollOpt::edge() | PollOpt::oneshot());
+  fn listener_handle_message(&mut self, token: Token, msg: ServerMessage) {
+    println!("got answer msg: {:?}", msg);
+    let answer = ConfigMessageAnswer {
+      id: msg.id.clone(),
+      status: match msg.status {
+        ServerMessageStatus::Error(_)   => ConfigMessageStatus::Error,
+        ServerMessageStatus::Ok         => ConfigMessageStatus::Ok,
+        ServerMessageStatus::Processing => ConfigMessageStatus::Processing,
+      },
+      message: match msg.status {
+                 ServerMessageStatus::Error(s) => s.clone(),
+                 _                             => String::new(),
+               },
+    };
+    info!("sending: {:?}", answer);
+    for client in self.conns.iter_mut() {
+      if let Some(index) = client.has_message_id(&msg.id) {
+        client.write_message(&serde_json::to_string(&answer).map(|s| s.into_bytes()).unwrap_or(vec!()));
+        client.remove_message_id(index);
       }
     }
   }
