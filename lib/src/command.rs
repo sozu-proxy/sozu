@@ -50,6 +50,20 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
     }
   }
 
+  fn into<Tx2: Debug+Serialize, Rx2: Debug+Deserialize>(self) -> CommandChannel<Tx2,Rx2> {
+    CommandChannel {
+      sock:            self.sock,
+      front_buf:       self.front_buf,
+      back_buf:        self.back_buf,
+      max_buffer_size: self.max_buffer_size,
+      readiness:       self.readiness,
+      interest:        self.interest,
+      blocking:        self.blocking,
+      phantom_tx:      PhantomData,
+      phantom_rx:      PhantomData,
+    }
+  }
+
   pub fn set_nonblocking(&mut self, nonblocking: bool) {
     unsafe {
       let fd = self.sock.as_raw_fd();
