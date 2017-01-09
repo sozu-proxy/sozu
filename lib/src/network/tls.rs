@@ -19,7 +19,7 @@ use time::{precise_time_s, precise_time_ns};
 use rand::random;
 use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod,
                    Ssl, SslRef, SslStream, SniError};
-use openssl::x509::{X509,X509FileType};
+use openssl::x509::X509;
 use openssl::dh::Dh;
 use openssl::pkey::PKey;
 use openssl::hash::MessageDigest;
@@ -430,7 +430,7 @@ impl ServerConfiguration {
     let cert_read = config.default_certificate.as_ref().map(|vec| &vec[..]).unwrap_or(&include_bytes!("../../../assets/certificate.pem")[..]);
     let key_read = config.default_key.as_ref().map(|vec| &vec[..]).unwrap_or(&include_bytes!("../../../assets/key.pem")[..]);
     if let Some(path) = config.default_certificate_chain.as_ref() {
-      context.set_certificate_chain_file(path, X509FileType::PEM);
+      context.set_certificate_chain_file(path);
     }
 
     if let (Ok(cert), Ok(key)) = (X509::from_pem(&cert_read[..]), PKey::private_key_from_pem(&key_read[..])) {
