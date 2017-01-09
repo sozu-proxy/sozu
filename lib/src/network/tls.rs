@@ -17,7 +17,7 @@ use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{precise_time_s, precise_time_ns};
 use rand::random;
-use openssl::ssl::{self, SslContext, SslContextOptions, SslMethod,
+use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod,
                    Ssl, SslRef, SslStream, SniError};
 use openssl::x509::{X509,X509FileType};
 use openssl::dh::Dh;
@@ -393,7 +393,7 @@ impl ServerConfiguration {
   }
 
   pub fn create_default_context(config: &TlsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, tag: String, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>)> {
-    let ctx = SslContext::new(SslMethod::tls());
+    let ctx = SslContext::builder(SslMethod::tls());
     if let Err(e) = ctx {
       //return Err(io::Error::new(io::ErrorKind::Other, e.description()));
       return None
@@ -486,7 +486,7 @@ impl ServerConfiguration {
         });
 
         let tls_data = TlsData {
-          context:     context,
+          context:     context.build(),
           certificate: cert_read.to_vec(),
           refcount:    1,
         };
@@ -501,7 +501,7 @@ impl ServerConfiguration {
 
   pub fn add_http_front(&mut self, http_front: TlsFront, event_loop: &mut Poll) -> bool {
     //FIXME: insert some error management with a Result here
-    let c = SslContext::new(SslMethod::tls());
+    let c = SslContext::builder(SslMethod::tls());
     if c.is_err() { return false; }
     let mut ctx = c.unwrap();
     let mut options = ctx.options();
@@ -548,7 +548,7 @@ impl ServerConfiguration {
       cert_chain.iter().map(|ref cert| ctx.add_extra_chain_cert(cert));
 
       let tls_data = TlsData {
-        context:     ctx,
+        context:     ctx.build(),
         certificate: cert_read.to_vec(),
         refcount:    1,
       };
@@ -1039,11 +1039,11 @@ mod tests {
     let domains    = TrieNode::root();
     let rc_domains = Arc::new(Mutex::new(domains));
 
-    let context    = SslContext::new(SslMethod::dtls()).unwrap();
+    let context    = SslContext::builder(SslMethod::dtls()).unwrap();
     let (command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
 
     let tls_data = TlsData {
-      context:     context,
+      context:     context.build(),
       certificate: vec!(),
       refcount:    0,
     };
