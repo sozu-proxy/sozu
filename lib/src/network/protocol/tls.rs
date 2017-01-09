@@ -49,10 +49,16 @@ impl TlsHandshake {
         let ssl     = self.ssl.take().unwrap();
         let sock    = self.front.take().unwrap();
         let version = ssl.version();
-        match SslStream::accept(ssl, sock) {
+        match ssl.accept(sock) {
           Ok(stream) => {
             self.stream = Some(stream);
             return (ProtocolResult::Upgrade, ClientResult::Continue);
+          },
+          Err(HandshakeError::SetupFailure(e)) => {
+            println!("accept: handshake setup failed: {:?}", e);
+            println!("version: {:?}", version);
+            self.state = TlsState::Error;
+            return (ProtocolResult::Continue, ClientResult::CloseClient);
           },
           Err(HandshakeError::Failure(e)) => {
             println!("accept: handshake failed: {:?}", e);
@@ -75,6 +81,12 @@ impl TlsHandshake {
           Ok(stream) => {
             self.stream = Some(stream);
             return (ProtocolResult::Upgrade, ClientResult::Continue);
+          },
+          Err(HandshakeError::SetupFailure(e)) => {
+            println!("mid handshake setup failed: {:?}", e);
+            println!("version: {:?}", version);
+            self.state = TlsState::Error;
+            return (ProtocolResult::Continue, ClientResult::CloseClient);
           },
           Err(HandshakeError::Failure(e)) => {
             println!("mid handshake failed: {:?}", e);
