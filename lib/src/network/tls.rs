@@ -23,7 +23,7 @@ use openssl::x509::{X509,X509FileType};
 use openssl::dh::Dh;
 use openssl::pkey::PKey;
 use openssl::hash::MessageDigest;
-use openssl::nid::Nid;
+use openssl::nid;
 use nom::IResult;
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
@@ -296,6 +296,10 @@ impl ProxyClient for TlsClient {
   }
 }
 
+fn get_cert_common_name(cert: &X509) -> Option<String> {
+    cert.subject_name().entries_by_nid(nid::COMMONNAME).next().and_then(|name| name.data().as_utf8().ok().map(|name| String::from(&*name)))
+}
+
 pub type AppId     = String;
 pub type HostName  = String;
 pub type PathBegin = String;
@@ -339,7 +343,7 @@ impl ServerConfiguration {
     let (fingerprint, mut tls_data, names):(Vec<u8>,TlsData, Vec<String>) = Self::create_default_context(&config, ref_ctx, ref_domains, cl_tag, default_name).unwrap();
     let cert = X509::from_pem(&tls_data.certificate).unwrap();
 
-    let common_name: Option<String> = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name));
+    let common_name: Option<String> = get_cert_common_name(&cert);
     info!("{}\tgot common name: {:?}", &tag, common_name);
 
     let app = TlsApp {
@@ -449,7 +453,7 @@ impl ServerConfiguration {
           }
         }
 
-        if let Some(common_name) = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name)) {
+        if let Some(common_name) = get_cert_common_name(&cert) {
         info!("got common name: {:?}", common_name);
           names.push(common_name);
         }
@@ -533,7 +537,7 @@ impl ServerConfiguration {
 
       //FIXME
       let fingerprint = cert.fingerprint(MessageDigest::sha256()).unwrap();
-      let common_name: Option<String> = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name));
+      let common_name: Option<String> = get_cert_common_name(&cert);
       info!("{}\tgot common name: {:?}", self.tag, common_name);
 
       let names: Vec<String> = cert.subject_alt_names().map(|names| {
@@ -619,7 +623,7 @@ impl ServerConfiguration {
           if must_delete == Some(true) {
             if let Some(data) = contexts.remove(&front.cert_fingerprint) {
               if let Ok(cert) = X509::from_pem(&data.certificate) {
-                let common_name: Option<String> = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name));
+                let common_name: Option<String> = get_cert_common_name(&cert);
                 //info!("got common name: {:?}", common_name);
                 if let Some(name) = common_name {
                   domains.domain_remove(&name.into_bytes());
