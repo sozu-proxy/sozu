@@ -393,7 +393,7 @@ impl ServerConfiguration {
   }
 
   pub fn create_default_context(config: &TlsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, tag: String, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>)> {
-    let ctx = SslContext::new(SslMethod::Sslv23);
+    let ctx = SslContext::new(SslMethod::tls());
     if let Err(e) = ctx {
       //return Err(io::Error::new(io::ErrorKind::Other, e.description()));
       return None
@@ -501,7 +501,7 @@ impl ServerConfiguration {
 
   pub fn add_http_front(&mut self, http_front: TlsFront, event_loop: &mut Poll) -> bool {
     //FIXME: insert some error management with a Result here
-    let c = SslContext::new(SslMethod::Sslv23);
+    let c = SslContext::new(SslMethod::tls());
     if c.is_err() { return false; }
     let mut ctx = c.unwrap();
     let mut options = ctx.options();
@@ -1039,7 +1039,7 @@ mod tests {
     let domains    = TrieNode::root();
     let rc_domains = Arc::new(Mutex::new(domains));
 
-    let context    = SslContext::new(SslMethod::Tlsv1).unwrap();
+    let context    = SslContext::new(SslMethod::dtls()).unwrap();
     let (command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
 
     let tls_data = TlsData {
