@@ -21,7 +21,7 @@ use openssl::ssl::{self, SslContext, SslContextOptions, SslMethod,
                    Ssl, SslRef, SslStream, SniError};
 use openssl::x509::{X509,X509FileType};
 use openssl::dh::DH;
-use openssl::crypto::pkey::PKey;
+use openssl::pkey::PKey;
 use openssl::crypto::hash::Type;
 use openssl::nid::Nid;
 use nom::IResult;
