@@ -22,7 +22,7 @@ use openssl::ssl::{self, SslContext, SslContextOptions, SslMethod,
 use openssl::x509::{X509,X509FileType};
 use openssl::dh::Dh;
 use openssl::pkey::PKey;
-use openssl::crypto::hash::Type;
+use openssl::hash::MessageDigest;
 use openssl::nid::Nid;
 use nom::IResult;
 
@@ -430,7 +430,7 @@ impl ServerConfiguration {
     }
 
     if let (Ok(cert), Ok(key)) = (X509::from_pem(&cert_read[..]), PKey::private_key_from_pem(&key_read[..])) {
-      if let Ok(fingerprint) = cert.fingerprint(Type::SHA256) {
+      if let Ok(fingerprint) = cert.fingerprint(MessageDigest::sha256()) {
         context.set_certificate(&cert);
         context.set_private_key(&key);
 
@@ -532,7 +532,7 @@ impl ServerConfiguration {
       //FIXME: would need more logs here
 
       //FIXME
-      let fingerprint = cert.fingerprint(Type::SHA256).unwrap();
+      let fingerprint = cert.fingerprint(MessageDigest::sha256()).unwrap();
       let common_name: Option<String> = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name));
       info!("{}\tgot common name: {:?}", self.tag, common_name);
 
