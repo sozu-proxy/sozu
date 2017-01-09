@@ -73,7 +73,7 @@ pub struct TlsProxyConfiguration {
     pub public_address:            Option<IpAddr>,
     pub answer_404:                String,
     pub answer_503:                String,
-    pub options:                   i64,
+    pub options:                   u64,
     pub cipher_list:               String,
     pub default_name:              Option<String>,
     pub default_app_id:            Option<String>,
