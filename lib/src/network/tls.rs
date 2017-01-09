@@ -463,7 +463,7 @@ impl ServerConfiguration {
           let domains  = ref_domains.lock().unwrap();
 
           info!("{}\tref: {:?}", tag, ssl);
-          if let Some(servername) = ssl.servername() {
+          if let Some(servername) = ssl.servername().map(|s| s.to_string()) {
             info!("checking servername: {}", servername);
             if &servername == &default_name {
               return Ok(());
@@ -761,7 +761,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       let hostname_str =  unsafe { from_utf8_unchecked(hostname) };
 
       //FIXME: what if we don't use SNI?
-      let servername: Option<String> = client.http().unwrap().frontend.ssl().servername();
+      let servername: Option<String> = client.http().unwrap().frontend.ssl().servername().map(|s| s.to_string());
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
         error!("{}\tTLS SNI hostname and Host header don't match", self.tag);
         return Err(ConnectionError::HostNotFound);
