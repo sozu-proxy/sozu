@@ -20,7 +20,7 @@ use rand::random;
 use openssl::ssl::{self, SslContext, SslContextOptions, SslMethod,
                    Ssl, SslRef, SslStream, SniError};
 use openssl::x509::{X509,X509FileType};
-use openssl::dh::DH;
+use openssl::dh::Dh;
 use openssl::pkey::PKey;
 use openssl::crypto::hash::Type;
 use openssl::nid::Nid;
@@ -412,7 +412,7 @@ impl ServerConfiguration {
 
     context.set_cipher_list(&config.cipher_list);
 
-    match DH::get_2048_256() {
+    match Dh::get_2048_256() {
       Ok(dh) => context.set_tmp_dh(&dh),
       Err(e) => {
         //return Err(io::Error::new(io::ErrorKind::Other, e.description()))
@@ -513,7 +513,7 @@ impl ServerConfiguration {
     options.insert(ssl::SSL_OP_CIPHER_SERVER_PREFERENCE);
     let opt = ctx.set_options(options);
 
-    match DH::get_2048_256() {
+    match Dh::get_2048_256() {
       Ok(dh) => ctx.set_tmp_dh(&dh),
       Err(e) => {
         return false;
