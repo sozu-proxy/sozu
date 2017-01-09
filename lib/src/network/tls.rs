@@ -549,7 +549,7 @@ impl ServerConfiguration {
 
       ctx.set_certificate(&cert);
       ctx.set_private_key(&key);
-      cert_chain.iter().map(|ref cert| ctx.add_extra_chain_cert(cert));
+      cert_chain.iter().map(|cert| ctx.add_extra_chain_cert(cert.clone()));
 
       let tls_data = TlsData {
         context:     ctx.build(),
