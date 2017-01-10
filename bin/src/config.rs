@@ -90,6 +90,7 @@ impl ListenerConfig {
         public_address:  public_address,
         max_connections: self.max_connections,
         buffer_size:     self.buffer_size,
+        cipher_list:     cipher_list,
         ..Default::default()
       };
 
