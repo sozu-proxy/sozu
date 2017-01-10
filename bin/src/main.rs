@@ -31,7 +31,7 @@ use env_logger::LogBuilder;
 use clap::{App,Arg,SubCommand};
 
 use command::Listener;
-use worker::{get_executable_path,start_worker_process,start_workers};
+use worker::{get_executable_path,begin_worker_process,start_workers};
 
 fn main() {
   println!("got path: {}", unsafe { get_executable_path().to_str().unwrap() });
@@ -54,34 +54,39 @@ fn main() {
   let matches = App::new("sozu")
                         .version(crate_version!())
                         .about("hot reconfigurable proxy")
-                        .arg(Arg::with_name("config")
-                                    .short("c")
-                                    .long("config")
-                                    .value_name("FILE")
-                                    .help("Sets a custom config file")
-                                    .takes_value(true)
-                                    .required(true))
+                        .subcommand(SubCommand::with_name("start")
+                                    .about("launch the master process")
+                                    .arg(Arg::with_name("config")
+                                        .short("c")
+                                        .long("config")
+                                        .value_name("FILE")
+                                        .help("Sets a custom config file")
+                                        .takes_value(true)
+                                        .required(true)))
                         .subcommand(SubCommand::with_name("worker")
                                     .about("start a worker (internal command, should not be used directly)")
+                                    .arg(Arg::with_name("tag").long("tag")
+                                         .takes_value(true).required(true).help("worker configuration tag"))
+                                    .arg(Arg::with_name("id").long("id")
+                                         .takes_value(true).required(true).help("worker identifier"))
                                     .arg(Arg::with_name("fd").long("fd")
                                          .takes_value(true).required(true).help("IPC file descriptor")))
                         .get_matches();
 
-  let config_file = matches.value_of("config").unwrap();
+  if let Some(matches) = matches.subcommand_matches("worker") {
+    let fd  = matches.value_of("fd").expect("needs a file descriptor")
+      .parse::<i32>().expect("the file descriptor must be a number");
+    let id  = matches.value_of("id").expect("needs a worker id");
+    let tag = matches.value_of("tag").expect("needs a configuration tag");
+
+    begin_worker_process(fd, id, tag);
+    return;
+  }
+
+  let submatches = matches.subcommand_matches("start").expect("unknown subcommand");
+  let config_file = submatches.value_of("config").expect("required config file");
 
   if let Ok(config) = config::Config::load_from_path(config_file) {
-    if let Some(matches) = matches.subcommand_matches("worker") {
-      let fd = matches.value_of("fd").expect("needs a file descriptor")
-        .parse::<i32>().expect("the file descriptor must be a number");
-      println!("worker started with with file descriptor: {}", fd);
-      let mut client = unsafe { UnixStream::from_raw_fd(fd) };
-      thread::sleep_ms(10000);
-      return;
-    } else {
-      let (pid, server) = start_worker_process(&config_file);
-      println!("launching worker with pid {:?}", pid);
-    }
-
     if let Some(log_level) = config.log_level {
      builder.parse(&log_level);
     }
@@ -98,20 +103,22 @@ fn main() {
     let mut jh_opt: Option<JoinHandle<()>> = None;
 
     for (ref tag, ref ls) in config.listeners {
-      if let Some((jg, workers)) = start_workers(&tag, ls) {
+      if let Some(workers) = start_workers(&tag, ls) {
         listeners.insert(tag.clone(), workers);
-        jh_opt = Some(jg);
       }
     };
 
     let buffer_size     = config.command_buffer_size.unwrap_or(10000);
     let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
     command::start(config.command_socket, listeners, config.saved_state, buffer_size, max_buffer_size);
+
+    /*
     //FIXME: really join on all threads?
     if let Some(jh) = jh_opt {
       let _ = jh.join();
       info!("good bye");
     }
+    */
   } else {
     println!("could not load configuration file at '{}', stopping", config_file);
   }

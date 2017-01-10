@@ -13,6 +13,7 @@ use std::sync::mpsc;
 use std::cmp::min;
 use std::time::Duration;
 use log;
+use libc::pid_t;
 use nom::{IResult,Offset};
 use serde_json;
 use serde_json::from_str;
@@ -54,10 +55,11 @@ pub struct Listener {
   pub channel:       CommandChannel<ProxyOrder,ServerMessage>,
   pub state:         ConfigState,
   pub token:         Option<Token>,
+  pub pid:           pid_t,
 }
 
 impl Listener {
-  pub fn new(tag: String, id: u8, listener_type: ListenerType, ip_address: String, port: u16, channel: CommandChannel<ProxyOrder,ServerMessage>) -> Listener {
+  pub fn new(tag: String, id: u8, pid: pid_t, listener_type: ListenerType, ip_address: String, port: u16, channel: CommandChannel<ProxyOrder,ServerMessage>) -> Listener {
     let state = match listener_type {
       ListenerType::HTTP  => ConfigState::Http(HttpProxy::new(ip_address, port)),
       ListenerType::HTTPS => ConfigState::Tls(TlsProxy::new(ip_address, port)),
@@ -71,6 +73,7 @@ impl Listener {
       channel:       channel,
       state:         state,
       token:         None,
+      pid:           pid,
     }
   }
 }

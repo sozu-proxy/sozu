@@ -20,34 +20,23 @@ use command::Listener;
 use command::data::ListenerType;
 use config::ListenerConfig;
 
-pub fn start_workers(tag: &str, ls: &ListenerConfig) -> Option<(JoinHandle<()>, Vec<Listener>)> {
+pub fn start_workers(tag: &str, ls: &ListenerConfig) -> Option<Vec<Listener>> {
   match ls.listener_type {
     ListenerType::HTTP => {
       //FIXME: make safer
       if let Some(conf) = ls.to_http() {
         let mut http_listeners = Vec::new();
-
         for index in 1..ls.worker_count.unwrap_or(1) {
-          let (command, proxy_channel) = generate_channels().unwrap();
-          let config = conf.clone();
-          let t = format!("{}-{}", tag, index);
-          thread::spawn(move || {
-            network::http::start_listener(t, config, proxy_channel);
-          });
-          let l =  Listener::new(tag.to_string(), index as u8, ls.listener_type, ls.address.clone(), ls.port, command);
+          let (pid, command) = start_worker_process(ls, tag, &index.to_string());
+          let l =  Listener::new(tag.to_string(), index as u8, pid, ls.listener_type, ls.address.clone(), ls.port, command);
           http_listeners.push(l);
         }
 
-        let (command, proxy_channel) = generate_channels().unwrap();
-        let t = format!("{}-{}", tag, 0);
-        //FIXME: keep this to get a join guard
-        let jg = thread::spawn(move || {
-          network::http::start_listener(t, conf, proxy_channel);
-        });
-
-        let l =  Listener::new(tag.to_string(), 0, ls.listener_type, ls.address.clone(), ls.port, command);
+        let (pid, command) = start_worker_process(ls, tag, &0.to_string());
+        let l =  Listener::new(tag.to_string(), 0, pid, ls.listener_type, ls.address.clone(), ls.port, command);
         http_listeners.push(l);
-        Some((jg, http_listeners))
+
+        Some(http_listeners)
       } else {
         None
       }
@@ -55,29 +44,17 @@ pub fn start_workers(tag: &str, ls: &ListenerConfig) -> Option<(JoinHandle<()>, 
     ListenerType::HTTPS => {
       if let Some(conf) = ls.to_tls() {
         let mut tls_listeners = Vec::new();
-
         for index in 1..ls.worker_count.unwrap_or(1) {
-          let (command, proxy_channel) = generate_channels().unwrap();
-          let config = conf.clone();
-          let t = format!("{}-{}", tag, index);
-          thread::spawn(move || {
-            network::tls::start_listener(t, config, proxy_channel);
-          });
-
-          let l =  Listener::new(tag.to_string(), index as u8, ls.listener_type, ls.address.clone(), ls.port, command);
+          let (pid, command) = start_worker_process(ls, tag, &index.to_string());
+          let l =  Listener::new(tag.to_string(), index as u8, pid, ls.listener_type, ls.address.clone(), ls.port, command);
           tls_listeners.push(l);
         }
 
-        let (command, proxy_channel) = generate_channels().unwrap();
-          let t = format!("{}-{}", tag, 0);
-        //FIXME: keep this to get a join guard
-        let jg = thread::spawn(move || {
-          network::tls::start_listener(t, conf, proxy_channel);
-        });
-
-        let l =  Listener::new(tag.to_string(), 0, ls.listener_type, ls.address.clone(), ls.port, command);
+        let (pid, command) = start_worker_process(ls, tag, &0.to_string());
+        let l =  Listener::new(tag.to_string(), 0, pid, ls.listener_type, ls.address.clone(), ls.port, command);
         tls_listeners.push(l);
-        Some((jg, tls_listeners))
+
+        Some(tls_listeners)
       } else {
         None
       }
@@ -94,7 +71,41 @@ fn generate_channels() -> io::Result<(CommandChannel<ProxyOrder,ServerMessage>, 
   Ok((command_channel, proxy_channel))
 }
 
-pub fn start_worker_process(config_path: &str) -> (pid_t,UnixStream) {
+pub fn begin_worker_process(fd: i32, id: &str, tag: &str) {
+  let mut command: CommandChannel<ServerMessage,ListenerConfig> = CommandChannel::new(
+    unsafe { UnixStream::from_raw_fd(fd) },
+    10000,
+    20000
+  );
+
+  command.set_nonblocking(false);
+
+  let listener_config = command.read_message().expect("worker could not read configuration from socket");
+  println!("got message: {:?}", listener_config);
+
+  command.set_nonblocking(true);
+  let command: CommandChannel<ServerMessage,ProxyOrder> = command.into();
+
+  let t = format!("{}-{}", tag, id);
+
+  match listener_config.listener_type {
+    ListenerType::HTTP => {
+      if let Some(config) = listener_config.to_http() {
+        network::http::start_listener(t, config, command);
+      }
+    },
+    ListenerType::HTTPS => {
+      if let Some(config) = listener_config.to_tls() {
+        network::tls::start_listener(t, config, command);
+      }
+    },
+    _ => unimplemented!()
+  }
+
+  info!("proxy ended");
+}
+
+pub fn start_worker_process(config: &ListenerConfig, tag: &str, id: &str) -> (pid_t, CommandChannel<ProxyOrder,ServerMessage>) {
   println!("parent({})", unsafe { libc::getpid() });
   let capacity = 2000usize;
 
@@ -108,20 +119,36 @@ pub fn start_worker_process(config_path: &str) -> (pid_t,UnixStream) {
   new_cl_flags.remove(FD_CLOEXEC);
   fcntl(client.as_raw_fd(), FcntlArg::F_SETFD(new_cl_flags));
 
+  let mut command: CommandChannel<ListenerConfig,ServerMessage> = CommandChannel::new(
+    server,
+    10000,
+    20000
+  );
+  command.set_nonblocking(false);
+
   let path = unsafe { get_executable_path() };
 
+  println!("launching worker");
+  //FIXME: remove the expect, return a result?
   match fork().expect("fork failed") {
     ForkResult::Parent{ child } => {
-      return (child, server);
+      println!("worker launched: {}", child);
+      command.write_message(config);
+      command.set_nonblocking(true);
+
+      let command: CommandChannel<ProxyOrder,ServerMessage> = command.into();
+      return (child, command);
     }
     ForkResult::Child => {
       println!("child({}):\twill spawn a child", unsafe { libc::getpid() });
       Command::new(path.to_str().unwrap())
-        .arg("-c")
-        .arg(config_path)
         .arg("worker")
         .arg("--fd")
         .arg(client.as_raw_fd().to_string())
+        .arg("--tag")
+        .arg(tag)
+        .arg("--id")
+        .arg(id)
         .exec();
 
       unreachable!();
