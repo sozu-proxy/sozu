@@ -150,7 +150,7 @@ impl CommandServer {
 
   fn dispatch(&mut self, token: FrontToken, v: Vec<ConfigMessage>) {
     for message in &v {
-      self.handle_message(token, message);
+      self.handle_client_message(token, message);
     }
   }
 

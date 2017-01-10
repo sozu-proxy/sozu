@@ -17,7 +17,7 @@ use super::data::{ConfigCommand,ConfigMessage};
 use super::client::parse;
 
 impl CommandServer {
-  pub fn handle_message(&mut self, token: FrontToken, message: &ConfigMessage) {
+  pub fn handle_client_message(&mut self, token: FrontToken, message: &ConfigMessage) {
     let config_command = message.data.clone();
     match config_command {
       ConfigCommand::SaveState(path) => {
