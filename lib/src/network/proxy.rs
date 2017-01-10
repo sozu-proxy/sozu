@@ -407,7 +407,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
 
       if self.shutting_down.is_some() && self.clients.len() == 0 {
         info!("last client stopped, shutting down!");
-        self.configuration.channel().write_message(ServerMessage{ id: self.shutting_down.take().unwrap(), status: ServerMessageStatus::Ok});
+        self.configuration.channel().write_message(&ServerMessage{ id: self.shutting_down.take().unwrap(), status: ServerMessageStatus::Ok});
         self.configuration.channel().run();
         return;
       }

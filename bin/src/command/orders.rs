@@ -90,7 +90,7 @@ impl CommandServer {
               let cl = command.clone();
               self.conns[token].add_message_id(message.id.clone());
               listener.state.handle_command(&cl);
-              listener.channel.write_message(ProxyOrder { id: message.id.clone(), command: cl });
+              listener.channel.write_message(&ProxyOrder { id: message.id.clone(), command: cl });
               listener.channel.run();
               found = true;
             }
@@ -155,7 +155,7 @@ impl CommandServer {
                       if tag == listener_tag {
                         let cl = command.clone();
                         listener.state.handle_command(&cl);
-                        listener.channel.write_message(ProxyOrder { id: message.id.clone(), command: cl });
+                        listener.channel.write_message(&ProxyOrder { id: message.id.clone(), command: cl });
                         listener.channel.run();
                         found = true;
                       }

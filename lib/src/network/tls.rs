@@ -825,12 +825,12 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       Command::AddTlsFront(front) => {
         //info!("TLS\t{} add front {:?}", id, front);
           self.add_http_front(front, event_loop);
-          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Command::RemoveTlsFront(front) => {
         //info!("TLS\t{} remove front {:?}", id, front);
         self.remove_http_front(front, event_loop);
-        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Command::AddInstance(instance) => {
         info!("{}\t{} add instance {:?}", self.tag, message.id, instance);
@@ -838,9 +838,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
-          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Command::RemoveInstance(instance) => {
@@ -849,9 +849,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
-          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Command::HttpProxy(configuration) => {
@@ -862,20 +862,20 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
         };
-        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Command::SoftStop => {
         info!("{}\t{} processing soft shutdown", self.tag, message.id);
         event_loop.deregister(&self.listener);
-        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
+        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
       },
       Command::HardStop => {
         info!("{}\t{} hard shutdown", self.tag, message.id);
-        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       command => {
         error!("{}\t{} unsupported message, ignoring {:?}", self.tag, message.id, command);
-        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
+        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
       }
     }
   }

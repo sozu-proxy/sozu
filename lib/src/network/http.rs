@@ -513,12 +513,12 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       Command::AddHttpFront(front) => {
         info!("{}\t{} add front {:?}", self.tag, message.id, front);
           self.add_http_front(front, event_loop);
-          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Command::RemoveHttpFront(front) => {
         info!("{}\t{} front {:?}", self.tag, message.id, front);
         self.remove_http_front(front, event_loop);
-        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Command::AddInstance(instance) => {
         info!("{}\t{} add instance {:?}", self.tag, message.id, instance);
@@ -526,9 +526,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
-          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Command::RemoveInstance(instance) => {
@@ -537,9 +537,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
-          self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Command::HttpProxy(configuration) => {
@@ -550,24 +550,24 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
         };
-        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Command::SoftStop => {
         info!("{}\t{} processing soft shutdown", self.tag, message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
         event_loop.deregister(&self.listener);
-        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
+        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
       },
       Command::HardStop => {
         info!("{}\t{} hard shutdown", self.tag, message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       command => {
         debug!("{}\t{} unsupported message, ignoring: {:?}", self.tag, message.id, command);
-        self.channel.write_message(ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
+        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
       }
     }
   }

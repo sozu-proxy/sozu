@@ -34,7 +34,6 @@ pub struct CommandChannel<Tx,Rx> {
   phantom_rx:      PhantomData<Rx>,
 }
 
-
 impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
   pub fn new(sock: UnixStream, buffer_size: usize, max_buffer_size: usize) -> CommandChannel<Tx,Rx> {
     CommandChannel {
@@ -50,7 +49,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
     }
   }
 
-  fn into<Tx2: Debug+Serialize, Rx2: Debug+Deserialize>(self) -> CommandChannel<Tx2,Rx2> {
+  pub fn into<Tx2: Debug+Serialize, Rx2: Debug+Deserialize>(self) -> CommandChannel<Tx2,Rx2> {
     CommandChannel {
       sock:            self.sock,
       front_buf:       self.front_buf,
@@ -261,7 +260,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
     }
   }
 
-  pub fn write_message(&mut self, message: Tx) -> bool {
+  pub fn write_message(&mut self, message: &Tx) -> bool {
     if self.blocking {
       self.write_message_blocking(message)
     } else {
@@ -269,8 +268,8 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
     }
   }
 
-  pub fn write_message_nonblocking(&mut self, message: Tx) -> bool {
-    let message = &serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!());
+  pub fn write_message_nonblocking(&mut self, message: &Tx) -> bool {
+    let message = &serde_json::to_string(message).map(|s| s.into_bytes()).unwrap_or(vec!());
 
     let msg_len = message.len() + 1;
     if msg_len > self.back_buf.available_space() {
@@ -294,8 +293,8 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
     true
   }
 
-  pub fn write_message_blocking(&mut self, message: Tx) -> bool {
-    let message = &serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!());
+  pub fn write_message_blocking(&mut self, message: &Tx) -> bool {
+    let message = &serde_json::to_string(message).map(|s| s.into_bytes()).unwrap_or(vec!());
 
     let msg_len = message.len() + 1;
     if msg_len > self.back_buf.available_space() {
