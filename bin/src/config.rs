@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::io::{self,Error,ErrorKind,Read};
 use std::fs::File;
 use std::str::FromStr;
-use serde::{Serialize,Deserialize};
+use serde::Deserialize;
 use toml;
 
 use command::data::ListenerType;

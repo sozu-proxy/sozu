@@ -1,22 +1,17 @@
 use mio::*;
-use mio::timer::{Timer,Timeout};
+use mio::timer::Timer;
 use mio_uds::{UnixListener,UnixStream};
 use slab::Slab;
 use std::fs;
 use std::fmt;
 use std::path::PathBuf;
-use std::io::{self,Read,Write,ErrorKind};
-use std::str::from_utf8;
+use std::io::{self,ErrorKind};
 use std::os::unix::fs::PermissionsExt;
 use std::collections::HashMap;
-use std::sync::mpsc;
-use std::cmp::min;
 use std::time::Duration;
 use log;
 use libc::pid_t;
-use nom::{IResult,Offset};
 use serde_json;
-use serde_json::from_str;
 
 use sozu::network::{ProxyOrder,ServerMessage,ServerMessageStatus};
 use sozu::command::CommandChannel;

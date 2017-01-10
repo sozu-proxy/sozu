@@ -1,6 +1,5 @@
 use std::fs;
 use std::str;
-use std::cmp::min;
 use std::io::Read;
 use std::io::Write;
 use std::collections::HashSet;

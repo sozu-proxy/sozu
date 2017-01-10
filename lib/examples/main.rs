@@ -9,20 +9,15 @@ extern crate mio;
 extern crate mio_uds;
 
 use std::net::{UdpSocket,ToSocketAddrs};
-use std::sync::mpsc::{channel};
 use std::thread;
 use std::env;
-use mio_uds::UnixStream;
 use sozu::network;
 use sozu::messages;
-use sozu::network::{ProxyOrder,ServerMessage};
 use sozu::network::metrics::{METRICS,ProxyMetrics};
-use sozu::network::proxy::Channel;
 use sozu::command::CommandChannel;
 use openssl::ssl;
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
-use mio::channel;
 
 fn main() {
   //env_logger::init().unwrap();

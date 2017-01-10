@@ -1,17 +1,13 @@
-use mio;
 use mio_uds::UnixStream;
-use libc::{self,c_char,uint8_t,uint32_t,int32_t,pid_t};
+use libc::{self,c_char,uint32_t,int32_t,pid_t};
+use std::io;
 use std::ffi::CString;
 use std::iter::repeat;
 use std::ptr::null_mut;
-use std::io::{self,Read,Write};
 use std::process::Command;
-use std::sync::mpsc;
-use std::thread::{self,JoinHandle};
 use std::os::unix::process::CommandExt;
-use std::os::unix::io::{AsRawFd,FromRawFd,RawFd};
+use std::os::unix::io::{AsRawFd,FromRawFd};
 use nix::unistd::*;
-use nix::sys::signal::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 
 use sozu::network::{self,ProxyOrder,ServerMessage};
@@ -24,7 +20,7 @@ pub fn start_workers(tag: &str, ls: &ListenerConfig) -> Option<Vec<Listener>> {
   match ls.listener_type {
     ListenerType::HTTP => {
       //FIXME: make safer
-      if let Some(conf) = ls.to_http() {
+      if ls.to_http().is_some() {
         let mut http_listeners = Vec::new();
         for index in 1..ls.worker_count.unwrap_or(1) {
           let (pid, command) = start_worker_process(ls, tag, &index.to_string());
@@ -42,7 +38,7 @@ pub fn start_workers(tag: &str, ls: &ListenerConfig) -> Option<Vec<Listener>> {
       }
     },
     ListenerType::HTTPS => {
-      if let Some(conf) = ls.to_tls() {
+      if ls.to_tls().is_some() {
         let mut tls_listeners = Vec::new();
         for index in 1..ls.worker_count.unwrap_or(1) {
           let (pid, command) = start_worker_process(ls, tag, &index.to_string());
@@ -107,9 +103,8 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str) {
 
 pub fn start_worker_process(config: &ListenerConfig, tag: &str, id: &str) -> (pid_t, CommandChannel<ProxyOrder,ServerMessage>) {
   println!("parent({})", unsafe { libc::getpid() });
-  let capacity = 2000usize;
 
-  let (mut server, mut client) = UnixStream::pair().unwrap();
+  let (server, client) = UnixStream::pair().unwrap();
 
   // FD_CLOEXEC is set by default on every fd in Rust standard lib,
   // so we need to remove the flag on the client, otherwise
@@ -180,7 +175,7 @@ pub unsafe fn get_executable_path() -> CString {
   let capacity = 2000;
   let mut temp:Vec<u8> = Vec::with_capacity(capacity);
   temp.extend(repeat(0).take(capacity));
-  let mut pathbuf = CString::from_vec_unchecked(temp);
+  let pathbuf = CString::from_vec_unchecked(temp);
   let ptr = pathbuf.into_raw();
 
   let mut size:uint32_t = capacity as u32;
@@ -188,7 +183,7 @@ pub unsafe fn get_executable_path() -> CString {
 
     let mut temp2:Vec<u8> = Vec::with_capacity(capacity);
     temp2.extend(repeat(0).take(capacity));
-    let mut pathbuf2 = CString::from_vec_unchecked(temp2);
+    let pathbuf2 = CString::from_vec_unchecked(temp2);
     let ptr2 = pathbuf2.into_raw();
 
     if libc::realpath(ptr, ptr2) != null_mut() {

@@ -22,9 +22,6 @@ mod worker;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::collections::HashMap;
-use std::thread::{self,JoinHandle};
-use std::os::unix::net::UnixStream;
-use std::os::unix::io::FromRawFd;
 use sozu::network::metrics::{METRICS,ProxyMetrics};
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
@@ -100,7 +97,6 @@ fn main() {
     let metrics_guard = ProxyMetrics::run();
 
     let mut listeners:HashMap<String,Vec<Listener>> = HashMap::new();
-    let mut jh_opt: Option<JoinHandle<()>> = None;
 
     for (ref tag, ref ls) in config.listeners {
       if let Some(workers) = start_workers(&tag, ls) {

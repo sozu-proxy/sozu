@@ -7,11 +7,8 @@ extern crate mio;
 extern crate mio_uds;
 
 use std::thread;
-use std::sync::mpsc;
-use mio_uds::UnixStream;
 use sozu::messages;
-use sozu::network::{self,ProxyOrder,ServerMessage};
-use sozu::network::proxy::Channel;
+use sozu::network;
 use sozu::command::CommandChannel;
 
 fn main() {

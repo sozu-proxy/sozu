@@ -1,12 +1,9 @@
-use mio;
 use serde;
 use serde_json;
 use openssl::ssl;
-use std::io;
 use std::net::{IpAddr,SocketAddr};
 use std::default::Default;
 use std::convert::From;
-use std::sync::mpsc;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpFront {

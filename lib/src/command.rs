@@ -8,7 +8,6 @@ use std::io::{self,Read,Write,ErrorKind};
 use std::os::unix::net;
 use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd,RawFd};
 use std::cmp::min;
-use log;
 use serde_json;
 use serde::ser::Serialize;
 use serde::de::Deserialize;
@@ -66,7 +65,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
   pub fn set_nonblocking(&mut self, nonblocking: bool) {
     unsafe {
       let fd = self.sock.as_raw_fd();
-      let mut stream = net::UnixStream::from_raw_fd(fd);
+      let stream = net::UnixStream::from_raw_fd(fd);
       stream.set_nonblocking(nonblocking);
       let fd = stream.into_raw_fd();
     }
@@ -116,7 +115,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
               self.readiness.remove(Ready::readable());
               break;
             },
-            code => {
+            _ => {
               //log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error (kind: {:?}): {:?}", tok.0, code, e);
               self.interest  = Ready::none();
               self.readiness = Ready::none();
@@ -162,7 +161,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
               self.interest.remove(Ready::writable());
               break;
             },
-            code => {
+            _ => {
               self.interest  = Ready::none();
               self.readiness = Ready::none();
               return Err(ConnError::SocketError);
@@ -184,8 +183,8 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
   }
 
   pub fn read_message_nonblocking(&mut self) -> Option<Rx> {
-    let mut offset = 0usize;
-    let mut grow   = false;
+    let offset = 0usize;
+    let grow   = false;
 
     if let Some(pos) = self.front_buf.data().iter().position(|&x| x == 0) {
       let mut res = None;
@@ -218,8 +217,8 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
   }
 
   pub fn read_message_blocking(&mut self) -> Option<Rx> {
-    let mut offset = 0usize;
-    let mut grow   = false;
+    let offset = 0usize;
+    let grow   = false;
 
     loop {
       if let Some(pos) = self.front_buf.data().iter().position(|&x| x == 0) {
@@ -343,9 +342,9 @@ impl<Tx: Debug+Deserialize+Serialize, Rx: Debug+Deserialize+Serialize> CommandCh
   }
 
   pub fn generate_nonblocking(buffer_size: usize, max_buffer_size: usize) -> io::Result<(CommandChannel<Tx,Rx>, CommandChannel<Rx,Tx>)> {
-    let     (command,proxy) = try!(UnixStream::pair());
-    let     proxy_channel   = CommandChannel::new(proxy, buffer_size, max_buffer_size);
-    let mut command_channel = CommandChannel::new(command, buffer_size, max_buffer_size);
+    let (command,proxy) = try!(UnixStream::pair());
+    let proxy_channel   = CommandChannel::new(proxy, buffer_size, max_buffer_size);
+    let command_channel = CommandChannel::new(command, buffer_size, max_buffer_size);
     Ok((command_channel, proxy_channel))
   }
 }

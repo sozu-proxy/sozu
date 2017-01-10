@@ -817,7 +817,7 @@ mod tests {
       HttpFront { app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned() },
     ]);
 
-    let (mut command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
+    let (command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").unwrap();
     let listener = tcp::TcpListener::bind(&front).unwrap();

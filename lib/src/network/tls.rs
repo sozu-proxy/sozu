@@ -700,7 +700,7 @@ impl ServerConfiguration {
     } else {
       host
     };
-    trace!("{}\tlooking for backend for real host: {}", self.tag, host);
+    trace!("{}\tlooking for backend for real host: {}", self.tag, real_host);
 
     if let Some(app_id) = self.frontend_from_request(real_host, uri).map(|ref front| front.app_id.clone()) {
       client.http().unwrap().app_id = Some(app_id.clone());
@@ -904,10 +904,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 pub type TlsServer = Server<ServerConfiguration,TlsClient>;
 
 pub fn start_listener(tag: String, config: TlsProxyConfiguration, channel: Channel) {
-
   let mut event_loop  = Poll::new().unwrap();
   let max_connections = config.max_connections;
   let max_listeners   = 1;
+
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
   let configuration = ServerConfiguration::new(tag.clone(), config, channel, &mut event_loop, 1 + max_listeners).unwrap();
   let mut server = TlsServer::new(max_listeners, max_connections, configuration, event_loop);
@@ -1047,7 +1047,7 @@ mod tests {
     let rc_domains = Arc::new(Mutex::new(domains));
 
     let context    = SslContext::new(SslMethod::Tlsv1).unwrap();
-    let (mut command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
+    let (command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
 
     let tls_data = TlsData {
       context:     context,
