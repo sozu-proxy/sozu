@@ -40,12 +40,12 @@ fn main() {
     port:       8000
   };
 
-  command.write_message(network::ProxyOrder {
+  command.write_message(&network::ProxyOrder {
     id:      String::from("ID_ABCD"),
     command: messages::Command::AddHttpFront(http_front)
   });
 
-  command.write_message(network::ProxyOrder {
+  command.write_message(&network::ProxyOrder {
     id:      String::from("ID_EFGH"),
     command: messages::Command::AddInstance(http_instance)
   });

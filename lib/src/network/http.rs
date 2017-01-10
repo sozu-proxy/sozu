@@ -663,9 +663,9 @@ mod tests {
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
-    command.write_message(ProxyOrder { id: String::from("ID_ABCD"), command: Command::AddHttpFront(front) });
+    command.write_message(&ProxyOrder { id: String::from("ID_ABCD"), command: Command::AddHttpFront(front) });
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
-    command.write_message(ProxyOrder { id: String::from("ID_EFGH"), command: Command::AddInstance(instance) });
+    command.write_message(&ProxyOrder { id: String::from("ID_EFGH"), command: Command::AddInstance(instance) });
 
     println!("test received: {:?}", command.read_message());
     println!("test received: {:?}", command.read_message());
@@ -716,9 +716,9 @@ mod tests {
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1031"), path_begin: String::from("/") };
-    command.write_message(ProxyOrder { id: String::from("ID_ABCD"), command: Command::AddHttpFront(front) });
+    command.write_message(&ProxyOrder { id: String::from("ID_ABCD"), command: Command::AddHttpFront(front) });
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1028 };
-    command.write_message(ProxyOrder { id: String::from("ID_EFGH"), command: Command::AddInstance(instance) });
+    command.write_message(&ProxyOrder { id: String::from("ID_EFGH"), command: Command::AddInstance(instance) });
 
     println!("test received: {:?}", command.read_message());
     println!("test received: {:?}", command.read_message());
