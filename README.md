@@ -23,5 +23,5 @@ export OPENSSL_INCLUDE_DIR=/usr/local/opt/openssl/include/
 The proxy uses `env_logger`. You can select which module displays logs at which level with an environment variable. Here is an example to display most logs at `info` level, but use `trace` level for the HTTP parser module:
 
 ```
-RUST_LOG=info,sozu-lib::parser::http11=trace ./target/debug/sozu
+RUST_LOG=info,sozu_lib::parser::http11=trace ./target/debug/sozu
 ```
