@@ -111,14 +111,6 @@ fn main() {
     let buffer_size     = config.command_buffer_size.unwrap_or(10000);
     let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
     command::start(config.command_socket, listeners, config.saved_state, buffer_size, max_buffer_size);
-
-    /*
-    //FIXME: really join on all threads?
-    if let Some(jh) = jh_opt {
-      let _ = jh.join();
-      info!("good bye");
-    }
-    */
   } else {
     println!("could not load configuration file at '{}', stopping", config_file);
   }
