@@ -372,8 +372,15 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
           // loop here because iterations has borrow issues
           loop {
             let msg = self.configuration.channel().read_message();
+
+            // if the message was too large, we grow the buffer and retry to read if possible
             if msg.is_none() {
-              break;
+              if (self.configuration.channel().interest & self.configuration.channel().readiness).is_readable() {
+                self.configuration.channel().run();
+                continue;
+              } else {
+                break;
+              }
             }
 
             let msg = msg.unwrap();
