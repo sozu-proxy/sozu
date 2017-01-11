@@ -131,7 +131,7 @@ impl CommandServer {
       let mut interest = Ready::hup();
       interest.insert(Ready::readable());
       interest.insert(Ready::writable());
-      self.poll.register(&self.conns[tok].sock, token, interest, PollOpt::edge())
+      self.poll.register(&self.conns[tok].channel.sock, token, interest, PollOpt::edge())
         .ok().expect("could not register socket with event loop");
 
       let accept_interest = Ready::readable();
@@ -249,44 +249,38 @@ impl CommandServer {
       _ => {
         let conn_token = self.to_front(token);
         if self.conns.contains(conn_token) {
-          self.conns[conn_token].readiness = self.conns[conn_token].readiness | events;
+          self.conns[conn_token].channel.handle_events(events);
+          self.conns[conn_token].channel.run();
 
+          //FIXME: handle deconnection
           loop {
-            info!("UNIX\t{:?}\t readiness: {:?}", conn_token, self.conns[conn_token].readiness);
-            if self.conns[conn_token].readiness.is_none() {
-              break;
-            }
+            let message = self.conns[conn_token].channel.read_message();
 
-            if self.conns[conn_token].readiness.is_readable() {
-              let opt_v = self.conns[conn_token].conn_readable(token);
-              match opt_v {
-                Ok(v) => self.dispatch(conn_token, v),
-                Err(ConnReadError::Continue) => {},
-                Err(ConnReadError::ParseError) | Err(ConnReadError::SocketError) => {
-                  self.poll.deregister(&self.conns[conn_token].sock);
-                  self.conns.remove(conn_token);
-                  trace!("closed client [{}]", token.0);
-                  break;
-                }
+            // if the message was too large, we grow the buffer and retry to read if possible
+            if message.is_none() {
+              if self.conns[conn_token].channel.readiness.is_hup() {
+                break;
+              }
+
+              if (self.conns[conn_token].channel.interest & self.conns[conn_token].channel.readiness).is_readable() {
+                self.conns[conn_token].channel.run();
+                continue;
+              } else {
+                break;
               }
             }
 
-            if self.conns[conn_token].readiness.is_writable() {
-              if let Some(ref timeout) = self.conns[conn_token].write_timeout {
-                self.timer.cancel_timeout(&timeout);
-              }
-              let res = self.conns[conn_token].conn_writable(token);
-              if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(700), token) {
-                self.conns[conn_token].write_timeout = Some(timeout);
-              }
-            }
+            let message = message.unwrap();
+            self.handle_client_message(conn_token, &message);
 
-            if self.conns[conn_token].readiness.is_hup() {
-              self.poll.deregister(&self.conns[conn_token].sock);
-              self.conns.remove(conn_token);
-              trace!("closed client [{}]", token.0);
-              break;
-            }
+          }
+
+          self.conns[conn_token].channel.run();
+
+          if self.conns[conn_token].channel.readiness.is_hup() {
+            self.poll.deregister(&self.conns[conn_token].channel.sock);
+            self.conns.remove(conn_token);
+            trace!("closed client [{}]", token.0);
           }
         }
       }
@@ -310,7 +304,7 @@ impl CommandServer {
     info!("sending: {:?}", answer);
     for client in self.conns.iter_mut() {
       if let Some(index) = client.has_message_id(&msg.id) {
-        client.write_message(&serde_json::to_string(&answer).map(|s| s.into_bytes()).unwrap_or(vec!()));
+        client.write_message(&answer);
         client.remove_message_id(index);
       }
     }

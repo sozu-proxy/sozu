@@ -12,7 +12,7 @@ use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
 
 use super::{CommandServer,FrontToken,ListenerConfiguration,StoredListener};
-use super::data::{ConfigCommand,ConfigMessage};
+use super::data::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
 use super::client::parse;
 
 impl CommandServer {
@@ -49,7 +49,11 @@ impl CommandServer {
         } else {
           // FIXME: should send back error here
           log!(log::LogLevel::Error, "could not open file: {}", &path);
-          self.conns[token].write_message(b"could not open file");
+          self.conns[token].write_message(&ConfigMessageAnswer {
+            id:      message.id.clone(),
+            status:  ConfigMessageStatus::Error,
+            message: "could not open file".to_string()
+          });
         }
       },
       ConfigCommand::DumpState => {
@@ -67,12 +71,21 @@ impl CommandServer {
           id:        message.id.clone(),
           listeners: stored_listeners,
         };
-        let encoded = serde_json::to_string(&conf).map(|s| s.into_bytes()).unwrap_or(vec!());
-        self.conns[token].write_message(&encoded);
+        //let encoded = serde_json::to_string(&conf).map(|s| s.into_bytes()).unwrap_or(vec!());
+        self.conns[token].write_message(&ConfigMessageAnswer {
+          id:      message.id.clone(),
+          status:  ConfigMessageStatus::Ok,
+          message: serde_json::to_string(&conf).unwrap_or(String::new())
+        });
+        //self.conns[token].write_message(&encoded);
       },
       ConfigCommand::LoadState(path) => {
         self.load_state(&message.id, &path);
-        self.conns[token].write_message(b"loaded the configuration");
+        self.conns[token].write_message(&ConfigMessageAnswer {
+          id:      message.id.clone(),
+          status:  ConfigMessageStatus::Ok,
+          message: "loaded the configuration".to_string()
+        });
       },
       ConfigCommand::ProxyConfiguration(command) => {
         if let Some(ref tag) = message.listener {
