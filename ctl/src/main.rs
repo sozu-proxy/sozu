@@ -60,15 +60,6 @@ fn main() {
                                     .subcommand(SubCommand::with_name("dump")))
                         .get_matches();
 
-  if let Some(matches) = matches.subcommand_matches("worker") {
-    let fd  = matches.value_of("fd").expect("needs a file descriptor")
-      .parse::<i32>().expect("the file descriptor must be a number");
-    let id  = matches.value_of("id").expect("needs a worker id");
-    let tag = matches.value_of("tag").expect("needs a configuration tag");
-
-    return;
-  }
-
   let config_file = matches.value_of("config").expect("required config file");
 
   let config = config::Config::load_from_path(config_file).expect("could not parse configuration file");
