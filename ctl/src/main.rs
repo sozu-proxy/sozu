@@ -22,8 +22,8 @@ use clap::{App,Arg,SubCommand};
 use sozu::messages::Command;
 use sozu::command::CommandChannel;
 
+use command::{dump_state,save_state};
 use messages::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
-use command::dump_state;
 
 fn main() {
   let matches = App::new("sozuctl")
@@ -84,6 +84,7 @@ fn main() {
       match sub.subcommand() {
         ("save", Some(state_sub)) => {
           let file = state_sub.value_of("file").expect("missing target file");
+          save_state(&mut channel, file);
         },
         ("load", Some(state_sub)) => {
           let file = state_sub.value_of("file").expect("missing target file");
