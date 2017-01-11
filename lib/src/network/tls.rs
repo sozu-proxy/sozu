@@ -327,26 +327,20 @@ pub struct ServerConfiguration {
 impl ServerConfiguration {
   pub fn new(tag: String, config: TlsProxyConfiguration, channel: Channel, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
-    let mut domains = TrieNode::root();
-    let mut fronts  = HashMap::new();
+    let mut domains  = TrieNode::root();
+    let mut fronts   = HashMap::new();
+    let rc_ctx       = Arc::new(Mutex::new(contexts));
+    let ref_ctx      = rc_ctx.clone();
+    let rc_domains   = Arc::new(Mutex::new(domains));
+    let ref_domains  = rc_domains.clone();
+    let cl_tag       = tag.clone();
+    let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
 
-    let (fingerprint, mut tls_data, names):(Vec<u8>,TlsData, Vec<String>) = Self::create_default_context(&config).unwrap();
+    let (fingerprint, mut tls_data, names):(Vec<u8>,TlsData, Vec<String>) = Self::create_default_context(&config, ref_ctx, ref_domains, cl_tag, default_name).unwrap();
     let cert = X509::from_pem(&tls_data.certificate).unwrap();
 
     let common_name: Option<String> = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name));
     info!("{}\tgot common name: {:?}", &tag, common_name);
-
-    let names: Vec<String> = cert.subject_alt_names().map(|names| {
-      names.iter().filter_map(|general_name|
-                              general_name.dnsname().map(|name| String::from(name))
-                             ).collect()
-    }).unwrap_or(vec!());
-    info!("{}\tgot subject alt names: {:?}", &tag, names);
-    {
-      for name in names {
-        domains.domain_insert(name.into_bytes(), fingerprint.clone());
-      }
-    }
 
     let app = TlsApp {
       app_id:           config.default_app_id.clone().unwrap_or(String::new()),
@@ -355,45 +349,6 @@ impl ServerConfiguration {
       cert_fingerprint: fingerprint.clone(),
     };
     fronts.insert(config.default_name.clone().unwrap_or(String::from("")), vec![app]);
-
-
-    let rc_ctx       = Arc::new(Mutex::new(contexts));
-    let ref_ctx      = rc_ctx.clone();
-    let rc_domains   = Arc::new(Mutex::new(domains));
-    let ref_domains  = rc_domains.clone();
-    let cl_tag       = tag.clone();
-    let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
-
-    tls_data.context.set_servername_callback(move |ssl: &mut SslRef| {
-      let contexts = ref_ctx.lock().unwrap();
-      let domains  = ref_domains.lock().unwrap();
-
-      info!("{}\tref: {:?}", cl_tag, ssl);
-      if let Some(servername) = ssl.servername() {
-        info!("checking servername: {}", servername);
-        if &servername == &default_name {
-          return Ok(());
-        }
-        info!("{}\tlooking for fingerprint for {:?}", cl_tag, servername);
-        if let Some(kv) = domains.domain_lookup(servername.as_bytes()) {
-          info!("{}\tlooking for context for {:?} with fingerprint {:?}", cl_tag, servername, kv.1);
-          if let Some(ref tls_data) = contexts.get(&kv.1) {
-            info!("{}\tfound context for {:?}", cl_tag, servername);
-            let context: &SslContext = &tls_data.context;
-            if let Ok(()) = ssl.set_ssl_context(context) {
-              info!("{}\tservername is now {:?}", cl_tag, ssl.servername());
-              return Ok(());
-            } else {
-              error!("{}\tno context found for {:?}", cl_tag, servername);
-            }
-          }
-        }
-      } else {
-        error!("{}\tgot no server name from ssl, answering with default one", cl_tag);
-      }
-      //answer ok because we use the default certificate
-      Ok(())
-    });
 
     match server_bind(&config.front) {
       Ok(listener) => {
@@ -437,7 +392,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn create_default_context(config: &TlsProxyConfiguration) -> Option<(CertFingerprint,TlsData,Vec<String>)> {
+  pub fn create_default_context(config: &TlsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, tag: String, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>)> {
     let ctx = SslContext::new(SslMethod::Sslv23);
     if let Err(e) = ctx {
       //return Err(io::Error::new(io::ErrorKind::Other, e.description()));
@@ -486,11 +441,49 @@ impl ServerConfiguration {
           ).collect()
         }).unwrap_or(vec!());
 
+        info!("{}\tgot subject alt names: {:?}", &tag, names);
+        {
+          let mut domains = ref_domains.lock().unwrap();
+          for name in &names {
+            domains.domain_insert(name.clone().into_bytes(), fingerprint.clone());
+          }
+        }
+
         if let Some(common_name) = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name)) {
         info!("got common name: {:?}", common_name);
           names.push(common_name);
         }
 
+        context.set_servername_callback(move |ssl: &mut SslRef| {
+          let contexts = ref_ctx.lock().unwrap();
+          let domains  = ref_domains.lock().unwrap();
+
+          info!("{}\tref: {:?}", tag, ssl);
+          if let Some(servername) = ssl.servername() {
+            info!("checking servername: {}", servername);
+            if &servername == &default_name {
+              return Ok(());
+            }
+            info!("{}\tlooking for fingerprint for {:?}", tag, servername);
+            if let Some(kv) = domains.domain_lookup(servername.as_bytes()) {
+              info!("{}\tlooking for context for {:?} with fingerprint {:?}", tag, servername, kv.1);
+              if let Some(ref tls_data) = contexts.get(&kv.1) {
+                info!("{}\tfound context for {:?}", tag, servername);
+                let context: &SslContext = &tls_data.context;
+                if let Ok(()) = ssl.set_ssl_context(context) {
+                  info!("{}\tservername is now {:?}", tag, ssl.servername());
+                  return Ok(());
+                } else {
+                  error!("{}\tno context found for {:?}", tag, servername);
+                }
+              }
+            }
+          } else {
+            error!("{}\tgot no server name from ssl, answering with default one", tag);
+          }
+          //answer ok because we use the default certificate
+          Ok(())
+        });
 
         let tls_data = TlsData {
           context:     context,

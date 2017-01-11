@@ -207,6 +207,11 @@ mod tests {
       public_address: None,
       cipher_list: None,
       worker_count: None,
+      default_app_id: None,
+      default_certificate: None,
+      default_certificate_chain: None,
+      default_key: None,
+      default_name: None,
     });
     map.insert(String::from("TLS"), ListenerConfig {
       listener_type: ListenerType::HTTPS,
@@ -219,6 +224,11 @@ mod tests {
       public_address: None,
       cipher_list: None,
       worker_count: None,
+      default_app_id: None,
+      default_certificate: None,
+      default_certificate_chain: None,
+      default_key: None,
+      default_name: None,
     });
     let config = Config {
       command_socket: String::from("./command_folder/sock"),
