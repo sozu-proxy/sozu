@@ -1043,7 +1043,7 @@ mod tests {
     let domains    = TrieNode::root();
     let rc_domains = Arc::new(Mutex::new(domains));
 
-    let context    = SslContext::builder(SslMethod::dtls()).unwrap();
+    let context    = SslContext::builder(SslMethod::tls()).unwrap();
     let (command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
 
     let tls_data = TlsData {
