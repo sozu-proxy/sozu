@@ -12,6 +12,7 @@ extern crate serde_json;
 extern crate sozu_lib as sozu;
 
 mod config;
+mod messages;
 
 use mio_uds::UnixStream;
 use std::net::{UdpSocket,ToSocketAddrs};
@@ -20,36 +21,7 @@ use clap::{App,Arg,SubCommand};
 use sozu::messages::Command;
 use sozu::command::CommandChannel;
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
- pub enum ConfigMessageStatus {
-   Ok,
-   Processing,
-   Error
- }
-
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize)]
-pub enum ConfigCommand {
-  ProxyConfiguration(Command),
-  SaveState(String),
-  LoadState(String),
-  DumpState,
-}
-
-//FIXME: maybe need a custom serialize here
-#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize)]
-pub struct ConfigMessage {
-  pub id:       String,
-  pub data:     ConfigCommand,
-  pub listener: Option<String>,
-}
-
-#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
-pub struct ConfigMessageAnswer {
-  pub id:      String,
-  pub status:  ConfigMessageStatus,
-  pub message: String
-}
-
+use messages::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
 fn main() {
   let matches = App::new("sozuctl")
                         .version(crate_version!())
