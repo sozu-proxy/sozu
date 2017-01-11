@@ -114,6 +114,32 @@ fn main() {
           let file = state_sub.value_of("file").expect("missing target file");
         },
         ("dump", _) => {
+          channel.write_message(&ConfigMessage {
+            //FIXME: make a random id generator
+            id:       "hello".to_string(),
+            data:     ConfigCommand::DumpState,
+            listener: None,
+          });
+
+          match channel.read_message() {
+            None          => println!("the proxy didn't answer"),
+            Some(message) => {
+              //FIXME: verify that the message id is correct
+              match message.status {
+                ConfigMessageStatus::Processing => {
+                  // do nothing here
+                  // for other messages, we would loop over read_message
+                  // until an error or ok message was sent
+                },
+                ConfigMessageStatus::Error => {
+                  println!("could not dump proxy state: {}", message.message);
+                },
+                ConfigMessageStatus::Ok => {
+                  println!("Proxy state:\n{}", message.message);
+                }
+              }
+            }
+          }
         },
         _                   => println!("unknown state management command")
       }
