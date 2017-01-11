@@ -12,6 +12,7 @@ extern crate serde_json;
 extern crate sozu_lib as sozu;
 
 mod config;
+mod command;
 mod messages;
 
 use mio_uds::UnixStream;
@@ -22,6 +23,8 @@ use sozu::messages::Command;
 use sozu::command::CommandChannel;
 
 use messages::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
+use command::dump_state;
+
 fn main() {
   let matches = App::new("sozuctl")
                         .version(crate_version!())
@@ -86,32 +89,7 @@ fn main() {
           let file = state_sub.value_of("file").expect("missing target file");
         },
         ("dump", _) => {
-          channel.write_message(&ConfigMessage {
-            //FIXME: make a random id generator
-            id:       "hello".to_string(),
-            data:     ConfigCommand::DumpState,
-            listener: None,
-          });
-
-          match channel.read_message() {
-            None          => println!("the proxy didn't answer"),
-            Some(message) => {
-              //FIXME: verify that the message id is correct
-              match message.status {
-                ConfigMessageStatus::Processing => {
-                  // do nothing here
-                  // for other messages, we would loop over read_message
-                  // until an error or ok message was sent
-                },
-                ConfigMessageStatus::Error => {
-                  println!("could not dump proxy state: {}", message.message);
-                },
-                ConfigMessageStatus::Ok => {
-                  println!("Proxy state:\n{}", message.message);
-                }
-              }
-            }
-          }
+          dump_state(&mut channel);
         },
         _                   => println!("unknown state management command")
       }

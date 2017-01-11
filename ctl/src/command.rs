@@ -1,0 +1,39 @@
+use sozu::command::CommandChannel;
+use messages::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
+
+fn generate_id() -> String {
+  "hello".to_string()
+}
+
+pub fn dump_state(channel: &mut CommandChannel<ConfigMessage,ConfigMessageAnswer>) {
+  let id = generate_id();
+  channel.write_message(&ConfigMessage {
+    id:       id.clone(),
+    data:     ConfigCommand::DumpState,
+    listener: None,
+  });
+
+  match channel.read_message() {
+    None          => println!("the proxy didn't answer"),
+    Some(message) => {
+      if id != message.id {
+        println!("received message with invalid id: {:?}", message);
+        return;
+      }
+      //FIXME: verify that the message id is correct
+      match message.status {
+        ConfigMessageStatus::Processing => {
+          // do nothing here
+          // for other messages, we would loop over read_message
+          // until an error or ok message was sent
+        },
+        ConfigMessageStatus::Error => {
+          println!("could not dump proxy state: {}", message.message);
+        },
+        ConfigMessageStatus::Ok => {
+          println!("Proxy state:\n{}", message.message);
+        }
+      }
+    }
+  }
+}
