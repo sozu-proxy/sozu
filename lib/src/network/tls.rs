@@ -17,13 +17,13 @@ use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{precise_time_s, precise_time_ns};
 use rand::random;
-use openssl::ssl::{self, SslContext, SslContextOptions, SslMethod,
+use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod,
                    Ssl, SslRef, SslStream, SniError};
-use openssl::x509::{X509,X509FileType};
-use openssl::dh::DH;
-use openssl::crypto::pkey::PKey;
-use openssl::crypto::hash::Type;
-use openssl::nid::Nid;
+use openssl::x509::X509;
+use openssl::dh::Dh;
+use openssl::pkey::PKey;
+use openssl::hash::MessageDigest;
+use openssl::nid;
 use nom::IResult;
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
@@ -296,6 +296,10 @@ impl ProxyClient for TlsClient {
   }
 }
 
+fn get_cert_common_name(cert: &X509) -> Option<String> {
+    cert.subject_name().entries_by_nid(nid::COMMONNAME).next().and_then(|name| name.data().as_utf8().ok().map(|name| String::from(&*name)))
+}
+
 pub type AppId     = String;
 pub type HostName  = String;
 pub type PathBegin = String;
@@ -339,7 +343,7 @@ impl ServerConfiguration {
     let (fingerprint, mut tls_data, names):(Vec<u8>,TlsData, Vec<String>) = Self::create_default_context(&config, ref_ctx, ref_domains, cl_tag, default_name).unwrap();
     let cert = X509::from_pem(&tls_data.certificate).unwrap();
 
-    let common_name: Option<String> = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name));
+    let common_name: Option<String> = get_cert_common_name(&cert);
     info!("{}\tgot common name: {:?}", &tag, common_name);
 
     let app = TlsApp {
@@ -393,7 +397,7 @@ impl ServerConfiguration {
   }
 
   pub fn create_default_context(config: &TlsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, tag: String, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>)> {
-    let ctx = SslContext::new(SslMethod::Sslv23);
+    let ctx = SslContext::builder(SslMethod::tls());
     if let Err(e) = ctx {
       //return Err(io::Error::new(io::ErrorKind::Other, e.description()));
       return None
@@ -412,7 +416,7 @@ impl ServerConfiguration {
 
     context.set_cipher_list(&config.cipher_list);
 
-    match DH::get_2048_256() {
+    match Dh::get_2048_256() {
       Ok(dh) => context.set_tmp_dh(&dh),
       Err(e) => {
         //return Err(io::Error::new(io::ErrorKind::Other, e.description()))
@@ -426,11 +430,11 @@ impl ServerConfiguration {
     let cert_read = config.default_certificate.as_ref().map(|vec| &vec[..]).unwrap_or(&include_bytes!("../../../assets/certificate.pem")[..]);
     let key_read = config.default_key.as_ref().map(|vec| &vec[..]).unwrap_or(&include_bytes!("../../../assets/key.pem")[..]);
     if let Some(path) = config.default_certificate_chain.as_ref() {
-      context.set_certificate_chain_file(path, X509FileType::PEM);
+      context.set_certificate_chain_file(path);
     }
 
     if let (Ok(cert), Ok(key)) = (X509::from_pem(&cert_read[..]), PKey::private_key_from_pem(&key_read[..])) {
-      if let Ok(fingerprint) = cert.fingerprint(Type::SHA256) {
+      if let Ok(fingerprint) = cert.fingerprint(MessageDigest::sha256()) {
         context.set_certificate(&cert);
         context.set_private_key(&key);
 
@@ -449,7 +453,7 @@ impl ServerConfiguration {
           }
         }
 
-        if let Some(common_name) = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name)) {
+        if let Some(common_name) = get_cert_common_name(&cert) {
         info!("got common name: {:?}", common_name);
           names.push(common_name);
         }
@@ -459,7 +463,7 @@ impl ServerConfiguration {
           let domains  = ref_domains.lock().unwrap();
 
           info!("{}\tref: {:?}", tag, ssl);
-          if let Some(servername) = ssl.servername() {
+          if let Some(servername) = ssl.servername().map(|s| s.to_string()) {
             info!("checking servername: {}", servername);
             if &servername == &default_name {
               return Ok(());
@@ -486,7 +490,7 @@ impl ServerConfiguration {
         });
 
         let tls_data = TlsData {
-          context:     context,
+          context:     context.build(),
           certificate: cert_read.to_vec(),
           refcount:    1,
         };
@@ -501,7 +505,7 @@ impl ServerConfiguration {
 
   pub fn add_http_front(&mut self, http_front: TlsFront, event_loop: &mut Poll) -> bool {
     //FIXME: insert some error management with a Result here
-    let c = SslContext::new(SslMethod::Sslv23);
+    let c = SslContext::builder(SslMethod::tls());
     if c.is_err() { return false; }
     let mut ctx = c.unwrap();
     let mut options = ctx.options();
@@ -513,7 +517,7 @@ impl ServerConfiguration {
     options.insert(ssl::SSL_OP_CIPHER_SERVER_PREFERENCE);
     let opt = ctx.set_options(options);
 
-    match DH::get_2048_256() {
+    match Dh::get_2048_256() {
       Ok(dh) => ctx.set_tmp_dh(&dh),
       Err(e) => {
         return false;
@@ -532,8 +536,8 @@ impl ServerConfiguration {
       //FIXME: would need more logs here
 
       //FIXME
-      let fingerprint = cert.fingerprint(Type::SHA256).unwrap();
-      let common_name: Option<String> = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name));
+      let fingerprint = cert.fingerprint(MessageDigest::sha256()).unwrap();
+      let common_name: Option<String> = get_cert_common_name(&cert);
       info!("{}\tgot common name: {:?}", self.tag, common_name);
 
       let names: Vec<String> = cert.subject_alt_names().map(|names| {
@@ -545,10 +549,10 @@ impl ServerConfiguration {
 
       ctx.set_certificate(&cert);
       ctx.set_private_key(&key);
-      cert_chain.iter().map(|ref cert| ctx.add_extra_chain_cert(cert));
+      cert_chain.iter().map(|cert| ctx.add_extra_chain_cert(cert.clone()));
 
       let tls_data = TlsData {
-        context:     ctx,
+        context:     ctx.build(),
         certificate: cert_read.to_vec(),
         refcount:    1,
       };
@@ -619,7 +623,7 @@ impl ServerConfiguration {
           if must_delete == Some(true) {
             if let Some(data) = contexts.remove(&front.cert_fingerprint) {
               if let Ok(cert) = X509::from_pem(&data.certificate) {
-                let common_name: Option<String> = cert.subject_name().text_by_nid(Nid::CN).map(|name| String::from(&*name));
+                let common_name: Option<String> = get_cert_common_name(&cert);
                 //info!("got common name: {:?}", common_name);
                 if let Some(name) = common_name {
                   domains.domain_remove(&name.into_bytes());
@@ -757,7 +761,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       let hostname_str =  unsafe { from_utf8_unchecked(hostname) };
 
       //FIXME: what if we don't use SNI?
-      let servername: Option<String> = client.http().unwrap().frontend.ssl().servername();
+      let servername: Option<String> = client.http().unwrap().frontend.ssl().servername().map(|s| s.to_string());
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
         error!("{}\tTLS SNI hostname and Host header don't match", self.tag);
         return Err(ConnectionError::HostNotFound);
@@ -1039,11 +1043,11 @@ mod tests {
     let domains    = TrieNode::root();
     let rc_domains = Arc::new(Mutex::new(domains));
 
-    let context    = SslContext::new(SslMethod::Tlsv1).unwrap();
+    let context    = SslContext::builder(SslMethod::dtls()).unwrap();
     let (command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
 
     let tls_data = TlsData {
-      context:     context,
+      context:     context.build(),
       certificate: vec!(),
       refcount:    0,
     };

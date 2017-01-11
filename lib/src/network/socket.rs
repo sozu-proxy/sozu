@@ -1,8 +1,7 @@
 use std::io::{self,ErrorKind,Read,Write};
 use std::net::{SocketAddr,SocketAddrV4,SocketAddrV6};
 use mio::tcp::{TcpListener,TcpStream};
-use openssl::ssl::SslStream;
-use openssl::ssl::error::Error;
+use openssl::ssl::{Error, SslStream};
 use net2::TcpBuilder;
 use net2::unix::UnixTcpBuilderExt;
 
