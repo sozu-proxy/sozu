@@ -45,9 +45,12 @@ impl CommandServer {
             }
             f.sync_all();
           }
-          // FIXME: should send back a DONE message here
+          self.conns[token].write_message(&ConfigMessageAnswer {
+            id:      message.id.clone(),
+            status:  ConfigMessageStatus::Ok,
+            message: format!("saved to {}", path)
+          });
         } else {
-          // FIXME: should send back error here
           log!(log::LogLevel::Error, "could not open file: {}", &path);
           self.conns[token].write_message(&ConfigMessageAnswer {
             id:      message.id.clone(),
