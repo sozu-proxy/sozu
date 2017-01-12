@@ -37,6 +37,38 @@ pub fn save_state(channel: &mut CommandChannel<ConfigMessage,ConfigMessageAnswer
   }
 }
 
+pub fn load_state(channel: &mut CommandChannel<ConfigMessage,ConfigMessageAnswer>, path: &str) {
+  let id = generate_id();
+  channel.write_message(&ConfigMessage {
+    id:       id.clone(),
+    data:     ConfigCommand::LoadState(path.to_string()),
+    listener: None,
+  });
+
+  match channel.read_message() {
+    None          => println!("the proxy didn't answer"),
+    Some(message) => {
+      if id != message.id {
+        println!("received message with invalid id: {:?}", message);
+        return;
+      }
+      match message.status {
+        ConfigMessageStatus::Processing => {
+          // do nothing here
+          // for other messages, we would loop over read_message
+          // until an error or ok message was sent
+        },
+        ConfigMessageStatus::Error => {
+          println!("could not save proxy state: {}", message.message);
+        },
+        ConfigMessageStatus::Ok => {
+          println!("Proxy state saved to {}", path);
+        }
+      }
+    }
+  }
+}
+
 pub fn dump_state(channel: &mut CommandChannel<ConfigMessage,ConfigMessageAnswer>) {
   let id = generate_id();
   channel.write_message(&ConfigMessage {

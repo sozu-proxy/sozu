@@ -1,4 +1,3 @@
-#![feature(proc_macro)]
 #[macro_use] extern crate clap;
 #[macro_use] extern crate serde_derive;
 extern crate mio;
@@ -16,14 +15,11 @@ mod command;
 mod messages;
 
 use mio_uds::UnixStream;
-use std::net::{UdpSocket,ToSocketAddrs};
-use std::collections::HashMap;
 use clap::{App,Arg,SubCommand};
-use sozu::messages::Command;
 use sozu::command::CommandChannel;
 
-use command::{dump_state,save_state};
-use messages::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
+use command::{dump_state,load_state,save_state};
+use messages::{ConfigMessage,ConfigMessageAnswer};
 
 fn main() {
   let matches = App::new("sozuctl")
@@ -79,6 +75,7 @@ fn main() {
         },
         ("load", Some(state_sub)) => {
           let file = state_sub.value_of("file").expect("missing target file");
+          load_state(&mut channel, file);
         },
         ("dump", _) => {
           dump_state(&mut channel);

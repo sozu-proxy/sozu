@@ -1,12 +1,9 @@
 //! parsing data from the configuration file
-use std::collections::HashMap;
 use std::io::{self,Error,ErrorKind,Read};
 use std::fs::File;
-use std::str::FromStr;
 use serde::Deserialize;
 use toml;
 
-use sozu::messages::{HttpProxyConfiguration,TlsProxyConfiguration};
 
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
