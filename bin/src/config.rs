@@ -1,13 +1,14 @@
 //! parsing data from the configuration file
-use std::collections::HashMap;
-use std::io::{self,Error,ErrorKind,Read};
 use std::fs::File;
 use std::str::FromStr;
+use std::net::ToSocketAddrs;
+use std::collections::HashMap;
+use std::io::{self,Error,ErrorKind,Read};
 use serde::Deserialize;
 use toml;
 
-use command::data::ProxyType;
-use sozu::messages::{HttpProxyConfiguration,TlsProxyConfiguration};
+use command::data::{ConfigCommand,ConfigMessage,ProxyType};
+use sozu::messages::{Order,HttpFront,TlsFront,Instance,HttpProxyConfiguration,TlsProxyConfiguration};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct ProxyConfig {
@@ -139,6 +140,17 @@ pub struct MetricsConfig {
   pub port:    u16,
 }
 
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+pub struct AppConfig {
+  pub hostname:          String,
+  pub path_begin:        Option<String>,
+  pub certificate:       Option<String>,
+  pub key:               Option<String>,
+  pub certificate_chain: Option<String>,
+  pub frontends:         Vec<String>,
+  pub backends:          Vec<String>,
+}
+
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct Config {
   pub command_socket:          String,
@@ -148,6 +160,7 @@ pub struct Config {
   pub metrics:                 MetricsConfig,
   pub proxies:                 HashMap<String, ProxyConfig>,
   pub log_level:               Option<String>,
+  pub applications:            HashMap<String, AppConfig>,
 }
 
 impl Config {
@@ -183,6 +196,85 @@ impl Config {
       }
       Err(Error::new(ErrorKind::InvalidData, format!("could not parse the configuration file: {:?}", parser.errors)))
     }
+  }
+
+/*
+pub struct AppConfig {
+  pub hostname:          String,
+  pub path_begin:        Option<String>,
+  pub certificate:       Option<String>,
+  pub key:               Option<String>,
+  pub certificate_chain: Option<String>,
+  pub frontends:         Vec<String>,
+  pub backends:          Vec<String>,
+}
+*/
+
+  pub fn generate_config_messages(&self) -> Vec<ConfigMessage> {
+    let mut v = Vec::new();
+    let mut count = 0u8;
+    for (ref id, ref app) in &self.applications {
+
+      for tag in &app.frontends {
+        let path_begin = app.path_begin.as_ref().unwrap_or(&String::new()).clone();
+
+        let frontend_order = if self.proxies.get(tag).and_then(|p| p.to_tls()).is_some() {
+          //FIXME: certificate loading and parsing
+          let certificate = "".to_string(); //load file in string
+          let key = "".to_string(); //load file in string
+          let certificate_chain = Vec::new(); // load and parse
+          Order::AddTlsFront(TlsFront {
+            app_id:            id.to_string(),
+            hostname:          app.hostname.clone(),
+            path_begin:        path_begin,
+            key:               key,
+            certificate:       certificate,
+            certificate_chain: certificate_chain,
+          })
+        } else {
+          Order::AddHttpFront(HttpFront {
+            app_id:     id.to_string(),
+            hostname:   app.hostname.clone(),
+            path_begin: path_begin,
+          })
+        };
+
+        v.push(ConfigMessage {
+          id:    format!("CONFIG-{}", count),
+          proxy: Some(tag.clone()),
+          data:  ConfigCommand::ProxyConfiguration(frontend_order),
+        });
+
+        count += 1;
+
+        for address_str in app.backends.iter() {
+          if let Ok(address_list) = address_str.to_socket_addrs() {
+            for address in address_list {
+              let ip   = format!("{}", address.ip());
+              let port = address.port();
+
+              let backend_order = Order::AddInstance(Instance {
+                app_id:     id.to_string(),
+                ip_address: ip,
+                port:       port
+              });
+
+              v.push(ConfigMessage {
+                id:    format!("CONFIG-{}", count),
+                proxy: Some(tag.clone()),
+                data:  ConfigCommand::ProxyConfiguration(backend_order),
+              });
+
+              count += 1;
+            }
+          } else {
+            error!("could not parse address: {}", address_str);
+          }
+        }
+      }
+    }
+
+    v
   }
 }
 
