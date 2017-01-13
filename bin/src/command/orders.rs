@@ -11,7 +11,7 @@ use sozu::messages::Command;
 use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
 
-use super::{CommandServer,FrontToken,ListenerConfiguration,StoredListener};
+use super::{CommandServer,FrontToken,ProxyConfiguration,StoredProxy};
 use super::data::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
 use super::client::parse;
 
@@ -22,21 +22,21 @@ impl CommandServer {
       ConfigCommand::SaveState(path) => {
         if let Ok(mut f) = fs::File::create(&path) {
           let mut seen = HashSet::new();
-          let mut stored_listeners: Vec<StoredListener> = Vec::new();
+          let mut stored_proxies: Vec<StoredProxy> = Vec::new();
 
-          for &(ref tag, ref listener) in  self.listeners.values() {
+          for &(ref tag, ref proxy) in  self.proxies.values() {
             if !seen.contains(&tag) {
               seen.insert(tag);
-              stored_listeners.push( StoredListener::from_listener(&listener) );
+              stored_proxies.push( StoredProxy::from_proxy(&proxy) );
             }
           }
 
           let mut counter = 0usize;
-          for listener in stored_listeners {
-            for command in listener.state.generate_commands() {
+          for proxy in stored_proxies {
+            for command in proxy.state.generate_commands() {
               let message = ConfigMessage {
                 id:       format!("SAVE-{}", counter),
-                listener: Some(listener.tag.to_string()),
+                proxy: Some(proxy.tag.to_string()),
                 data:     ConfigCommand::ProxyConfiguration(command)
               };
               f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()));
@@ -61,18 +61,18 @@ impl CommandServer {
       },
       ConfigCommand::DumpState => {
         let mut seen = HashSet::new();
-        let mut stored_listeners: Vec<StoredListener> = Vec::new();
+        let mut stored_proxies: Vec<StoredProxy> = Vec::new();
 
-        for &(ref tag, ref listener) in  self.listeners.values() {
+        for &(ref tag, ref proxy) in  self.proxies.values() {
           if !seen.contains(&tag) {
             seen.insert(tag);
-            stored_listeners.push( StoredListener::from_listener(&listener) );
+            stored_proxies.push( StoredProxy::from_proxy(&proxy) );
           }
         }
 
-        let conf = ListenerConfiguration {
+        let conf = ProxyConfiguration {
           id:        message.id.clone(),
-          listeners: stored_listeners,
+          proxies: stored_proxies,
         };
         //let encoded = serde_json::to_string(&conf).map(|s| s.into_bytes()).unwrap_or(vec!());
         self.conns[token].write_message(&ConfigMessageAnswer {
@@ -91,7 +91,7 @@ impl CommandServer {
         });
       },
       ConfigCommand::ProxyConfiguration(command) => {
-        if let Some(ref tag) = message.listener {
+        if let Some(ref tag) = message.proxy {
           if let &Command::AddTlsFront(ref data) = &command {
             log!(log::LogLevel::Info, "received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
             data.app_id, data.hostname, data.path_begin, tag);
@@ -100,25 +100,25 @@ impl CommandServer {
           }
 
           let mut found = false;
-          for &mut (ref listener_tag, ref mut listener) in self.listeners.values_mut() {
-            if tag == listener_tag {
+          for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
+            if tag == proxy_tag {
               let cl = command.clone();
               self.conns[token].add_message_id(message.id.clone());
-              listener.state.handle_command(&cl);
-              listener.channel.write_message(&ProxyOrder { id: message.id.clone(), command: cl });
-              listener.channel.run();
+              proxy.state.handle_command(&cl);
+              proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), command: cl });
+              proxy.channel.run();
               found = true;
             }
           }
 
           if !found {
             // FIXME: should send back error here
-            log!(log::LogLevel::Error, "no listener found for tag: {}", tag);
+            log!(log::LogLevel::Error, "no proxy found for tag: {}", tag);
           }
 
         } else {
           // FIXME: should send back error here
-          log!(log::LogLevel::Error, "expecting listener tag");
+          log!(log::LogLevel::Error, "expecting proxy tag");
         }
       }
     }
@@ -158,7 +158,7 @@ impl CommandServer {
 
               for message in o {
                 if let ConfigCommand::ProxyConfiguration(command) = message.data {
-                  if let Some(ref tag) = message.listener {
+                  if let Some(ref tag) = message.proxy {
                     if let &Command::AddTlsFront(ref data) = &command {
                       log!(log::LogLevel::Info, "received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
                       data.app_id, data.hostname, data.path_begin, tag);
@@ -166,24 +166,24 @@ impl CommandServer {
                       log!(log::LogLevel::Info, "received {:?} with tag {:?}", command, tag);
                     }
                     let mut found = false;
-                    for &mut (ref listener_tag, ref mut listener) in self.listeners.values_mut() {
-                      if tag == listener_tag {
+                    for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
+                      if tag == proxy_tag {
                         let cl = command.clone();
-                        listener.state.handle_command(&cl);
-                        listener.channel.write_message(&ProxyOrder { id: message.id.clone(), command: cl });
-                        listener.channel.run();
+                        proxy.state.handle_command(&cl);
+                        proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), command: cl });
+                        proxy.channel.run();
                         found = true;
                       }
                     }
 
                     if !found {
                       // FIXME: should send back error here
-                      log!(log::LogLevel::Error, "no listener found for tag: {}", tag);
+                      log!(log::LogLevel::Error, "no proxy found for tag: {}", tag);
                     }
 
                   } else {
                     // FIXME: should send back error here
-                    log!(log::LogLevel::Error, "expecting listener tag");
+                    log!(log::LogLevel::Error, "expecting proxy tag");
                   }
                 }
               }

@@ -12,45 +12,45 @@ use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 
 use sozu::network::{ProxyOrder,ServerMessage,http,tls};
 use sozu::command::CommandChannel;
-use command::Listener;
-use command::data::ListenerType;
-use config::ListenerConfig;
+use command::Proxy;
+use command::data::ProxyType;
+use config::ProxyConfig;
 
-pub fn start_workers(tag: &str, ls: &ListenerConfig) -> Option<Vec<Listener>> {
-  match ls.listener_type {
-    ListenerType::HTTP => {
+pub fn start_workers(tag: &str, ls: &ProxyConfig) -> Option<Vec<Proxy>> {
+  match ls.proxy_type {
+    ProxyType::HTTP => {
       //FIXME: make safer
       if ls.to_http().is_some() {
-        let mut http_listeners = Vec::new();
+        let mut http_proxies = Vec::new();
         for index in 1..ls.worker_count.unwrap_or(1) {
           let (pid, command) = start_worker_process(ls, tag, &index.to_string());
-          let l =  Listener::new(tag.to_string(), index as u8, pid, ls.listener_type, ls.address.clone(), ls.port, command);
-          http_listeners.push(l);
+          let l =  Proxy::new(tag.to_string(), index as u8, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
+          http_proxies.push(l);
         }
 
         let (pid, command) = start_worker_process(ls, tag, &0.to_string());
-        let l =  Listener::new(tag.to_string(), 0, pid, ls.listener_type, ls.address.clone(), ls.port, command);
-        http_listeners.push(l);
+        let l =  Proxy::new(tag.to_string(), 0, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
+        http_proxies.push(l);
 
-        Some(http_listeners)
+        Some(http_proxies)
       } else {
         None
       }
     },
-    ListenerType::HTTPS => {
+    ProxyType::HTTPS => {
       if ls.to_tls().is_some() {
-        let mut tls_listeners = Vec::new();
+        let mut tls_proxies = Vec::new();
         for index in 1..ls.worker_count.unwrap_or(1) {
           let (pid, command) = start_worker_process(ls, tag, &index.to_string());
-          let l =  Listener::new(tag.to_string(), index as u8, pid, ls.listener_type, ls.address.clone(), ls.port, command);
-          tls_listeners.push(l);
+          let l =  Proxy::new(tag.to_string(), index as u8, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
+          tls_proxies.push(l);
         }
 
         let (pid, command) = start_worker_process(ls, tag, &0.to_string());
-        let l =  Listener::new(tag.to_string(), 0, pid, ls.listener_type, ls.address.clone(), ls.port, command);
-        tls_listeners.push(l);
+        let l =  Proxy::new(tag.to_string(), 0, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
+        tls_proxies.push(l);
 
-        Some(tls_listeners)
+        Some(tls_proxies)
       } else {
         None
       }
@@ -68,7 +68,7 @@ fn generate_channels() -> io::Result<(CommandChannel<ProxyOrder,ServerMessage>, 
 }
 
 pub fn begin_worker_process(fd: i32, id: &str, tag: &str) {
-  let mut command: CommandChannel<ServerMessage,ListenerConfig> = CommandChannel::new(
+  let mut command: CommandChannel<ServerMessage,ProxyConfig> = CommandChannel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
     10000,
     20000
@@ -76,22 +76,22 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str) {
 
   command.set_nonblocking(false);
 
-  let listener_config = command.read_message().expect("worker could not read configuration from socket");
-  println!("got message: {:?}", listener_config);
+  let proxy_config = command.read_message().expect("worker could not read configuration from socket");
+  println!("got message: {:?}", proxy_config);
 
   command.set_nonblocking(true);
   let command: CommandChannel<ServerMessage,ProxyOrder> = command.into();
 
   let t = format!("{}-{}", tag, id);
 
-  match listener_config.listener_type {
-    ListenerType::HTTP => {
-      if let Some(config) = listener_config.to_http() {
+  match proxy_config.proxy_type {
+    ProxyType::HTTP => {
+      if let Some(config) = proxy_config.to_http() {
         http::start(t, config, command);
       }
     },
-    ListenerType::HTTPS => {
-      if let Some(config) = listener_config.to_tls() {
+    ProxyType::HTTPS => {
+      if let Some(config) = proxy_config.to_tls() {
         tls::start(t, config, command);
       }
     },
@@ -101,7 +101,7 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str) {
   info!("proxy ended");
 }
 
-pub fn start_worker_process(config: &ListenerConfig, tag: &str, id: &str) -> (pid_t, CommandChannel<ProxyOrder,ServerMessage>) {
+pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t, CommandChannel<ProxyOrder,ServerMessage>) {
   println!("parent({})", unsafe { libc::getpid() });
 
   let (server, client) = UnixStream::pair().unwrap();
@@ -114,7 +114,7 @@ pub fn start_worker_process(config: &ListenerConfig, tag: &str, id: &str) -> (pi
   new_cl_flags.remove(FD_CLOEXEC);
   fcntl(client.as_raw_fd(), FcntlArg::F_SETFD(new_cl_flags));
 
-  let mut command: CommandChannel<ListenerConfig,ServerMessage> = CommandChannel::new(
+  let mut command: CommandChannel<ProxyConfig,ServerMessage> = CommandChannel::new(
     server,
     10000,
     20000

@@ -9,20 +9,20 @@ command_buffer_size = 16384
 address = "192.168.59.103"
 port = 8125
 
-[listeners]
+[proxies]
 
-[listeners.HTTP]
+[proxies.HTTP]
 address = "127.0.0.1"
-listener_type = "HTTP"
+proxy_type = "HTTP"
 max_connections = 500
 port = 8080
 buffer_size = 16384
 #answer_404 = "./404.html"
 #answer_503 = "./503.html"
 
-[listeners.TLS]
+[proxies.TLS]
 address = "127.0.0.1"
-listener_type = "HTTPS"
+proxy_type = "HTTPS"
 max_connections = 500
 port = 8443
 buffer_size = 16384

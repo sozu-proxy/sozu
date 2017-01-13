@@ -26,7 +26,7 @@ use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
 use clap::{App,Arg,SubCommand};
 
-use command::Listener;
+use command::Proxy;
 use worker::{get_executable_path,begin_worker_process,start_workers};
 
 fn main() {
@@ -95,17 +95,17 @@ fn main() {
     METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
     let metrics_guard = ProxyMetrics::run();
 
-    let mut listeners:HashMap<String,Vec<Listener>> = HashMap::new();
+    let mut proxies:HashMap<String,Vec<Proxy>> = HashMap::new();
 
-    for (ref tag, ref ls) in config.listeners {
+    for (ref tag, ref ls) in config.proxies {
       if let Some(workers) = start_workers(&tag, ls) {
-        listeners.insert(tag.clone(), workers);
+        proxies.insert(tag.to_string(), workers);
       }
     };
 
     let buffer_size     = config.command_buffer_size.unwrap_or(10000);
     let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
-    command::start(config.command_socket, listeners, config.saved_state, buffer_size, max_buffer_size);
+    command::start(config.command_socket, proxies, config.saved_state, buffer_size, max_buffer_size);
   } else {
     println!("could not load configuration file at '{}', stopping", config_file);
   }

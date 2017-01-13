@@ -6,12 +6,12 @@ use std::str::FromStr;
 use serde::Deserialize;
 use toml;
 
-use command::data::ListenerType;
+use command::data::ProxyType;
 use sozu::messages::{HttpProxyConfiguration,TlsProxyConfiguration};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
-pub struct ListenerConfig {
-  pub listener_type:             ListenerType,
+pub struct ProxyConfig {
+  pub proxy_type:                ProxyType,
   pub address:                   String,
   pub public_address:            Option<String>,
   pub port:                      u16,
@@ -29,7 +29,7 @@ pub struct ListenerConfig {
 
 }
 
-impl ListenerConfig {
+impl ProxyConfig {
   pub fn to_http(&self) -> Option<HttpProxyConfiguration> {
     let mut address = self.address.clone();
     address.push(':');
@@ -141,13 +141,13 @@ pub struct MetricsConfig {
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct Config {
-  pub command_socket: String,
-  pub command_buffer_size: Option<usize>,
+  pub command_socket:          String,
+  pub command_buffer_size:     Option<usize>,
   pub max_command_buffer_size: Option<usize>,
-  pub saved_state:    Option<String>,
-  pub metrics:        MetricsConfig,
-  pub listeners:      HashMap<String, ListenerConfig>,
-  pub log_level:      Option<String>,
+  pub saved_state:             Option<String>,
+  pub metrics:                 MetricsConfig,
+  pub proxies:                 HashMap<String, ProxyConfig>,
+  pub log_level:               Option<String>,
 }
 
 impl Config {
@@ -191,13 +191,13 @@ mod tests {
   use super::*;
   use std::collections::HashMap;
   use toml::encode_str;
-  use command::data::ListenerType;
+  use command::data::ProxyType;
 
   #[test]
   fn serialize() {
     let mut map = HashMap::new();
-    map.insert(String::from("HTTP"), ListenerConfig {
-      listener_type: ListenerType::HTTP,
+    map.insert(String::from("HTTP"), ProxyConfig {
+      proxy_type: ProxyType::HTTP,
       address: String::from("127.0.0.1"),
       port: 8080,
       max_connections: 500,
@@ -213,8 +213,8 @@ mod tests {
       default_key: None,
       default_name: None,
     });
-    map.insert(String::from("TLS"), ListenerConfig {
-      listener_type: ListenerType::HTTPS,
+    map.insert(String::from("TLS"), ProxyConfig {
+      proxy_type: ProxyType::HTTPS,
       address: String::from("127.0.0.1"),
       port: 8080,
       max_connections: 500,
@@ -240,7 +240,7 @@ mod tests {
         address: String::from("192.168.59.103"),
         port:    8125,
       },
-      listeners: map
+      proxies: map
     };
 
     let encoded = encode_str(&config);

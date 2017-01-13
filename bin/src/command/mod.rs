@@ -22,7 +22,7 @@ pub mod data;
 pub mod orders;
 pub mod client;
 
-use self::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,ListenerType};
+use self::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,ProxyType};
 use self::client::{ConnReadError,CommandClient};
 
 const SERVER: Token = Token(0);
@@ -43,63 +43,63 @@ impl From<FrontToken> for usize {
 }
 
 //#[derive(Serialize)]
-pub struct Listener {
+pub struct Proxy {
   pub tag:           String,
   pub id:            u8,
-  pub listener_type: ListenerType,
+  pub proxy_type:    ProxyType,
   pub channel:       CommandChannel<ProxyOrder,ServerMessage>,
   pub state:         ConfigState,
   pub token:         Option<Token>,
   pub pid:           pid_t,
 }
 
-impl Listener {
-  pub fn new(tag: String, id: u8, pid: pid_t, listener_type: ListenerType, ip_address: String, port: u16, channel: CommandChannel<ProxyOrder,ServerMessage>) -> Listener {
-    let state = match listener_type {
-      ListenerType::HTTP  => ConfigState::Http(HttpProxy::new(ip_address, port)),
-      ListenerType::HTTPS => ConfigState::Tls(TlsProxy::new(ip_address, port)),
-      _                   => unimplemented!(),
+impl Proxy {
+  pub fn new(tag: String, id: u8, pid: pid_t, proxy_type: ProxyType, ip_address: String, port: u16, channel: CommandChannel<ProxyOrder,ServerMessage>) -> Proxy {
+    let state = match proxy_type {
+      ProxyType::HTTP  => ConfigState::Http(HttpProxy::new(ip_address, port)),
+      ProxyType::HTTPS => ConfigState::Tls(TlsProxy::new(ip_address, port)),
+      _                => unimplemented!(),
     };
 
-    Listener {
-      tag:           tag,
-      id:            id,
-      listener_type: listener_type,
-      channel:       channel,
-      state:         state,
-      token:         None,
-      pid:           pid,
+    Proxy {
+      tag:        tag,
+      id:         id,
+      proxy_type: proxy_type,
+      channel:    channel,
+      state:      state,
+      token:      None,
+      pid:        pid,
     }
   }
 }
 
-impl fmt::Debug for Listener {
+impl fmt::Debug for Proxy {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    write!(f, "Listener {{ tag: {}, listener_type: {:?}, state: {:?} }}", self.tag, self.listener_type, self.state)
+    write!(f, "Proxy {{ tag: {}, proxy_type: {:?}, state: {:?} }}", self.tag, self.proxy_type, self.state)
   }
 }
 
 #[derive(Deserialize,Serialize,Debug)]
-pub struct StoredListener {
-  pub tag:           String,
-  pub listener_type: ListenerType,
-  pub state:         ConfigState,
+pub struct StoredProxy {
+  pub tag:        String,
+  pub proxy_type: ProxyType,
+  pub state:      ConfigState,
 }
 
-impl StoredListener {
-  pub fn from_listener(listener: &Listener) -> StoredListener {
-    StoredListener {
-      tag:           listener.tag.clone(),
-      listener_type: listener.listener_type.clone(),
-      state:         listener.state.clone(),
+impl StoredProxy {
+  pub fn from_proxy(proxy: &Proxy) -> StoredProxy {
+    StoredProxy {
+      tag:        proxy.tag.clone(),
+      proxy_type: proxy.proxy_type.clone(),
+      state:      proxy.state.clone(),
     }
   }
 }
 
 #[derive(Deserialize,Serialize,Debug)]
-pub struct ListenerConfiguration {
-  id:        String,
-  listeners: Vec<StoredListener>,
+pub struct ProxyConfiguration {
+  id:      String,
+  proxies: Vec<StoredProxy>,
 }
 
 pub type Tag = String;
@@ -109,8 +109,8 @@ struct CommandServer {
   buffer_size:     usize,
   max_buffer_size: usize,
   conns:           Slab<CommandClient,FrontToken>,
-  listeners:       HashMap<Token, (Tag, Listener)>,
-  listener_count:  usize,
+  proxies:         HashMap<Token, (Tag, Proxy)>,
+  proxy_count:     usize,
   pub poll:        Poll,
   timer:           Timer<Token>,
 }
@@ -149,18 +149,18 @@ impl CommandServer {
     }
   }
 
-  fn new(srv: UnixListener, listeners_map: HashMap<String, Vec<Listener>>, buffer_size: usize, max_buffer_size: usize, poll: Poll) -> CommandServer {
+  fn new(srv: UnixListener, proxies_map: HashMap<String, Vec<Proxy>>, buffer_size: usize, max_buffer_size: usize, poll: Poll) -> CommandServer {
     //FIXME: verify this
     poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
 
-    let mut listeners = HashMap::new();
+    let mut proxies = HashMap::new();
 
     let mut token_count = 0;
-    for (tag, mut listener_list) in listeners_map {
-      for listener in listener_list.drain(..) {
+    for (tag, mut proxy_list) in proxies_map {
+      for proxy in proxy_list.drain(..) {
         token_count += 1;
-        poll.register(&listener.channel.sock, Token(token_count), Ready::all(), PollOpt::edge()).unwrap();
-        listeners.insert(Token(token_count), (tag.clone(), listener));
+        poll.register(&proxy.channel.sock, Token(token_count), Ready::all(), PollOpt::edge()).unwrap();
+        proxies.insert(Token(token_count), (tag.clone(), proxy));
       }
     }
     //let mut timer = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
@@ -173,19 +173,19 @@ impl CommandServer {
       buffer_size:     buffer_size,
       max_buffer_size: max_buffer_size,
       conns:           Slab::with_capacity(128),
-      listeners:       listeners,
-      listener_count:  token_count,
+      proxies:       proxies,
+      proxy_count:  token_count,
       poll:            poll,
       timer:           timer,
     }
   }
 
   pub fn to_front(&self, token: Token) -> FrontToken {
-    FrontToken(token.0 - self.listener_count - 1)
+    FrontToken(token.0 - self.proxy_count - 1)
   }
 
   pub fn from_front(&self, token: FrontToken) -> Token {
-    Token(token.0 + self.listener_count + 1)
+    Token(token.0 + self.proxy_count + 1)
   }
 
 }
@@ -214,18 +214,18 @@ impl CommandServer {
           error!("received writable for token 0");
         }
       },
-      Token(i) if i < self.listener_count + 1 => {
+      Token(i) if i < self.proxy_count + 1 => {
         info!("token({}) worker got event {:?}", i, events);
-        //println!("listeners:\n{:?}", self.listeners);
+        //println!("proxies:\n{:?}", self.proxies);
 
         let mut messages = {
-          let &mut (ref tag, ref mut listener) =  self.listeners.get_mut(&Token(i)).unwrap();
-          listener.channel.handle_events(events);
-          listener.channel.run();
+          let &mut (ref tag, ref mut proxy) =  self.proxies.get_mut(&Token(i)).unwrap();
+          proxy.channel.handle_events(events);
+          proxy.channel.run();
 
           let mut messages = Vec::new();
           loop {
-            let msg = listener.channel.read_message();
+            let msg = proxy.channel.read_message();
             if msg.is_none() {
               break;
             } else {
@@ -237,12 +237,12 @@ impl CommandServer {
         };
 
         for msg in messages.drain(..) {
-          self.listener_handle_message(Token(i), msg);
+          self.proxy_handle_message(Token(i), msg);
         }
 
         {
-          let &mut (ref tag, ref mut listener) =  self.listeners.get_mut(&Token(i)).unwrap();
-          listener.channel.run();
+          let &mut (ref tag, ref mut proxy) =  self.proxies.get_mut(&Token(i)).unwrap();
+          proxy.channel.run();
         }
 
       },
@@ -287,7 +287,7 @@ impl CommandServer {
     }
   }
 
-  fn listener_handle_message(&mut self, token: Token, msg: ServerMessage) {
+  fn proxy_handle_message(&mut self, token: Token, msg: ServerMessage) {
     println!("got answer msg: {:?}", msg);
     let answer = ConfigMessageAnswer {
       id: msg.id.clone(),
@@ -312,7 +312,7 @@ impl CommandServer {
 
 }
 
-pub fn start(path: String,  listeners: HashMap<String, Vec<Listener>>, saved_state: Option<String>, buffer_size: usize,
+pub fn start(path: String,  proxies: HashMap<String, Vec<Proxy>>, saved_state: Option<String>, buffer_size: usize,
     max_buffer_size: usize) {
   let event_loop = Poll::new().unwrap();
   let addr = PathBuf::from(path);
@@ -337,13 +337,13 @@ pub fn start(path: String,  listeners: HashMap<String, Vec<Listener>>, saved_sta
       /*FIXME: timeout
        * event_loop.timeout_ms(0, 700);
        */
-      let mut server = CommandServer::new(srv, listeners, buffer_size, max_buffer_size, event_loop);
+      let mut server = CommandServer::new(srv, proxies, buffer_size, max_buffer_size, event_loop);
       saved_state.as_ref().map(|state_path| {
         server.load_state("INITIALIZATION", state_path);
       });
 
       server.run();
-      //event_loop.run(&mut CommandServer::new(srv, listeners, buffer_size, max_buffer_size)).unwrap()
+      //event_loop.run(&mut CommandServer::new(srv, proxies, buffer_size, max_buffer_size)).unwrap()
     },
       Err(e) => {
         log!(log::LogLevel::Error, "could not create unix socket: {:?}", e);

@@ -4,107 +4,107 @@ use state::{HttpProxy,TlsProxy,ConfigState};
 use sozu::messages::Command;
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]
-pub enum ListenerType {
+pub enum ProxyType {
   HTTP,
   HTTPS,
   TCP
 }
 
-impl serde::Serialize for ListenerType {
+impl serde::Serialize for ProxyType {
   fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
       where S: serde::Serializer,
   {
     match *self {
-      ListenerType::HTTP  => serializer.serialize_str("HTTP"),
-      ListenerType::HTTPS => serializer.serialize_str("HTTPS"),
-      ListenerType::TCP   => serializer.serialize_str("TCP"),
+      ProxyType::HTTP  => serializer.serialize_str("HTTP"),
+      ProxyType::HTTPS => serializer.serialize_str("HTTPS"),
+      ProxyType::TCP   => serializer.serialize_str("TCP"),
     }
   }
 }
 
-impl serde::Deserialize for ListenerType {
-  fn deserialize<D>(deserializer: &mut D) -> Result<ListenerType, D::Error>
+impl serde::Deserialize for ProxyType {
+  fn deserialize<D>(deserializer: &mut D) -> Result<ProxyType, D::Error>
     where D: serde::de::Deserializer
   {
-    struct ListenerTypeVisitor;
+    struct ProxyTypeVisitor;
 
-    impl serde::de::Visitor for ListenerTypeVisitor {
-      type Value = ListenerType;
+    impl serde::de::Visitor for ProxyTypeVisitor {
+      type Value = ProxyType;
 
-      fn visit_str<E>(&mut self, value: &str) -> Result<ListenerType, E>
+      fn visit_str<E>(&mut self, value: &str) -> Result<ProxyType, E>
         where E: serde::de::Error
         {
           match value {
-            "HTTP"  => Ok(ListenerType::HTTP),
-            "HTTPS" => Ok(ListenerType::HTTPS),
-            "TCP"   => Ok(ListenerType::TCP),
-            _ => Err(serde::de::Error::custom("expected HTTP, HTTPS or TCP listener type")),
+            "HTTP"  => Ok(ProxyType::HTTP),
+            "HTTPS" => Ok(ProxyType::HTTPS),
+            "TCP"   => Ok(ProxyType::TCP),
+            _ => Err(serde::de::Error::custom("expected HTTP, HTTPS or TCP proxy type")),
           }
         }
     }
 
-    deserializer.deserialize(ListenerTypeVisitor)
+    deserializer.deserialize(ProxyTypeVisitor)
   }
 }
 
 
 #[derive(Debug,Clone,PartialEq,Eq)]
-pub struct ListenerDeserializer {
+pub struct ProxyDeserializer {
   pub tag:   String,
   pub state: ConfigState,
 }
 
-enum ListenerDeserializerField {
+enum ProxyDeserializerField {
   Tag,
   Type,
   State,
 }
 
-impl serde::Deserialize for ListenerDeserializerField {
-  fn deserialize<D>(deserializer: &mut D) -> Result<ListenerDeserializerField, D::Error>
+impl serde::Deserialize for ProxyDeserializerField {
+  fn deserialize<D>(deserializer: &mut D) -> Result<ProxyDeserializerField, D::Error>
         where D: serde::de::Deserializer {
-    struct ListenerDeserializerFieldVisitor;
-    impl serde::de::Visitor for ListenerDeserializerFieldVisitor {
-      type Value = ListenerDeserializerField;
+    struct ProxyDeserializerFieldVisitor;
+    impl serde::de::Visitor for ProxyDeserializerFieldVisitor {
+      type Value = ProxyDeserializerField;
 
-      fn visit_str<E>(&mut self, value: &str) -> Result<ListenerDeserializerField, E>
+      fn visit_str<E>(&mut self, value: &str) -> Result<ProxyDeserializerField, E>
         where E: serde::de::Error {
         match value {
-          "tag"           => Ok(ListenerDeserializerField::Tag),
-          "listener_type" => Ok(ListenerDeserializerField::Type),
-          "state"         => Ok(ListenerDeserializerField::State),
-          _ => Err(serde::de::Error::custom("expected tag, listener_type or state")),
+          "tag"           => Ok(ProxyDeserializerField::Tag),
+          "proxy_type" => Ok(ProxyDeserializerField::Type),
+          "state"         => Ok(ProxyDeserializerField::State),
+          _ => Err(serde::de::Error::custom("expected tag, proxy_type or state")),
         }
       }
     }
 
-    deserializer.deserialize(ListenerDeserializerFieldVisitor)
+    deserializer.deserialize(ProxyDeserializerFieldVisitor)
   }
 }
 
-struct ListenerDeserializerVisitor;
-impl serde::de::Visitor for ListenerDeserializerVisitor {
-  type Value = ListenerDeserializer;
+struct ProxyDeserializerVisitor;
+impl serde::de::Visitor for ProxyDeserializerVisitor {
+  type Value = ProxyDeserializer;
 
-  fn visit_map<V>(&mut self, mut visitor: V) -> Result<ListenerDeserializer, V::Error>
+  fn visit_map<V>(&mut self, mut visitor: V) -> Result<ProxyDeserializer, V::Error>
         where V: serde::de::MapVisitor {
-    let mut tag:Option<String>                 = None;
-    let mut listener_type:Option<ListenerType> = None;
-    let mut state:Option<serde_json::Value>    = None;
+    let mut tag:Option<String>              = None;
+    let mut proxy_type:Option<ProxyType>    = None;
+    let mut state:Option<serde_json::Value> = None;
 
     loop {
       match try!(visitor.visit_key()) {
-        Some(ListenerDeserializerField::Type)  => { listener_type = Some(try!(visitor.visit_value())); }
-        Some(ListenerDeserializerField::Tag)   => { tag = Some(try!(visitor.visit_value())); }
-        Some(ListenerDeserializerField::State) => { state = Some(try!(visitor.visit_value())); }
+        Some(ProxyDeserializerField::Type)  => { proxy_type = Some(try!(visitor.visit_value())); }
+        Some(ProxyDeserializerField::Tag)   => { tag = Some(try!(visitor.visit_value())); }
+        Some(ProxyDeserializerField::State) => { state = Some(try!(visitor.visit_value())); }
         None => { break; }
       }
     }
 
-    println!("decoded type = {:?}, value= {:?}", listener_type, state);
-    let listener_type = match listener_type {
-      Some(listener) => listener,
-      None => try!(visitor.missing_field("listener_type")),
+    println!("decoded type = {:?}, value= {:?}", proxy_type, state);
+    let proxy_type = match proxy_type {
+      Some(proxy) => proxy,
+      None => try!(visitor.missing_field("proxy_type")),
     };
     let tag = match tag {
       Some(tag) => tag,
@@ -117,32 +117,32 @@ impl serde::de::Visitor for ListenerDeserializerVisitor {
 
     try!(visitor.end());
 
-    let state = match listener_type {
-      ListenerType::HTTP => {
+    let state = match proxy_type {
+      ProxyType::HTTP => {
         let http_proxy: HttpProxy = try!(serde_json::from_value(state).or(Err(serde::de::Error::custom("http_proxy"))));
         ConfigState::Http(http_proxy)
       },
-      ListenerType::HTTPS => {
+      ProxyType::HTTPS => {
         let tls_proxy: TlsProxy = try!(serde_json::from_value(state).or(Err(serde::de::Error::custom("tls_proxy"))));
         ConfigState::Tls(tls_proxy)
       },
-      ListenerType::TCP => {
+      ProxyType::TCP => {
         ConfigState::Tcp
       }
     };
 
-    Ok(ListenerDeserializer {
+    Ok(ProxyDeserializer {
       tag: tag,
       state: state,
     })
   }
 }
 
-impl serde::Deserialize for ListenerDeserializer {
-  fn deserialize<D>(deserializer: &mut D) -> Result<ListenerDeserializer, D::Error>
+impl serde::Deserialize for ProxyDeserializer {
+  fn deserialize<D>(deserializer: &mut D) -> Result<ProxyDeserializer, D::Error>
         where D: serde::de::Deserializer {
-    static FIELDS: &'static [&'static str] = &["tag", "listener_type", "state"];
-    deserializer.deserialize_struct("Listener", FIELDS, ListenerDeserializerVisitor)
+    static FIELDS: &'static [&'static str] = &["tag", "proxy_type", "state"];
+    deserializer.deserialize_struct("Proxy", FIELDS, ProxyDeserializerVisitor)
   }
 }
 
@@ -156,9 +156,9 @@ pub enum ConfigCommand {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub struct ConfigMessage {
-  pub id:       String,
-  pub data:     ConfigCommand,
-  pub listener: Option<String>,
+  pub id:    String,
+  pub data:  ConfigCommand,
+  pub proxy: Option<String>,
 }
 
 
@@ -183,7 +183,7 @@ struct SaveStateData {
 
 enum ConfigMessageField {
   Id,
-  Listener,
+  Proxy,
   Type,
   Data,
 }
@@ -200,9 +200,9 @@ impl serde::Deserialize for ConfigMessageField {
         match value {
           "id"       => Ok(ConfigMessageField::Id),
           "type"     => Ok(ConfigMessageField::Type),
-          "listener" => Ok(ConfigMessageField::Listener),
+          "proxy"    => Ok(ConfigMessageField::Proxy),
           "data"     => Ok(ConfigMessageField::Data),
-          _ => Err(serde::de::Error::custom("expected id, listener, type or data")),
+          _ => Err(serde::de::Error::custom("expected id, proxy, type or data")),
         }
       }
     }
@@ -218,21 +218,21 @@ impl serde::de::Visitor for ConfigMessageVisitor {
   fn visit_map<V>(&mut self, mut visitor: V) -> Result<ConfigMessage, V::Error>
         where V: serde::de::MapVisitor {
     let mut id:Option<String>              = None;
-    let mut listener: Option<String>       = None;
+    let mut proxy: Option<String>          = None;
     let mut config_type:Option<String>     = None;
     let mut data:Option<serde_json::Value> = None;
 
     loop {
       match try!(visitor.visit_key()) {
-        Some(ConfigMessageField::Type)     => { config_type = Some(try!(visitor.visit_value())); }
-        Some(ConfigMessageField::Id)       => { id = Some(try!(visitor.visit_value())); }
-        Some(ConfigMessageField::Listener) => { listener = Some(try!(visitor.visit_value())); }
-        Some(ConfigMessageField::Data)     => { data = Some(try!(visitor.visit_value())); }
+        Some(ConfigMessageField::Type)  => { config_type = Some(try!(visitor.visit_value())); }
+        Some(ConfigMessageField::Id)    => { id = Some(try!(visitor.visit_value())); }
+        Some(ConfigMessageField::Proxy) => { proxy = Some(try!(visitor.visit_value())); }
+        Some(ConfigMessageField::Data)  => { data = Some(try!(visitor.visit_value())); }
         None => { break; }
       }
     }
 
-    //println!("decoded type = {:?}, value= {:?}", listener_type, state);
+    //println!("decoded type = {:?}, value= {:?}", proxy_type, state);
     let config_type = match config_type {
       Some(config) => config,
       None => try!(visitor.missing_field("type")),
@@ -274,7 +274,7 @@ impl serde::de::Visitor for ConfigMessageVisitor {
     Ok(ConfigMessage {
       id:       id,
       data:     data,
-      listener: listener
+      proxy: proxy
     })
   }
 }
@@ -282,7 +282,7 @@ impl serde::de::Visitor for ConfigMessageVisitor {
 impl serde::Deserialize for ConfigMessage {
   fn deserialize<D>(deserializer: &mut D) -> Result<ConfigMessage, D::Error>
     where D: serde::de::Deserializer {
-    static FIELDS: &'static [&'static str] = &["id", "listener", "type", "data"];
+    static FIELDS: &'static [&'static str] = &["id", "proxy", "type", "data"];
     deserializer.deserialize_struct("ConfigMessage", FIELDS, ConfigMessageVisitor)
   }
 }
@@ -296,7 +296,7 @@ impl serde::Serialize for ConfigMessage {
   fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
       where S: serde::Serializer,
   {
-    let mut state = if self.listener.is_some() {
+    let mut state = if self.proxy.is_some() {
       try!(serializer.serialize_map(Some(4)))
     } else {
       try!(serializer.serialize_map(Some(3)))
@@ -305,9 +305,9 @@ impl serde::Serialize for ConfigMessage {
     try!(serializer.serialize_map_key(&mut state, "id"));
     try!(serializer.serialize_map_value(&mut state, &self.id));
 
-    if self.listener.is_some() {
-      try!(serializer.serialize_map_key(&mut state, "listener"));
-      try!(serializer.serialize_map_value(&mut state, self.listener.as_ref().unwrap()));
+    if self.proxy.is_some() {
+      try!(serializer.serialize_map_key(&mut state, "proxy"));
+      try!(serializer.serialize_map_value(&mut state, self.proxy.as_ref().unwrap()));
     }
 
     match self.data {
@@ -348,10 +348,10 @@ mod tests {
 
   #[test]
   fn config_message_test() {
-    let raw_json = r#"{ "id": "ID_TEST", "type": "PROXY", "listener": "HTTP", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}} }"#;
+    let raw_json = r#"{ "id": "ID_TEST", "type": "PROXY", "proxy": "HTTP", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}} }"#;
     let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", message);
-    assert_eq!(message.listener, Some(String::from("HTTP")));
+    assert_eq!(message.proxy, Some(String::from("HTTP")));
     assert_eq!(message.data, ConfigCommand::ProxyConfiguration(Command::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
@@ -364,7 +364,7 @@ mod tests {
     let raw_json = r#"{ "id": "ID_TEST", "type": "SAVE_STATE", "data":{ "path": "./config_dump.json"} }"#;
     let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", message);
-    assert_eq!(message.listener, None);
+    assert_eq!(message.proxy, None);
     assert_eq!(message.data, ConfigCommand::SaveState(String::from("./config_dump.json")));
   }
 
@@ -377,7 +377,7 @@ mod tests {
     let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
     println!("C");
     println!("{:?}", message);
-    assert_eq!(message.listener, None);
+    assert_eq!(message.proxy, None);
     println!("D");
     assert_eq!(message.data, ConfigCommand::DumpState);
   }
