@@ -16,6 +16,7 @@ use serde_json;
 use sozu::network::{ProxyOrder,ServerMessage,ServerMessageStatus};
 use sozu::channel::Channel;
 
+use config::Config;
 use state::{HttpProxy,TlsProxy,ConfigState};
 
 pub mod data;
@@ -312,10 +313,13 @@ impl CommandServer {
 
 }
 
-pub fn start(path: String,  proxies: HashMap<String, Vec<Proxy>>, saved_state: Option<String>, buffer_size: usize,
-    max_buffer_size: usize) {
+pub fn start(config: Config, proxies: HashMap<String, Vec<Proxy>>) {
+  let buffer_size     = config.command_buffer_size.unwrap_or(10000);
+  let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
+  let saved_state     = config.saved_state;
+
   let event_loop = Poll::new().unwrap();
-  let addr = PathBuf::from(path);
+  let addr = PathBuf::from(config.command_socket);
   if let Err(e) = fs::remove_file(&addr) {
     match e.kind() {
       ErrorKind::NotFound => {},

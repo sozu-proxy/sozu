@@ -83,7 +83,7 @@ fn main() {
   let config_file = submatches.value_of("config").expect("required config file");
 
   if let Ok(config) = config::Config::load_from_path(config_file) {
-    if let Some(log_level) = config.log_level {
+    if let Some(ref log_level) = config.log_level {
      builder.parse(&log_level);
     }
 
@@ -97,7 +97,7 @@ fn main() {
 
     let mut proxies:HashMap<String,Vec<Proxy>> = HashMap::new();
 
-    for (ref tag, ref ls) in config.proxies {
+    for (ref tag, ref ls) in &config.proxies {
       if let Some(workers) = start_workers(&tag, ls) {
         proxies.insert(tag.to_string(), workers);
       }
@@ -105,7 +105,7 @@ fn main() {
 
     let buffer_size     = config.command_buffer_size.unwrap_or(10000);
     let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
-    command::start(config.command_socket, proxies, config.saved_state, buffer_size, max_buffer_size);
+    command::start(config, proxies);
   } else {
     println!("could not load configuration file at '{}', stopping", config_file);
   }
