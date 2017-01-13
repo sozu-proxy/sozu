@@ -165,9 +165,7 @@ pub struct Config {
 
 impl Config {
   pub fn load_from_path(path: &str) -> io::Result<Config> {
-    let mut f = try!(File::open(path));
-    let mut data = String::new();
-    try!(f.read_to_string(&mut data));
+    let data = try!(Config::load_file(path));
 
     let mut parser = toml::Parser::new(&data[..]);
     if let Some(table) = parser.parse() {
@@ -198,18 +196,6 @@ impl Config {
     }
   }
 
-/*
-pub struct AppConfig {
-  pub hostname:          String,
-  pub path_begin:        Option<String>,
-  pub certificate:       Option<String>,
-  pub key:               Option<String>,
-  pub certificate_chain: Option<String>,
-  pub frontends:         Vec<String>,
-  pub backends:          Vec<String>,
-}
-*/
-
   pub fn generate_config_messages(&self) -> Vec<ConfigMessage> {
     let mut v = Vec::new();
     let mut count = 0u8;
@@ -219,17 +205,31 @@ pub struct AppConfig {
         let path_begin = app.path_begin.as_ref().unwrap_or(&String::new()).clone();
 
         let frontend_order = if self.proxies.get(tag).and_then(|p| p.to_tls()).is_some() {
-          //FIXME: certificate loading and parsing
-          let certificate = "".to_string(); //load file in string
-          let key = "".to_string(); //load file in string
-          let certificate_chain = Vec::new(); // load and parse
+          let key_opt         = app.key.as_ref().and_then(|path| Config::load_file(&path).ok());
+          let certificate_opt = app.certificate.as_ref().and_then(|path| Config::load_file(&path).ok());
+          let chain_opt       = app.certificate_chain.as_ref().and_then(|path| Config::load_file(&path).ok())
+            .map(Config::split_certificate_chain);
+
+          if key_opt.is_none() {
+            error!("cannot read the key at {:?}", app.key);
+            continue;
+          }
+          if certificate_opt.is_none() {
+            error!("cannot read the certificate at {:?}", app.certificate);
+            continue;
+          }
+          if chain_opt.is_none() {
+            error!("cannot read the certificate chain at {:?}", app.certificate_chain);
+            continue;
+          }
+
           Order::AddTlsFront(TlsFront {
             app_id:            id.to_string(),
             hostname:          app.hostname.clone(),
             path_begin:        path_begin,
-            key:               key,
-            certificate:       certificate,
-            certificate_chain: certificate_chain,
+            key:               key_opt.unwrap(),
+            certificate:       certificate_opt.unwrap(),
+            certificate_chain: chain_opt.unwrap(),
           })
         } else {
           Order::AddHttpFront(HttpFront {
@@ -274,6 +274,29 @@ pub struct AppConfig {
       }
     }
 
+    v
+  }
+
+  pub fn load_file(path: &str) -> io::Result<String> {
+    let mut f = try!(File::open(path));
+    let mut data = String::new();
+    try!(f.read_to_string(&mut data));
+    Ok(data)
+  }
+
+  pub fn split_certificate_chain(mut chain: String) -> Vec<String> {
+    let mut v = Vec::new();
+
+    let end = "-----END CERTIFICATE-----";
+    loop {
+      match chain.find(end) {
+        Some(sz) => {
+          let cert: String = chain.drain(..sz+end.len()).collect();
+          v.push(cert.trim().to_string());
+        },
+        None     => break,
+      }
+    }
     v
   }
 }
