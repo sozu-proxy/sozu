@@ -23,7 +23,7 @@ fn main() {
   let (mut command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
 
   let jg            = thread::spawn(move || {
-    network::http::start_listener(String::from("HTTP"), config, channel);
+    network::http::start(String::from("HTTP"), config, channel);
   });
 
   let http_front = messages::HttpFront {

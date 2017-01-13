@@ -611,7 +611,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
 pub type HttpServer = Server<ServerConfiguration,Client>;
 
-pub fn start_listener(tag:String, config: HttpProxyConfiguration, channel: Channel) {
+pub fn start(tag:String, config: HttpProxyConfiguration, channel: Channel) {
   let mut event_loop  = Poll::new().unwrap();
   let max_connections = config.max_connections;
   let max_listeners   = 1;
@@ -659,7 +659,7 @@ mod tests {
 
     let (mut command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
     let jg = thread::spawn(move || {
-      start_listener(String::from("HTTP"), config, channel);
+      start(String::from("HTTP"), config, channel);
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
@@ -712,7 +712,7 @@ mod tests {
     let (mut command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
 
     let jg = thread::spawn(move|| {
-      start_listener(String::from("HTTP"), config, channel);
+      start(String::from("HTTP"), config, channel);
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1031"), path_begin: String::from("/") };

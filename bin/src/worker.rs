@@ -10,7 +10,7 @@ use std::os::unix::io::{AsRawFd,FromRawFd};
 use nix::unistd::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 
-use sozu::network::{self,ProxyOrder,ServerMessage};
+use sozu::network::{ProxyOrder,ServerMessage,http,tls};
 use sozu::command::CommandChannel;
 use command::Listener;
 use command::data::ListenerType;
@@ -87,12 +87,12 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str) {
   match listener_config.listener_type {
     ListenerType::HTTP => {
       if let Some(config) = listener_config.to_http() {
-        network::http::start_listener(t, config, command);
+        http::start(t, config, command);
       }
     },
     ListenerType::HTTPS => {
       if let Some(config) = listener_config.to_tls() {
-        network::tls::start_listener(t, config, command);
+        tls::start(t, config, command);
       }
     },
     _ => unimplemented!()

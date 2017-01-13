@@ -556,7 +556,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
 pub type TcpServer = Server<ServerConfiguration,Client>;
 
-pub fn start() -> CommandChannel<ProxyOrder,ServerMessage> {
+pub fn start_example() -> CommandChannel<ProxyOrder,ServerMessage> {
   let poll = Poll::new().unwrap();
 
 
@@ -603,7 +603,7 @@ pub fn start() -> CommandChannel<ProxyOrder,ServerMessage> {
   command
 }
 
-pub fn start_listener(max_listeners: usize, max_connections: usize, channel: Channel) {
+pub fn start(max_listeners: usize, max_connections: usize, channel: Channel) {
   let poll              = Poll::new().unwrap();
   let configuration     = ServerConfiguration::new(max_listeners, channel);
   let mut server        = TcpServer::new(max_listeners, max_connections, configuration, poll);
@@ -629,7 +629,7 @@ mod tests {
   #[test]
   fn mi() {
     thread::spawn(|| { start_server(); });
-    let tx = start();
+    let tx = start_example();
     thread::sleep(Duration::from_millis(300));
 
     let mut s1 = TcpStream::connect("127.0.0.1:1234").unwrap();

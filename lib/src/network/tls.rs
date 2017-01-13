@@ -900,7 +900,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
 pub type TlsServer = Server<ServerConfiguration,TlsClient>;
 
-pub fn start_listener(tag: String, config: TlsProxyConfiguration, channel: Channel) {
+pub fn start(tag: String, config: TlsProxyConfiguration, channel: Channel) {
   let mut event_loop  = Poll::new().unwrap();
   let max_connections = config.max_connections;
   let max_listeners   = 1;
