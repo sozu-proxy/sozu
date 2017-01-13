@@ -18,14 +18,14 @@ use rand::random;
 use uuid::Uuid;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
 use network::proxy::{BackendConnectAction,Server,ProxyClient,ProxyConfiguration,
-  Readiness,ListenToken,FrontToken,BackToken,Channel};
+  Readiness,ListenToken,FrontToken,BackToken,ProxyChannel};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use pool::{Pool,Checkout,Reset};
 
 use messages::{self,TcpFront,Command,Instance};
-use command::CommandChannel;
+use channel::Channel;
 
 
 const SERVER: Token = Token(0);
@@ -332,14 +332,14 @@ pub struct ServerConfiguration {
   fronts:          HashMap<String, ListenToken>,
   instances:       HashMap<String, Vec<Backend>>,
   listeners:       Slab<ApplicationListener,ListenToken>,
-  channel:         Channel,
+  channel:         ProxyChannel,
   pool:            Pool<BufferQueue>,
   front_timeout:   u64,
   back_timeout:    u64,
 }
 
 impl ServerConfiguration {
-  pub fn new(max_listeners: usize, channel: Channel) -> ServerConfiguration {
+  pub fn new(max_listeners: usize, channel: ProxyChannel) -> ServerConfiguration {
     ServerConfiguration {
       instances:     HashMap::new(),
       listeners:     Slab::with_capacity(max_listeners),
@@ -548,7 +548,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     self.back_timeout
   }
 
-  fn channel(&mut self) -> &mut Channel {
+  fn channel(&mut self) -> &mut ProxyChannel {
     &mut self.channel
   }
 
@@ -556,13 +556,13 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
 pub type TcpServer = Server<ServerConfiguration,Client>;
 
-pub fn start_example() -> CommandChannel<ProxyOrder,ServerMessage> {
+pub fn start_example() -> Channel<ProxyOrder,ServerMessage> {
   let poll = Poll::new().unwrap();
 
 
   info!("TCP\tlisten for connections");
   //event_loop.register(&listener, SERVER, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-  let (mut command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
+  let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
   let configuration = ServerConfiguration::new(10, channel);
   let mut s = TcpServer::new(10, 500, configuration, poll);
   thread::spawn(move|| {
@@ -603,7 +603,7 @@ pub fn start_example() -> CommandChannel<ProxyOrder,ServerMessage> {
   command
 }
 
-pub fn start(max_listeners: usize, max_connections: usize, channel: Channel) {
+pub fn start(max_listeners: usize, max_connections: usize, channel: ProxyChannel) {
   let poll              = Poll::new().unwrap();
   let configuration     = ServerConfiguration::new(max_listeners, channel);
   let mut server        = TcpServer::new(max_listeners, max_connections, configuration, poll);

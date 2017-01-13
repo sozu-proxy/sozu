@@ -14,7 +14,7 @@ use libc::pid_t;
 use serde_json;
 
 use sozu::network::{ProxyOrder,ServerMessage,ServerMessageStatus};
-use sozu::command::CommandChannel;
+use sozu::channel::Channel;
 
 use state::{HttpProxy,TlsProxy,ConfigState};
 
@@ -47,14 +47,14 @@ pub struct Proxy {
   pub tag:           String,
   pub id:            u8,
   pub proxy_type:    ProxyType,
-  pub channel:       CommandChannel<ProxyOrder,ServerMessage>,
+  pub channel:       Channel<ProxyOrder,ServerMessage>,
   pub state:         ConfigState,
   pub token:         Option<Token>,
   pub pid:           pid_t,
 }
 
 impl Proxy {
-  pub fn new(tag: String, id: u8, pid: pid_t, proxy_type: ProxyType, ip_address: String, port: u16, channel: CommandChannel<ProxyOrder,ServerMessage>) -> Proxy {
+  pub fn new(tag: String, id: u8, pid: pid_t, proxy_type: ProxyType, ip_address: String, port: u16, channel: Channel<ProxyOrder,ServerMessage>) -> Proxy {
     let state = match proxy_type {
       ProxyType::HTTP  => ConfigState::Http(HttpProxy::new(ip_address, port)),
       ProxyType::HTTPS => ConfigState::Tls(TlsProxy::new(ip_address, port)),

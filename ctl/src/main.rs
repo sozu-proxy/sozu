@@ -16,7 +16,7 @@ mod messages;
 
 use mio_uds::UnixStream;
 use clap::{App,Arg,SubCommand};
-use sozu::command::CommandChannel;
+use sozu::channel::Channel;
 
 use command::{dump_state,load_state,save_state};
 use messages::{ConfigMessage,ConfigMessageAnswer};
@@ -60,7 +60,7 @@ fn main() {
 
   let config = config::Config::load_from_path(config_file).expect("could not parse configuration file");
   let stream = UnixStream::connect(config.command_socket).expect("could not connect to the command unix socket");
-  let mut channel: CommandChannel<ConfigMessage,ConfigMessageAnswer> = CommandChannel::new(stream, 10000, 20000);
+  let mut channel: Channel<ConfigMessage,ConfigMessageAnswer> = Channel::new(stream, 10000, 20000);
   channel.set_nonblocking(false);
 
   match matches.subcommand() {

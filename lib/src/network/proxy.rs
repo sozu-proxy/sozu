@@ -24,13 +24,13 @@ use rand::random;
 use network::{ClientResult,MessageId,ServerMessage,ServerMessageStatus,ConnectionError,
   SocketType,socket_type,Protocol,ProxyOrder,RequiredEvents};
 use messages::{self,TcpFront,Command,Instance};
-use command::CommandChannel;
+use channel::Channel;
 
 const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
 const DEFAULT_BACK_TIMEOUT:  u64 = 50000;
 
-pub type Channel = CommandChannel<ServerMessage,ProxyOrder>;
+pub type ProxyChannel = Channel<ServerMessage,ProxyOrder>;
 
 #[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
 pub struct ListenToken(pub usize);
@@ -140,7 +140,7 @@ pub trait ProxyConfiguration<Client> {
   fn front_timeout(&self) -> u64;
   fn back_timeout(&self)  -> u64;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
-  fn channel(&mut self) -> &mut Channel;
+  fn channel(&mut self) -> &mut ProxyChannel;
 }
 
 pub struct Server<ServerConfiguration,Client> {

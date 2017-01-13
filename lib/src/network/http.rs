@@ -19,10 +19,10 @@ use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionE
 use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
 use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,
-  Readiness,ListenToken,FrontToken,BackToken,Channel};
+  Readiness,ListenToken,FrontToken,BackToken,ProxyChannel};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use messages::{self,Command,HttpFront,HttpProxyConfiguration};
-use command::CommandChannel;
+use channel::Channel;
 use parser::http11::hostname_and_port;
 
 type BackendToken = Token;
@@ -283,7 +283,7 @@ pub struct ServerConfiguration {
   instances:       HashMap<AppId, Vec<Backend>>,
   fronts:          HashMap<Hostname, Vec<HttpFront>>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
-  channel:         Channel,
+  channel:         ProxyChannel,
   answers:         DefaultAnswers,
   front_timeout:   u64,
   back_timeout:    u64,
@@ -292,7 +292,7 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(tag: String, config: HttpProxyConfiguration, channel: Channel, event_loop: &mut Poll, start_at:usize) -> io::Result<ServerConfiguration> {
+  pub fn new(tag: String, config: HttpProxyConfiguration, channel: ProxyChannel, event_loop: &mut Poll, start_at:usize) -> io::Result<ServerConfiguration> {
     let front = config.front;
     match server_bind(&config.front) {
       Ok(sock) => {
@@ -604,14 +604,14 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     self.back_timeout
   }
 
-  fn channel(&mut self) -> &mut Channel {
+  fn channel(&mut self) -> &mut ProxyChannel {
     &mut self.channel
   }
 }
 
 pub type HttpServer = Server<ServerConfiguration,Client>;
 
-pub fn start(tag:String, config: HttpProxyConfiguration, channel: Channel) {
+pub fn start(tag:String, config: HttpProxyConfiguration, channel: ProxyChannel) {
   let mut event_loop  = Poll::new().unwrap();
   let max_connections = config.max_connections;
   let max_listeners   = 1;
@@ -657,7 +657,7 @@ mod tests {
       ..Default::default()
     };
 
-    let (mut command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
+    let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
     let jg = thread::spawn(move || {
       start(String::from("HTTP"), config, channel);
     });
@@ -709,7 +709,7 @@ mod tests {
       ..Default::default()
     };
 
-    let (mut command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
+    let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 
     let jg = thread::spawn(move|| {
       start(String::from("HTTP"), config, channel);
@@ -817,7 +817,7 @@ mod tests {
       HttpFront { app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned() },
     ]);
 
-    let (command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
+    let (command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").unwrap();
     let listener = tcp::TcpListener::bind(&front).unwrap();

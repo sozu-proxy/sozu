@@ -14,7 +14,7 @@ use std::env;
 use sozu::network;
 use sozu::messages;
 use sozu::network::metrics::{METRICS,ProxyMetrics};
-use sozu::command::CommandChannel;
+use sozu::channel::Channel;
 use openssl::ssl;
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
@@ -57,7 +57,7 @@ fn main() {
     ..Default::default()
   };
 
-  let (mut command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
+  let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
   let jg = thread::spawn(move || {
     network::http::start(String::from("HTTP"), config, channel);
   });
@@ -94,7 +94,7 @@ fn main() {
     ..Default::default()
   };
 
-  let (mut command2, channel2) = CommandChannel::generate(1000, 10000).expect("should create a channel");
+  let (mut command2, channel2) = Channel::generate(1000, 10000).expect("should create a channel");
   let jg2 = thread::spawn(move || {
     network::tls::start(String::from("TLS"), config, channel2);
   });

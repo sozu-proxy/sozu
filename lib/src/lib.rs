@@ -27,12 +27,12 @@
 //!   ..Default::default()
 //! };
 //!
-//! let (tx, rx)      = mio::channel::channel::<ProxyOrder>();
-//! let (sender, rec) = mpsc::channel::<network::ServerMessage>();
+//! let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 //!
 //! let jg            = thread::spawn(move || {
-//!   network::http::start_listener(String::from("HTTP"), config, sender, rx);
+//!    network::http::start(String::from("HTTP"), config, channel);
 //! });
+//!
 //! ```
 //!
 //! The `tx, rx` channel here is a mio channel through which the proxy will
@@ -57,18 +57,18 @@
 //!   port:       8080
 //! };
 //!
-//! tx.send(network::ProxyOrder { id:
+//! command.write_message(network::ProxyOrder { id:
 //!   String::from("ID_ABCD"),
 //!   messages::Command::AddHttpFront(http_front)
 //! ));
 //!
-//! tx.send(network::ProxyOrder { id:
+//! command.write_message(network::ProxyOrder { id:
 //!   String::from("ID_EFGH"),
 //!   messages::Command::AddInstance(http_instance)
 //! ));
 //!
-//! println!("HTTP -> {:?}", rec.recv().unwrap());
-//! println!("HTTP -> {:?}", rec.recv().unwrap());
+//! println!("HTTP -> {:?}", command.read_message());
+//! println!("HTTP -> {:?}", command.read_message());
 //! ```
 //!
 //! An application is identified by its `app_id`, a string that will be shared
@@ -103,7 +103,8 @@
 //! use std::sync::mpsc;
 //! use sozu::messages;
 //! use sozu::network::{self,ProxyOrder};
-
+//! use sozu::channel::Channel;
+//!
 //! fn main() {
 //!   env_logger::init().unwrap();
 //!   info!("starting up");
@@ -113,11 +114,10 @@
 //!     ..Default::default()
 //!   };
 //!
-//!   let (tx, rx)      = mio::channel::channel::<ProxyOrder>();
-//!   let (sender, rec) = mpsc::channel::<network::ServerMessage>();
+//!   let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 //!
 //!   let jg            = thread::spawn(move || {
-//!     network::http::start_listener(String::from("HTTP"), config, sender, rx);
+//!      network::http::start(String::from("HTTP"), config, channel);
 //!   });
 //!
 //!   let http_front = messages::HttpFront {
@@ -131,18 +131,18 @@
 //!     port:       8080
 //!   };
 //!
-//!   tx.send(network::ProxyOrder {
+//!   command.write_message(network::ProxyOrder {
 //!     id:      String::from("ID_ABCD"),
 //!     command: messages::Command::AddHttpFront(http_front)
 //!   ));
 //!
-//!   tx.send(network::ProxyOrder {
+//!   command.write_message(network::ProxyOrder {
 //!     id:      String::from("ID_EFGH"),
 //!     command: messages::Command::AddInstance(http_instance)
 //!   ));
 //!
-//!   println!("HTTP -> {:?}", rec.recv().unwrap());
-//!   println!("HTTP -> {:?}", rec.recv().unwrap());
+//!   println!("HTTP -> {:?}", command.read_message());
+//!   println!("HTTP -> {:?}", command.write_message());
 //!
 //!   let _ = jg.join();
 //!   info!("good bye");
@@ -173,4 +173,4 @@ extern crate mio_uds;
 pub mod network;
 pub mod parser;
 pub mod messages;
-pub mod command;
+pub mod channel;

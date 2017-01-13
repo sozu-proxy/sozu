@@ -11,7 +11,7 @@ use nix::unistd::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 
 use sozu::network::{ProxyOrder,ServerMessage,http,tls};
-use sozu::command::CommandChannel;
+use sozu::channel::Channel;
 use command::Proxy;
 use command::data::ProxyType;
 use config::ProxyConfig;
@@ -59,16 +59,16 @@ pub fn start_workers(tag: &str, ls: &ProxyConfig) -> Option<Vec<Proxy>> {
   }
 }
 
-fn generate_channels() -> io::Result<(CommandChannel<ProxyOrder,ServerMessage>, CommandChannel<ServerMessage,ProxyOrder>)> {
+fn generate_channels() -> io::Result<(Channel<ProxyOrder,ServerMessage>, Channel<ServerMessage,ProxyOrder>)> {
   let (command,proxy) = try!(UnixStream::pair());
   //FIXME: configurable buffer size
-  let proxy_channel   = CommandChannel::new(proxy, 10000, 20000);
-  let command_channel = CommandChannel::new(command, 10000, 20000);
+  let proxy_channel   = Channel::new(proxy, 10000, 20000);
+  let command_channel = Channel::new(command, 10000, 20000);
   Ok((command_channel, proxy_channel))
 }
 
 pub fn begin_worker_process(fd: i32, id: &str, tag: &str) {
-  let mut command: CommandChannel<ServerMessage,ProxyConfig> = CommandChannel::new(
+  let mut command: Channel<ServerMessage,ProxyConfig> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
     10000,
     20000
@@ -80,7 +80,7 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str) {
   println!("got message: {:?}", proxy_config);
 
   command.set_nonblocking(true);
-  let command: CommandChannel<ServerMessage,ProxyOrder> = command.into();
+  let command: Channel<ServerMessage,ProxyOrder> = command.into();
 
   let t = format!("{}-{}", tag, id);
 
@@ -101,7 +101,7 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str) {
   info!("proxy ended");
 }
 
-pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t, CommandChannel<ProxyOrder,ServerMessage>) {
+pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t, Channel<ProxyOrder,ServerMessage>) {
   println!("parent({})", unsafe { libc::getpid() });
 
   let (server, client) = UnixStream::pair().unwrap();
@@ -114,7 +114,7 @@ pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t
   new_cl_flags.remove(FD_CLOEXEC);
   fcntl(client.as_raw_fd(), FcntlArg::F_SETFD(new_cl_flags));
 
-  let mut command: CommandChannel<ProxyConfig,ServerMessage> = CommandChannel::new(
+  let mut command: Channel<ProxyConfig,ServerMessage> = Channel::new(
     server,
     10000,
     20000
@@ -131,7 +131,7 @@ pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t
       command.write_message(config);
       command.set_nonblocking(true);
 
-      let command: CommandChannel<ProxyOrder,ServerMessage> = command.into();
+      let command: Channel<ProxyOrder,ServerMessage> = command.into();
       return (child, command);
     }
     ForkResult::Child => {

@@ -21,7 +21,7 @@ pub enum ConnError {
   SocketError,
 }
 
-pub struct CommandChannel<Tx,Rx> {
+pub struct Channel<Tx,Rx> {
   pub sock:        UnixStream,
   front_buf:       Buffer,
   back_buf:        Buffer,
@@ -33,9 +33,9 @@ pub struct CommandChannel<Tx,Rx> {
   phantom_rx:      PhantomData<Rx>,
 }
 
-impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
-  pub fn new(sock: UnixStream, buffer_size: usize, max_buffer_size: usize) -> CommandChannel<Tx,Rx> {
-    CommandChannel {
+impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
+  pub fn new(sock: UnixStream, buffer_size: usize, max_buffer_size: usize) -> Channel<Tx,Rx> {
+    Channel {
       sock:            sock,
       front_buf:       Buffer::with_capacity(buffer_size),
       back_buf:        Buffer::with_capacity(buffer_size),
@@ -48,8 +48,8 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
     }
   }
 
-  pub fn into<Tx2: Debug+Serialize, Rx2: Debug+Deserialize>(self) -> CommandChannel<Tx2,Rx2> {
-    CommandChannel {
+  pub fn into<Tx2: Debug+Serialize, Rx2: Debug+Deserialize>(self) -> Channel<Tx2,Rx2> {
+    Channel {
       sock:            self.sock,
       front_buf:       self.front_buf,
       back_buf:        self.back_buf,
@@ -332,31 +332,31 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> CommandChannel<Tx,Rx> {
   }
 }
 
-impl<Tx: Debug+Deserialize+Serialize, Rx: Debug+Deserialize+Serialize> CommandChannel<Tx,Rx> {
-  pub fn generate(buffer_size: usize, max_buffer_size: usize) -> io::Result<(CommandChannel<Tx,Rx>, CommandChannel<Rx,Tx>)> {
+impl<Tx: Debug+Deserialize+Serialize, Rx: Debug+Deserialize+Serialize> Channel<Tx,Rx> {
+  pub fn generate(buffer_size: usize, max_buffer_size: usize) -> io::Result<(Channel<Tx,Rx>, Channel<Rx,Tx>)> {
     let     (command,proxy) = try!(UnixStream::pair());
-    let     proxy_channel   = CommandChannel::new(proxy, buffer_size, max_buffer_size);
-    let mut command_channel = CommandChannel::new(command, buffer_size, max_buffer_size);
+    let     proxy_channel   = Channel::new(proxy, buffer_size, max_buffer_size);
+    let mut command_channel = Channel::new(command, buffer_size, max_buffer_size);
     command_channel.set_nonblocking(false);
     Ok((command_channel, proxy_channel))
   }
 
-  pub fn generate_nonblocking(buffer_size: usize, max_buffer_size: usize) -> io::Result<(CommandChannel<Tx,Rx>, CommandChannel<Rx,Tx>)> {
+  pub fn generate_nonblocking(buffer_size: usize, max_buffer_size: usize) -> io::Result<(Channel<Tx,Rx>, Channel<Rx,Tx>)> {
     let (command,proxy) = try!(UnixStream::pair());
-    let proxy_channel   = CommandChannel::new(proxy, buffer_size, max_buffer_size);
-    let command_channel = CommandChannel::new(command, buffer_size, max_buffer_size);
+    let proxy_channel   = Channel::new(proxy, buffer_size, max_buffer_size);
+    let command_channel = Channel::new(command, buffer_size, max_buffer_size);
     Ok((command_channel, proxy_channel))
   }
 }
 
-impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Iterator for CommandChannel<Tx,Rx> {
+impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Iterator for Channel<Tx,Rx> {
   type Item = Rx;
   fn next(&mut self) -> Option<Self::Item> {
     self.read_message()
   }
 }
 
-impl<Tx,Rx> Evented for CommandChannel<Tx,Rx> {
+impl<Tx,Rx> Evented for Channel<Tx,Rx> {
   fn register(&self,
               poll: &Poll,
               token: Token,

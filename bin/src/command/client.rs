@@ -8,7 +8,7 @@ use log;
 use nom::{IResult,Offset};
 use serde_json::from_str;
 
-use sozu::command::CommandChannel;
+use sozu::channel::Channel;
 use sozu::network::buffer::Buffer;
 
 use super::{ConfigMessage,ConfigMessageAnswer};
@@ -21,7 +21,7 @@ pub enum ConnReadError {
 }
 
 pub struct CommandClient {
-  pub channel:       CommandChannel<ConfigMessageAnswer,ConfigMessage>,
+  pub channel:       Channel<ConfigMessageAnswer,ConfigMessage>,
   pub token:         Option<Token>,
   message_ids:       Vec<String>,
   pub write_timeout: Option<Timeout>,
@@ -29,7 +29,7 @@ pub struct CommandClient {
 
 impl CommandClient {
   pub fn new(sock: UnixStream, buffer_size: usize, max_buffer_size: usize) -> CommandClient {
-    let channel = CommandChannel::new(sock, buffer_size, max_buffer_size);
+    let channel = Channel::new(sock, buffer_size, max_buffer_size);
     CommandClient {
       channel:         channel,
       token:           None,

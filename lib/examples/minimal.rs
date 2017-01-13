@@ -9,7 +9,7 @@ extern crate mio_uds;
 use std::thread;
 use sozu::messages;
 use sozu::network;
-use sozu::command::CommandChannel;
+use sozu::channel::Channel;
 
 fn main() {
   env_logger::init().unwrap();
@@ -20,7 +20,7 @@ fn main() {
     ..Default::default()
   };
 
-  let (mut command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
+  let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 
   let jg            = thread::spawn(move || {
     network::http::start(String::from("HTTP"), config, channel);

@@ -31,14 +31,14 @@ use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,Protocol};
 use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,
-  Readiness,ListenToken,FrontToken,BackToken,Channel};
+  Readiness,ListenToken,FrontToken,BackToken,ProxyChannel};
 use messages::{self,Command,TlsFront,TlsProxyConfiguration};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
 
-use command::CommandChannel;
+use channel::Channel;
 
 type BackendToken = Token;
 
@@ -319,7 +319,7 @@ pub struct ServerConfiguration {
   domains:         Arc<Mutex<TrieNode<CertFingerprint>>>,
   default_context: TlsData,
   contexts:        Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
-  channel:         Channel,
+  channel:         ProxyChannel,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
   front_timeout:   u64,
@@ -329,7 +329,7 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(tag: String, config: TlsProxyConfiguration, channel: Channel, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
+  pub fn new(tag: String, config: TlsProxyConfiguration, channel: ProxyChannel, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let mut domains  = TrieNode::root();
     let mut fronts   = HashMap::new();
@@ -893,14 +893,14 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     self.back_timeout
   }
 
-  fn channel(&mut self) -> &mut Channel {
+  fn channel(&mut self) -> &mut ProxyChannel {
     &mut self.channel
   }
 }
 
 pub type TlsServer = Server<ServerConfiguration,TlsClient>;
 
-pub fn start(tag: String, config: TlsProxyConfiguration, channel: Channel) {
+pub fn start(tag: String, config: TlsProxyConfiguration, channel: ProxyChannel) {
   let mut event_loop  = Poll::new().unwrap();
   let max_connections = config.max_connections;
   let max_listeners   = 1;
@@ -1044,7 +1044,7 @@ mod tests {
     let rc_domains = Arc::new(Mutex::new(domains));
 
     let context    = SslContext::builder(SslMethod::tls()).unwrap();
-    let (command, channel) = CommandChannel::generate(1000, 10000).expect("should create a channel");
+    let (command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 
     let tls_data = TlsData {
       context:     context.build(),

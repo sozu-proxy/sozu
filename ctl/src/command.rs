@@ -1,11 +1,11 @@
-use sozu::command::CommandChannel;
+use sozu::channel::Channel;
 use messages::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
 
 fn generate_id() -> String {
   "hello".to_string()
 }
 
-pub fn save_state(channel: &mut CommandChannel<ConfigMessage,ConfigMessageAnswer>, path: &str) {
+pub fn save_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path: &str) {
   let id = generate_id();
   channel.write_message(&ConfigMessage {
     id:       id.clone(),
@@ -37,7 +37,7 @@ pub fn save_state(channel: &mut CommandChannel<ConfigMessage,ConfigMessageAnswer
   }
 }
 
-pub fn load_state(channel: &mut CommandChannel<ConfigMessage,ConfigMessageAnswer>, path: &str) {
+pub fn load_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path: &str) {
   let id = generate_id();
   channel.write_message(&ConfigMessage {
     id:       id.clone(),
@@ -69,7 +69,7 @@ pub fn load_state(channel: &mut CommandChannel<ConfigMessage,ConfigMessageAnswer
   }
 }
 
-pub fn dump_state(channel: &mut CommandChannel<ConfigMessage,ConfigMessageAnswer>) {
+pub fn dump_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   let id = generate_id();
   channel.write_message(&ConfigMessage {
     id:       id.clone(),
