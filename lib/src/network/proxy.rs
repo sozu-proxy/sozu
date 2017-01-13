@@ -23,7 +23,7 @@ use rand::random;
 
 use network::{ClientResult,MessageId,ServerMessage,ServerMessageStatus,ConnectionError,
   SocketType,socket_type,Protocol,ProxyOrder,RequiredEvents};
-use messages::{self,TcpFront,Command,Instance};
+use messages::{self,TcpFront,Order,Instance};
 use channel::Channel;
 
 const SERVER: Token = Token(0);
@@ -384,12 +384,12 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
             }
 
             let msg = msg.unwrap();
-            if let Command::HardStop = msg.command {
+            if let Order::HardStop = msg.order {
               self.notify(msg);
               self.configuration.channel().run();
               //FIXME: it's a bit brutal
               return;
-            } else if let Command::SoftStop = msg.command {
+            } else if let Order::SoftStop = msg.order {
               self.shutting_down = Some(msg.id.clone());
               self.notify(msg);
             } else {

@@ -21,7 +21,7 @@ use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
 use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,
   Readiness,ListenToken,FrontToken,BackToken,ProxyChannel};
 use network::socket::{SocketHandler,SocketResult,server_bind};
-use messages::{self,Command,HttpFront,HttpProxyConfiguration};
+use messages::{self,Order,HttpFront,HttpProxyConfiguration};
 use channel::Channel;
 use parser::http11::hostname_and_port;
 
@@ -509,18 +509,18 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyOrder) {
   // ToDo temporary
     trace!("{}\t{} notified", self.tag, message);
-    match message.command {
-      Command::AddHttpFront(front) => {
+    match message.order {
+      Order::AddHttpFront(front) => {
         info!("{}\t{} add front {:?}", self.tag, message.id, front);
           self.add_http_front(front, event_loop);
           self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
-      Command::RemoveHttpFront(front) => {
+      Order::RemoveHttpFront(front) => {
         info!("{}\t{} front {:?}", self.tag, message.id, front);
         self.remove_http_front(front, event_loop);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
-      Command::AddInstance(instance) => {
+      Order::AddInstance(instance) => {
         info!("{}\t{} add instance {:?}", self.tag, message.id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
@@ -531,7 +531,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
-      Command::RemoveInstance(instance) => {
+      Order::RemoveInstance(instance) => {
         info!("{}\t{} remove instance {:?}", self.tag, message.id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
@@ -542,7 +542,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
-      Command::HttpProxy(configuration) => {
+      Order::HttpProxy(configuration) => {
         info!("{}\t{} modifying proxy configuration: {:?}", self.tag, message.id, configuration);
         self.front_timeout = configuration.front_timeout;
         self.back_timeout  = configuration.back_timeout;
@@ -552,14 +552,14 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         };
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
-      Command::SoftStop => {
+      Order::SoftStop => {
         info!("{}\t{} processing soft shutdown", self.tag, message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
         event_loop.deregister(&self.listener);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
       },
-      Command::HardStop => {
+      Order::HardStop => {
         info!("{}\t{} hard shutdown", self.tag, message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
@@ -640,7 +640,7 @@ mod tests {
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
-  use messages::{Command,HttpFront,Instance,HttpProxyConfiguration};
+  use messages::{Order,HttpFront,Instance,HttpProxyConfiguration};
   use network::{ProxyOrder,ServerMessage};
   use network::buffer_queue::BufferQueue;
   use pool::Pool;
@@ -663,9 +663,9 @@ mod tests {
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
-    command.write_message(&ProxyOrder { id: String::from("ID_ABCD"), command: Command::AddHttpFront(front) });
+    command.write_message(&ProxyOrder { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
-    command.write_message(&ProxyOrder { id: String::from("ID_EFGH"), command: Command::AddInstance(instance) });
+    command.write_message(&ProxyOrder { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
 
     println!("test received: {:?}", command.read_message());
     println!("test received: {:?}", command.read_message());
@@ -716,9 +716,9 @@ mod tests {
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1031"), path_begin: String::from("/") };
-    command.write_message(&ProxyOrder { id: String::from("ID_ABCD"), command: Command::AddHttpFront(front) });
+    command.write_message(&ProxyOrder { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1028 };
-    command.write_message(&ProxyOrder { id: String::from("ID_EFGH"), command: Command::AddInstance(instance) });
+    command.write_message(&ProxyOrder { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
 
     println!("test received: {:?}", command.read_message());
     println!("test received: {:?}", command.read_message());

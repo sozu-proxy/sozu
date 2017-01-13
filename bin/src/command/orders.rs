@@ -7,7 +7,7 @@ use log;
 use serde_json;
 use nom::{HexDisplay,IResult,Offset};
 
-use sozu::messages::Command;
+use sozu::messages::Order;
 use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
 
@@ -33,7 +33,7 @@ impl CommandServer {
 
           let mut counter = 0usize;
           for proxy in stored_proxies {
-            for command in proxy.state.generate_commands() {
+            for command in proxy.state.generate_orders() {
               let message = ConfigMessage {
                 id:       format!("SAVE-{}", counter),
                 proxy: Some(proxy.tag.to_string()),
@@ -90,22 +90,22 @@ impl CommandServer {
           message: "loaded the configuration".to_string()
         });
       },
-      ConfigCommand::ProxyConfiguration(command) => {
+      ConfigCommand::ProxyConfiguration(order) => {
         if let Some(ref tag) = message.proxy {
-          if let &Command::AddTlsFront(ref data) = &command {
+          if let &Order::AddTlsFront(ref data) = &order {
             log!(log::LogLevel::Info, "received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
             data.app_id, data.hostname, data.path_begin, tag);
           } else {
-            log!(log::LogLevel::Info, "received {:?} with tag {:?}", command, tag);
+            log!(log::LogLevel::Info, "received {:?} with tag {:?}", order, tag);
           }
 
           let mut found = false;
           for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
             if tag == proxy_tag {
-              let cl = command.clone();
+              let o = order.clone();
               self.conns[token].add_message_id(message.id.clone());
-              proxy.state.handle_command(&cl);
-              proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), command: cl });
+              proxy.state.handle_order(&o);
+              proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), order: o });
               proxy.channel.run();
               found = true;
             }
@@ -157,20 +157,20 @@ impl CommandServer {
               offset = buffer.data().offset(i);
 
               for message in o {
-                if let ConfigCommand::ProxyConfiguration(command) = message.data {
+                if let ConfigCommand::ProxyConfiguration(order) = message.data {
                   if let Some(ref tag) = message.proxy {
-                    if let &Command::AddTlsFront(ref data) = &command {
+                    if let &Order::AddTlsFront(ref data) = &order {
                       log!(log::LogLevel::Info, "received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
                       data.app_id, data.hostname, data.path_begin, tag);
                     } else {
-                      log!(log::LogLevel::Info, "received {:?} with tag {:?}", command, tag);
+                      log!(log::LogLevel::Info, "received {:?} with tag {:?}", order, tag);
                     }
                     let mut found = false;
                     for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
                       if tag == proxy_tag {
-                        let cl = command.clone();
-                        proxy.state.handle_command(&cl);
-                        proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), command: cl });
+                        let o = order.clone();
+                        proxy.state.handle_order(&o);
+                        proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), order: o });
                         proxy.channel.run();
                         found = true;
                       }

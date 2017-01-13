@@ -1,5 +1,5 @@
 use serde;
-use sozu::messages::Command;
+use sozu::messages::Order;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
  pub enum ConfigMessageStatus {
@@ -10,7 +10,7 @@ use sozu::messages::Command;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize)]
 pub enum ConfigCommand {
-  ProxyConfiguration(Command),
+  ProxyConfiguration(Order),
   SaveState(String),
   LoadState(String),
   DumpState,

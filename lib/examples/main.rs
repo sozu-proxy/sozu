@@ -64,8 +64,8 @@ fn main() {
 
   let http_front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") };
   let http_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
-  command.write_message(&network::ProxyOrder { id: String::from("ID_ABCD"), command: messages::Command::AddHttpFront(http_front) });
-  command.write_message(&network::ProxyOrder { id: String::from("ID_EFGH"), command: messages::Command::AddInstance(http_instance) });
+  command.write_message(&network::ProxyOrder { id: String::from("ID_ABCD"), order: messages::Order::AddHttpFront(http_front) });
+  command.write_message(&network::ProxyOrder { id: String::from("ID_EFGH"), order: messages::Order::AddInstance(http_instance) });
   info!("MAIN\tHTTP -> {:?}", command.read_message());
   info!("MAIN\tHTTP -> {:?}", command.read_message());
 
@@ -103,17 +103,17 @@ fn main() {
   let key1  = include_str!("../../assets/key.pem");
 
   let tls_front = messages::TlsFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st"), path_begin: String::from("/"), certificate: String::from(cert1), key: String::from(key1), certificate_chain: vec!() };
-  command2.write_message(&network::ProxyOrder { id: String::from("ID_IJKL"), command: messages::Command::AddTlsFront(tls_front) });
+  command2.write_message(&network::ProxyOrder { id: String::from("ID_IJKL"), order: messages::Order::AddTlsFront(tls_front) });
   let tls_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
-  command2.write_message(&network::ProxyOrder { id: String::from("ID_MNOP"), command: messages::Command::AddInstance(tls_instance) });
+  command2.write_message(&network::ProxyOrder { id: String::from("ID_MNOP"), order: messages::Order::AddInstance(tls_instance) });
 
   let cert2 = include_str!("../../assets/cert_test.pem");
   let key2  = include_str!("../../assets/key_test.pem");
 
   let tls_front2 = messages::TlsFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/"), certificate: String::from(cert2), key: String::from(key2), certificate_chain: vec!() };
-  command2.write_message(&network::ProxyOrder { id: String::from("ID_QRST"), command: messages::Command::AddTlsFront(tls_front2) });
+  command2.write_message(&network::ProxyOrder { id: String::from("ID_QRST"), order: messages::Order::AddTlsFront(tls_front2) });
   let tls_instance2 = messages::Instance { app_id: String::from("app_2"), ip_address: String::from("127.0.0.1"), port: 1026 };
-  command2.write_message(&network::ProxyOrder { id: String::from("ID_UVWX"), command: messages::Command::AddInstance(tls_instance2) });
+  command2.write_message(&network::ProxyOrder { id: String::from("ID_UVWX"), order: messages::Order::AddInstance(tls_instance2) });
 
   info!("MAIN\tTLS -> {:?}", command2.read_message());
   info!("MAIN\tTLS -> {:?}", command2.read_message());

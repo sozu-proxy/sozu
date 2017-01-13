@@ -19,7 +19,7 @@ pub mod tcp;
 pub mod proxy;
 
 use mio::Token;
-use messages::Command;
+use messages::Order;
 
 pub type MessageId = String;
 
@@ -51,13 +51,13 @@ pub enum ServerMessageStatus {
 
 #[derive(Debug,Serialize,Deserialize)]
 pub struct ProxyOrder {
-  pub id:      MessageId,
-  pub command: Command,
+  pub id:    MessageId,
+  pub order: Order,
 }
 
 impl fmt::Display for ProxyOrder {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    write!(f, "{}-{:?}", self.id, self.command)
+    write!(f, "{}-{:?}", self.id, self.order)
   }
 }
 

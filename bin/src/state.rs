@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use sozu::messages::{Command,HttpFront,TlsFront,Instance};
+use sozu::messages::{Order,HttpFront,TlsFront,Instance};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpProxyInstance {
@@ -51,18 +51,18 @@ pub enum ConfigState {
 }
 
 impl ConfigState {
-  pub fn handle_command(&mut self, command: &Command) {
+  pub fn handle_order(&mut self, order: &Order) {
     match *self {
-      ConfigState::Http(ref mut state) => state.handle_command(command),
-      ConfigState::Tls(ref mut state)  => state.handle_command(command),
+      ConfigState::Http(ref mut state) => state.handle_order(order),
+      ConfigState::Tls(ref mut state)  => state.handle_order(order),
       ConfigState::Tcp                 => {},
     }
   }
 
-  pub fn generate_commands(&self) -> Vec<Command> {
+  pub fn generate_orders(&self) -> Vec<Order> {
     match *self {
-      ConfigState::Http(ref state) => state.generate_commands(),
-      ConfigState::Tls(ref state)  => state.generate_commands(),
+      ConfigState::Http(ref state) => state.generate_orders(),
+      ConfigState::Tls(ref state)  => state.generate_orders(),
       ConfigState::Tcp             => vec!(),
     }
   }
@@ -78,9 +78,9 @@ impl HttpProxy {
     }
   }
 
-  pub fn handle_command(&mut self, command: &Command) {
-    match command {
-      &Command::AddHttpFront(ref front) => {
+  pub fn handle_order(&mut self, order: &Order) {
+    match order {
+      &Order::AddHttpFront(ref front) => {
         let f = HttpProxyFront {
           app_id:     front.app_id.clone(),
           hostname:   front.hostname.clone(),
@@ -96,12 +96,12 @@ impl HttpProxy {
           self.fronts.insert(front.app_id.clone(), vec!(f));
         }
       },
-      &Command::RemoveHttpFront(ref front) => {
+      &Order::RemoveHttpFront(ref front) => {
         if let Some(front_list) = self.fronts.get_mut(&front.app_id) {
           front_list.retain(|el| el.hostname != front.hostname || el.path_begin != front.path_begin);
         }
       },
-      &Command::AddInstance(ref instance)  => {
+      &Order::AddInstance(ref instance)  => {
         let inst = HttpProxyInstance {
           ip_address: instance.ip_address.clone(),
           port:       instance.port,
@@ -116,7 +116,7 @@ impl HttpProxy {
           self.instances.insert(instance.app_id.clone(), vec!(inst));
         }
       },
-      &Command::RemoveInstance(ref instance) => {
+      &Order::RemoveInstance(ref instance) => {
         if let Some(instance_list) = self.instances.get_mut(&instance.app_id) {
           instance_list.retain(|el| el.ip_address != instance.ip_address || el.port != instance.port);
           /*let mut v = Vec::new();
@@ -133,11 +133,11 @@ impl HttpProxy {
     }
   }
 
-  pub fn generate_commands(&self) -> Vec<Command> {
+  pub fn generate_orders(&self) -> Vec<Order> {
     let mut v = Vec::new();
     for (app_id, front_list) in self.fronts.iter() {
       for front in front_list {
-        v.push(Command::AddHttpFront(HttpFront {
+        v.push(Order::AddHttpFront(HttpFront {
           app_id:     app_id.clone(),
           hostname:   front.hostname.clone(),
           path_begin: front.path_begin.clone(),
@@ -147,7 +147,7 @@ impl HttpProxy {
 
     for (app_id,instance_list) in self.instances.iter() {
       for instance in instance_list {
-        v.push(Command::AddInstance(Instance {
+        v.push(Order::AddInstance(Instance {
           app_id:     app_id.clone(),
           ip_address: instance.ip_address.clone(),
           port:       instance.port.clone(),
@@ -169,9 +169,9 @@ impl TlsProxy {
     }
   }
 
-  pub fn handle_command(&mut self, command: &Command) {
-    match command {
-      &Command::AddTlsFront(ref front) => {
+  pub fn handle_order(&mut self, order: &Order) {
+    match order {
+      &Order::AddTlsFront(ref front) => {
         let f = TlsProxyFront {
           app_id:      front.app_id.clone(),
           hostname:    front.hostname.clone(),
@@ -190,10 +190,10 @@ impl TlsProxy {
           self.fronts.insert(front.app_id.clone(), vec!(f));
         }
       },
-      &Command::RemoveTlsFront(ref front) => {
+      &Order::RemoveTlsFront(ref front) => {
         self.fronts.remove(&front.app_id);
       },
-      &Command::AddInstance(ref instance)  => {
+      &Order::AddInstance(ref instance)  => {
         let inst = HttpProxyInstance {
           ip_address: instance.ip_address.clone(),
           port:       instance.port,
@@ -208,7 +208,7 @@ impl TlsProxy {
           self.instances.insert(instance.app_id.clone(), vec!(inst));
         }
       },
-      &Command::RemoveInstance(ref instance) => {
+      &Order::RemoveInstance(ref instance) => {
         if let Some(instance_list) = self.instances.get_mut(&instance.app_id) {
           instance_list.retain(|el| el.ip_address != instance.ip_address || el.port != instance.port);
           /*let mut v = Vec::new();
@@ -224,11 +224,11 @@ impl TlsProxy {
     }
   }
 
-  pub fn generate_commands(&self) -> Vec<Command> {
+  pub fn generate_orders(&self) -> Vec<Order> {
     let mut v = Vec::new();
     for (app_id, front_list) in &self.fronts {
       for front in front_list {
-        v.push(Command::AddTlsFront(TlsFront {
+        v.push(Order::AddTlsFront(TlsFront {
           app_id:      app_id.clone(),
           hostname:    front.hostname.clone(),
           path_begin:  front.path_begin.clone(),
@@ -240,7 +240,7 @@ impl TlsProxy {
     }
     for (app_id, instance_list) in &self.instances {
       for instance in instance_list {
-        v.push(Command::AddInstance(Instance {
+        v.push(Order::AddInstance(Instance {
           app_id:     app_id.clone(),
           ip_address: instance.ip_address.clone(),
           port:       instance.port.clone(),
@@ -255,18 +255,18 @@ impl TlsProxy {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use sozu::messages::{Command,HttpFront,Instance};
+  use sozu::messages::{Order,HttpFront,Instance};
 
   #[test]
   fn serialize() {
     let mut state = HttpProxy::new(String::from("127.0.0.1"), 80);
-    state.handle_command(&Command::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") }));
-    state.handle_command(&Command::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc") }));
-    state.handle_command(&Command::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 }));
-    state.handle_command(&Command::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
-    state.handle_command(&Command::AddInstance(Instance { app_id: String::from("app_2"), ip_address: String::from("192.167.1.2"), port: 1026 }));
-    state.handle_command(&Command::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("192.168.1.3"), port: 1027 }));
-    state.handle_command(&Command::RemoveInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("192.168.1.3"), port: 1027 }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc") }));
+    state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 }));
+    state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
+    state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_2"), ip_address: String::from("192.167.1.2"), port: 1026 }));
+    state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("192.168.1.3"), port: 1027 }));
+    state.handle_order(&Order::RemoveInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("192.168.1.3"), port: 1027 }));
 
     /*
     let encoded = state.encode();

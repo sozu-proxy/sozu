@@ -121,7 +121,7 @@ impl Default for TlsProxyConfiguration {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
-pub enum Command {
+pub enum Order {
     AddHttpFront(HttpFront),
     RemoveHttpFront(HttpFront),
 
@@ -141,65 +141,65 @@ pub enum Command {
     HardStop,
 }
 
-impl Command {
+impl Order {
   pub fn get_topics(&self) -> Vec<Topic> {
     match *self {
-      Command::AddHttpFront(_)    => vec![Topic::HttpProxyConfig                       ],
-      Command::RemoveHttpFront(_) => vec![Topic::HttpProxyConfig                       ],
-      Command::AddTlsFront(_)     => vec![Topic::TlsProxyConfig                        ],
-      Command::RemoveTlsFront(_)  => vec![Topic::TlsProxyConfig                        ],
-      Command::AddTcpFront(_)     => vec![Topic::TcpProxyConfig                        ],
-      Command::RemoveTcpFront(_)  => vec![Topic::TcpProxyConfig                        ],
-      Command::AddInstance(_)     => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
-      Command::RemoveInstance(_)  => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
-      Command::HttpProxy(_)       => vec![Topic::HttpProxyConfig],
-      Command::TlsProxy(_)        => vec![Topic::TlsProxyConfig],
-      Command::SoftStop           => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
-      Command::HardStop           => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
+      Order::AddHttpFront(_)    => vec![Topic::HttpProxyConfig                       ],
+      Order::RemoveHttpFront(_) => vec![Topic::HttpProxyConfig                       ],
+      Order::AddTlsFront(_)     => vec![Topic::TlsProxyConfig                        ],
+      Order::RemoveTlsFront(_)  => vec![Topic::TlsProxyConfig                        ],
+      Order::AddTcpFront(_)     => vec![Topic::TcpProxyConfig                        ],
+      Order::RemoveTcpFront(_)  => vec![Topic::TcpProxyConfig                        ],
+      Order::AddInstance(_)     => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
+      Order::RemoveInstance(_)  => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
+      Order::HttpProxy(_)       => vec![Topic::HttpProxyConfig],
+      Order::TlsProxy(_)        => vec![Topic::TlsProxyConfig],
+      Order::SoftStop           => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
+      Order::HardStop           => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
     }
   }
 }
 
-enum CommandField {
+enum OrderField {
   Type,
   Data,
 }
 
 
-impl serde::Deserialize for CommandField {
-  fn deserialize<D>(deserializer: &mut D) -> Result<CommandField, D::Error>
+impl serde::Deserialize for OrderField {
+  fn deserialize<D>(deserializer: &mut D) -> Result<OrderField, D::Error>
         where D: serde::de::Deserializer {
-    struct CommandFieldVisitor;
-    impl serde::de::Visitor for CommandFieldVisitor {
-      type Value = CommandField;
+    struct OrderFieldVisitor;
+    impl serde::de::Visitor for OrderFieldVisitor {
+      type Value = OrderField;
 
-      fn visit_str<E>(&mut self, value: &str) -> Result<CommandField, E>
+      fn visit_str<E>(&mut self, value: &str) -> Result<OrderField, E>
         where E: serde::de::Error {
         match value {
-          "type" => Ok(CommandField::Type),
-          "data" => Ok(CommandField::Data),
+          "type" => Ok(OrderField::Type),
+          "data" => Ok(OrderField::Data),
           _ => Err(serde::de::Error::custom("expected type or data")),
         }
       }
     }
 
-    deserializer.deserialize(CommandFieldVisitor)
+    deserializer.deserialize(OrderFieldVisitor)
   }
 }
 
-struct CommandVisitor;
-impl serde::de::Visitor for CommandVisitor {
-  type Value = Command;
+struct OrderVisitor;
+impl serde::de::Visitor for OrderVisitor {
+  type Value = Order;
 
-  fn visit_map<V>(&mut self, mut visitor: V) -> Result<Command, V::Error>
+  fn visit_map<V>(&mut self, mut visitor: V) -> Result<Order, V::Error>
         where V: serde::de::MapVisitor {
     let mut command_type:Option<String>    = None;
     let mut data:Option<serde_json::Value> = None;
 
     loop {
       match try!(visitor.visit_key()) {
-        Some(CommandField::Type) => { command_type = Some(try!(visitor.visit_value())); }
-        Some(CommandField::Data) => { data = Some(try!(visitor.visit_value())); }
+        Some(OrderField::Type) => { command_type = Some(try!(visitor.visit_value())); }
+        Some(OrderField::Data) => { data = Some(try!(visitor.visit_value())); }
         None => { break; }
       }
     }
@@ -220,117 +220,117 @@ impl serde::de::Visitor for CommandVisitor {
       let res = serde_json::from_value(data).or(Err(serde::de::Error::custom("add_http_front")));
       //println!("ADD_HTTP_FRONT => {:?}", res);
       let acl = try!(res);
-      Ok(Command::AddHttpFront(acl))
+      Ok(Order::AddHttpFront(acl))
     } else if &command_type == "REMOVE_HTTP_FRONT" {
       let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("remove_http_front"))));
-      Ok(Command::RemoveHttpFront(acl))
+      Ok(Order::RemoveHttpFront(acl))
     } else if &command_type == "ADD_TLS_FRONT" {
       let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("add_tls_front"))));
-      Ok(Command::AddTlsFront(acl))
+      Ok(Order::AddTlsFront(acl))
     } else if &command_type == "REMOVE_TLS_FRONT" {
       let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("remove_tls_front"))));
-      Ok(Command::RemoveTlsFront(acl))
+      Ok(Order::RemoveTlsFront(acl))
     } else if &command_type == "ADD_TCP_FRONT" {
       let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("add_tcp_front"))));
-      Ok(Command::AddTcpFront(acl))
+      Ok(Order::AddTcpFront(acl))
     } else if &command_type == "REMOVE_TCP_FRONT" {
       let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("remove_tcp_front"))));
-      Ok(Command::RemoveTcpFront(acl))
+      Ok(Order::RemoveTcpFront(acl))
     } else if &command_type == "ADD_INSTANCE" {
       let instance = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("add_instance"))));
-      Ok(Command::AddInstance(instance))
+      Ok(Order::AddInstance(instance))
     } else if &command_type == "REMOVE_INSTANCE" {
       let instance = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("remove_instance"))));
-      Ok(Command::RemoveInstance(instance))
+      Ok(Order::RemoveInstance(instance))
     } else if &command_type == "CONFIGURE_HTTP_PROXY" {
       let conf = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("configure_http_proxy"))));
-      Ok(Command::HttpProxy(conf))
+      Ok(Order::HttpProxy(conf))
     } else {
       Err(serde::de::Error::custom("unrecognized command"))
     }
   }
 }
 
-impl serde::Deserialize for Command {
-  fn deserialize<D>(deserializer: &mut D) -> Result<Command, D::Error>
+impl serde::Deserialize for Order {
+  fn deserialize<D>(deserializer: &mut D) -> Result<Order, D::Error>
         where D: serde::de::Deserializer {
     static FIELDS: &'static [&'static str] = &["type", "data"];
-    deserializer.deserialize_struct("Command", FIELDS, CommandVisitor)
+    deserializer.deserialize_struct("Order", FIELDS, OrderVisitor)
   }
 }
 
-impl serde::Serialize for Command {
+impl serde::Serialize for Order {
   fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
       where S: serde::Serializer,
   {
     let mut state = try!(serializer.serialize_map(Some(2)));
 
     match self {
-      &Command::AddHttpFront(ref front) => {
+      &Order::AddHttpFront(ref front) => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "ADD_HTTP_FRONT"));
         try!(serializer.serialize_map_key(&mut state, "data"));
         try!(serializer.serialize_map_value(&mut state, front));
       },
-      &Command::RemoveHttpFront(ref front) => {
+      &Order::RemoveHttpFront(ref front) => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "REMOVE_HTTP_FRONT"));
         try!(serializer.serialize_map_key(&mut state, "data"));
         try!(serializer.serialize_map_value(&mut state, front));
       },
-      &Command::AddTlsFront(ref front) => {
+      &Order::AddTlsFront(ref front) => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "ADD_TLS_FRONT"));
         try!(serializer.serialize_map_key(&mut state, "data"));
         try!(serializer.serialize_map_value(&mut state, front));
       },
-      &Command::RemoveTlsFront(ref front) => {
+      &Order::RemoveTlsFront(ref front) => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "REMOVE_TLS_FRONT"));
         try!(serializer.serialize_map_key(&mut state, "data"));
         try!(serializer.serialize_map_value(&mut state, front));
       },
-      &Command::AddTcpFront(ref front) => {
+      &Order::AddTcpFront(ref front) => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "ADD_TCP_FRONT"));
         try!(serializer.serialize_map_key(&mut state, "data"));
         try!(serializer.serialize_map_value(&mut state, front));
       },
-      &Command::RemoveTcpFront(ref front) => {
+      &Order::RemoveTcpFront(ref front) => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "REMOVE_TCP_FRONT"));
         try!(serializer.serialize_map_key(&mut state, "data"));
         try!(serializer.serialize_map_value(&mut state, front));
       },
-      &Command::AddInstance(ref instance) => {
+      &Order::AddInstance(ref instance) => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "ADD_INSTANCE"));
         try!(serializer.serialize_map_key(&mut state, "data"));
         try!(serializer.serialize_map_value(&mut state, instance));
       },
-      &Command::RemoveInstance(ref instance) => {
+      &Order::RemoveInstance(ref instance) => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "REMOVE_INSTANCE"));
         try!(serializer.serialize_map_key(&mut state, "data"));
         try!(serializer.serialize_map_value(&mut state, instance));
       },
-      &Command::HttpProxy(ref config) => {
+      &Order::HttpProxy(ref config) => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "CONFIGURE_HTTP_PROXY"));
         try!(serializer.serialize_map_key(&mut state, "data"));
         try!(serializer.serialize_map_value(&mut state, config));
       },
-      &Command::TlsProxy(ref config) => {
+      &Order::TlsProxy(ref config) => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "CONFIGURE_HTTP_PROXY"));
         try!(serializer.serialize_map_key(&mut state, "data"));
         try!(serializer.serialize_map_value(&mut state, config));
       },
-      &Command::SoftStop => {
+      &Order::SoftStop => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "SOFT_STOP"));
       },
-      &Command::HardStop => {
+      &Order::HardStop => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "HARD_STOP"));
       },
@@ -355,9 +355,9 @@ mod tests {
   #[test]
   fn add_acl_test() {
     let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}}"#;
-    let command: Command = serde_json::from_str(raw_json).unwrap();
+    let command: Order = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", command);
-    assert!(command == Command::AddHttpFront(HttpFront{
+    assert!(command == Order::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
@@ -367,9 +367,9 @@ mod tests {
   #[test]
   fn remove_acl_test() {
     let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}}"#;
-    let command: Command = serde_json::from_str(raw_json).unwrap();
+    let command: Order = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", command);
-    assert!(command == Command::RemoveHttpFront(HttpFront{
+    assert!(command == Order::RemoveHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
@@ -380,9 +380,9 @@ mod tests {
   #[test]
   fn add_instance_test() {
     let raw_json = r#"{"type": "ADD_INSTANCE", "data": {"app_id": "xxx", "ip_address": "yyy", "port": 8080}}"#;
-    let command: Command = serde_json::from_str(raw_json).unwrap();
+    let command: Order = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", command);
-    assert!(command == Command::AddInstance(Instance{
+    assert!(command == Order::AddInstance(Instance{
       app_id: String::from("xxx"),
       ip_address: String::from("yyy"),
       port: 8080
@@ -392,9 +392,9 @@ mod tests {
   #[test]
   fn remove_instance_test() {
     let raw_json = r#"{"type": "REMOVE_INSTANCE", "data": {"app_id": "xxx", "ip_address": "yyy", "port": 8080}}"#;
-    let command: Command = serde_json::from_str(raw_json).unwrap();
+    let command: Order = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", command);
-    assert!(command == Command::RemoveInstance(Instance{
+    assert!(command == Order::RemoveInstance(Instance{
       app_id: String::from("xxx"),
       ip_address: String::from("yyy"),
       port: 8080
@@ -404,9 +404,9 @@ mod tests {
   #[test]
   fn http_front_crash_test() {
     let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "aa", "hostname": "cltdl.fr", "path_begin": ""}}"#;
-    let command: Command = serde_json::from_str(raw_json).unwrap();
+    let command: Order = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", command);
-    assert!(command == Command::AddHttpFront(HttpFront{
+    assert!(command == Order::AddHttpFront(HttpFront{
       app_id: String::from("aa"),
       hostname: String::from("cltdl.fr"),
       path_begin: String::from(""),

@@ -24,7 +24,7 @@ use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use pool::{Pool,Checkout,Reset};
 
-use messages::{self,TcpFront,Command,Instance};
+use messages::{self,TcpFront,Order,Instance};
 use channel::Channel;
 
 
@@ -454,8 +454,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   }
 
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyOrder) {
-    match message.command {
-      Command::AddTcpFront(tcp_front) => {
+    match message.order {
+      Order::AddTcpFront(tcp_front) => {
         let addr_string = tcp_front.ip_address + ":" + &tcp_front.port.to_string();
         if let Ok(front) = addr_string.parse() {
           if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, event_loop) {
@@ -469,12 +469,12 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
-      Command::RemoveTcpFront(front) => {
+      Order::RemoveTcpFront(front) => {
         trace!("TCP\t{:?}", front);
         let _ = self.remove_tcp_front(front.app_id, event_loop);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
-      Command::AddInstance(instance) => {
+      Order::AddInstance(instance) => {
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
@@ -484,7 +484,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot add tcp instance"))});
         }
       },
-      Command::RemoveInstance(instance) => {
+      Order::RemoveInstance(instance) => {
         trace!("TCP\t{:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
@@ -495,14 +495,14 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot remove tcp instance"))});
         }
       },
-      Command::SoftStop => {
+      Order::SoftStop => {
         info!("{}\t{} processing soft shutdown", "TCP", message.id);
         for listener in self.listeners.iter() {
           event_loop.deregister(&listener.sock);
         }
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
       },
-      Command::HardStop => {
+      Order::HardStop => {
         info!("{}\t{} hard shutdown", "TCP", message.id);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
@@ -583,8 +583,8 @@ pub fn start_example() -> Channel<ProxyOrder,ServerMessage> {
       port: 5678,
     };
 
-    command.write_message(&ProxyOrder { id: String::from("ID_YOLO1"), command: Command::AddTcpFront(front) });
-    command.write_message(&ProxyOrder { id: String::from("ID_YOLO2"), command: Command::AddInstance(instance) });
+    command.write_message(&ProxyOrder { id: String::from("ID_YOLO1"), order: Order::AddTcpFront(front) });
+    command.write_message(&ProxyOrder { id: String::from("ID_YOLO2"), order: Order::AddInstance(instance) });
   }
   {
     let front = TcpFront {
@@ -597,8 +597,8 @@ pub fn start_example() -> Channel<ProxyOrder,ServerMessage> {
       ip_address: String::from("127.0.0.1"),
       port: 5678,
     };
-    command.write_message(&ProxyOrder { id: String::from("ID_YOLO3"), command: Command::AddTcpFront(front) });
-    command.write_message(&ProxyOrder { id: String::from("ID_YOLO4"), command: Command::AddInstance(instance) });
+    command.write_message(&ProxyOrder { id: String::from("ID_YOLO3"), order: Order::AddTcpFront(front) });
+    command.write_message(&ProxyOrder { id: String::from("ID_YOLO4"), order: Order::AddInstance(instance) });
   }
   command
 }

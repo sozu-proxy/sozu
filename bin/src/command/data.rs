@@ -1,7 +1,7 @@
 use serde;
 use serde_json;
 use state::{HttpProxy,TlsProxy,ConfigState};
-use sozu::messages::Command;
+use sozu::messages::Order;
 
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]
 pub enum ProxyType {
@@ -148,7 +148,7 @@ impl serde::Deserialize for ProxyDeserializer {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize)]
 pub enum ConfigCommand {
-  ProxyConfiguration(Command),
+  ProxyConfiguration(Order),
   SaveState(String),
   LoadState(String),
   DumpState,
@@ -311,11 +311,11 @@ impl serde::Serialize for ConfigMessage {
     }
 
     match self.data {
-      ConfigCommand::ProxyConfiguration(ref command) => {
+      ConfigCommand::ProxyConfiguration(ref order) => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "PROXY"));
         try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, command));
+        try!(serializer.serialize_map_value(&mut state, order));
       },
       ConfigCommand::SaveState(ref path) => {
         try!(serializer.serialize_map_key(&mut state, "type"));
