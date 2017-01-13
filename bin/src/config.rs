@@ -204,48 +204,55 @@ impl Config {
       for tag in &app.frontends {
         let path_begin = app.path_begin.as_ref().unwrap_or(&String::new()).clone();
 
-        let frontend_order = if self.proxies.get(tag).and_then(|p| p.to_tls()).is_some() {
-          let key_opt         = app.key.as_ref().and_then(|path| Config::load_file(&path).ok());
-          let certificate_opt = app.certificate.as_ref().and_then(|path| Config::load_file(&path).ok());
-          let chain_opt       = app.certificate_chain.as_ref().and_then(|path| Config::load_file(&path).ok())
-            .map(Config::split_certificate_chain);
+        //FIXME: TCP should be handled as well
+        if let Some(ref proxy) = self.proxies.get(tag).as_ref() {
+          let frontend_order = if proxy.proxy_type == ProxyType::HTTPS {
+            let key_opt         = app.key.as_ref().and_then(|path| Config::load_file(&path).ok());
+            let certificate_opt = app.certificate.as_ref().and_then(|path| Config::load_file(&path).ok());
+            let chain_opt       = app.certificate_chain.as_ref().and_then(|path| Config::load_file(&path).ok())
+              .map(Config::split_certificate_chain);
 
-          if key_opt.is_none() {
-            error!("cannot read the key at {:?}", app.key);
-            continue;
-          }
-          if certificate_opt.is_none() {
-            error!("cannot read the certificate at {:?}", app.certificate);
-            continue;
-          }
-          if chain_opt.is_none() {
-            error!("cannot read the certificate chain at {:?}", app.certificate_chain);
-            continue;
-          }
+            if key_opt.is_none() {
+              error!("cannot read the key at {:?}", app.key);
+              continue;
+            }
+            if certificate_opt.is_none() {
+              error!("cannot read the certificate at {:?}", app.certificate);
+              continue;
+            }
+            if chain_opt.is_none() {
+              error!("cannot read the certificate chain at {:?}", app.certificate_chain);
+              continue;
+            }
 
-          Order::AddTlsFront(TlsFront {
-            app_id:            id.to_string(),
-            hostname:          app.hostname.clone(),
-            path_begin:        path_begin,
-            key:               key_opt.unwrap(),
-            certificate:       certificate_opt.unwrap(),
-            certificate_chain: chain_opt.unwrap(),
-          })
+            Order::AddTlsFront(TlsFront {
+              app_id:            id.to_string(),
+              hostname:          app.hostname.clone(),
+              path_begin:        path_begin,
+              key:               key_opt.unwrap(),
+              certificate:       certificate_opt.unwrap(),
+              certificate_chain: chain_opt.unwrap(),
+            })
+          } else {
+            Order::AddHttpFront(HttpFront {
+              app_id:     id.to_string(),
+              hostname:   app.hostname.clone(),
+              path_begin: path_begin,
+            })
+          };
+
+          v.push(ConfigMessage {
+            id:    format!("CONFIG-{}", count),
+            proxy: Some(tag.clone()),
+            data:  ConfigCommand::ProxyConfiguration(frontend_order),
+          });
+
+          count += 1;
         } else {
-          Order::AddHttpFront(HttpFront {
-            app_id:     id.to_string(),
-            hostname:   app.hostname.clone(),
-            path_begin: path_begin,
-          })
-        };
+          error!("invalid proxy name: {}", tag);
+          continue;
+        }
 
-        v.push(ConfigMessage {
-          id:    format!("CONFIG-{}", count),
-          proxy: Some(tag.clone()),
-          data:  ConfigCommand::ProxyConfiguration(frontend_order),
-        });
-
-        count += 1;
 
         for address_str in app.backends.iter() {
           if let Ok(address_list) = address_str.to_socket_addrs() {

@@ -36,7 +36,7 @@ buffer_size = 16384
 
 [applications]
 
-[applications.ABCD]
+[applications.MyApp]
 hostname   = "example.com"
 path_begin = "/api" # optional
 certificate = "../assets/certificate.pem" # optional

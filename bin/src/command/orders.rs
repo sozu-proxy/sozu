@@ -11,6 +11,7 @@ use sozu::messages::Order;
 use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
 
+use config::Config;
 use super::{CommandServer,FrontToken,ProxyConfiguration,StoredProxy};
 use super::data::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
 use super::client::parse;
@@ -200,6 +201,41 @@ impl CommandServer {
             },
           }
           buffer.consume(offset);
+        }
+      }
+    }
+  }
+
+  pub fn load_static_application_configuration(&mut self, config: &Config) {
+    //FIXME: too many loops, this could be cleaner
+    for message in config.generate_config_messages() {
+      if let ConfigCommand::ProxyConfiguration(order) = message.data {
+        if let Some(ref tag) = message.proxy {
+          if let &Order::AddTlsFront(ref data) = &order {
+            log!(log::LogLevel::Info, "received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
+            data.app_id, data.hostname, data.path_begin, tag);
+          } else {
+            log!(log::LogLevel::Info, "received {:?} with tag {:?}", order, tag);
+          }
+          let mut found = false;
+          for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
+            if tag == proxy_tag {
+              let o = order.clone();
+              proxy.state.handle_order(&o);
+              proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), order: o });
+              proxy.channel.run();
+              found = true;
+            }
+          }
+
+          if !found {
+            // FIXME: should send back error here
+            log!(log::LogLevel::Error, "no proxy found for tag: {}", tag);
+          }
+
+        } else {
+          // FIXME: should send back error here
+          log!(log::LogLevel::Error, "expecting proxy tag");
         }
       }
     }

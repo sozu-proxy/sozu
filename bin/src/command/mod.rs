@@ -316,10 +316,10 @@ impl CommandServer {
 pub fn start(config: Config, proxies: HashMap<String, Vec<Proxy>>) {
   let buffer_size     = config.command_buffer_size.unwrap_or(10000);
   let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
-  let saved_state     = config.saved_state;
+  let saved_state     = config.saved_state.clone();
 
   let event_loop = Poll::new().unwrap();
-  let addr = PathBuf::from(config.command_socket);
+  let addr = PathBuf::from(&config.command_socket);
   if let Err(e) = fs::remove_file(&addr) {
     match e.kind() {
       ErrorKind::NotFound => {},
@@ -336,16 +336,16 @@ pub fn start(config: Config, proxies: HashMap<String, Vec<Proxy>>) {
         fs::remove_file(&addr);
         return;
       }
-      info!("listen for connections");
-      //event_loop.register(&srv, SERVER, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-      /*FIXME: timeout
-       * event_loop.timeout_ms(0, 700);
-       */
+
       let mut server = CommandServer::new(srv, proxies, buffer_size, max_buffer_size, event_loop);
+
+      server.load_static_application_configuration(&config);
+
       saved_state.as_ref().map(|state_path| {
         server.load_state("INITIALIZATION", state_path);
       });
 
+      info!("listen for connections");
       server.run();
       //event_loop.run(&mut CommandServer::new(srv, proxies, buffer_size, max_buffer_size)).unwrap()
     },
