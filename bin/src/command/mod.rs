@@ -216,9 +216,6 @@ impl CommandServer {
         }
       },
       Token(i) if i < self.proxy_count + 1 => {
-        info!("token({}) worker got event {:?}", i, events);
-        //println!("proxies:\n{:?}", self.proxies);
-
         let mut messages = {
           let &mut (ref tag, ref mut proxy) =  self.proxies.get_mut(&Token(i)).unwrap();
           proxy.channel.handle_events(events);
