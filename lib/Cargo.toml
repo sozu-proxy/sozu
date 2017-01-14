@@ -17,6 +17,7 @@ serde_derive = "^0.8.0"
 lazy_static = "0.1.15"
 libc = "^0.2"
 slab = "^0.3.0"
+pool = "^0.1"
 
 [dev-dependencies]
 tiny_http = "0.4"
@@ -25,9 +26,6 @@ env_logger = "0.3"
 [dependencies.openssl]
 version = "^0.9.5"
 features = ["v102"]
-
-[dependencies.pool]
-git = "https://github.com/Geal/pool.git"
 
 [dependencies.uuid]
 version = "~0.2.0"
