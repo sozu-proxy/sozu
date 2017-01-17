@@ -1,6 +1,7 @@
 [package]
 name = "sozu-lib"
 version = "0.1.0"
+license = "AGPL-3.0"
 authors = ["Clément Delafargue <clement@delafargue.name>", "Geoffroy Couprie <geo.couprie@gmail.com>"]
 
 [dependencies]

@@ -1,6 +1,7 @@
 [package]
 name = "sozuctl"
 version = "0.1.0"
+license = "AGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 
 [dependencies]

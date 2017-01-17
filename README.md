@@ -25,3 +25,15 @@ The proxy uses `env_logger`. You can select which module displays logs at which 
 ```
 RUST_LOG=info,sozu_lib::parser::http11=trace ./target/debug/sozu
 ```
+
+## License
+
+Copyright (C) 2015-2016 Geoffroy Couprie, Clément Delafargue
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, version 3.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+See the GNU Affero General Public License for more details.
