@@ -1,4 +1,8 @@
-# sozu proxy
+# sozu HTTP proxy
+
+it will be awesome when it will be ready
+
+## Goals
 
 ## Building
 
@@ -25,6 +29,12 @@ The proxy uses `env_logger`. You can select which module displays logs at which 
 ```
 RUST_LOG=info,sozu_lib::parser::http11=trace ./target/debug/sozu
 ```
+
+## Exploring the source
+
+- `lib/`: the `sozu_lib` proxy library contains the event loop management, the parsers and protocols
+- `bin/`: the `sozu` executable wraps the library in worker processes, and handle dynamic configuration
+- `ctl/`: the `sozuctl` executable can send commands to the proxy
 
 ## License
 
