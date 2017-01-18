@@ -15,20 +15,20 @@ before_script:
   - pip install 'travis-cargo<0.2' --user && export PATH=$HOME/.local/bin:$PATH
 
 script:
-  - cd lib && travis-cargo --only nightly test
-  - cd bin && travis-cargo --only nightly build
-  - cd ctl && travis-cargo --only nightly build
-  - cd lib && travis-cargo --only beta    test
-  - cd bin && travis-cargo --only beta    build
-  - cd ctl && travis-cargo --only beta    build
+  - cd lib && travis-cargo --only nightly test;  cd ..
+  - cd bin && travis-cargo --only nightly build; cd ..
+  - cd ctl && travis-cargo --only nightly build; cd ..
+  - cd lib && travis-cargo --only beta    test;  cd ..
+  - cd bin && travis-cargo --only beta    build; cd ..
+  - cd ctl && travis-cargo --only beta    build; cd ..
 
 after_success:
   - travis-cargo coveralls --no-sudo
 
-env:
-  global:
+    #env:
+  #  global:
     # override the default `--features unstable` used for the nightly branch (optional)
-    - TRAVIS_CARGO_NIGHTLY_FEATURE=nightly
+    #    - TRAVIS_CARGO_NIGHTLY_FEATURE=nightly
 
 sudo: false
 
