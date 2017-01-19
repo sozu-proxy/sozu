@@ -121,7 +121,6 @@ pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, confi
   }));
 
   loop {
-    println!("tags: {:?}", tags);
     if tags.is_empty() {
       println!("all proxies shut down");
       break;
@@ -130,14 +129,13 @@ pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, confi
     match channel.read_message() {
       None          => println!("the proxy didn't answer"),
       Some(message) => {
-        println!("received message: {:?}", message);
         if !tags.contains_key(&message.id) {
           println!("received message with invalid id: {:?}", message);
           return;
         }
         match message.status {
           ConfigMessageStatus::Processing => {
-            tags.get(&message.id).map(|tag| println!("[{}]: {}", tag, message.message));
+            tags.get(&message.id).map(|tag| println!("Proxy {} is processing: {}", tag, message.message));
           },
           ConfigMessageStatus::Error => {
             println!("could not stop the proxy: {}", message.message);
@@ -167,7 +165,6 @@ pub fn hard_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, confi
 
 
   loop {
-    println!("tags: {:?}", tags);
     if tags.is_empty() {
       println!("all proxies shut down");
       break;
@@ -176,14 +173,13 @@ pub fn hard_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, confi
     match channel.read_message() {
       None          => println!("the proxy didn't answer"),
       Some(message) => {
-        println!("received message: {:?}", message);
         if !tags.contains_key(&message.id) {
           println!("received message with invalid id: {:?}", message);
           return;
         }
         match message.status {
           ConfigMessageStatus::Processing => {
-            tags.get(&message.id).map(|tag| println!("[{}]: {}", tag, message.message));
+            tags.get(&message.id).map(|tag| println!("Proxy {} is processing: {}", tag, message.message));
           },
           ConfigMessageStatus::Error => {
             println!("could not stop the proxy: {}", message.message);
