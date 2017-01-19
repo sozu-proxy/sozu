@@ -7,6 +7,7 @@ dependencies = [
  "mio 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "mio-uds 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "nix 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rand 0.3.15 (registry+https://github.com/rust-lang/crates.io-index)",
  "sozu-command-lib 0.1.0",
  "sozu-lib 0.1.0",
  "time 0.1.36 (registry+https://github.com/rust-lang/crates.io-index)",

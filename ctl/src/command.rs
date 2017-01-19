@@ -3,8 +3,13 @@ use sozu::messages::Order;
 use sozu_command::config::Config;
 use sozu_command::data::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
 
+use std::iter::FromIterator;
+use std::collections::HashMap;
+use rand::{thread_rng, Rng};
+
 fn generate_id() -> String {
-  "hello".to_string()
+  let s: String = thread_rng().gen_ascii_chars().take(6).collect();
+  format!("ID-{}", s)
 }
 
 pub fn save_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path: &str) {
