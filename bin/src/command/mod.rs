@@ -301,8 +301,11 @@ impl CommandServer {
     for client in self.conns.iter_mut() {
       if let Some(index) = client.has_message_id(&msg.id) {
         client.write_message(&answer);
-        client.remove_message_id(index);
+        if answer.status != ConfigMessageStatus::Processing {
+          client.remove_message_id(index);
+        }
       }
+      client.channel.run();
     }
   }
 
