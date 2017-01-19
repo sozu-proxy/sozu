@@ -7,8 +7,8 @@ use std::io::{self,Error,ErrorKind,Read};
 use serde::Deserialize;
 use toml;
 
-use command::data::{ConfigCommand,ConfigMessage,ProxyType};
 use sozu::messages::{Order,HttpFront,TlsFront,Instance,HttpProxyConfiguration,TlsProxyConfiguration};
+use sozu_command::data::{ConfigCommand,ConfigMessage,ProxyType};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct ProxyConfig {
@@ -313,7 +313,7 @@ mod tests {
   use super::*;
   use std::collections::HashMap;
   use toml::encode_str;
-  use command::data::ProxyType;
+  use sozu_command::data::ProxyType;
 
   #[test]
   fn serialize() {

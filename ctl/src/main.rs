@@ -9,17 +9,17 @@ extern crate toml;
 extern crate serde;
 extern crate serde_json;
 extern crate sozu_lib as sozu;
+extern crate sozu_command_lib as sozu_command;
 
 mod config;
 mod command;
-mod messages;
 
 use mio_uds::UnixStream;
 use clap::{App,Arg,SubCommand};
 use sozu::channel::Channel;
 
 use command::{dump_state,load_state,save_state};
-use messages::{ConfigMessage,ConfigMessageAnswer};
+use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 
 fn main() {
   let matches = App::new("sozuctl")

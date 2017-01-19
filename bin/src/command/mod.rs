@@ -15,15 +15,14 @@ use serde_json;
 
 use sozu::network::{ProxyOrder,ServerMessage,ServerMessageStatus};
 use sozu::channel::Channel;
+use sozu_command::state::{HttpProxy,TlsProxy,ConfigState};
+use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,ProxyType};
 
 use config::Config;
-use state::{HttpProxy,TlsProxy,ConfigState};
 
-pub mod data;
 pub mod orders;
 pub mod client;
 
-use self::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,ProxyType};
 use self::client::{ConnReadError,CommandClient};
 
 const SERVER: Token = Token(0);

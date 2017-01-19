@@ -70,9 +70,9 @@ impl serde::Deserialize for ProxyDeserializerField {
       fn visit_str<E>(&mut self, value: &str) -> Result<ProxyDeserializerField, E>
         where E: serde::de::Error {
         match value {
-          "tag"           => Ok(ProxyDeserializerField::Tag),
+          "tag"        => Ok(ProxyDeserializerField::Tag),
           "proxy_type" => Ok(ProxyDeserializerField::Type),
-          "state"         => Ok(ProxyDeserializerField::State),
+          "state"      => Ok(ProxyDeserializerField::State),
           _ => Err(serde::de::Error::custom("expected tag, proxy_type or state")),
         }
       }

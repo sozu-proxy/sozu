@@ -1,5 +1,5 @@
 use sozu::channel::Channel;
-use messages::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
+use sozu_command::data::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
 
 fn generate_id() -> String {
   "hello".to_string()
@@ -8,9 +8,9 @@ fn generate_id() -> String {
 pub fn save_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path: &str) {
   let id = generate_id();
   channel.write_message(&ConfigMessage {
-    id:       id.clone(),
-    data:     ConfigCommand::SaveState(path.to_string()),
-    listener: None,
+    id:    id.clone(),
+    data:  ConfigCommand::SaveState(path.to_string()),
+    proxy: None,
   });
 
   match channel.read_message() {
@@ -40,9 +40,9 @@ pub fn save_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
 pub fn load_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path: &str) {
   let id = generate_id();
   channel.write_message(&ConfigMessage {
-    id:       id.clone(),
-    data:     ConfigCommand::LoadState(path.to_string()),
-    listener: None,
+    id:    id.clone(),
+    data:  ConfigCommand::LoadState(path.to_string()),
+    proxy: None,
   });
 
   match channel.read_message() {
@@ -72,9 +72,9 @@ pub fn load_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
 pub fn dump_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   let id = generate_id();
   channel.write_message(&ConfigMessage {
-    id:       id.clone(),
-    data:     ConfigCommand::DumpState,
-    listener: None,
+    id:    id.clone(),
+    data:  ConfigCommand::DumpState,
+    proxy: None,
   });
 
   match channel.read_message() {

@@ -13,10 +13,10 @@ extern crate libc;
 extern crate slab;
 extern crate nix;
 extern crate sozu_lib as sozu;
+extern crate sozu_command_lib as sozu_command;
 
 mod config;
 mod command;
-mod state;
 mod worker;
 
 use std::net::{UdpSocket,ToSocketAddrs};

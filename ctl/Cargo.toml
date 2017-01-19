@@ -22,3 +22,6 @@ features = ["serde"]
 
 [dependencies.sozu-lib]
 path = "../lib"
+
+[dependencies.sozu-command-lib]
+path = "../command"

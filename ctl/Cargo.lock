@@ -10,6 +10,7 @@ dependencies = [
  "serde 0.8.22 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_derive 0.8.22 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_json 0.8.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sozu-command-lib 0.1.0",
  "sozu-lib 0.1.0",
  "time 0.1.36 (registry+https://github.com/rust-lang/crates.io-index)",
  "toml 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -298,6 +299,16 @@ dependencies = [
 name = "slab"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
+
+[[package]]
+name = "sozu-command-lib"
+version = "0.1.0"
+dependencies = [
+ "serde 0.8.22 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde_derive 0.8.22 (registry+https://github.com/rust-lang/crates.io-index)",
+ "serde_json 0.8.5 (registry+https://github.com/rust-lang/crates.io-index)",
+ "sozu-lib 0.1.0",
+]
 
 [[package]]
 name = "sozu-lib"
