@@ -4,6 +4,7 @@ extern crate mio_uds;
 extern crate nix;
 extern crate libc;
 extern crate time;
+extern crate rand;
 extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
 

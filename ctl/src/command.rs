@@ -109,7 +109,7 @@ pub fn dump_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
 }
 
 pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config: &Config) {
-  let messages: Vec<(String, String)> = config.proxies.keys().map(|tag| {
+  let mut tags: HashMap<String,String> = HashMap::from_iter(config.proxies.keys().map(|tag| {
     println!("shutting down proxy \"{}\"", tag);
     let id = generate_id();
     channel.write_message(&ConfigMessage {
@@ -118,28 +118,35 @@ pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, confi
       proxy: Some(tag.clone()),
     });
     (id, tag.clone())
-  }).collect();
+  }));
 
-  let id = "hello";
+  loop {
+    println!("tags: {:?}", tags);
+    if tags.is_empty() {
+      println!("all proxies shut down");
+      break;
+    }
 
-  match channel.read_message() {
-    None          => println!("the proxy didn't answer"),
-    Some(message) => {
-      if id != message.id {
-        println!("received message with invalid id: {:?}", message);
-        return;
-      }
-      match message.status {
-        ConfigMessageStatus::Processing => {
-          // do nothing here
-          // for other messages, we would loop over read_message
-          // until an error or ok message was sent
-        },
-        ConfigMessageStatus::Error => {
-          println!("could not stop the proxy: {}", message.message);
-        },
-        ConfigMessageStatus::Ok => {
-          println!("Proxy state:\n{}", message.message);
+    match channel.read_message() {
+      None          => println!("the proxy didn't answer"),
+      Some(message) => {
+        println!("received message: {:?}", message);
+        if !tags.contains_key(&message.id) {
+          println!("received message with invalid id: {:?}", message);
+          return;
+        }
+        match message.status {
+          ConfigMessageStatus::Processing => {
+            tags.get(&message.id).map(|tag| println!("[{}]: {}", tag, message.message));
+          },
+          ConfigMessageStatus::Error => {
+            println!("could not stop the proxy: {}", message.message);
+          },
+          ConfigMessageStatus::Ok => {
+            if let Some(tag) = tags.remove(&message.id) {
+              println!("Proxy {} shut down: {}", tag, message.message);
+            }
+          }
         }
       }
     }
@@ -147,37 +154,45 @@ pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, confi
 }
 
 pub fn hard_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config: &Config) {
-  let messages: Vec<(String, String)> = config.proxies.keys().map(|tag| {
+  let mut tags: HashMap<String,String> = HashMap::from_iter(config.proxies.keys().map(|tag| {
     println!("shutting down proxy \"{}\"", tag);
     let id = generate_id();
     channel.write_message(&ConfigMessage {
       id:    id.clone(),
-      data:  ConfigCommand::ProxyConfiguration(Order::SoftStop),
+      data:  ConfigCommand::ProxyConfiguration(Order::HardStop),
       proxy: Some(tag.clone()),
     });
     (id, tag.clone())
-  }).collect();
+  }));
 
-  let id = "hello";
 
-  match channel.read_message() {
-    None          => println!("the proxy didn't answer"),
-    Some(message) => {
-      if id != message.id {
-        println!("received message with invalid id: {:?}", message);
-        return;
-      }
-      match message.status {
-        ConfigMessageStatus::Processing => {
-          // do nothing here
-          // for other messages, we would loop over read_message
-          // until an error or ok message was sent
-        },
-        ConfigMessageStatus::Error => {
-          println!("could not stop the proxy: {}", message.message);
-        },
-        ConfigMessageStatus::Ok => {
-          println!("Proxy state:\n{}", message.message);
+  loop {
+    println!("tags: {:?}", tags);
+    if tags.is_empty() {
+      println!("all proxies shut down");
+      break;
+    }
+
+    match channel.read_message() {
+      None          => println!("the proxy didn't answer"),
+      Some(message) => {
+        println!("received message: {:?}", message);
+        if !tags.contains_key(&message.id) {
+          println!("received message with invalid id: {:?}", message);
+          return;
+        }
+        match message.status {
+          ConfigMessageStatus::Processing => {
+            tags.get(&message.id).map(|tag| println!("[{}]: {}", tag, message.message));
+          },
+          ConfigMessageStatus::Error => {
+            println!("could not stop the proxy: {}", message.message);
+          },
+          ConfigMessageStatus::Ok => {
+            if let Some(tag) = tags.remove(&message.id) {
+              println!("Proxy {} shut down: {}", tag, message.message);
+            }
+          }
         }
       }
     }
