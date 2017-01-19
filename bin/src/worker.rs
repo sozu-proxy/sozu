@@ -13,9 +13,9 @@ use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 use sozu::network::{ProxyOrder,ServerMessage,http,tls};
 use sozu::channel::Channel;
 use sozu_command::data::ProxyType;
+use sozu_command::config::ProxyConfig;
 
 use command::Proxy;
-use config::ProxyConfig;
 
 pub fn start_workers(tag: &str, ls: &ProxyConfig) -> Option<Vec<Proxy>> {
   match ls.proxy_type {

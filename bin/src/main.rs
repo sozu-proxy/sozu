@@ -15,13 +15,13 @@ extern crate nix;
 extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
 
-mod config;
 mod command;
 mod worker;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::collections::HashMap;
 use sozu::network::metrics::{METRICS,ProxyMetrics};
+use sozu_command::config::Config;
 use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
 use clap::{App,Arg,SubCommand};
@@ -82,7 +82,7 @@ fn main() {
   let submatches = matches.subcommand_matches("start").expect("unknown subcommand");
   let config_file = submatches.value_of("config").expect("required config file");
 
-  if let Ok(config) = config::Config::load_from_path(config_file) {
+  if let Ok(config) = Config::load_from_path(config_file) {
     if let Some(ref log_level) = config.log_level {
      builder.parse(&log_level);
     }

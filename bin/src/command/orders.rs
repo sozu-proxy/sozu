@@ -10,9 +10,9 @@ use nom::{HexDisplay,IResult,Offset};
 use sozu::messages::Order;
 use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
+use sozu_command::config::Config;
 use sozu_command::data::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
 
-use config::Config;
 use super::{CommandServer,FrontToken,ProxyConfiguration,StoredProxy};
 use super::client::parse;
 

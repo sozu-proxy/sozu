@@ -8,7 +8,8 @@ use serde::Deserialize;
 use toml;
 
 use sozu::messages::{Order,HttpFront,TlsFront,Instance,HttpProxyConfiguration,TlsProxyConfiguration};
-use sozu_command::data::{ConfigCommand,ConfigMessage,ProxyType};
+
+use data::{ConfigCommand,ConfigMessage,ProxyType};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct ProxyConfig {

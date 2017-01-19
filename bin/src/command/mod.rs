@@ -17,8 +17,7 @@ use sozu::network::{ProxyOrder,ServerMessage,ServerMessageStatus};
 use sozu::channel::Channel;
 use sozu_command::state::{HttpProxy,TlsProxy,ConfigState};
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,ProxyType};
-
-use config::Config;
+use sozu_command::config::Config;
 
 pub mod orders;
 pub mod client;
