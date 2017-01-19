@@ -17,7 +17,6 @@ dependencies = [
  "sozu-command-lib 0.1.0",
  "sozu-lib 0.1.0",
  "time 0.1.36 (registry+https://github.com/rust-lang/crates.io-index)",
- "toml 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]

@@ -19,11 +19,6 @@ slab = "^0.3.0"
 libc = "^0.2"
 nix  = "^0.7"
 
-[dependencies.toml]
-version = "^0.2"
-default-features = false
-features = ["serde"]
-
 [dependencies.sozu-lib]
 path = "../lib"
 

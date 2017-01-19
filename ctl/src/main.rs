@@ -1,13 +1,9 @@
 #[macro_use] extern crate clap;
-#[macro_use] extern crate serde_derive;
 extern crate mio;
 extern crate mio_uds;
 extern crate nix;
 extern crate libc;
 extern crate time;
-extern crate toml;
-extern crate serde;
-extern crate serde_json;
 extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
 

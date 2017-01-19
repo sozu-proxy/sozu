@@ -5,7 +5,6 @@
 extern crate env_logger;
 extern crate mio;
 extern crate mio_uds;
-extern crate toml;
 extern crate serde;
 extern crate serde_json;
 extern crate time;
