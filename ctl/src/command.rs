@@ -1,4 +1,6 @@
 use sozu::channel::Channel;
+use sozu::messages::Order;
+use sozu_command::config::Config;
 use sozu_command::data::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
 
 fn generate_id() -> String {
@@ -92,6 +94,82 @@ pub fn dump_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
         },
         ConfigMessageStatus::Error => {
           println!("could not dump proxy state: {}", message.message);
+        },
+        ConfigMessageStatus::Ok => {
+          println!("Proxy state:\n{}", message.message);
+        }
+      }
+    }
+  }
+}
+
+pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config: &Config) {
+  let messages: Vec<(String, String)> = config.proxies.keys().map(|tag| {
+    println!("shutting down proxy \"{}\"", tag);
+    let id = generate_id();
+    channel.write_message(&ConfigMessage {
+      id:    id.clone(),
+      data:  ConfigCommand::ProxyConfiguration(Order::SoftStop),
+      proxy: Some(tag.clone()),
+    });
+    (id, tag.clone())
+  }).collect();
+
+  let id = "hello";
+
+  match channel.read_message() {
+    None          => println!("the proxy didn't answer"),
+    Some(message) => {
+      if id != message.id {
+        println!("received message with invalid id: {:?}", message);
+        return;
+      }
+      match message.status {
+        ConfigMessageStatus::Processing => {
+          // do nothing here
+          // for other messages, we would loop over read_message
+          // until an error or ok message was sent
+        },
+        ConfigMessageStatus::Error => {
+          println!("could not stop the proxy: {}", message.message);
+        },
+        ConfigMessageStatus::Ok => {
+          println!("Proxy state:\n{}", message.message);
+        }
+      }
+    }
+  }
+}
+
+pub fn hard_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config: &Config) {
+  let messages: Vec<(String, String)> = config.proxies.keys().map(|tag| {
+    println!("shutting down proxy \"{}\"", tag);
+    let id = generate_id();
+    channel.write_message(&ConfigMessage {
+      id:    id.clone(),
+      data:  ConfigCommand::ProxyConfiguration(Order::SoftStop),
+      proxy: Some(tag.clone()),
+    });
+    (id, tag.clone())
+  }).collect();
+
+  let id = "hello";
+
+  match channel.read_message() {
+    None          => println!("the proxy didn't answer"),
+    Some(message) => {
+      if id != message.id {
+        println!("received message with invalid id: {:?}", message);
+        return;
+      }
+      match message.status {
+        ConfigMessageStatus::Processing => {
+          // do nothing here
+          // for other messages, we would loop over read_message
+          // until an error or ok message was sent
+        },
+        ConfigMessageStatus::Error => {
+          println!("could not stop the proxy: {}", message.message);
         },
         ConfigMessageStatus::Ok => {
           println!("Proxy state:\n{}", message.message);

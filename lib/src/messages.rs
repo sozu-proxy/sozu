@@ -209,9 +209,19 @@ impl serde::de::Visitor for OrderVisitor {
       Some(command) => command,
       None => try!(visitor.missing_field("type")),
     };
+
+    // no data field for SoftStop and HardStop
+    if &command_type == "SOFT_STOP" {
+      try!(visitor.end());
+      return Ok(Order::SoftStop);
+    } else if &command_type == "HARD_STOP" {
+      try!(visitor.end());
+      return Ok(Order::HardStop);
+    }
+
     let data = match data {
       Some(data) => data,
-      None => try!(visitor.missing_field("data")),
+      None       => try!(visitor.missing_field("data")),
     };
 
     try!(visitor.end());
@@ -246,7 +256,7 @@ impl serde::de::Visitor for OrderVisitor {
       let conf = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("configure_http_proxy"))));
       Ok(Order::HttpProxy(conf))
     } else {
-      Err(serde::de::Error::custom("unrecognized command"))
+      Err(serde::de::Error::custom(format!("unrecognized command: {:?}", command_type)))
     }
   }
 }

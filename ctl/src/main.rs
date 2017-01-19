@@ -16,7 +16,7 @@ use sozu::channel::Channel;
 use sozu_command::config::Config;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 
-use command::{dump_state,load_state,save_state};
+use command::{dump_state,load_state,save_state,soft_stop,hard_stop};
 
 fn main() {
   let matches = App::new("sozuctl")
@@ -56,13 +56,18 @@ fn main() {
   let config_file = matches.value_of("config").expect("required config file");
 
   let config = Config::load_from_path(config_file).expect("could not parse configuration file");
-  let stream = UnixStream::connect(config.command_socket).expect("could not connect to the command unix socket");
+  let stream = UnixStream::connect(&config.command_socket).expect("could not connect to the command unix socket");
   let mut channel: Channel<ConfigMessage,ConfigMessageAnswer> = Channel::new(stream, 10000, 20000);
   channel.set_nonblocking(false);
 
   match matches.subcommand() {
     ("shutdown", Some(sub)) => {
       let hard_shutdown = sub.is_present("hard");
+      if hard_shutdown {
+        hard_stop(&mut channel, &config);
+      } else {
+        soft_stop(&mut channel, &config);
+      }
     },
     ("state", Some(sub))    => {
       match sub.subcommand() {
