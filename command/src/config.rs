@@ -314,7 +314,7 @@ mod tests {
   use super::*;
   use std::collections::HashMap;
   use toml::encode_str;
-  use sozu_command::data::ProxyType;
+  use data::ProxyType;
 
   #[test]
   fn serialize() {
@@ -363,7 +363,8 @@ mod tests {
         address: String::from("192.168.59.103"),
         port:    8125,
       },
-      proxies: map
+      proxies: map,
+      applications: HashMap::new()
     };
 
     let encoded = encode_str(&config);

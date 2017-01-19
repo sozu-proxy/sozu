@@ -344,7 +344,7 @@ impl serde::Serialize for ConfigMessage {
 mod tests {
   use super::*;
   use serde_json;
-  use sozu::messages::{Command,HttpFront};
+  use sozu::messages::{Order,HttpFront};
 
   #[test]
   fn config_message_test() {
@@ -352,7 +352,7 @@ mod tests {
     let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", message);
     assert_eq!(message.proxy, Some(String::from("HTTP")));
-    assert_eq!(message.data, ConfigCommand::ProxyConfiguration(Command::AddHttpFront(HttpFront{
+    assert_eq!(message.data, ConfigCommand::ProxyConfiguration(Order::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
