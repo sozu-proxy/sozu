@@ -382,6 +382,27 @@ impl ServerConfiguration {
   }
 
   pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&HttpFront> {
+    let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(host.as_bytes()) {
+      if i != &b""[..] {
+        error!("{}\tinvalid remaining chars after hostname", self.tag);
+        return None;
+      }
+
+      /*if port == Some(&b"80"[..]) {
+      // it is alright to call from_utf8_unchecked,
+      // we already verified that there are only ascii
+      // chars in there
+        unsafe { from_utf8_unchecked(hostname) }
+      } else {
+        host
+      }
+      */
+      unsafe { from_utf8_unchecked(hostname) }
+    } else {
+      error!("{}\thostname parsing failed", self.tag);
+      return None;
+    };
+
     if let Some(http_fronts) = self.fronts.get(host) {
       let matching_fronts = http_fronts.iter().filter(|f| uri.starts_with(&f.path_begin)); // ToDo match on uri
       let mut front = None;
