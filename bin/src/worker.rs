@@ -9,6 +9,7 @@ use std::os::unix::process::CommandExt;
 use std::os::unix::io::{AsRawFd,FromRawFd};
 use nix::unistd::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
+use env_logger::LogBuilder;
 
 use sozu::network::{ProxyOrder,ServerMessage,http,tls};
 use sozu::channel::Channel;
@@ -68,7 +69,7 @@ fn generate_channels() -> io::Result<(Channel<ProxyOrder,ServerMessage>, Channel
   Ok((command_channel, proxy_channel))
 }
 
-pub fn begin_worker_process(fd: i32, id: &str, tag: &str) {
+pub fn begin_worker_process(fd: i32, id: &str, tag: &str, mut builder: LogBuilder) {
   let mut command: Channel<ServerMessage,ProxyConfig> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
     10000,
@@ -79,6 +80,10 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str) {
 
   let proxy_config = command.read_message().expect("worker could not read configuration from socket");
   println!("got message: {:?}", proxy_config);
+
+  //FIXME: hardcoded log level
+  builder.parse("info");
+  builder.init().unwrap();
 
   command.set_nonblocking(true);
   let command: Channel<ServerMessage,ProxyOrder> = command.into();

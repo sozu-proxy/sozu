@@ -74,7 +74,7 @@ fn main() {
     let id  = matches.value_of("id").expect("needs a worker id");
     let tag = matches.value_of("tag").expect("needs a configuration tag");
 
-    begin_worker_process(fd, id, tag);
+    begin_worker_process(fd, id, tag, builder);
     return;
   }
 
