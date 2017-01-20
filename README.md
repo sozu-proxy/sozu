@@ -4,7 +4,46 @@ it will be awesome when it will be ready
 
 ## Goals
 
-## Building
+Build the most reliable proxy ever:
+
+- it should never crash (currently fixing the remaining panics)
+- you should not need to restart it
+  - it can receive configuration changes from a unix socket at runtime
+  - it should be able to upgrade without any downtime
+- it should not have exploitable memory errors
+  - even if it has one, workers will be sandboxed
+- you set up a limit on the number of concurrent connections to a worker
+  - the proxy will refuse new connections over that limit, instead of requesting unavailable ressources like memory
+
+## Building and starting
+
+You can create the required executables like this:
+
+```
+cd ctl && cargo build; cd ../bin && cargo build
+```
+
+This will create the `sozu` executable for the proxy, and `sozuctl` to command it.
+
+To start the proxy:
+
+```
+cd bin;
+./target/debug/sozu start -c config.toml
+```
+
+You can edit the proxy's configuration with the `config.toml` file. You can declare
+new applications, their frontends and backends through that file, but for more flexibility,
+you should use the command socket (you can find one end of that unix socket at the path
+designed by `command_socket` in the configuration file).
+
+`sozuctl` has a few commands you can use to interact with the proxy:
+
+
+- soft shutdown (wait for active connections to stop): `sozuctl -c config.toml shutdown`
+- hard shutdown: `sozuctl -c config.toml shutdown --hard`
+- display the list of current configuration messages: `sozuctl -c config.toml state dump`
+- save the configuration state to a file: `sozuctl -c config.toml state save -f state.json`
 
 ### For OSX build
 
