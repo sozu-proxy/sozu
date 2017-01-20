@@ -17,6 +17,7 @@ proxy_type = "HTTP"
 max_connections = 500
 port = 8080
 buffer_size = 16384
+worker_count = 2
 #answer_404 = "./404.html"
 #answer_503 = "./503.html"
 
@@ -26,7 +27,7 @@ proxy_type = "HTTPS"
 max_connections = 500
 port = 8443
 buffer_size = 16384
-#default_app_id = "xxx"
+default_app_id = "MyApp"
 #default_certificate = "../assets/cert_test.pem"
 #default_certificate_chain = "../assets/cert__chain_test.pem"
 #default_key = "../assets/key_test.pem"
@@ -37,8 +38,8 @@ buffer_size = 16384
 [applications]
 
 [applications.MyApp]
-hostname   = "example.com"
-path_begin = "/api" # optional
+hostname   = "lolcatho.st"
+#path_begin = "/api" # optional
 certificate = "../assets/certificate.pem" # optional
 key = "../assets/key.pem" # optional
 certificate_chain = "../assets/certificate_chain.pem" # optional
