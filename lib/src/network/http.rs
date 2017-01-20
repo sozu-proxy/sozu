@@ -683,7 +683,7 @@ mod tests {
       start(String::from("HTTP"), config, channel);
     });
 
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
+    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&ProxyOrder { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
     command.write_message(&ProxyOrder { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
@@ -736,7 +736,7 @@ mod tests {
       start(String::from("HTTP"), config, channel);
     });
 
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1031"), path_begin: String::from("/") };
+    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&ProxyOrder { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1028 };
     command.write_message(&ProxyOrder { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
