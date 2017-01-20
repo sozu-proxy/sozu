@@ -14,11 +14,11 @@ fn generate_id() -> String {
 
 pub fn save_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path: &str) {
   let id = generate_id();
-  channel.write_message(&ConfigMessage {
-    id:    id.clone(),
-    data:  ConfigCommand::SaveState(path.to_string()),
-    proxy: None,
-  });
+  channel.write_message(&ConfigMessage::new(
+    id.clone(),
+    ConfigCommand::SaveState(path.to_string()),
+    None,
+  ));
 
   match channel.read_message() {
     None          => println!("the proxy didn't answer"),
@@ -46,11 +46,11 @@ pub fn save_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
 
 pub fn load_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path: &str) {
   let id = generate_id();
-  channel.write_message(&ConfigMessage {
-    id:    id.clone(),
-    data:  ConfigCommand::LoadState(path.to_string()),
-    proxy: None,
-  });
+  channel.write_message(&ConfigMessage::new(
+    id.clone(),
+    ConfigCommand::LoadState(path.to_string()),
+    None,
+  ));
 
   match channel.read_message() {
     None          => println!("the proxy didn't answer"),
@@ -78,11 +78,11 @@ pub fn load_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
 
 pub fn dump_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   let id = generate_id();
-  channel.write_message(&ConfigMessage {
-    id:    id.clone(),
-    data:  ConfigCommand::DumpState,
-    proxy: None,
-  });
+  channel.write_message(&ConfigMessage::new(
+    id.clone(),
+    ConfigCommand::DumpState,
+    None,
+  ));
 
   match channel.read_message() {
     None          => println!("the proxy didn't answer"),
@@ -112,11 +112,11 @@ pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, confi
   let mut tags: HashMap<String,String> = HashMap::from_iter(config.proxies.keys().map(|tag| {
     println!("shutting down proxy \"{}\"", tag);
     let id = generate_id();
-    channel.write_message(&ConfigMessage {
-      id:    id.clone(),
-      data:  ConfigCommand::ProxyConfiguration(Order::SoftStop),
-      proxy: Some(tag.clone()),
-    });
+    channel.write_message(&ConfigMessage::new(
+      id.clone(),
+      ConfigCommand::ProxyConfiguration(Order::SoftStop),
+      Some(tag.clone()),
+    ));
     (id, tag.clone())
   }));
 
@@ -155,11 +155,11 @@ pub fn hard_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, confi
   let mut tags: HashMap<String,String> = HashMap::from_iter(config.proxies.keys().map(|tag| {
     println!("shutting down proxy \"{}\"", tag);
     let id = generate_id();
-    channel.write_message(&ConfigMessage {
-      id:    id.clone(),
-      data:  ConfigCommand::ProxyConfiguration(Order::HardStop),
-      proxy: Some(tag.clone()),
-    });
+    channel.write_message(&ConfigMessage::new(
+      id.clone(),
+      ConfigCommand::ProxyConfiguration(Order::HardStop),
+      Some(tag.clone()),
+    ));
     (id, tag.clone())
   }));
 

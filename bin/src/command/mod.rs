@@ -285,18 +285,18 @@ impl CommandServer {
 
   fn proxy_handle_message(&mut self, token: Token, msg: ServerMessage) {
     println!("got answer msg: {:?}", msg);
-    let answer = ConfigMessageAnswer {
-      id: msg.id.clone(),
-      status: match msg.status {
+    let answer = ConfigMessageAnswer::new(
+      msg.id.clone(),
+      match msg.status {
         ServerMessageStatus::Error(_)   => ConfigMessageStatus::Error,
         ServerMessageStatus::Ok         => ConfigMessageStatus::Ok,
         ServerMessageStatus::Processing => ConfigMessageStatus::Processing,
       },
-      message: match msg.status {
-                 ServerMessageStatus::Error(s) => s.clone(),
-                 _                             => String::new(),
-               },
-    };
+      match msg.status {
+        ServerMessageStatus::Error(s) => s.clone(),
+        _                             => String::new(),
+      },
+    );
     info!("sending: {:?}", answer);
     for client in self.conns.iter_mut() {
       if let Some(index) = client.has_message_id(&msg.id) {

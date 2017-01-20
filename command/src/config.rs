@@ -9,7 +9,7 @@ use toml;
 
 use sozu::messages::{Order,HttpFront,TlsFront,Instance,HttpProxyConfiguration,TlsProxyConfiguration};
 
-use data::{ConfigCommand,ConfigMessage,ProxyType};
+use data::{ConfigCommand,ConfigMessage,ProxyType,PROTOCOL_VERSION};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct ProxyConfig {
@@ -243,9 +243,10 @@ impl Config {
           };
 
           v.push(ConfigMessage {
-            id:    format!("CONFIG-{}", count),
-            proxy: Some(tag.clone()),
-            data:  ConfigCommand::ProxyConfiguration(frontend_order),
+            id:      format!("CONFIG-{}", count),
+            version: PROTOCOL_VERSION,
+            proxy:   Some(tag.clone()),
+            data:    ConfigCommand::ProxyConfiguration(frontend_order),
           });
 
           count += 1;
@@ -268,9 +269,10 @@ impl Config {
               });
 
               v.push(ConfigMessage {
-                id:    format!("CONFIG-{}", count),
-                proxy: Some(tag.clone()),
-                data:  ConfigCommand::ProxyConfiguration(backend_order),
+                id:      format!("CONFIG-{}", count),
+                version: PROTOCOL_VERSION,
+                proxy:   Some(tag.clone()),
+                data:    ConfigCommand::ProxyConfiguration(backend_order),
               });
 
               count += 1;

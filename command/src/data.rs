@@ -3,6 +3,8 @@ use serde_json;
 use state::{HttpProxy,TlsProxy,ConfigState};
 use sozu::messages::Order;
 
+pub const PROTOCOL_VERSION: u8 = 0;
+
 #[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]
 pub enum ProxyType {
   HTTP,
@@ -156,11 +158,22 @@ pub enum ConfigCommand {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub struct ConfigMessage {
-  pub id:    String,
-  pub data:  ConfigCommand,
-  pub proxy: Option<String>,
+  pub id:      String,
+  pub version: u8,
+  pub data:    ConfigCommand,
+  pub proxy:   Option<String>,
 }
 
+impl ConfigMessage {
+  pub fn new(id: String, data: ConfigCommand, proxy: Option<String>) -> ConfigMessage {
+    ConfigMessage {
+      id:      id,
+      version: PROTOCOL_VERSION,
+      data:    data,
+      proxy:   proxy,
+    }
+  }
+}
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub enum ConfigMessageStatus {
@@ -172,8 +185,20 @@ pub enum ConfigMessageStatus {
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct ConfigMessageAnswer {
   pub id:      String,
+  pub version: u8,
   pub status:  ConfigMessageStatus,
   pub message: String
+}
+
+impl ConfigMessageAnswer {
+  pub fn new(id: String, status: ConfigMessageStatus, message: String) -> ConfigMessageAnswer {
+    ConfigMessageAnswer {
+      id:      id,
+      version: PROTOCOL_VERSION,
+      status:  status,
+      message: message,
+    }
+  }
 }
 
 #[derive(Deserialize)]
@@ -183,6 +208,7 @@ struct SaveStateData {
 
 enum ConfigMessageField {
   Id,
+  Version,
   Proxy,
   Type,
   Data,
@@ -199,10 +225,11 @@ impl serde::Deserialize for ConfigMessageField {
         where E: serde::de::Error {
         match value {
           "id"       => Ok(ConfigMessageField::Id),
+          "version"  => Ok(ConfigMessageField::Version),
           "type"     => Ok(ConfigMessageField::Type),
           "proxy"    => Ok(ConfigMessageField::Proxy),
           "data"     => Ok(ConfigMessageField::Data),
-          _ => Err(serde::de::Error::custom("expected id, proxy, type or data")),
+          e => Err(serde::de::Error::custom(format!("expected id, version, proxy, type or data, got: {}", e))),
         }
       }
     }
@@ -218,16 +245,18 @@ impl serde::de::Visitor for ConfigMessageVisitor {
   fn visit_map<V>(&mut self, mut visitor: V) -> Result<ConfigMessage, V::Error>
         where V: serde::de::MapVisitor {
     let mut id:Option<String>              = None;
+    let mut version:Option<u8>             = None;
     let mut proxy: Option<String>          = None;
     let mut config_type:Option<String>     = None;
     let mut data:Option<serde_json::Value> = None;
 
     loop {
       match try!(visitor.visit_key()) {
-        Some(ConfigMessageField::Type)  => { config_type = Some(try!(visitor.visit_value())); }
-        Some(ConfigMessageField::Id)    => { id = Some(try!(visitor.visit_value())); }
-        Some(ConfigMessageField::Proxy) => { proxy = Some(try!(visitor.visit_value())); }
-        Some(ConfigMessageField::Data)  => { data = Some(try!(visitor.visit_value())); }
+        Some(ConfigMessageField::Type)    => { config_type = Some(try!(visitor.visit_value())); }
+        Some(ConfigMessageField::Id)      => { id = Some(try!(visitor.visit_value())); }
+        Some(ConfigMessageField::Version) => { version = Some(try!(visitor.visit_value())); }
+        Some(ConfigMessageField::Proxy)   => { proxy = Some(try!(visitor.visit_value())); }
+        Some(ConfigMessageField::Data)    => { data = Some(try!(visitor.visit_value())); }
         None => { break; }
       }
     }
@@ -240,6 +269,10 @@ impl serde::de::Visitor for ConfigMessageVisitor {
     let id = match id {
       Some(id) => id,
       None => try!(visitor.missing_field("id")),
+    };
+    let version = match version {
+      Some(version) => version,
+      None => try!(visitor.missing_field("version")),
     };
 
     try!(visitor.end());
@@ -272,9 +305,10 @@ impl serde::de::Visitor for ConfigMessageVisitor {
     };
 
     Ok(ConfigMessage {
-      id:       id,
-      data:     data,
-      proxy: proxy
+      id:      id,
+      version: PROTOCOL_VERSION,
+      data:    data,
+      proxy:   proxy
     })
   }
 }
@@ -282,7 +316,7 @@ impl serde::de::Visitor for ConfigMessageVisitor {
 impl serde::Deserialize for ConfigMessage {
   fn deserialize<D>(deserializer: &mut D) -> Result<ConfigMessage, D::Error>
     where D: serde::de::Deserializer {
-    static FIELDS: &'static [&'static str] = &["id", "proxy", "type", "data"];
+    static FIELDS: &'static [&'static str] = &["id", "version", "proxy", "type", "data"];
     deserializer.deserialize_struct("ConfigMessage", FIELDS, ConfigMessageVisitor)
   }
 }
@@ -297,13 +331,16 @@ impl serde::Serialize for ConfigMessage {
       where S: serde::Serializer,
   {
     let mut state = if self.proxy.is_some() {
-      try!(serializer.serialize_map(Some(4)))
+      try!(serializer.serialize_map(Some(5)))
     } else {
-      try!(serializer.serialize_map(Some(3)))
+      try!(serializer.serialize_map(Some(4)))
     };
 
     try!(serializer.serialize_map_key(&mut state, "id"));
     try!(serializer.serialize_map_value(&mut state, &self.id));
+
+    try!(serializer.serialize_map_key(&mut state, "version"));
+    try!(serializer.serialize_map_value(&mut state, &self.version));
 
     if self.proxy.is_some() {
       try!(serializer.serialize_map_key(&mut state, "proxy"));

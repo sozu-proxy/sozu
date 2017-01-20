@@ -11,7 +11,7 @@ use sozu::messages::Order;
 use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
 use sozu_command::config::Config;
-use sozu_command::data::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
+use sozu_command::data::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,PROTOCOL_VERSION};
 
 use super::{CommandServer,FrontToken,ProxyConfiguration,StoredProxy};
 use super::client::parse;
@@ -35,29 +35,29 @@ impl CommandServer {
           let mut counter = 0usize;
           for proxy in stored_proxies {
             for command in proxy.state.generate_orders() {
-              let message = ConfigMessage {
-                id:       format!("SAVE-{}", counter),
-                proxy: Some(proxy.tag.to_string()),
-                data:     ConfigCommand::ProxyConfiguration(command)
-              };
+              let message = ConfigMessage::new(
+                format!("SAVE-{}", counter),
+                ConfigCommand::ProxyConfiguration(command),
+                Some(proxy.tag.to_string())
+              );
               f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()));
               f.write_all(&b"\n\0"[..]);
               counter += 1;
             }
             f.sync_all();
           }
-          self.conns[token].write_message(&ConfigMessageAnswer {
-            id:      message.id.clone(),
-            status:  ConfigMessageStatus::Ok,
-            message: format!("saved to {}", path)
-          });
+          self.conns[token].write_message(&ConfigMessageAnswer::new(
+            message.id.clone(),
+            ConfigMessageStatus::Ok,
+            format!("saved to {}", path)
+          ));
         } else {
           log!(log::LogLevel::Error, "could not open file: {}", &path);
-          self.conns[token].write_message(&ConfigMessageAnswer {
-            id:      message.id.clone(),
-            status:  ConfigMessageStatus::Error,
-            message: "could not open file".to_string()
-          });
+          self.conns[token].write_message(&ConfigMessageAnswer::new(
+            message.id.clone(),
+            ConfigMessageStatus::Error,
+            "could not open file".to_string()
+          ));
         }
       },
       ConfigCommand::DumpState => {
@@ -76,20 +76,20 @@ impl CommandServer {
           proxies: stored_proxies,
         };
         //let encoded = serde_json::to_string(&conf).map(|s| s.into_bytes()).unwrap_or(vec!());
-        self.conns[token].write_message(&ConfigMessageAnswer {
-          id:      message.id.clone(),
-          status:  ConfigMessageStatus::Ok,
-          message: serde_json::to_string(&conf).unwrap_or(String::new())
-        });
+        self.conns[token].write_message(&ConfigMessageAnswer::new(
+          message.id.clone(),
+          ConfigMessageStatus::Ok,
+          serde_json::to_string(&conf).unwrap_or(String::new())
+        ));
         //self.conns[token].write_message(&encoded);
       },
       ConfigCommand::LoadState(path) => {
         self.load_state(&message.id, &path);
-        self.conns[token].write_message(&ConfigMessageAnswer {
-          id:      message.id.clone(),
-          status:  ConfigMessageStatus::Ok,
-          message: "loaded the configuration".to_string()
-        });
+        self.conns[token].write_message(&ConfigMessageAnswer::new(
+          message.id.clone(),
+          ConfigMessageStatus::Ok,
+          "loaded the configuration".to_string()
+        ));
       },
       ConfigCommand::ProxyConfiguration(order) => {
         if let Some(ref tag) = message.proxy {
