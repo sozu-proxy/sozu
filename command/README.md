@@ -118,6 +118,22 @@ The dump state message is defined like this:
 The proxy's configuration can be altered at runtime, without restarts,
 by communication configuration changes through the socket.
 
+The proxy attribute indicates the proxy's name, as defined in the
+configuration file, in the section name (ie, `[proxies.HELLO]` creates
+the `HELLO` proxy).
+
+The data attribute will contain one of the proxy orders.
+
+#### HTTP proxy configuration
+
+```json
+```
+
+#### HTTPS proxy configuration
+
+```json
+```
+
 #### Adding a new HTTP front
 
 ```json
@@ -159,12 +175,79 @@ by communication configuration changes through the socket.
 }
 ```
 
+#### Adding a new backend server
 
-The proxy attribute indicates the proxy's name, as defined in the
-configuration file, in the section name (ie, `[listeners.HELLO]` creates
-the `HELLO` listener).
+```json
+{
+  "id": "ID_ABCD",
+  "version": 0,
+  "type": "PROXY",
+  "proxy": "HTTP",
+  "data":{
+    "type": "ADD_INSTANCE",
+    "data": {
+      "app_id": "xxx",
+      "ip_address": "127.0.0.1",
+      "port": 1026
+    }
+  }
+}
+```
 
-The data attribute will contain one of the proxy orders.
+#### Removing a HTTP frontend
+
+```json
+{
+  "type": "REMOVE_HTTP_FRONT",
+  "data": {
+    "app_id": "xxx",
+    "hostname": "yyy",
+    "path_begin": "xxx",
+    "port": 4242
+  }
+}
+```
+
+#### Removing a HTTPS frontend
+
+```json
+{
+  "id":      "ID_TEST",
+  "version": 0,
+  "type":    "PROXY",
+  "proxy":   "TLS",
+  "data": {
+    "type": "REMOVE_TLS_FRONT",
+    "data": {
+      "app_id":      "xxx",
+      "hostname":    "yyy",
+      "path_begin":  "xxx",
+      //FIXME: see issue #113, those should not appear in the remove message
+      "certificate": "<PEM data>",
+      "key":         "<PEM data>",
+      "certificate_chain": [ "<PEM data>", "<PEM data>" ]
+    }
+  }
+}
+```
+
+#### Removing a backend server
+
+```json
+{
+  "id": "ID_789",
+  "type": "PROXY",
+  "proxy": "HTTP",
+  "data": {
+    "type": "REMOVE_INSTANCE",
+    "data": {
+      "app_id": "xxx",
+      "ip_address": "127.0.0.1",
+      "port": 1026
+    }
+  }
+}
+```
 
 #### Soft shutdown
 
