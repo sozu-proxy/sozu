@@ -385,7 +385,7 @@ mod tests {
 
   #[test]
   fn config_message_test() {
-    let raw_json = r#"{ "id": "ID_TEST", "type": "PROXY", "proxy": "HTTP", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}} }"#;
+    let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "proxy": "HTTP", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}} }"#;
     let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", message);
     assert_eq!(message.proxy, Some(String::from("HTTP")));
@@ -398,7 +398,7 @@ mod tests {
 
   #[test]
   fn save_state_test() {
-    let raw_json = r#"{ "id": "ID_TEST", "type": "SAVE_STATE", "data":{ "path": "./config_dump.json"} }"#;
+    let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "SAVE_STATE", "data":{ "path": "./config_dump.json"} }"#;
     let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", message);
     assert_eq!(message.proxy, None);
@@ -409,7 +409,7 @@ mod tests {
   fn dump_state_test() {
     println!("A");
     //let raw_json = r#"{ "id": "ID_TEST", "type": "DUMP_STATE" }"#;
-    let raw_json = "{ \"id\": \"ID_TEST\", \"type\": \"DUMP_STATE\" }";
+    let raw_json = "{ \"id\": \"ID_TEST\", \"version\": 0, \"type\": \"DUMP_STATE\" }";
     println!("B");
     let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
     println!("C");
