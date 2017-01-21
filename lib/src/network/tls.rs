@@ -329,7 +329,7 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(tag: String, config: TlsProxyConfiguration, channel: ProxyChannel, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
+  pub fn new(tag: String, config: TlsProxyConfiguration, mut channel: ProxyChannel, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let mut domains  = TrieNode::root();
     let mut fronts   = HashMap::new();
@@ -390,7 +390,10 @@ impl ServerConfiguration {
         })
       },
       Err(e) => {
-        error!("{}\tcould not create listener {:?}: {:?}", tag, config.front, e);
+        let formatted_err = format!("{}\tcould not create listener {:?}: {:?}", tag, fronts, e);
+        error!("{}", formatted_err);
+        channel.write_message(&ServerMessage{id: String::from("listener_failed"), status: ServerMessageStatus::Error(formatted_err)});
+        channel.run();
         Err(e)
       }
     }
@@ -921,13 +924,14 @@ pub fn start(tag: String, config: TlsProxyConfiguration, channel: ProxyChannel) 
   let max_listeners   = 1;
 
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  let configuration = ServerConfiguration::new(tag.clone(), config, channel, &mut event_loop, 1 + max_listeners).unwrap();
-  let mut server = TlsServer::new(max_listeners, max_connections, configuration, event_loop);
+  if let Ok(configuration) = ServerConfiguration::new(tag.clone(), config, channel, &mut event_loop, 1 + max_listeners) {
+    let mut server = TlsServer::new(max_listeners, max_connections, configuration, event_loop);
 
-  info!("{}\tstarting event loop", &tag);
-  server.run();
-  //event_loop.run(&mut server).unwrap();
-  info!("{}\tending event loop", &tag);
+    info!("{}\tstarting event loop", &tag);
+    server.run();
+    //event_loop.run(&mut server).unwrap();
+    info!("{}\tending event loop", &tag);
+  }
 }
 
 #[cfg(test)]
