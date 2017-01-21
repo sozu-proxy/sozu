@@ -38,8 +38,15 @@ impl ProxyConfig {
     address.push_str(&self.port.to_string());
 
     let public_address = self.public_address.as_ref().and_then(|addr| FromStr::from_str(&addr).ok());
-    //FIXME: error message when we cannot parse the address
-    address.parse().ok().map(|addr| {
+    let http_proxy_configuration = match address.parse() {
+      Ok(addr) => Some(addr),
+      Err(err) => {
+        error!("Couldn't parse address of HTTP proxy: {}", err);
+        None
+      }
+    };
+
+    http_proxy_configuration.map(|addr| {
       let mut configuration = HttpProxyConfiguration {
         front: addr,
         public_address: public_address,
@@ -85,8 +92,15 @@ impl ProxyConfig {
         AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:\
         AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:!DSS"));
 
-    //FIXME: error message when we cannot parse the address
-    address.parse().ok().map(|addr| {
+    let tls_proxy_configuration = match address.parse() {
+      Ok(addr) => Some(addr),
+      Err(err) => {
+        error!("Couldn't parse address of TLS proxy: {}", err);
+        None
+      }
+    };
+
+    tls_proxy_configuration.map(|addr| {
       let mut configuration = TlsProxyConfiguration {
         front:           addr,
         public_address:  public_address,
