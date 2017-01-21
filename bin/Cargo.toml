@@ -3,6 +3,7 @@ name = "sozu"
 version = "0.1.0"
 license = "AGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
+categories = ["network-programming"]
 
 [dependencies]
 log = "0.3"
@@ -24,3 +25,6 @@ path = "../lib"
 
 [dependencies.sozu-command-lib]
 path = "../command"
+
+[badges]
+travis-ci = { repository = "sozu-proxy/sozu" }

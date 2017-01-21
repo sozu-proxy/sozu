@@ -2,6 +2,7 @@
 name = "sozu-command-lib"
 version = "0.1.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
+categories = ["network-programming"]
 
 [dependencies]
 log = "0.3"
@@ -16,3 +17,6 @@ features = ["serde"]
 
 [dependencies.sozu-lib]
 path = "../lib"
+
+[badges]
+travis-ci = { repository = "sozu-proxy/sozu" }
