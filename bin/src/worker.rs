@@ -120,10 +120,13 @@ pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t
   new_cl_flags.remove(FD_CLOEXEC);
   fcntl(client.as_raw_fd(), FcntlArg::F_SETFD(new_cl_flags));
 
+  let channel_buffer_size = config.channel_buffer_size.unwrap_or(10000);
+  let channel_max_buffer_size = channel_buffer_size * 2;
+
   let mut command: Channel<ProxyConfig,ServerMessage> = Channel::new(
     server,
-    10000,
-    20000
+    channel_buffer_size,
+    channel_max_buffer_size
   );
   command.set_nonblocking(false);
 
