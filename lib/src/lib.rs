@@ -149,8 +149,8 @@
 //! }
 //! ```
 //!
-#![cfg_attr(test, feature(test))]
-#[cfg(test)]
+#![cfg_attr(feature = "unstable", feature(test))]
+#[cfg(all(feature = "unstable", test))]
 extern crate test;
 
 #[macro_use] extern crate nom;

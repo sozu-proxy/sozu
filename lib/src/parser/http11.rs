@@ -2502,7 +2502,7 @@ mod tests {
   }
 }
 
-#[cfg(test)]
+#[cfg(all(feature = "unstable", test))]
 mod bench {
   use super::*;
   use test::Bencher;

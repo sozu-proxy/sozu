@@ -34,8 +34,8 @@ script:
   - cd $ROOT_PATH/command && travis-cargo --only nightly test
   - cd $ROOT_PATH/bin     && travis-cargo --only nightly build
   - cd $ROOT_PATH/ctl     && travis-cargo --only nightly build
-  - cd $ROOT_PATH/lib     && travis-cargo --only beta    test
-  - cd $ROOT_PATH/command && travis-cargo --only beta    test
+  - cd $ROOT_PATH/lib     && travis-cargo --only beta    build
+  - cd $ROOT_PATH/command && travis-cargo --only beta    build
   - cd $ROOT_PATH/bin     && travis-cargo --only beta    build
   - cd $ROOT_PATH/ctl     && travis-cargo --only beta    build
 
