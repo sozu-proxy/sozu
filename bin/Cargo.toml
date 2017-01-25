@@ -26,5 +26,8 @@ path = "../lib"
 [dependencies.sozu-command-lib]
 path = "../command"
 
+[features]
+unstable = []
+
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }

@@ -34,8 +34,9 @@ version = "~0.2.0"
 features = ["v4"]
 
 [features]
-default = []
-splice  = []
+default  = []
+splice   = []
+unstable = []
 
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }

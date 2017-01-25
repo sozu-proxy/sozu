@@ -3,26 +3,41 @@ language: rust
 addons:
   apt:
     packages:
-      - libcurl4-openssl-dev
-      - libelf-dev
-      - libdw-dev
+      # - openssl
+      # - libssl-dev
+      #      - libcurl4-openssl-dev
+      #- libelf-dev
+      #- libdw-dev
 
 rust:
   - nightly
   - beta
 
+before_install:
+  - export ROOT_PATH=`pwd`
+  - export CFLAGS="-fPIC"
+  - curl -L -O https://www.openssl.org/source/openssl-1.0.2j.tar.gz
+  - tar xzf openssl-1.0.2j.tar.gz
+  - cd openssl-1.0.2j
+  - mkdir $ROOT_PATH/openssl-1.0.2j/dist
+  - ./Configure --prefix=$ROOT_PATH/openssl-1.0.2j/dist linux-x86_64 -fPIC && make && make install
+  - make build_tests
+
 before_script:
   - pip install 'travis-cargo<0.2' --user && export PATH=$HOME/.local/bin:$PATH
 
 script:
-  - cd lib     && travis-cargo --only nightly test;  cd ..
-  - cd command && travis-cargo --only nightly test;  cd ..
-  - cd bin     && travis-cargo --only nightly build; cd ..
-  - cd ctl     && travis-cargo --only nightly build; cd ..
-  - cd lib     && travis-cargo --only beta    test;  cd ..
-  - cd command && travis-cargo --only beta    test;  cd ..
-  - cd bin     && travis-cargo --only beta    build; cd ..
-  - cd ctl     && travis-cargo --only beta    build; cd ..
+  - export OPENSSL_INCLUDE_DIR=$ROOT_PATH/openssl-1.0.2j/dist/include
+  - export OPENSSL_LIB_DIR=$ROOT_PATH/openssl-1.0.2j/dist/lib
+  - ls $ROOT_PATH/openssl-1.0.2j/dist/lib
+  - cd $ROOT_PATH/lib     && travis-cargo --only nightly test
+  - cd $ROOT_PATH/command && travis-cargo --only nightly test
+  - cd $ROOT_PATH/bin     && travis-cargo --only nightly build
+  - cd $ROOT_PATH/ctl     && travis-cargo --only nightly build
+  - cd $ROOT_PATH/lib     && travis-cargo --only beta    test
+  - cd $ROOT_PATH/command && travis-cargo --only beta    test
+  - cd $ROOT_PATH/bin     && travis-cargo --only beta    build
+  - cd $ROOT_PATH/ctl     && travis-cargo --only beta    build
 
 after_success:
   - travis-cargo coveralls --no-sudo
@@ -32,6 +47,7 @@ after_success:
     # override the default `--features unstable` used for the nightly branch (optional)
     #    - TRAVIS_CARGO_NIGHTLY_FEATURE=nightly
 
+dist: trusty
 sudo: false
 
 notifications:

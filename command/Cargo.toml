@@ -18,5 +18,8 @@ features = ["serde"]
 [dependencies.sozu-lib]
 path = "../lib"
 
+[features]
+unstable = []
+
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }
