@@ -87,8 +87,10 @@ fn main() {
   let config_file = submatches.value_of("config").expect("required config file");
 
   if let Ok(config) = Config::load_from_path(config_file) {
-    if let Some(ref log_level) = config.log_level {
-     builder.parse(&log_level);
+    if let Ok(log_level) = ::std::env::var("RUST_LOG") {
+      builder.parse(&log_level);
+    } else if let Some(ref log_level) = config.log_level {
+      builder.parse(&log_level);
     }
 
     builder.init().unwrap();
