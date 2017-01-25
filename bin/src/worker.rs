@@ -69,11 +69,11 @@ fn generate_channels() -> io::Result<(Channel<ProxyOrder,ServerMessage>, Channel
   Ok((command_channel, proxy_channel))
 }
 
-pub fn begin_worker_process(fd: i32, id: &str, tag: &str, mut builder: LogBuilder) {
+pub fn begin_worker_process(fd: i32, id: &str, tag: &str, channel_buffer_size: usize, mut builder: LogBuilder) {
   let mut command: Channel<ServerMessage,ProxyConfig> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
-    10000,
-    20000
+    channel_buffer_size,
+    channel_buffer_size * 2
   );
 
   command.set_nonblocking(false);
@@ -120,10 +120,13 @@ pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t
   new_cl_flags.remove(FD_CLOEXEC);
   fcntl(client.as_raw_fd(), FcntlArg::F_SETFD(new_cl_flags));
 
+  let channel_buffer_size = config.channel_buffer_size.unwrap_or(10000);
+  let channel_max_buffer_size = channel_buffer_size * 2;
+
   let mut command: Channel<ProxyConfig,ServerMessage> = Channel::new(
     server,
-    10000,
-    20000
+    channel_buffer_size,
+    channel_max_buffer_size
   );
   command.set_nonblocking(false);
 

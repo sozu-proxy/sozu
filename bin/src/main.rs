@@ -65,7 +65,9 @@ fn main() {
                                     .arg(Arg::with_name("id").long("id")
                                          .takes_value(true).required(true).help("worker identifier"))
                                     .arg(Arg::with_name("fd").long("fd")
-                                         .takes_value(true).required(true).help("IPC file descriptor")))
+                                         .takes_value(true).required(true).help("IPC file descriptor"))
+                                    .arg(Arg::with_name("channel-buffer-size").long("channel-buffer-size")
+                                         .takes_value(true).required(false).help("Worker's channel buffer size")))
                         .get_matches();
 
   if let Some(matches) = matches.subcommand_matches("worker") {
@@ -73,8 +75,11 @@ fn main() {
       .parse::<i32>().expect("the file descriptor must be a number");
     let id  = matches.value_of("id").expect("needs a worker id");
     let tag = matches.value_of("tag").expect("needs a configuration tag");
+    let buffer_size = matches.value_of("channel-buffer-size")
+      .and_then(|size| size.parse::<usize>().ok())
+      .unwrap_or(10000);
 
-    begin_worker_process(fd, id, tag, builder);
+    begin_worker_process(fd, id, tag, buffer_size, builder);
     return;
   }
 

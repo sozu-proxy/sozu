@@ -277,7 +277,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
 
     if msg_len > self.back_buf.available_space() {
       if msg_len - self.back_buf.available_space() + self.back_buf.capacity() > self.max_buffer_size {
-        error!("message is too large to write to back buffer");
+        error!("message is too large to write to back buffer. Consider increasing proxy channel buffer size, current value is {}", self.back_buf.capacity());
         return false;
       }
 
@@ -302,7 +302,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
 
     if msg_len > self.back_buf.available_space() {
       if msg_len - self.back_buf.available_space() + self.back_buf.capacity() > self.max_buffer_size {
-        error!("message is too large to write to back buffer");
+        error!("message is too large to write to back buffer. Consider increasing proxy channel buffer size, current value is {}", self.back_buf.capacity());
         return false;
       }
 

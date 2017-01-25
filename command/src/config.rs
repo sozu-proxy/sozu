@@ -19,6 +19,7 @@ pub struct ProxyConfig {
   pub port:                      u16,
   pub max_connections:           usize,
   pub buffer_size:               usize,
+  pub channel_buffer_size:       Option<usize>,
   pub answer_404:                Option<String>,
   pub answer_503:                Option<String>,
   pub cipher_list:               Option<String>,
