@@ -81,8 +81,10 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str, channel_buffer_size: u
   let proxy_config = command.read_message().expect("worker could not read configuration from socket");
   println!("got message: {:?}", proxy_config);
 
-  //FIXME: hardcoded log level
-  builder.parse("info");
+  if let Ok(log_level) = ::std::env::var("RUST_LOG"){
+    builder.parse(&log_level);
+  }
+
   builder.init().unwrap();
 
   command.set_nonblocking(true);
