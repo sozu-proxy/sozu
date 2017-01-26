@@ -153,6 +153,8 @@ pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t
         .arg(tag)
         .arg("--id")
         .arg(id)
+        .arg("--channel-buffer-size")
+        .arg(channel_buffer_size.to_string())
         .exec();
 
       unreachable!();
