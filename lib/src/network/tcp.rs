@@ -26,6 +26,7 @@ use pool::{Pool,Checkout,Reset};
 
 use messages::{self,TcpFront,Order,Instance};
 use channel::Channel;
+use util::UnwrapLog;
 
 
 const SERVER: Token = Token(0);
@@ -147,7 +148,7 @@ impl ProxyClient for Client {
   }
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    debug!("{}\tTCP\tPROXY [{} -> {}] CLOSED BACKEND", self.request_id, self.token.unwrap().0, self.backend_token.unwrap().0);
+    debug!("{}\tTCP\tPROXY [{} -> {}] CLOSED BACKEND", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0);
     let addr = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
     self.backend       = None;
     self.backend_token = None;
@@ -191,7 +192,7 @@ impl ProxyClient for Client {
     } else {
       self.readiness.front_readiness.remove(Ready::readable());
     }
-    trace!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, self.token.unwrap().0, self.backend_token.unwrap().0, sz);
+    trace!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0, sz);
 
     match res {
       SocketResult::Error => {
@@ -223,7 +224,7 @@ impl ProxyClient for Client {
        self.back_buf.consume_output_data(current_sz);
        sz += current_sz;
      }
-     trace!("{}\tTCP\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, self.token.unwrap().0, self.backend_token.unwrap().0, sz);
+     trace!("{}\tTCP\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0, sz);
 
      match socket_res {
        SocketResult::Error => {
@@ -254,7 +255,7 @@ impl ProxyClient for Client {
       self.back_buf.sliced_input(sz);
       self.back_buf.consume_parsed_data(sz);
       self.back_buf.slice_output(sz);
-      trace!("{}\tTCP\tBACK  [{}<-{}]: read {} bytes", self.request_id, self.token.unwrap().0, self.backend_token.unwrap().0, sz);
+      trace!("{}\tTCP\tBACK  [{}<-{}]: read {} bytes", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0, sz);
 
       match res {
         SocketResult::Error => {

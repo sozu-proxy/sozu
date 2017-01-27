@@ -13,6 +13,7 @@ use network::buffer_queue::BufferQueue;
 use network::proxy::Readiness;
 use network::socket::{SocketHandler,SocketResult};
 use network::protocol::ProtocolResult;
+use util::UnwrapLog;
 
 type BackendToken = Token;
 
@@ -108,7 +109,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn state(&mut self) -> &mut HttpState {
-    self.state.as_mut().unwrap()
+    unwrap_msg!(self.state.as_mut())
   }
 
   pub fn set_state(&mut self, state: HttpState) {
@@ -210,9 +211,8 @@ impl<Front:SocketHandler> Http<Front> {
     Protocol::HTTP
   }
 
-  //FIXME: unwrap bad, bad rust coder
   pub fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.log_ctx, self.token.unwrap().0, self.backend_token.unwrap().0);
+    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.log_ctx, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0);
     let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
     self.backend       = None;
     self.backend_token = None;
@@ -244,7 +244,7 @@ impl<Front:SocketHandler> Http<Front> {
       return ClientResult::Continue;
     }
 
-    assert!(!self.state.as_ref().unwrap().is_front_error());
+    assert!(!unwrap_msg!(self.state.as_ref()).is_front_error());
     assert!(self.back_buf.empty(), "investigating single buffer usage: the back->front buffer should not be used while parsing and forwarding the request");
 
     if self.front_buf.buffer.available_space() == 0 {
@@ -294,18 +294,18 @@ impl<Front:SocketHandler> Http<Front> {
     };
 
     // if there's no host, continue parsing until we find it
-    let has_host = self.state.as_ref().unwrap().has_host();
+    let has_host = unwrap_msg!(self.state.as_ref()).has_host();
     if !has_host {
-      self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
+      self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
         &mut self.front_buf));
-      if self.state.as_ref().unwrap().is_front_error() {
+      if unwrap_msg!(self.state.as_ref()).is_front_error() {
         error!("{}\t[{:?}] front parsing error, closing the connection", self.log_ctx, self.token);
         time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
         self.readiness.front_interest.remove(Ready::readable());
         return ClientResult::CloseClient;
       }
 
-      if self.state.as_ref().unwrap().has_host() {
+      if unwrap_msg!(self.state.as_ref()).has_host() {
         self.readiness.back_interest.insert(Ready::writable());
         return ClientResult::ConnectBackend;
       } else {
@@ -314,7 +314,7 @@ impl<Front:SocketHandler> Http<Front> {
     }
 
     self.readiness.back_interest.insert(Ready::writable());
-    match self.state.as_ref().unwrap().request {
+    match unwrap_msg!(self.state.as_ref()).request {
       Some(RequestState::Request(_,_,_)) | Some(RequestState::RequestWithBody(_,_,_,_)) => {
         if ! self.front_buf.needs_input() {
           // stop reading
@@ -334,34 +334,34 @@ impl<Front:SocketHandler> Http<Front> {
       },
       Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
         if ! self.front_buf.needs_input() {
-          self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
+          self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
           &mut self.front_buf));
 
-          if self.state.as_ref().unwrap().is_front_error() {
+          if unwrap_msg!(self.state.as_ref()).is_front_error() {
             error!("{}\t[{:?}] front chunk parsing error, closing the connection", self.log_ctx, self.token);
             time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             self.readiness.reset();
             return ClientResult::CloseClient;
           }
 
-          if let Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) = self.state.as_ref().unwrap().request {
+          if let Some(&Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended))) = self.state.as_ref().map(|s| &s.request) {
             self.readiness.front_interest.remove(Ready::readable());
           }
         }
         ClientResult::Continue
       },
     _ => {
-        self.state = Some(parse_request_until_stop(self.state.take().unwrap(), &self.request_id,
+        self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
           &mut self.front_buf));
 
-        if self.state.as_ref().unwrap().is_front_error() {
+        if unwrap_msg!(self.state.as_ref()).is_front_error() {
           error!("{}\t[{:?}] front parsing error, closing the connection", self.log_ctx, self.token);
           time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
           self.readiness.reset();
           return ClientResult::CloseClient;
         }
 
-        if let Some(RequestState::Request(_,_,_)) = self.state.as_ref().unwrap().request {
+        if let Some(&Some(RequestState::Request(_,_,_))) = self.state.as_ref().map(|s| &s.request) {
           self.readiness.front_interest.remove(Ready::readable());
         }
         self.readiness.back_interest.insert(Ready::writable());
@@ -453,7 +453,7 @@ impl<Front:SocketHandler> Http<Front> {
       return ClientResult::Continue;
     }
 
-    match self.state.as_ref().unwrap().response {
+    match unwrap_msg!(self.state.as_ref()).response {
       // FIXME: should only restart parsing if we are using keepalive
       Some(ResponseState::Response(_,_))                            |
       Some(ResponseState::ResponseWithBody(_,_,_))                  |
@@ -524,7 +524,7 @@ impl<Front:SocketHandler> Http<Front> {
       return ClientResult::CloseBothFailure;
     }
 
-    let sock = self.backend.as_mut().unwrap();
+    let sock = unwrap_msg!(self.backend.as_mut());
     let mut sz = 0usize;
     let mut socket_res = SocketResult::Continue;
 
@@ -561,7 +561,7 @@ impl<Front:SocketHandler> Http<Front> {
     // FIXME/ should read exactly as much data as needed
     //if self.front_buf_position >= self.state.req_position {
     if self.front_buf.can_restart_parsing() {
-      match self.state.as_ref().unwrap().request {
+      match unwrap_msg!(self.state.as_ref()).request {
         Some(RequestState::Request(_,_,_))                            |
         Some(RequestState::RequestWithBody(_,_,_,_))                  |
         Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
@@ -610,7 +610,7 @@ impl<Front:SocketHandler> Http<Front> {
       return (ProtocolResult::Continue, ClientResult::CloseBothFailure);
     }
 
-    let sock = self.backend.as_mut().unwrap();
+    let sock = unwrap_msg!(self.backend.as_mut());
     let (sz, r) = sock.socket_read(&mut self.back_buf.buffer.space());
     self.back_buf.buffer.fill(sz);
     self.back_buf.sliced_input(sz);
@@ -630,7 +630,7 @@ impl<Front:SocketHandler> Http<Front> {
     }
 
     // isolate that here because the "ref protocol" and the self.state = " make borrowing conflicts
-    if let Some(ResponseState::ResponseUpgrade(_,_, ref protocol)) = self.state.as_ref().unwrap().response {
+    if let Some(&Some(ResponseState::ResponseUpgrade(_,_, ref protocol))) = self.state.as_ref().map(|s| &s.response) {
       info!("got an upgrade state[{}]: {:?}", line!(), protocol);
       if protocol == "websocket" {
         return (ProtocolResult::Upgrade, ClientResult::Continue);
@@ -640,7 +640,7 @@ impl<Front:SocketHandler> Http<Front> {
       }
     }
 
-    match self.state.as_ref().unwrap().response {
+    match unwrap_msg!(self.state.as_ref()).response {
       Some(ResponseState::Response(_,_)) => {
         error!("{}\tshould not go back in back_readable if the whole response was parsed", self.log_ctx);
         self.readiness.back_interest.remove(Ready::readable());
@@ -665,17 +665,17 @@ impl<Front:SocketHandler> Http<Front> {
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
         if ! self.back_buf.needs_input() {
-          self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id,
+          self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
           &mut self.back_buf));
 
-          if self.state.as_ref().unwrap().is_back_error() {
+          if unwrap_msg!(self.state.as_ref()).is_back_error() {
             error!("{}\tback socket chunk parse error, closing connection", self.log_ctx);
             time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             self.readiness.reset();
             return (ProtocolResult::Continue, ClientResult::CloseBothFailure);
           }
 
-          if let Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) = self.state.as_ref().unwrap().response {
+          if let Some(&Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended))) = self.state.as_ref().map(|s| &s.response) {
             self.readiness.back_interest.remove(Ready::readable());
           }
           self.readiness.front_interest.insert(Ready::writable());
@@ -684,21 +684,21 @@ impl<Front:SocketHandler> Http<Front> {
       },
       Some(ResponseState::Error(_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
       _ => {
-        self.state = Some(parse_response_until_stop(self.state.take().unwrap(), &self.request_id,
+        self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
         &mut self.back_buf));
 
-        if self.state.as_ref().unwrap().is_back_error() {
+        if unwrap_msg!(self.state.as_ref()).is_back_error() {
           error!("{}\tback socket parse error, closing connection", self.log_ctx);
           time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
           self.readiness.reset();
           return (ProtocolResult::Continue, ClientResult::CloseBothFailure);
         }
 
-        if let Some(ResponseState::Response(_,_)) = self.state.as_ref().unwrap().response {
+        if let Some(ResponseState::Response(_,_)) = unwrap_msg!(self.state.as_ref()).response {
           self.readiness.back_interest.remove(Ready::readable());
         }
 
-        if let Some(ResponseState::ResponseUpgrade(_,_, ref protocol)) = self.state.as_ref().unwrap().response {
+        if let Some(&Some(ResponseState::ResponseUpgrade(_,_, ref protocol))) = self.state.as_ref().map(|s| &s.response) {
           info!("got an upgrade state[{}]: {:?}", line!(), protocol);
           if protocol == "websocket" {
             return (ProtocolResult::Upgrade, ClientResult::Continue);

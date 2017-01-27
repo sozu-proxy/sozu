@@ -37,6 +37,7 @@ use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
+use util::UnwrapLog;
 
 use channel::Channel;
 
@@ -73,7 +74,7 @@ impl TlsClient {
   pub fn new(server_context: &str, ssl:Ssl, sock: TcpStream, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> Option<TlsClient> {
     //FIXME: we should not need to clone the socket. Maybe do the accept here instead of
     // in TlsHandshake?
-    let s = sock.try_clone().unwrap();
+    let s = sock.try_clone().expect("could not clone the socket");
     let handshake = TlsHandshake::new(server_context, ssl, s);
     Some(TlsClient {
       front:          Some(sock),
@@ -88,27 +89,29 @@ impl TlsClient {
   }
 
   pub fn http(&mut self) -> Option<&mut Http<SslStream<TcpStream>>> {
-    if let State::Http(ref mut http) = *self.protocol.as_mut().unwrap() {
-      Some(http)
-    } else {
-      None
-    }
+    self.protocol.as_mut().and_then(|protocol| {
+      if let &mut State::Http(ref mut http) = protocol {
+        Some(http)
+      } else {
+        None
+      }
+    })
   }
 
   pub fn upgrade(&mut self) -> bool {
-    let protocol = self.protocol.take().unwrap();
+    let protocol = unwrap_msg!(self.protocol.take());
 
     if let State::Handshake(handshake) = protocol {
       if let Some(pool) = self.pool.upgrade() {
         let mut p = pool.borrow_mut();
 
         if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-          let mut http = Http::new(&handshake.server_context, handshake.stream.unwrap(), front_buf,
+          let mut http = Http::new(&handshake.server_context, unwrap_msg!(handshake.stream), front_buf,
             back_buf, self.public_address.clone()).unwrap();
 
           http.readiness = handshake.readiness;
           http.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
-          http.set_front_token(self.front_token.as_ref().unwrap().clone());
+          http.set_front_token(unwrap_msg!(self.front_token.as_ref()).clone());
           self.ssl = handshake.ssl;
           self.protocol = Some(State::Http(http));
           return true;
@@ -120,11 +123,11 @@ impl TlsClient {
       false
     } else if let State::Http(http) = protocol {
       info!("https switching to wss");
-      let front_token = http.front_token().unwrap();
-      let back_token  = http.back_token().unwrap();
+      let front_token = unwrap_msg!(http.front_token());
+      let back_token  = unwrap_msg!(http.back_token());
 
-      let mut pipe = Pipe::new(&http.server_context, http.frontend, http.backend.unwrap(),
-        http.front_buf, http.back_buf, http.public_address).unwrap();
+      let mut pipe = Pipe::new(&http.server_context, http.frontend, unwrap_msg!(http.backend),
+        http.front_buf, http.back_buf, http.public_address).expect("could not create Pipe instance");
 
       pipe.readiness.front_readiness = http.readiness.front_readiness;
       pipe.readiness.back_readiness  = http.readiness.back_readiness;
@@ -142,14 +145,14 @@ impl TlsClient {
 
 impl ProxyClient for TlsClient {
   fn front_socket(&self) -> &TcpStream {
-    self.front.as_ref().unwrap()
+    unwrap_msg!(self.front.as_ref())
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
-    match *self.protocol.as_ref().unwrap() {
-      State::Handshake(ref handshake) => None,
-      State::Http(ref http)           => http.back_socket(),
-      State::WebSocket(ref pipe)      => pipe.back_socket(),
+    match unwrap_msg!(self.protocol.as_ref()) {
+      &State::Handshake(ref handshake) => None,
+      &State::Http(ref http)           => http.back_socket(),
+      &State::WebSocket(ref pipe)      => pipe.back_socket(),
     }
   }
 
@@ -158,7 +161,7 @@ impl ProxyClient for TlsClient {
   }
 
   fn back_token(&self)   -> Option<Token> {
-    if let State::Http(ref http) = *self.protocol.as_ref().unwrap() {
+    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
       http.back_token()
     } else {
       None
@@ -171,7 +174,7 @@ impl ProxyClient for TlsClient {
   }
 
   fn log_context(&self)  -> String {
-    if let State::Http(ref http) = *self.protocol.as_ref().unwrap() {
+    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
       http.log_context()
     } else {
       "".to_string()
@@ -179,7 +182,7 @@ impl ProxyClient for TlsClient {
   }
 
   fn set_back_socket(&mut self, sock:TcpStream) {
-    self.http().unwrap().set_back_socket(sock)
+    unwrap_msg!(self.http()).set_back_socket(sock)
   }
 
   fn set_front_token(&mut self, token: Token) {
@@ -191,7 +194,7 @@ impl ProxyClient for TlsClient {
   }
 
   fn set_back_token(&mut self, token: Token) {
-    self.http().unwrap().set_back_token(token)
+    unwrap_msg!(self.http()).set_back_token(token)
   }
 
   fn front_timeout(&mut self) -> Option<Timeout> {
@@ -211,15 +214,15 @@ impl ProxyClient for TlsClient {
   }
 
   fn front_hup(&mut self)     -> ClientResult {
-    self.http().unwrap().front_hup()
+    unwrap_msg!(self.http()).front_hup()
   }
 
   fn back_hup(&mut self)      -> ClientResult {
-    self.http().unwrap().back_hup()
+    unwrap_msg!(self.http()).back_hup()
   }
 
   fn readable(&mut self)      -> ClientResult {
-    let (upgrade, result) = match *self.protocol.as_mut().unwrap() {
+    let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Handshake(ref mut handshake) => handshake.readable(),
       State::Http(ref mut http)           => (ProtocolResult::Continue, http.readable()),
       State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.readable()),
@@ -229,7 +232,7 @@ impl ProxyClient for TlsClient {
       result
     } else {
         if self.upgrade() {
-        match *self.protocol.as_mut().unwrap() {
+        match *unwrap_msg!(self.protocol.as_mut()) {
           State::Http(ref mut http) => http.readable(),
           _ => result
         }
@@ -240,7 +243,7 @@ impl ProxyClient for TlsClient {
   }
 
   fn writable(&mut self)      -> ClientResult {
-    match *self.protocol.as_mut().unwrap() {
+    match *unwrap_msg!(self.protocol.as_mut()) {
       State::Handshake(ref mut handshake) => ClientResult::CloseClient,
       State::Http(ref mut http)           => http.writable(),
       State::WebSocket(ref mut pipe)      => pipe.writable(),
@@ -248,7 +251,7 @@ impl ProxyClient for TlsClient {
   }
 
   fn back_readable(&mut self) -> ClientResult {
-    let (upgrade, result) = match *self.protocol.as_mut().unwrap() {
+    let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)           => http.back_readable(),
       State::Handshake(ref mut handshake) => (ProtocolResult::Continue, ClientResult::CloseClient),
       State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.back_readable()),
@@ -258,7 +261,7 @@ impl ProxyClient for TlsClient {
       result
     } else {
       if self.upgrade() {
-      match *self.protocol.as_mut().unwrap() {
+      match *unwrap_msg!(self.protocol.as_mut()) {
         State::WebSocket(ref mut pipe) => pipe.back_readable(),
         _ => result
       }
@@ -269,8 +272,7 @@ impl ProxyClient for TlsClient {
   }
 
   fn back_writable(&mut self) -> ClientResult {
-    //self.http().unwrap().back_writable()
-    match *self.protocol.as_mut().unwrap() {
+    match *unwrap_msg!(self.protocol.as_mut()) {
       State::Handshake(ref mut handshake) => ClientResult::CloseClient,
       State::Http(ref mut http)           => http.back_writable(),
       State::WebSocket(ref mut pipe)      => pipe.back_writable(),
@@ -278,11 +280,11 @@ impl ProxyClient for TlsClient {
   }
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    self.http().unwrap().remove_backend()
+    unwrap_msg!(self.http()).remove_backend()
   }
 
   fn readiness(&mut self)      -> &mut Readiness {
-    let r = match *self.protocol.as_mut().unwrap() {
+    let r = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Handshake(ref mut handshake) => &mut handshake.readiness,
       State::Http(ref mut http)           => http.readiness(),
       State::WebSocket(ref mut pipe)      => &mut pipe.readiness,
@@ -340,8 +342,8 @@ impl ServerConfiguration {
     let cl_tag       = tag.clone();
     let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
 
-    let (fingerprint, mut tls_data, names):(Vec<u8>,TlsData, Vec<String>) = Self::create_default_context(&config, ref_ctx, ref_domains, cl_tag, default_name).unwrap();
-    let cert = X509::from_pem(&tls_data.certificate).unwrap();
+    let (fingerprint, mut tls_data, names):(Vec<u8>,TlsData, Vec<String>) = Self::create_default_context(&config, ref_ctx, ref_domains, cl_tag, default_name).expect("could not create default context");
+    let cert = try!(X509::from_pem(&tls_data.certificate));
 
     let common_name: Option<String> = get_cert_common_name(&cert);
     info!("{}\tgot common name: {:?}", &tag, common_name);
@@ -406,7 +408,7 @@ impl ServerConfiguration {
       return None
     }
 
-    let mut context = ctx.unwrap();
+    let mut context = ctx.expect("should have built a correct SSL context");
 
     let mut options = context.options();
     options.insert(ssl::SSL_OP_NO_SSLV2);
@@ -450,7 +452,7 @@ impl ServerConfiguration {
 
         info!("{}\tgot subject alt names: {:?}", &tag, names);
         {
-          let mut domains = ref_domains.lock().unwrap();
+          let mut domains = unwrap_msg!(ref_domains.lock());
           for name in &names {
             domains.domain_insert(name.clone().into_bytes(), fingerprint.clone());
           }
@@ -462,8 +464,8 @@ impl ServerConfiguration {
         }
 
         context.set_servername_callback(move |ssl: &mut SslRef| {
-          let contexts = ref_ctx.lock().unwrap();
-          let domains  = ref_domains.lock().unwrap();
+          let contexts = unwrap_msg!(ref_ctx.lock());
+          let domains  = unwrap_msg!(ref_domains.lock());
 
           info!("{}\tref: {:?}", tag, ssl);
           if let Some(servername) = ssl.servername().map(|s| s.to_string()) {
@@ -510,7 +512,7 @@ impl ServerConfiguration {
     //FIXME: insert some error management with a Result here
     let c = SslContext::builder(SslMethod::tls());
     if c.is_err() { return false; }
-    let mut ctx = c.unwrap();
+    let mut ctx = c.expect("should have built a correct SSL context");
     let mut options = ctx.options();
     options.insert(ssl::SSL_OP_NO_SSLV2);
     options.insert(ssl::SSL_OP_NO_SSLV3);
@@ -539,7 +541,7 @@ impl ServerConfiguration {
       //FIXME: would need more logs here
 
       //FIXME
-      let fingerprint = cert.fingerprint(MessageDigest::sha256()).unwrap();
+      let fingerprint = unwrap_msg!(cert.fingerprint(MessageDigest::sha256()));
       let common_name: Option<String> = get_cert_common_name(&cert);
       info!("{}\tgot common name: {:?}", self.tag, common_name);
 
@@ -566,7 +568,7 @@ impl ServerConfiguration {
       //FIXME: this is blocking
       //this lock is only obtained from this thread, so is it alright?
       {
-        let mut contexts = self.contexts.lock().unwrap();
+        let mut contexts = unwrap_msg!(self.contexts.lock());
 
         if contexts.contains_key(&fingerprint) {
           contexts.get_mut(&fingerprint).map(|data| {
@@ -577,7 +579,7 @@ impl ServerConfiguration {
         }
       }
       {
-        let mut domains = self.domains.lock().unwrap();
+        let mut domains = unwrap_msg!(self.domains.lock());
         if let Some(name) = common_name {
           domains.domain_insert(name.into_bytes(), fingerprint.clone());
         }
@@ -616,8 +618,8 @@ impl ServerConfiguration {
         let front = fronts.remove(pos);
 
         {
-          let mut contexts = self.contexts.lock().unwrap();
-          let mut domains  = self.domains.lock().unwrap();
+          let mut contexts = unwrap_msg!(self.contexts.lock());
+          let mut domains  = unwrap_msg!(self.domains.lock());
           let must_delete = contexts.get_mut(&front.cert_fingerprint).map(|tls_data| {
             tls_data.refcount -= 1;
             tls_data.refcount == 0
@@ -718,17 +720,17 @@ impl ServerConfiguration {
     trace!("{}\tlooking for backend for real host: {}", self.tag, real_host);
 
     if let Some(app_id) = self.frontend_from_request(real_host, uri).map(|ref front| front.app_id.clone()) {
-      client.http().unwrap().app_id = Some(app_id.clone());
+      unwrap_msg!(client.http()).app_id = Some(app_id.clone());
       // ToDo round-robin on instances
       if let Some(ref mut app_instances) = self.instances.get_mut(&app_id) {
         if app_instances.len() == 0 {
-          client.http().unwrap().set_answer(&self.answers.ServiceUnavailable);
+          unwrap_msg!(client.http()).set_answer(&self.answers.ServiceUnavailable);
           return Err(ConnectionError::NoBackendAvailable);
         }
         let rnd = random::<usize>();
         let mut instances:Vec<&mut Backend> = app_instances.iter_mut().filter(|backend| backend.can_open()).collect();
         let idx = rnd % instances.len();
-        info!("{}\tConnecting {} -> {:?}", client.http().unwrap().log_context(), host, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
+        info!("{}\tConnecting {} -> {:?}", unwrap_msg!(client.http()).log_context(), host, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
         instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut backend| {
           let conn =  TcpStream::connect(&backend.address).map_err(|_| ConnectionError::NoBackendAvailable);
           if conn.is_ok() {
@@ -765,7 +767,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   }
 
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut TlsClient) -> Result<BackendConnectAction,ConnectionError> {
-    let h = try!(client.http().unwrap().state().get_host().ok_or(ConnectionError::NoHostGiven));
+    let h = try!(unwrap_msg!(client.http()).state().get_host().ok_or(ConnectionError::NoHostGiven));
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
@@ -779,7 +781,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       let hostname_str =  unsafe { from_utf8_unchecked(hostname) };
 
       //FIXME: what if we don't use SNI?
-      let servername: Option<String> = client.http().unwrap().frontend.ssl().servername().map(|s| s.to_string());
+      let servername: Option<String> = unwrap_msg!(client.http()).frontend.ssl().servername().map(|s| s.to_string());
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
         error!("{}\tTLS SNI hostname and Host header don't match", self.tag);
         return Err(ConnectionError::HostNotFound);
@@ -797,19 +799,19 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       return Err(ConnectionError::ToBeDefined);
     };
 
-    let rl:RRequestLine = try!(client.http().unwrap().state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-    let conn   = try!(client.http().unwrap().state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
+    let rl:RRequestLine = try!(unwrap_msg!(client.http()).state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
+    let conn   = try!(unwrap_msg!(client.http()).state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
     let conn   = self.backend_from_request(client, &host, &rl.uri);
 
     match conn {
       Ok(socket) => {
-        let req_state = client.http().unwrap().state().request.clone();
-        let req_header_end = client.http().unwrap().state().req_header_end;
-        let res_header_end = client.http().unwrap().state().res_header_end;
-        let added_req_header = client.http().unwrap().state().added_req_header.clone();
-        let added_res_header = client.http().unwrap().state().added_res_header.clone();
+        let req_state = unwrap_msg!(client.http()).state().request.clone();
+        let req_header_end = unwrap_msg!(client.http()).state().req_header_end;
+        let res_header_end = unwrap_msg!(client.http()).state().res_header_end;
+        let added_req_header = unwrap_msg!(client.http()).state().added_req_header.clone();
+        let added_res_header = unwrap_msg!(client.http()).state().added_res_header.clone();
         // FIXME: is this still needed?
-        client.http().unwrap().set_state(HttpState {
+        unwrap_msg!(client.http()).set_state(HttpState {
           req_header_end: req_header_end,
           res_header_end: res_header_end,
           request:  req_state,
@@ -823,11 +825,11 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         Ok(BackendConnectAction::New)
       },
       Err(ConnectionError::NoBackendAvailable) => {
-        client.http().unwrap().set_answer(&self.answers.ServiceUnavailable);
+        unwrap_msg!(client.http()).set_answer(&self.answers.ServiceUnavailable);
         Err(ConnectionError::NoBackendAvailable)
       },
       Err(ConnectionError::HostNotFound) => {
-        client.http().unwrap().set_answer(&self.answers.NotFound);
+        unwrap_msg!(client.http()).set_answer(&self.answers.NotFound);
         Err(ConnectionError::HostNotFound)
       },
       e => panic!(e)

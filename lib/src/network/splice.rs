@@ -77,10 +77,10 @@ mod tests {
   fn zerocopy() {
     start_server();
     start_server2();
-    let mut stream = TcpStream::connect("127.0.0.1:2121").unwrap();
+    let mut stream = TcpStream::connect("127.0.0.1:2121").expect("could not connect tcp socket");
     stream.write(&b"hello world"[..]);
     let mut res = [0; 128];
-    let mut sz = stream.read(&mut res[..]).unwrap();
+    let mut sz = stream.read(&mut res[..]).expect("could not read from stream");
     println!("stream received {:?}", str::from_utf8(&res[..sz]));
     assert_eq!(&res[..sz], &b"hello world"[..]);
     //assert!(false);
@@ -88,7 +88,7 @@ mod tests {
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server() {
-    let listener = TcpListener::bind("127.0.0.1:4242").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:4242").expect("could not bind socket");
     fn handle_client(stream: &mut TcpStream, id: u8) {
       let mut buf = [0; 128];
       let response = b" END";
@@ -120,7 +120,7 @@ mod tests {
 
 #[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server2() {
-    let listener = TcpListener::bind("127.0.0.1:2121").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:2121").expect("could not bind socket");
 
     fn handle_client(stream: &mut TcpStream, backend: &mut TcpStream, id: u8) {
       let mut buf = [0; 128];
@@ -145,8 +145,8 @@ mod tests {
         match conn {
           Ok(mut stream) => {
           thread::spawn(move|| {
-            let addr: SocketAddr = FromStr::from_str("127.0.0.1:4242").unwrap();
-            let mut backend  = TcpStream::connect(&addr).unwrap();
+            let addr: SocketAddr = FromStr::from_str("127.0.0.1:4242").expect("could not parse address");
+            let mut backend  = TcpStream::connect(&addr).expect("could not create tcp stream");
             println!("got a new client: {}", count);
             handle_client(&mut stream, &mut backend, count)
             });
