@@ -557,17 +557,15 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 pub type TcpServer = Server<ServerConfiguration,Client>;
 
 pub fn start_example() -> Channel<ProxyOrder,ServerMessage> {
-  let poll = Poll::new().unwrap();
+  let poll = Poll::new().expect("could not create event loop");
 
 
   info!("TCP\tlisten for connections");
-  //event_loop.register(&listener, SERVER, Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
   let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
   let configuration = ServerConfiguration::new(10, channel);
   let mut s = TcpServer::new(10, 500, configuration, poll);
   thread::spawn(move|| {
     info!("TCP\tstarting event loop");
-    //event_loop.run(&mut s).unwrap();
     s.run();
     info!("TCP\tending event loop");
   });
@@ -604,14 +602,12 @@ pub fn start_example() -> Channel<ProxyOrder,ServerMessage> {
 }
 
 pub fn start(max_listeners: usize, max_connections: usize, channel: ProxyChannel) {
-  let poll              = Poll::new().unwrap();
+  let poll              = Poll::new().expect("could not create event loop");
   let configuration     = ServerConfiguration::new(max_listeners, channel);
   let mut server        = TcpServer::new(max_listeners, max_connections, configuration, poll);
-  let front: SocketAddr = FromStr::from_str("127.0.0.1:8443").unwrap();
-  //server.configuration().add_tcp_front("yolo", &front, &mut event_loop);
+  let front: SocketAddr = FromStr::from_str("127.0.0.1:8443").expect("could not parse address");
 
   info!("TCP\tstarting event loop");
-  //event_loop.run(&mut server).unwrap();
   server.run();
   info!("TCP\tending event loop");
 }
@@ -632,10 +628,10 @@ mod tests {
     let tx = start_example();
     thread::sleep(Duration::from_millis(300));
 
-    let mut s1 = TcpStream::connect("127.0.0.1:1234").unwrap();
-    let mut s3 = TcpStream::connect("127.0.0.1:1234").unwrap();
+    let mut s1 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
+    let mut s3 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
     thread::sleep(Duration::from_millis(300));
-    let mut s2 = TcpStream::connect("127.0.0.1:1234").unwrap();
+    let mut s2 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
     s1.write(&b"hello"[..]);
     println!("s1 sent");
     s2.write(&b"pouet pouet"[..]);
@@ -644,17 +640,17 @@ mod tests {
 
     let mut res = [0; 128];
     s1.write(&b"coucou"[..]);
-    let mut sz1 = s1.read(&mut res[..]).unwrap();
+    let mut sz1 = s1.read(&mut res[..]).expect("could not read from socket");
     println!("s1 received {:?}", str::from_utf8(&res[..sz1]));
     assert_eq!(&res[..sz1], &b"hello END"[..]);
     s3.shutdown(Shutdown::Both);
-    let sz2 = s2.read(&mut res[..]).unwrap();
+    let sz2 = s2.read(&mut res[..]).expect("could not read from socket");
     println!("s2 received {:?}", str::from_utf8(&res[..sz2]));
     assert_eq!(&res[..sz2], &b"pouet pouet END"[..]);
 
 
     thread::sleep(Duration::from_millis(400));
-    sz1 = s1.read(&mut res[..]).unwrap();
+    sz1 = s1.read(&mut res[..]).expect("could not read from socket");
     println!("s1 received again({}): {:?}", sz1, str::from_utf8(&res[..sz1]));
     assert_eq!(&res[..sz1], &b"coucou END"[..]);
     //assert!(false);
@@ -717,7 +713,7 @@ mod tests {
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server() {
-    let listener = TcpListener::bind("127.0.0.1:5678").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:5678").expect("could not parse address");
     fn handle_client(stream: &mut TcpStream, id: u8) {
       let mut buf = [0; 128];
       let response = b" END";

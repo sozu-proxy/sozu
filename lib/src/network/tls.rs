@@ -919,7 +919,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 pub type TlsServer = Server<ServerConfiguration,TlsClient>;
 
 pub fn start(tag: String, config: TlsProxyConfiguration, channel: ProxyChannel) {
-  let mut event_loop  = Poll::new().unwrap();
+  let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_connections = config.max_connections;
   let max_listeners   = 1;
 
@@ -929,7 +929,6 @@ pub fn start(tag: String, config: TlsProxyConfiguration, channel: ProxyChannel) 
 
     info!("{}\tstarting event loop", &tag);
     server.run();
-    //event_loop.run(&mut server).unwrap();
     info!("{}\tending event loop", &tag);
   }
 }
@@ -965,7 +964,7 @@ mod tests {
   #[test]
   fn mi() {
     thread::spawn(|| { start_server(); });
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").unwrap();
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
     let (tx,rx) = channel::<ServerMessage>();
     let (sender, jg) = start_listener(front, 10, 10, tx.clone());
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
@@ -976,7 +975,7 @@ mod tests {
     println!("test received: {:?}", rx.recv());
     thread::sleep_ms(300);
 
-    let mut client = TcpStream::connect(("127.0.0.1", 1024)).unwrap();
+    let mut client = TcpStream::connect(("127.0.0.1", 1024)).expect("could not parse address");
     // 5 seconds of timeout
     client.set_read_timeout(Some(Duration::new(5,0)));
     thread::sleep_ms(100);
@@ -992,7 +991,7 @@ mod tests {
         // Read the Response.
         println!("read response");
 
-        println!("Response: {}", str::from_utf8(&buffer[..]).unwrap());
+        println!("Response: {}", str::from_utf8(&buffer[..]).expect("could not make string from buffer"));
 
         //thread::sleep_ms(300);
         //assert_eq!(&body, &"Hello World!"[..]);
@@ -1007,7 +1006,7 @@ mod tests {
   #[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server() {
     thread::spawn(move|| {
-      let server = ServerBuilder::new().with_port(1025).build().unwrap();
+      let server = ServerBuilder::new().with_port(1025).build().expect("could not create server");
       println!("starting web server");
 
       for request in server.incoming_requests() {
@@ -1062,7 +1061,7 @@ mod tests {
     let domains    = TrieNode::root();
     let rc_domains = Arc::new(Mutex::new(domains));
 
-    let context    = SslContext::builder(SslMethod::tls()).unwrap();
+    let context    = SslContext::builder(SslMethod::tls()).expect("could not create a SslContextBuilder");
     let (command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 
     let tls_data = TlsData {
@@ -1095,16 +1094,16 @@ mod tests {
 
     println!("TEST {}", line!());
     let frontend1 = server_config.frontend_from_request("lolcatho.st", "/");
-    assert_eq!(frontend1.unwrap().app_id, "app_1");
+    assert_eq!(frontend1.expect("should find a frontend").app_id, "app_1");
     println!("TEST {}", line!());
     let frontend2 = server_config.frontend_from_request("lolcatho.st", "/test");
-    assert_eq!(frontend2.unwrap().app_id, "app_1");
+    assert_eq!(frontend2.expect("should find a frontend").app_id, "app_1");
     println!("TEST {}", line!());
     let frontend3 = server_config.frontend_from_request("lolcatho.st", "/yolo/test");
-    assert_eq!(frontend3.unwrap().app_id, "app_2");
+    assert_eq!(frontend3.expect("should find a frontend").app_id, "app_2");
     println!("TEST {}", line!());
     let frontend4 = server_config.frontend_from_request("lolcatho.st", "/yolo/swag");
-    assert_eq!(frontend4.unwrap().app_id, "app_3");
+    assert_eq!(frontend4.expect("should find a frontend").app_id, "app_3");
     println!("TEST {}", line!());
     let frontend5 = server_config.frontend_from_request("domain", "/");
     assert_eq!(frontend5, None);

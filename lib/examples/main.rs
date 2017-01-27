@@ -20,7 +20,6 @@ use log::{LogRecord,LogLevelFilter,LogLevel};
 use env_logger::LogBuilder;
 
 fn main() {
-  //env_logger::init().unwrap();
   let pid = unsafe { libc::getpid() };
   let format = move |record: &LogRecord| {
     match record.level() {
@@ -38,20 +37,20 @@ fn main() {
   builder.format(format).filter(None, LogLevelFilter::Info);
 
   if env::var("RUST_LOG").is_ok() {
-   builder.parse(&env::var("RUST_LOG").unwrap());
+   builder.parse(&env::var("RUST_LOG").expect("could not get the RUST_LOG env var"));
   }
 
-  builder.init().unwrap();
+  builder.init().expect("could not init log builder");
 
   info!("MAIN\tstarting up");
-  let metrics_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
-  let metrics_host   = ("192.168.59.103", 8125).to_socket_addrs().unwrap().next().unwrap();
-  METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
+  let metrics_socket = UdpSocket::bind("0.0.0.0:0").expect("could not parse address");
+  let metrics_host   = ("192.168.59.103", 8125).to_socket_addrs().expect("could not parse address").next().expect("could not get first address");
+  METRICS.lock().expect("could not get metrics instance").set_up_remote(metrics_socket, metrics_host);
   let metrics_guard = ProxyMetrics::run();
-  METRICS.lock().unwrap().gauge("TEST", 42);
+  METRICS.lock().expect("could not get metrics instance").gauge("TEST", 42);
 
   let config = messages::HttpProxyConfiguration {
-    front: "127.0.0.1:8080".parse().unwrap(),
+    front: "127.0.0.1:8080".parse().expect("could not parse address"),
     max_connections: 500,
     buffer_size: 16384,
     ..Default::default()
@@ -71,7 +70,7 @@ fn main() {
 
 
   let config = messages::TlsProxyConfiguration {
-    front: "127.0.0.1:8443".parse().unwrap(),
+    front: "127.0.0.1:8443".parse().expect("could not parse address"),
     max_connections: 500,
     buffer_size: 16384,
     options: (ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |

@@ -12,11 +12,11 @@ use sozu::network;
 use sozu::channel::Channel;
 
 fn main() {
-  env_logger::init().unwrap();
+  env_logger::init().expect("could not create env logger");
   info!("starting up");
 
   let config = messages::HttpProxyConfiguration {
-    front: "127.0.0.1:8080".parse().unwrap(),
+    front: "127.0.0.1:8080".parse().expect("could not parse address"),
     ..Default::default()
   };
 

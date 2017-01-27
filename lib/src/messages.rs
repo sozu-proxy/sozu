@@ -51,7 +51,7 @@ pub struct HttpProxyConfiguration {
 impl Default for HttpProxyConfiguration {
   fn default() -> HttpProxyConfiguration {
     HttpProxyConfiguration {
-      front:           "127.0.0.1:8080".parse().unwrap(),
+      front:           "127.0.0.1:8080".parse().expect("could not parse address"),
       front_timeout:   5000,
       back_timeout:    5000,
       max_connections: 1000,
@@ -85,7 +85,7 @@ pub struct TlsProxyConfiguration {
 impl Default for TlsProxyConfiguration {
   fn default() -> TlsProxyConfiguration {
     TlsProxyConfiguration {
-      front:           "127.0.0.1:8443".parse().unwrap(),
+      front:           "127.0.0.1:8443".parse().expect("could not parse address"),
       front_timeout:   5000,
       back_timeout:    5000,
       max_connections: 1000,
@@ -365,7 +365,7 @@ mod tests {
   #[test]
   fn add_acl_test() {
     let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}}"#;
-    let command: Order = serde_json::from_str(raw_json).unwrap();
+    let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
@@ -377,7 +377,7 @@ mod tests {
   #[test]
   fn remove_acl_test() {
     let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}}"#;
-    let command: Order = serde_json::from_str(raw_json).unwrap();
+    let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::RemoveHttpFront(HttpFront{
       app_id: String::from("xxx"),
@@ -390,7 +390,7 @@ mod tests {
   #[test]
   fn add_instance_test() {
     let raw_json = r#"{"type": "ADD_INSTANCE", "data": {"app_id": "xxx", "ip_address": "yyy", "port": 8080}}"#;
-    let command: Order = serde_json::from_str(raw_json).unwrap();
+    let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::AddInstance(Instance{
       app_id: String::from("xxx"),
@@ -402,7 +402,7 @@ mod tests {
   #[test]
   fn remove_instance_test() {
     let raw_json = r#"{"type": "REMOVE_INSTANCE", "data": {"app_id": "xxx", "ip_address": "yyy", "port": 8080}}"#;
-    let command: Order = serde_json::from_str(raw_json).unwrap();
+    let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::RemoveInstance(Instance{
       app_id: String::from("xxx"),
@@ -414,7 +414,7 @@ mod tests {
   #[test]
   fn http_front_crash_test() {
     let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "aa", "hostname": "cltdl.fr", "path_begin": ""}}"#;
-    let command: Order = serde_json::from_str(raw_json).unwrap();
+    let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::AddHttpFront(HttpFront{
       app_id: String::from("aa"),
@@ -426,7 +426,7 @@ mod tests {
   #[test]
   fn http_front_crash_test2() {
     let raw_json = r#"{"app_id": "aa", "hostname": "cltdl.fr", "path_begin": ""}"#;
-    let front: HttpFront = serde_json::from_str(raw_json).unwrap();
+    let front: HttpFront = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}",front);
     assert!(front == HttpFront{
       app_id: String::from("aa"),

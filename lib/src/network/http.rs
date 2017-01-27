@@ -636,7 +636,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 pub type HttpServer = Server<ServerConfiguration,Client>;
 
 pub fn start(tag:String, config: HttpProxyConfiguration, channel: ProxyChannel) {
-  let mut event_loop  = Poll::new().unwrap();
+  let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_connections = config.max_connections;
   let max_listeners   = 1;
 
@@ -646,7 +646,6 @@ pub fn start(tag:String, config: HttpProxyConfiguration, channel: ProxyChannel) 
 
     info!("{}\tstarting event loop", &tag);
     server.run();
-    //event_loop.run(&mut server).unwrap();
     info!("{}\tending event loop", &tag);
   }
 }
@@ -674,7 +673,7 @@ mod tests {
   #[test]
   fn mi() {
     start_server(1025);
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").unwrap();
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
     let config = HttpProxyConfiguration {
       front: front,
       max_connections: 10,
@@ -696,7 +695,7 @@ mod tests {
     println!("test received: {:?}", command.read_message());
     thread::sleep(Duration::from_millis(300));
 
-    let mut client = TcpStream::connect(("127.0.0.1", 1024)).unwrap();
+    let mut client = TcpStream::connect(("127.0.0.1", 1024)).expect("could not parse address");
     // 5 seconds of timeout
     client.set_read_timeout(Some(Duration::new(5,0)));
     thread::sleep(Duration::from_millis(100));
@@ -712,7 +711,7 @@ mod tests {
         // Read the Response.
         println!("read response");
 
-        println!("Response: {}", str::from_utf8(&buffer[..]).unwrap());
+        println!("Response: {}", str::from_utf8(&buffer[..]).expect("could not make string from buffer"));
 
         //thread::sleep(Duration::from_millis(300));
         //assert_eq!(&body, &"Hello World!"[..]);
@@ -726,7 +725,7 @@ mod tests {
   #[test]
   fn keep_alive() {
     start_server(1028);
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1031").unwrap();
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1031").expect("could not parse address");
     let config = HttpProxyConfiguration {
       front: front,
       max_connections: 10,
@@ -749,7 +748,7 @@ mod tests {
     println!("test received: {:?}", command.read_message());
     thread::sleep(Duration::from_millis(300));
 
-    let mut client = TcpStream::connect(("127.0.0.1", 1031)).unwrap();
+    let mut client = TcpStream::connect(("127.0.0.1", 1031)).expect("could not parse address");
     // 5 seconds of timeout
     client.set_read_timeout(Some(Duration::new(5,0)));
     thread::sleep(Duration::from_millis(100));
@@ -765,7 +764,7 @@ mod tests {
         // Read the Response.
         println!("read response");
 
-        println!("Response: {}", str::from_utf8(&buffer[..]).unwrap());
+        println!("Response: {}", str::from_utf8(&buffer[..]).expect("could not make string from buffer"));
 
         //thread::sleep(Duration::from_millis(300));
         //assert_eq!(&body, &"Hello World!"[..]);
@@ -787,7 +786,7 @@ mod tests {
         // Read the Response.
         println!("read response");
 
-        println!("Response: {}", str::from_utf8(&buffer2[..]).unwrap());
+        println!("Response: {}", str::from_utf8(&buffer2[..]).expect("could not make string from buffer"));
 
         //thread::sleep(Duration::from_millis(300));
         //assert_eq!(&body, &"Hello World!"[..]);
@@ -803,7 +802,7 @@ mod tests {
   #[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server(port: u16) {
     thread::spawn(move|| {
-      let server = ServerBuilder::new().with_port(port).build().unwrap();
+      let server = ServerBuilder::new().with_port(port).build().expect("could not create server");
       println!("starting web server in port {}", port);
 
       for request in server.incoming_requests() {
@@ -844,8 +843,8 @@ mod tests {
 
     let (command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").unwrap();
-    let listener = tcp::TcpListener::bind(&front).unwrap();
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
+    let listener = tcp::TcpListener::bind(&front).expect("should bind TCP socket");
     let server_config = ServerConfiguration {
       listener:  listener,
       address:   front,
@@ -868,10 +867,10 @@ mod tests {
     let frontend3 = server_config.frontend_from_request("lolcatho.st", "/yolo/test");
     let frontend4 = server_config.frontend_from_request("lolcatho.st", "/yolo/swag");
     let frontend5 = server_config.frontend_from_request("domain", "/");
-    assert_eq!(frontend1.unwrap().app_id, "app_1");
-    assert_eq!(frontend2.unwrap().app_id, "app_1");
-    assert_eq!(frontend3.unwrap().app_id, "app_2");
-    assert_eq!(frontend4.unwrap().app_id, "app_3");
+    assert_eq!(frontend1.expect("should find frontend").app_id, "app_1");
+    assert_eq!(frontend2.expect("should find frontend").app_id, "app_1");
+    assert_eq!(frontend3.expect("should find frontend").app_id, "app_2");
+    assert_eq!(frontend4.expect("should find frontend").app_id, "app_3");
     assert_eq!(frontend5, None);
   }
 }
