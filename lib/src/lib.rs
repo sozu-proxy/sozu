@@ -170,6 +170,7 @@ extern crate libc;
 extern crate slab;
 extern crate mio_uds;
 
+#[macro_use] pub mod util;
 pub mod network;
 pub mod parser;
 pub mod messages;
