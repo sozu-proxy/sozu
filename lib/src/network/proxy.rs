@@ -157,13 +157,13 @@ pub struct Server<ServerConfiguration,Client> {
 impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<ServerConfiguration,Client> {
   pub fn new(max_listeners: usize, max_connections: usize, configuration: ServerConfiguration, poll: Poll) -> Self {
     let mut configuration = configuration;
-    poll.register(configuration.channel(), Token(0), Ready::all(), PollOpt::edge()).unwrap();
+    poll.register(configuration.channel(), Token(0), Ready::all(), PollOpt::edge()).expect("should register the channel");
     let clients = Slab::with_capacity(max_connections);
     let backend = Slab::with_capacity(max_connections);
     //let timer   = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
     let timer   = Timer::default();
     //FIXME: registering the timer makes the timer thread spin too much
-    //poll.register(&timer, Token(1), Ready::readable(), PollOpt::edge()).unwrap();
+    //poll.register(&timer, Token(1), Ready::readable(), PollOpt::edge()).expect("should register the timer");
     Server {
       configuration:   configuration,
       clients:         clients,
@@ -352,11 +352,10 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
     let mut events = Events::with_capacity(1024);
     let poll_timeout = Some(Duration::from_millis(1000));
     loop {
-      self.poll.poll(&mut events, poll_timeout).unwrap();
+      self.poll.poll(&mut events, poll_timeout).expect("should be able to poll for events");
 
       for event in events.iter() {
         if event.token() == Token(0) {
-          //FIXME: should not unwrap
           let kind = event.kind();
           if kind.is_error() {
             error!("error reading from command channel");
@@ -383,7 +382,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
               }
             }
 
-            let msg = msg.unwrap();
+            let msg = msg.expect("the message should be valid");
             if let Order::HardStop = msg.order {
               self.notify(msg);
               self.configuration.channel().run();
@@ -414,7 +413,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
 
       if self.shutting_down.is_some() && self.clients.len() == 0 {
         info!("last client stopped, shutting down!");
-        self.configuration.channel().write_message(&ServerMessage{ id: self.shutting_down.take().unwrap(), status: ServerMessageStatus::Ok});
+        self.configuration.channel().write_message(&ServerMessage{ id: self.shutting_down.take().expect("should have shut down correctly"), status: ServerMessageStatus::Ok});
         self.configuration.channel().run();
         return;
       }

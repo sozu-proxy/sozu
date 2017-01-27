@@ -786,7 +786,7 @@ impl HttpState {
   }
 
   pub fn has_host(&self) -> bool {
-    self.request.as_ref().map(|r| r.has_host()).unwrap()
+    self.request.as_ref().map(|r| r.has_host()).expect("there should be a request")
   }
 
   pub fn is_front_error(&self) -> bool {
@@ -798,23 +798,23 @@ impl HttpState {
   }
 
   pub fn is_front_proxying(&self) -> bool {
-    self.request.as_ref().map(|r| r.is_proxying()).unwrap()
+    self.request.as_ref().map(|r| r.is_proxying()).expect("there should be a request")
   }
 
   pub fn get_host(&self) -> Option<String> {
-    self.request.as_ref().map(|r| r.get_host()).unwrap()
+    self.request.as_ref().map(|r| r.get_host()).expect("there should be a request")
   }
 
   pub fn get_uri(&self) -> Option<String> {
-    self.request.as_ref().map(|r| r.get_uri()).unwrap()
+    self.request.as_ref().map(|r| r.get_uri()).expect("there should be a request")
   }
 
   pub fn get_request_line(&self) -> Option<RRequestLine> {
-    self.request.as_ref().map(|r| r.get_request_line()).unwrap()
+    self.request.as_ref().map(|r| r.get_request_line()).expect("there should be a request")
   }
 
   pub fn get_front_keep_alive(&self) -> Option<Connection> {
-    self.request.as_ref().map(|r| r.get_keep_alive()).unwrap()
+    self.request.as_ref().map(|r| r.get_keep_alive()).expect("there should be a request")
   }
 
   /*
@@ -836,7 +836,7 @@ impl HttpState {
   */
 
   pub fn front_should_keep_alive(&self) -> bool {
-    self.request.as_ref().map(|r| r.should_keep_alive()).unwrap()
+    self.request.as_ref().map(|r| r.should_keep_alive()).expect("there should be a request")
   }
 
   pub fn is_back_error(&self) -> bool {
@@ -848,15 +848,15 @@ impl HttpState {
   }
 
   pub fn is_back_proxying(&self) -> bool {
-    self.response.as_ref().map(|r| r.is_proxying()).unwrap()
+    self.response.as_ref().map(|r| r.is_proxying()).expect("there should be a response")
   }
 
   pub fn get_status_line(&self) -> Option<RStatusLine> {
-    self.response.as_ref().map(|r| r.get_status_line()).unwrap()
+    self.response.as_ref().map(|r| r.get_status_line()).expect("there should be a response")
   }
 
   pub fn get_back_keep_alive(&self) -> Option<Connection> {
-    self.response.as_ref().map(|ref r| r.get_keep_alive()).unwrap()
+    self.response.as_ref().map(|ref r| r.get_keep_alive()).expect("there should be a response")
   }
 
   /*
@@ -870,7 +870,7 @@ impl HttpState {
   */
 
   pub fn back_should_keep_alive(&self) -> bool {
-    self.response.as_ref().map(|ref r| r.should_keep_alive()).unwrap()
+    self.response.as_ref().map(|ref r| r.should_keep_alive()).expect("there should be a response")
   }
 }
 
@@ -922,7 +922,7 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
     HeaderValue::Connection(c) => {
       let mut conn = state.get_keep_alive().unwrap_or(Connection::KeepAlive);
       for value in c {
-      trace!("PARSER\tgot Connection header: {:?}", str::from_utf8(value).unwrap());
+      trace!("PARSER\tgot Connection header: {:?}", str::from_utf8(value).expect("could not make string from value"));
         match value {
           b"close"      => conn = Connection::Close,
           b"keep-alive" => conn = Connection::KeepAlive,
@@ -1091,7 +1091,7 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
     HeaderValue::Connection(c) => {
       let mut conn = state.get_keep_alive().unwrap_or(Connection::KeepAlive);
       for value in c {
-      trace!("PARSER\tgot Connection header: {:?}", str::from_utf8(value).unwrap());
+      trace!("PARSER\tgot Connection header: {:?}", str::from_utf8(value).expect("could not make string from value"));
         match &value.to_ascii_lowercase()[..] {
           b"close"      => conn = Connection::Close,
           b"keep-alive" => conn = Connection::KeepAlive,
@@ -1114,7 +1114,7 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
       }
     },
     HeaderValue::Upgrade(protocol) => {
-      let proto = str::from_utf8(protocol).unwrap().to_string();
+      let proto = str::from_utf8(protocol).expect("the parsed protocol should be a valid utf8 string").to_string();
       info!("parsed a protocol: {:?}", proto);
       info!("state is {:?}", state);
       match state {

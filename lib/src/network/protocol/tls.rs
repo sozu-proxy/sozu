@@ -46,8 +46,8 @@ impl TlsHandshake {
     match self.state {
       TlsState::Error   => return (ProtocolResult::Continue, ClientResult::CloseClient),
       TlsState::Initial => {
-        let ssl     = self.ssl.take().unwrap();
-        let sock    = self.front.take().unwrap();
+        let ssl     = self.ssl.take().expect("TlsHandshake should have a Ssl instance");
+        let sock    = self.front.take().expect("TlsHandshake should have a front socket");
         let version = ssl.version();
         match ssl.accept(sock) {
           Ok(stream) => {
@@ -55,14 +55,12 @@ impl TlsHandshake {
             return (ProtocolResult::Upgrade, ClientResult::Continue);
           },
           Err(HandshakeError::SetupFailure(e)) => {
-            println!("accept: handshake setup failed: {:?}", e);
-            println!("version: {:?}", version);
+            error!("accept: handshake setup failed: {:?}", e);
             self.state = TlsState::Error;
             return (ProtocolResult::Continue, ClientResult::CloseClient);
           },
           Err(HandshakeError::Failure(e)) => {
-            println!("accept: handshake failed: {:?}", e);
-            println!("version: {:?}", version);
+            error!("accept: handshake failed: {:?}", e);
             self.state = TlsState::Error;
             return (ProtocolResult::Continue, ClientResult::CloseClient);
           },
@@ -75,7 +73,7 @@ impl TlsHandshake {
         }
       },
       TlsState::Handshake => {
-        let mid = self.mid.take().unwrap();
+        let mid = self.mid.take().expect("TlsHandshake should have a MidHandshakeSslStream instance");
         let version = mid.ssl().version();
         match mid.handshake() {
           Ok(stream) => {
@@ -83,14 +81,12 @@ impl TlsHandshake {
             return (ProtocolResult::Upgrade, ClientResult::Continue);
           },
           Err(HandshakeError::SetupFailure(e)) => {
-            println!("mid handshake setup failed: {:?}", e);
-            println!("version: {:?}", version);
+            debug!("mid handshake setup failed: {:?}", e);
             self.state = TlsState::Error;
             return (ProtocolResult::Continue, ClientResult::CloseClient);
           },
           Err(HandshakeError::Failure(e)) => {
-            println!("mid handshake failed: {:?}", e);
-            println!("version: {:?}", version);
+            debug!("mid handshake failed: {:?}", e);
             self.state = TlsState::Error;
             return (ProtocolResult::Continue, ClientResult::CloseClient);
           },
