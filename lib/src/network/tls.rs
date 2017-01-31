@@ -508,7 +508,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_http_front(&mut self, http_front: TlsFront, event_loop: &mut Poll) -> bool {
+  pub fn add_tls_front(&mut self, tls_front: TlsFront, event_loop: &mut Poll) -> bool {
     //FIXME: insert some error management with a Result here
     let c = SslContext::builder(SslMethod::tls());
     if c.is_err() { return false; }
@@ -531,9 +531,9 @@ impl ServerConfiguration {
 
     ctx.set_ecdh_auto(true);
 
-    let mut cert_read  = &http_front.certificate.as_bytes()[..];
-    let mut key_read   = &http_front.key.as_bytes()[..];
-    let cert_chain: Vec<X509> = http_front.certificate_chain.iter().filter_map(|c| {
+    let mut cert_read  = &tls_front.certificate.as_bytes()[..];
+    let mut key_read   = &tls_front.key.as_bytes()[..];
+    let cert_chain: Vec<X509> = tls_front.certificate_chain.iter().filter_map(|c| {
       X509::from_pem(c.as_bytes()).ok()
     }).collect();
 
@@ -589,19 +589,19 @@ impl ServerConfiguration {
       }
 
       let app = TlsApp {
-        app_id:           http_front.app_id.clone(),
-        hostname:         http_front.hostname.clone(),
-        path_begin:       http_front.path_begin.clone(),
+        app_id:           tls_front.app_id.clone(),
+        hostname:         tls_front.hostname.clone(),
+        path_begin:       tls_front.path_begin.clone(),
         cert_fingerprint: fingerprint.clone(),
       };
 
-      if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
+      if let Some(fronts) = self.fronts.get_mut(&tls_front.hostname) {
           if ! fronts.contains(&app) {
             fronts.push(app.clone());
           }
       }
-      if self.fronts.get(&http_front.hostname).is_none() {
-        self.fronts.insert(http_front.hostname, vec![app]);
+      if self.fronts.get(&tls_front.hostname).is_none() {
+        self.fronts.insert(tls_front.hostname, vec![app]);
       }
 
       true
@@ -610,8 +610,8 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn remove_http_front(&mut self, front: TlsFront, event_loop: &mut Poll) {
-    info!("{}\tremoving http_front {:?}", self.tag, front);
+  pub fn remove_tls_front(&mut self, front: TlsFront, event_loop: &mut Poll) {
+    info!("{}\tremoving tls_front {:?}", self.tag, front);
 
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
       if let Some(pos) = fronts.iter().position(|f| &f.app_id == &front.app_id) {
@@ -841,12 +841,12 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     match message.order {
       Order::AddTlsFront(front) => {
         //info!("TLS\t{} add front {:?}", id, front);
-          self.add_http_front(front, event_loop);
+          self.add_tls_front(front, event_loop);
           self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::RemoveTlsFront(front) => {
         //info!("TLS\t{} remove front {:?}", id, front);
-        self.remove_http_front(front, event_loop);
+        self.remove_tls_front(front, event_loop);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::AddInstance(instance) => {
