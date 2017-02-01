@@ -4,36 +4,14 @@ use openssl::hash::MessageDigest;
 
 use sozu::messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,TlsFront,Instance};
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct HttpProxyInstance {
-  ip_address: String,
-  port:       u16,
-}
-
 pub type AppId = String;
-
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct HttpProxyFront {
-  app_id:     AppId,
-  hostname:   String,
-  path_begin: String,
-}
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
 pub struct HttpProxy {
   ip_address: String,
   port:       u16,
-  fronts:     HashMap<AppId, Vec<HttpProxyFront>>,
-  instances:  HashMap<AppId, Vec<HttpProxyInstance>>,
-}
-
-//FIXME: do we need to have a redundant structure for this?
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct TlsProxyFront {
-  app_id:      AppId,
-  hostname:    String,
-  path_begin:  String,
-  fingerprint: CertFingerprint,
+  fronts:     HashMap<AppId, Vec<HttpFront>>,
+  instances:  HashMap<AppId, Vec<Instance>>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize, Deserialize)]
@@ -41,8 +19,8 @@ pub struct TlsProxy {
   ip_address:   String,
   port:         u16,
   certificates: HashMap<CertFingerprint, CertificateAndKey>,
-  fronts:       HashMap<AppId, Vec<TlsProxyFront>>,
-  instances:    HashMap<AppId, Vec<HttpProxyInstance>>,
+  fronts:       HashMap<AppId, Vec<TlsFront>>,
+  instances:    HashMap<AppId, Vec<Instance>>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
@@ -83,7 +61,7 @@ impl HttpProxy {
   pub fn handle_order(&mut self, order: &Order) {
     match order {
       &Order::AddHttpFront(ref front) => {
-        let f = HttpProxyFront {
+        let f = HttpFront {
           app_id:     front.app_id.clone(),
           hostname:   front.hostname.clone(),
           path_begin: front.path_begin.clone(),
@@ -104,18 +82,14 @@ impl HttpProxy {
         }
       },
       &Order::AddInstance(ref instance)  => {
-        let inst = HttpProxyInstance {
-          ip_address: instance.ip_address.clone(),
-          port:       instance.port,
-        };
         if self.instances.contains_key(&instance.app_id) {
-          self.instances.get_mut(&instance.app_id).map(|instance| {
-            if !instance.contains(&inst) {
-              instance.push(inst);
+          self.instances.get_mut(&instance.app_id).map(|instance_vec| {
+            if !instance_vec.contains(&instance) {
+              instance_vec.push(instance.clone());
             }
           });
         } else {
-          self.instances.insert(instance.app_id.clone(), vec!(inst));
+          self.instances.insert(instance.app_id.clone(), vec!(instance.clone()));
         }
       },
       &Order::RemoveInstance(ref instance) => {
@@ -147,13 +121,9 @@ impl HttpProxy {
       }
     }
 
-    for (app_id,instance_list) in self.instances.iter() {
+    for instance_list in self.instances.values() {
       for instance in instance_list {
-        v.push(Order::AddInstance(Instance {
-          app_id:     app_id.clone(),
-          ip_address: instance.ip_address.clone(),
-          port:       instance.port.clone(),
-        }));
+        v.push(Order::AddInstance(instance.clone()));
       }
     }
 
@@ -197,7 +167,7 @@ impl TlsProxy {
         self.certificates.remove(fingerprint);
       },
       &Order::AddTlsFront(ref front) => {
-        let f = TlsProxyFront {
+        let f = TlsFront {
           app_id:      front.app_id.clone(),
           hostname:    front.hostname.clone(),
           path_begin:  front.path_begin.clone(),
@@ -217,7 +187,8 @@ impl TlsProxy {
         self.fronts.remove(&front.app_id);
       },
       &Order::AddInstance(ref instance)  => {
-        let inst = HttpProxyInstance {
+        let inst = Instance {
+          app_id:     instance.app_id.clone(),
           ip_address: instance.ip_address.clone(),
           port:       instance.port,
         };
