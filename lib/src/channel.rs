@@ -190,10 +190,9 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
       let mut res = None;
 
       if let Ok(s) = from_utf8(&self.front_buf.data()[..pos]) {
-        if let Ok(message) = serde_json::from_str(s) {
-          res = Some(message);
-        } else {
-          error!("could not parse message, ignoring:\n{}", s);
+        match serde_json::from_str(s) {
+          Ok(message) => res = Some(message),
+          Err(e) => error!("could not parse message (error={:?}), ignoring:\n{}", e, s),
         }
       } else {
         error!("invalid utf-8 encoding in command message, ignoring");
@@ -225,10 +224,9 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
         let mut res = None;
 
         if let Ok(s) = from_utf8(&self.front_buf.data()[..pos]) {
-          if let Ok(message) = serde_json::from_str(s) {
-            res = Some(message);
-          } else {
-            error!("could not parse message, ignoring:\n{}", s);
+          match serde_json::from_str(s) {
+            Ok(message) => res = Some(message),
+            Err(e) => error!("could not parse message (error={:?}), ignoring:\n{}", e, s),
           }
         } else {
           error!("invalid utf-8 encoding in command message, ignoring");
