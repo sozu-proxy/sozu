@@ -5,9 +5,11 @@ use std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::io::{self,Error,ErrorKind,Read};
 use serde::Deserialize;
+use openssl::x509::X509;
+use openssl::hash::MessageDigest;
 use toml;
 
-use sozu::messages::{Order,HttpFront,TlsFront,Instance,HttpProxyConfiguration,TlsProxyConfiguration};
+use sozu::messages::{CertificateAndKey,Order,HttpFront,TlsFront,Instance,HttpProxyConfiguration,TlsProxyConfiguration};
 
 use data::{ConfigCommand,ConfigMessage,ProxyType,PROTOCOL_VERSION};
 
@@ -222,7 +224,7 @@ impl Config {
 
         //FIXME: TCP should be handled as well
         if let Some(ref proxy) = self.proxies.get(tag).as_ref() {
-          let frontend_order = if proxy.proxy_type == ProxyType::HTTPS {
+          if proxy.proxy_type == ProxyType::HTTPS {
             let key_opt         = app.key.as_ref().and_then(|path| Config::load_file(&path).ok());
             let certificate_opt = app.certificate.as_ref().and_then(|path| Config::load_file(&path).ok());
             let chain_opt       = app.certificate_chain.as_ref().and_then(|path| Config::load_file(&path).ok())
@@ -240,31 +242,56 @@ impl Config {
               error!("cannot read the certificate chain at {:?}", app.certificate_chain);
               continue;
             }
+            let certificate = certificate_opt.unwrap();
+            let fingerprint = match X509::from_pem(&certificate.as_bytes()[..]).and_then(|cert| cert.fingerprint(MessageDigest::sha256())) {
+              Ok(f)  => f,
+              Err(e) => {
+                error!("cannot obtain the certificate's fingerprint: {:?}", e);
+                continue;
+              }
+            };
 
-            Order::AddTlsFront(TlsFront {
-              app_id:            id.to_string(),
-              hostname:          app.hostname.clone(),
-              path_begin:        path_begin,
+            let certificate_order = Order::AddCertificate(CertificateAndKey {
               key:               key_opt.unwrap(),
-              certificate:       certificate_opt.unwrap(),
+              certificate:       certificate,
               certificate_chain: chain_opt.unwrap(),
-            })
+            });
+            v.push(ConfigMessage {
+              id:      format!("CONFIG-{}", count),
+              version: PROTOCOL_VERSION,
+              proxy:   Some(tag.clone()),
+              data:    ConfigCommand::ProxyConfiguration(certificate_order),
+            });
+            count += 1;
+            let front_order = Order::AddTlsFront(TlsFront {
+              app_id:      id.to_string(),
+              hostname:    app.hostname.clone(),
+              path_begin:  path_begin,
+              fingerprint: fingerprint,
+            });
+            v.push(ConfigMessage {
+              id:      format!("CONFIG-{}", count),
+              version: PROTOCOL_VERSION,
+              proxy:   Some(tag.clone()),
+              data:    ConfigCommand::ProxyConfiguration(front_order),
+            });
+            count += 1;
           } else {
-            Order::AddHttpFront(HttpFront {
+            let order = Order::AddHttpFront(HttpFront {
               app_id:     id.to_string(),
               hostname:   app.hostname.clone(),
               path_begin: path_begin,
-            })
+            });
+            v.push(ConfigMessage {
+              id:      format!("CONFIG-{}", count),
+              version: PROTOCOL_VERSION,
+              proxy:   Some(tag.clone()),
+              data:    ConfigCommand::ProxyConfiguration(order),
+            });
+            count += 1;
           };
 
-          v.push(ConfigMessage {
-            id:      format!("CONFIG-{}", count),
-            version: PROTOCOL_VERSION,
-            proxy:   Some(tag.clone()),
-            data:    ConfigCommand::ProxyConfiguration(frontend_order),
-          });
 
-          count += 1;
         } else {
           error!("invalid proxy name: {}", tag);
           continue;

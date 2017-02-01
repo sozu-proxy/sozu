@@ -4,6 +4,7 @@
 extern crate toml;
 extern crate serde;
 extern crate serde_json;
+extern crate openssl;
 extern crate sozu_lib as sozu;
 
 pub mod config;

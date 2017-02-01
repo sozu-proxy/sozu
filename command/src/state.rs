@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use openssl::x509::X509;
+use openssl::hash::MessageDigest;
 
-use sozu::messages::{Order,HttpFront,TlsFront,Instance};
+use sozu::messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,TlsFront,Instance};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpProxyInstance {
@@ -25,22 +27,22 @@ pub struct HttpProxy {
   instances:  HashMap<AppId, Vec<HttpProxyInstance>>,
 }
 
+//FIXME: do we need to have a redundant structure for this?
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct TlsProxyFront {
   app_id:      AppId,
   hostname:    String,
   path_begin:  String,
-  certificate: String,
-  key:         String,
-  certificate_chain: Vec<String>,
+  fingerprint: CertFingerprint,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize, Deserialize)]
 pub struct TlsProxy {
-  ip_address: String,
-  port:       u16,
-  fronts:     HashMap<AppId, Vec<TlsProxyFront>>,
-  instances:  HashMap<AppId, Vec<HttpProxyInstance>>,
+  ip_address:   String,
+  port:         u16,
+  certificates: HashMap<CertFingerprint, CertificateAndKey>,
+  fronts:       HashMap<AppId, Vec<TlsProxyFront>>,
+  instances:    HashMap<AppId, Vec<HttpProxyInstance>>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
@@ -162,23 +164,44 @@ impl HttpProxy {
 impl TlsProxy {
   pub fn new(ip: String, port: u16) -> TlsProxy {
     TlsProxy {
-      ip_address: ip,
-      port:       port,
-      fronts:     HashMap::new(),
-      instances:  HashMap::new(),
+      ip_address:   ip,
+      port:         port,
+      certificates: HashMap::new(),
+      fronts:       HashMap::new(),
+      instances:    HashMap::new(),
     }
   }
 
   pub fn handle_order(&mut self, order: &Order) {
     match order {
+      &Order::AddCertificate(ref certificate_and_key) => {
+        let f = CertificateAndKey {
+          certificate:       certificate_and_key.certificate.clone(),
+          certificate_chain: certificate_and_key.certificate_chain.clone(),
+          key:               certificate_and_key.key.clone(),
+        };
+        let fingerprint = match X509::from_pem(&certificate_and_key.certificate.as_bytes()[..]).and_then(|cert|
+                                  cert.fingerprint(MessageDigest::sha256())) {
+          Ok(f)  => f,
+          Err(e) => {
+            error!("cannot obtain the certificate's fingerprint: {:?}", e);
+            return;
+          }
+        };
+
+        if !self.certificates.contains_key(&fingerprint) {
+          self.certificates.insert(fingerprint.clone(), f);
+        }
+      },
+      &Order::RemoveCertificate(ref fingerprint) => {
+        self.certificates.remove(fingerprint);
+      },
       &Order::AddTlsFront(ref front) => {
         let f = TlsProxyFront {
           app_id:      front.app_id.clone(),
           hostname:    front.hostname.clone(),
           path_begin:  front.path_begin.clone(),
-          certificate: front.certificate.clone(),
-          certificate_chain: front.certificate_chain.clone(),
-          key:         front.key.clone(),
+          fingerprint: front.fingerprint.clone(),
         };
         if self.fronts.contains_key(&front.app_id) {
           self.fronts.get_mut(&front.app_id).map(|front| {
@@ -226,15 +249,16 @@ impl TlsProxy {
 
   pub fn generate_orders(&self) -> Vec<Order> {
     let mut v = Vec::new();
+    for certificate_and_key in (&self.certificates).values() {
+      v.push(Order::AddCertificate(certificate_and_key.clone()));
+    }
     for (app_id, front_list) in &self.fronts {
       for front in front_list {
         v.push(Order::AddTlsFront(TlsFront {
           app_id:      app_id.clone(),
           hostname:    front.hostname.clone(),
           path_begin:  front.path_begin.clone(),
-          certificate: front.certificate.clone(),
-          certificate_chain: front.certificate_chain.clone(),
-          key:         front.key.clone(),
+          fingerprint: front.fingerprint.clone(),
         }));
       }
     }
