@@ -7,6 +7,7 @@ extern crate time;
 extern crate libc;
 extern crate mio;
 extern crate mio_uds;
+extern crate hex;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::thread;
@@ -101,16 +102,45 @@ fn main() {
   let cert1 = include_str!("../../assets/certificate.pem");
   let key1  = include_str!("../../assets/key.pem");
 
-  let tls_front = messages::TlsFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st"), path_begin: String::from("/"), certificate: String::from(cert1), key: String::from(key1), certificate_chain: vec!() };
-  command2.write_message(&network::ProxyOrder { id: String::from("ID_IJKL"), order: messages::Order::AddTlsFront(tls_front) });
+  let certificate_and_key = messages::CertificateAndKey {
+    certificate:       String::from(cert1),
+    key:               String::from(key1),
+    certificate_chain: vec!()
+  };
+  command2.write_message(&network::ProxyOrder {
+    id:    String::from("ID_IJKL1"),
+    order: messages::Order::AddCertificate(certificate_and_key)
+  });
+
+  let tls_front = messages::TlsFront {
+    app_id:      String::from("app_1"),
+    hostname:    String::from("lolcatho.st"),
+    path_begin:  String::from("/"),
+    fingerprint: hex::FromHex::from_hex("AB2618B674E15243FD02A5618C66509E4840BA60E7D64CEBEC84CDBFECEEE0C5").unwrap()
+  };
+  command2.write_message(&network::ProxyOrder { id: String::from("ID_IJKL2"), order: messages::Order::AddTlsFront(tls_front) });
   let tls_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
   command2.write_message(&network::ProxyOrder { id: String::from("ID_MNOP"), order: messages::Order::AddInstance(tls_instance) });
 
   let cert2 = include_str!("../../assets/cert_test.pem");
   let key2  = include_str!("../../assets/key_test.pem");
 
-  let tls_front2 = messages::TlsFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/"), certificate: String::from(cert2), key: String::from(key2), certificate_chain: vec!() };
-  command2.write_message(&network::ProxyOrder { id: String::from("ID_QRST"), order: messages::Order::AddTlsFront(tls_front2) });
+  let certificate_and_key2 = messages::CertificateAndKey {
+    certificate: String::from(cert2),
+    key: String::from(key2),
+    certificate_chain: vec!()
+  };
+  command2.write_message(&network::ProxyOrder {
+    id:    String::from("ID_QRST1"),
+    order: messages::Order::AddCertificate(certificate_and_key2)
+  });
+  let tls_front2 = messages::TlsFront {
+    app_id:     String::from("app_2"),
+    hostname:   String::from("test.local"),
+    path_begin: String::from("/"),
+    fingerprint: hex::FromHex::from_hex("7E8EBF9AD0645AB755A2E51EB3734B91D4ACACEF1F28AD9D96D9385487FAE6E6").unwrap()
+  };
+  command2.write_message(&network::ProxyOrder { id: String::from("ID_QRST2"), order: messages::Order::AddTlsFront(tls_front2) });
   let tls_instance2 = messages::Instance { app_id: String::from("app_2"), ip_address: String::from("127.0.0.1"), port: 1026 };
   command2.write_message(&network::ProxyOrder { id: String::from("ID_UVWX"), order: messages::Order::AddInstance(tls_instance2) });
 

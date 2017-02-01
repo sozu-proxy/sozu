@@ -5,6 +5,9 @@ use std::net::{IpAddr,SocketAddr};
 use std::default::Default;
 use std::convert::From;
 
+//FIXME: make fixed size depending on hash algorithm
+pub type CertFingerprint = Vec<u8>;
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpFront {
     pub app_id:     String,
@@ -13,13 +16,18 @@ pub struct HttpFront {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct TlsFront {
-    pub app_id:            String,
-    pub hostname:          String,
-    pub path_begin:        String,
+pub struct CertificateAndKey {
     pub certificate:       String,
     pub certificate_chain: Vec<String>,
     pub key:               String,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct TlsFront {
+    pub app_id:       String,
+    pub hostname:     String,
+    pub path_begin:   String,
+    pub fingerprint:  CertFingerprint,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -128,6 +136,9 @@ pub enum Order {
     AddTlsFront(TlsFront),
     RemoveTlsFront(TlsFront),
 
+    AddCertificate(CertificateAndKey),
+    RemoveCertificate(CertFingerprint),
+
     AddTcpFront(TcpFront),
     RemoveTcpFront(TcpFront),
 
@@ -144,18 +155,20 @@ pub enum Order {
 impl Order {
   pub fn get_topics(&self) -> Vec<Topic> {
     match *self {
-      Order::AddHttpFront(_)    => vec![Topic::HttpProxyConfig                       ],
-      Order::RemoveHttpFront(_) => vec![Topic::HttpProxyConfig                       ],
-      Order::AddTlsFront(_)     => vec![Topic::TlsProxyConfig                        ],
-      Order::RemoveTlsFront(_)  => vec![Topic::TlsProxyConfig                        ],
-      Order::AddTcpFront(_)     => vec![Topic::TcpProxyConfig                        ],
-      Order::RemoveTcpFront(_)  => vec![Topic::TcpProxyConfig                        ],
-      Order::AddInstance(_)     => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
-      Order::RemoveInstance(_)  => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
-      Order::HttpProxy(_)       => vec![Topic::HttpProxyConfig],
-      Order::TlsProxy(_)        => vec![Topic::TlsProxyConfig],
-      Order::SoftStop           => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
-      Order::HardStop           => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
+      Order::AddHttpFront(_)      => vec![Topic::HttpProxyConfig                       ],
+      Order::RemoveHttpFront(_)   => vec![Topic::HttpProxyConfig                       ],
+      Order::AddTlsFront(_)       => vec![Topic::TlsProxyConfig                        ],
+      Order::RemoveTlsFront(_)    => vec![Topic::TlsProxyConfig                        ],
+      Order::AddCertificate(_)    => vec![Topic::TlsProxyConfig                        ],
+      Order::RemoveCertificate(_) => vec![Topic::TlsProxyConfig                        ],
+      Order::AddTcpFront(_)       => vec![Topic::TcpProxyConfig                        ],
+      Order::RemoveTcpFront(_)    => vec![Topic::TcpProxyConfig                        ],
+      Order::AddInstance(_)       => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
+      Order::RemoveInstance(_)    => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
+      Order::HttpProxy(_)         => vec![Topic::HttpProxyConfig],
+      Order::TlsProxy(_)          => vec![Topic::TlsProxyConfig],
+      Order::SoftStop             => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
+      Order::HardStop             => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
     }
   }
 }
@@ -234,6 +247,12 @@ impl serde::de::Visitor for OrderVisitor {
     } else if &command_type == "REMOVE_HTTP_FRONT" {
       let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("remove_http_front"))));
       Ok(Order::RemoveHttpFront(acl))
+    } else if &command_type == "ADD_CERTIFICATE" {
+      let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("add_certificate"))));
+      Ok(Order::AddCertificate(acl))
+    } else if &command_type == "REMOVE_CERTIFICATE" {
+      let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("remove_certificate"))));
+      Ok(Order::RemoveCertificate(acl))
     } else if &command_type == "ADD_TLS_FRONT" {
       let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("add_tls_front"))));
       Ok(Order::AddTlsFront(acl))
@@ -299,6 +318,18 @@ impl serde::Serialize for Order {
         try!(serializer.serialize_map_value(&mut state, "REMOVE_TLS_FRONT"));
         try!(serializer.serialize_map_key(&mut state, "data"));
         try!(serializer.serialize_map_value(&mut state, front));
+      },
+      &Order::AddCertificate(ref certificate_and_key) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "ADD_CERTIFICATE"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, certificate_and_key));
+      },
+      &Order::RemoveCertificate(ref fingerprint) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "REMOVE_CERTIFICATE"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, fingerprint));
       },
       &Order::AddTcpFront(ref front) => {
         try!(serializer.serialize_map_key(&mut state, "type"));

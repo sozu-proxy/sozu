@@ -32,7 +32,7 @@ use network::buffer_queue::BufferQueue;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,Protocol};
 use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,
   Readiness,ListenToken,FrontToken,BackToken,ProxyChannel};
-use messages::{self,Order,TlsFront,TlsProxyConfiguration};
+use messages::{self,CertFingerprint,CertificateAndKey,Order,TlsFront,TlsProxyConfiguration};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
@@ -305,12 +305,11 @@ fn get_cert_common_name(cert: &X509) -> Option<String> {
 pub type AppId     = String;
 pub type HostName  = String;
 pub type PathBegin = String;
-//maybe not the most efficient type for that
-pub type CertFingerprint = Vec<u8>;
 pub struct TlsData {
   context:     SslContext,
   certificate: Vec<u8>,
   refcount:    usize,
+  initialized: bool,
 }
 
 pub struct ServerConfiguration {
@@ -478,6 +477,11 @@ impl ServerConfiguration {
               info!("{}\tlooking for context for {:?} with fingerprint {:?}", tag, servername, kv.1);
               if let Some(ref tls_data) = contexts.get(&kv.1) {
                 info!("{}\tfound context for {:?}", tag, servername);
+                if !tls_data.initialized {
+                  //FIXME: couldn't we skip to the next cert?
+                  error!("{}\t no application is using that certificate", tag);
+                  return Ok(());
+                }
                 let context: &SslContext = &tls_data.context;
                 if let Ok(()) = ssl.set_ssl_context(context) {
                   info!("{}\tservername is now {:?}", tag, ssl.servername());
@@ -498,6 +502,7 @@ impl ServerConfiguration {
           context:     context.build(),
           certificate: cert_read.to_vec(),
           refcount:    1,
+          initialized: true,
         };
         Some((fingerprint, tls_data, names))
       } else {
@@ -509,6 +514,60 @@ impl ServerConfiguration {
   }
 
   pub fn add_tls_front(&mut self, tls_front: TlsFront, event_loop: &mut Poll) -> bool {
+    {
+      let mut contexts = unwrap_msg!(self.contexts.lock());
+
+      if contexts.contains_key(&tls_front.fingerprint) {
+        contexts.get_mut(&tls_front.fingerprint).map(|data| {
+          data.refcount    += 1;
+          data.initialized  = true;
+        });
+      } else {
+        //FIXME return error here, no available certificate
+        return false
+      }
+    }
+
+    //FIXME: should clone he hostname then do a into() here
+    let app = TlsApp {
+      app_id:           tls_front.app_id.clone(),
+      hostname:         tls_front.hostname.clone(),
+      path_begin:       tls_front.path_begin.clone(),
+      cert_fingerprint: tls_front.fingerprint.clone(),
+    };
+
+    if let Some(fronts) = self.fronts.get_mut(&tls_front.hostname) {
+        if ! fronts.contains(&app) {
+          fronts.push(app.clone());
+        }
+    }
+    if self.fronts.get(&tls_front.hostname).is_none() {
+      self.fronts.insert(tls_front.hostname, vec![app]);
+    }
+
+    true
+  }
+
+  pub fn remove_tls_front(&mut self, front: TlsFront, event_loop: &mut Poll) {
+    info!("{}\tremoving tls_front {:?}", self.tag, front);
+
+    if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
+      if let Some(pos) = fronts.iter().position(|f| &f.app_id == &front.app_id) {
+        let front = fronts.remove(pos);
+
+        {
+          let mut contexts = unwrap_msg!(self.contexts.lock());
+          let mut domains  = unwrap_msg!(self.domains.lock());
+          let must_delete = contexts.get_mut(&front.cert_fingerprint).map(|tls_data| {
+            tls_data.refcount -= 1;
+            tls_data.refcount == 0
+          });
+        }
+      }
+    }
+  }
+
+  pub fn add_certificate(&mut self, certificate_and_key: CertificateAndKey, event_loop: &mut Poll) -> bool {
     //FIXME: insert some error management with a Result here
     let c = SslContext::builder(SslMethod::tls());
     if c.is_err() { return false; }
@@ -531,9 +590,9 @@ impl ServerConfiguration {
 
     ctx.set_ecdh_auto(true);
 
-    let mut cert_read  = &tls_front.certificate.as_bytes()[..];
-    let mut key_read   = &tls_front.key.as_bytes()[..];
-    let cert_chain: Vec<X509> = tls_front.certificate_chain.iter().filter_map(|c| {
+    let mut cert_read  = &certificate_and_key.certificate.as_bytes()[..];
+    let mut key_read   = &certificate_and_key.key.as_bytes()[..];
+    let cert_chain: Vec<X509> = certificate_and_key.certificate_chain.iter().filter_map(|c| {
       X509::from_pem(c.as_bytes()).ok()
     }).collect();
 
@@ -559,8 +618,10 @@ impl ServerConfiguration {
       let tls_data = TlsData {
         context:     ctx.build(),
         certificate: cert_read.to_vec(),
-        refcount:    1,
+        refcount:    0,
+        initialized: false,
       };
+
       // if the name or the fingerprint are already used,
       // those insertions should fail, because it would be
       // from the same certificate
@@ -569,12 +630,7 @@ impl ServerConfiguration {
       //this lock is only obtained from this thread, so is it alright?
       {
         let mut contexts = unwrap_msg!(self.contexts.lock());
-
-        if contexts.contains_key(&fingerprint) {
-          contexts.get_mut(&fingerprint).map(|data| {
-            data.refcount += 1;
-          });
-        }  else {
+        if !contexts.contains_key(&fingerprint) {
           contexts.insert(fingerprint.clone(), tls_data);
         }
       }
@@ -588,62 +644,38 @@ impl ServerConfiguration {
         }
       }
 
-      let app = TlsApp {
-        app_id:           tls_front.app_id.clone(),
-        hostname:         tls_front.hostname.clone(),
-        path_begin:       tls_front.path_begin.clone(),
-        cert_fingerprint: fingerprint.clone(),
-      };
-
-      if let Some(fronts) = self.fronts.get_mut(&tls_front.hostname) {
-          if ! fronts.contains(&app) {
-            fronts.push(app.clone());
-          }
-      }
-      if self.fronts.get(&tls_front.hostname).is_none() {
-        self.fronts.insert(tls_front.hostname, vec![app]);
-      }
-
       true
     } else {
       false
     }
   }
 
-  pub fn remove_tls_front(&mut self, front: TlsFront, event_loop: &mut Poll) {
-    info!("{}\tremoving tls_front {:?}", self.tag, front);
+  // FIXME: return an error if the cert is still in use
+  pub fn remove_certificate(&mut self, fingerprint: CertFingerprint, event_loop: &mut Poll) {
+    info!("{}\tremoving certificate {:?}", self.tag, fingerprint);
+    let mut contexts = unwrap_msg!(self.contexts.lock());
+    let mut domains  = unwrap_msg!(self.domains.lock());
+    let must_delete = contexts.get_mut(&fingerprint).map(|tls_data| {
+      tls_data.refcount -= 1;
+      tls_data.refcount == 0 || !tls_data.initialized
+    });
 
-    if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
-      if let Some(pos) = fronts.iter().position(|f| &f.app_id == &front.app_id) {
-        let front = fronts.remove(pos);
+    if must_delete == Some(true) {
+      if let Some(data) = contexts.remove(&fingerprint) {
+        if let Ok(cert) = X509::from_pem(&data.certificate) {
+          let common_name: Option<String> = get_cert_common_name(&cert);
+          //info!("got common name: {:?}", common_name);
+          if let Some(name) = common_name {
+            domains.domain_remove(&name.into_bytes());
+          }
 
-        {
-          let mut contexts = unwrap_msg!(self.contexts.lock());
-          let mut domains  = unwrap_msg!(self.domains.lock());
-          let must_delete = contexts.get_mut(&front.cert_fingerprint).map(|tls_data| {
-            tls_data.refcount -= 1;
-            tls_data.refcount == 0
-          });
-
-          if must_delete == Some(true) {
-            if let Some(data) = contexts.remove(&front.cert_fingerprint) {
-              if let Ok(cert) = X509::from_pem(&data.certificate) {
-                let common_name: Option<String> = get_cert_common_name(&cert);
-                //info!("got common name: {:?}", common_name);
-                if let Some(name) = common_name {
-                  domains.domain_remove(&name.into_bytes());
-                }
-
-                let names: Vec<String> = cert.subject_alt_names().map(|names| {
-                  names.iter().filter_map(|general_name|
-                                          general_name.dnsname().map(|name| String::from(name))
-                                         ).collect()
-                }).unwrap_or(vec!());
-                for name in names {
-                  domains.domain_remove(&name.into_bytes());
-                }
-              }
-            }
+          let names: Vec<String> = cert.subject_alt_names().map(|names| {
+            names.iter().filter_map(|general_name|
+                                    general_name.dnsname().map(|name| String::from(name))
+                                   ).collect()
+          }).unwrap_or(vec!());
+          for name in names {
+            domains.domain_remove(&name.into_bytes());
           }
         }
       }
@@ -847,6 +879,16 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       Order::RemoveTlsFront(front) => {
         //info!("TLS\t{} remove front {:?}", id, front);
         self.remove_tls_front(front, event_loop);
+        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+      },
+      Order::AddCertificate(certificate_and_key) => {
+        //info!("TLS\t{} add certificate: {:?}", id, certificate_and_key);
+          self.add_certificate(certificate_and_key, event_loop);
+          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+      },
+      Order::RemoveCertificate(fingerprint) => {
+        //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
+        self.remove_certificate(fingerprint, event_loop);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::AddInstance(instance) => {
@@ -1070,6 +1112,7 @@ mod tests {
       context:     context.build(),
       certificate: vec!(),
       refcount:    0,
+      initialized: false,
     };
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1032").expect("test address 127.0.0.1:1032 should be parsed");

@@ -20,6 +20,7 @@ lazy_static = "0.1.15"
 libc = "^0.2"
 slab = "^0.3.0"
 pool = "^0.1"
+hex  = "^0.2"
 
 [dev-dependencies]
 tiny_http = "0.4"
