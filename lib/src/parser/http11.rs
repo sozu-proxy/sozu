@@ -192,8 +192,8 @@ pub struct Header<'a> {
 named!(pub message_header<Header>,
        chain!(
          name: token ~
-         tag!(":") ~
-         sp ~ // ToDo make it optional
+         tag!(":")   ~
+         opt!(sp)    ~
          value: take_while!(is_header_value_char) ~ // ToDo handle folding?
          crlf, || {
            Header {
@@ -1447,6 +1447,18 @@ mod tests {
       let expected = Header {
         name: b"Accept",
         value: b"*/*"
+      };
+
+      assert_eq!(result, Done(&b""[..], expected))
+  }
+
+  #[test]
+  fn header_without_space_test() {
+      let input = b"Host:localhost\r\n";
+      let result = message_header(input);
+      let expected = Header {
+        name: b"Host",
+        value: b"localhost"
       };
 
       assert_eq!(result, Done(&b""[..], expected))
