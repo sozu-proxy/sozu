@@ -18,7 +18,7 @@ use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{precise_time_s, precise_time_ns};
 use rand::random;
 use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod,
-                   Ssl, SslRef, SslStream, SniError};
+                   Ssl, SslOption, SslRef, SslStream, SniError};
 use openssl::x509::X509;
 use openssl::dh::Dh;
 use openssl::pkey::PKey;
@@ -409,14 +409,7 @@ impl ServerConfiguration {
 
     let mut context = ctx.expect("should have built a correct SSL context");
 
-    let mut options = context.options();
-    options.insert(ssl::SSL_OP_NO_SSLV2);
-    options.insert(ssl::SSL_OP_NO_SSLV3);
-    options.insert(ssl::SSL_OP_NO_TLSV1);
-    options.insert(ssl::SSL_OP_NO_COMPRESSION);
-    options.insert(ssl::SSL_OP_NO_TICKET);
-    options.insert(ssl::SSL_OP_CIPHER_SERVER_PREFERENCE);
-    let opt = context.set_options(options);
+    let opt = context.set_options(unwrap_msg!(SslOption::from_bits(config.options)));
 
     context.set_cipher_list(&config.cipher_list);
 
@@ -572,14 +565,7 @@ impl ServerConfiguration {
     let c = SslContext::builder(SslMethod::tls());
     if c.is_err() { return false; }
     let mut ctx = c.expect("should have built a correct SSL context");
-    let mut options = ctx.options();
-    options.insert(ssl::SSL_OP_NO_SSLV2);
-    options.insert(ssl::SSL_OP_NO_SSLV3);
-    options.insert(ssl::SSL_OP_NO_TLSV1);
-    options.insert(ssl::SSL_OP_NO_COMPRESSION);
-    options.insert(ssl::SSL_OP_NO_TICKET);
-    options.insert(ssl::SSL_OP_CIPHER_SERVER_PREFERENCE);
-    let opt = ctx.set_options(options);
+    let opt = ctx.set_options(unwrap_msg!(SslOption::from_bits(self.config.options)));
 
     match Dh::get_2048_256() {
       Ok(dh) => ctx.set_tmp_dh(&dh),

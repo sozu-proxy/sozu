@@ -5,6 +5,7 @@ use std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::io::{self,Error,ErrorKind,Read};
 use serde::Deserialize;
+use openssl::ssl;
 use openssl::x509::X509;
 use openssl::hash::MessageDigest;
 use toml;
@@ -24,6 +25,7 @@ pub struct ProxyConfig {
   pub channel_buffer_size:       Option<usize>,
   pub answer_404:                Option<String>,
   pub answer_503:                Option<String>,
+  pub tls_versions:              Option<Vec<String>>,
   pub cipher_list:               Option<String>,
   pub worker_count:              Option<u16>,
   pub default_name:              Option<String>,
@@ -103,6 +105,29 @@ impl ProxyConfig {
       }
     };
 
+    let mut default_options = ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION | ssl::SSL_OP_NO_TICKET;
+    let mut versions = ssl::SSL_OP_NO_SSLV2 |
+      ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1 |
+      ssl::SSL_OP_NO_TLSV1_1 | ssl::SSL_OP_NO_TLSV1_2;
+
+    if let Some(ref versions_list) = self.tls_versions {
+      for version in versions_list {
+        match version.as_str() {
+          "SSLv2"   => versions.remove(ssl::SSL_OP_NO_SSLV2),
+          "SSLv3"   => versions.remove(ssl::SSL_OP_NO_SSLV3),
+          "TLSv1"   => versions.remove(ssl::SSL_OP_NO_TLSV1),
+          "TLSv1.1" => versions.remove(ssl::SSL_OP_NO_TLSV1_1),
+          "TLSv1.2" => versions.remove(ssl::SSL_OP_NO_TLSV1_2),
+          s         => error!("unrecognized TLS version: {}", s)
+        };
+      }
+    } else {
+      versions = ssl::SSL_OP_NO_SSLV2 | ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1;
+    }
+
+    default_options.insert(versions);
+    trace!("parsed tls options: {:?}", default_options);
+
     tls_proxy_configuration.map(|addr| {
       let mut configuration = TlsProxyConfiguration {
         front:           addr,
@@ -110,6 +135,7 @@ impl ProxyConfig {
         max_connections: self.max_connections,
         buffer_size:     self.buffer_size,
         cipher_list:     cipher_list,
+        options:         default_options.bits(),
         ..Default::default()
       };
 
@@ -373,6 +399,7 @@ mod tests {
       answer_404: Some(String::from("404.html")),
       answer_503: None,
       public_address: None,
+      tls_versions: None,
       cipher_list: None,
       worker_count: None,
       default_app_id: None,
@@ -391,6 +418,7 @@ mod tests {
       answer_404: Some(String::from("404.html")),
       answer_503: None,
       public_address: None,
+      tls_versions: None,
       cipher_list: None,
       worker_count: None,
       default_app_id: None,
