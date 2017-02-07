@@ -16,6 +16,7 @@ use sozu::channel::Channel;
 use sozu_command::data::ProxyType;
 use sozu_command::config::ProxyConfig;
 
+use logging;
 use command::Proxy;
 
 pub fn start_workers(tag: &str, ls: &ProxyConfig) -> Option<Vec<Proxy>> {
@@ -69,7 +70,7 @@ fn generate_channels() -> io::Result<(Channel<ProxyOrder,ServerMessage>, Channel
   Ok((command_channel, proxy_channel))
 }
 
-pub fn begin_worker_process(fd: i32, id: &str, tag: &str, channel_buffer_size: usize, mut builder: LogBuilder) {
+pub fn begin_worker_process(fd: i32, id: &str, tag: &str, channel_buffer_size: usize) {
   let mut command: Channel<ServerMessage,ProxyConfig> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
     channel_buffer_size,
@@ -81,11 +82,7 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str, channel_buffer_size: u
   let proxy_config = command.read_message().expect("worker could not read configuration from socket");
   println!("got message: {:?}", proxy_config);
 
-  if let Ok(log_level) = ::std::env::var("RUST_LOG"){
-    builder.parse(&log_level);
-  }
-
-  builder.init().unwrap();
+  logging::setup(None);
 
   command.set_nonblocking(true);
   let command: Channel<ServerMessage,ProxyOrder> = command.into();

@@ -16,14 +16,13 @@ extern crate sozu_command_lib as sozu_command;
 
 mod command;
 mod worker;
+mod logging;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::collections::HashMap;
 use std::env;
 use sozu::network::metrics::{METRICS,ProxyMetrics};
 use sozu_command::config::Config;
-use log::{LogRecord,LogLevelFilter,LogLevel};
-use env_logger::LogBuilder;
 use clap::{App,Arg,SubCommand};
 
 use command::Proxy;
@@ -31,21 +30,6 @@ use worker::{get_executable_path,begin_worker_process,start_workers};
 
 fn main() {
   println!("got path: {}", unsafe { get_executable_path().to_str().unwrap() });
-  let pid = unsafe { libc::getpid() };
-  let format = move |record: &LogRecord| {
-    match record.level() {
-    LogLevel::Debug | LogLevel::Trace => format!("{}\t{}\t{}\t{}\t{}\t|\t{}",
-      time::now_utc().rfc3339(), time::precise_time_ns(), pid,
-      record.level(), record.args(), record.location().module_path()),
-    _ => format!("{}\t{}\t{}\t{}\t{}",
-      time::now_utc().rfc3339(), time::precise_time_ns(), pid,
-      record.level(), record.args())
-
-    }
-  };
-
-  let mut builder = LogBuilder::new();
-  builder.format(format).filter(None, LogLevelFilter::Info);
 
   let matches = App::new("sozu")
                         .version(crate_version!())
@@ -80,7 +64,7 @@ fn main() {
       .and_then(|size| size.parse::<usize>().ok())
       .unwrap_or(10000);
 
-    begin_worker_process(fd, id, tag, buffer_size, builder);
+    begin_worker_process(fd, id, tag, buffer_size);
     return;
   }
 
@@ -88,15 +72,7 @@ fn main() {
   let config_file = submatches.value_of("config").expect("required config file");
 
   if let Ok(config) = Config::load_from_path(config_file) {
-    if let Ok(log_level) = env::var("RUST_LOG") {
-      builder.parse(&log_level);
-    } else if let Some(ref log_level) = config.log_level {
-      // We set the env variable so every worker can access it
-      env::set_var("RUST_LOG", log_level);
-      builder.parse(&log_level);
-    }
-
-    builder.init().unwrap();
+    logging::setup(config.log_level.clone());
     info!("starting up");
 
     let metrics_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
