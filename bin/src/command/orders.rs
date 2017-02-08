@@ -3,7 +3,6 @@ use std::str;
 use std::io::Read;
 use std::io::Write;
 use std::collections::HashSet;
-use log;
 use serde_json;
 use nom::{HexDisplay,IResult,Offset};
 
@@ -52,7 +51,7 @@ impl CommandServer {
             format!("saved to {}", path)
           ));
         } else {
-          log!(log::LogLevel::Error, "could not open file: {}", &path);
+          error!("could not open file: {}", &path);
           self.conns[token].write_message(&ConfigMessageAnswer::new(
             message.id.clone(),
             ConfigMessageStatus::Error,
@@ -94,10 +93,10 @@ impl CommandServer {
       ConfigCommand::ProxyConfiguration(order) => {
         if let Some(ref tag) = message.proxy {
           if let &Order::AddTlsFront(ref data) = &order {
-            log!(log::LogLevel::Info, "received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
+            info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
             data.app_id, data.hostname, data.path_begin, tag);
           } else {
-            log!(log::LogLevel::Info, "received {:?} with tag {:?}", order, tag);
+            info!("received {:?} with tag {:?}", order, tag);
           }
 
           let mut found = false;
@@ -114,12 +113,12 @@ impl CommandServer {
 
           if !found {
             // FIXME: should send back error here
-            log!(log::LogLevel::Error, "no proxy found for tag: {}", tag);
+            error!("no proxy found for tag: {}", tag);
           }
 
         } else {
           // FIXME: should send back error here
-          log!(log::LogLevel::Error, "expecting proxy tag");
+          error!("expecting proxy tag");
         }
       }
     }
@@ -161,10 +160,10 @@ impl CommandServer {
                 if let ConfigCommand::ProxyConfiguration(order) = message.data {
                   if let Some(ref tag) = message.proxy {
                     if let &Order::AddTlsFront(ref data) = &order {
-                      log!(log::LogLevel::Info, "received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
+                      info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
                       data.app_id, data.hostname, data.path_begin, tag);
                     } else {
-                      log!(log::LogLevel::Info, "received {:?} with tag {:?}", order, tag);
+                      info!("received {:?} with tag {:?}", order, tag);
                     }
                     let mut found = false;
                     for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
@@ -179,12 +178,12 @@ impl CommandServer {
 
                     if !found {
                       // FIXME: should send back error here
-                      log!(log::LogLevel::Error, "no proxy found for tag: {}", tag);
+                      error!("no proxy found for tag: {}", tag);
                     }
 
                   } else {
                     // FIXME: should send back error here
-                    log!(log::LogLevel::Error, "expecting proxy tag");
+                     error!("expecting proxy tag");
                   }
                 }
               }
@@ -212,10 +211,10 @@ impl CommandServer {
       if let ConfigCommand::ProxyConfiguration(order) = message.data {
         if let Some(ref tag) = message.proxy {
           if let &Order::AddTlsFront(ref data) = &order {
-            log!(log::LogLevel::Info, "received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
+            info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
             data.app_id, data.hostname, data.path_begin, tag);
           } else {
-            log!(log::LogLevel::Info, "received {:?} with tag {:?}", order, tag);
+            info!("received {:?} with tag {:?}", order, tag);
           }
           let mut found = false;
           for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
@@ -230,12 +229,12 @@ impl CommandServer {
 
           if !found {
             // FIXME: should send back error here
-            log!(log::LogLevel::Error, "no proxy found for tag: {}", tag);
+            error!("no proxy found for tag: {}", tag);
           }
 
         } else {
           // FIXME: should send back error here
-          log!(log::LogLevel::Error, "expecting proxy tag");
+          error!("expecting proxy tag");
         }
       }
     }

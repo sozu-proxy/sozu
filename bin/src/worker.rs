@@ -9,7 +9,6 @@ use std::os::unix::process::CommandExt;
 use std::os::unix::io::{AsRawFd,FromRawFd};
 use nix::unistd::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
-use env_logger::LogBuilder;
 
 use sozu::network::{ProxyOrder,ServerMessage,http,tls};
 use sozu::channel::Channel;

@@ -154,7 +154,6 @@
 extern crate test;
 
 #[macro_use] extern crate nom;
-#[macro_use] extern crate log;
 #[macro_use] extern crate lazy_static;
 #[macro_use] extern crate serde_derive;
 extern crate mio;
@@ -171,6 +170,7 @@ extern crate slab;
 extern crate mio_uds;
 
 #[macro_use] pub mod util;
+#[macro_use] pub mod logging;
 pub mod network;
 pub mod parser;
 pub mod messages;

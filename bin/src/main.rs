@@ -1,8 +1,6 @@
 #[macro_use] extern crate nom;
-#[macro_use] extern crate log;
 #[macro_use] extern crate clap;
 #[macro_use] extern crate serde_derive;
-extern crate env_logger;
 extern crate mio;
 extern crate mio_uds;
 extern crate serde;
@@ -11,7 +9,7 @@ extern crate time;
 extern crate libc;
 extern crate slab;
 extern crate nix;
-extern crate sozu_lib as sozu;
+#[macro_use] extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
 
 mod command;

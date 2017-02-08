@@ -9,7 +9,6 @@ use std::io::{self,ErrorKind};
 use std::os::unix::fs::PermissionsExt;
 use std::collections::HashMap;
 use std::time::Duration;
-use log;
 use libc::pid_t;
 use serde_json;
 
@@ -322,7 +321,7 @@ pub fn start(config: Config, proxies: HashMap<String, Vec<Proxy>>) {
     match e.kind() {
       ErrorKind::NotFound => {},
       _ => {
-        log!(log::LogLevel::Error, "could not delete previous socket at {:?}: {:?}", addr, e);
+        error!("could not delete previous socket at {:?}: {:?}", addr, e);
         return;
       }
     }
@@ -330,7 +329,7 @@ pub fn start(config: Config, proxies: HashMap<String, Vec<Proxy>>) {
   match UnixListener::bind(&addr) {
     Ok(srv) => {
       if let Err(e) =  fs::set_permissions(&addr, fs::Permissions::from_mode(0o600)) {
-        log!( log::LogLevel::Error, "could not set the unix socket permissions: {:?}", e);
+        error!("could not set the unix socket permissions: {:?}", e);
         fs::remove_file(&addr);
         return;
       }
@@ -348,7 +347,7 @@ pub fn start(config: Config, proxies: HashMap<String, Vec<Proxy>>) {
       //event_loop.run(&mut CommandServer::new(srv, proxies, buffer_size, max_buffer_size)).unwrap()
     },
       Err(e) => {
-        log!(log::LogLevel::Error, "could not create unix socket: {:?}", e);
+        error!("could not create unix socket: {:?}", e);
       }
   }
 }

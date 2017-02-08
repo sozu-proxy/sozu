@@ -4,7 +4,6 @@ use mio_uds::UnixStream;
 use std::io::{Read,Write,ErrorKind};
 use std::str::from_utf8;
 use std::cmp::min;
-use log;
 use nom::{IResult,Offset};
 use serde_json::from_str;
 
