@@ -81,7 +81,7 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str, channel_buffer_size: u
   let proxy_config = command.read_message().expect("worker could not read configuration from socket");
   println!("got message: {:?}", proxy_config);
 
-  logging::setup(None);
+  logging::setup(&proxy_config.log_level, &proxy_config.log_target);
 
   command.set_nonblocking(true);
   let command: Channel<ServerMessage,ProxyOrder> = command.into();

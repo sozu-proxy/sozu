@@ -33,7 +33,8 @@ pub struct ProxyConfig {
   pub default_certificate:       Option<String>,
   pub default_certificate_chain: Option<String>,
   pub default_key:               Option<String>,
-
+  pub log_level:                 Option<String>,
+  pub log_target:                Option<String>,
 }
 
 impl ProxyConfig {
@@ -204,6 +205,7 @@ pub struct Config {
   pub metrics:                 MetricsConfig,
   pub proxies:                 HashMap<String, ProxyConfig>,
   pub log_level:               Option<String>,
+  pub log_target:              Option<String>,
   pub applications:            HashMap<String, AppConfig>,
 }
 
@@ -214,7 +216,17 @@ impl Config {
     let mut parser = toml::Parser::new(&data[..]);
     if let Some(table) = parser.parse() {
       match Deserialize::deserialize(&mut toml::Decoder::new(toml::Value::Table(table))) {
-        Ok(config) => Ok(config),
+        Ok(config) => {
+          let mut c: Config = config;
+          let log_level:  Option<String> = c.log_level.clone();
+          let log_target: Option<String> = c.log_target.clone();
+
+          for ref mut proxy in c.proxies.values_mut() {
+            proxy.log_level  = log_level.clone();
+            proxy.log_target = log_target.clone();
+          };
+          Ok(c)
+        },
         Err(e)     => {
           println!("decoding error: {:?}", e);
           Err(Error::new(
@@ -432,7 +444,8 @@ mod tests {
       saved_state: None,
       command_buffer_size: None,
       max_command_buffer_size: None,
-      log_level: None,
+      log_level:  None,
+      log_target: None,
       metrics: MetricsConfig {
         address: String::from("192.168.59.103"),
         port:    8125,

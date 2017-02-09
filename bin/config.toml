@@ -3,6 +3,9 @@
 command_socket = "./command_folder/sock"
 saved_state    = "./state.json"
 log_level      = "info"
+log_target     = "stdout"
+#log_target     = "udp://127.0.0.1:9876"
+#log_target     = "tcp://127.0.0.1:9876"
 command_buffer_size = 16384
 
 [metrics]

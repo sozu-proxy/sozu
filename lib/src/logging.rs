@@ -3,9 +3,13 @@ use std::str::FromStr;
 use std::cmp::{self,Ord};
 use std::sync::{Mutex, Once, ONCE_INIT};
 use std::cell::RefCell;
-use std::fmt::{Arguments,write};
+use std::fmt::{Arguments,format,write};
 use std::io::{stdout,Stdout,Write};
 use std::ascii::AsciiExt;
+use std::net::{SocketAddr,UdpSocket};
+use std::net::TcpStream;
+use mio_uds::UnixDatagram;
+
 
 lazy_static! {
   pub static ref LOGGER: Mutex<Logger> = Mutex::new(Logger::new());
@@ -15,6 +19,7 @@ lazy_static! {
 
 pub struct Logger {
   directives: Vec<LogDirective>,
+  backend:    LoggerBackend,
 }
 
 impl Logger {
@@ -23,19 +28,41 @@ impl Logger {
       directives: vec!(LogDirective {
         name:  None,
         level: LogLevelFilter::Error,
-      })
+      }),
+      backend: LoggerBackend::Stdout(stdout())
     }
   }
 
-  pub fn init(spec: &str) {
+  pub fn init(spec: &str, backend: LoggerBackend) {
     let directives = parse_logging_spec(spec);
-    LOGGER.lock().unwrap().set_directives(directives);
+    if let Ok(ref mut logger) = LOGGER.lock() {
+      logger.set_directives(directives);
+      logger.backend = backend;
+    }
   }
 
   pub fn log<'a>(&mut self, meta: &LogMetadata, args: Arguments) {
     if self.enabled(meta) {
-      stdout().write_fmt(args);
-      stdout().write(b"\n");
+      match self.backend {
+        LoggerBackend::Stdout(ref mut stdout) => {
+          stdout.write_fmt(args);
+          stdout.write(b"\n");
+        },
+        //FIXME: should have a buffer to write to instead of allocating a string
+        LoggerBackend::Unix(ref mut socket) => {
+          socket.send(format(args).as_bytes());
+          socket.send(&b"\n"[..]);
+        },
+        //FIXME: should have a buffer to write to instead of allocating a string
+        LoggerBackend::Udp(ref mut socket, ref address) => {
+          socket.send_to(format(args).as_bytes(), address);
+          socket.send_to(&b"\n"[..], address);
+        }
+        LoggerBackend::Tcp(ref mut socket) => {
+          socket.write_fmt(args);
+          socket.write(b"\n");
+        },
+      }
     }
   }
 
@@ -55,6 +82,14 @@ impl Logger {
     }
     false
   }
+}
+
+#[derive(Debug)]
+pub enum LoggerBackend {
+  Stdout(Stdout),
+  Unix(UnixDatagram),
+  Udp(UdpSocket, SocketAddr),
+  Tcp(TcpStream)
 }
 
 #[repr(usize)]
