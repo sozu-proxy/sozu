@@ -10,7 +10,7 @@ use sozu::messages::Order;
 use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
 use sozu_command::config::Config;
-use sozu_command::data::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,PROTOCOL_VERSION};
+use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,PROTOCOL_VERSION,WorkerInfo};
 
 use super::{CommandServer,FrontToken,ProxyConfiguration,StoredProxy};
 use super::client::parse;
@@ -48,14 +48,16 @@ impl CommandServer {
           self.conns[token].write_message(&ConfigMessageAnswer::new(
             message.id.clone(),
             ConfigMessageStatus::Ok,
-            format!("saved to {}", path)
+            format!("saved to {}", path),
+            None
           ));
         } else {
           error!("could not open file: {}", &path);
           self.conns[token].write_message(&ConfigMessageAnswer::new(
             message.id.clone(),
             ConfigMessageStatus::Error,
-            "could not open file".to_string()
+            "could not open file".to_string(),
+            None
           ));
         }
       },
@@ -78,7 +80,8 @@ impl CommandServer {
         self.conns[token].write_message(&ConfigMessageAnswer::new(
           message.id.clone(),
           ConfigMessageStatus::Ok,
-          serde_json::to_string(&conf).unwrap_or(String::new())
+          serde_json::to_string(&conf).unwrap_or(String::new()),
+          None
         ));
         //self.conns[token].write_message(&encoded);
       },
@@ -87,7 +90,24 @@ impl CommandServer {
         self.conns[token].write_message(&ConfigMessageAnswer::new(
           message.id.clone(),
           ConfigMessageStatus::Ok,
-          "loaded the configuration".to_string()
+          "loaded the configuration".to_string(),
+          None
+        ));
+      },
+      ConfigCommand::ListWorkers => {
+        let workers: Vec<WorkerInfo> = self.proxies.values().map(|&(ref tag, ref proxy)| {
+          WorkerInfo {
+            tag:        tag.clone(),
+            id:         proxy.id,
+            proxy_type: proxy.proxy_type,
+            pid:        proxy.pid,
+          }
+        }).collect();
+        self.conns[token].write_message(&ConfigMessageAnswer::new(
+          message.id.clone(),
+          ConfigMessageStatus::Ok,
+          "".to_string(),
+          Some(AnswerData::Workers(workers))
         ));
       },
       ConfigCommand::ProxyConfiguration(order) => {

@@ -295,6 +295,7 @@ impl CommandServer {
         ServerMessageStatus::Error(s) => s.clone(),
         _                             => String::new(),
       },
+      None,
     );
     info!("sending: {:?}", answer);
     for client in self.conns.iter_mut() {

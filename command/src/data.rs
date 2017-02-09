@@ -154,6 +154,7 @@ pub enum ConfigCommand {
   SaveState(String),
   LoadState(String),
   DumpState,
+  ListWorkers,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
@@ -183,22 +184,37 @@ pub enum ConfigMessageStatus {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+pub enum AnswerData {
+  Workers(Vec<WorkerInfo>),
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct ConfigMessageAnswer {
   pub id:      String,
   pub version: u8,
   pub status:  ConfigMessageStatus,
-  pub message: String
+  pub message: String,
+  pub data:    Option<AnswerData>,
 }
 
 impl ConfigMessageAnswer {
-  pub fn new(id: String, status: ConfigMessageStatus, message: String) -> ConfigMessageAnswer {
+  pub fn new(id: String, status: ConfigMessageStatus, message: String, data: Option<AnswerData>) -> ConfigMessageAnswer {
     ConfigMessageAnswer {
       id:      id,
       version: PROTOCOL_VERSION,
       status:  status,
       message: message,
+      data:    data,
     }
   }
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+pub struct WorkerInfo {
+  pub id:         u8,
+  pub pid:        i32,
+  pub tag:        String,
+  pub proxy_type: ProxyType,
 }
 
 #[derive(Deserialize)]
@@ -300,6 +316,8 @@ impl serde::de::Visitor for ConfigMessageVisitor {
       };
       let state: SaveStateData = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("save state"))));
       ConfigCommand::LoadState(state.path)
+    } else if &config_type == &"LIST_WORKERS" {
+      ConfigCommand::ListWorkers
     } else {
       return Err(serde::de::Error::custom("unrecognized command"));
     };
@@ -369,6 +387,10 @@ impl serde::Serialize for ConfigMessage {
       ConfigCommand::DumpState => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "DUMP_STATE"));
+      }
+      ConfigCommand::ListWorkers => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "LIST_WORKERS"));
       }
     };
 
