@@ -108,9 +108,12 @@ struct CommandServer {
   max_buffer_size: usize,
   conns:           Slab<CommandClient,FrontToken>,
   proxies:         HashMap<Token, (Tag, Proxy)>,
+  next_ids:        HashMap<Tag,u8>,
   proxy_count:     usize,
   pub poll:        Poll,
   timer:           Timer<Token>,
+  config:          Config,
+  token_count:     usize,
 }
 
 impl CommandServer {
@@ -147,18 +150,23 @@ impl CommandServer {
     }
   }
 
-  fn new(srv: UnixListener, proxies_map: HashMap<String, Vec<Proxy>>, buffer_size: usize, max_buffer_size: usize, poll: Poll) -> CommandServer {
+  fn new(srv: UnixListener, config: Config, proxies_map: HashMap<String, Vec<Proxy>>, buffer_size: usize, max_buffer_size: usize, poll: Poll) -> CommandServer {
     //FIXME: verify this
     poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+
+    let mut next_ids: HashMap<String, u8> = HashMap::new();
+    for (ref tag, ref value) in &proxies_map {
+      next_ids.insert(tag.to_string(), value.len() as u8);
+    }
 
     let mut proxies = HashMap::new();
 
     let mut token_count = 0;
-    for (tag, mut proxy_list) in proxies_map {
+    for (ref tag, ref mut proxy_list) in proxies_map {
       for proxy in proxy_list.drain(..) {
         token_count += 1;
         poll.register(&proxy.channel.sock, Token(token_count), Ready::all(), PollOpt::edge()).unwrap();
-        proxies.insert(Token(token_count), (tag.clone(), proxy));
+        proxies.insert(Token(token_count), (tag.to_string(), proxy));
       }
     }
     //let mut timer = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
@@ -171,10 +179,13 @@ impl CommandServer {
       buffer_size:     buffer_size,
       max_buffer_size: max_buffer_size,
       conns:           Slab::with_capacity(128),
-      proxies:       proxies,
-      proxy_count:  token_count,
+      proxies:         proxies,
+      next_ids:        next_ids,
+      proxy_count:     token_count,
       poll:            poll,
       timer:           timer,
+      config:          config,
+      token_count:     token_count,
     }
   }
 
@@ -335,9 +346,9 @@ pub fn start(config: Config, proxies: HashMap<String, Vec<Proxy>>) {
         return;
       }
 
-      let mut server = CommandServer::new(srv, proxies, buffer_size, max_buffer_size, event_loop);
+      let mut server = CommandServer::new(srv, config.clone(), proxies, buffer_size, max_buffer_size, event_loop);
 
-      server.load_static_application_configuration(&config);
+      server.load_static_application_configuration();
 
       saved_state.as_ref().map(|state_path| {
         server.load_state("INITIALIZATION", state_path);

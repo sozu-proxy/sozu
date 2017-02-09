@@ -61,6 +61,31 @@ pub fn start_workers(tag: &str, ls: &ProxyConfig) -> Option<Vec<Proxy>> {
   }
 }
 
+pub fn start_worker(tag: &str, ls: &ProxyConfig, id: u8) -> Option<Proxy> {
+  match ls.proxy_type {
+    ProxyType::HTTP => {
+      if ls.to_http().is_some() {
+        let (pid, command) = start_worker_process(ls, tag, &id.to_string());
+        let worker = Proxy::new(tag.to_string(), id, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
+        Some(worker)
+      } else {
+        None
+      }
+    },
+    ProxyType::HTTPS => {
+      if ls.to_tls().is_some() {
+        let (pid, command) = start_worker_process(ls, tag, &id.to_string());
+        let worker =  Proxy::new(tag.to_string(), id, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
+
+        Some(worker)
+      } else {
+        None
+      }
+    },
+    _ => unimplemented!()
+  }
+}
+
 fn generate_channels() -> io::Result<(Channel<ProxyOrder,ServerMessage>, Channel<ServerMessage,ProxyOrder>)> {
   let (command,proxy) = try!(UnixStream::pair());
   //FIXME: configurable buffer size

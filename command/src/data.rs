@@ -155,6 +155,7 @@ pub enum ConfigCommand {
   LoadState(String),
   DumpState,
   ListWorkers,
+  LaunchWorker(String)
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
@@ -318,6 +319,12 @@ impl serde::de::Visitor for ConfigMessageVisitor {
       ConfigCommand::LoadState(state.path)
     } else if &config_type == &"LIST_WORKERS" {
       ConfigCommand::ListWorkers
+    } else if &config_type == &"LAUNCH_WORKER" {
+      let data = match data {
+        Some(data) => data,
+        None => try!(visitor.missing_field("data")),
+      };
+      ConfigCommand::LaunchWorker(try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("launch worker")))))
     } else {
       return Err(serde::de::Error::custom("unrecognized command"));
     };
@@ -387,10 +394,16 @@ impl serde::Serialize for ConfigMessage {
       ConfigCommand::DumpState => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "DUMP_STATE"));
-      }
+      },
       ConfigCommand::ListWorkers => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "LIST_WORKERS"));
+      },
+      ConfigCommand::LaunchWorker(ref tag) => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "LAUNCH_WORKER"));
+        try!(serializer.serialize_map_key(&mut state, "data"));
+        try!(serializer.serialize_map_value(&mut state, tag));
       }
     };
 

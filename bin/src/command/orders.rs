@@ -4,6 +4,7 @@ use std::io::Read;
 use std::io::Write;
 use std::collections::HashSet;
 use serde_json;
+use mio::{PollOpt,Ready,Token};
 use nom::{HexDisplay,IResult,Offset};
 
 use sozu::messages::Order;
@@ -14,6 +15,7 @@ use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAns
 
 use super::{CommandServer,FrontToken,ProxyConfiguration,StoredProxy};
 use super::client::parse;
+use worker::start_worker;
 
 impl CommandServer {
   pub fn handle_client_message(&mut self, token: FrontToken, message: &ConfigMessage) {
@@ -109,6 +111,19 @@ impl CommandServer {
           "".to_string(),
           Some(AnswerData::Workers(workers))
         ));
+      },
+      ConfigCommand::LaunchWorker(tag) => {
+        let id = self.next_ids.get(&tag).unwrap_or(&0) + 1;
+        if let Some(mut worker) = self.config.proxies.get(&tag).and_then(|config| start_worker(&tag, config, id)) {
+          *self.next_ids.get_mut(&tag).unwrap() += 1;
+
+          let token        = self.token_count + 1;
+          self.token_count = token;
+          worker.token     = Some(Token(token));
+          self.poll.register(&worker.channel.sock, Token(token), Ready::all(), PollOpt::edge()).unwrap();
+
+          self.proxies.insert(Token(token), (tag, worker));
+        }
       },
       ConfigCommand::ProxyConfiguration(order) => {
         if let Some(ref tag) = message.proxy {
@@ -225,9 +240,9 @@ impl CommandServer {
     }
   }
 
-  pub fn load_static_application_configuration(&mut self, config: &Config) {
+  pub fn load_static_application_configuration(&mut self) {
     //FIXME: too many loops, this could be cleaner
-    for message in config.generate_config_messages() {
+    for message in self.config.generate_config_messages() {
       if let ConfigCommand::ProxyConfiguration(order) = message.data {
         if let Some(ref tag) = message.proxy {
           if let &Order::AddTlsFront(ref data) = &order {

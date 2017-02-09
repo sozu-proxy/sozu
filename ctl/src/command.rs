@@ -1,7 +1,7 @@
 use sozu::channel::Channel;
 use sozu::messages::Order;
 use sozu_command::config::Config;
-use sozu_command::data::{ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
+use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
 
 use std::iter::FromIterator;
 use std::collections::HashMap;
