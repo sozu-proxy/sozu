@@ -283,7 +283,7 @@ impl CommandServer {
   }
 
   fn proxy_handle_message(&mut self, token: Token, msg: ServerMessage) {
-    println!("got answer msg: {:?}", msg);
+    //println!("got answer msg: {:?}", msg);
     let answer = ConfigMessageAnswer::new(
       msg.id.clone(),
       match msg.status {

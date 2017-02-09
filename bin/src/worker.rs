@@ -79,7 +79,7 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str, channel_buffer_size: u
   command.set_nonblocking(false);
 
   let proxy_config = command.read_message().expect("worker could not read configuration from socket");
-  println!("got message: {:?}", proxy_config);
+  //println!("got message: {:?}", proxy_config);
 
   logging::setup(&proxy_config.log_level, &proxy_config.log_target);
 
@@ -106,7 +106,7 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str, channel_buffer_size: u
 }
 
 pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t, Channel<ProxyOrder,ServerMessage>) {
-  println!("parent({})", unsafe { libc::getpid() });
+  trace!("parent({})", unsafe { libc::getpid() });
 
   let (server, client) = UnixStream::pair().unwrap();
 
@@ -130,11 +130,11 @@ pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t
 
   let path = unsafe { get_executable_path() };
 
-  println!("launching worker");
+  trace!("launching worker");
   //FIXME: remove the expect, return a result?
   match fork().expect("fork failed") {
     ForkResult::Parent{ child } => {
-      println!("worker launched: {}", child);
+      trace!("worker launched: {}", child);
       command.write_message(config);
       command.set_nonblocking(true);
 
@@ -142,7 +142,7 @@ pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t
       return (child, command);
     }
     ForkResult::Child => {
-      println!("child({}):\twill spawn a child", unsafe { libc::getpid() });
+      trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
       Command::new(path.to_str().unwrap())
         .arg("worker")
         .arg("--fd")

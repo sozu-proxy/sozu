@@ -28,8 +28,6 @@ use command::Proxy;
 use worker::{get_executable_path,begin_worker_process,start_workers};
 
 fn main() {
-  println!("got path: {}", unsafe { get_executable_path().to_str().unwrap() });
-
   let matches = App::new("sozu")
                         .version(crate_version!())
                         .about("hot reconfigurable proxy")
