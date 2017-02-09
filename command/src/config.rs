@@ -419,6 +419,8 @@ mod tests {
       default_certificate_chain: None,
       default_key: None,
       default_name: None,
+      log_level:    None,
+      log_target:   None,
     });
     map.insert(String::from("TLS"), ProxyConfig {
       proxy_type: ProxyType::HTTPS,
@@ -438,6 +440,8 @@ mod tests {
       default_certificate_chain: None,
       default_key: None,
       default_name: None,
+      log_level:    None,
+      log_target:   None,
     });
     let config = Config {
       command_socket: String::from("./command_folder/sock"),
