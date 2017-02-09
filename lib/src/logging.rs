@@ -46,21 +46,17 @@ impl Logger {
       match self.backend {
         LoggerBackend::Stdout(ref mut stdout) => {
           stdout.write_fmt(args);
-          stdout.write(b"\n");
         },
         //FIXME: should have a buffer to write to instead of allocating a string
         LoggerBackend::Unix(ref mut socket) => {
           socket.send(format(args).as_bytes());
-          socket.send(&b"\n"[..]);
         },
         //FIXME: should have a buffer to write to instead of allocating a string
         LoggerBackend::Udp(ref mut socket, ref address) => {
           socket.send_to(format(args).as_bytes(), address);
-          socket.send_to(&b"\n"[..], address);
         }
         LoggerBackend::Tcp(ref mut socket) => {
           socket.write_fmt(args);
-          socket.write(b"\n");
         },
       }
     }
@@ -359,12 +355,12 @@ macro_rules! log {
 #[macro_export]
 macro_rules! error {
     ($format:expr, $($arg:tt)*) => {
-        log!($crate::logging::LogLevel::Error, concat!("{}\t{}\t{}\t{}\t", $format),
+        log!($crate::logging::LogLevel::Error, concat!("{}\t{}\t{}\t{}\t", $format, '\n'),
           ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
           "ERROR", $($arg)*);
     };
     ($format:expr) => {
-        log!($crate::logging::LogLevel::Error, concat!("{}\t{}\t{}\t{}\t", $format),
+        log!($crate::logging::LogLevel::Error, concat!("{}\t{}\t{}\t{}\t", $format, '\n'),
           ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
           "ERROR");
     };
@@ -375,12 +371,12 @@ macro_rules! warn {
     ($format:expr, $($arg:tt)*) => {
         use time;
         use logging::PID;
-        log!($crate::logging::LogLevel::Warn, concat!("{}\t{}\t{}\t{}\t", $format),
+        log!($crate::logging::LogLevel::Warn, concat!("{}\t{}\t{}\t{}\t", $format, '\n'),
           ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
           "WARN", $($arg)*);
     };
     ($format:expr) => {
-        log!($crate::logging::LogLevel::Warn, concat!("{}\t{}\t{}\t{}\t", $format),
+        log!($crate::logging::LogLevel::Warn, concat!("{}\t{}\t{}\t{}\t", $format, '\n'),
           ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
           "WARN");
     }
@@ -389,12 +385,12 @@ macro_rules! warn {
 #[macro_export]
 macro_rules! info {
     ($format:expr, $($arg:tt)*) => {
-        log!($crate::logging::LogLevel::Info, concat!("{}\t{}\t{}\t{}\t", $format),
+        log!($crate::logging::LogLevel::Info, concat!("{}\t{}\t{}\t{}\t", $format, '\n'),
           ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
           "INFO", $($arg)*);
     };
     ($format:expr) => {
-        log!($crate::logging::LogLevel::Info, concat!("{}\t{}\t{}\t{}\t", $format),
+        log!($crate::logging::LogLevel::Info, concat!("{}\t{}\t{}\t{}\t", $format, '\n'),
           ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
           "INFO");
     }
@@ -403,12 +399,12 @@ macro_rules! info {
 #[macro_export]
 macro_rules! debug {
     ($format:expr, $($arg:tt)*) => {
-        log!($crate::logging::LogLevel::Debug, concat!("{}\t{}\t{}\t{}\t{}\t", $format),
+        log!($crate::logging::LogLevel::Debug, concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
           ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
           "DEBUG", module_path!(), $($arg)*);
     };
     ($format:expr) => {
-        log!($crate::logging::LogLevel::Debug, concat!("{}\t{}\t{}\t{}\t{}\t", $format),
+        log!($crate::logging::LogLevel::Debug, concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
           ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
           "DEBUG", module_path!());
     }
@@ -417,12 +413,12 @@ macro_rules! debug {
 #[macro_export]
 macro_rules! trace {
     ($format:expr, $($arg:tt)*) => (
-        log!($crate::logging::LogLevel::Trace, concat!("{}\t{}\t{}\t{}\t{}\t", $format),
+        log!($crate::logging::LogLevel::Trace, concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
           ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
           "TRACE", module_path!(), $($arg)*);
     );
     ($format:expr) => (
-        log!($crate::logging::LogLevel::Trace, concat!("{}\t{}\t{}\t{}\t{}\t", $format),
+        log!($crate::logging::LogLevel::Trace, concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
           ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
           "TRACE", module_path!());
     )
