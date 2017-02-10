@@ -12,6 +12,7 @@ use std::time::Duration;
 use libc::pid_t;
 use serde_json;
 
+use sozu::messages::Order;
 use sozu::network::{ProxyOrder,ServerMessage,ServerMessageStatus};
 use sozu::channel::Channel;
 use sozu_command::state::{HttpProxy,TlsProxy,ConfigState};
@@ -50,6 +51,7 @@ pub struct Proxy {
   pub token:         Option<Token>,
   pub pid:           pid_t,
   pub run_state:     RunState,
+  pub inflight:      HashMap<String,Order>,
 }
 
 impl Proxy {
@@ -69,6 +71,7 @@ impl Proxy {
       token:      None,
       pid:        pid,
       run_state:  RunState::Running,
+      inflight:   HashMap::new(),
     }
   }
 }
@@ -297,6 +300,19 @@ impl CommandServer {
 
   fn proxy_handle_message(&mut self, token: Token, msg: ServerMessage) {
     //println!("got answer msg: {:?}", msg);
+    if msg.status != ServerMessageStatus::Processing {
+      if let Some(&mut (_, ref mut proxy)) = self.proxies.get_mut(&token) {
+        if let Some(order) = proxy.inflight.remove(&msg.id) {
+          info!("REMOVING INFLIGHT MESSAGE {}: {:?}", msg.id, order);
+          // handle message completion here
+          // there will probably be other cases to handle in the future
+          if order == Order::SoftStop || order == Order::HardStop {
+            proxy.run_state = RunState::Stopped
+          }
+        }
+      }
+    }
+
     let answer = ConfigMessageAnswer::new(
       msg.id.clone(),
       match msg.status {
@@ -310,6 +326,7 @@ impl CommandServer {
       },
       None,
     );
+
     info!("sending: {:?}", answer);
     for client in self.conns.iter_mut() {
       if let Some(index) = client.has_message_id(&msg.id) {

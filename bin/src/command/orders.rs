@@ -162,6 +162,7 @@ impl CommandServer {
                 proxy.run_state = RunState::Stopping;
               }
 
+              proxy.inflight.insert(message.id.clone(), order.clone());
               let o = order.clone();
               self.conns[token].add_message_id(message.id.clone());
               proxy.state.handle_order(&o);
