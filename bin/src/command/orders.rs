@@ -100,7 +100,7 @@ impl CommandServer {
       ConfigCommand::ListWorkers => {
         let workers: Vec<WorkerInfo> = self.proxies.values().map(|&(ref tag, ref proxy)| {
           WorkerInfo {
-            tag:        tag.clone(),
+            tag:        proxy.tag.clone(),
             id:         proxy.id,
             proxy_type: proxy.proxy_type,
             pid:        proxy.pid,
@@ -138,6 +138,11 @@ impl CommandServer {
           let mut found = false;
           for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
             if tag == proxy_tag {
+              if let Some(id) = message.proxy_id {
+                if id != proxy.id {
+                  continue;
+                }
+              }
               let o = order.clone();
               self.conns[token].add_message_id(message.id.clone());
               proxy.state.handle_order(&o);
