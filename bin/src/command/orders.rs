@@ -137,6 +137,8 @@ impl CommandServer {
           if let Some(&(_, ref previous)) = self.proxies.values().filter(|&&(ref ptag, ref proxy)| {
             ptag == &tag && proxy.run_state == RunState::Running
           }).next() {
+            worker.channel.set_blocking(true);
+
             let mut counter = 0u32;
             for order in previous.state.generate_orders() {
               let message_id = format!("LAUNCH-CONF-{}", counter);
@@ -145,10 +147,14 @@ impl CommandServer {
               //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
               self.conns[token].add_message_id(message_id.clone());
               worker.state.handle_order(&o);
-              worker.channel.write_message(&ProxyOrder { id: message_id, order: o });
-              worker.channel.run();
+              if !worker.channel.write_message(&ProxyOrder { id: message_id.clone(), order: o }) {
+                error!("could not send to new worker({}-{}): {}", tag, worker.id, message_id);
+              }
+
+              //worker.channel.run();
               counter += 1;
             }
+            worker.channel.set_blocking(false);
           }
 
           self.proxies.insert(Token(worker_token), (tag, worker));
