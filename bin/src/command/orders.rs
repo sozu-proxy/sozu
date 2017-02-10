@@ -115,8 +115,18 @@ impl CommandServer {
         ));
       },
       ConfigCommand::LaunchWorker(tag) => {
+        info!("received LaunchWorker with tag \"{}\"", tag);
+
         let id = self.next_ids.get(&tag).unwrap_or(&0) + 1;
         if let Some(mut worker) = self.config.proxies.get(&tag).and_then(|config| start_worker(&tag, config, id)) {
+          self.conns[token].write_message(&ConfigMessageAnswer::new(
+            message.id.clone(),
+            ConfigMessageStatus::Processing,
+            "sending configuration orders".to_string(),
+            None
+          ));
+          info!("created new worker");
+
           *self.next_ids.get_mut(&tag).unwrap() += 1;
 
           let worker_token = self.token_count + 1;
@@ -124,7 +134,25 @@ impl CommandServer {
           worker.token     = Some(Token(worker_token));
           self.poll.register(&worker.channel.sock, Token(worker_token), Ready::all(), PollOpt::edge()).unwrap();
 
+          if let Some(&(_, ref previous)) = self.proxies.values().filter(|&&(ref ptag, ref proxy)| {
+            ptag == &tag && proxy.run_state == RunState::Running
+          }).next() {
+            let mut counter = 0u32;
+            for order in previous.state.generate_orders() {
+              let message_id = format!("LAUNCH-CONF-{}", counter);
+              worker.inflight.insert(message_id.clone(), order.clone());
+              let o = order.clone();
+              //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
+              self.conns[token].add_message_id(message_id.clone());
+              worker.state.handle_order(&o);
+              worker.channel.write_message(&ProxyOrder { id: message_id, order: o });
+              worker.channel.run();
+              counter += 1;
+            }
+          }
+
           self.proxies.insert(Token(worker_token), (tag, worker));
+
           self.conns[token].write_message(&ConfigMessageAnswer::new(
             message.id.clone(),
             ConfigMessageStatus::Ok,
