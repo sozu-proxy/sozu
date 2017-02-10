@@ -72,6 +72,10 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
     self.blocking = !nonblocking;
   }
 
+  pub fn set_blocking(&mut self, blocking: bool) {
+    self.set_nonblocking(!blocking)
+  }
+
   pub fn fd(&self) -> RawFd {
     self.sock.as_raw_fd()
   }

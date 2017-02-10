@@ -17,7 +17,7 @@ use sozu::channel::Channel;
 use sozu_command::config::Config;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 
-use command::{dump_state,load_state,save_state,soft_stop,hard_stop};
+use command::{dump_state,load_state,save_state,soft_stop,hard_stop,upgrade};
 
 fn main() {
   let matches = App::new("sozuctl")
@@ -34,6 +34,10 @@ fn main() {
                                     .about("shuts down the proxy")
                                     .arg(Arg::with_name("hard").long("hard")
                                          .help("shuts down the proxy without waiting for connections to finish")))
+                        .subcommand(SubCommand::with_name("upgrade")
+                                    .about("upgrades the proxy")
+                                    .arg(Arg::with_name("hard").long("hard")
+                                         .help("upgrades the proxy while it is running")))
                         .subcommand(SubCommand::with_name("state")
                                     .about("state management")
                                     .subcommand(SubCommand::with_name("save")
@@ -69,6 +73,9 @@ fn main() {
       } else {
         soft_stop(&mut channel, &config);
       }
+    },
+    ("upgrade", Some(sub)) => {
+      upgrade(&mut channel, &config);
     },
     ("state", Some(sub))    => {
       match sub.subcommand() {
