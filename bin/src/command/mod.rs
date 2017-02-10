@@ -161,7 +161,7 @@ impl CommandServer {
 
     let mut next_ids: HashMap<String, u8> = HashMap::new();
     for (ref tag, ref value) in &proxies_map {
-      next_ids.insert(tag.to_string(), value.len() as u8);
+      next_ids.insert(tag.to_string(), (value.len() - 1) as u8);
     }
 
     let mut proxies = HashMap::new();
