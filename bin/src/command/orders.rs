@@ -119,12 +119,25 @@ impl CommandServer {
         if let Some(mut worker) = self.config.proxies.get(&tag).and_then(|config| start_worker(&tag, config, id)) {
           *self.next_ids.get_mut(&tag).unwrap() += 1;
 
-          let token        = self.token_count + 1;
-          self.token_count = token;
-          worker.token     = Some(Token(token));
-          self.poll.register(&worker.channel.sock, Token(token), Ready::all(), PollOpt::edge()).unwrap();
+          let worker_token = self.token_count + 1;
+          self.token_count = worker_token;
+          worker.token     = Some(Token(worker_token));
+          self.poll.register(&worker.channel.sock, Token(worker_token), Ready::all(), PollOpt::edge()).unwrap();
 
-          self.proxies.insert(Token(token), (tag, worker));
+          self.proxies.insert(Token(worker_token), (tag, worker));
+          self.conns[token].write_message(&ConfigMessageAnswer::new(
+            message.id.clone(),
+            ConfigMessageStatus::Ok,
+            "".to_string(),
+            None
+          ));
+        } else {
+          self.conns[token].write_message(&ConfigMessageAnswer::new(
+            message.id.clone(),
+            ConfigMessageStatus::Error,
+            "failed creating worker".to_string(),
+            None
+          ));
         }
       },
       ConfigCommand::ProxyConfiguration(order) => {
