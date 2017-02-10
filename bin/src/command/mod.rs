@@ -15,7 +15,7 @@ use serde_json;
 use sozu::network::{ProxyOrder,ServerMessage,ServerMessageStatus};
 use sozu::channel::Channel;
 use sozu_command::state::{HttpProxy,TlsProxy,ConfigState};
-use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,ProxyType};
+use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,ProxyType,RunState};
 use sozu_command::config::Config;
 
 pub mod orders;
@@ -49,6 +49,7 @@ pub struct Proxy {
   pub state:         ConfigState,
   pub token:         Option<Token>,
   pub pid:           pid_t,
+  pub run_state:     RunState,
 }
 
 impl Proxy {
@@ -67,6 +68,7 @@ impl Proxy {
       state:      state,
       token:      None,
       pid:        pid,
+      run_state:  RunState::Running,
     }
   }
 }

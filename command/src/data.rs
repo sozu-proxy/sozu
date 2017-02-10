@@ -213,11 +213,19 @@ impl ConfigMessageAnswer {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+pub enum RunState {
+  Running,
+  Stopping,
+  Stopped,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct WorkerInfo {
   pub id:         u8,
   pub pid:        i32,
   pub tag:        String,
   pub proxy_type: ProxyType,
+  pub run_state:  RunState,
 }
 
 #[derive(Deserialize)]

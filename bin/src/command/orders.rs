@@ -11,7 +11,7 @@ use sozu::messages::Order;
 use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
 use sozu_command::config::Config;
-use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,PROTOCOL_VERSION,WorkerInfo};
+use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,PROTOCOL_VERSION,RunState,WorkerInfo};
 
 use super::{CommandServer,FrontToken,ProxyConfiguration,StoredProxy};
 use super::client::parse;
@@ -76,7 +76,7 @@ impl CommandServer {
         }
 
         let conf = ProxyConfiguration {
-          id:        message.id.clone(),
+          id:      message.id.clone(),
           proxies: stored_proxies,
         };
         //let encoded = serde_json::to_string(&conf).map(|s| s.into_bytes()).unwrap_or(vec!());
@@ -104,6 +104,7 @@ impl CommandServer {
             id:         proxy.id,
             proxy_type: proxy.proxy_type,
             pid:        proxy.pid,
+            run_state:  proxy.run_state.clone(),
           }
         }).collect();
         self.conns[token].write_message(&ConfigMessageAnswer::new(
@@ -143,6 +144,11 @@ impl CommandServer {
                   continue;
                 }
               }
+
+              if order == Order::SoftStop || order == Order::HardStop {
+                proxy.run_state = RunState::Stopping;
+              }
+
               let o = order.clone();
               self.conns[token].add_message_id(message.id.clone());
               proxy.state.handle_order(&o);
