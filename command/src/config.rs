@@ -295,10 +295,11 @@ impl Config {
               certificate_chain: chain_opt.unwrap(),
             });
             v.push(ConfigMessage {
-              id:      format!("CONFIG-{}", count),
-              version: PROTOCOL_VERSION,
-              proxy:   Some(tag.clone()),
-              data:    ConfigCommand::ProxyConfiguration(certificate_order),
+              id:       format!("CONFIG-{}", count),
+              version:  PROTOCOL_VERSION,
+              proxy:    Some(tag.clone()),
+              proxy_id: None,
+              data:     ConfigCommand::ProxyConfiguration(certificate_order),
             });
             count += 1;
             let front_order = Order::AddTlsFront(TlsFront {
@@ -308,10 +309,11 @@ impl Config {
               fingerprint: fingerprint,
             });
             v.push(ConfigMessage {
-              id:      format!("CONFIG-{}", count),
-              version: PROTOCOL_VERSION,
-              proxy:   Some(tag.clone()),
-              data:    ConfigCommand::ProxyConfiguration(front_order),
+              id:       format!("CONFIG-{}", count),
+              version:  PROTOCOL_VERSION,
+              proxy:    Some(tag.clone()),
+              proxy_id: None,
+              data:     ConfigCommand::ProxyConfiguration(front_order),
             });
             count += 1;
           } else {
@@ -321,10 +323,11 @@ impl Config {
               path_begin: path_begin,
             });
             v.push(ConfigMessage {
-              id:      format!("CONFIG-{}", count),
-              version: PROTOCOL_VERSION,
-              proxy:   Some(tag.clone()),
-              data:    ConfigCommand::ProxyConfiguration(order),
+              id:       format!("CONFIG-{}", count),
+              version:  PROTOCOL_VERSION,
+              proxy:    Some(tag.clone()),
+              proxy_id: None,
+              data:     ConfigCommand::ProxyConfiguration(order),
             });
             count += 1;
           };
@@ -349,10 +352,11 @@ impl Config {
               });
 
               v.push(ConfigMessage {
-                id:      format!("CONFIG-{}", count),
-                version: PROTOCOL_VERSION,
-                proxy:   Some(tag.clone()),
-                data:    ConfigCommand::ProxyConfiguration(backend_order),
+                id:       format!("CONFIG-{}", count),
+                version:  PROTOCOL_VERSION,
+                proxy:    Some(tag.clone()),
+                proxy_id: None,
+                data:     ConfigCommand::ProxyConfiguration(backend_order),
               });
 
               count += 1;

@@ -18,6 +18,7 @@ pub fn save_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
     id.clone(),
     ConfigCommand::SaveState(path.to_string()),
     None,
+    None,
   ));
 
   match channel.read_message() {
@@ -50,6 +51,7 @@ pub fn load_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
     id.clone(),
     ConfigCommand::LoadState(path.to_string()),
     None,
+    None,
   ));
 
   match channel.read_message() {
@@ -81,6 +83,7 @@ pub fn dump_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   channel.write_message(&ConfigMessage::new(
     id.clone(),
     ConfigCommand::DumpState,
+    None,
     None,
   ));
 
@@ -116,6 +119,8 @@ pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, confi
       id.clone(),
       ConfigCommand::ProxyConfiguration(Order::SoftStop),
       Some(tag.clone()),
+      //FIXME: we should be able to soft stop one specific worker
+      None,
     ));
     (id, tag.clone())
   }));
@@ -159,6 +164,8 @@ pub fn hard_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, confi
       id.clone(),
       ConfigCommand::ProxyConfiguration(Order::HardStop),
       Some(tag.clone()),
+      //FIXME: we should be able to soft stop one specific worker
+      None,
     ));
     (id, tag.clone())
   }));

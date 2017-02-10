@@ -39,7 +39,8 @@ impl CommandServer {
               let message = ConfigMessage::new(
                 format!("SAVE-{}", counter),
                 ConfigCommand::ProxyConfiguration(command),
-                Some(proxy.tag.to_string())
+                Some(proxy.tag.to_string()),
+                None
               );
               f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()));
               f.write_all(&b"\n\0"[..]);

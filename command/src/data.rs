@@ -160,19 +160,21 @@ pub enum ConfigCommand {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub struct ConfigMessage {
-  pub id:      String,
-  pub version: u8,
-  pub data:    ConfigCommand,
-  pub proxy:   Option<String>,
+  pub id:       String,
+  pub version:  u8,
+  pub data:     ConfigCommand,
+  pub proxy:    Option<String>,
+  pub proxy_id: Option<u8>,
 }
 
 impl ConfigMessage {
-  pub fn new(id: String, data: ConfigCommand, proxy: Option<String>) -> ConfigMessage {
+  pub fn new(id: String, data: ConfigCommand, proxy: Option<String>, proxy_id: Option<u8>) -> ConfigMessage {
     ConfigMessage {
-      id:      id,
-      version: PROTOCOL_VERSION,
-      data:    data,
-      proxy:   proxy,
+      id:       id,
+      version:  PROTOCOL_VERSION,
+      data:     data,
+      proxy:    proxy,
+      proxy_id: proxy_id,
     }
   }
 }
@@ -227,6 +229,7 @@ enum ConfigMessageField {
   Id,
   Version,
   Proxy,
+  ProxyId,
   Type,
   Data,
 }
@@ -245,6 +248,7 @@ impl serde::Deserialize for ConfigMessageField {
           "version"  => Ok(ConfigMessageField::Version),
           "type"     => Ok(ConfigMessageField::Type),
           "proxy"    => Ok(ConfigMessageField::Proxy),
+          "proxy_id" => Ok(ConfigMessageField::ProxyId),
           "data"     => Ok(ConfigMessageField::Data),
           e => Err(serde::de::Error::custom(format!("expected id, version, proxy, type or data, got: {}", e))),
         }
@@ -264,6 +268,7 @@ impl serde::de::Visitor for ConfigMessageVisitor {
     let mut id:Option<String>              = None;
     let mut version:Option<u8>             = None;
     let mut proxy: Option<String>          = None;
+    let mut proxy_id: Option<u8>           = None;
     let mut config_type:Option<String>     = None;
     let mut data:Option<serde_json::Value> = None;
 
@@ -273,6 +278,7 @@ impl serde::de::Visitor for ConfigMessageVisitor {
         Some(ConfigMessageField::Id)      => { id = Some(try!(visitor.visit_value())); }
         Some(ConfigMessageField::Version) => { version = Some(try!(visitor.visit_value())); }
         Some(ConfigMessageField::Proxy)   => { proxy = Some(try!(visitor.visit_value())); }
+        Some(ConfigMessageField::ProxyId) => { proxy_id = Some(try!(visitor.visit_value())); }
         Some(ConfigMessageField::Data)    => { data = Some(try!(visitor.visit_value())); }
         None => { break; }
       }
@@ -333,7 +339,8 @@ impl serde::de::Visitor for ConfigMessageVisitor {
       id:      id,
       version: PROTOCOL_VERSION,
       data:    data,
-      proxy:   proxy
+      proxy:   proxy,
+      proxy_id: proxy_id,
     })
   }
 }
@@ -355,11 +362,14 @@ impl serde::Serialize for ConfigMessage {
   fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
       where S: serde::Serializer,
   {
-    let mut state = if self.proxy.is_some() {
-      try!(serializer.serialize_map(Some(5)))
-    } else {
-      try!(serializer.serialize_map(Some(4)))
-    };
+    let mut count = 4;
+    if self.proxy.is_some() {
+      count += 1;
+    }
+    if self.proxy_id.is_some() {
+      count += 1;
+    }
+    let mut state = try!(serializer.serialize_map(Some(count)));
 
     try!(serializer.serialize_map_key(&mut state, "id"));
     try!(serializer.serialize_map_value(&mut state, &self.id));
@@ -370,6 +380,11 @@ impl serde::Serialize for ConfigMessage {
     if self.proxy.is_some() {
       try!(serializer.serialize_map_key(&mut state, "proxy"));
       try!(serializer.serialize_map_value(&mut state, self.proxy.as_ref().unwrap()));
+    }
+
+    if self.proxy_id.is_some() {
+      try!(serializer.serialize_map_key(&mut state, "proxy_id"));
+      try!(serializer.serialize_map_value(&mut state, self.proxy_id.as_ref().unwrap()));
     }
 
     match self.data {
