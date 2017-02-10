@@ -137,10 +137,11 @@ pub trait ProxyConfiguration<Client> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client:&mut Client) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyOrder);
   fn accept(&mut self, token: ListenToken) -> Option<(Client, bool)>;
+  fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
   fn front_timeout(&self) -> u64;
   fn back_timeout(&self)  -> u64;
-  fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
-  fn channel(&mut self) -> &mut ProxyChannel;
+  fn channel(&mut self)   -> &mut ProxyChannel;
+  fn tag(&self)           -> &str;
 }
 
 pub struct Server<ServerConfiguration,Client> {
@@ -174,6 +175,10 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
       timer:           timer,
       shutting_down:   None,
     }
+  }
+
+  pub fn tag(&self) -> &str {
+    self.configuration.tag()
   }
 
   pub fn to_front(&self, token: Token) -> FrontToken {
@@ -358,11 +363,11 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
         if event.token() == Token(0) {
           let kind = event.kind();
           if kind.is_error() {
-            error!("error reading from command channel");
+            error!("{}\terror reading from command channel", self.tag());
             continue;
           }
           if kind.is_hup() {
-            error!("command channel was closed");
+            error!("{}\tcommand channel was closed", self.tag());
             continue;
           }
           self.configuration.channel().handle_events(kind);
@@ -371,6 +376,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
           // loop here because iterations has borrow issues
           loop {
             let msg = self.configuration.channel().read_message();
+            info!("{}\tgot message: {:?}", self.tag(), msg);
 
             // if the message was too large, we grow the buffer and retry to read if possible
             if msg.is_none() {
@@ -431,12 +437,12 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
         }
 
         if events.is_writable() {
-          error!("PROXY\treceived writable for listener {:?}, this should not happen", token);
+          error!("{}\treceived writable for listener {:?}, this should not happen", self.tag(), token);
           return;
         }
 
         if events.is_hup() {
-          error!("PROXY\tshould not happen: server {:?} closed", token);
+          error!("{}\tshould not happen: server {:?} closed", self.tag(), token);
           return;
         }
         unreachable!();
@@ -481,7 +487,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
 
       if front_interest.is_readable() {
         let order = self.clients[client_token].readable();
-        trace!("PROXY\tfront readable\tinterpreting client order {:?}", order);
+        trace!("{}\tfront readable\tinterpreting client order {:?}", self.tag(), order);
 
         // FIXME: should clear the timeout only if data was consumed
         if let Some(timeout) = self.clients[client_token].front_timeout() {
@@ -529,7 +535,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
 
       if front_interest.is_writable() {
         let order = self.clients[client_token].writable();
-        trace!("PROXY\tfront writable\tinterpreting client order {:?}", order);
+        trace!("{}\tfront writable\tinterpreting client order {:?}", self.tag(), order);
         self.interpret_client_order(client_token, order);
         //self.clients[client_token].readiness().front_readiness.remove(Ready::writable());
       }

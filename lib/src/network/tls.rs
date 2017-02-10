@@ -941,8 +941,12 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     self.back_timeout
   }
 
-  fn channel(&mut self) -> &mut ProxyChannel {
+  fn channel(&mut self)   -> &mut ProxyChannel {
     &mut self.channel
+  }
+
+  fn tag(&self)           -> &str {
+    &self.tag
   }
 }
 
