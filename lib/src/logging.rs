@@ -80,7 +80,6 @@ impl Logger {
   }
 }
 
-#[derive(Debug)]
 pub enum LoggerBackend {
   Stdout(Stdout),
   Unix(UnixDatagram),
