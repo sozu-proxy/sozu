@@ -150,6 +150,8 @@ pub enum Order {
 
     SoftStop,
     HardStop,
+
+    Status
 }
 
 impl Order {
@@ -169,6 +171,7 @@ impl Order {
       Order::TlsProxy(_)          => vec![Topic::TlsProxyConfig],
       Order::SoftStop             => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
       Order::HardStop             => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
+      Order::Status               => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
     }
   }
 }
@@ -230,6 +233,9 @@ impl serde::de::Visitor for OrderVisitor {
     } else if &command_type == "HARD_STOP" {
       try!(visitor.end());
       return Ok(Order::HardStop);
+    } else if &command_type == "STATUS" {
+      try!(visitor.end());
+      return Ok(Order::Status);
     }
 
     let data = match data {
@@ -374,6 +380,10 @@ impl serde::Serialize for Order {
       &Order::HardStop => {
         try!(serializer.serialize_map_key(&mut state, "type"));
         try!(serializer.serialize_map_value(&mut state, "HARD_STOP"));
+      },
+      &Order::Status => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "STATUS"));
       },
     }
 

@@ -507,6 +507,10 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         info!("{}\t{} hard shutdown", "TCP", message.id);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
+      Order::Status => {
+        info!("{}\t{} status", "TCP", message.id);
+        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+      },
       _ => {
         error!("TCP\tunsupported message, ignoring");
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});

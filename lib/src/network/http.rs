@@ -590,6 +590,10 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         //event_loop.shutdown();
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
+      Order::Status => {
+        info!("{}\t{} status", self.tag, message.id);
+        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+      },
       command => {
         debug!("{}\t{} unsupported message, ignoring: {:?}", self.tag, message.id, command);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});

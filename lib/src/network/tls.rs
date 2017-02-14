@@ -918,6 +918,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         info!("{}\t{} hard shutdown", self.tag, message.id);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
+      Order::Status => {
+        info!("{}\t{} status", self.tag, message.id);
+        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+      },
       command => {
         error!("{}\t{} unsupported message, ignoring {:?}", self.tag, message.id, command);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
