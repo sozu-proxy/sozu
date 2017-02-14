@@ -116,18 +116,18 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str, channel_buffer_size: u
   match proxy_config.proxy_type {
     ProxyType::HTTP => {
       if let Some(config) = proxy_config.to_http() {
-        http::start(t, config, command);
+        http::start(t.clone(), config, command);
       }
     },
     ProxyType::HTTPS => {
       if let Some(config) = proxy_config.to_tls() {
-        tls::start(t, config, command);
+        tls::start(t.clone(), config, command);
       }
     },
     _ => unimplemented!()
   }
 
-  info!("proxy ended");
+  info!("{}\tproxy ended", t);
 }
 
 pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t, Channel<ProxyOrder,ServerMessage>) {
