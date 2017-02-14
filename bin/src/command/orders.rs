@@ -132,7 +132,6 @@ impl CommandServer {
           let worker_token = self.token_count + 1;
           self.token_count = worker_token;
           worker.token     = Some(Token(worker_token));
-          self.poll.register(&worker.channel.sock, Token(worker_token), Ready::all(), PollOpt::edge()).unwrap();
 
           if let Some(&(_, ref previous)) = self.proxies.values().filter(|&&(ref ptag, ref proxy)| {
             ptag == &tag && proxy.run_state == RunState::Running
@@ -151,12 +150,17 @@ impl CommandServer {
                 error!("could not send to new worker({}-{}): {}", tag, worker.id, message_id);
               }
 
+              let received = worker.channel.read_message();
+              info!("worker ({}-{}) sent: {:?}", tag, worker.id, received);
               //worker.channel.run();
               counter += 1;
             }
             worker.channel.set_blocking(false);
           }
 
+          info!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
+            worker_token, tag, worker.id, worker.channel.sock.take_error());
+          self.poll.register(&worker.channel.sock, Token(worker_token), Ready::all(), PollOpt::edge()).unwrap();
           self.proxies.insert(Token(worker_token), (tag, worker));
 
           self.conns[token].write_message(&ConfigMessageAnswer::new(
@@ -180,7 +184,7 @@ impl CommandServer {
             info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
             data.app_id, data.hostname, data.path_begin, tag);
           } else {
-            info!("received {:?} with tag {:?}", order, tag);
+            info!("received client order {:?} with tag {:?}", order, tag);
           }
 
           let mut found = false;
