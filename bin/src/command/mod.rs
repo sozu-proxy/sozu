@@ -25,6 +25,7 @@ pub mod client;
 use self::client::{ConnReadError,CommandClient};
 
 const SERVER: Token = Token(0);
+const HALF_USIZE: usize = 0x8000000000000000usize;
 
 #[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
 pub struct FrontToken(pub usize);
@@ -114,7 +115,6 @@ struct CommandServer {
   conns:           Slab<CommandClient,FrontToken>,
   proxies:         HashMap<Token, (Tag, Proxy)>,
   next_ids:        HashMap<Tag,u8>,
-  proxy_count:     usize,
   pub poll:        Poll,
   timer:           Timer<Token>,
   config:          Config,
@@ -186,7 +186,6 @@ impl CommandServer {
       conns:           Slab::with_capacity(128),
       proxies:         proxies,
       next_ids:        next_ids,
-      proxy_count:     token_count,
       poll:            poll,
       timer:           timer,
       config:          config,
@@ -195,11 +194,11 @@ impl CommandServer {
   }
 
   pub fn to_front(&self, token: Token) -> FrontToken {
-    FrontToken(token.0 - self.proxy_count - 1)
+    FrontToken(token.0 - HALF_USIZE - 1)
   }
 
   pub fn from_front(&self, token: FrontToken) -> Token {
-    Token(token.0 + self.proxy_count + 1)
+    Token(token.0 + HALF_USIZE + 1)
   }
 
 }
@@ -228,7 +227,7 @@ impl CommandServer {
           error!("received writable for token 0");
         }
       },
-      Token(i) if i < self.proxy_count + 1 => {
+      Token(i) if i < HALF_USIZE + 1 => {
         let mut messages = {
           let &mut (ref tag, ref mut proxy) =  self.proxies.get_mut(&Token(i)).unwrap();
           proxy.channel.handle_events(events);
