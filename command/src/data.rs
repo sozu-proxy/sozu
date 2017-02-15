@@ -155,7 +155,8 @@ pub enum ConfigCommand {
   LoadState(String),
   DumpState,
   ListWorkers,
-  LaunchWorker(String)
+  LaunchWorker(String),
+  UpgradeMaster,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
@@ -339,6 +340,8 @@ impl serde::de::Visitor for ConfigMessageVisitor {
         None => try!(visitor.missing_field("data")),
       };
       ConfigCommand::LaunchWorker(try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("launch worker")))))
+    } else if &config_type == &"UPGRADE_MASTER" {
+      ConfigCommand::UpgradeMaster
     } else {
       return Err(serde::de::Error::custom("unrecognized command"));
     };
@@ -427,7 +430,11 @@ impl serde::Serialize for ConfigMessage {
         try!(serializer.serialize_map_value(&mut state, "LAUNCH_WORKER"));
         try!(serializer.serialize_map_key(&mut state, "data"));
         try!(serializer.serialize_map_value(&mut state, tag));
-      }
+      },
+      ConfigCommand::UpgradeMaster => {
+        try!(serializer.serialize_map_key(&mut state, "type"));
+        try!(serializer.serialize_map_value(&mut state, "UPGRADE_MASTER"));
+      },
     };
 
     serializer.serialize_map_end(state)

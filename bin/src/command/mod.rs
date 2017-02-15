@@ -108,7 +108,7 @@ pub struct ProxyConfiguration {
 
 pub type Tag = String;
 
-struct CommandServer {
+pub struct CommandServer {
   sock:            UnixListener,
   buffer_size:     usize,
   max_buffer_size: usize,
@@ -155,7 +155,7 @@ impl CommandServer {
     }
   }
 
-  fn new(srv: UnixListener, config: Config, proxies_map: HashMap<String, Vec<Proxy>>, buffer_size: usize, max_buffer_size: usize, poll: Poll) -> CommandServer {
+  fn new(srv: UnixListener, config: Config, proxies_map: HashMap<String, Vec<Proxy>>, poll: Poll) -> CommandServer {
     //FIXME: verify this
     poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
 
@@ -179,10 +179,13 @@ impl CommandServer {
     let mut timer = timer::Timer::default();
     //poll.register(&timer, Token(1), Ready::readable(), PollOpt::edge()).unwrap();
     timer.set_timeout(Duration::from_millis(700), Token(0));
+
+    let buffer_size = config.command_buffer_size.unwrap_or(10000);
+
     CommandServer {
       sock:            srv,
       buffer_size:     buffer_size,
-      max_buffer_size: max_buffer_size,
+      max_buffer_size: config.max_command_buffer_size.unwrap_or(buffer_size * 2),
       conns:           Slab::with_capacity(128),
       proxies:         proxies,
       next_ids:        next_ids,
@@ -364,7 +367,7 @@ pub fn start(config: Config, proxies: HashMap<String, Vec<Proxy>>) {
         return;
       }
 
-      let mut server = CommandServer::new(srv, config.clone(), proxies, buffer_size, max_buffer_size, event_loop);
+      let mut server = CommandServer::new(srv, config.clone(), proxies, event_loop);
 
       server.load_static_application_configuration();
 

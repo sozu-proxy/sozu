@@ -155,11 +155,11 @@ pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t
 
   let path = unsafe { get_executable_path() };
 
-  trace!("launching worker");
+  info!("launching worker");
   //FIXME: remove the expect, return a result?
   match fork().expect("fork failed") {
     ForkResult::Parent{ child } => {
-      trace!("worker launched: {}", child);
+      info!("worker launched: {}", child);
       command.write_message(config);
       command.set_nonblocking(true);
 

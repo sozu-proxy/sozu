@@ -16,6 +16,7 @@ extern crate sozu_command_lib as sozu_command;
 mod command;
 mod worker;
 mod logging;
+mod upgrade;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::collections::HashMap;
@@ -26,6 +27,7 @@ use clap::{App,Arg,SubCommand};
 
 use command::Proxy;
 use worker::{get_executable_path,begin_worker_process,start_workers};
+use upgrade::begin_new_master_process;
 
 fn main() {
   let matches = App::new("sozu")
@@ -50,6 +52,12 @@ fn main() {
                                          .takes_value(true).required(true).help("IPC file descriptor"))
                                     .arg(Arg::with_name("channel-buffer-size").long("channel-buffer-size")
                                          .takes_value(true).required(false).help("Worker's channel buffer size")))
+                        .subcommand(SubCommand::with_name("upgrade")
+                                    .about("start a new master process (internal command, should not be used directly)")
+                                    .arg(Arg::with_name("fd").long("fd")
+                                         .takes_value(true).required(true).help("IPC file descriptor"))
+                                    .arg(Arg::with_name("channel-buffer-size").long("channel-buffer-size")
+                                         .takes_value(true).required(false).help("Worker's channel buffer size")))
                         .get_matches();
 
   if let Some(matches) = matches.subcommand_matches("worker") {
@@ -62,6 +70,17 @@ fn main() {
       .unwrap_or(10000);
 
     begin_worker_process(fd, id, tag, buffer_size);
+    return;
+  }
+
+  if let Some(matches) = matches.subcommand_matches("upgrade") {
+    let fd  = matches.value_of("fd").expect("needs a file descriptor")
+      .parse::<i32>().expect("the file descriptor must be a number");
+    let buffer_size = matches.value_of("channel-buffer-size")
+      .and_then(|size| size.parse::<usize>().ok())
+      .unwrap_or(10000);
+
+    begin_new_master_process(fd, buffer_size);
     return;
   }
 
@@ -84,12 +103,12 @@ fn main() {
         proxies.insert(tag.to_string(), workers);
       }
     };
+    info!("created proxies: {:?}", proxies);
 
-    let buffer_size     = config.command_buffer_size.unwrap_or(10000);
-    let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
     command::start(config, proxies);
+    info!("master process stopped");
   } else {
-    println!("could not load configuration file at '{}', stopping", config_file);
+    error!("could not load configuration file at '{}', stopping", config_file);
   }
 }
 

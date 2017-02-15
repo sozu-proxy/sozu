@@ -299,6 +299,38 @@ pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config:
             }
 
             println!("worker upgrade done");
+            let id = generate_id();
+            channel.write_message(&ConfigMessage::new(
+              id.clone(),
+              ConfigCommand::UpgradeMaster,
+              None,
+              None,
+            ));
+
+            loop {
+              match channel.read_message() {
+                None          => println!("the proxy didn't answer"),
+                Some(message) => {
+                  if &id != &message.id {
+                    println!("received message with invalid id: {:?}", message);
+                    return;
+                  }
+                  match message.status {
+                    ConfigMessageStatus::Processing => {
+                      println!("master is processing: {}", message.message);
+                    },
+                    ConfigMessageStatus::Error => {
+                      println!("could not upgrade the master: {}", message.message);
+                      return;
+                    },
+                    ConfigMessageStatus::Ok => {
+                      println!("successfully upgraded the master: {}", message.message);
+                      return;
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }

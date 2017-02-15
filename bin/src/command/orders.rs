@@ -1,21 +1,31 @@
 use std::fs;
 use std::str;
+use std::process;
 use std::io::Read;
 use std::io::Write;
-use std::collections::HashSet;
+use std::thread::sleep;
+use std::time::Duration;
+use std::collections::{HashMap,HashSet};
+use std::os::unix::io::{AsRawFd,FromRawFd};
+use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 use serde_json;
-use mio::{PollOpt,Ready,Token};
+use slab::Slab;
+use mio_uds::{UnixListener,UnixStream};
+use mio::timer::{self,Timer};
+use mio::{Poll,PollOpt,Ready,Token};
 use nom::{HexDisplay,IResult,Offset};
 
 use sozu::messages::Order;
+use sozu::channel::Channel;
 use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
 use sozu_command::config::Config;
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,PROTOCOL_VERSION,RunState,WorkerInfo};
 
-use super::{CommandServer,FrontToken,ProxyConfiguration,StoredProxy};
+use super::{CommandServer,FrontToken,Proxy,ProxyConfiguration,StoredProxy};
 use super::client::parse;
 use worker::start_worker;
+use upgrade::{start_new_master_process,SerializedWorker,SerializedState,UpgradeData};
 
 impl CommandServer {
   pub fn handle_client_message(&mut self, token: FrontToken, message: &ConfigMessage) {
@@ -178,6 +188,40 @@ impl CommandServer {
           ));
         }
       },
+      ConfigCommand::UpgradeMaster => {
+        self.disable_cloexec_before_upgrade();
+        self.conns[token].channel.set_blocking(true);
+        self.conns[token].write_message(&ConfigMessageAnswer::new(
+          message.id.clone(),
+          ConfigMessageStatus::Processing,
+          "".to_string(),
+          None
+        ));
+        let (pid, mut channel) = start_new_master_process(self.generate_upgrade_data());
+        channel.set_blocking(true);
+        let res = channel.read_message();
+        info!("upgrade channel sent: {:?}", res);
+        if let Some(true) = res {
+          self.conns[token].write_message(&ConfigMessageAnswer::new(
+            message.id.clone(),
+            ConfigMessageStatus::Ok,
+            "new master process launched, closing the old one".to_string(),
+            None
+          ));
+          info!("wrote final message, closing");
+          //FIXME: should do some cleanup before exiting
+          sleep(Duration::from_secs(2));
+          process::exit(0);
+        } else {
+          self.conns[token].write_message(&ConfigMessageAnswer::new(
+            message.id.clone(),
+            ConfigMessageStatus::Error,
+            "could not upgrade master process".to_string(),
+            None
+          ));
+
+        }
+      },
       ConfigCommand::ProxyConfiguration(order) => {
         if let Some(ref tag) = message.proxy {
           if let &Order::AddTlsFront(ref data) = &order {
@@ -336,6 +380,122 @@ impl CommandServer {
           error!("expecting proxy tag");
         }
       }
+    }
+  }
+
+  pub fn disable_cloexec_before_upgrade(&mut self) {
+    for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
+      if proxy.run_state == RunState::Running {
+        let flags = fcntl(proxy.channel.sock.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
+        let mut new_flags = FdFlag::from_bits(flags).unwrap();
+        new_flags.remove(FD_CLOEXEC);
+        fcntl(proxy.channel.sock.as_raw_fd(), FcntlArg::F_SETFD(new_flags));
+      }
+    }
+    info!("disabling cloexec on listener: {}", self.sock.as_raw_fd());
+    let flags = fcntl(self.sock.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
+    let mut new_flags = FdFlag::from_bits(flags).unwrap();
+    new_flags.remove(FD_CLOEXEC);
+    fcntl(self.sock.as_raw_fd(), FcntlArg::F_SETFD(new_flags));
+  }
+
+  pub fn enable_cloexec_after_upgrade(&mut self) {
+    for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
+      if proxy.run_state == RunState::Running {
+        let flags = fcntl(proxy.channel.sock.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
+        let mut new_flags = FdFlag::from_bits(flags).unwrap();
+        new_flags.insert(FD_CLOEXEC);
+        fcntl(proxy.channel.sock.as_raw_fd(), FcntlArg::F_SETFD(new_flags));
+      }
+    }
+    let flags = fcntl(self.sock.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
+    let mut new_flags = FdFlag::from_bits(flags).unwrap();
+    new_flags.insert(FD_CLOEXEC);
+    fcntl(self.sock.as_raw_fd(), FcntlArg::F_SETFD(new_flags));
+  }
+
+  pub fn generate_upgrade_data(&self) -> UpgradeData {
+    let workers: Vec<SerializedWorker> = self.proxies.values().map(|&(_,ref proxy)| SerializedWorker::from_proxy(proxy)).collect();
+    let mut seen = HashSet::new();
+    let mut state: HashMap<String, SerializedState> = HashMap::new();
+
+    for &(ref tag, ref proxy) in  self.proxies.values() {
+      if !seen.contains(&tag) {
+        seen.insert(tag);
+        state.insert(tag.to_string(), SerializedState::from_proxy(&proxy) );
+      }
+    }
+
+    UpgradeData {
+      command:     self.sock.as_raw_fd(),
+      config:      self.config.clone(),
+      workers:     workers,
+      state:       state,
+      next_ids:    self.next_ids.clone(),
+      token_count: self.token_count,
+    }
+  }
+
+  pub fn from_upgrade_data(upgrade_data: UpgradeData) -> CommandServer {
+    let poll = Poll::new().expect("should create poll object");
+    let UpgradeData {
+      command: command,
+      config: config,
+      workers: serialized_workers,
+      state: state,
+      next_ids: next_ids,
+      token_count: token_count,
+    } = upgrade_data;
+
+    println!("listener is: {}", command);
+    let listener = unsafe { UnixListener::from_raw_fd(command) };
+    poll.register(&listener, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).expect("should register listener correctly");
+
+
+    let buffer_size     = config.command_buffer_size.unwrap_or(10000);
+    let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
+
+    let workers: HashMap<Token, (String, Proxy)> = serialized_workers.iter().filter_map(|serialized| {
+      let stream = unsafe { UnixStream::from_raw_fd(serialized.fd) };
+      if let Some(token) = serialized.token {
+        info!("registering: {:?}", poll.register(&stream, Token(token), Ready::all(), PollOpt::edge()));
+        let worker_state = state.get(&serialized.tag).map(|ser| ser.state.clone()).expect("worker state should be there");
+        Some(
+          (
+            Token(token),
+            (serialized.tag.clone(), Proxy {
+              tag:        serialized.tag.clone(),
+              id:         serialized.id,
+              proxy_type: serialized.proxy_type,
+              channel:    Channel::new(stream, buffer_size, buffer_size * 2),
+              token:      Some(Token(token)),
+              pid:        serialized.pid,
+              run_state:  serialized.run_state.clone(),
+              state:      worker_state,
+              //FIXME: transmit those as well?
+              inflight:   HashMap::new()
+            })
+          )
+        )
+      } else { None }
+    }).collect();
+
+
+    let mut timer = timer::Timer::default();
+    timer.set_timeout(Duration::from_millis(700), Token(0));
+
+    CommandServer {
+      sock:            listener,
+      poll:            poll,
+      timer:           timer,
+      config:          config,
+      buffer_size:     buffer_size,
+      max_buffer_size: max_buffer_size,
+      //FIXME: deserialize client connections as well, otherwise they might leak?
+      conns:           Slab::with_capacity(128),
+      proxies:         workers,
+      next_ids:        next_ids,
+      token_count:     token_count,
     }
   }
 }
