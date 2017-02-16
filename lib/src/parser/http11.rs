@@ -1762,6 +1762,7 @@ mod tests {
 
   #[test]
   fn parse_request_without_length() {
+      setup_test_logger!();
       let input =
           b"GET / HTTP/1.1\r\n\
             Host: localhost:8888\r\n\
@@ -1831,6 +1832,7 @@ mod tests {
 
   #[test]
   fn parse_request_http_1_0_connection_keep_alive() {
+    setup_test_logger!();
       let input =
           b"GET / HTTP/1.0\r\n\
             Host: localhost:8888\r\n\
@@ -1868,6 +1870,7 @@ mod tests {
 
   #[test]
   fn parse_request_http_1_1_connection_close() {
+      setup_test_logger!();
       let input =
           b"GET / HTTP/1.1\r\n\
             Connection: close\r\n\
@@ -1904,6 +1907,7 @@ mod tests {
 
   #[test]
   fn parse_request_add_header_test() {
+      setup_test_logger!();
       let input =
           b"GET /index.html HTTP/1.1\r\n\
             Host: localhost:8888\r\n\
@@ -2241,6 +2245,7 @@ mod tests {
 
   #[test]
   fn parse_incomplete_chunk_header_test() {
+      setup_test_logger!();
       let input =
           b"HTTP/1.1 200 OK\r\n\
             Server: ABCD\r\n\

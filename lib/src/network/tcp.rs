@@ -634,6 +634,7 @@ mod tests {
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn mi() {
+    setup_test_logger!();
     thread::spawn(|| { start_server(); });
     let tx = start_example();
     thread::sleep(Duration::from_millis(300));

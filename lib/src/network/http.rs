@@ -681,6 +681,7 @@ mod tests {
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn mi() {
+    setup_test_logger!();
     start_server(1025);
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
     let config = HttpProxyConfiguration {
@@ -733,6 +734,7 @@ mod tests {
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn keep_alive() {
+    setup_test_logger!();
     start_server(1028);
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1031").expect("could not parse address");
     let config = HttpProxyConfiguration {
