@@ -11,7 +11,7 @@ pub fn setup(level: &Option<String>, target: &Option<String>) {
     if s == "stdout" {
       LoggerBackend::Stdout(stdout())
     } else if s.starts_with("udp://") {
-      let mut addr_res = (&s[6..]).to_socket_addrs();
+      let addr_res = (&s[6..]).to_socket_addrs();
       match addr_res {
         Err(e) => {
           println!("invalid log target configuration ({:?}): {}", e, s);
@@ -23,7 +23,7 @@ pub fn setup(level: &Option<String>, target: &Option<String>) {
         }
       }
     } else if s.starts_with("tcp://") {
-      let mut addr_res = (&s[6..]).to_socket_addrs();
+      let addr_res = (&s[6..]).to_socket_addrs();
       match addr_res {
         Err(e) => {
           println!("invalid log target configuration ({:?}): {}", e, s);
@@ -42,7 +42,7 @@ pub fn setup(level: &Option<String>, target: &Option<String>) {
         let mut dir = env::temp_dir();
         let s: String = thread_rng().gen_ascii_chars().take(12).collect();
         dir.push(s);
-        let mut socket = UnixDatagram::bind(dir).unwrap();
+        let socket = UnixDatagram::bind(dir).unwrap();
         socket.connect(path).unwrap();
         LoggerBackend::Unix(socket)
       }

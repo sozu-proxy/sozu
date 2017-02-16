@@ -1,10 +1,6 @@
 use mio_uds::UnixStream;
-use mio::{Poll,Token};
-use libc::{self,c_char,uint32_t,int32_t,pid_t};
-use std::io;
-use std::ffi::CString;
-use std::iter::repeat;
-use std::ptr::null_mut;
+use mio::Token;
+use libc::{self,pid_t};
 use std::process::Command;
 use std::collections::HashMap;
 use std::os::unix::process::CommandExt;
@@ -12,10 +8,8 @@ use std::os::unix::io::{AsRawFd,FromRawFd};
 use nix::unistd::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 
-use sozu::network::{ProxyOrder,ServerMessage,http,tls};
 use sozu::channel::Channel;
-use sozu_command::state::ConfigState;
-use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ProxyType,RunState};
+use sozu_command::data::{ProxyType,RunState};
 use sozu_command::config::Config;
 
 use logging;

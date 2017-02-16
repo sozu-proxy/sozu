@@ -8,10 +8,9 @@ use std::time::Duration;
 use std::collections::{HashMap,HashSet};
 use std::os::unix::io::{AsRawFd,FromRawFd};
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
-use serde_json;
 use slab::Slab;
-use mio_uds::{UnixListener,UnixStream};
-use mio::timer::{self,Timer};
+use mio_uds::UnixListener;
+use mio::timer;
 use mio::{Poll,PollOpt,Ready,Token};
 use nom::{HexDisplay,IResult,Offset};
 
@@ -19,9 +18,7 @@ use sozu::messages::Order;
 use sozu::channel::Channel;
 use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
-use sozu_command::config::Config;
-use sozu_command::state::ConfigState;
-use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,PROTOCOL_VERSION,RunState,WorkerInfo};
+use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 
 use super::{CommandServer,FrontToken,Proxy,ProxyConfiguration,StoredProxy};
 use super::client::parse;
@@ -91,7 +88,7 @@ impl CommandServer {
         ));
       },
       ConfigCommand::ListWorkers => {
-        let workers: Vec<WorkerInfo> = self.proxies.values().map(|&(ref tag, ref proxy)| {
+        let workers: Vec<WorkerInfo> = self.proxies.values().map(|&(_, ref proxy)| {
           WorkerInfo {
             tag:        proxy.tag.clone(),
             id:         proxy.id,
@@ -374,7 +371,7 @@ impl CommandServer {
   }
 
   pub fn disable_cloexec_before_upgrade(&mut self) {
-    for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
+    for &mut (_, ref mut proxy) in self.proxies.values_mut() {
       if proxy.run_state == RunState::Running {
         let flags = fcntl(proxy.channel.sock.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
         let mut new_flags = FdFlag::from_bits(flags).unwrap();
@@ -390,7 +387,7 @@ impl CommandServer {
   }
 
   pub fn enable_cloexec_after_upgrade(&mut self) {
-    for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
+    for &mut (_, ref mut proxy) in self.proxies.values_mut() {
       if proxy.run_state == RunState::Running {
         let flags = fcntl(proxy.channel.sock.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
         let mut new_flags = FdFlag::from_bits(flags).unwrap();
@@ -429,12 +426,12 @@ impl CommandServer {
   pub fn from_upgrade_data(upgrade_data: UpgradeData) -> CommandServer {
     let poll = Poll::new().expect("should create poll object");
     let UpgradeData {
-      command: command,
-      config: config,
-      workers: serialized_workers,
-      state: state,
-      next_ids: next_ids,
-      token_count: token_count,
+      command,
+      config,
+      workers,
+      state,
+      next_ids,
+      token_count,
     } = upgrade_data;
 
     println!("listener is: {}", command);
@@ -445,7 +442,7 @@ impl CommandServer {
     let buffer_size     = config.command_buffer_size.unwrap_or(10000);
     let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
 
-    let workers: HashMap<Token, (String, Proxy)> = serialized_workers.iter().filter_map(|serialized| {
+    let workers: HashMap<Token, (String, Proxy)> = workers.iter().filter_map(|serialized| {
       let stream = unsafe { UnixStream::from_raw_fd(serialized.fd) };
       if let Some(token) = serialized.token {
         info!("registering: {:?}", poll.register(&stream, Token(token), Ready::all(), PollOpt::edge()));

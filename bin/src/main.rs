@@ -26,7 +26,7 @@ use sozu_command::config::Config;
 use clap::{App,Arg,SubCommand};
 
 use command::Proxy;
-use worker::{get_executable_path,begin_worker_process,start_workers};
+use worker::{begin_worker_process,start_workers};
 use upgrade::begin_new_master_process;
 
 fn main() {

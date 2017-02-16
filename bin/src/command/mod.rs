@@ -22,7 +22,7 @@ use sozu_command::config::Config;
 pub mod orders;
 pub mod client;
 
-use self::client::{ConnReadError,CommandClient};
+use self::client::CommandClient;
 
 const SERVER: Token = Token(0);
 const HALF_USIZE: usize = 0x8000000000000000usize;
@@ -127,7 +127,7 @@ impl CommandServer {
     debug!("server accepting socket");
 
     let acc = self.sock.accept();
-    if let Ok(Some((sock, addr))) = acc {
+    if let Ok(Some((sock, _))) = acc {
       let conn = CommandClient::new(sock, self.buffer_size, self.max_buffer_size);
       let tok = self.conns.insert(conn)
         .ok().expect("could not add connection to slab");
@@ -214,8 +214,6 @@ impl CommandServer {
 
 }
 
-type Message = ();
-
 impl CommandServer {
   pub fn run(&mut self) {
     let mut events = Events::with_capacity(1024);
@@ -240,7 +238,7 @@ impl CommandServer {
       },
       Token(i) if i < HALF_USIZE + 1 => {
         let mut messages = {
-          let &mut (ref tag, ref mut proxy) =  self.proxies.get_mut(&Token(i)).unwrap();
+          let &mut (_, ref mut proxy) =  self.proxies.get_mut(&Token(i)).unwrap();
           proxy.channel.handle_events(events);
           proxy.channel.run();
 
@@ -262,7 +260,7 @@ impl CommandServer {
         }
 
         {
-          let &mut (ref tag, ref mut proxy) =  self.proxies.get_mut(&Token(i)).unwrap();
+          let &mut (_, ref mut proxy) =  self.proxies.get_mut(&Token(i)).unwrap();
           proxy.channel.run();
         }
 
@@ -352,8 +350,6 @@ impl CommandServer {
 }
 
 pub fn start(config: Config, proxies: HashMap<String, Vec<Proxy>>) {
-  let buffer_size     = config.command_buffer_size.unwrap_or(10000);
-  let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
   let saved_state     = config.saved_state.clone();
 
   let event_loop = Poll::new().unwrap();

@@ -1,14 +1,11 @@
 use mio::*;
 use mio::timer::Timeout;
 use mio_uds::UnixStream;
-use std::io::{Read,Write,ErrorKind};
 use std::str::from_utf8;
-use std::cmp::min;
-use nom::{IResult,Offset};
+use nom::IResult;
 use serde_json::from_str;
 
 use sozu::channel::Channel;
-use sozu::network::buffer::Buffer;
 
 use super::{ConfigMessage,ConfigMessageAnswer};
 
