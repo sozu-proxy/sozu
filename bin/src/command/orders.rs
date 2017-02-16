@@ -20,6 +20,7 @@ use sozu::channel::Channel;
 use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
 use sozu_command::config::Config;
+use sozu_command::state::ConfigState;
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,PROTOCOL_VERSION,RunState,WorkerInfo};
 
 use super::{CommandServer,FrontToken,Proxy,ProxyConfiguration,StoredProxy};
@@ -33,18 +34,9 @@ impl CommandServer {
     match config_command {
       ConfigCommand::SaveState(path) => {
         if let Ok(mut f) = fs::File::create(&path) {
-          let mut seen = HashSet::new();
-          let mut stored_proxies: Vec<StoredProxy> = Vec::new();
-
-          for &(ref tag, ref proxy) in  self.proxies.values() {
-            if !seen.contains(&tag) {
-              seen.insert(tag);
-              stored_proxies.push( StoredProxy::from_proxy(&proxy) );
-            }
-          }
 
           let mut counter = 0usize;
-          for proxy in stored_proxies {
+          for proxy in self.state.values() {
             for command in proxy.state.generate_orders() {
               let message = ConfigMessage::new(
                 format!("SAVE-{}", counter),
@@ -75,19 +67,10 @@ impl CommandServer {
         }
       },
       ConfigCommand::DumpState => {
-        let mut seen = HashSet::new();
-        let mut stored_proxies: Vec<StoredProxy> = Vec::new();
-
-        for &(ref tag, ref proxy) in  self.proxies.values() {
-          if !seen.contains(&tag) {
-            seen.insert(tag);
-            stored_proxies.push( StoredProxy::from_proxy(&proxy) );
-          }
-        }
 
         let conf = ProxyConfiguration {
           id:      message.id.clone(),
-          proxies: stored_proxies,
+          proxies: self.state.values().cloned().collect(),
         };
         //let encoded = serde_json::to_string(&conf).map(|s| s.into_bytes()).unwrap_or(vec!());
         self.conns[token].write_message(&ConfigMessageAnswer::new(
@@ -231,6 +214,8 @@ impl CommandServer {
             info!("received client order {:?} with tag {:?}", order, tag);
           }
 
+          self.state.get_mut(tag).map(|st| st.state.handle_order(&order));
+
           let mut found = false;
           for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
             if tag == proxy_tag {
@@ -301,7 +286,10 @@ impl CommandServer {
 
               for message in o {
                 if let ConfigCommand::ProxyConfiguration(order) = message.data {
+
                   if let Some(ref tag) = message.proxy {
+                    self.state.get_mut(tag).map(|st| st.state.handle_order(&order));
+
                     if let &Order::AddTlsFront(ref data) = &order {
                       info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
                       data.app_id, data.hostname, data.path_begin, tag);
@@ -353,6 +341,8 @@ impl CommandServer {
     for message in self.config.generate_config_messages() {
       if let ConfigCommand::ProxyConfiguration(order) = message.data {
         if let Some(ref tag) = message.proxy {
+          self.state.get_mut(tag).map(|st| st.state.handle_order(&order));
+
           if let &Order::AddTlsFront(ref data) = &order {
             info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
             data.app_id, data.hostname, data.path_begin, tag);
@@ -480,6 +470,15 @@ impl CommandServer {
       } else { None }
     }).collect();
 
+    let config_state: HashMap<String, StoredProxy> = state.values().map(|st| {
+      (st.tag.to_string(),
+        StoredProxy {
+          tag:        st.tag.to_string(),
+          proxy_type: st.proxy_type,
+          state:      st.state.clone()
+        }
+      )
+    }).collect();
 
     let mut timer = timer::Timer::default();
     timer.set_timeout(Duration::from_millis(700), Token(0));
@@ -495,6 +494,7 @@ impl CommandServer {
       conns:           Slab::with_capacity(128),
       proxies:         workers,
       next_ids:        next_ids,
+      state:           config_state,
       token_count:     token_count,
     }
   }

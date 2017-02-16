@@ -83,7 +83,7 @@ impl fmt::Debug for Proxy {
   }
 }
 
-#[derive(Deserialize,Serialize,Debug)]
+#[derive(Clone,Deserialize,Serialize,Debug)]
 pub struct StoredProxy {
   pub tag:        String,
   pub proxy_type: ProxyType,
@@ -115,6 +115,7 @@ pub struct CommandServer {
   conns:           Slab<CommandClient,FrontToken>,
   proxies:         HashMap<Token, (Tag, Proxy)>,
   next_ids:        HashMap<Tag,u32>,
+  state:           HashMap<Tag, StoredProxy>,
   pub poll:        Poll,
   timer:           Timer<Token>,
   config:          Config,
@@ -165,15 +166,21 @@ impl CommandServer {
     }
 
     let mut proxies = HashMap::new();
+    let mut state   = HashMap::new();
 
     let mut token_count = 0;
     for (ref tag, ref mut proxy_list) in proxies_map {
       for proxy in proxy_list.drain(..) {
+        if !state.contains_key(tag) {
+          state.insert(tag.to_string(), StoredProxy::from_proxy(&proxy));
+        }
+
         token_count += 1;
         poll.register(&proxy.channel.sock, Token(token_count), Ready::all(), PollOpt::edge()).unwrap();
         proxies.insert(Token(token_count), (tag.to_string(), proxy));
       }
     }
+
     //let mut timer = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
     //FIXME: registering the timer makes the timer thread spin too much
     let mut timer = timer::Timer::default();
@@ -189,6 +196,7 @@ impl CommandServer {
       conns:           Slab::with_capacity(128),
       proxies:         proxies,
       next_ids:        next_ids,
+      state:           state,
       poll:            poll,
       timer:           timer,
       config:          config,
