@@ -9,7 +9,8 @@ use std::collections::{HashMap,HashSet};
 use std::os::unix::io::{AsRawFd,FromRawFd};
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 use slab::Slab;
-use mio_uds::UnixListener;
+use serde_json;
+use mio_uds::{UnixListener,UnixStream};
 use mio::timer;
 use mio::{Poll,PollOpt,Ready,Token};
 use nom::{HexDisplay,IResult,Offset};
@@ -20,7 +21,7 @@ use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 
-use super::{CommandServer,FrontToken,Proxy,ProxyConfiguration,StoredProxy};
+use super::{CommandServer,FrontToken,ProxyConfiguration,StoredProxy,Worker};
 use super::client::parse;
 use worker::start_worker;
 use upgrade::{start_new_master_process,SerializedWorker,UpgradeData};
@@ -409,7 +410,7 @@ impl CommandServer {
     for &(ref tag, ref proxy) in  self.proxies.values() {
       if !seen.contains(&tag) {
         seen.insert(tag);
-        state.insert(tag.to_string(), StoredProxy::from_proxy(&proxy) );
+        state.insert(tag.to_string(), StoredProxy::from_worker(&proxy) );
       }
     }
 
@@ -442,7 +443,7 @@ impl CommandServer {
     let buffer_size     = config.command_buffer_size.unwrap_or(10000);
     let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
 
-    let workers: HashMap<Token, (String, Proxy)> = workers.iter().filter_map(|serialized| {
+    let workers: HashMap<Token, (String, Worker)> = workers.iter().filter_map(|serialized| {
       let stream = unsafe { UnixStream::from_raw_fd(serialized.fd) };
       if let Some(token) = serialized.token {
         info!("registering: {:?}", poll.register(&stream, Token(token), Ready::all(), PollOpt::edge()));
@@ -450,7 +451,7 @@ impl CommandServer {
         Some(
           (
             Token(token),
-            (serialized.tag.clone(), Proxy {
+            (serialized.tag.clone(), Worker {
               tag:        serialized.tag.clone(),
               id:         serialized.id,
               proxy_type: serialized.proxy_type,

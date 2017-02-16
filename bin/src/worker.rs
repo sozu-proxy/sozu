@@ -16,9 +16,9 @@ use sozu_command::data::ProxyType;
 use sozu_command::config::ProxyConfig;
 
 use logging;
-use command::Proxy;
+use command::Worker;
 
-pub fn start_workers(tag: &str, ls: &ProxyConfig) -> Option<Vec<Proxy>> {
+pub fn start_workers(tag: &str, ls: &ProxyConfig) -> Option<Vec<Worker>> {
   match ls.proxy_type {
     ProxyType::HTTP => {
       //FIXME: make safer
@@ -26,12 +26,12 @@ pub fn start_workers(tag: &str, ls: &ProxyConfig) -> Option<Vec<Proxy>> {
         let mut http_proxies = Vec::new();
         for index in 1..ls.worker_count.unwrap_or(1) {
           let (pid, command) = start_worker_process(ls, tag, &index.to_string());
-          let l =  Proxy::new(tag.to_string(), index as u32, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
+          let l =  Worker::new(tag.to_string(), index as u32, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
           http_proxies.push(l);
         }
 
         let (pid, command) = start_worker_process(ls, tag, &0.to_string());
-        let l =  Proxy::new(tag.to_string(), 0, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
+        let l =  Worker::new(tag.to_string(), 0, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
         http_proxies.push(l);
 
         Some(http_proxies)
@@ -44,12 +44,12 @@ pub fn start_workers(tag: &str, ls: &ProxyConfig) -> Option<Vec<Proxy>> {
         let mut tls_proxies = Vec::new();
         for index in 1..ls.worker_count.unwrap_or(1) {
           let (pid, command) = start_worker_process(ls, tag, &index.to_string());
-          let l =  Proxy::new(tag.to_string(), index as u32, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
+          let l =  Worker::new(tag.to_string(), index as u32, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
           tls_proxies.push(l);
         }
 
         let (pid, command) = start_worker_process(ls, tag, &0.to_string());
-        let l =  Proxy::new(tag.to_string(), 0, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
+        let l =  Worker::new(tag.to_string(), 0, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
         tls_proxies.push(l);
 
         Some(tls_proxies)
@@ -61,12 +61,12 @@ pub fn start_workers(tag: &str, ls: &ProxyConfig) -> Option<Vec<Proxy>> {
   }
 }
 
-pub fn start_worker(tag: &str, ls: &ProxyConfig, id: u32) -> Option<Proxy> {
+pub fn start_worker(tag: &str, ls: &ProxyConfig, id: u32) -> Option<Worker> {
   match ls.proxy_type {
     ProxyType::HTTP => {
       if ls.to_http().is_some() {
         let (pid, command) = start_worker_process(ls, tag, &id.to_string());
-        let worker = Proxy::new(tag.to_string(), id, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
+        let worker = Worker::new(tag.to_string(), id, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
         Some(worker)
       } else {
         None
@@ -75,7 +75,7 @@ pub fn start_worker(tag: &str, ls: &ProxyConfig, id: u32) -> Option<Proxy> {
     ProxyType::HTTPS => {
       if ls.to_tls().is_some() {
         let (pid, command) = start_worker_process(ls, tag, &id.to_string());
-        let worker =  Proxy::new(tag.to_string(), id, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
+        let worker =  Worker::new(tag.to_string(), id, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
 
         Some(worker)
       } else {

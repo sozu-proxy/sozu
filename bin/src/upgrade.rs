@@ -13,7 +13,7 @@ use sozu_command::data::{ProxyType,RunState};
 use sozu_command::config::Config;
 
 use logging;
-use command::{CommandServer,Proxy,StoredProxy};
+use command::{CommandServer,StoredProxy,Worker};
 use worker::get_executable_path;
 
 #[derive(Deserialize,Serialize,Debug)]
@@ -28,7 +28,7 @@ pub struct SerializedWorker {
 }
 
 impl SerializedWorker {
-  pub fn from_proxy(proxy: &Proxy) -> SerializedWorker {
+  pub fn from_proxy(proxy: &Worker) -> SerializedWorker {
     SerializedWorker {
       fd:         proxy.channel.sock.as_raw_fd(),
       pid:        proxy.pid,

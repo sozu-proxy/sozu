@@ -25,7 +25,7 @@ use sozu::network::metrics::{METRICS,ProxyMetrics};
 use sozu_command::config::Config;
 use clap::{App,Arg,SubCommand};
 
-use command::Proxy;
+use command::Worker;
 use worker::{begin_worker_process,start_workers};
 use upgrade::begin_new_master_process;
 
@@ -96,7 +96,7 @@ fn main() {
     METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
     let metrics_guard = ProxyMetrics::run();
 
-    let mut proxies:HashMap<String,Vec<Proxy>> = HashMap::new();
+    let mut proxies:HashMap<String,Vec<Worker>> = HashMap::new();
 
     for (ref tag, ref ls) in &config.proxies {
       if let Some(workers) = start_workers(&tag, ls) {

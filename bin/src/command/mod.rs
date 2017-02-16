@@ -42,8 +42,7 @@ impl From<FrontToken> for usize {
     }
 }
 
-//#[derive(Serialize)]
-pub struct Proxy {
+pub struct Worker {
   pub tag:           String,
   pub id:            u32,
   pub proxy_type:    ProxyType,
@@ -55,15 +54,15 @@ pub struct Proxy {
   pub inflight:      HashMap<String,Order>,
 }
 
-impl Proxy {
-  pub fn new(tag: String, id: u32, pid: pid_t, proxy_type: ProxyType, ip_address: String, port: u16, channel: Channel<ProxyOrder,ServerMessage>) -> Proxy {
+impl Worker {
+  pub fn new(tag: String, id: u32, pid: pid_t, proxy_type: ProxyType, ip_address: String, port: u16, channel: Channel<ProxyOrder,ServerMessage>) -> Worker {
     let state = match proxy_type {
       ProxyType::HTTP  => ConfigState::Http(HttpProxy::new(ip_address, port)),
       ProxyType::HTTPS => ConfigState::Tls(TlsProxy::new(ip_address, port)),
       _                => unimplemented!(),
     };
 
-    Proxy {
+    Worker {
       tag:        tag,
       id:         id,
       proxy_type: proxy_type,
@@ -77,9 +76,9 @@ impl Proxy {
   }
 }
 
-impl fmt::Debug for Proxy {
+impl fmt::Debug for Worker {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    write!(f, "Proxy {{ tag: {}, proxy_type: {:?}, state: {:?} }}", self.tag, self.proxy_type, self.state)
+    write!(f, "Worker {{ tag: {}, proxy_type: {:?}, state: {:?} }}", self.tag, self.proxy_type, self.state)
   }
 }
 
@@ -91,7 +90,7 @@ pub struct StoredProxy {
 }
 
 impl StoredProxy {
-  pub fn from_proxy(proxy: &Proxy) -> StoredProxy {
+  pub fn from_worker(proxy: &Worker) -> StoredProxy {
     StoredProxy {
       tag:        proxy.tag.clone(),
       proxy_type: proxy.proxy_type.clone(),
@@ -113,7 +112,7 @@ pub struct CommandServer {
   buffer_size:     usize,
   max_buffer_size: usize,
   conns:           Slab<CommandClient,FrontToken>,
-  proxies:         HashMap<Token, (Tag, Proxy)>,
+  proxies:         HashMap<Token, (Tag, Worker)>,
   next_ids:        HashMap<Tag,u32>,
   state:           HashMap<Tag, StoredProxy>,
   pub poll:        Poll,
@@ -156,7 +155,7 @@ impl CommandServer {
     }
   }
 
-  fn new(srv: UnixListener, config: Config, proxies_map: HashMap<String, Vec<Proxy>>, poll: Poll) -> CommandServer {
+  fn new(srv: UnixListener, config: Config, proxies_map: HashMap<String, Vec<Worker>>, poll: Poll) -> CommandServer {
     //FIXME: verify this
     poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
 
@@ -172,7 +171,7 @@ impl CommandServer {
     for (ref tag, ref mut proxy_list) in proxies_map {
       for proxy in proxy_list.drain(..) {
         if !state.contains_key(tag) {
-          state.insert(tag.to_string(), StoredProxy::from_proxy(&proxy));
+          state.insert(tag.to_string(), StoredProxy::from_worker(&proxy));
         }
 
         token_count += 1;
@@ -349,7 +348,7 @@ impl CommandServer {
 
 }
 
-pub fn start(config: Config, proxies: HashMap<String, Vec<Proxy>>) {
+pub fn start(config: Config, proxies: HashMap<String, Vec<Worker>>) {
   let saved_state     = config.saved_state.clone();
 
   let event_loop = Poll::new().unwrap();
