@@ -6,7 +6,7 @@ use mio_uds::UnixDatagram;
 use std::net::{TcpStream,UdpSocket,ToSocketAddrs};
 use sozu::logging::{Logger,LoggerBackend};
 
-pub fn setup(level: &Option<String>, target: &Option<String>) {
+pub fn setup(tag: String, level: &Option<String>, target: &Option<String>) {
   let backend: LoggerBackend = target.as_ref().map(|s| {
     if s == "stdout" {
       LoggerBackend::Stdout(stdout())
@@ -53,11 +53,11 @@ pub fn setup(level: &Option<String>, target: &Option<String>) {
   }).unwrap_or(LoggerBackend::Stdout(stdout()));
 
   if let Ok(log_level) = env::var("RUST_LOG") {
-    Logger::init(&log_level, backend);
+    Logger::init(tag, &log_level, backend);
   } else if let &Some(ref log_level) = level {
     // We set the env variable so every worker can access it
     env::set_var("RUST_LOG", &log_level);
-    Logger::init(&log_level, backend);
+    Logger::init(tag, &log_level, backend);
   }
 }
 

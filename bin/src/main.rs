@@ -88,7 +88,8 @@ fn main() {
   let config_file = submatches.value_of("config").expect("required config file");
 
   if let Ok(config) = Config::load_from_path(config_file) {
-    logging::setup(&config.log_level, &config.log_target);
+    //FIXME: should have an id for the master too
+    logging::setup("MASTER".to_string(), &config.log_level, &config.log_target);
     info!("starting up");
 
     let metrics_socket = UdpSocket::bind("0.0.0.0:0").unwrap();

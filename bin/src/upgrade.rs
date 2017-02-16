@@ -112,7 +112,8 @@ pub fn begin_new_master_process(fd: i32, channel_buffer_size: usize) {
   command.set_blocking(true);
 
   let upgrade_data = command.read_message().expect("new master could not read upgradz_data from socket");
-  logging::setup(&upgrade_data.config.log_level, &upgrade_data.config.log_target);
+  //FIXME: should have an id for the master too
+  logging::setup("MASTER".to_string(), &upgrade_data.config.log_level, &upgrade_data.config.log_target);
   info!("new master got upgrade data: {:?}", upgrade_data);
 
   let mut server = CommandServer::from_upgrade_data(upgrade_data);

@@ -13,13 +13,15 @@ use mio_uds::UnixDatagram;
 
 lazy_static! {
   pub static ref LOGGER: Mutex<Logger> = Mutex::new(Logger::new());
-  pub static ref PID:    i32 = unsafe { libc::getpid() };
+  pub static ref PID:    i32           = unsafe { libc::getpid() };
+  pub static ref TAG:    String        = LOGGER.lock().unwrap().tag.clone();
 }
 
 
 pub struct Logger {
-  directives: Vec<LogDirective>,
-  backend:    LoggerBackend,
+  pub directives: Vec<LogDirective>,
+  pub backend:    LoggerBackend,
+  pub tag:        String,
 }
 
 impl Logger {
@@ -29,16 +31,20 @@ impl Logger {
         name:  None,
         level: LogLevelFilter::Error,
       }),
-      backend: LoggerBackend::Stdout(stdout())
+      backend: LoggerBackend::Stdout(stdout()),
+      tag:     "WAAAAAAAH".to_string()
     }
   }
 
-  pub fn init(spec: &str, backend: LoggerBackend) {
+  pub fn init(tag: String, spec: &str, backend: LoggerBackend) {
     let directives = parse_logging_spec(spec);
     if let Ok(ref mut logger) = LOGGER.lock() {
       logger.set_directives(directives);
       logger.backend = backend;
+      logger.tag     = tag;
     }
+    //trying to init the logger tag
+    let ref t = *TAG;
   }
 
   pub fn log<'a>(&mut self, meta: &LogMetadata, args: Arguments) {
@@ -340,18 +346,37 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
 
 #[macro_export]
 macro_rules! log {
-    (target: $target:expr, $lvl:expr, $format:expr, $($arg:tt)+) => ({
+    (target: $target:expr, $lvl:expr, $format:expr, $level_tag:expr, $($arg:tt)+) => ({
       use $crate::logging::LOGGER;
       static _META: $crate::logging::LogMetadata = $crate::logging::LogMetadata {
           level:  $lvl,
           target: module_path!(),
       };
-      LOGGER.lock().unwrap().log(
-        &_META,
-        format_args!(
-          concat!("{}\t{}\t{}\t{}\t", $format, '\n'),
-          ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
-          $($arg)+));
+      {
+        let mut logger = LOGGER.lock().unwrap();
+        logger.log(
+          &_META,
+          format_args!(
+            concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
+            ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
+            $level_tag, *$crate::logging::TAG, $($arg)+));
+      }
+    });
+    (target: $target:expr, $lvl:expr, $format:expr, $level_tag:expr) => ({
+      use $crate::logging::LOGGER;
+      static _META: $crate::logging::LogMetadata = $crate::logging::LogMetadata {
+          level:  $lvl,
+          target: module_path!(),
+      };
+      {
+        let mut logger = LOGGER.lock().unwrap();
+        logger.log(
+          &_META,
+          format_args!(
+            concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
+            ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
+            $level_tag, *$crate::logging::TAG));
+      }
     });
     ($lvl:expr, $($arg:tt)+) => (log!(target: module_path!(), $lvl, $($arg)+));
 }
