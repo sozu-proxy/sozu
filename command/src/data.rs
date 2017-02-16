@@ -165,11 +165,11 @@ pub struct ConfigMessage {
   pub version:  u8,
   pub data:     ConfigCommand,
   pub proxy:    Option<String>,
-  pub proxy_id: Option<u8>,
+  pub proxy_id: Option<u32>,
 }
 
 impl ConfigMessage {
-  pub fn new(id: String, data: ConfigCommand, proxy: Option<String>, proxy_id: Option<u8>) -> ConfigMessage {
+  pub fn new(id: String, data: ConfigCommand, proxy: Option<String>, proxy_id: Option<u32>) -> ConfigMessage {
     ConfigMessage {
       id:       id,
       version:  PROTOCOL_VERSION,
@@ -222,7 +222,7 @@ pub enum RunState {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct WorkerInfo {
-  pub id:         u8,
+  pub id:         u32,
   pub pid:        i32,
   pub tag:        String,
   pub proxy_type: ProxyType,
@@ -277,7 +277,7 @@ impl serde::de::Visitor for ConfigMessageVisitor {
     let mut id:Option<String>              = None;
     let mut version:Option<u8>             = None;
     let mut proxy: Option<String>          = None;
-    let mut proxy_id: Option<u8>           = None;
+    let mut proxy_id: Option<u32>          = None;
     let mut config_type:Option<String>     = None;
     let mut data:Option<serde_json::Value> = None;
 

@@ -26,7 +26,7 @@ use worker::get_executable_path;
 pub struct SerializedWorker {
   pub fd:         i32,
   pub pid:        i32,
-  pub id:         u8,
+  pub id:         u32,
   pub tag:        String,
   pub proxy_type: ProxyType,
   pub run_state:  RunState,
@@ -71,7 +71,7 @@ pub struct UpgradeData {
   pub config:      Config,
   pub workers:     Vec<SerializedWorker>,
   pub state:       HashMap<String, SerializedState>,
-  pub next_ids:    HashMap<String,u8>,
+  pub next_ids:    HashMap<String,u32>,
   pub token_count: usize,
 }
 

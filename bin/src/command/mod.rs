@@ -45,7 +45,7 @@ impl From<FrontToken> for usize {
 //#[derive(Serialize)]
 pub struct Proxy {
   pub tag:           String,
-  pub id:            u8,
+  pub id:            u32,
   pub proxy_type:    ProxyType,
   pub channel:       Channel<ProxyOrder,ServerMessage>,
   pub state:         ConfigState,
@@ -56,7 +56,7 @@ pub struct Proxy {
 }
 
 impl Proxy {
-  pub fn new(tag: String, id: u8, pid: pid_t, proxy_type: ProxyType, ip_address: String, port: u16, channel: Channel<ProxyOrder,ServerMessage>) -> Proxy {
+  pub fn new(tag: String, id: u32, pid: pid_t, proxy_type: ProxyType, ip_address: String, port: u16, channel: Channel<ProxyOrder,ServerMessage>) -> Proxy {
     let state = match proxy_type {
       ProxyType::HTTP  => ConfigState::Http(HttpProxy::new(ip_address, port)),
       ProxyType::HTTPS => ConfigState::Tls(TlsProxy::new(ip_address, port)),
@@ -114,7 +114,7 @@ pub struct CommandServer {
   max_buffer_size: usize,
   conns:           Slab<CommandClient,FrontToken>,
   proxies:         HashMap<Token, (Tag, Proxy)>,
-  next_ids:        HashMap<Tag,u8>,
+  next_ids:        HashMap<Tag,u32>,
   pub poll:        Poll,
   timer:           Timer<Token>,
   config:          Config,
@@ -159,9 +159,9 @@ impl CommandServer {
     //FIXME: verify this
     poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
 
-    let mut next_ids: HashMap<String, u8> = HashMap::new();
+    let mut next_ids: HashMap<String, u32> = HashMap::new();
     for (ref tag, ref value) in &proxies_map {
-      next_ids.insert(tag.to_string(), (value.len() - 1) as u8);
+      next_ids.insert(tag.to_string(), (value.len() - 1) as u32);
     }
 
     let mut proxies = HashMap::new();
