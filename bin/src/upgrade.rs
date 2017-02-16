@@ -19,7 +19,7 @@ use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ProxyType,RunState};
 use sozu_command::config::Config;
 
 use logging;
-use command::{CommandServer,Proxy};
+use command::{CommandServer,Proxy,StoredProxy};
 use worker::get_executable_path;
 
 #[derive(Deserialize,Serialize,Debug)]
@@ -48,29 +48,12 @@ impl SerializedWorker {
 }
 
 #[derive(Deserialize,Serialize,Debug)]
-pub struct SerializedState {
-  pub tag:        String,
-  pub proxy_type: ProxyType,
-  pub state:      ConfigState,
-}
-
-impl SerializedState {
-  pub fn from_proxy(proxy: &Proxy) -> SerializedState {
-    SerializedState {
-      tag:        proxy.tag.clone(),
-      proxy_type: proxy.proxy_type.clone(),
-      state:      proxy.state.clone(),
-    }
-  }
-}
-
-#[derive(Deserialize,Serialize,Debug)]
 pub struct UpgradeData {
   pub command:     i32,
   //clients: ????
   pub config:      Config,
   pub workers:     Vec<SerializedWorker>,
-  pub state:       HashMap<String, SerializedState>,
+  pub state:       HashMap<String, StoredProxy>,
   pub next_ids:    HashMap<String,u32>,
   pub token_count: usize,
 }

@@ -26,7 +26,7 @@ use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAns
 use super::{CommandServer,FrontToken,Proxy,ProxyConfiguration,StoredProxy};
 use super::client::parse;
 use worker::start_worker;
-use upgrade::{start_new_master_process,SerializedWorker,SerializedState,UpgradeData};
+use upgrade::{start_new_master_process,SerializedWorker,UpgradeData};
 
 impl CommandServer {
   pub fn handle_client_message(&mut self, token: FrontToken, message: &ConfigMessage) {
@@ -407,12 +407,12 @@ impl CommandServer {
   pub fn generate_upgrade_data(&self) -> UpgradeData {
     let workers: Vec<SerializedWorker> = self.proxies.values().map(|&(_,ref proxy)| SerializedWorker::from_proxy(proxy)).collect();
     let mut seen = HashSet::new();
-    let mut state: HashMap<String, SerializedState> = HashMap::new();
+    let mut state: HashMap<String, StoredProxy> = HashMap::new();
 
     for &(ref tag, ref proxy) in  self.proxies.values() {
       if !seen.contains(&tag) {
         seen.insert(tag);
-        state.insert(tag.to_string(), SerializedState::from_proxy(&proxy) );
+        state.insert(tag.to_string(), StoredProxy::from_proxy(&proxy) );
       }
     }
 
