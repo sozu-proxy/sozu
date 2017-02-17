@@ -1091,7 +1091,7 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
     HeaderValue::Connection(c) => {
       let mut conn = state.get_keep_alive().unwrap_or(Connection::KeepAlive);
       for value in c {
-      trace!("PARSER\tgot Connection header: {:?}", str::from_utf8(value).expect("could not make string from value"));
+      info!("PARSER\tgot Connection header: {:?}", str::from_utf8(value).expect("could not make string from value"));
         match &value.to_ascii_lowercase()[..] {
           b"close"      => conn = Connection::Close,
           b"keep-alive" => conn = Connection::KeepAlive,

@@ -363,11 +363,11 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
         if event.token() == Token(0) {
           let kind = event.kind();
           if kind.is_error() {
-            error!("{}\terror reading from command channel", self.tag());
+            error!("error reading from command channel");
             continue;
           }
           if kind.is_hup() {
-            error!("{}\tcommand channel was closed", self.tag());
+            error!("command channel was closed");
             continue;
           }
           self.configuration.channel().handle_events(kind);
@@ -376,7 +376,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
           // loop here because iterations has borrow issues
           loop {
             let msg = self.configuration.channel().read_message();
-            info!("{}\tgot message: {:?}", self.tag(), msg);
+            info!("got message: {:?}", msg);
 
             // if the message was too large, we grow the buffer and retry to read if possible
             if msg.is_none() {
@@ -437,12 +437,12 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
         }
 
         if events.is_writable() {
-          error!("{}\treceived writable for listener {:?}, this should not happen", self.tag(), token);
+          error!("received writable for listener {:?}, this should not happen", token);
           return;
         }
 
         if events.is_hup() {
-          error!("{}\tshould not happen: server {:?} closed", self.tag(), token);
+          error!("should not happen: server {:?} closed", token);
           return;
         }
         unreachable!();
@@ -487,7 +487,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
 
       if front_interest.is_readable() {
         let order = self.clients[client_token].readable();
-        trace!("{}\tfront readable\tinterpreting client order {:?}", self.tag(), order);
+        trace!("front readable\tinterpreting client order {:?}", order);
 
         // FIXME: should clear the timeout only if data was consumed
         if let Some(timeout) = self.clients[client_token].front_timeout() {
@@ -535,7 +535,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
 
       if front_interest.is_writable() {
         let order = self.clients[client_token].writable();
-        trace!("{}\tfront writable\tinterpreting client order {:?}", self.tag(), order);
+        trace!("front writable\tinterpreting client order {:?}", order);
         self.interpret_client_order(client_token, order);
         //self.clients[client_token].readiness().front_readiness.remove(Ready::writable());
       }

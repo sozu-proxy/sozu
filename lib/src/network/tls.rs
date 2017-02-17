@@ -345,7 +345,7 @@ impl ServerConfiguration {
     let cert = try!(X509::from_pem(&tls_data.certificate));
 
     let common_name: Option<String> = get_cert_common_name(&cert);
-    info!("{}\tgot common name: {:?}", &tag, common_name);
+    info!("got common name: {:?}", common_name);
 
     let app = TlsApp {
       app_id:           config.default_app_id.clone().unwrap_or(String::new()),
@@ -391,7 +391,7 @@ impl ServerConfiguration {
         })
       },
       Err(e) => {
-        let formatted_err = format!("{}\tcould not create listener {:?}: {:?}", tag, fronts, e);
+        let formatted_err = format!("could not create listener {:?}: {:?}", fronts, e);
         error!("{}", formatted_err);
         channel.write_message(&ServerMessage{id: String::from("listener_failed"), status: ServerMessageStatus::Error(formatted_err)});
         channel.run();
@@ -442,7 +442,7 @@ impl ServerConfiguration {
           ).collect()
         }).unwrap_or(vec!());
 
-        info!("{}\tgot subject alt names: {:?}", &tag, names);
+        info!("got subject alt names: {:?}", names);
         {
           let mut domains = unwrap_msg!(ref_domains.lock());
           for name in &names {
@@ -459,33 +459,33 @@ impl ServerConfiguration {
           let contexts = unwrap_msg!(ref_ctx.lock());
           let domains  = unwrap_msg!(ref_domains.lock());
 
-          info!("{}\tref: {:?}", tag, ssl);
+          info!("ref: {:?}", ssl);
           if let Some(servername) = ssl.servername().map(|s| s.to_string()) {
             info!("checking servername: {}", servername);
             if &servername == &default_name {
               return Ok(());
             }
-            info!("{}\tlooking for fingerprint for {:?}", tag, servername);
+            info!("looking for fingerprint for {:?}", servername);
             if let Some(kv) = domains.domain_lookup(servername.as_bytes()) {
-              info!("{}\tlooking for context for {:?} with fingerprint {:?}", tag, servername, kv.1);
+              info!("looking for context for {:?} with fingerprint {:?}", servername, kv.1);
               if let Some(ref tls_data) = contexts.get(&kv.1) {
-                info!("{}\tfound context for {:?}", tag, servername);
+                info!("found context for {:?}", servername);
                 if !tls_data.initialized {
                   //FIXME: couldn't we skip to the next cert?
-                  error!("{}\t no application is using that certificate", tag);
+                  error!("no application is using that certificate");
                   return Ok(());
                 }
                 let context: &SslContext = &tls_data.context;
                 if let Ok(()) = ssl.set_ssl_context(context) {
-                  info!("{}\tservername is now {:?}", tag, ssl.servername());
+                  info!("servername is now {:?}", ssl.servername());
                   return Ok(());
                 } else {
-                  error!("{}\tno context found for {:?}", tag, servername);
+                  error!("no context found for {:?}", servername);
                 }
               }
             }
           } else {
-            error!("{}\tgot no server name from ssl, answering with default one", tag);
+            error!("got no server name from ssl, answering with default one");
           }
           //answer ok because we use the default certificate
           Ok(())
@@ -542,7 +542,7 @@ impl ServerConfiguration {
   }
 
   pub fn remove_tls_front(&mut self, front: TlsFront, event_loop: &mut Poll) {
-    info!("{}\tremoving tls_front {:?}", self.tag, front);
+    info!("removing tls_front {:?}", front);
 
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
       if let Some(pos) = fronts.iter().position(|f| &f.app_id == &front.app_id) {
@@ -588,14 +588,14 @@ impl ServerConfiguration {
       //FIXME
       let fingerprint = unwrap_msg!(cert.fingerprint(MessageDigest::sha256()));
       let common_name: Option<String> = get_cert_common_name(&cert);
-      info!("{}\tgot common name: {:?}", self.tag, common_name);
+      info!("got common name: {:?}", common_name);
 
       let names: Vec<String> = cert.subject_alt_names().map(|names| {
         names.iter().filter_map(|general_name|
           general_name.dnsname().map(|name| String::from(name))
         ).collect()
       }).unwrap_or(vec!());
-      info!("{}\tgot subject alt names: {:?}", self.tag, names);
+      info!("got subject alt names: {:?}", names);
 
       ctx.set_certificate(&cert);
       ctx.set_private_key(&key);
@@ -638,7 +638,7 @@ impl ServerConfiguration {
 
   // FIXME: return an error if the cert is still in use
   pub fn remove_certificate(&mut self, fingerprint: CertFingerprint, event_loop: &mut Poll) {
-    info!("{}\tremoving certificate {:?}", self.tag, fingerprint);
+    info!("removing certificate {:?}", fingerprint);
     let mut contexts = unwrap_msg!(self.contexts.lock());
     let mut domains  = unwrap_msg!(self.domains.lock());
     let must_delete = contexts.get_mut(&fingerprint).map(|tls_data| {
@@ -686,7 +686,7 @@ impl ServerConfiguration {
       if let Some(instances) = self.instances.get_mut(app_id) {
         instances.retain(|backend| &backend.address != instance_address);
       } else {
-        error!("{}\tInstance was already removed", self.tag);
+        error!("Instance was already removed");
       }
   }
 
@@ -694,7 +694,7 @@ impl ServerConfiguration {
   pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&TlsApp> {
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
-        error!("{}\tinvalid remaining chars after hostname", self.tag);
+        error!("invalid remaining chars after hostname");
         return None;
       }
 
@@ -703,7 +703,7 @@ impl ServerConfiguration {
       // chars in there
       unsafe { from_utf8_unchecked(hostname) }
     } else {
-      error!("{}\thostname parsing failed", self.tag);
+      error!("hostname parsing failed");
       return None;
     };
 
@@ -729,13 +729,13 @@ impl ServerConfiguration {
   }
 
   pub fn backend_from_request(&mut self, client: &mut TlsClient, host: &str, uri: &str) -> Result<TcpStream,ConnectionError> {
-    trace!("{}\tlooking for backend for host: {}", self.tag, host);
+    trace!("looking for backend for host: {}", host);
     let real_host = if let Some(h) = host.split(":").next() {
       h
     } else {
       host
     };
-    trace!("{}\tlooking for backend for real host: {}", self.tag, real_host);
+    trace!("looking for backend for real host: {}", real_host);
 
     if let Some(app_id) = self.frontend_from_request(real_host, uri).map(|ref front| front.app_id.clone()) {
       unwrap_msg!(client.http()).app_id = Some(app_id.clone());
@@ -776,10 +776,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           return Some((c, false))
         }
       } else {
-        error!("{}\tcould not create ssl context", self.tag);
+        error!("could not create ssl context");
       }
     } else {
-      error!("{}\tcould not accept connection: {:?}", self.tag, accepted);
+      error!("could not accept connection: {:?}", accepted);
     }
     None
   }
@@ -789,7 +789,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
-        error!("{}\tinvalid remaining chars after hostname", self.tag);
+        error!("invalid remaining chars after hostname");
         return Err(ConnectionError::ToBeDefined);
       }
 
@@ -801,7 +801,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       //FIXME: what if we don't use SNI?
       let servername: Option<String> = unwrap_msg!(client.http()).frontend.ssl().servername().map(|s| s.to_string());
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
-        error!("{}\tTLS SNI hostname and Host header don't match", self.tag);
+        error!("TLS SNI hostname and Host header don't match");
         return Err(ConnectionError::HostNotFound);
       }
 
@@ -813,7 +813,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         &h
       }
     } else {
-      error!("{}\thostname parsing failed", self.tag);
+      error!("hostname parsing failed");
       return Err(ConnectionError::ToBeDefined);
     };
 
@@ -855,7 +855,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   }
 
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyOrder) {
-    trace!("{}\t{} notified", self.tag, message);
+    trace!("{} notified", message);
     match message.order {
       Order::AddTlsFront(front) => {
         //info!("TLS\t{} add front {:?}", id, front);
@@ -878,7 +878,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::AddInstance(instance) => {
-        info!("{}\t{} add instance {:?}", self.tag, message.id, instance);
+        info!("{} add instance {:?}", message.id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -889,7 +889,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         }
       },
       Order::RemoveInstance(instance) => {
-        info!("{}\t{} remove instance {:?}", self.tag, message.id, instance);
+        info!("{} remove instance {:?}", message.id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -900,7 +900,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         }
       },
       Order::HttpProxy(configuration) => {
-        info!("{}\t{} modifying proxy configuration: {:?}", self.tag, message.id, configuration);
+        info!("{} modifying proxy configuration: {:?}", message.id, configuration);
         self.front_timeout = configuration.front_timeout;
         self.back_timeout  = configuration.back_timeout;
         self.answers = DefaultAnswers {
@@ -910,20 +910,20 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::SoftStop => {
-        info!("{}\t{} processing soft shutdown", self.tag, message.id);
+        info!("{} processing soft shutdown", message.id);
         event_loop.deregister(&self.listener);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
       },
       Order::HardStop => {
-        info!("{}\t{} hard shutdown", self.tag, message.id);
+        info!("{} hard shutdown", message.id);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::Status => {
-        info!("{}\t{} status", self.tag, message.id);
+        info!("{} status", message.id);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       command => {
-        error!("{}\t{} unsupported message, ignoring {:?}", self.tag, message.id, command);
+        error!("{} unsupported message, ignoring {:?}", message.id, command);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
       }
     }
@@ -965,9 +965,9 @@ pub fn start(tag: String, config: TlsProxyConfiguration, channel: ProxyChannel) 
   if let Ok(configuration) = ServerConfiguration::new(tag.clone(), config, channel, &mut event_loop, 1 + max_listeners) {
     let mut server = TlsServer::new(max_listeners, max_connections, configuration, event_loop);
 
-    info!("{}\tstarting event loop", &tag);
+    info!("starting event loop");
     server.run();
-    info!("{}\tending event loop", &tag);
+    info!("ending event loop");
   }
 }
 

@@ -381,14 +381,14 @@ impl ServerConfiguration {
       if let Some(instances) = self.instances.get_mut(app_id) {
         instances.retain(|backend| &backend.address != instance_address);
       } else {
-        error!("{}\tInstance was already removed", self.tag);
+        error!("Instance was already removed");
       }
   }
 
   pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&HttpFront> {
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
-        error!("{}\tinvalid remaining chars after hostname", self.tag);
+        error!("invalid remaining chars after hostname");
         return None;
       }
 
@@ -403,7 +403,7 @@ impl ServerConfiguration {
       */
       unsafe { from_utf8_unchecked(hostname) }
     } else {
-      error!("{}\thostname parsing failed", self.tag);
+      error!("hostname parsing failed");
       return None;
     };
 
@@ -461,7 +461,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
-        error!("{}\tinvalid remaining chars after hostname", self.tag);
+        error!("invalid remaining chars after hostname");
         return Err(ConnectionError::ToBeDefined);
       }
 
@@ -477,7 +477,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         &h
       }
     } else {
-      error!("{}\thostname parsing failed", self.tag);
+      error!("hostname parsing failed");
       return Err(ConnectionError::ToBeDefined);
     };
 
@@ -533,20 +533,20 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyOrder) {
   // ToDo temporary
-    trace!("{}\t{} notified", self.tag, message);
+    trace!("{} notified", message);
     match message.order {
       Order::AddHttpFront(front) => {
-        info!("{}\t{} add front {:?}", self.tag, message.id, front);
+        info!("{} add front {:?}", message.id, front);
           self.add_http_front(front, event_loop);
           self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::RemoveHttpFront(front) => {
-        info!("{}\t{} front {:?}", self.tag, message.id, front);
+        info!("{} front {:?}", message.id, front);
         self.remove_http_front(front, event_loop);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::AddInstance(instance) => {
-        info!("{}\t{} add instance {:?}", self.tag, message.id, instance);
+        info!("{} add instance {:?}", message.id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -557,7 +557,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         }
       },
       Order::RemoveInstance(instance) => {
-        info!("{}\t{} remove instance {:?}", self.tag, message.id, instance);
+        info!("{} remove instance {:?}", message.id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -568,7 +568,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         }
       },
       Order::HttpProxy(configuration) => {
-        info!("{}\t{} modifying proxy configuration: {:?}", self.tag, message.id, configuration);
+        info!("{} modifying proxy configuration: {:?}", message.id, configuration);
         self.front_timeout = configuration.front_timeout;
         self.back_timeout  = configuration.back_timeout;
         self.answers = DefaultAnswers {
@@ -578,24 +578,24 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::SoftStop => {
-        info!("{}\t{} processing soft shutdown", self.tag, message.id);
+        info!("{} processing soft shutdown", message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
         event_loop.deregister(&self.listener);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
       },
       Order::HardStop => {
-        info!("{}\t{} hard shutdown", self.tag, message.id);
+        info!("{} hard shutdown", message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::Status => {
-        info!("{}\t{} status", self.tag, message.id);
+        info!("{} status", message.id);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       command => {
-        debug!("{}\t{} unsupported message, ignoring: {:?}", self.tag, message.id, command);
+        debug!("{} unsupported message, ignoring: {:?}", message.id, command);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
       }
     }
@@ -612,7 +612,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         return Some((c, false))
       }
     } else {
-      error!("{}\tcould not accept: {:?}", self.tag, accepted);
+      error!("could not accept: {:?}", accepted);
     }
     None
   }
@@ -653,9 +653,9 @@ pub fn start(tag:String, config: HttpProxyConfiguration, channel: ProxyChannel) 
   if let Ok(configuration) = ServerConfiguration::new(tag.clone(), config, channel, &mut event_loop, 1 + max_listeners) {
     let mut server = HttpServer::new(max_listeners, max_connections, configuration, event_loop);
 
-    info!("{}\tstarting event loop", &tag);
+    info!("starting event loop");
     server.run();
-    info!("{}\tending event loop", &tag);
+    info!("ending event loop");
   }
 }
 

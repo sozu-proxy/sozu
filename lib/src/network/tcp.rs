@@ -109,9 +109,9 @@ impl ProxyClient for Client {
 
   fn log_context(&self) -> String {
     if let Some(ref app_id) = self.app_id {
-      format!("TCP\t{}\t{}\t", self.request_id, app_id)
+      format!("{}\t{}\t", self.request_id, app_id)
     } else {
-      format!("TCP\t{}\tunknown\t", self.request_id)
+      format!("{}\tunknown\t", self.request_id)
     }
   }
 
@@ -148,7 +148,7 @@ impl ProxyClient for Client {
   }
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    debug!("{}\tTCP\tPROXY [{} -> {}] CLOSED BACKEND", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0);
+    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0);
     let addr = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
     self.backend       = None;
     self.backend_token = None;
@@ -192,7 +192,7 @@ impl ProxyClient for Client {
     } else {
       self.readiness.front_readiness.remove(Ready::readable());
     }
-    trace!("{}\tTCP\tFRONT [{}->{}]: read {} bytes", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0, sz);
+    trace!("{}\tFRONT [{}->{}]: read {} bytes", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0, sz);
 
     match res {
       SocketResult::Error => {
@@ -224,7 +224,7 @@ impl ProxyClient for Client {
        self.back_buf.consume_output_data(current_sz);
        sz += current_sz;
      }
-     trace!("{}\tTCP\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0, sz);
+     trace!("{}\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0, sz);
 
      match socket_res {
        SocketResult::Error => {
@@ -255,7 +255,7 @@ impl ProxyClient for Client {
       self.back_buf.sliced_input(sz);
       self.back_buf.consume_parsed_data(sz);
       self.back_buf.slice_output(sz);
-      trace!("{}\tTCP\tBACK  [{}<-{}]: read {} bytes", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0, sz);
+      trace!("{}\tBACK  [{}<-{}]: read {} bytes", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0, sz);
 
       match res {
         SocketResult::Error => {
@@ -294,7 +294,7 @@ impl ProxyClient for Client {
          sz += current_sz;
        }
      }
-    trace!("{}\tTCP\tBACK [{}->{}]: wrote {} bytes", self.request_id, self.token.unwrap().0, self.backend_token.unwrap().0, sz);
+    trace!("{}\tBACK [{}->{}]: wrote {} bytes", self.request_id, self.token.unwrap().0, self.backend_token.unwrap().0, sz);
 
      match socket_res {
        SocketResult::Error => {
@@ -373,21 +373,21 @@ impl ServerConfiguration {
         self.listeners[tok].token = Some(Token(2+tok.0));
         self.fronts.insert(String::from(app_id), tok);
         event_loop.register(&self.listeners[tok].sock, Token(2+tok.0), Ready::readable(), PollOpt::level());
-        info!("TCP\tregistered listener for app {} on port {}", app_id, front.port());
+        info!("registered listener for app {} on port {}", app_id, front.port());
         Some(tok)
       } else {
-        error!("TCP\tcould not register listener for app {} on port {}", app_id, front.port());
+        error!("could not register listener for app {} on port {}", app_id, front.port());
         None
       }
 
     } else {
-      error!("TCP\tcould not declare listener for app {} on port {}", app_id, front.port());
+      error!("could not declare listener for app {} on port {}", app_id, front.port());
       None
     }
   }
 
   pub fn remove_tcp_front(&mut self, app_id: String, event_loop: &mut Poll) -> Option<ListenToken>{
-    info!("TCP\tremoving tcp_front {:?}", app_id);
+    info!("removing tcp_front {:?}", app_id);
     // ToDo
     // Removes all listeners for the given app_id
     // an app can't have two listeners. Is this a problem?
@@ -395,7 +395,7 @@ impl ServerConfiguration {
       if self.listeners.contains(tok) {
         event_loop.deregister(&self.listeners[tok].sock);
         self.listeners.remove(tok);
-        warn!("TCP\tremoved server {:?}", tok);
+        warn!("removed server {:?}", tok);
         //self.listeners[tok].sock.shutdown(Shutdown::Both);
         Some(tok)
       } else {
@@ -425,7 +425,7 @@ impl ServerConfiguration {
       application_listener.back_addresses.push(*instance_address);
       Some(tok)
     } else {
-      error!("TCP\tNo front for this instance");
+      error!("No front for this instance");
       None
     }
   }
@@ -462,16 +462,16 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, event_loop) {
             self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
           } else {
-            error!("TCP\tCouldn't add tcp front");
+            error!("Couldn't add tcp front");
             self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot add tcp front"))});
           }
         } else {
-          error!("TCP\tCouldn't parse tcp front address");
+          error!("Couldn't parse tcp front address");
           self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Order::RemoveTcpFront(front) => {
-        trace!("TCP\t{:?}", front);
+        trace!("{:?}", front);
         let _ = self.remove_tcp_front(front.app_id, event_loop);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
@@ -481,38 +481,38 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
           self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
-          error!("TCP\tCouldn't add tcp instance");
+          error!("Couldn't add tcp instance");
           self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot add tcp instance"))});
         }
       },
       Order::RemoveInstance(instance) => {
-        trace!("TCP\t{:?}", instance);
+        trace!("{:?}", instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
           self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
-          error!("TCP\tCouldn't remove tcp instance");
+          error!("Couldn't remove tcp instance");
           self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot remove tcp instance"))});
         }
       },
       Order::SoftStop => {
-        info!("{}\t{} processing soft shutdown", "TCP", message.id);
+        info!("{} processing soft shutdown", message.id);
         for listener in self.listeners.iter() {
           event_loop.deregister(&listener.sock);
         }
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
       },
       Order::HardStop => {
-        info!("{}\t{} hard shutdown", "TCP", message.id);
+        info!("{} hard shutdown", message.id);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::Status => {
-        info!("{}\t{} status", "TCP", message.id);
+        info!("{} status", message.id);
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       _ => {
-        error!("TCP\tunsupported message, ignoring");
+        error!("unsupported message, ignoring");
         self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
       }
     }
@@ -532,7 +532,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         }
       }
     } else {
-      error!("TCP\tcould not get buffers from pool");
+      error!("could not get buffers from pool");
     }
     None
   }
@@ -570,14 +570,14 @@ pub fn start_example() -> Channel<ProxyOrder,ServerMessage> {
   let poll = Poll::new().expect("could not create event loop");
 
 
-  info!("TCP\tlisten for connections");
+  info!("listen for connections");
   let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
   let configuration = ServerConfiguration::new(10, channel);
   let mut s = TcpServer::new(10, 500, configuration, poll);
   thread::spawn(move|| {
-    info!("TCP\tstarting event loop");
+    info!("starting event loop");
     s.run();
-    info!("TCP\tending event loop");
+    info!("ending event loop");
   });
   {
     let front = TcpFront {
@@ -617,9 +617,9 @@ pub fn start(max_listeners: usize, max_connections: usize, channel: ProxyChannel
   let mut server        = TcpServer::new(max_listeners, max_connections, configuration, poll);
   let front: SocketAddr = FromStr::from_str("127.0.0.1:8443").expect("could not parse address");
 
-  info!("TCP\tstarting event loop");
+  info!("starting event loop");
   server.run();
-  info!("TCP\tending event loop");
+  info!("ending event loop");
 }
 
 
