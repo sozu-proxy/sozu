@@ -111,23 +111,19 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str, channel_buffer_size: u
   command.set_nonblocking(true);
   let command: Channel<ServerMessage,ProxyOrder> = command.into();
 
-  let t = format!("{}-{}", tag, id);
-
   match proxy_config.proxy_type {
     ProxyType::HTTP => {
       if let Some(config) = proxy_config.to_http() {
-        http::start(t.clone(), config, command);
+        http::start(config, command);
       }
     },
     ProxyType::HTTPS => {
       if let Some(config) = proxy_config.to_tls() {
-        tls::start(t.clone(), config, command);
+        tls::start(config, command);
       }
     },
     _ => unimplemented!()
   }
-
-  info!("{}\tproxy ended", t);
 }
 
 pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t, Channel<ProxyOrder,ServerMessage>) {

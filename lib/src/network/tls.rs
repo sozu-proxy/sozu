@@ -71,11 +71,11 @@ pub struct TlsClient {
 }
 
 impl TlsClient {
-  pub fn new(server_context: &str, ssl:Ssl, sock: TcpStream, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> Option<TlsClient> {
+  pub fn new(ssl:Ssl, sock: TcpStream, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> Option<TlsClient> {
     //FIXME: we should not need to clone the socket. Maybe do the accept here instead of
     // in TlsHandshake?
     let s = sock.try_clone().expect("could not clone the socket");
-    let handshake = TlsHandshake::new(server_context, ssl, s);
+    let handshake = TlsHandshake::new(ssl, s);
     Some(TlsClient {
       front:          Some(sock),
       front_token:    None,
@@ -106,7 +106,7 @@ impl TlsClient {
         let mut p = pool.borrow_mut();
 
         if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-          let mut http = Http::new(&handshake.server_context, unwrap_msg!(handshake.stream), front_buf,
+          let mut http = Http::new(unwrap_msg!(handshake.stream), front_buf,
             back_buf, self.public_address.clone()).unwrap();
 
           http.readiness = handshake.readiness;
@@ -126,7 +126,7 @@ impl TlsClient {
       let front_token = unwrap_msg!(http.front_token());
       let back_token  = unwrap_msg!(http.back_token());
 
-      let mut pipe = Pipe::new(&http.server_context, http.frontend, unwrap_msg!(http.backend),
+      let mut pipe = Pipe::new(http.frontend, unwrap_msg!(http.backend),
         http.front_buf, http.back_buf, http.public_address).expect("could not create Pipe instance");
 
       pipe.readiness.front_readiness = http.readiness.front_readiness;
@@ -326,11 +326,10 @@ pub struct ServerConfiguration {
   front_timeout:   u64,
   back_timeout:    u64,
   config:          TlsProxyConfiguration,
-  tag:             String,
 }
 
 impl ServerConfiguration {
-  pub fn new(tag: String, config: TlsProxyConfiguration, mut channel: ProxyChannel, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
+  pub fn new(config: TlsProxyConfiguration, mut channel: ProxyChannel, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let mut domains  = TrieNode::root();
     let mut fronts   = HashMap::new();
@@ -338,10 +337,9 @@ impl ServerConfiguration {
     let ref_ctx      = rc_ctx.clone();
     let rc_domains   = Arc::new(Mutex::new(domains));
     let ref_domains  = rc_domains.clone();
-    let cl_tag       = tag.clone();
     let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
 
-    let (fingerprint, mut tls_data, names):(Vec<u8>,TlsData, Vec<String>) = Self::create_default_context(&config, ref_ctx, ref_domains, cl_tag, default_name).expect("could not create default context");
+    let (fingerprint, mut tls_data, names):(Vec<u8>,TlsData, Vec<String>) = Self::create_default_context(&config, ref_ctx, ref_domains, default_name).expect("could not create default context");
     let cert = try!(X509::from_pem(&tls_data.certificate));
 
     let common_name: Option<String> = get_cert_common_name(&cert);
@@ -387,7 +385,6 @@ impl ServerConfiguration {
           back_timeout:    50000,
           answers:         default,
           config:          config,
-          tag:             tag,
         })
       },
       Err(e) => {
@@ -400,7 +397,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn create_default_context(config: &TlsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, tag: String, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>)> {
+  pub fn create_default_context(config: &TlsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>)> {
     let ctx = SslContext::builder(SslMethod::tls());
     if let Err(e) = ctx {
       //return Err(io::Error::new(io::ErrorKind::Other, e.description()));
@@ -772,7 +769,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     if let Ok((frontend_sock, _)) = accepted {
       frontend_sock.set_nodelay(true);
       if let Ok(ssl) = Ssl::new(&self.default_context.context) {
-        if let Some(c) = TlsClient::new("TLS", ssl, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address) {
+        if let Some(c) = TlsClient::new(ssl, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address) {
           return Some((c, false))
         }
       } else {
@@ -948,21 +945,17 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   fn channel(&mut self)   -> &mut ProxyChannel {
     &mut self.channel
   }
-
-  fn tag(&self)           -> &str {
-    &self.tag
-  }
 }
 
 pub type TlsServer = Server<ServerConfiguration,TlsClient>;
 
-pub fn start(tag: String, config: TlsProxyConfiguration, channel: ProxyChannel) {
+pub fn start(config: TlsProxyConfiguration, channel: ProxyChannel) {
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_connections = config.max_connections;
   let max_listeners   = 1;
 
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok(configuration) = ServerConfiguration::new(tag.clone(), config, channel, &mut event_loop, 1 + max_listeners) {
+  if let Ok(configuration) = ServerConfiguration::new(config, channel, &mut event_loop, 1 + max_listeners) {
     let mut server = TlsServer::new(max_listeners, max_connections, configuration, event_loop);
 
     info!("starting event loop");
@@ -1128,7 +1121,6 @@ mod tests {
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
       },
       config: Default::default(),
-      tag:    String::from("TLS"),
     };
 
     println!("TEST {}", line!());

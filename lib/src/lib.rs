@@ -30,7 +30,7 @@
 //! let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 //!
 //! let jg            = thread::spawn(move || {
-//!    network::http::start(String::from("HTTP"), config, channel);
+//!    network::http::start(config, channel);
 //! });
 //!
 //! ```
@@ -102,7 +102,7 @@
 //! use std::thread;
 //! use std::sync::mpsc;
 //! use sozu::messages;
-//! use sozu::network::{self,ProxyOrder};
+//! use sozu::network;
 //! use sozu::channel::Channel;
 //!
 //! fn main() {
@@ -117,7 +117,7 @@
 //!   let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 //!
 //!   let jg            = thread::spawn(move || {
-//!      network::http::start(String::from("HTTP"), config, channel);
+//!      network::http::start(config, channel);
 //!   });
 //!
 //!   let http_front = messages::HttpFront {

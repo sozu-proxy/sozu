@@ -556,12 +556,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   fn channel(&mut self)   -> &mut ProxyChannel {
     &mut self.channel
   }
-
-
-  fn tag(&self)           -> &str {
-    //FIXME: pass this from configuration
-    "TCP"
-  }
 }
 
 pub type TcpServer = Server<ServerConfiguration,Client>;

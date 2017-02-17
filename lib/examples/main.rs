@@ -59,7 +59,7 @@ fn main() {
 
   let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
   let jg = thread::spawn(move || {
-    network::http::start(String::from("HTTP"), config, channel);
+    network::http::start(config, channel);
   });
 
   let http_front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") };
@@ -96,7 +96,7 @@ fn main() {
 
   let (mut command2, channel2) = Channel::generate(1000, 10000).expect("should create a channel");
   let jg2 = thread::spawn(move || {
-    network::tls::start(String::from("TLS"), config, channel2);
+    network::tls::start(config, channel2);
   });
 
   let cert1 = include_str!("../../assets/certificate.pem");

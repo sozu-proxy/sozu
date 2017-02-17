@@ -41,16 +41,15 @@ pub struct Http<Front:SocketHandler> {
   res_size:           usize,
   pub app_id:         Option<String>,
   pub request_id:     String,
-  pub server_context: String,
   pub readiness:      Readiness,
   pub log_ctx:        String,
   pub public_address: Option<IpAddr>,
 }
 
 impl<Front:SocketHandler> Http<Front> {
-  pub fn new(server_context: &str, sock: Front, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<Http<Front>> {
+  pub fn new(sock: Front, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<Http<Front>> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
-    let log_ctx    = format!("{}\t{}\tunknown\t", server_context, &request_id);
+    let log_ctx    = format!("{}\tunknown\t", &request_id);
     let mut client = Http {
       frontend:           sock,
       backend:            None,
@@ -69,7 +68,6 @@ impl<Front:SocketHandler> Http<Front> {
       res_size:           0,
       app_id:             None,
       request_id:         request_id,
-      server_context:     String::from(server_context),
       readiness:          Readiness::new(),
       log_ctx:            log_ctx,
       public_address:     public_address,
@@ -96,7 +94,7 @@ impl<Front:SocketHandler> Http<Front> {
     self.back_buf.reset();
     //self.readiness = Readiness::new();
     self.request_id = request_id;
-    self.log_ctx = format!("{}\t{}\t{}\t", self.server_context, self.request_id, self.app_id.as_ref().unwrap_or(&String::from("unknown")));
+    self.log_ctx = format!("{}\t{}\t", self.request_id, self.app_id.as_ref().unwrap_or(&String::from("unknown")));
   }
 
   fn tokens(&self) -> Option<(Token,Token)> {
@@ -185,9 +183,9 @@ impl<Front:SocketHandler> Http<Front> {
 
   pub fn log_context(&self) -> String {
     if let Some(ref app_id) = self.app_id {
-      format!("{}\t{}\t{}\t", self.server_context, self.request_id, app_id)
+      format!("{}\t{}\t", self.request_id, app_id)
     } else {
-      format!("{}\t{}\tunknown\t", self.server_context, self.request_id)
+      format!("{}\tunknown\t", self.request_id)
     }
   }
 

@@ -141,7 +141,6 @@ pub trait ProxyConfiguration<Client> {
   fn front_timeout(&self) -> u64;
   fn back_timeout(&self)  -> u64;
   fn channel(&mut self)   -> &mut ProxyChannel;
-  fn tag(&self)           -> &str;
 }
 
 pub struct Server<ServerConfiguration,Client> {
@@ -175,10 +174,6 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
       timer:           timer,
       shutting_down:   None,
     }
-  }
-
-  pub fn tag(&self) -> &str {
-    self.configuration.tag()
   }
 
   pub fn to_front(&self, token: Token) -> FrontToken {

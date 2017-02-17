@@ -51,17 +51,17 @@ pub struct Client {
 }
 
 impl Client {
-  pub fn new(server_context: &str, sock: TcpStream, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> Option<Client> {
+  pub fn new(sock: TcpStream, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> Option<Client> {
     let protocol = if let Some(pool) = pool.upgrade() {
       let mut p = pool.borrow_mut();
       if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-        Some(Http::new(server_context, unwrap_msg!(sock.try_clone()), front_buf, back_buf, public_address).expect("should create a HTTP state"))
+        Some(Http::new(unwrap_msg!(sock.try_clone()), front_buf, back_buf, public_address).expect("should create a HTTP state"))
       } else { None }
     } else { None };
 
     protocol.map(|http| {
       let request_id = Uuid::new_v4().hyphenated().to_string();
-      let log_ctx    = format!("{}\t{}\tunknown\t", server_context, &request_id);
+      let log_ctx    = format!("{}\tunknown\t", &request_id);
       let client = Client {
         backend:        None,
         token:          None,
@@ -85,7 +85,7 @@ impl Client {
       let front_token = unwrap_msg!(http.front_token());
       let back_token  = unwrap_msg!(http.back_token());
 
-      let mut pipe = Pipe::new(&http.server_context, http.frontend, unwrap_msg!(http.backend),
+      let mut pipe = Pipe::new(http.frontend, unwrap_msg!(http.backend),
         http.front_buf, http.back_buf, http.public_address).expect("could not create a Pipe instance");
 
       pipe.readiness.front_readiness = http.readiness.front_readiness;
@@ -138,9 +138,9 @@ impl ProxyClient for Client {
     match *unwrap_msg!(self.protocol.as_ref()) {
       State::Http(ref http) => {
         if let Some(ref app_id) = http.app_id {
-          format!("{}\t{}\t{}\t", http.server_context, http.request_id, app_id)
+          format!("{}\t{}\t", http.request_id, app_id)
         } else {
-          format!("{}\t{}\tunknown\t", http.server_context, http.request_id)
+          format!("{}\tunknown\t", http.request_id)
         }
 
       },
@@ -289,11 +289,10 @@ pub struct ServerConfiguration {
   front_timeout:   u64,
   back_timeout:    u64,
   config:          HttpProxyConfiguration,
-  tag:             String,
 }
 
 impl ServerConfiguration {
-  pub fn new(tag: String, config: HttpProxyConfiguration, mut channel: ProxyChannel, event_loop: &mut Poll, start_at:usize) -> io::Result<ServerConfiguration> {
+  pub fn new(config: HttpProxyConfiguration, mut channel: ProxyChannel, event_loop: &mut Poll, start_at:usize) -> io::Result<ServerConfiguration> {
     let front = config.front;
     match server_bind(&config.front) {
       Ok(sock) => {
@@ -326,11 +325,10 @@ impl ServerConfiguration {
           back_timeout:  5000,
           answers:       default,
           config:        config,
-          tag:           tag,
         })
       },
       Err(e) => {
-        let formatted_err = format!("{}\tcould not create listener {:?}: {:?}", tag, front, e);
+        let formatted_err = format!("could not create listener {:?}: {:?}", front, e);
         error!("{}", formatted_err);
         channel.write_message(&ServerMessage{id: String::from("listener_failed"), status: ServerMessageStatus::Error(formatted_err)});
         channel.run();
@@ -357,7 +355,7 @@ impl ServerConfiguration {
   }
 
   pub fn remove_http_front(&mut self, front: HttpFront, event_loop: &mut Poll) {
-    info!("{}\tremoving http_front {:?}", self.tag, front);
+    info!("removing http_front {:?}", front);
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
       fronts.retain(|f| f != &front);
     }
@@ -606,7 +604,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
     if let Ok((frontend_sock, _)) = accepted {
       frontend_sock.set_nodelay(true);
-      if let Some(mut c) = Client::new(&self.tag, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address) {
+      if let Some(mut c) = Client::new(frontend_sock, Rc::downgrade(&self.pool), self.config.public_address) {
         c.readiness().front_interest.insert(Ready::readable());
         c.readiness().back_interest.remove(Ready::readable() | Ready::writable());
         return Some((c, false))
@@ -636,21 +634,17 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   fn channel(&mut self)   -> &mut ProxyChannel {
     &mut self.channel
   }
-
-  fn tag(&self)           -> &str {
-    &self.tag
-  }
 }
 
 pub type HttpServer = Server<ServerConfiguration,Client>;
 
-pub fn start(tag:String, config: HttpProxyConfiguration, channel: ProxyChannel) {
+pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel) {
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_connections = config.max_connections;
   let max_listeners   = 1;
 
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok(configuration) = ServerConfiguration::new(tag.clone(), config, channel, &mut event_loop, 1 + max_listeners) {
+  if let Ok(configuration) = ServerConfiguration::new(config, channel, &mut event_loop, 1 + max_listeners) {
     let mut server = HttpServer::new(max_listeners, max_connections, configuration, event_loop);
 
     info!("starting event loop");
@@ -693,7 +687,7 @@ mod tests {
 
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
     let jg = thread::spawn(move || {
-      start(String::from("HTTP"), config, channel);
+      start(config, channel);
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
@@ -747,7 +741,7 @@ mod tests {
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 
     let jg = thread::spawn(move|| {
-      start(String::from("HTTP"), config, channel);
+      start(config, channel);
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
@@ -870,7 +864,6 @@ mod tests {
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
       },
       config: Default::default(),
-      tag:  String::from("HTTP"),
     };
 
     let frontend1 = server_config.frontend_from_request("lolcatho.st", "/");

@@ -31,16 +31,15 @@ pub struct Pipe<Front:SocketHandler> {
   back_buf_position:  usize,
   pub app_id:         Option<String>,
   pub request_id:     String,
-  pub server_context: String,
   pub readiness:      Readiness,
   pub log_ctx:        String,
   public_address:     Option<IpAddr>,
 }
 
 impl<Front:SocketHandler> Pipe<Front> {
-  pub fn new(server_context: &str, frontend: Front, backend: TcpStream, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<Pipe<Front>> {
+  pub fn new(frontend: Front, backend: TcpStream, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<Pipe<Front>> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
-    let log_ctx    = format!("{}\t{}\tunknown\t", server_context, &request_id);
+    let log_ctx    = format!("{}\tunknown\t", &request_id);
     let client = Pipe {
       frontend:           frontend,
       backend:            backend,
@@ -52,7 +51,6 @@ impl<Front:SocketHandler> Pipe<Front> {
       back_buf_position:  0,
       app_id:             None,
       request_id:         request_id,
-      server_context:     String::from(server_context),
       readiness:          Readiness {
                             front_interest:  Ready::readable() | Ready::writable() |Ready::hup() | Ready::error(),
                             back_interest:   Ready::readable() | Ready::writable() |Ready::hup() | Ready::error(),
@@ -97,9 +95,9 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   pub fn log_context(&self) -> String {
     if let Some(ref app_id) = self.app_id {
-      format!("{}\t{}\t{}\t", self.server_context, self.request_id, app_id)
+      format!("{}\t{}\t", self.request_id, app_id)
     } else {
-      format!("{}\t{}\tunknown\t", self.server_context, self.request_id)
+      format!("{}\tunknown\t", self.request_id)
     }
   }
 

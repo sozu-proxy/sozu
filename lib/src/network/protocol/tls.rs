@@ -19,16 +19,14 @@ pub struct TlsHandshake {
   pub front:           Option<TcpStream>,
   pub ssl:             Option<Ssl>,
   pub stream:          Option<SslStream<TcpStream>>,
-  pub server_context:  String,
   mid:                 Option<MidHandshakeSslStream<TcpStream>>,
   state:               TlsState,
 }
 
 impl TlsHandshake {
-  pub fn new(server_context: &str, ssl:Ssl, sock: TcpStream) -> TlsHandshake {
+  pub fn new(ssl:Ssl, sock: TcpStream) -> TlsHandshake {
     TlsHandshake {
       front:          Some(sock),
-      server_context: String::from(server_context),
       ssl:            Some(ssl),
       mid:            None,
       stream:         None,
