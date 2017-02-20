@@ -205,7 +205,7 @@ named!(pub message_header<Header>,
 );
 
 pub fn comma_separated_header_value(input:&[u8]) -> Option<Vec<&[u8]>> {
-  let res: IResult<&[u8], Vec<&[u8]>> = separated_list!(input, char!(','), vchar_1);
+  let res: IResult<&[u8], Vec<&[u8]>> = separated_list!(input, delimited!(opt!(sp),char!(','),opt!(sp)), vchar_1);
   if let IResult::Done(_,o) = res {
     Some(o)
   } else {
