@@ -1,7 +1,8 @@
 #![allow(dead_code, unused_must_use, unused_variables, unused_imports)]
 
-use std::net::SocketAddr;
+use mio;
 use std::fmt;
+use std::net::SocketAddr;
 
 pub mod buffer;
 pub mod buffer_queue;
@@ -190,6 +191,7 @@ pub struct Backend {
   pub address:            SocketAddr,
   pub status:             BackendStatus,
   pub active_connections: usize,
+  pub failures:           usize,
 }
 
 impl Backend {
@@ -198,6 +200,7 @@ impl Backend {
       address:            addr,
       status:             BackendStatus::Normal,
       active_connections: 0,
+      failures:           0,
     }
   }
 
@@ -205,8 +208,8 @@ impl Backend {
     self.status = BackendStatus::Closing;
   }
 
-  pub fn can_open(&self) -> bool {
-    self.status == BackendStatus::Normal
+  pub fn can_open(&self, max_failures: usize) -> bool {
+    self.status == BackendStatus::Normal && self.failures < max_failures
   }
 
   pub fn inc_connections(&mut self) -> Option<usize> {
@@ -240,6 +243,23 @@ impl Backend {
         }
       },
     }
+  }
+
+  pub fn try_connect(&mut self, max_failures: usize) -> Result<mio::tcp::TcpStream, ConnectionError> {
+    if self.failures >= max_failures || self.status == BackendStatus::Closing || self.status == BackendStatus::Closed {
+      return Err(ConnectionError::NoBackendAvailable);
+    }
+
+    //FIXME: what happens if the connect() call fails with EINPROGRESS?
+    let conn = mio::tcp::TcpStream::connect(&self.address).map_err(|_| ConnectionError::NoBackendAvailable);
+    if conn.is_ok() {
+      self.inc_connections();
+      self.failures = 0;
+    } else {
+      self.failures += 1;
+    }
+
+    conn
   }
 }
 

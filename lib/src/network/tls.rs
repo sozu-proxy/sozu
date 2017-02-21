@@ -742,17 +742,32 @@ impl ServerConfiguration {
           unwrap_msg!(client.http()).set_answer(&self.answers.ServiceUnavailable);
           return Err(ConnectionError::NoBackendAvailable);
         }
-        let rnd = random::<usize>();
-        let mut instances:Vec<&mut Backend> = app_instances.iter_mut().filter(|backend| backend.can_open()).collect();
-        let idx = rnd % instances.len();
-        info!("{}\tConnecting {} -> {:?}", unwrap_msg!(client.http()).log_context(), host, instances.get(idx).map(|backend| (backend.address, backend.active_connections)));
-        instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut backend| {
-          let conn =  TcpStream::connect(&backend.address).map_err(|_| ConnectionError::NoBackendAvailable);
-          if conn.is_ok() {
-             backend.inc_connections();
-          }
-          conn
-         })
+
+        //FIXME: hardcoded for now, these should come from configuration
+        let max_failures_per_backend:usize = 10;
+        let max_failures:usize             = 3;
+
+        for _ in 0..max_failures {
+          //FIXME: it's probably pretty wasteful to refilter every time here
+          let mut instances:Vec<&mut Backend> = app_instances.iter_mut().filter(|backend| backend.can_open(max_failures_per_backend)).collect();
+          let rnd = random::<usize>();
+          let idx = rnd % instances.len();
+
+          let conn = instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut backend| {
+            info!("{}\tConnecting {} -> {:?}", client.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), app_id, (backend.address, backend.active_connections));
+            let conn = backend.try_connect(max_failures_per_backend);
+            if backend.failures >= max_failures_per_backend {
+              error!("{}\tbackend {:?} connections failed {} times, disabling it", client.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), (backend.address, backend.active_connections), backend.failures);
+            }
+
+            conn
+          });
+
+           if conn.is_ok() {
+             return conn;
+           }
+        }
+        Err(ConnectionError::NoBackendAvailable)
       } else {
         Err(ConnectionError::NoBackendAvailable)
       }
