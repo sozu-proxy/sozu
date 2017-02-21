@@ -10,9 +10,10 @@ use nom::IResult::*;
 use nom::{digit,is_alphanumeric};
 
 use std::str;
-use std::ascii::AsciiExt;
-use std::convert::From;
 use std::cmp::min;
+use std::convert::From;
+use std::ascii::AsciiExt;
+use std::collections::HashSet;
 
 // Primitives
 fn is_token_char(i: u8) -> bool {
@@ -494,14 +495,15 @@ impl<'a> Header<'a> {
     }
   }
 
-  pub fn should_delete(&self) -> bool {
+  pub fn should_delete(&self, conn: &Connection) -> bool {
     let lowercase = self.name.to_ascii_lowercase();
     &lowercase[..] == b"connection" && &self.value.to_ascii_lowercase()[..] != b"upgrade" ||
     &lowercase[..] == b"forwarded"         ||
     &lowercase[..] == b"x-forwarded-for"   ||
     &lowercase[..] == b"x-forwarded-proto" ||
     &lowercase[..] == b"x-forwarded-port"  ||
-    &lowercase[..] == b"request-id"
+    &lowercase[..] == b"request-id"        ||
+    conn.to_delete.contains(unsafe {str::from_utf8_unchecked(&self.value.to_ascii_lowercase()[..])})
   }
 }
 
@@ -544,11 +546,51 @@ pub enum LengthInformation {
   //Compressed
 }
 
+/*
 #[derive(Debug,Clone,PartialEq)]
 pub enum Connection {
   KeepAlive,
   Close,
-  Upgrade
+  Upgrade,
+}
+*/
+
+
+#[derive(Debug,Clone,PartialEq)]
+pub struct Connection {
+  keep_alive:  Option<bool>,
+  has_upgrade: bool,
+  upgrade:     Option<String>,
+  to_delete:   HashSet<String>,
+}
+
+impl Connection {
+  pub fn new() -> Connection {
+    Connection {
+      keep_alive:  None,
+      has_upgrade: false,
+      upgrade:     None,
+      to_delete:   HashSet::new(),
+    }
+  }
+
+  pub fn keep_alive() -> Connection {
+    Connection {
+      keep_alive:  Some(true),
+      has_upgrade: false,
+      upgrade:     None,
+      to_delete:   HashSet::new(),
+    }
+  }
+
+  pub fn close() -> Connection {
+    Connection {
+      keep_alive:  Some(false),
+      has_upgrade: false,
+      upgrade:     None,
+      to_delete:   HashSet::new(),
+    }
+  }
 }
 
 #[derive(Debug,Clone,PartialEq)]
@@ -653,13 +695,13 @@ impl RequestState {
     //FIXME: should not clone here
     let rl =  self.get_request_line();
     let version: &str    = rl.as_ref().map(|rl| rl.version.as_str()).unwrap_or("");
-    let keep_alive = self.get_keep_alive();
-    match (version, keep_alive) {
-      (_, Some(Connection::KeepAlive)) => true,
-      (_, Some(Connection::Close))     => false,
-      ("10", None)                     => false,
-      ("11", None)                     => true,
-      (_, _)                           => false,
+    let conn = self.get_keep_alive();
+    match (version, conn.map(|c| c.keep_alive)) {
+      (_, Some(Some(true)))  => true,
+      (_, Some(Some(false))) => false,
+      ("10", _)              => false,
+      ("11", _)              => true,
+      (_, _)                 => false,
     }
   }
 
@@ -731,15 +773,15 @@ impl ResponseState {
 
   pub fn should_keep_alive(&self) -> bool {
     //FIXME: should not clone here
-    let sl = self.get_status_line();
-    let version    = sl.as_ref().map(|sl| sl.version.as_str()).unwrap_or("");
-    let keep_alive = self.get_keep_alive();
-    match (version, keep_alive) {
-      (_, Some(Connection::KeepAlive)) => true,
-      (_, Some(Connection::Close))     => false,
-      ("10", None)                     => false,
-      ("11", None)                     => true,
-      (_, _)                           => false,
+    let sl      = self.get_status_line();
+    let version = sl.as_ref().map(|sl| sl.version.as_str()).unwrap_or("");
+    let conn    = self.get_keep_alive();
+    match (version, conn.map(|c| c.keep_alive)) {
+      (_, Some(Some(true)))  => true,
+      (_, Some(Some(false))) => false,
+      ("10", _)              => false,
+      ("11", _)              => true,
+      (_, _)                 => false,
     }
   }
 
@@ -918,17 +960,17 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
         _                                        => RequestState::Error(ErrorState::InvalidHttp)
       }
     },
-    // FIXME: for now, we don't remember if we cancel indiations from a previous Connection Header
+    // FIXME: for now, we don't remember if we cancel indications from a previous Connection Header
     HeaderValue::Connection(c) => {
-      let mut conn = state.get_keep_alive().unwrap_or(Connection::KeepAlive);
+      let mut conn = state.get_keep_alive().unwrap_or(Connection::new());
       for value in c {
       trace!("PARSER\tgot Connection header: {:?}", str::from_utf8(value).expect("could not make string from value"));
-        match value {
-          b"close"      => conn = Connection::Close,
-          b"keep-alive" => conn = Connection::KeepAlive,
-          b"upgrade"    => conn = Connection::Upgrade,
-          _             => {}
-        }
+        match &value.to_ascii_lowercase()[..] {
+          b"close"      => { conn.keep_alive = Some(false); },
+          b"keep-alive" => { conn.keep_alive = Some(true); },
+          b"upgrade"    => { conn.has_upgrade    = true; },
+          v             => { conn.to_delete.insert(unsafe { str::from_utf8_unchecked(v).to_string() }); },
+        };
       }
       match state {
         RequestState::HasRequestLine(rl, _)                 => RequestState::HasRequestLine(rl, conn),
@@ -937,7 +979,7 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
         RequestState::HasHostAndLength(rl, _, host, length) => RequestState::HasHostAndLength(rl, conn, host, length),
         RequestState::Request(rl, _, host)                  => RequestState::Request(rl, conn, host),
         RequestState::RequestWithBody(rl, _, host, length)  => RequestState::RequestWithBody(rl, conn, host, length),
-        _                                                => RequestState::Error(ErrorState::InvalidHttp)
+        _                                                   => RequestState::Error(ErrorState::InvalidHttp)
       }
     },
 
@@ -971,11 +1013,13 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
       match request_line(buf) {
         IResult::Done(i, r)    => {
           if let Some(rl) = RRequestLine::from_request_line(r) {
-            let conn = if rl.version == "11" {
-              Connection::KeepAlive
+            let conn = Connection::new();
+            /*let conn = if rl.version == "11" {
+              Connection::keep_alive()
             } else {
-              Connection::Close
+              Connection::close()
             };
+            */
             let s = (BufferMove::Advance(buf.offset(i)), RequestState::HasRequestLine(rl, conn));
             s
           } else {
@@ -985,22 +1029,22 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
         res => default_request_result(state, res)
       }
     },
-    RequestState::HasRequestLine(_, _) => {
+    RequestState::HasRequestLine(rl, conn) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          if header.should_delete() {
-            (BufferMove::Delete(buf.offset(i)), validate_request_header(state, &header))
+          if header.should_delete(&conn) {
+            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_request_header(state, &header))
+            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
           }
         },
-        res => default_request_result(state, res)
+        res => default_request_result(RequestState::HasRequestLine(rl, conn), res)
       }
     },
     RequestState::HasHost(rl, conn, h) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          if header.should_delete() {
+          if header.should_delete(&conn) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
@@ -1023,7 +1067,7 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
     RequestState::HasHostAndLength(rl, conn, h, l) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          if header.should_delete() {
+          if header.should_delete(&conn) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
@@ -1089,22 +1133,22 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
     },
     // FIXME: for now, we don't remember if we cancel indiations from a previous Connection Header
     HeaderValue::Connection(c) => {
-      let mut conn = state.get_keep_alive().unwrap_or(Connection::KeepAlive);
+      let mut conn = state.get_keep_alive().unwrap_or(Connection::new());
       for value in c {
       info!("PARSER\tgot Connection header: {:?}", str::from_utf8(value).expect("could not make string from value"));
         match &value.to_ascii_lowercase()[..] {
-          b"close"      => conn = Connection::Close,
-          b"keep-alive" => conn = Connection::KeepAlive,
-          b"upgrade"    => conn = Connection::Upgrade,
-          _             => {}
-        }
+          b"close"      => { conn.keep_alive = Some(false); },
+          b"keep-alive" => { conn.keep_alive = Some(true); },
+          b"upgrade"    => { conn.has_upgrade    = true; },
+          v             => { conn.to_delete.insert(unsafe { str::from_utf8_unchecked(v).to_string() }); },
+        };
       }
       match state {
         ResponseState::HasStatusLine(rl, _)     => ResponseState::HasStatusLine(rl, conn),
         ResponseState::HasLength(rl, _, length) => ResponseState::HasLength(rl, conn, length),
         ResponseState::HasUpgrade(rl, _, proto) => {
           info!("has upgrade, got conn: {:?}", conn);
-          if conn == Connection::Upgrade {
+          if conn.has_upgrade {
             ResponseState::HasUpgrade(rl, conn, proto)
           } else {
             ResponseState::Error(ErrorState::InvalidHttp)
@@ -1118,7 +1162,10 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
       info!("parsed a protocol: {:?}", proto);
       info!("state is {:?}", state);
       match state {
-        ResponseState::HasStatusLine(sl, conn) => ResponseState::HasUpgrade(sl, conn, proto),
+        ResponseState::HasStatusLine(sl, mut conn) => {
+          conn.upgrade = Some(proto.clone());
+          ResponseState::HasUpgrade(sl, conn, proto)
+        },
         _                                      => ResponseState::Error(ErrorState::InvalidHttp)
       }
     }
@@ -1144,11 +1191,13 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool) -> (Buffe
       match status_line(buf) {
         IResult::Done(i, r)    => {
           if let Some(rl) = RStatusLine::from_status_line(r) {
-            let conn = if rl.version == "11" {
-              Connection::KeepAlive
+            let conn = Connection::new();
+            /*let conn = if rl.version == "11" {
+              Connection::keep_alive()
             } else {
-              Connection::Close
+              Connection::close()
             };
+            */
             let s = (BufferMove::Advance(buf.offset(i)), ResponseState::HasStatusLine(rl, conn));
             s
           } else {
@@ -1161,7 +1210,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool) -> (Buffe
     ResponseState::HasStatusLine(sl, conn) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          if header.should_delete() {
+          if header.should_delete(&conn) {
             (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header, is_head))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header, is_head))
@@ -1185,7 +1234,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool) -> (Buffe
     ResponseState::HasLength(sl, conn, length) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          if header.should_delete() {
+          if header.should_delete(&conn) {
             (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header, is_head))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header, is_head))
@@ -1212,7 +1261,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool) -> (Buffe
     ResponseState::HasUpgrade(sl, conn, protocol) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          if header.should_delete() {
+          if header.should_delete(&conn) {
             (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasUpgrade(sl, conn, protocol), &header, is_head))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasUpgrade(sl, conn, protocol), &header, is_head))
@@ -1583,7 +1632,7 @@ mod tests {
           res_header_end: None,
           request: Some(RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
-            Connection::KeepAlive,
+            Connection::new(),
             String::from("localhost:8888"),
             200
           )),
@@ -1612,7 +1661,7 @@ mod tests {
             uri: String::from("/index.html"),
             version: String::from("11")
           },
-          Connection::KeepAlive
+          Connection::keep_alive()
         )),
         response: Some(ResponseState::Initial),
         added_req_header: String::from(""),
@@ -1647,7 +1696,7 @@ mod tests {
           res_header_end: None,
           request:    Some(RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
-            Connection::KeepAlive,
+            Connection::keep_alive(),
             String::from("localhost:8888"),
             200
           )),
@@ -1682,7 +1731,7 @@ mod tests {
           res_header_end: None,
           request:    Some(RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
-            Connection::KeepAlive,
+            Connection::new(),
             String::from("localhost:8888"),
             Chunk::Initial
           )),
@@ -1749,7 +1798,7 @@ mod tests {
           res_header_end: None,
           request:  Some(RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
-            Connection::KeepAlive,
+            Connection::new(),
             String::from("localhost:8888"),
             Chunk::Initial
           )),
@@ -1788,7 +1837,7 @@ mod tests {
           res_header_end: None,
           request:  Some(RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
-            Connection::Close,
+            Connection::close(),
             String::from("localhost:8888")
           )),
           response: Some(ResponseState::Initial),
@@ -1820,7 +1869,7 @@ mod tests {
           res_header_end: None,
           request:  Some(RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
-            Connection::Close,
+            Connection::new(),
             String::from("localhost:8888")
           )),
           response: Some(ResponseState::Initial),
@@ -1828,6 +1877,7 @@ mod tests {
           added_res_header: String::from(""),
         }
       );
+      assert!(!result.request.unwrap().should_keep_alive());
   }
 
   #[test]
@@ -1858,7 +1908,7 @@ mod tests {
           res_header_end: None,
           request:  Some(RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
-            Connection::KeepAlive,
+            Connection::keep_alive(),
             String::from("localhost:8888")
           )),
           response: Some(ResponseState::Initial),
@@ -1866,6 +1916,44 @@ mod tests {
           added_res_header: String::from(""),
         }
       );
+      assert!(result.request.unwrap().should_keep_alive());
+  }
+
+  #[test]
+  fn parse_request_http_1_1_connection_keep_alive() {
+      setup_test_logger!();
+      let input =
+          b"GET / HTTP/1.1\r\n\
+            Host: localhost:8888\r\n\
+            \r\n";
+      let initial = HttpState::new();
+      let mut buf = BufferQueue::with_capacity(2048);
+      buf.write(&input[..]);
+
+      //let result = parse_request(initial, input);
+      let result = parse_request_until_stop(initial, "", &mut buf);
+      println!("end buf:\n{}", buf.buffer.data().to_hex(16));
+      println!("result: {:?}", result);
+      assert_eq!(buf.output_queue, vec!(
+        OutputElement::Slice(16), OutputElement::Slice(22),
+        OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+      assert_eq!(buf.start_parsing_position, 40);
+      assert_eq!(
+        result,
+        HttpState {
+          req_header_end: Some(40),
+          res_header_end: None,
+          request:  Some(RequestState::Request(
+            RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
+            Connection::new(),
+            String::from("localhost:8888")
+          )),
+          response: Some(ResponseState::Initial),
+          added_req_header: String::from(""),
+          added_res_header: String::from(""),
+        }
+      );
+      assert!(result.request.unwrap().should_keep_alive());
   }
 
   #[test]
@@ -1895,7 +1983,7 @@ mod tests {
           res_header_end: None,
           request:  Some(RequestState::Request(
             RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
-            Connection::Close,
+            Connection::close(),
             String::from("localhost:8888")
           )),
           response: Some(ResponseState::Initial),
@@ -1903,6 +1991,7 @@ mod tests {
           added_res_header: String::from(""),
         }
       );
+      assert!(!result.request.unwrap().should_keep_alive());
   }
 
   #[test]
@@ -1938,7 +2027,7 @@ mod tests {
           res_header_end: None,
           request: Some(RequestState::RequestWithBody(
             RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
-            Connection::KeepAlive,
+            Connection::new(),
             String::from("localhost:8888"),
             200
           )),
@@ -2034,7 +2123,7 @@ mod tests {
           res_header_end: None,
           request:    Some(RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
-            Connection::KeepAlive,
+            Connection::new(),
             String::from("localhost:8888"),
             Chunk::Ended
           )),
@@ -2077,7 +2166,7 @@ mod tests {
           res_header_end: None,
           request:    Some(RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
-            Connection::KeepAlive,
+            Connection::new(),
             String::from("localhost:8888"),
             Chunk::Copying
           )),
@@ -2101,7 +2190,7 @@ mod tests {
           res_header_end: None,
           request:    Some(RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
-            Connection::KeepAlive,
+            Connection::new(),
             String::from("localhost:8888"),
             Chunk::Copying
           )),
@@ -2123,7 +2212,7 @@ mod tests {
           res_header_end: None,
           request:    Some(RequestState::RequestWithBodyChunks(
             RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
-            Connection::KeepAlive,
+            Connection::new(),
             String::from("localhost:8888"),
             Chunk::Ended
           )),
@@ -2166,7 +2255,7 @@ mod tests {
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
-            Connection::KeepAlive,
+            Connection::new(),
             Chunk::Copying
           )),
           added_req_header: String::from(""),
@@ -2189,7 +2278,7 @@ mod tests {
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
-            Connection::KeepAlive,
+            Connection::new(),
             Chunk::Copying
           )),
           added_req_header: String::from(""),
@@ -2212,7 +2301,7 @@ mod tests {
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
-            Connection::KeepAlive,
+            Connection::new(),
             Chunk::CopyingLastHeader
           )),
           added_req_header: String::from(""),
@@ -2234,7 +2323,7 @@ mod tests {
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
-            Connection::KeepAlive,
+            Connection::new(),
             Chunk::Ended
           )),
           added_req_header: String::from(""),
@@ -2266,7 +2355,7 @@ mod tests {
         request:      Some(RequestState::Initial),
         response:     Some(ResponseState::HasLength(
           RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
-          Connection::KeepAlive,
+          Connection::keep_alive(),
           LengthInformation::Chunked
         )),
         added_req_header: String::from(""),
@@ -2292,7 +2381,7 @@ mod tests {
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
-            Connection::KeepAlive,
+            Connection::keep_alive(),
             Chunk::Initial
           )),
           added_req_header: String::from(""),
@@ -2314,7 +2403,7 @@ mod tests {
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
-            Connection::KeepAlive,
+            Connection::keep_alive(),
             Chunk::Copying
           )),
           added_req_header: String::from(""),
@@ -2339,7 +2428,7 @@ mod tests {
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
-            Connection::KeepAlive,
+            Connection::keep_alive(),
             Chunk::CopyingLastHeader
           )),
           added_req_header: String::from(""),
@@ -2359,7 +2448,7 @@ mod tests {
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
-            Connection::KeepAlive,
+            Connection::keep_alive(),
             Chunk::Ended
           )),
           added_req_header: String::from(""),
@@ -2406,7 +2495,7 @@ mod tests {
         request:  Some(RequestState::Initial),
         response: Some(ResponseState::ResponseWithBody(
           RStatusLine { version: String::from("11"), status: 302, reason: String::from("Found") },
-          Connection::Close,
+          Connection::close(),
           0
         )),
         added_req_header: String::from(""),
@@ -2449,7 +2538,7 @@ mod tests {
         request: Some(RequestState::Initial),
         response: Some(ResponseState::ResponseWithBody(
           RStatusLine { version: String::from("11"), status: 303, reason: String::from("See Other") },
-          Connection::Close,
+          Connection::close(),
           0
         )),
         added_req_header: String::from(""),
@@ -2477,7 +2566,7 @@ mod tests {
         res_header_end: None,
         request:  Some(RequestState::Request(
             RRequestLine { method: String::from("HEAD"), uri: String::from("/index.html"), version: String::from("11") },
-          Connection::KeepAlive,
+          Connection::new(),
           String::from("localhost:8888")
         )),
         response: Some(ResponseState::Initial),
@@ -2505,12 +2594,12 @@ mod tests {
           res_header_end: Some(40),
           request:  Some(RequestState::Request(
               RRequestLine { method: String::from("HEAD"), uri: String::from("/index.html"), version: String::from("11") },
-            Connection::KeepAlive,
+            Connection::new(),
             String::from("localhost:8888")
           )),
           response: Some(ResponseState::Response(
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("Ok") },
-            Connection::KeepAlive
+            Connection::new()
           )),
           added_req_header: String::from(""),
           added_res_header: String::from(""),
