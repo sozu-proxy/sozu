@@ -200,7 +200,7 @@ impl ProxyClient for Client {
   }
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", unwrap_msg!(self.http()).log_ctx.clone(), unwrap_msg!(self.token).0,
+    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), unwrap_msg!(self.token).0,
       unwrap_msg!(self.backend_token).0);
     let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
     self.backend       = None;
