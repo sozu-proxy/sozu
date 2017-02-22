@@ -1,18 +1,25 @@
 #![allow(unused_variables,unused_must_use)]
-#[macro_use] extern crate log;
-extern crate env_logger;
-extern crate sozu_lib as sozu;
+#[macro_use] extern crate sozu_lib as sozu;
 extern crate openssl;
 extern crate mio;
 extern crate mio_uds;
+extern crate time;
 
+use std::env;
 use std::thread;
-use sozu::messages;
+use std::io::stdout;
 use sozu::network;
+use sozu::messages;
 use sozu::channel::Channel;
+use sozu::logging::{Logger,LoggerBackend};
 
 fn main() {
-  env_logger::init().expect("could not create env logger");
+  if env::var("RUST_LOG").is_ok() {
+   Logger::init("EXAMPLE".to_string(), &env::var("RUST_LOG").expect("could not get the RUST_LOG env var"), LoggerBackend::Stdout(stdout()));
+  } else {
+   Logger::init("EXAMPLE".to_string(), "info", LoggerBackend::Stdout(stdout()));
+  }
+
   info!("starting up");
 
   let config = messages::HttpProxyConfiguration {

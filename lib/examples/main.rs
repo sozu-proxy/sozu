@@ -12,36 +12,20 @@ extern crate hex;
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::thread;
 use std::env;
+use std::io::stdout;
 use sozu::network;
+use sozu::logging::{Logger,LoggerBackend};
 use sozu::messages;
 use sozu::network::metrics::{METRICS,ProxyMetrics};
 use sozu::channel::Channel;
 use openssl::ssl;
-use log::{LogRecord,LogLevelFilter,LogLevel};
-use env_logger::LogBuilder;
 
 fn main() {
-  let pid = unsafe { libc::getpid() };
-  let format = move |record: &LogRecord| {
-    match record.level() {
-    LogLevel::Debug | LogLevel::Trace => format!("{}\t{}\t{}\t{}\t{}\t|\t{}",
-      time::now_utc().rfc3339(), time::precise_time_ns(), pid,
-      record.level(), record.args(), record.location().module_path()),
-    _ => format!("{}\t{}\t{}\t{}\t{}",
-      time::now_utc().rfc3339(), time::precise_time_ns(), pid,
-      record.level(), record.args())
-
-    }
-  };
-
-  let mut builder = LogBuilder::new();
-  builder.format(format).filter(None, LogLevelFilter::Info);
-
   if env::var("RUST_LOG").is_ok() {
-   builder.parse(&env::var("RUST_LOG").expect("could not get the RUST_LOG env var"));
+   Logger::init("EXAMPLE".to_string(), &env::var("RUST_LOG").expect("could not get the RUST_LOG env var"), LoggerBackend::Stdout(stdout()));
+  } else {
+   Logger::init("EXAMPLE".to_string(), "info", LoggerBackend::Stdout(stdout()));
   }
-
-  builder.init().expect("could not init log builder");
 
   info!("MAIN\tstarting up");
   let metrics_socket = UdpSocket::bind("0.0.0.0:0").expect("could not parse address");
