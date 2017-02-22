@@ -842,7 +842,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       //FIXME: what if we don't use SNI?
       let servername: Option<String> = unwrap_msg!(client.http()).frontend.ssl().servername().map(|s| s.to_string());
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
-        error!("TLS SNI hostname and Host header don't match");
+        error!("TLS SNI hostname '{:?}' and Host header '{}' don't match", servername, hostname_str);
+        unwrap_msg!(client.http()).set_answer(&self.answers.NotFound);
+        client.readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
         return Err(ConnectionError::HostNotFound);
       }
 
@@ -917,10 +919,12 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Err(ConnectionError::NoBackendAvailable) => {
         unwrap_msg!(client.http()).set_answer(&self.answers.ServiceUnavailable);
+        client.readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
         Err(ConnectionError::NoBackendAvailable)
       },
       Err(ConnectionError::HostNotFound) => {
         unwrap_msg!(client.http()).set_answer(&self.answers.NotFound);
+        client.readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
         Err(ConnectionError::HostNotFound)
       },
       e => panic!(e)
