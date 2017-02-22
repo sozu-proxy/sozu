@@ -490,6 +490,13 @@ impl<Front:SocketHandler> Http<Front> {
         self.readiness.back_interest.insert(Ready::readable());
         ClientResult::Continue
       },
+      //we're not done parsing the headers
+      Some(ResponseState::HasStatusLine(_,_)) |
+      Some(ResponseState::HasUpgrade(_,_,_))  |
+      Some(ResponseState::HasLength(_,_,_))   => {
+        self.readiness.back_interest.insert(Ready::readable());
+        ClientResult::Continue
+      },
       _ => {
         self.readiness.reset();
         ClientResult::CloseBothFailure
@@ -569,6 +576,14 @@ impl<Front:SocketHandler> Http<Front> {
           ClientResult::Continue
         },
         Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
+          self.readiness.front_interest.insert(Ready::readable());
+          ClientResult::Continue
+        },
+        //we're not done parsing the headers
+        Some(RequestState::HasRequestLine(_,_))       |
+        Some(RequestState::HasHost(_,_,_))            |
+        Some(RequestState::HasLength(_,_,_))          |
+        Some(RequestState::HasHostAndLength(_,_,_,_)) => {
           self.readiness.front_interest.insert(Ready::readable());
           ClientResult::Continue
         },
