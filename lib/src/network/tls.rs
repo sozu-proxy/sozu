@@ -30,7 +30,7 @@ use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_req
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,Protocol};
-use network::proxy::{BackendConnectAction,Server,ProxyConfiguration,ProxyClient,
+use network::proxy::{BackendConnectAction,BackendConnectionStatus,Server,ProxyConfiguration,ProxyClient,
   Readiness,ListenToken,FrontToken,BackToken,ProxyChannel};
 use messages::{self,CertFingerprint,CertificateAndKey,Order,TlsFront,TlsProxyConfiguration};
 use network::http::{self,DefaultAnswers};
@@ -64,6 +64,8 @@ pub struct TlsClient {
   front_token:    Option<Token>,
   front_timeout:  Option<Timeout>,
   back_timeout:   Option<Timeout>,
+  instance:       Option<Rc<RefCell<Backend>>>,
+  back_connected: BackendConnectionStatus,
   protocol:       Option<State>,
   public_address: Option<IpAddr>,
   ssl:            Option<Ssl>,
@@ -81,6 +83,8 @@ impl TlsClient {
       front_token:    None,
       front_timeout:  None,
       back_timeout:   None,
+      instance:       None,
+      back_connected: BackendConnectionStatus::NotConnected,
       protocol:       Some(State::Handshake(handshake)),
       public_address: public_address,
       ssl:            None,
@@ -165,6 +169,20 @@ impl ProxyClient for TlsClient {
       http.back_token()
     } else {
       None
+    }
+  }
+
+  fn back_connected(&self)     -> BackendConnectionStatus {
+    self.back_connected
+  }
+
+  fn set_back_connected(&mut self, connected: BackendConnectionStatus) {
+    self.back_connected = connected;
+
+    if connected == BackendConnectionStatus::Connected {
+      self.instance.as_ref().map(|instance| {
+        (*instance.borrow_mut()).failures = 0;
+      });
     }
   }
 
@@ -315,7 +333,7 @@ pub struct TlsData {
 pub struct ServerConfiguration {
   listener:        TcpListener,
   address:         SocketAddr,
-  instances:       HashMap<AppId, Vec<Backend>>,
+  instances:       HashMap<AppId, Vec<Rc<RefCell<Backend>>>>,
   fronts:          HashMap<HostName, Vec<TlsApp>>,
   domains:         Arc<Mutex<TrieNode<CertFingerprint>>>,
   default_context: TlsData,
@@ -667,7 +685,7 @@ impl ServerConfiguration {
 
   pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
     if let Some(addrs) = self.instances.get_mut(app_id) {
-      let backend = Backend::new(*instance_address);
+      let backend = Rc::new(RefCell::new(Backend::new(*instance_address)));
       if !addrs.contains(&backend) {
         addrs.push(backend);
       }
@@ -675,13 +693,13 @@ impl ServerConfiguration {
 
     if self.instances.get(app_id).is_none() {
       let backend = Backend::new(*instance_address);
-      self.instances.insert(String::from(app_id), vec![backend]);
+      self.instances.insert(String::from(app_id), vec![Rc::new(RefCell::new(backend))]);
     }
   }
 
   pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
       if let Some(instances) = self.instances.get_mut(app_id) {
-        instances.retain(|backend| &backend.address != instance_address);
+        instances.retain(|backend| &(*backend.borrow()).address != instance_address);
       } else {
         error!("Instance was already removed");
       }
@@ -749,16 +767,27 @@ impl ServerConfiguration {
 
         for _ in 0..max_failures {
           //FIXME: it's probably pretty wasteful to refilter every time here
-          let mut instances:Vec<&mut Backend> = app_instances.iter_mut().filter(|backend| backend.can_open(max_failures_per_backend)).collect();
+          let mut instances:Vec<&mut Rc<RefCell<Backend>>> = app_instances.iter_mut().filter(|backend| (*backend.borrow()).can_open(max_failures_per_backend)).collect();
+          if instances.is_empty() {
+            error!("no more available backends for app {}", app_id);
+            return Err(ConnectionError::NoBackendAvailable);
+          }
+
           let rnd = random::<usize>();
           let idx = rnd % instances.len();
 
-          let conn = instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut backend| {
-            info!("{}\tConnecting {} -> {:?}", client.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), app_id, (backend.address, backend.active_connections));
+          let conn = instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut b| {
+            let ref mut backend = *b.borrow_mut();
+            info!("{}\tConnecting {} -> {:?}", client.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), app_id, (backend.address, backend.active_connections, backend.failures));
             let conn = backend.try_connect(max_failures_per_backend);
             if backend.failures >= max_failures_per_backend {
               error!("{}\tbackend {:?} connections failed {} times, disabling it", client.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), (backend.address, backend.active_connections), backend.failures);
             }
+
+           if conn.is_ok() {
+             client.back_connected = BackendConnectionStatus::Connecting;
+             client.instance = Some(b.clone());
+           }
 
             conn
           });
@@ -830,6 +859,35 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     };
 
     let rl:RRequestLine = try!(unwrap_msg!(client.http()).state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
+    if let Some(app_id) = self.frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
+      if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
+        //matched on keepalive
+        return Ok(BackendConnectAction::Reuse);
+      }
+    }
+
+    // circuit breaker
+    if client.back_connected == BackendConnectionStatus::Connecting {
+      client.instance.as_ref().map(|instance| {
+        let ref mut backend = *instance.borrow_mut();
+        backend.failures += 1;
+        backend.dec_connections();
+      });
+    }
+
+    let reused = client.http().map(|http| http.app_id.is_some()).unwrap_or(false);
+    //deregister back socket if it is the wrong one or if it was not connecting
+    if reused || client.back_connected == BackendConnectionStatus::Connecting {
+      client.instance = None;
+      client.back_connected = BackendConnectionStatus::NotConnected;
+      client.readiness().back_interest  = Ready::none();
+      client.readiness().back_readiness = Ready::none();
+      client.back_socket().as_ref().map(|sock| {
+        event_loop.deregister(*sock);
+        sock.shutdown(Shutdown::Both);
+      });
+    }
+
     let conn   = try!(unwrap_msg!(client.http()).state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
     let conn   = self.backend_from_request(client, &host, &rl.uri);
 
@@ -851,8 +909,11 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         });
 
         client.set_back_socket(socket);
-        //FIXME: implement keepalive
-        Ok(BackendConnectAction::New)
+        if reused {
+          Ok(BackendConnectAction::Replace)
+        } else {
+          Ok(BackendConnectAction::New)
+        }
       },
       Err(ConnectionError::NoBackendAvailable) => {
         unwrap_msg!(client.http()).set_answer(&self.answers.ServiceUnavailable);
@@ -943,8 +1004,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
   fn close_backend(&mut self, app_id: AppId, addr: &SocketAddr) {
     if let Some(app_instances) = self.instances.get_mut(&app_id) {
-      if let Some(ref mut backend) = app_instances.iter_mut().find(|backend| &backend.address == addr) {
-        backend.dec_connections();
+      if let Some(ref mut backend) = app_instances.iter_mut().find(|backend| &(*backend.borrow()).address == addr) {
+        (*backend.borrow_mut()).dec_connections();
       }
     }
   }

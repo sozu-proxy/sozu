@@ -111,6 +111,8 @@ pub trait ProxyClient {
   fn set_back_socket(&mut self, TcpStream);
   fn set_front_token(&mut self, token: Token);
   fn set_back_token(&mut self, token: Token);
+  fn back_connected(&self)     -> BackendConnectionStatus;
+  fn set_back_connected(&mut self, connected: BackendConnectionStatus);
   fn front_timeout(&mut self) -> Option<Timeout>;
   fn back_timeout(&mut self)  -> Option<Timeout>;
   fn set_front_timeout(&mut self, timeout: Timeout);
@@ -124,6 +126,13 @@ pub trait ProxyClient {
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>);
   fn readiness(&mut self)      -> &mut Readiness;
   fn protocol(&self)           -> Protocol;
+}
+
+#[derive(Clone,Copy,Debug,PartialEq)]
+pub enum BackendConnectionStatus {
+  NotConnected,
+  Connecting,
+  Connected,
 }
 
 #[derive(Debug,PartialEq)]
@@ -454,6 +463,18 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
       Some(SocketType::BackClient) => {
         if let Some(tok) = self.get_client_token(token) {
           self.clients[tok].readiness().back_readiness = self.clients[tok].readiness().back_readiness | events;
+
+          if self.clients[tok].back_connected() == BackendConnectionStatus::Connecting {
+            if self.clients[tok].readiness().back_readiness.is_hup() {
+              //retry connecting the backend
+              //FIXME: there should probably be a circuit breaker per client too
+              error!("error connecting to backend, trying again");
+              self.connect_to_backend(tok);
+              return;
+            } else {
+              self.clients[tok].set_back_connected(BackendConnectionStatus::Connected);
+            }
+          }
           tok
         } else {
           return;

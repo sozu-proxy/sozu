@@ -17,7 +17,7 @@ use time::{Duration,precise_time_s};
 use rand::random;
 use uuid::Uuid;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
-use network::proxy::{BackendConnectAction,Server,ProxyClient,ProxyConfiguration,
+use network::proxy::{BackendConnectAction,BackendConnectionStatus,Server,ProxyClient,ProxyConfiguration,
   Readiness,ListenToken,FrontToken,BackToken,ProxyChannel};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
@@ -125,6 +125,14 @@ impl ProxyClient for Client {
 
   fn set_back_token(&mut self, token: Token) {
     self.backend_token = Some(token);
+  }
+
+  fn back_connected(&self)     -> BackendConnectionStatus {
+    //FIXME: handle backends correctly when refactoring the TCP proxy
+    BackendConnectionStatus::Connected
+  }
+
+  fn set_back_connected(&mut self, _: BackendConnectionStatus) {
   }
 
   fn front_timeout(&mut self) -> Option<Timeout> {

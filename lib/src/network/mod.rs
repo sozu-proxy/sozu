@@ -254,7 +254,6 @@ impl Backend {
     let conn = mio::tcp::TcpStream::connect(&self.address).map_err(|_| ConnectionError::NoBackendAvailable);
     if conn.is_ok() {
       self.inc_connections();
-      self.failures = 0;
     } else {
       self.failures += 1;
     }
