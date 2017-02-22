@@ -380,7 +380,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
           // loop here because iterations has borrow issues
           loop {
             let msg = self.configuration.channel().read_message();
-            info!("got message: {:?}", msg);
+            //info!("got message: {:?}", msg);
 
             // if the message was too large, we grow the buffer and retry to read if possible
             if msg.is_none() {
