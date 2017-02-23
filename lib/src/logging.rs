@@ -353,13 +353,15 @@ macro_rules! log {
           target: module_path!(),
       };
       {
-        let mut logger = LOGGER.lock().unwrap();
-        logger.log(
-          &_META,
-          format_args!(
-            concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
-            ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
-            $level_tag, *$crate::logging::TAG, $($arg)+));
+        //FIXME: we will lose logs in multithreading like this
+        if let Ok(mut logger) = LOGGER.try_lock() {
+          logger.log(
+            &_META,
+            format_args!(
+              concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
+              ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
+              $level_tag, *$crate::logging::TAG, $($arg)+));
+        }
       }
     });
     (target: $target:expr, $lvl:expr, $format:expr, $level_tag:expr) => ({
@@ -369,13 +371,15 @@ macro_rules! log {
           target: module_path!(),
       };
       {
-        let mut logger = LOGGER.lock().unwrap();
-        logger.log(
-          &_META,
-          format_args!(
-            concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
-            ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
-            $level_tag, *$crate::logging::TAG));
+        //FIXME: we will lose logs in multithreading like this
+        if let Ok(mut logger) = LOGGER.try_lock() {
+          logger.log(
+            &_META,
+            format_args!(
+              concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
+              ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
+              $level_tag, *$crate::logging::TAG));
+        }
       }
     });
     ($lvl:expr, $($arg:tt)+) => (log!(target: module_path!(), $lvl, $($arg)+));
