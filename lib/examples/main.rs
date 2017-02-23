@@ -46,7 +46,7 @@ fn main() {
     network::http::start(config, channel);
   });
 
-  let http_front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") };
+  let http_front = messages::HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st"), path_begin: String::from("/") };
   let http_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
   command.write_message(&network::ProxyOrder { id: String::from("ID_ABCD"), order: messages::Order::AddHttpFront(http_front) });
   command.write_message(&network::ProxyOrder { id: String::from("ID_EFGH"), order: messages::Order::AddInstance(http_instance) });
