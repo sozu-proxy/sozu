@@ -1,9 +1,10 @@
+use std::str;
+use std::thread;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::fmt::Arguments;
 use std::net::{UdpSocket,SocketAddr};
 use std::io::{self,Write,Error,ErrorKind};
-use std::sync::Mutex;
-use std::thread;
-use std::time::Duration;
-use std::str;
 
 use network::buffer::Buffer;
 
@@ -37,6 +38,12 @@ impl ProxyMetrics {
 
   pub fn set_up_remote(&mut self, socket: UdpSocket, addr: SocketAddr) {
     self.remote = Some((addr, socket));
+  }
+
+  pub fn write(&mut self, args: Arguments) {
+    //FIXME: error handling
+    self.buffer.write_fmt(args);
+    self.send();
   }
 
   pub fn send(&mut self) -> io::Result<usize> {
@@ -93,8 +100,7 @@ impl ProxyMetrics {
 macro_rules! count (
   ($key:expr, $value: expr) => {
     let mut metrics = ::network::metrics::METRICS.lock().unwrap();
-    metrics.buffer.write_fmt(format_args!("{}.{}:{}|c\n", *$crate::logging::TAG, $key, $value));
-    metrics.send();
+    metrics.write(format_args!("{}.{}:{}|c\n", *$crate::logging::TAG, $key, $value));
   }
 );
 
@@ -112,8 +118,7 @@ macro_rules! decr (
 macro_rules! time (
   ($key:expr, $value: expr) => {
     let mut metrics = ::network::metrics::METRICS.lock().unwrap();
-    metrics.buffer.write_fmt(format_args!("{}.{}:{}|ms\n", *$crate::logging::TAG, $key, $value));
-    metrics.send();
+    metrics.write(format_args!("{}.{}:{}|ms\n", *$crate::logging::TAG, $key, $value));
   }
 );
 
@@ -121,8 +126,7 @@ macro_rules! time (
 macro_rules! gauge (
   ($key:expr, $value: expr) => {
     let mut metrics = ::network::metrics::METRICS.lock().unwrap();
-    metrics.buffer.write_fmt(format_args!("{}.{}:{}|g\n", *$crate::logging::TAG, $key, $value));
-    metrics.send();
+    metrics.write(format_args!("{}.{}:{}|g\n", *$crate::logging::TAG, $key, $value));
   }
 );
 
@@ -130,7 +134,6 @@ macro_rules! gauge (
 macro_rules! meter (
   ($key:expr, $value: expr) =>  {
     let mut metrics = ::network::metrics::METRICS.lock().unwrap();
-    metrics.buffer.write_fmt(format_args!("{}.{}:{}|m\n", *$crate::logging::TAG, $key, $value));
-    metrics.send();
+    metrics.write(format_args!("{}.{}:{}|m\n", *$crate::logging::TAG, $key, $value));
   }
 );
