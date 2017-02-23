@@ -205,8 +205,15 @@ named!(pub message_header<Header>,
        )
 );
 
-pub fn comma_separated_header_value(input:&[u8]) -> Option<Vec<&[u8]>> {
-  let res: IResult<&[u8], Vec<&[u8]>> = separated_list!(input, delimited!(opt!(sp),char!(','),opt!(sp)), vchar_1);
+//not a space nor a comma
+fn is_single_header_value_char(i: u8) -> bool {
+  i > 33 && i <= 126 && i != 44
+}
+
+named!(pub single_header_value, take_while!(is_single_header_value_char));
+
+pub fn comma_separated_header_values(input:&[u8]) -> Option<Vec<&[u8]>> {
+  let res: IResult<&[u8], Vec<&[u8]>> = separated_list!(input, delimited!(opt!(sp),char!(','),opt!(sp)), single_header_value);
   if let IResult::Done(_,o) = res {
     Some(o)
   } else {
@@ -454,7 +461,7 @@ impl<'a> Header<'a> {
         }
       },
       b"connection" => {
-        match comma_separated_header_value(self.value) {
+        match comma_separated_header_values(self.value) {
           Some(tokens) => HeaderValue::Connection(tokens),
           None         => HeaderValue::Error
         }
@@ -964,7 +971,7 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
     HeaderValue::Connection(c) => {
       let mut conn = state.get_keep_alive().unwrap_or(Connection::new());
       for value in c {
-      trace!("PARSER\tgot Connection header: {:?}", str::from_utf8(value).expect("could not make string from value"));
+      trace!("PARSER\tgot Connection header: \"{:?}\"", str::from_utf8(value).expect("could not make string from value"));
         match &value.to_ascii_lowercase()[..] {
           b"close"      => { conn.keep_alive = Some(false); },
           b"keep-alive" => { conn.keep_alive = Some(true); },
@@ -1135,7 +1142,7 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
     HeaderValue::Connection(c) => {
       let mut conn = state.get_keep_alive().unwrap_or(Connection::new());
       for value in c {
-      info!("PARSER\tgot Connection header: {:?}", str::from_utf8(value).expect("could not make string from value"));
+      info!("PARSER\tgot Connection header: \"{:?}\"", str::from_utf8(value).expect("could not make string from value"));
         match &value.to_ascii_lowercase()[..] {
           b"close"      => { conn.keep_alive = Some(false); },
           b"keep-alive" => { conn.keep_alive = Some(true); },
@@ -1147,7 +1154,7 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
         ResponseState::HasStatusLine(rl, _)     => ResponseState::HasStatusLine(rl, conn),
         ResponseState::HasLength(rl, _, length) => ResponseState::HasLength(rl, conn, length),
         ResponseState::HasUpgrade(rl, _, proto) => {
-          info!("has upgrade, got conn: {:?}", conn);
+          info!("has upgrade, got conn: \"{:?}\"", conn);
           if conn.has_upgrade {
             ResponseState::HasUpgrade(rl, conn, proto)
           } else {
