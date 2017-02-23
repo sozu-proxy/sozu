@@ -64,32 +64,28 @@ impl ProxyMetrics {
   }
 
 
-  pub fn count(&mut self, key: &str, count: i64) -> io::Result<usize> {
-    let fmt = format!("{}.{}:{}|c\n", &self.prefix, key, count);
-    self.emit(&fmt)
+  pub fn count(&mut self, key: &str, count: i64) -> io::Result<()> {
+    self.buffer.write_fmt(format_args!("{}.{}:{}|c\n", &self.prefix, key, count))
   }
 
-  pub fn incr(&mut self, key: &str) -> io::Result<usize> {
+  pub fn incr(&mut self, key: &str) -> io::Result<()> {
     self.count(key, 1)
   }
 
-  pub fn decr(&mut self, key: &str) -> io::Result<usize> {
+  pub fn decr(&mut self, key: &str) -> io::Result<()> {
     self.count(key, -1)
   }
 
-  pub fn time(&mut self, key: &str, time: u64) -> io::Result<usize> {
-    let fmt = format!("{}.{}:{}|ms\n", self.prefix, key, time);
-    self.emit(&fmt)
+  pub fn time(&mut self, key: &str, time: u64) -> io::Result<()> {
+    self.buffer.write_fmt(format_args!("{}.{}:{}|ms\n", self.prefix, key, time))
   }
 
-  pub fn gauge(&mut self, key: &str, value: u64) -> io::Result<usize> {
-    let fmt = format!("{}.{}:{}|g\n", self.prefix, key, value);
-    self.emit(&fmt)
+  pub fn gauge(&mut self, key: &str, value: u64) -> io::Result<()> {
+    self.buffer.write_fmt(format_args!("{}.{}:{}|g\n", self.prefix, key, value))
   }
 
-  pub fn meter(&mut self, key: &str, value: u64) -> io::Result<usize> {
-    let fmt = format!("{}.{}:{}|m\n", self.prefix, key, value);
-    self.emit(&fmt)
+  pub fn meter(&mut self, key: &str, value: u64) -> io::Result<()> {
+    self.buffer.write_fmt(format_args!("{}.{}:{}|m\n", self.prefix, key, value))
   }
 }
 
