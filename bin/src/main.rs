@@ -12,11 +12,13 @@ extern crate rand;
 extern crate nix;
 #[macro_use] extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
+extern crate procinfo;
 
 mod command;
 mod worker;
 mod logging;
 mod upgrade;
+mod limits;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::collections::HashMap;
@@ -99,17 +101,47 @@ fn main() {
 
     let mut proxies:HashMap<String,Vec<Worker>> = HashMap::new();
 
-    for (ref tag, ref ls) in &config.proxies {
-      if let Some(workers) = start_workers(&tag, ls) {
-        proxies.insert(tag.to_string(), workers);
-      }
-    };
-    info!("created proxies: {:?}", proxies);
+    if check_process_limits(&config) {
+      for (ref tag, ref ls) in &config.proxies {
+        if let Some(workers) = start_workers(&tag, ls) {
+          proxies.insert(tag.to_string(), workers);
+        }
+      };
+      info!("created proxies: {:?}", proxies);
+      command::start(config, proxies);
+    }
 
-    command::start(config, proxies);
     info!("master process stopped");
   } else {
     error!("could not load configuration file at '{}', stopping", config_file);
   }
 }
 
+fn check_process_limits(config: &Config) -> bool{
+  let process_limits = procinfo::pid::limits_self().expect("Couldn't read /proc/self/limits to determine max open file descriptors limit");
+  // We check the hard_limit. The soft_limit can be changed at runtime
+  // by the process. hard_limit can only be changed by root
+  let hard_limit = process_limits.max_open_files.hard_limit;
+
+  // If limit is "unlimited"
+  if hard_limit == -1 {
+    return true;
+  }
+
+  let max_limit_per_proxy = config.proxies.values().all(|proxy| (proxy.max_connections as isize) <= hard_limit);
+  if !max_limit_per_proxy {
+    error!("At least one proxy can't have that much of connections. Current max file descriptor hard limit is: {}", hard_limit);
+    return false;
+  }
+
+  let total_proxies_connections = config.proxies.values().fold(0, |acc, ref proxy| acc + proxy.max_connections);
+  let system_max_fd = limits::limits_file_max().expect("Couldn't read /proc/sys/fs/file-max");
+
+  if total_proxies_connections > system_max_fd {
+    error!("Proxies total max_connections can't be higher than system's file-max limit. Current limit: {}, current value: {}",
+           system_max_fd, total_proxies_connections);
+    return false;
+  }
+
+  true
+}
