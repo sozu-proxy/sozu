@@ -12,8 +12,8 @@ lazy_static! {
 }
 
 pub struct ProxyMetrics {
-  buffer: Buffer,
-  prefix: String,
+  pub buffer: Buffer,
+  pub prefix: String,
   remote: Option<(SocketAddr, UdpSocket)>,
 }
 
@@ -40,7 +40,7 @@ impl ProxyMetrics {
   }
 
   pub fn send(&mut self) -> io::Result<usize> {
-    if self.buffer.available_data() > 0 {
+    if self.buffer.available_data() >= 512 {
       if let Some((ref addr, ref socket)) = self.remote {
         match socket.send_to(self.buffer.data(), addr) {
           Ok(sz) => {
@@ -91,30 +91,46 @@ impl ProxyMetrics {
 
 #[macro_export]
 macro_rules! count (
-  ($key:expr, $value: expr) => (::network::metrics::METRICS.lock().unwrap().count($key, $value);)
+  ($key:expr, $value: expr) => {
+    let mut metrics = ::network::metrics::METRICS.lock().unwrap();
+    metrics.buffer.write_fmt(format_args!("{}.{}:{}|c\n", *$crate::logging::TAG, $key, $value));
+    metrics.send();
+  }
 );
 
 #[macro_export]
 macro_rules! incr (
-  ($key:expr) => (::network::metrics::METRICS.lock().unwrap().incr($key);)
+  ($key:expr) => (count!($key, 1);)
 );
 
 #[macro_export]
 macro_rules! decr (
-  ($key:expr) => (::network::metrics::METRICS.lock().unwrap().decr($key);)
+  ($key:expr) => (count!($key, -1);)
 );
 
 #[macro_export]
 macro_rules! time (
-  ($key:expr, $value: expr) => (::network::metrics::METRICS.lock().unwrap().time($key, $value);)
+  ($key:expr, $value: expr) => {
+    let mut metrics = ::network::metrics::METRICS.lock().unwrap();
+    metrics.buffer.write_fmt(format_args!("{}.{}:{}|ms\n", *$crate::logging::TAG, $key, $value));
+    metrics.send();
+  }
 );
 
 #[macro_export]
 macro_rules! gauge (
-  ($key:expr, $value: expr) => (::network::metrics::METRICS.lock().unwrap().gauge($key, $value);)
+  ($key:expr, $value: expr) => {
+    let mut metrics = ::network::metrics::METRICS.lock().unwrap();
+    metrics.buffer.write_fmt(format_args!("{}.{}:{}|g\n", *$crate::logging::TAG, $key, $value));
+    metrics.send();
+  }
 );
 
 #[macro_export]
 macro_rules! meter (
-  ($key:expr, $value: expr) => (::network::metrics::METRICS.lock().unwrap().meter($key, $value);)
+  ($key:expr, $value: expr) =>  {
+    let mut metrics = ::network::metrics::METRICS.lock().unwrap();
+    metrics.buffer.write_fmt(format_args!("{}.{}:{}|m\n", *$crate::logging::TAG, $key, $value));
+    metrics.send();
+  }
 );
