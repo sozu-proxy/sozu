@@ -317,7 +317,7 @@ impl ProxyClient for TlsClient {
 }
 
 fn get_cert_common_name(cert: &X509) -> Option<String> {
-    cert.subject_name().entries_by_nid(nid::COMMONNAME).next().and_then(|name| name.data().as_utf8().ok().map(|name| String::from(&*name)))
+    cert.subject_name().entries_by_nid(nid::COMMONNAME).next().and_then(|name| name.data().as_utf8().ok().map(|name| (&*name).to_string()))
 }
 
 pub type AppId     = String;
