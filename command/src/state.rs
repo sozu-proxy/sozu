@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap,HashSet};
+use std::iter::FromIterator;
 use openssl::x509::X509;
 use openssl::hash::MessageDigest;
 
@@ -44,6 +45,14 @@ impl ConfigState {
       ConfigState::Http(ref state) => state.generate_orders(),
       ConfigState::Tls(ref state)  => state.generate_orders(),
       ConfigState::Tcp             => vec!(),
+    }
+  }
+
+  pub fn diff(&self, other:&ConfigState) -> Vec<Order> {
+    match (self, other) {
+      (&ConfigState::Http(ref state), &ConfigState::Http(ref other_state)) => state.diff(other_state),
+      (&ConfigState::Tls(ref state),  &ConfigState::Tls(ref other_state))  => state.diff(other_state),
+      _                                                                  => vec!(),
     }
   }
 }
@@ -125,6 +134,68 @@ impl HttpProxy {
       for instance in instance_list {
         v.push(Order::AddInstance(instance.clone()));
       }
+    }
+
+    v
+  }
+
+  pub fn diff(&self, other:&HttpProxy) -> Vec<Order> {
+    let mut my_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
+    for (ref app_id, ref front_list) in self.fronts.iter() {
+      for ref front in front_list.iter() {
+        my_fronts.insert((&app_id, &front));
+      }
+    }
+    let mut their_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
+    for (ref app_id, ref front_list) in other.fronts.iter() {
+      for ref front in front_list.iter() {
+        their_fronts.insert((&app_id, &front));
+      }
+    }
+
+    let removed_fronts = my_fronts.difference(&their_fronts);
+    let added_fronts   = their_fronts.difference(&my_fronts);
+
+    let mut my_instances: HashSet<(&AppId, &Instance)> = HashSet::new();
+    for (ref app_id, ref instance_list) in self.instances.iter() {
+      for ref instance in instance_list.iter() {
+        my_instances.insert((&app_id, &instance));
+      }
+    }
+    let mut their_instances: HashSet<(&AppId, &Instance)> = HashSet::new();
+    for (ref app_id, ref instance_list) in other.instances.iter() {
+      for ref instance in instance_list.iter() {
+        their_instances.insert((&app_id, &instance));
+      }
+    }
+
+    let removed_instances = my_instances.difference(&their_instances);
+    let added_instances   = their_instances.difference(&my_instances);
+
+    let mut v = vec!();
+
+    for &(app_id, front) in removed_fronts {
+     v.push(Order::RemoveHttpFront(HttpFront {
+       app_id:     app_id.clone(),
+       hostname:   front.hostname.clone(),
+       path_begin: front.path_begin.clone(),
+      }));
+    }
+
+    for &(_, instance) in added_instances {
+      v.push(Order::AddInstance(instance.clone()));
+    }
+
+    for &(_, instance) in removed_instances {
+      v.push(Order::RemoveInstance(instance.clone()));
+    }
+
+    for &(app_id, front) in added_fronts {
+      v.push(Order::AddHttpFront(HttpFront {
+        app_id:     app_id.clone(),
+        hostname:   front.hostname.clone(),
+        path_begin: front.path_begin.clone(),
+      }));
     }
 
     v
@@ -245,6 +316,85 @@ impl TlsProxy {
 
     v
   }
+
+  pub fn diff(&self, other:&TlsProxy) -> Vec<Order> {
+    let mut my_fronts: HashSet<(&AppId, &TlsFront)> = HashSet::new();
+    for (ref app_id, ref front_list) in self.fronts.iter() {
+      for ref front in front_list.iter() {
+        my_fronts.insert((&app_id, &front));
+      }
+    }
+    let mut their_fronts: HashSet<(&AppId, &TlsFront)> = HashSet::new();
+    for (ref app_id, ref front_list) in other.fronts.iter() {
+      for ref front in front_list.iter() {
+        their_fronts.insert((&app_id, &front));
+      }
+    }
+
+    let removed_fronts = my_fronts.difference(&their_fronts);
+    let added_fronts   = their_fronts.difference(&my_fronts);
+
+    let mut my_instances: HashSet<(&AppId, &Instance)> = HashSet::new();
+    for (ref app_id, ref instance_list) in self.instances.iter() {
+      for ref instance in instance_list.iter() {
+        my_instances.insert((&app_id, &instance));
+      }
+    }
+    let mut their_instances: HashSet<(&AppId, &Instance)> = HashSet::new();
+    for (ref app_id, ref instance_list) in other.instances.iter() {
+      for ref instance in instance_list.iter() {
+        their_instances.insert((&app_id, &instance));
+      }
+    }
+
+    let removed_instances = my_instances.difference(&their_instances);
+    let added_instances   = their_instances.difference(&my_instances);
+
+
+    let my_certificates:    HashSet<(&CertFingerprint, &CertificateAndKey)> = HashSet::from_iter(self.certificates.iter());
+    let their_certificates: HashSet<(&CertFingerprint, &CertificateAndKey)> = HashSet::from_iter(other.certificates.iter());
+
+    let removed_certificates = my_certificates.difference(&their_certificates);
+    let added_certificates   = their_certificates.difference(&my_certificates);
+
+    let mut v = vec!();
+
+    for &(_, certificate_and_key) in added_certificates {
+      v.push(Order::AddCertificate(certificate_and_key.clone()));
+    }
+
+    for &(app_id, front) in removed_fronts {
+     v.push(Order::RemoveTlsFront(TlsFront {
+       app_id:      app_id.clone(),
+       hostname:    front.hostname.clone(),
+       path_begin:  front.path_begin.clone(),
+       fingerprint: front.fingerprint.clone(),
+      }));
+    }
+
+    for &(_, instance) in added_instances {
+      v.push(Order::AddInstance(instance.clone()));
+    }
+
+    for &(_, instance) in removed_instances {
+      v.push(Order::RemoveInstance(instance.clone()));
+    }
+
+    for &(app_id, front) in added_fronts {
+      v.push(Order::AddTlsFront(TlsFront {
+        app_id:      app_id.clone(),
+        hostname:    front.hostname.clone(),
+        path_begin:  front.path_begin.clone(),
+        fingerprint: front.fingerprint.clone(),
+      }));
+    }
+
+    for  &(fingerprint, _) in removed_certificates {
+      v.push(Order::RemoveCertificate(fingerprint.clone()));
+    }
+
+    v
+  }
 }
 
 #[cfg(test)]
@@ -272,5 +422,35 @@ mod tests {
     assert_eq!(new_state, Some(state));
     */
     //assert!(false);
+  }
+
+  #[test]
+  fn diff() {
+    let mut state = HttpProxy::new(String::from("127.0.0.1"), 80);
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc") }));
+    state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 }));
+    state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
+    state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_2"), ip_address: String::from("192.167.1.2"), port: 1026 }));
+
+    let mut state2 = HttpProxy::new(String::from("127.0.0.1"), 80);
+    state2.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") }));
+    state2.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 }));
+    state2.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
+    state2.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1028 }));
+
+   let e = vec!(
+     Order::RemoveHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc") }),
+     Order::RemoveInstance(Instance { app_id: String::from("app_2"), ip_address: String::from("192.167.1.2"), port: 1026 }),
+     Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1028 }),
+   );
+   let expected_diff:HashSet<&Order> = HashSet::from_iter(e.iter());
+
+   let d = state.diff(&state2);
+   let diff = HashSet::from_iter(d.iter());
+   println!("diff orders:\n{:?}\n", diff);
+   println!("expected diff orders:\n{:?}\n", expected_diff);
+
+   assert_eq!(diff, expected_diff);
   }
 }
