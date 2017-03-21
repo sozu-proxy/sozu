@@ -1,35 +1,23 @@
 language: rust
 
-addons:
-  apt:
-    packages:
-      # - openssl
-      # - libssl-dev
-      #      - libcurl4-openssl-dev
-      #- libelf-dev
-      #- libdw-dev
+cache: cargo
 
 rust:
   - nightly
   - beta
+  - stable
 
 before_install:
   - export ROOT_PATH=`pwd`
-  - export CFLAGS="-fPIC"
-  - curl -L -O https://www.openssl.org/source/openssl-1.0.2j.tar.gz
-  - tar xzf openssl-1.0.2j.tar.gz
-  - cd openssl-1.0.2j
-  - mkdir $ROOT_PATH/openssl-1.0.2j/dist
-  - ./Configure --prefix=$ROOT_PATH/openssl-1.0.2j/dist linux-x86_64 -fPIC && make && make install
-  - make build_tests
+  - wget http://security.ubuntu.com/ubuntu/pool/main/o/openssl/libssl1.0.0_1.0.2g-1ubuntu4.6_amd64.deb
+  - wget http://security.ubuntu.com/ubuntu/pool/main/o/openssl/libssl-dev_1.0.2g-1ubuntu4.6_amd64.deb
+  - sudo dpkg -i libssl1.0.0_1.0.2g-1ubuntu4.6_amd64.deb
+  - sudo dpkg -i libssl-dev_1.0.2g-1ubuntu4.6_amd64.deb
 
 before_script:
   - pip install 'travis-cargo<0.2' --user && export PATH=$HOME/.local/bin:$PATH
 
 script:
-  - export OPENSSL_INCLUDE_DIR=$ROOT_PATH/openssl-1.0.2j/dist/include
-  - export OPENSSL_LIB_DIR=$ROOT_PATH/openssl-1.0.2j/dist/lib
-  - ls $ROOT_PATH/openssl-1.0.2j/dist/lib
   - cd $ROOT_PATH/lib     && travis-cargo --only nightly test
   - cd $ROOT_PATH/command && travis-cargo --only nightly test
   - cd $ROOT_PATH/bin     && travis-cargo --only nightly build
