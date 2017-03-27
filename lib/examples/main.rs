@@ -1,7 +1,5 @@
 #![allow(unused_variables,unused_must_use)]
-#[macro_use] extern crate log;
-extern crate env_logger;
-extern crate sozu_lib as sozu;
+#[macro_use] extern crate sozu_lib as sozu;
 extern crate openssl;
 extern crate time;
 extern crate libc;

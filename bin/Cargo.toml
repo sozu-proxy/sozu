@@ -6,8 +6,6 @@ authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
 
 [dependencies]
-log = "0.3"
-env_logger = "0.3"
 mio = "^0.6"
 mio-uds = "^0.6"
 serde = "~0.8"
