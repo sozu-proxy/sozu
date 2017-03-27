@@ -8,6 +8,7 @@ use mio::*;
 use mio::tcp::*;
 use mio::timer::Timeout;
 use mio_uds::UnixStream;
+use mio::unix::UnixReady;
 use std::io::{self,Read,Write,ErrorKind,BufReader};
 use std::collections::HashMap;
 use std::error::Error;
@@ -114,7 +115,7 @@ impl TlsClient {
             back_buf, self.public_address.clone()).unwrap();
 
           http.readiness = handshake.readiness;
-          http.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
+          http.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
           http.set_front_token(unwrap_msg!(self.front_token.as_ref()).clone());
           self.ssl = handshake.ssl;
           self.protocol = Some(State::Http(http));
@@ -844,7 +845,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
         error!("TLS SNI hostname '{:?}' and Host header '{}' don't match", servername, hostname_str);
         unwrap_msg!(client.http()).set_answer(&self.answers.NotFound);
-        client.readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
+        client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
         return Err(ConnectionError::HostNotFound);
       }
 
@@ -876,14 +877,15 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         backend.dec_connections();
       });
     }
+    info!("instances: {:?}", self.instances);
 
     let reused = client.http().map(|http| http.app_id.is_some()).unwrap_or(false);
     //deregister back socket if it is the wrong one or if it was not connecting
     if reused || client.back_connected == BackendConnectionStatus::Connecting {
       client.instance = None;
       client.back_connected = BackendConnectionStatus::NotConnected;
-      client.readiness().back_interest  = Ready::none();
-      client.readiness().back_readiness = Ready::none();
+      client.readiness().back_interest  = UnixReady::from(Ready::empty());
+      client.readiness().back_readiness = UnixReady::from(Ready::empty());
       client.back_socket().as_ref().map(|sock| {
         event_loop.deregister(*sock);
         sock.shutdown(Shutdown::Both);
@@ -919,12 +921,12 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Err(ConnectionError::NoBackendAvailable) => {
         unwrap_msg!(client.http()).set_answer(&self.answers.ServiceUnavailable);
-        client.readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
+        client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
         Err(ConnectionError::NoBackendAvailable)
       },
       Err(ConnectionError::HostNotFound) => {
         unwrap_msg!(client.http()).set_answer(&self.answers.NotFound);
-        client.readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
+        client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
         Err(ConnectionError::HostNotFound)
       },
       e => panic!(e)

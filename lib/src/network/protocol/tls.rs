@@ -1,5 +1,6 @@
 use mio::*;
 use mio::tcp::*;
+use mio::unix::UnixReady;
 use pool::Checkout;
 use network::buffer_queue::BufferQueue;
 use openssl::ssl::{self,HandshakeError,MidHandshakeSslStream,Ssl,SslStream};
@@ -32,10 +33,10 @@ impl TlsHandshake {
       stream:         None,
       state:          TlsState::Initial,
       readiness:      Readiness {
-                        front_interest:  Ready::readable() | Ready::hup() | Ready::error(),
-                        back_interest:   Ready::none(),
-                        front_readiness: Ready::none(),
-                        back_readiness:  Ready::none(),
+                        front_interest:  UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
+                        back_interest:   UnixReady::from(Ready::empty()),
+                        front_readiness: UnixReady::from(Ready::empty()),
+                        back_readiness:  UnixReady::from(Ready::empty()),
       },
     }
   }

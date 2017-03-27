@@ -1,13 +1,12 @@
 #![allow(dead_code, unused_must_use, unused_variables, unused_imports)]
 
 use std::thread::{self,Thread,Builder};
-//use std::sync::mpsc::{self,channel,Receiver};
 use std::sync::mpsc::TryRecvError;
-use std::net::SocketAddr;
-use mio::tcp::*;
+use std::net::{SocketAddr,Shutdown};
+use mio::net::*;
 use mio::*;
+use mio::unix::UnixReady;
 use mio::timer::{Timer,Timeout};
-use mio::channel::Receiver;
 use std::collections::HashMap;
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
@@ -77,27 +76,27 @@ impl From<BackToken> for usize {
 
 #[derive(Debug)]
 pub struct Readiness {
-  pub front_interest:  Ready,
-  pub back_interest:   Ready,
-  pub front_readiness: Ready,
-  pub back_readiness:  Ready,
+  pub front_interest:  UnixReady,
+  pub back_interest:   UnixReady,
+  pub front_readiness: UnixReady,
+  pub back_readiness:  UnixReady,
 }
 
 impl Readiness {
   pub fn new() -> Readiness {
     Readiness {
-      front_interest:  Ready::none(),
-      back_interest:   Ready::none(),
-      front_readiness: Ready::none(),
-      back_readiness:  Ready::none(),
+      front_interest:  UnixReady::from(Ready::empty()),
+      back_interest:   UnixReady::from(Ready::empty()),
+      front_readiness: UnixReady::from(Ready::empty()),
+      back_readiness:  UnixReady::from(Ready::empty()),
     }
   }
 
   pub fn reset(&mut self) {
-    self.front_interest  = Ready::none();
-    self.back_interest   = Ready::none();
-    self.front_readiness = Ready::none();
-    self.back_readiness  = Ready::none();
+    self.front_interest  = UnixReady::from(Ready::empty());
+    self.back_interest   = UnixReady::from(Ready::empty());
+    self.front_readiness = UnixReady::from(Ready::empty());
+    self.back_readiness  = UnixReady::from(Ready::empty());
   }
 }
 
@@ -166,7 +165,13 @@ pub struct Server<ServerConfiguration,Client> {
 impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<ServerConfiguration,Client> {
   pub fn new(max_listeners: usize, max_connections: usize, configuration: ServerConfiguration, poll: Poll) -> Self {
     let mut configuration = configuration;
-    poll.register(configuration.channel(), Token(0), Ready::all(), PollOpt::edge()).expect("should register the channel");
+    poll.register(
+      configuration.channel(),
+      Token(0),
+      Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+      PollOpt::edge()
+    ).expect("should register the channel");
+
     let clients = Slab::with_capacity(max_connections);
     let backend = Slab::with_capacity(max_connections);
     //let timer   = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
@@ -234,8 +239,13 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
   pub fn accept(&mut self, token: ListenToken) {
     if let Some((client, should_connect)) = self.configuration.accept(token) {
       if let Ok(client_token) = self.clients.insert(client) {
-        self.clients[client_token].readiness().front_interest = Ready::readable() | Ready::hup() | Ready::error();
-        self.poll.register(self.clients[client_token].front_socket(), self.from_front(client_token), Ready::all(), PollOpt::edge() );
+        self.clients[client_token].readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+        self.poll.register(
+          self.clients[client_token].front_socket(),
+          self.from_front(client_token),
+          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+          PollOpt::edge()
+        );
         let front = self.from_front(client_token);
         &self.clients[client_token].set_front_token(front);
 
@@ -265,7 +275,12 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
       Ok(BackendConnectAction::Replace) => {
         if let Some(backend_token) = self.clients[token].back_token() {
           if let Some(sock) = self.clients[token].back_socket() {
-            self.poll.register(sock, backend_token, Ready::all(), PollOpt::edge());
+            self.poll.register(
+              sock,
+              backend_token,
+              Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+              PollOpt::edge()
+            );
           }
 
           /*
@@ -281,9 +296,14 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
           let back = self.from_back(backend_token);
           self.clients[token].set_back_token(back);
 
-          //self.clients[token].readiness().back_interest = Ready::writable() | Ready::hup() | Ready::error();
+          //self.clients[token].readiness().back_interest = Ready::writable() | UnixReady::hup() | UnixReady::error();
           if let Some(sock) = self.clients[token].back_socket() {
-            self.poll.register(sock, back, Ready::all(), PollOpt::edge());
+            self.poll.register(
+              sock,
+              back,
+              Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+              PollOpt::edge()
+            );
           }
 
           let back = self.from_back(backend_token);
@@ -296,9 +316,9 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
         }
       },
       Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) => {
-        self.clients[token].readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
-        self.clients[token].readiness().back_interest  = Ready::hup() | Ready::error();
-        //let mut front_interest = Ready::hup();
+        self.clients[token].readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+        self.clients[token].readiness().back_interest  = UnixReady::hup() | UnixReady::error();
+        //let mut front_interest = UnixReady::hup();
         //front_interest.insert(Ready::writable());
         //let client = &self.clients[token];
 
@@ -412,7 +432,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
             self.timeout(token);
           }
         } else {
-          self.ready(event.token(), event.kind());
+          self.ready(event.token(), event.readiness());
         }
       }
 
@@ -454,7 +474,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
       Some(SocketType::FrontClient) => {
         let front_token = self.to_front(token);
         if self.clients.contains(front_token) {
-          self.clients[front_token].readiness().front_readiness = self.clients[front_token].readiness().front_readiness | events;
+          self.clients[front_token].readiness().front_readiness = self.clients[front_token].readiness().front_readiness | UnixReady::from(events);
           front_token
         } else {
           return;
@@ -462,7 +482,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
       },
       Some(SocketType::BackClient) => {
         if let Some(tok) = self.get_client_token(token) {
-          self.clients[tok].readiness().back_readiness = self.clients[tok].readiness().back_readiness | events;
+          self.clients[tok].readiness().back_readiness = self.clients[tok].readiness().back_readiness | UnixReady::from(events);
 
           if self.clients[tok].back_connected() == BackendConnectionStatus::Connecting {
             if self.clients[tok].readiness().back_readiness.is_hup() {
@@ -493,7 +513,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
 
       //info!("PROXY\t{:?} {:?} | {:?} front: {:?} | back: {:?} ", client_token, events, self.clients[client_token].readiness(), front_interest, back_interest);
 
-      if front_interest == Ready::none() && back_interest == Ready::none() {
+      if front_interest == UnixReady::from(Ready::empty()) && back_interest == UnixReady::from(Ready::empty()) {
         break;
       }
 
@@ -562,33 +582,33 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
 
       if front_interest.is_hup() {
         if self.clients[client_token].front_hup() == ClientResult::CloseClient {
-          self.clients[client_token].readiness().front_interest = Ready::none();
-          self.clients[client_token].readiness().back_interest  = Ready::none();
-          self.clients[client_token].readiness().back_readiness.remove(Ready::hup());
+          self.clients[client_token].readiness().front_interest = UnixReady::from(Ready::empty());
+          self.clients[client_token].readiness().back_interest  = UnixReady::from(Ready::empty());
+          self.clients[client_token].readiness().back_readiness.remove(UnixReady::hup());
           self.close_client(client_token);
           break;
         } else {
-          self.clients[client_token].readiness().front_readiness.remove(Ready::hup());
+          self.clients[client_token].readiness().front_readiness.remove(UnixReady::hup());
         }
       }
 
       if back_interest.is_hup() {
         if self.clients[client_token].front_hup() == ClientResult::CloseClient {
-          self.clients[client_token].readiness().front_interest = Ready::none();
-          self.clients[client_token].readiness().back_interest  = Ready::none();
-          self.clients[client_token].readiness().front_readiness.remove(Ready::hup());
+          self.clients[client_token].readiness().front_interest = UnixReady::from(Ready::empty());
+          self.clients[client_token].readiness().back_interest  = UnixReady::from(Ready::empty());
+          self.clients[client_token].readiness().front_readiness.remove(UnixReady::hup());
           self.close_client(client_token);
           break;
         } else {
-          self.clients[client_token].readiness().back_readiness.remove(Ready::hup());
+          self.clients[client_token].readiness().back_readiness.remove(UnixReady::hup());
         }
       }
 
       if front_interest.is_error() || back_interest.is_error() {
         error!("PROXY client {:?} got an error: front: {:?} back: {:?}", client_token, front_interest,
           back_interest);
-        self.clients[client_token].readiness().front_interest = Ready::none();
-        self.clients[client_token].readiness().back_interest  = Ready::none();
+        self.clients[client_token].readiness().front_interest = UnixReady::from(Ready::empty());
+        self.clients[client_token].readiness().back_interest  = UnixReady::from(Ready::empty());
         self.close_client(client_token);
         break;
       }

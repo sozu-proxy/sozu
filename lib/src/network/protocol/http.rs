@@ -2,6 +2,7 @@ use std::cmp::min;
 use std::net::{SocketAddr,IpAddr};
 use std::io::Write;
 use mio::*;
+use mio::unix::UnixReady;
 use mio::tcp::TcpStream;
 use pool::{Pool,Checkout,Reset};
 use time::{Duration, precise_time_s, precise_time_ns};
@@ -249,8 +250,8 @@ impl<Front:SocketHandler> Http<Front> {
       if self.backend_token == None {
         // We don't have a backend to empty the buffer into, close the connection
         error!("{}\t[{:?}] front buffer full, no backend, closing the connection", self.log_ctx, self.token);
-        self.readiness.front_interest = Ready::none();
-        self.readiness.back_interest  = Ready::none();
+        self.readiness.front_interest = UnixReady::from(Ready::empty());
+        self.readiness.back_interest  = UnixReady::from(Ready::empty());
         return ClientResult::CloseClient;
       } else {
         self.readiness.front_interest.remove(Ready::readable());
@@ -465,18 +466,18 @@ impl<Front:SocketHandler> Http<Front> {
         // a pool of connections
         if front_keep_alive && back_keep_alive {
           self.reset();
-          self.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
-          self.readiness.back_interest  = Ready::writable() | Ready::hup() | Ready::error();
+          self.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+          self.readiness.back_interest  = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
 
           info!("{}\t[{:?}] request ended successfully, keep alive for front and back", self.log_ctx, self.token);
           ClientResult::Continue
           //FIXME: issues reusing the backend socket
-          //self.readiness.back_interest  = Ready::hup() | Ready::error();
+          //self.readiness.back_interest  = UnixReady::hup() | UnixReady::error();
           //ClientResult::CloseBackend
         } else if front_keep_alive && !back_keep_alive {
           self.reset();
-          self.readiness.front_interest = Ready::readable() | Ready::hup() | Ready::error();
-          self.readiness.back_interest  = Ready::hup() | Ready::error();
+          self.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+          self.readiness.back_interest  = UnixReady::hup() | UnixReady::error();
           info!("{}\t[{:?}] request ended successfully, keepalive for front", self.log_ctx, self.token);
           ClientResult::CloseBackend
         } else {

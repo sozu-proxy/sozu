@@ -2,7 +2,7 @@
 
 use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
-use mio::tcp::*;
+use mio::net::*;
 use mio::*;
 use mio_uds::UnixStream;
 use mio::timer::Timeout;

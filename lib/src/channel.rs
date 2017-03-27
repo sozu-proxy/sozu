@@ -40,7 +40,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
       front_buf:       Buffer::with_capacity(buffer_size),
       back_buf:        Buffer::with_capacity(buffer_size),
       max_buffer_size: max_buffer_size,
-      readiness:       Ready::none(),
+      readiness:       Ready::empty(),
       interest:        Ready::readable(),
       blocking:        false,
       phantom_tx:      PhantomData,
@@ -121,8 +121,8 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
             },
             _ => {
               //log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error (kind: {:?}): {:?}", tok.0, code, e);
-              self.interest  = Ready::none();
-              self.readiness = Ready::none();
+              self.interest  = Ready::empty();
+              self.readiness = Ready::empty();
               return Err(ConnError::SocketError);
             }
           }
@@ -166,8 +166,8 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
               break;
             },
             _ => {
-              self.interest  = Ready::none();
-              self.readiness = Ready::none();
+              self.interest  = Ready::empty();
+              self.readiness = Ready::empty();
               return Err(ConnError::SocketError);
             }
           }

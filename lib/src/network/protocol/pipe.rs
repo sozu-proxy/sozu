@@ -3,6 +3,7 @@ use std::net::{SocketAddr,IpAddr};
 use std::io::Write;
 use mio::*;
 use mio::tcp::TcpStream;
+use mio::unix::UnixReady;
 use pool::{Pool,Checkout,Reset};
 use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
@@ -52,10 +53,10 @@ impl<Front:SocketHandler> Pipe<Front> {
       app_id:             None,
       request_id:         request_id,
       readiness:          Readiness {
-                            front_interest:  Ready::readable() | Ready::writable() |Ready::hup() | Ready::error(),
-                            back_interest:   Ready::readable() | Ready::writable() |Ready::hup() | Ready::error(),
-                            front_readiness: Ready::none(),
-                            back_readiness:  Ready::none(),
+                            front_interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
+                            back_interest:   UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
+                            front_readiness: UnixReady::from(Ready::empty()),
+                            back_readiness:  UnixReady::from(Ready::empty()),
       },
       log_ctx:            log_ctx,
       public_address:     public_address,

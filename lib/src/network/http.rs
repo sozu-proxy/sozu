@@ -10,6 +10,7 @@ use mio::*;
 use mio::tcp::*;
 use mio::timer::Timeout;
 use mio_uds::UnixStream;
+use mio::unix::UnixReady;
 use pool::{Pool,Checkout,Reset};
 use uuid::Uuid;
 use nom::{HexDisplay,IResult};
@@ -545,8 +546,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       if reused || client.back_connected == BackendConnectionStatus::Connecting {
         client.instance = None;
         client.back_connected = BackendConnectionStatus::NotConnected;
-        client.readiness().back_interest  = Ready::none();
-        client.readiness().back_readiness = Ready::none();
+        client.readiness().back_interest  = UnixReady::from(Ready::empty());
+        client.readiness().back_readiness = UnixReady::from(Ready::empty());
         let sock = unwrap_msg!(client.backend.as_ref());
         event_loop.deregister(sock);
         sock.shutdown(Shutdown::Both);
@@ -558,8 +559,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           socket.set_nodelay(true);
           client.set_back_socket(socket);
           client.readiness().back_interest.insert(Ready::writable());
-          client.readiness().back_interest.insert(Ready::hup());
-          client.readiness().back_interest.insert(Ready::error());
+          client.readiness().back_interest.insert(UnixReady::hup());
+          client.readiness().back_interest.insert(UnixReady::error());
           if reused {
             Ok(BackendConnectAction::Replace)
           } else {
@@ -569,19 +570,19 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         },
         Err(ConnectionError::NoBackendAvailable) => {
           client.set_answer(&self.answers.ServiceUnavailable);
-          client.readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
+          client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::NoBackendAvailable)
         }
         Err(ConnectionError::HostNotFound) => {
           client.set_answer(&self.answers.NotFound);
-          client.readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
+          client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::HostNotFound)
         }
         e => panic!(e)
       }
     } else {
       client.set_answer(&self.answers.NotFound);
-      client.readiness().front_interest = Ready::writable() | Ready::hup() | Ready::error();
+      client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
       Err(ConnectionError::HostNotFound)
     }
   }

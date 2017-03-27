@@ -1,9 +1,8 @@
 use libc;
 use std::str::FromStr;
 use std::cmp::{self,Ord};
-use std::sync::{Mutex, Once, ONCE_INIT};
-use std::cell::RefCell;
-use std::fmt::{Arguments,format,write};
+use std::sync::Mutex;
+use std::fmt::{Arguments,format};
 use std::io::{stdout,Stdout,Write};
 use std::ascii::AsciiExt;
 use std::net::{SocketAddr,UdpSocket};
