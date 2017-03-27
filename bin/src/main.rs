@@ -12,6 +12,8 @@ extern crate rand;
 extern crate nix;
 #[macro_use] extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
+
+#[cfg(target_os="linux")]
 extern crate procinfo;
 
 mod command;
@@ -117,7 +119,8 @@ fn main() {
   }
 }
 
-fn check_process_limits(config: &Config) -> bool{
+#[cfg(target_os="linux")]
+fn check_process_limits(config: &Config) -> bool {
   let process_limits = procinfo::pid::limits_self().expect("Couldn't read /proc/self/limits to determine max open file descriptors limit");
   // We check the hard_limit. The soft_limit can be changed at runtime
   // by the process. hard_limit can only be changed by root
@@ -143,5 +146,10 @@ fn check_process_limits(config: &Config) -> bool{
     return false;
   }
 
+  true
+}
+
+#[cfg(not(target_os="linux"))]
+fn check_process_limits(_: &Config) -> bool {
   true
 }
