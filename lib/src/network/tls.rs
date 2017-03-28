@@ -350,7 +350,7 @@ pub struct ServerConfiguration {
 impl ServerConfiguration {
   pub fn new(config: TlsProxyConfiguration, mut channel: ProxyChannel, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
-    let mut domains  = TrieNode::root();
+    let     domains  = TrieNode::root();
     let mut fronts   = HashMap::new();
     let rc_ctx       = Arc::new(Mutex::new(contexts));
     let ref_ctx      = rc_ctx.clone();
@@ -358,7 +358,7 @@ impl ServerConfiguration {
     let ref_domains  = rc_domains.clone();
     let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
 
-    let (fingerprint, mut tls_data, names):(Vec<u8>,TlsData, Vec<String>) = Self::create_default_context(&config, ref_ctx, ref_domains, default_name).expect("could not create default context");
+    let (fingerprint, tls_data, names):(Vec<u8>,TlsData, Vec<String>) = Self::create_default_context(&config, ref_ctx, ref_domains, default_name).expect("could not create default context");
     let cert = try!(X509::from_pem(&tls_data.certificate));
 
     let common_name: Option<String> = get_cert_common_name(&cert);
@@ -1137,7 +1137,7 @@ mod tests {
   }
 */
 
-  use mio::tcp;
+  use mio::net;
   #[test]
   fn frontend_from_request_test() {
     let app_id1 = "app_1".to_owned();
@@ -1185,7 +1185,7 @@ mod tests {
     };
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1032").expect("test address 127.0.0.1:1032 should be parsed");
-    let listener = tcp::TcpListener::bind(&front).expect("test address 127.0.0.1:1032 should be available");
+    let listener = net::TcpListener::bind(&front).expect("test address 127.0.0.1:1032 should be available");
     let server_config = ServerConfiguration {
       listener:  listener,
       address:   front,

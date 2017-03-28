@@ -187,9 +187,6 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
   }
 
   pub fn read_message_nonblocking(&mut self) -> Option<Rx> {
-    let offset = 0usize;
-    let grow   = false;
-
     if let Some(pos) = self.front_buf.data().iter().position(|&x| x == 0) {
       let mut res = None;
 
@@ -220,9 +217,6 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
   }
 
   pub fn read_message_blocking(&mut self) -> Option<Rx> {
-    let offset = 0usize;
-    let grow   = false;
-
     loop {
       if let Some(pos) = self.front_buf.data().iter().position(|&x| x == 0) {
         let mut res = None;
@@ -252,7 +246,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
         match self.sock.read(self.front_buf.space()) {
           Ok(0) => {
           },
-          Err(e) => { return None; },
+          Err(_) => { return None; },
           Ok(r) => {
             self.front_buf.fill(r);
           },
@@ -325,7 +319,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
         Ok(r) => {
           self.back_buf.consume(r);
         },
-        Err(e) => {
+        Err(_) => {
           return true;
         }
       }

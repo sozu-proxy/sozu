@@ -385,12 +385,12 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
 
       for event in events.iter() {
         if event.token() == Token(0) {
-          let kind = event.kind();
-          if kind.is_error() {
+          let kind = event.readiness();
+          if UnixReady::from(kind).is_error() {
             error!("error reading from command channel");
             continue;
           }
-          if kind.is_hup() {
+          if UnixReady::from(kind).is_hup() {
             error!("command channel was closed");
             continue;
           }
@@ -465,7 +465,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
           return;
         }
 
-        if events.is_hup() {
+        if UnixReady::from(events).is_hup() {
           error!("should not happen: server {:?} closed", token);
           return;
         }

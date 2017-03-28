@@ -6,6 +6,7 @@ use mio::net::*;
 use mio::*;
 use mio_uds::UnixStream;
 use mio::timer::Timeout;
+use mio::unix::UnixReady;
 use std::collections::HashMap;
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
@@ -72,8 +73,8 @@ impl Client {
       token:          None,
       backend_token:  None,
       accept_token:   accept_token,
-      back_interest:  Ready::all(),
-      front_interest: Ready::all(),
+      back_interest:  Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+      front_interest: Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
       front_timeout:  None,
       back_timeout:   None,
       status:         ConnectionStatus::Connected,
