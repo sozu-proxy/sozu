@@ -561,7 +561,7 @@ impl ServerConfiguration {
     info!("removing tls_front {:?}", front);
 
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
-      if let Some(pos) = fronts.iter().position(|f| &f.app_id == &front.app_id) {
+      if let Some(pos) = fronts.iter().position(|f| &f.app_id == &front.app_id && &f.cert_fingerprint == &front.fingerprint) {
         let front = fronts.remove(pos);
 
         {
