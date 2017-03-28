@@ -504,13 +504,22 @@ impl<'a> Header<'a> {
 
   pub fn should_delete(&self, conn: &Connection) -> bool {
     let lowercase = self.name.to_ascii_lowercase();
-    &lowercase[..] == b"connection" && &self.value.to_ascii_lowercase()[..] != b"upgrade" ||
-    &lowercase[..] == b"forwarded"         ||
-    &lowercase[..] == b"x-forwarded-for"   ||
-    &lowercase[..] == b"x-forwarded-proto" ||
-    &lowercase[..] == b"x-forwarded-port"  ||
-    &lowercase[..] == b"request-id"        ||
-    conn.to_delete.contains(unsafe {str::from_utf8_unchecked(&self.value.to_ascii_lowercase()[..])})
+    //FIXME: we should delete this header anyway, and add a Connection: Upgrade if we detected an upgrade
+    if &lowercase[..] == b"connection" {
+      match comma_separated_header_values(self.value) {
+        //FIXME: do case insensitive ascii comparison
+        Some(tokens) => ! tokens.iter().any(|value| &value.to_ascii_lowercase()[..] == b"upgrade"),
+        None         => true
+      }
+    } else {
+      &lowercase[..] == b"connection" && &self.value.to_ascii_lowercase()[..] != b"upgrade" ||
+      &lowercase[..] == b"forwarded"         ||
+      &lowercase[..] == b"x-forwarded-for"   ||
+      &lowercase[..] == b"x-forwarded-proto" ||
+      &lowercase[..] == b"x-forwarded-port"  ||
+      &lowercase[..] == b"request-id"        ||
+      conn.to_delete.contains(unsafe {str::from_utf8_unchecked(&self.value.to_ascii_lowercase()[..])})
+    }
   }
 }
 
@@ -565,10 +574,10 @@ pub enum Connection {
 
 #[derive(Debug,Clone,PartialEq)]
 pub struct Connection {
-  keep_alive:  Option<bool>,
-  has_upgrade: bool,
-  upgrade:     Option<String>,
-  to_delete:   HashSet<String>,
+  pub keep_alive:  Option<bool>,
+  pub has_upgrade: bool,
+  pub upgrade:     Option<String>,
+  pub to_delete:   HashSet<String>,
 }
 
 impl Connection {
@@ -688,6 +697,20 @@ impl RequestState {
       RequestState::RequestWithBodyChunks(_, ref conn, _, _) => Some(conn.clone()),
       _                                                      => None
     }
+  }
+
+  pub fn get_mut_connection(&mut self) -> Option<&mut Connection> {
+    match *self {
+      RequestState::HasRequestLine(_, ref mut conn)         |
+      RequestState::HasHost(_, ref mut conn, _)             |
+      RequestState::HasLength(_, ref mut conn, _)           |
+      RequestState::HasHostAndLength(_, ref mut conn, _, _) |
+      RequestState::Request(_, ref mut conn, _)             |
+      RequestState::RequestWithBody(_, ref mut conn, _, _)  |
+      RequestState::RequestWithBodyChunks(_, ref mut conn, _, _) => Some(conn),
+      _                                                      => None
+    }
+
   }
 
   pub fn should_copy(&self, position: usize) -> Option<usize> {
@@ -1001,7 +1024,11 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
     HeaderValue::Forwarded   => state,
     HeaderValue::Other(_,_)  => state,
     //FIXME: for now, we don't look at what is asked in upgrade since the backend is the one deciding
-    HeaderValue::Upgrade(_)  => state,
+    HeaderValue::Upgrade(s)  => {
+      let mut st = state;
+      st.get_mut_connection().map(|conn| conn.upgrade = Some(str::from_utf8(s).expect("should be ascii").to_string()));
+      st
+    },
     HeaderValue::Error       => RequestState::Error(ErrorState::InvalidHttp)
   }
 }
@@ -1138,7 +1165,7 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
         _                                      => ResponseState::Error(ErrorState::InvalidHttp)
       }
     },
-    // FIXME: for now, we don't remember if we cancel indiations from a previous Connection Header
+    // FIXME: for now, we don't remember if we cancel indications from a previous Connection Header
     HeaderValue::Connection(c) => {
       let mut conn = state.get_keep_alive().unwrap_or(Connection::new());
       for value in c {
@@ -1155,6 +1182,7 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
         ResponseState::HasLength(rl, _, length) => ResponseState::HasLength(rl, conn, length),
         ResponseState::HasUpgrade(rl, _, proto) => {
           info!("has upgrade, got conn: \"{:?}\"", conn);
+          //FIXME: verify here if the Upgrade header we got is the same as the request Upgrade header
           if conn.has_upgrade {
             ResponseState::HasUpgrade(rl, conn, proto)
           } else {
@@ -2608,6 +2636,54 @@ mod tests {
             RStatusLine { version: String::from("11"), status: 200, reason: String::from("Ok") },
             Connection::new()
           )),
+          added_req_header: String::from(""),
+          added_res_header: String::from(""),
+        }
+      );
+  }
+
+  #[test]
+  fn parse_connection_upgrade_test() {
+      let input =
+          b"GET /index.html HTTP/1.1\r\n\
+            Host: localhost:8888\r\n\
+            User-Agent: curl/7.43.0\r\n\
+            Accept: */*\r\n\
+            Upgrade: WebSocket\r\n\
+            Connection: keep-alive, Upgrade\r\n\
+            \r\n";
+      let initial = HttpState::new();
+      let mut buf = BufferQueue::with_capacity(2048);
+      buf.write(&input[..]);
+      println!("buffer input: {:?}", buf.input_queue);
+
+      //let result = parse_request(initial, input);
+      let result = parse_request_until_stop(initial, "", &mut buf);
+      println!("result: {:?}", result);
+      println!("input length: {}", input.len());
+      println!("buffer input: {:?}", buf.input_queue);
+      println!("buffer output: {:?}", buf.output_queue);
+      assert_eq!(buf.output_queue, vec!(
+        OutputElement::Slice(26), OutputElement::Slice(22), OutputElement::Slice(25),
+        OutputElement::Slice(13), OutputElement::Slice(20), OutputElement::Slice(33),
+        OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+      assert_eq!(buf.start_parsing_position, 141);
+      assert_eq!(
+        result,
+        HttpState {
+          req_header_end: Some(141),
+          res_header_end: None,
+          request: Some(RequestState::Request(
+            RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
+            Connection {
+              keep_alive:  Some(true),
+              has_upgrade: true,
+              upgrade:     Some("WebSocket".to_string()),
+              to_delete:   HashSet::new(),
+            },
+            String::from("localhost:8888"),
+          )),
+          response: Some(ResponseState::Initial),
           added_req_header: String::from(""),
           added_res_header: String::from(""),
         }
