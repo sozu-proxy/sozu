@@ -13,8 +13,8 @@ extern crate nix;
 #[macro_use] extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
 
-#[cfg(target_os="linux")]
-extern crate procinfo;
+//#[cfg(target_os="linux")]
+//extern crate procinfo;
 
 mod command;
 mod worker;
@@ -119,6 +119,7 @@ fn main() {
   }
 }
 
+/* FIXME: uncomment this feature once code has been merged back into the procinfo crate
 #[cfg(target_os="linux")]
 fn check_process_limits(config: &Config) -> bool {
   let process_limits = procinfo::pid::limits_self().expect("Couldn't read /proc/self/limits to determine max open file descriptors limit");
@@ -148,8 +149,9 @@ fn check_process_limits(config: &Config) -> bool {
 
   true
 }
+*/
 
-#[cfg(not(target_os="linux"))]
+//#[cfg(not(target_os="linux"))]
 fn check_process_limits(_: &Config) -> bool {
   true
 }
