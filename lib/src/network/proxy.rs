@@ -263,7 +263,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
         error!("PROXY\tcould not add client to slab");
       }
     } else {
-      error!("PROXY\tcould not create a client");
+      error!("PROXY\tcould not accept a new client");
     }
   }
 
@@ -605,8 +605,11 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
       }
 
       if front_interest.is_error() || back_interest.is_error() {
-        error!("PROXY client {:?} got an error: front: {:?} back: {:?}", client_token, front_interest,
-          back_interest);
+        if front_interest.is_error() {
+          error!("PROXY client {:?} front error, disconnecting", client_token);
+        } else {
+          error!("PROXY client {:?} back error, disconnecting", client_token);
+        }
         self.clients[client_token].readiness().front_interest = UnixReady::from(Ready::empty());
         self.clients[client_token].readiness().back_interest  = UnixReady::from(Ready::empty());
         self.close_client(client_token);
