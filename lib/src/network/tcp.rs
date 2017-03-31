@@ -381,7 +381,7 @@ impl ServerConfiguration {
       if let Ok(tok) = self.listeners.insert(al) {
         self.listeners[tok].token = Some(Token(2+tok.0));
         self.fronts.insert(String::from(app_id), tok);
-        event_loop.register(&self.listeners[tok].sock, Token(2+tok.0), Ready::readable(), PollOpt::level());
+        event_loop.register(&self.listeners[tok].sock, Token(2+tok.0), Ready::readable(), PollOpt::edge());
         info!("registered listener for app {} on port {}", app_id, front.port());
         Some(tok)
       } else {

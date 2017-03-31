@@ -233,6 +233,8 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
     self.close_backend(token);
     self.clients[token].close();
     self.clients.remove(token);
+
+    self.can_accept = true;
   }
 
   pub fn close_backend(&mut self, token: FrontToken) {
@@ -247,16 +249,19 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
     }
   }
 
-  pub fn accept(&mut self, token: ListenToken) {
+  pub fn accept(&mut self, token: ListenToken) -> bool {
     match self.configuration.accept(token) {
       Err(AcceptError::IoError) => {
         //FIXME: do we stop accepting?
+        false
       },
       Err(AcceptError::TooManyClients) => {
         self.can_accept = false;
+        false
       },
       Err(AcceptError::WouldBlock) => {
         self.accept_ready.remove(&token);
+        false
       },
       Ok((client, should_connect)) => {
         if let Ok(client_token) = self.clients.insert(client) {
@@ -280,10 +285,13 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
           if should_connect {
             self.connect_to_backend(client_token);
           }
+
+          // should continue accepting
+          true
         } else {
           error!("PROXY\tcould not add client to slab");
+          false
         }
-
       }
     }
   }
@@ -457,6 +465,20 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
         }
       }
 
+      // try to accept again after handling all client events,
+      // since we might have released a few client slots
+      if !self.accept_ready.is_empty() && self.can_accept {
+        loop {
+          if let Some(token) = self.accept_ready.iter().next().map(|token| ListenToken(token.0)) {
+            if !self.accept(token) {
+              if !self.accept_ready.is_empty() && self.can_accept {
+                break;
+              }
+            }
+          }
+        }
+      }
+
       //FIXME: manually call the timer instead of relying on a separate thread
       while let Some(token) = self.timer.poll() {
         self.timeout(token);
@@ -477,7 +499,12 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
     let client_token:FrontToken = match socket_type(token, self.max_listeners, self.max_connections) {
       Some(SocketType::Listener) => {
         if events.is_readable() {
-          self.accept(ListenToken(token.0));
+          self.accept_ready.insert(ListenToken(token.0));
+          loop {
+            if !self.accept(ListenToken(token.0)) {
+              break;
+            }
+          }
           return;
         }
 

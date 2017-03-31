@@ -315,7 +315,7 @@ impl ServerConfiguration {
     let front = config.front;
     match server_bind(&config.front) {
       Ok(sock) => {
-        event_loop.register(&sock, Token(start_at), Ready::readable(), PollOpt::level());
+        event_loop.register(&sock, Token(start_at), Ready::readable(), PollOpt::edge());
 
         let default = DefaultAnswers {
           NotFound: Vec::from(if config.answer_404.len() > 0 {

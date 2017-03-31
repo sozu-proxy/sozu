@@ -374,7 +374,7 @@ impl ServerConfiguration {
 
     match server_bind(&config.front) {
       Ok(listener) => {
-        event_loop.register(&listener, Token(start_at), Ready::readable(), PollOpt::level());
+        event_loop.register(&listener, Token(start_at), Ready::readable(), PollOpt::edge());
         let default = DefaultAnswers {
           NotFound: Vec::from(if config.answer_404.len() > 0 {
               config.answer_404.as_bytes()
