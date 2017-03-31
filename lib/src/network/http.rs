@@ -20,7 +20,7 @@ use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionE
 use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
 use network::proxy::{BackendConnectAction,BackendConnectionStatus,Server,ProxyConfiguration,ProxyClient,
-  Readiness,ListenToken,FrontToken,BackToken,ProxyChannel};
+  Readiness,ListenToken,FrontToken,BackToken,ProxyChannel,AcceptError};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use messages::{self,Order,HttpFront,HttpProxyConfiguration};
 use channel::Channel;
@@ -657,20 +657,25 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: ListenToken) -> Option<(Client, bool)> {
-    let accepted = self.listener.accept();
-
-    if let Ok((frontend_sock, _)) = accepted {
+  fn accept(&mut self, token: ListenToken) -> Result<(Client, bool), AcceptError> {
+    self.listener.accept().map_err(|e| {
+      match e.kind() {
+        ErrorKind::WouldBlock => AcceptError::WouldBlock,
+        other => {
+          error!("accept() IO error: {:?}", e);
+          AcceptError::IoError
+        }
+      }
+    }).and_then(|(frontend_sock, _)| {
       frontend_sock.set_nodelay(true);
       if let Some(mut c) = Client::new(frontend_sock, Rc::downgrade(&self.pool), self.config.public_address) {
         c.readiness().front_interest.insert(Ready::readable());
         c.readiness().back_interest.remove(Ready::readable() | Ready::writable());
-        return Some((c, false))
+        Ok((c, false))
+      } else {
+        Err(AcceptError::TooManyClients)
       }
-    } else {
-      error!("could not accept: {:?}", accepted);
-    }
-    None
+    })
   }
 
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {

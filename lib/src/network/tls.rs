@@ -32,7 +32,7 @@ use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,Protocol};
 use network::proxy::{BackendConnectAction,BackendConnectionStatus,Server,ProxyConfiguration,ProxyClient,
-  Readiness,ListenToken,FrontToken,BackToken,ProxyChannel};
+  Readiness,ListenToken,FrontToken,BackToken,ProxyChannel,AcceptError};
 use messages::{self,CertFingerprint,CertificateAndKey,Order,TlsFront,TlsProxyConfiguration};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -74,12 +74,12 @@ pub struct TlsClient {
 }
 
 impl TlsClient {
-  pub fn new(ssl:Ssl, sock: TcpStream, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> Option<TlsClient> {
+  pub fn new(ssl:Ssl, sock: TcpStream, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> TlsClient {
     //FIXME: we should not need to clone the socket. Maybe do the accept here instead of
     // in TlsHandshake?
     let s = sock.try_clone().expect("could not clone the socket");
     let handshake = TlsHandshake::new(ssl, s);
-    Some(TlsClient {
+    TlsClient {
       front:          Some(sock),
       front_token:    None,
       front_timeout:  None,
@@ -90,7 +90,7 @@ impl TlsClient {
       public_address: public_address,
       ssl:            None,
       pool:           pool,
-    })
+    }
   }
 
   pub fn http(&mut self) -> Option<&mut Http<SslStream<TcpStream>>> {
@@ -808,22 +808,25 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
-  fn accept(&mut self, token: ListenToken) -> Option<(TlsClient,bool)> {
-    let accepted = self.listener.accept();
-
-    if let Ok((frontend_sock, _)) = accepted {
+  fn accept(&mut self, token: ListenToken) -> Result<(TlsClient,bool), AcceptError> {
+    self.listener.accept().map_err(|e| {
+      match e.kind() {
+        ErrorKind::WouldBlock => AcceptError::WouldBlock,
+        other => {
+          error!("accept() IO error: {:?}", e);
+          AcceptError::IoError
+        }
+      }
+    }).and_then(|(frontend_sock, _)| {
       frontend_sock.set_nodelay(true);
       if let Ok(ssl) = Ssl::new(&self.default_context.context) {
-        if let Some(c) = TlsClient::new(ssl, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address) {
-          return Some((c, false))
-        }
+        let c = TlsClient::new(ssl, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address);
+        return Ok((c, false))
       } else {
         error!("could not create ssl context");
+        Err(AcceptError::IoError)
       }
-    } else {
-      error!("could not accept connection: {:?}", accepted);
-    }
-    None
+    })
   }
 
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut TlsClient) -> Result<BackendConnectAction,ConnectionError> {

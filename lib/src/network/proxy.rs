@@ -7,7 +7,7 @@ use mio::net::*;
 use mio::*;
 use mio::unix::UnixReady;
 use mio::timer::{Timer,Timeout};
-use std::collections::HashMap;
+use std::collections::{HashSet,HashMap};
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
 use std::error::Error;
@@ -141,10 +141,17 @@ pub enum BackendConnectAction {
   Replace,
 }
 
+#[derive(Debug,PartialEq)]
+pub enum AcceptError {
+  IoError,
+  TooManyClients,
+  WouldBlock,
+}
+
 pub trait ProxyConfiguration<Client> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client:&mut Client) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyOrder);
-  fn accept(&mut self, token: ListenToken) -> Option<(Client, bool)>;
+  fn accept(&mut self, token: ListenToken) -> Result<(Client, bool), AcceptError>;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
   fn front_timeout(&self) -> u64;
   fn back_timeout(&self)  -> u64;
@@ -160,6 +167,8 @@ pub struct Server<ServerConfiguration,Client> {
   pub poll:        Poll,
   timer:           Timer<Token>,
   shutting_down:   Option<MessageId>,
+  accept_ready:    HashSet<ListenToken>,
+  can_accept:      bool,
 }
 
 impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<ServerConfiguration,Client> {
@@ -187,6 +196,8 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
       poll:            poll,
       timer:           timer,
       shutting_down:   None,
+      accept_ready:    HashSet::new(),
+      can_accept:      true,
     }
   }
 
@@ -237,33 +248,43 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Server<S
   }
 
   pub fn accept(&mut self, token: ListenToken) {
-    if let Some((client, should_connect)) = self.configuration.accept(token) {
-      if let Ok(client_token) = self.clients.insert(client) {
-        self.clients[client_token].readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-        self.poll.register(
-          self.clients[client_token].front_socket(),
-          self.from_front(client_token),
-          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-          PollOpt::edge()
-        );
-        let front = self.from_front(client_token);
-        &self.clients[client_token].set_front_token(front);
+    match self.configuration.accept(token) {
+      Err(AcceptError::IoError) => {
+        //FIXME: do we stop accepting?
+      },
+      Err(AcceptError::TooManyClients) => {
+        self.can_accept = false;
+      },
+      Err(AcceptError::WouldBlock) => {
+        self.accept_ready.remove(&token);
+      },
+      Ok((client, should_connect)) => {
+        if let Ok(client_token) = self.clients.insert(client) {
+          self.clients[client_token].readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+          self.poll.register(
+            self.clients[client_token].front_socket(),
+            self.from_front(client_token),
+            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+            PollOpt::edge()
+            );
+          let front = self.from_front(client_token);
+          &self.clients[client_token].set_front_token(front);
 
-        let front = self.from_front(client_token);
-        /*
-        if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.front_timeout()), front) {
+          let front = self.from_front(client_token);
+          /*
+          if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.front_timeout()), front) {
           &self.clients[client_token].set_front_timeout(timeout);
+          }
+          */
+          gauge!("accept", 1);
+          if should_connect {
+            self.connect_to_backend(client_token);
+          }
+        } else {
+          error!("PROXY\tcould not add client to slab");
         }
-        */
-        gauge!("accept", 1);
-        if should_connect {
-          self.connect_to_backend(client_token);
-        }
-      } else {
-        error!("PROXY\tcould not add client to slab");
+
       }
-    } else {
-      error!("PROXY\tcould not accept a new client");
     }
   }
 

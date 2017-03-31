@@ -19,7 +19,7 @@ use rand::random;
 use uuid::Uuid;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
 use network::proxy::{BackendConnectAction,BackendConnectionStatus,Server,ProxyClient,ProxyConfiguration,
-  Readiness,ListenToken,FrontToken,BackToken,ProxyChannel};
+  Readiness,ListenToken,FrontToken,BackToken,ProxyChannel,AcceptError};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -64,8 +64,8 @@ pub struct Client {
 
 impl Client {
   fn new(sock: TcpStream, accept_token: ListenToken, front_buf: Checkout<BufferQueue>,
-    back_buf: Checkout<BufferQueue>) -> Option<Client> {
-    Some(Client {
+    back_buf: Checkout<BufferQueue>) -> Client {
+    Client {
       sock:           sock,
       backend:        None,
       front_buf:      front_buf,
@@ -83,7 +83,7 @@ impl Client {
       app_id:         None,
       request_id:     Uuid::new_v4().hyphenated().to_string(),
       readiness:      Readiness::new(),
-    })
+    }
   }
 }
 
@@ -527,23 +527,30 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: ListenToken) -> Option<(Client, bool)> {
+  fn accept(&mut self, token: ListenToken) -> Result<(Client, bool), AcceptError> {
     if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
       let internal_token = ListenToken(token.0 - 2);
       if self.listeners.contains(internal_token) {
-        let accepted = self.listeners[internal_token].sock.accept();
-
-        if let Ok((frontend_sock, _)) = accepted {
+        self.listeners[internal_token].sock.accept().map(|(frontend_sock, _)| {
           frontend_sock.set_nodelay(true);
-          if let Some(c) = Client::new(frontend_sock, internal_token, front_buf, back_buf) {
-            return Some((c, true));
+          let c = Client::new(frontend_sock, internal_token, front_buf, back_buf);
+          (c, true)
+        }).map_err(|e| {
+          match e.kind() {
+            ErrorKind::WouldBlock => AcceptError::WouldBlock,
+            other => {
+              error!("accept() IO error: {:?}", e);
+              AcceptError::IoError
+            }
           }
-        }
+        })
+      } else {
+        Err(AcceptError::IoError)
       }
     } else {
       error!("could not get buffers from pool");
+      Err(AcceptError::TooManyClients)
     }
-    None
   }
 
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {
