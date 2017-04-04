@@ -440,8 +440,8 @@ impl ServerConfiguration {
     context.set_ecdh_auto(true);
 
     //FIXME: get the default cert and key from the configuration
-    let cert_read = config.default_certificate.as_ref().map(|vec| &vec[..]).unwrap_or(&include_bytes!("../../../assets/certificate.pem")[..]);
-    let key_read = config.default_key.as_ref().map(|vec| &vec[..]).unwrap_or(&include_bytes!("../../../assets/key.pem")[..]);
+    let cert_read = config.default_certificate.as_ref().map(|vec| &vec[..]).unwrap_or(&include_bytes!("../../assets/certificate.pem")[..]);
+    let key_read = config.default_key.as_ref().map(|vec| &vec[..]).unwrap_or(&include_bytes!("../../assets/key.pem")[..]);
     if let Some(path) = config.default_certificate_chain.as_ref() {
       context.set_certificate_chain_file(path);
     }

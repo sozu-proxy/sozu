@@ -11,6 +11,7 @@ include = [
   "src/*.rs",
   "examples/main.rs",
   "examples/minimal.rs",
+  "assets/*"
 ]
 
 [dependencies]

@@ -33,21 +33,21 @@ buffer_size = 16384
 default_app_id = "MyApp"
 #tls_versions = ["TLSv1.2"]
 #cipher_list = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256"
-#default_certificate = "../assets/cert_test.pem"
-#default_certificate_chain = "../assets/cert__chain_test.pem"
-#default_key = "../assets/key_test.pem"
+#default_certificate = "../lib/assets/cert_test.pem"
+#default_certificate_chain = "../lib/assets/cert__chain_test.pem"
+#default_key = "../lib/assets/key_test.pem"
 
-#answer_404 = "../assets/404.html"
-#answer_503 = "../assets/503.html"
+#answer_404 = "../lib/assets/404.html"
+#answer_503 = "../lib/assets/503.html"
 
 [applications]
 
 [applications.MyApp]
 hostname   = "lolcatho.st"
 #path_begin = "/api" # optional
-certificate = "../assets/certificate.pem" # optional
-key = "../assets/key.pem" # optional
-certificate_chain = "../assets/certificate_chain.pem" # optional
+certificate = "../lib/assets/certificate.pem" # optional
+key = "../lib/assets/key.pem" # optional
+certificate_chain = "../lib/assets/certificate_chain.pem" # optional
 frontends = ["HTTP", "TLS"] # list of proxy tags
 backends  = [ "127.0.0.1:1026" ] # list of IP/port
 

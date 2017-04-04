@@ -81,8 +81,8 @@ fn main() {
     network::tls::start(config, channel2);
   });
 
-  let cert1 = include_str!("../../assets/certificate.pem");
-  let key1  = include_str!("../../assets/key.pem");
+  let cert1 = include_str!("../assets/certificate.pem");
+  let key1  = include_str!("../assets/key.pem");
 
   let certificate_and_key = messages::CertificateAndKey {
     certificate:       String::from(cert1),
@@ -104,8 +104,8 @@ fn main() {
   let tls_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
   command2.write_message(&network::ProxyOrder { id: String::from("ID_MNOP"), order: messages::Order::AddInstance(tls_instance) });
 
-  let cert2 = include_str!("../../assets/cert_test.pem");
-  let key2  = include_str!("../../assets/key_test.pem");
+  let cert2 = include_str!("../assets/cert_test.pem");
+  let key2  = include_str!("../assets/key_test.pem");
 
   let certificate_and_key2 = messages::CertificateAndKey {
     certificate: String::from(cert2),

@@ -121,8 +121,8 @@ impl Default for TlsProxyConfiguration {
       default_name:        Some(String::from("lolcatho.st")),
       default_app_id:      None,
 
-      default_certificate: Some(Vec::from(&include_bytes!("../../assets/certificate.pem")[..])),
-      default_key:         Some(Vec::from(&include_bytes!("../../assets/key.pem")[..])),
+      default_certificate: Some(Vec::from(&include_bytes!("../assets/certificate.pem")[..])),
+      default_key:         Some(Vec::from(&include_bytes!("../assets/key.pem")[..])),
       default_certificate_chain: None,
     }
   }
