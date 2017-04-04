@@ -1,6 +1,12 @@
 [package]
 name = "sozu-command-lib"
+description = "configuration library to command a sozu instance"
+repository = "https://github.com/sozu-proxy/sozu"
+readme = "README.md"
+documentation = "https://docs.rs/sozu-command-lib"
+homepage = "http://sozu.io"
 version = "0.1.0"
+license = "AGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
 

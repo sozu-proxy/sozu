@@ -1,5 +1,10 @@
 [package]
 name = "sozuctl"
+description = "command line application to configure a sozu instance"
+repository = "https://github.com/sozu-proxy/sozu"
+readme = "README.md"
+documentation = "https://docs.rs/sozuctl"
+homepage = "http://sozu.io"
 version = "0.1.0"
 license = "AGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]

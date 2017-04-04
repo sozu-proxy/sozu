@@ -1,5 +1,10 @@
 [package]
 name = "sozu-lib"
+description = "sozu library to build hot reconfigurable HTTP reverse proxies"
+repository = "https://github.com/sozu-proxy/sozu"
+readme = "README.md"
+documentation = "https://docs.rs/sozu-lib"
+homepage = "http://sozu.io"
 version = "0.1.0"
 license = "AGPL-3.0"
 authors = ["Clément Delafargue <clement@delafargue.name>", "Geoffroy Couprie <geo.couprie@gmail.com>"]
