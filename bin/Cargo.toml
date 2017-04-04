@@ -10,6 +10,12 @@ license = "AGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
 
+include = [
+  "README.md",
+  "Cargo.toml",
+  "src/*.rs",
+]
+
 [dependencies]
 mio = "^0.6"
 mio-uds = "^0.6"
