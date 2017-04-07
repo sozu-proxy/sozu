@@ -15,7 +15,7 @@ Build the most reliable reverse proxy ever:
 - it should not have exploitable memory errors
   - even if it has one, workers will be sandboxed
 - you set up a limit on the number of concurrent connections to a worker
-  - the reverse proxy will refuse new connections over that limit, instead of requesting unavailable ressources like memory
+  - the reverse proxy will refuse new connections over that limit, instead of requesting unavailable resources like memory
 
 ## Building and starting
 
