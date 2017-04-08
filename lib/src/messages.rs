@@ -384,8 +384,8 @@ mod tests {
   #[test]
   fn add_acl_test() {
     let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}}"#;
-        let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
-        println!("{:?}", command);
+    let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
+    println!("{:?}", command);
     assert!(command == Order::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
