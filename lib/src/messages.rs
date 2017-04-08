@@ -1,9 +1,11 @@
 use serde;
+use serde::ser::SerializeMap;
 use serde_json;
 use openssl::ssl;
 use std::net::{IpAddr,SocketAddr};
 use std::default::Default;
 use std::convert::From;
+use std::fmt;
 
 //FIXME: make fixed size depending on hash algorithm
 pub type CertFingerprint = Vec<u8>;
@@ -183,13 +185,17 @@ enum OrderField {
 
 
 impl serde::Deserialize for OrderField {
-  fn deserialize<D>(deserializer: &mut D) -> Result<OrderField, D::Error>
+  fn deserialize<D>(deserializer: D) -> Result<OrderField, D::Error>
         where D: serde::de::Deserializer {
     struct OrderFieldVisitor;
     impl serde::de::Visitor for OrderFieldVisitor {
       type Value = OrderField;
 
-      fn visit_str<E>(&mut self, value: &str) -> Result<OrderField, E>
+      fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("expected type or data")
+      }
+
+      fn visit_str<E>(self, value: &str) -> Result<OrderField, E>
         where E: serde::de::Error {
         match value {
           "type" => Ok(OrderField::Type),
@@ -207,7 +213,11 @@ struct OrderVisitor;
 impl serde::de::Visitor for OrderVisitor {
   type Value = Order;
 
-  fn visit_map<V>(&mut self, mut visitor: V) -> Result<Order, V::Error>
+  fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    formatter.write_str("expected map")
+  }
+
+  fn visit_map<V>(self, mut visitor: V) -> Result<Order, V::Error>
         where V: serde::de::MapVisitor {
     let mut command_type:Option<String>    = None;
     let mut data:Option<serde_json::Value> = None;
@@ -223,27 +233,22 @@ impl serde::de::Visitor for OrderVisitor {
     //println!("decoded type = {:?}, value= {:?}", command_type, data);
     let command_type = match command_type {
       Some(command) => command,
-      None => try!(visitor.missing_field("type")),
+      None => return Err(serde::de::Error::missing_field("type")),
     };
 
     // no data field for SoftStop and HardStop
     if &command_type == "SOFT_STOP" {
-      try!(visitor.end());
       return Ok(Order::SoftStop);
     } else if &command_type == "HARD_STOP" {
-      try!(visitor.end());
       return Ok(Order::HardStop);
     } else if &command_type == "STATUS" {
-      try!(visitor.end());
       return Ok(Order::Status);
     }
 
     let data = match data {
       Some(data) => data,
-      None       => try!(visitor.missing_field("data")),
+      None       => return Err(serde::de::Error::missing_field("data")),
     };
-
-    try!(visitor.end());
 
     if &command_type == "ADD_HTTP_FRONT" {
       let res = serde_json::from_value(data).or(Err(serde::de::Error::custom("add_http_front")));
@@ -287,7 +292,7 @@ impl serde::de::Visitor for OrderVisitor {
 }
 
 impl serde::Deserialize for Order {
-  fn deserialize<D>(deserializer: &mut D) -> Result<Order, D::Error>
+  fn deserialize<D>(deserializer: D) -> Result<Order, D::Error>
         where D: serde::de::Deserializer {
     static FIELDS: &'static [&'static str] = &["type", "data"];
     deserializer.deserialize_struct("Order", FIELDS, OrderVisitor)
@@ -295,99 +300,72 @@ impl serde::Deserialize for Order {
 }
 
 impl serde::Serialize for Order {
-  fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
       where S: serde::Serializer,
   {
-    let mut state = try!(serializer.serialize_map(Some(2)));
+    let mut map = try!(serializer.serialize_map(Some(2)));
 
     match self {
       &Order::AddHttpFront(ref front) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "ADD_HTTP_FRONT"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, front));
+        try!(map.serialize_entry("type", "ADD_HTTP_FRONT"));
+        try!(map.serialize_entry("data", front));
       },
       &Order::RemoveHttpFront(ref front) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "REMOVE_HTTP_FRONT"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, front));
+        try!(map.serialize_entry("type", "REMOVE_HTTP_FRONT"));
+        try!(map.serialize_entry("data", front));
       },
       &Order::AddTlsFront(ref front) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "ADD_TLS_FRONT"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, front));
+        try!(map.serialize_entry("type", "ADD_TLS_FRONT"));
+        try!(map.serialize_entry("data", front));
       },
       &Order::RemoveTlsFront(ref front) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "REMOVE_TLS_FRONT"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, front));
+        try!(map.serialize_entry("type", "REMOVE_TLS_FRONT"));
+        try!(map.serialize_entry("data", front));
       },
       &Order::AddCertificate(ref certificate_and_key) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "ADD_CERTIFICATE"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, certificate_and_key));
+        try!(map.serialize_entry("type", "ADD_CERTIFICATE"));
+        try!(map.serialize_entry("data", certificate_and_key));
       },
       &Order::RemoveCertificate(ref fingerprint) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "REMOVE_CERTIFICATE"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, fingerprint));
+        try!(map.serialize_entry("type", "REMOVE_CERTIFICATE"));
+        try!(map.serialize_entry("data", fingerprint));
       },
       &Order::AddTcpFront(ref front) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "ADD_TCP_FRONT"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, front));
+        try!(map.serialize_entry("type", "ADD_TCP_FRONT"));
+        try!(map.serialize_entry("data", front));
       },
       &Order::RemoveTcpFront(ref front) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "REMOVE_TCP_FRONT"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, front));
+        try!(map.serialize_entry("type", "REMOVE_TCP_FRONT"));
+        try!(map.serialize_entry("data", front));
       },
       &Order::AddInstance(ref instance) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "ADD_INSTANCE"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, instance));
+        try!(map.serialize_entry("type", "ADD_INSTANCE"));
+        try!(map.serialize_entry("data", instance));
       },
       &Order::RemoveInstance(ref instance) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "REMOVE_INSTANCE"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, instance));
+        try!(map.serialize_entry("type", "REMOVE_INSTANCE"));
+        try!(map.serialize_entry("data", instance));
       },
       &Order::HttpProxy(ref config) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "CONFIGURE_HTTP_PROXY"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, config));
+        try!(map.serialize_entry("type", "CONFIGURE_HTTP_PROXY"));
+        try!(map.serialize_entry("data", config));
       },
       &Order::TlsProxy(ref config) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "CONFIGURE_HTTP_PROXY"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, config));
+        try!(map.serialize_entry("type", "CONFIGURE_HTTP_PROXY"));
+        try!(map.serialize_entry("data", config));
       },
       &Order::SoftStop => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "SOFT_STOP"));
+        try!(map.serialize_entry("type", "SOFT_STOP"));
       },
       &Order::HardStop => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "HARD_STOP"));
+        try!(map.serialize_entry("type", "HARD_STOP"));
       },
       &Order::Status => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "STATUS"));
+        try!(map.serialize_entry("type", "STATUS"));
       },
     }
 
-    serializer.serialize_map_end(state)
+    map.end()
   }
 }
 
@@ -406,8 +384,8 @@ mod tests {
   #[test]
   fn add_acl_test() {
     let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}}"#;
-    let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
-    println!("{:?}", command);
+        let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
+        println!("{:?}", command);
     assert!(command == Order::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
@@ -476,4 +454,3 @@ mod tests {
     });
   }
 }
-

@@ -12,14 +12,14 @@ categories = ["network-programming"]
 
 [dependencies]
 log = "0.3"
-serde = "^0.8"
-serde_json = "^0.8"
-serde_derive = "^0.8"
+serde = "^0.9.13"
+serde_json = "^0.9.9"
+serde_derive = "^0.9.13"
 openssl = "^0.9.5"
 sozu-lib = "^0.1"
 
 [dependencies.toml]
-version = "^0.2"
+version = "^0.3"
 default-features = false
 features = ["serde"]
 

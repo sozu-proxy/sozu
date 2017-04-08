@@ -1,7 +1,9 @@
 use serde;
+use serde::ser::SerializeMap;
 use serde_json;
 use state::{HttpProxy,TlsProxy,ConfigState};
 use sozu::messages::Order;
+use std::fmt;
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
@@ -13,7 +15,7 @@ pub enum ProxyType {
 }
 
 impl serde::Serialize for ProxyType {
-  fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
       where S: serde::Serializer,
   {
     match *self {
@@ -25,7 +27,7 @@ impl serde::Serialize for ProxyType {
 }
 
 impl serde::Deserialize for ProxyType {
-  fn deserialize<D>(deserializer: &mut D) -> Result<ProxyType, D::Error>
+  fn deserialize<D>(deserializer: D) -> Result<ProxyType, D::Error>
     where D: serde::de::Deserializer
   {
     struct ProxyTypeVisitor;
@@ -33,7 +35,11 @@ impl serde::Deserialize for ProxyType {
     impl serde::de::Visitor for ProxyTypeVisitor {
       type Value = ProxyType;
 
-      fn visit_str<E>(&mut self, value: &str) -> Result<ProxyType, E>
+      fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("expected HTTP, HTTPS or TCP proxy type")
+      }
+
+      fn visit_str<E>(self, value: &str) -> Result<ProxyType, E>
         where E: serde::de::Error
         {
           match value {
@@ -63,13 +69,17 @@ enum ProxyDeserializerField {
 }
 
 impl serde::Deserialize for ProxyDeserializerField {
-  fn deserialize<D>(deserializer: &mut D) -> Result<ProxyDeserializerField, D::Error>
+  fn deserialize<D>(deserializer: D) -> Result<ProxyDeserializerField, D::Error>
         where D: serde::de::Deserializer {
     struct ProxyDeserializerFieldVisitor;
     impl serde::de::Visitor for ProxyDeserializerFieldVisitor {
       type Value = ProxyDeserializerField;
 
-      fn visit_str<E>(&mut self, value: &str) -> Result<ProxyDeserializerField, E>
+      fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("expected tag, proxy_type or state")
+      }
+
+      fn visit_str<E>(self, value: &str) -> Result<ProxyDeserializerField, E>
         where E: serde::de::Error {
         match value {
           "tag"        => Ok(ProxyDeserializerField::Tag),
@@ -88,7 +98,11 @@ struct ProxyDeserializerVisitor;
 impl serde::de::Visitor for ProxyDeserializerVisitor {
   type Value = ProxyDeserializer;
 
-  fn visit_map<V>(&mut self, mut visitor: V) -> Result<ProxyDeserializer, V::Error>
+  fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    formatter.write_str("")
+  }
+
+  fn visit_map<V>(self, mut visitor: V) -> Result<ProxyDeserializer, V::Error>
         where V: serde::de::MapVisitor {
     let mut tag:Option<String>              = None;
     let mut proxy_type:Option<ProxyType>    = None;
@@ -106,18 +120,16 @@ impl serde::de::Visitor for ProxyDeserializerVisitor {
     println!("decoded type = {:?}, value= {:?}", proxy_type, state);
     let proxy_type = match proxy_type {
       Some(proxy) => proxy,
-      None => try!(visitor.missing_field("proxy_type")),
+      None => return Err(serde::de::Error::missing_field("proxy_type")),
     };
     let tag = match tag {
       Some(tag) => tag,
-      None => try!(visitor.missing_field("tag")),
+      None => return Err(serde::de::Error::missing_field("tag")),
     };
     let state = match state {
       Some(state) => state,
-      None => try!(visitor.missing_field("state")),
+      None => return Err(serde::de::Error::missing_field("state")),
     };
-
-    try!(visitor.end());
 
     let state = match proxy_type {
       ProxyType::HTTP => {
@@ -141,7 +153,7 @@ impl serde::de::Visitor for ProxyDeserializerVisitor {
 }
 
 impl serde::Deserialize for ProxyDeserializer {
-  fn deserialize<D>(deserializer: &mut D) -> Result<ProxyDeserializer, D::Error>
+  fn deserialize<D>(deserializer: D) -> Result<ProxyDeserializer, D::Error>
         where D: serde::de::Deserializer {
     static FIELDS: &'static [&'static str] = &["tag", "proxy_type", "state"];
     deserializer.deserialize_struct("Proxy", FIELDS, ProxyDeserializerVisitor)
@@ -244,13 +256,17 @@ enum ConfigMessageField {
 }
 
 impl serde::Deserialize for ConfigMessageField {
-  fn deserialize<D>(deserializer: &mut D) -> Result<ConfigMessageField, D::Error>
+  fn deserialize<D>(deserializer: D) -> Result<ConfigMessageField, D::Error>
         where D: serde::de::Deserializer {
     struct ConfigMessageFieldVisitor;
     impl serde::de::Visitor for ConfigMessageFieldVisitor {
       type Value = ConfigMessageField;
 
-      fn visit_str<E>(&mut self, value: &str) -> Result<ConfigMessageField, E>
+      fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("expected id, version, proxy, type or data")
+      }
+
+      fn visit_str<E>(self, value: &str) -> Result<ConfigMessageField, E>
         where E: serde::de::Error {
         match value {
           "id"       => Ok(ConfigMessageField::Id),
@@ -272,7 +288,11 @@ struct ConfigMessageVisitor;
 impl serde::de::Visitor for ConfigMessageVisitor {
   type Value = ConfigMessage;
 
-  fn visit_map<V>(&mut self, mut visitor: V) -> Result<ConfigMessage, V::Error>
+  fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    formatter.write_str("")
+  }
+
+  fn visit_map<V>(self, mut visitor: V) -> Result<ConfigMessage, V::Error>
         where V: serde::de::MapVisitor {
     let mut id:Option<String>              = None;
     let mut version:Option<u8>             = None;
@@ -296,30 +316,28 @@ impl serde::de::Visitor for ConfigMessageVisitor {
     //println!("decoded type = {:?}, value= {:?}", proxy_type, state);
     let config_type = match config_type {
       Some(config) => config,
-      None => try!(visitor.missing_field("type")),
+      None => return Err(serde::de::Error::missing_field("type")),
     };
     let id = match id {
       Some(id) => id,
-      None => try!(visitor.missing_field("id")),
+      None => return Err(serde::de::Error::missing_field("id")),
     };
     let version = match version {
       Some(version) => version,
-      None => try!(visitor.missing_field("version")),
+      None => return Err(serde::de::Error::missing_field("version")),
     };
-
-    try!(visitor.end());
 
     let data = if &config_type == "PROXY" {
       let data = match data {
         Some(data) => data,
-        None => try!(visitor.missing_field("data")),
+        None => return Err(serde::de::Error::missing_field("data")),
       };
       let command = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("proxy configuration command"))));
       ConfigCommand::ProxyConfiguration(command)
     } else if &config_type == &"SAVE_STATE" {
       let data = match data {
         Some(data) => data,
-        None => try!(visitor.missing_field("data")),
+        None => return Err(serde::de::Error::missing_field("data")),
       };
       let state: SaveStateData = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("save state"))));
       ConfigCommand::SaveState(state.path)
@@ -328,7 +346,7 @@ impl serde::de::Visitor for ConfigMessageVisitor {
     } else if &config_type == &"LOAD_STATE" {
       let data = match data {
         Some(data) => data,
-        None => try!(visitor.missing_field("data")),
+        None => return Err(serde::de::Error::missing_field("data")),
       };
       let state: SaveStateData = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("save state"))));
       ConfigCommand::LoadState(state.path)
@@ -337,7 +355,7 @@ impl serde::de::Visitor for ConfigMessageVisitor {
     } else if &config_type == &"LAUNCH_WORKER" {
       let data = match data {
         Some(data) => data,
-        None => try!(visitor.missing_field("data")),
+        None => return Err(serde::de::Error::missing_field("data")),
       };
       ConfigCommand::LaunchWorker(try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("launch worker")))))
     } else if &config_type == &"UPGRADE_MASTER" {
@@ -357,7 +375,7 @@ impl serde::de::Visitor for ConfigMessageVisitor {
 }
 
 impl serde::Deserialize for ConfigMessage {
-  fn deserialize<D>(deserializer: &mut D) -> Result<ConfigMessage, D::Error>
+  fn deserialize<D>(deserializer: D) -> Result<ConfigMessage, D::Error>
     where D: serde::de::Deserializer {
     static FIELDS: &'static [&'static str] = &["id", "version", "proxy", "type", "data"];
     deserializer.deserialize_struct("ConfigMessage", FIELDS, ConfigMessageVisitor)
@@ -370,7 +388,7 @@ struct StatePath {
 }
 
 impl serde::Serialize for ConfigMessage {
-  fn serialize<S>(&self, serializer: &mut S) -> Result<(), S::Error>
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
       where S: serde::Serializer,
   {
     let mut count = 4;
@@ -380,64 +398,49 @@ impl serde::Serialize for ConfigMessage {
     if self.proxy_id.is_some() {
       count += 1;
     }
-    let mut state = try!(serializer.serialize_map(Some(count)));
+    let mut map = try!(serializer.serialize_map(Some(count)));
 
-    try!(serializer.serialize_map_key(&mut state, "id"));
-    try!(serializer.serialize_map_value(&mut state, &self.id));
+    try!(map.serialize_entry("id", &self.id));
 
-    try!(serializer.serialize_map_key(&mut state, "version"));
-    try!(serializer.serialize_map_value(&mut state, &self.version));
+    try!(map.serialize_entry("version", &self.version));
 
     if self.proxy.is_some() {
-      try!(serializer.serialize_map_key(&mut state, "proxy"));
-      try!(serializer.serialize_map_value(&mut state, self.proxy.as_ref().unwrap()));
+      try!(map.serialize_entry("proxy", self.proxy.as_ref().unwrap()));
     }
 
     if self.proxy_id.is_some() {
-      try!(serializer.serialize_map_key(&mut state, "proxy_id"));
-      try!(serializer.serialize_map_value(&mut state, self.proxy_id.as_ref().unwrap()));
+      try!(map.serialize_entry("proxy_id", self.proxy_id.as_ref().unwrap()));
     }
 
     match self.data {
       ConfigCommand::ProxyConfiguration(ref order) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "PROXY"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, order));
+        try!(map.serialize_entry("type", "PROXY"));
+        try!(map.serialize_entry("data", order));
       },
       ConfigCommand::SaveState(ref path) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "SAVE_STATE"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, StatePath { path: path.to_string() }));
+        try!(map.serialize_entry("type", "SAVE_STATE"));
+        try!(map.serialize_entry("data", &StatePath { path: path.to_string() }));
       },
       ConfigCommand::LoadState(ref path) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "LOAD_STATE"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, StatePath { path: path.to_string() }));
+        try!(map.serialize_entry("type", "LOAD_STATE"));
+        try!(map.serialize_entry("data", &StatePath { path: path.to_string() }));
       },
       ConfigCommand::DumpState => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "DUMP_STATE"));
+        try!(map.serialize_entry("type", "DUMP_STATE"));
       },
       ConfigCommand::ListWorkers => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "LIST_WORKERS"));
+        try!(map.serialize_entry("type", "LIST_WORKERS"));
       },
       ConfigCommand::LaunchWorker(ref tag) => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "LAUNCH_WORKER"));
-        try!(serializer.serialize_map_key(&mut state, "data"));
-        try!(serializer.serialize_map_value(&mut state, tag));
+        try!(map.serialize_entry("type", "LAUNCH_WORKER"));
+        try!(map.serialize_entry("data", tag));
       },
       ConfigCommand::UpgradeMaster => {
-        try!(serializer.serialize_map_key(&mut state, "type"));
-        try!(serializer.serialize_map_value(&mut state, "UPGRADE_MASTER"));
+        try!(map.serialize_entry("type", "UPGRADE_MASTER"));
       },
     };
 
-    serializer.serialize_map_end(state)
+    map.end()
   }
 }
 
