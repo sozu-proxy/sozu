@@ -4,7 +4,6 @@ use std::str::FromStr;
 use std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::io::{self,Error,ErrorKind,Read};
-use serde::Deserialize;
 use openssl::ssl;
 use openssl::x509::X509;
 use openssl::hash::MessageDigest;
@@ -213,10 +212,8 @@ impl Config {
   pub fn load_from_path(path: &str) -> io::Result<Config> {
     let data = try!(Config::load_file(path));
 
-    let mut parser = toml::Parser::new(&data[..]);
-    if let Some(table) = parser.parse() {
-      match Deserialize::deserialize(&mut toml::Decoder::new(toml::Value::Table(table))) {
-        Ok(config) => {
+    match toml::from_str(&data) {
+      Ok(config) => {
           let mut c: Config = config;
           let log_level:  Option<String> = c.log_level.clone();
           let log_target: Option<String> = c.log_target.clone();
@@ -226,29 +223,14 @@ impl Config {
             proxy.log_target = log_target.clone();
           };
           Ok(c)
-        },
-        Err(e)     => {
-          println!("decoding error: {:?}", e);
-          Err(Error::new(
-            ErrorKind::InvalidData,
-            format!("decoding error: {:?}", e))
-          )
-        }
+      },
+      Err(e)     => {
+        println!("decoding error: {:?}", e);
+        Err(Error::new(
+          ErrorKind::InvalidData,
+          format!("decoding error: {:?}", e))
+        )
       }
-    } else {
-      println!("error parsing file:");
-      let mut offset = 0usize;
-      let mut index  = 0usize;
-      for line in data.lines() {
-        for error in &parser.errors {
-          if error.lo >= offset && error.lo <= offset + line.len() {
-            println!("line {}: {}", index, error.desc);
-          }
-        }
-        offset += line.len();
-        index  += 1;
-      }
-      Err(Error::new(ErrorKind::InvalidData, format!("could not parse the configuration file: {:?}", parser.errors)))
     }
   }
 
@@ -399,7 +381,7 @@ impl Config {
 mod tests {
   use super::*;
   use std::collections::HashMap;
-  use toml::encode_str;
+  use toml::to_string;
   use data::ProxyType;
 
   #[test]
@@ -462,7 +444,7 @@ mod tests {
       applications: HashMap::new()
     };
 
-    let encoded = encode_str(&config);
+    let encoded = to_string(&config).unwrap();
     println!("conf:\n{}", encoded);
   }
 }

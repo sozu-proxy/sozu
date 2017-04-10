@@ -19,9 +19,9 @@ include = [
 [dependencies]
 mio = "^0.6"
 mio-uds = "^0.6"
-serde = "~0.8"
-serde_json = "~0.8"
-serde_derive = "~0.8"
+serde = "~0.9.13"
+serde_json = "~0.9.9"
+serde_derive = "~0.9.13"
 nom = "^2.0"
 nix  = "^0.7"
 time = "^0.1.34"
