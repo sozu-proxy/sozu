@@ -9,7 +9,7 @@ use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
 use network::{ClientResult,Protocol};
 use network::buffer_queue::BufferQueue;
-use network::proxy::Readiness;
+use network::session::Readiness;
 use network::socket::{SocketHandler,SocketResult};
 use nom::HexDisplay;
 

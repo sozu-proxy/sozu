@@ -5,7 +5,7 @@ use pool::Checkout;
 use network::buffer_queue::BufferQueue;
 use openssl::ssl::{self,HandshakeError,MidHandshakeSslStream,Ssl,SslStream};
 use network::{ClientResult,Protocol};
-use network::proxy::Readiness;
+use network::session::Readiness;
 use network::protocol::ProtocolResult;
 
 pub enum TlsState {

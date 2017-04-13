@@ -11,7 +11,7 @@ use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_st
   BufferMove, RequestState, ResponseState, Chunk};
 use network::{ClientResult,Protocol};
 use network::buffer_queue::BufferQueue;
-use network::proxy::Readiness;
+use network::session::Readiness;
 use network::socket::{SocketHandler,SocketResult};
 use network::protocol::ProtocolResult;
 use util::UnwrapLog;

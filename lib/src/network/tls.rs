@@ -31,8 +31,8 @@ use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_req
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,Protocol};
-use network::proxy::{BackendConnectAction,BackendConnectionStatus,Server,ProxyConfiguration,ProxyClient,
-  Readiness,ListenToken,FrontToken,BackToken,ProxyChannel,AcceptError};
+use network::proxy::{Server,ProxyChannel};
+use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
 use messages::{self,CertFingerprint,CertificateAndKey,Order,TlsFront,TlsProxyConfiguration};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -339,16 +339,16 @@ pub struct ServerConfiguration {
   domains:         Arc<Mutex<TrieNode<CertFingerprint>>>,
   default_context: TlsData,
   contexts:        Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
-  channel:         ProxyChannel,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
   front_timeout:   u64,
   back_timeout:    u64,
   config:          TlsProxyConfiguration,
+  base_token:      usize,
 }
 
 impl ServerConfiguration {
-  pub fn new(config: TlsProxyConfiguration, mut channel: ProxyChannel, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
+  pub fn new(config: TlsProxyConfiguration, base_token: usize, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let     domains  = TrieNode::root();
     let mut fronts   = HashMap::new();
@@ -374,7 +374,7 @@ impl ServerConfiguration {
 
     match server_bind(&config.front) {
       Ok(listener) => {
-        event_loop.register(&listener, Token(start_at), Ready::readable(), PollOpt::edge());
+        event_loop.register(&listener, Token(base_token), Ready::readable(), PollOpt::edge());
         let default = DefaultAnswers {
           NotFound: Vec::from(if config.answer_404.len() > 0 {
               config.answer_404.as_bytes()
@@ -396,21 +396,22 @@ impl ServerConfiguration {
           domains:         rc_domains,
           default_context: tls_data,
           contexts:        rc_ctx,
-          channel:         channel,
           pool:            Rc::new(RefCell::new(
                              Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size))
           )),
           front_timeout:   50000,
           back_timeout:    50000,
           answers:         default,
+          base_token:      base_token,
           config:          config,
         })
       },
       Err(e) => {
         let formatted_err = format!("could not create listener {:?}: {:?}", fronts, e);
         error!("{}", formatted_err);
-        channel.write_message(&ServerMessage{id: String::from("listener_failed"), status: ServerMessageStatus::Error(formatted_err)});
-        channel.run();
+        //FIXME: send message if we could not create the listener
+        //channel.write_message(&ServerMessage{id: String::from("listener_failed"), status: ServerMessageStatus::Error(formatted_err)});
+        //channel.run();
         Err(e)
       }
     }
@@ -936,28 +937,29 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     }
   }
 
-  fn notify(&mut self, event_loop: &mut Poll, message: ProxyOrder) {
+  fn notify(&mut self, event_loop: &mut Poll, channel: &mut ProxyChannel, message: ProxyOrder) {
     trace!("{} notified", message);
     match message.order {
       Order::AddTlsFront(front) => {
         //info!("TLS\t{} add front {:?}", id, front);
           self.add_tls_front(front, event_loop);
-          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::RemoveTlsFront(front) => {
         //info!("TLS\t{} remove front {:?}", id, front);
         self.remove_tls_front(front, event_loop);
-        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::AddCertificate(certificate_and_key) => {
         //info!("TLS\t{} add certificate: {:?}", id, certificate_and_key);
           self.add_certificate(certificate_and_key, event_loop);
-          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::RemoveCertificate(fingerprint) => {
         //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
         self.remove_certificate(fingerprint, event_loop);
-        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        //FIXME: should return an error if certificate still has fronts referencing it
+        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::AddInstance(instance) => {
         info!("{} add instance {:?}", message.id, instance);
@@ -965,9 +967,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
-          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Order::RemoveInstance(instance) => {
@@ -976,9 +978,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
-          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Order::HttpProxy(configuration) => {
@@ -989,24 +991,24 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
         };
-        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
         event_loop.deregister(&self.listener);
-        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
+        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
-        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::Status => {
         info!("{} status", message.id);
-        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       command => {
         error!("{} unsupported message, ignoring {:?}", message.id, command);
-        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
+        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
       }
     }
   }
@@ -1026,13 +1028,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   fn back_timeout(&self)  -> u64 {
     self.back_timeout
   }
-
-  fn channel(&mut self)   -> &mut ProxyChannel {
-    &mut self.channel
-  }
 }
 
-pub type TlsServer = Server<ServerConfiguration,TlsClient>;
+pub type TlsServer = Session<ServerConfiguration,TlsClient>;
 
 pub fn start(config: TlsProxyConfiguration, channel: ProxyChannel) {
   let mut event_loop  = Poll::new().expect("could not create event loop");
@@ -1040,8 +1038,9 @@ pub fn start(config: TlsProxyConfiguration, channel: ProxyChannel) {
   let max_listeners   = 1;
 
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok(configuration) = ServerConfiguration::new(config, channel, &mut event_loop, 1 + max_listeners) {
-    let mut server = TlsServer::new(max_listeners, max_connections, configuration, event_loop);
+  if let Ok(configuration) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop, 1 + max_listeners) {
+    let mut session = Session::new(max_listeners, max_connections, 6148914691236517205, configuration, &mut event_loop);
+    let mut server: Server<TlsClient> = Server::new(max_listeners, max_connections, event_loop, channel, None, Some(session), None);
 
     info!("starting event loop");
     server.run();
@@ -1178,7 +1177,6 @@ mod tests {
     let rc_domains = Arc::new(Mutex::new(domains));
 
     let context    = SslContext::builder(SslMethod::tls()).expect("could not create a SslContextBuilder");
-    let (command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 
     let tls_data = TlsData {
       context:     context.build(),
@@ -1197,10 +1195,10 @@ mod tests {
       domains:   rc_domains,
       default_context: tls_data,
       contexts: rc_ctx,
-      channel:   channel,
       pool:      Rc::new(RefCell::new(Pool::with_capacity(1, 0, || BufferQueue::with_capacity(16384)))),
       front_timeout: 5000,
       back_timeout:  5000,
+      base_token:    6148914691236517205,
       answers:   DefaultAnswers {
         NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),

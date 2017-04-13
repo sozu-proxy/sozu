@@ -19,8 +19,8 @@ use rand::random;
 use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
 use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
-use network::proxy::{BackendConnectAction,BackendConnectionStatus,Server,ProxyConfiguration,ProxyClient,
-  Readiness,ListenToken,FrontToken,BackToken,ProxyChannel,AcceptError};
+use network::proxy::{Server,ProxyChannel};
+use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use messages::{self,Order,HttpFront,HttpProxyConfiguration};
 use channel::Channel;
@@ -303,7 +303,6 @@ pub struct ServerConfiguration {
   instances:       HashMap<AppId, Vec<Rc<RefCell<Backend>>>>,
   fronts:          HashMap<Hostname, Vec<HttpFront>>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
-  channel:         ProxyChannel,
   answers:         DefaultAnswers,
   front_timeout:   u64,
   back_timeout:    u64,
@@ -311,7 +310,8 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(config: HttpProxyConfiguration, mut channel: ProxyChannel, event_loop: &mut Poll, start_at:usize) -> io::Result<ServerConfiguration> {
+  pub fn new(config: HttpProxyConfiguration, event_loop: &mut Poll, start_at:usize) -> io::Result<ServerConfiguration> {
+    count!("pouet", 1);
     let front = config.front;
     match server_bind(&config.front) {
       Ok(sock) => {
@@ -335,7 +335,6 @@ impl ServerConfiguration {
           address:       config.front,
           instances:     HashMap::new(),
           fronts:        HashMap::new(),
-          channel:       channel,
           pool:          Rc::new(RefCell::new(
                            Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size))
           )),
@@ -349,8 +348,9 @@ impl ServerConfiguration {
       Err(e) => {
         let formatted_err = format!("could not create listener {:?}: {:?}", front, e);
         error!("{}", formatted_err);
-        channel.write_message(&ServerMessage{id: String::from("listener_failed"), status: ServerMessageStatus::Error(formatted_err)});
-        channel.run();
+        //FIXME: return an error if listener creation failed
+        //channel.write_message(&ServerMessage{id: String::from("listener_failed"), status: ServerMessageStatus::Error(formatted_err)});
+        //channel.run();
         Err(e)
       }
     }
@@ -587,19 +587,19 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn notify(&mut self, event_loop: &mut Poll, message: ProxyOrder) {
+  fn notify(&mut self, event_loop: &mut Poll, channel: &mut ProxyChannel, message: ProxyOrder) {
   // ToDo temporary
     trace!("{} notified", message);
     match message.order {
       Order::AddHttpFront(front) => {
         info!("{} add front {:?}", message.id, front);
           self.add_http_front(front, event_loop);
-          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::RemoveHttpFront(front) => {
         info!("{} front {:?}", message.id, front);
         self.remove_http_front(front, event_loop);
-        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::AddInstance(instance) => {
         info!("{} add instance {:?}", message.id, instance);
@@ -607,9 +607,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
-          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Order::RemoveInstance(instance) => {
@@ -618,9 +618,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
         } else {
-          self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Order::HttpProxy(configuration) => {
@@ -631,28 +631,28 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
         };
-        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
         event_loop.deregister(&self.listener);
-        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
+        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       Order::Status => {
         info!("{} status", message.id);
-        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
       },
       command => {
         debug!("{} unsupported message, ignoring: {:?}", message.id, command);
-        self.channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
+        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
       }
     }
   }
@@ -693,13 +693,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   fn back_timeout(&self)  -> u64 {
     self.back_timeout
   }
-
-  fn channel(&mut self)   -> &mut ProxyChannel {
-    &mut self.channel
-  }
 }
 
-pub type HttpServer = Server<ServerConfiguration,Client>;
+pub type HttpServer = Session<ServerConfiguration,Client>;
 
 pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel) {
   let mut event_loop  = Poll::new().expect("could not create event loop");
@@ -707,8 +703,9 @@ pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel) {
   let max_listeners   = 1;
 
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok(configuration) = ServerConfiguration::new(config, channel, &mut event_loop, 1 + max_listeners) {
-    let mut server = HttpServer::new(max_listeners, max_connections, configuration, event_loop);
+  if let Ok(configuration) = ServerConfiguration::new(config, &mut event_loop, 1 + max_listeners) {
+    let mut session = Session::new(max_listeners, max_connections, 0, configuration, &mut event_loop);
+    let mut server: Server<Client> = Server::new(max_listeners, max_connections, event_loop, channel, Some(session), None, None);
 
     info!("starting event loop");
     server.run();
@@ -909,8 +906,6 @@ mod tests {
       HttpFront { app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned() },
     ]);
 
-    let (command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
-
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
     let listener = tcp::TcpListener::bind(&front).expect("should bind TCP socket");
     let server_config = ServerConfiguration {
@@ -918,7 +913,6 @@ mod tests {
       address:   front,
       instances: HashMap::new(),
       fronts:    fronts,
-      channel:   channel,
       pool:      Rc::new(RefCell::new(Pool::with_capacity(1,0, || BufferQueue::with_capacity(16384)))),
       front_timeout: 50000,
       back_timeout:  50000,

@@ -18,6 +18,7 @@ mod splice;
 
 pub mod tcp;
 pub mod proxy;
+pub mod session;
 
 use mio::Token;
 use messages::Order;
@@ -50,7 +51,7 @@ pub enum ServerMessageStatus {
   Error(String),
 }
 
-#[derive(Debug,Serialize,Deserialize)]
+#[derive(Debug,Clone,Serialize,Deserialize)]
 pub struct ProxyOrder {
   pub id:    MessageId,
   pub order: Order,
@@ -165,18 +166,6 @@ pub enum SocketType {
   Listener,
   FrontClient,
   BackClient,
-}
-
-pub fn socket_type(token: Token, max_listeners: usize, max_connections: usize) -> Option<SocketType> {
-  if token.0 < 2 + max_listeners {
-    Some(SocketType::Listener)
-  } else if token.0 < 2 + max_listeners + max_connections {
-    Some(SocketType::FrontClient)
-  } else if token.0 < 2 + max_listeners + 2 * max_connections {
-    Some(SocketType::BackClient)
-  } else {
-    None
-  }
 }
 
 #[derive(Debug,PartialEq,Eq)]
