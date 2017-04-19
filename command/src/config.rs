@@ -235,20 +235,21 @@ impl Config {
       let chain_opt       = app.certificate_chain.as_ref().and_then(|path| Config::load_file(&path).ok())
         .map(Config::split_certificate_chain);
 
-      if key_opt.is_none() && certificate_opt.is_none() && chain_opt.is_none() {
-        let order = Order::AddHttpFront(HttpFront {
-          app_id:     id.to_string(),
-          hostname:   app.hostname.clone(),
-          path_begin: path_begin,
-        });
-        v.push(ConfigMessage {
-          id:       format!("CONFIG-{}", count),
-          version:  PROTOCOL_VERSION,
-          proxy_id: None,
-          data:     ConfigCommand::ProxyConfiguration(order),
-        });
-        count += 1;
-      } else {
+      //create the front both for HTTP and HTTPS if possible
+      let order = Order::AddHttpFront(HttpFront {
+        app_id:     id.to_string(),
+        hostname:   app.hostname.clone(),
+        path_begin: path_begin.clone(),
+      });
+      v.push(ConfigMessage {
+        id:       format!("CONFIG-{}", count),
+        version:  PROTOCOL_VERSION,
+        proxy_id: None,
+        data:     ConfigCommand::ProxyConfiguration(order),
+      });
+      count += 1;
+
+      if key_opt.is_some() || certificate_opt.is_some()  || chain_opt.is_some() {
 
         if key_opt.is_none() {
           error!("cannot read the key at {:?}", app.key);
