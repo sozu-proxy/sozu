@@ -1,7 +1,6 @@
 use serde;
 use serde::ser::SerializeMap;
 use serde_json;
-use state::{HttpProxy,TlsProxy,ConfigState};
 use sozu::messages::Order;
 use std::fmt;
 
@@ -55,111 +54,6 @@ impl serde::Deserialize for ProxyType {
   }
 }
 
-
-#[derive(Debug,Clone,PartialEq,Eq)]
-pub struct ProxyDeserializer {
-  pub tag:   String,
-  pub state: ConfigState,
-}
-
-enum ProxyDeserializerField {
-  Tag,
-  Type,
-  State,
-}
-
-impl serde::Deserialize for ProxyDeserializerField {
-  fn deserialize<D>(deserializer: D) -> Result<ProxyDeserializerField, D::Error>
-        where D: serde::de::Deserializer {
-    struct ProxyDeserializerFieldVisitor;
-    impl serde::de::Visitor for ProxyDeserializerFieldVisitor {
-      type Value = ProxyDeserializerField;
-
-      fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("expected tag, proxy_type or state")
-      }
-
-      fn visit_str<E>(self, value: &str) -> Result<ProxyDeserializerField, E>
-        where E: serde::de::Error {
-        match value {
-          "tag"        => Ok(ProxyDeserializerField::Tag),
-          "proxy_type" => Ok(ProxyDeserializerField::Type),
-          "state"      => Ok(ProxyDeserializerField::State),
-          _ => Err(serde::de::Error::custom("expected tag, proxy_type or state")),
-        }
-      }
-    }
-
-    deserializer.deserialize(ProxyDeserializerFieldVisitor)
-  }
-}
-
-struct ProxyDeserializerVisitor;
-impl serde::de::Visitor for ProxyDeserializerVisitor {
-  type Value = ProxyDeserializer;
-
-  fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-    formatter.write_str("")
-  }
-
-  fn visit_map<V>(self, mut visitor: V) -> Result<ProxyDeserializer, V::Error>
-        where V: serde::de::MapVisitor {
-    let mut tag:Option<String>              = None;
-    let mut proxy_type:Option<ProxyType>    = None;
-    let mut state:Option<serde_json::Value> = None;
-
-    loop {
-      match try!(visitor.visit_key()) {
-        Some(ProxyDeserializerField::Type)  => { proxy_type = Some(try!(visitor.visit_value())); }
-        Some(ProxyDeserializerField::Tag)   => { tag = Some(try!(visitor.visit_value())); }
-        Some(ProxyDeserializerField::State) => { state = Some(try!(visitor.visit_value())); }
-        None => { break; }
-      }
-    }
-
-    println!("decoded type = {:?}, value= {:?}", proxy_type, state);
-    let proxy_type = match proxy_type {
-      Some(proxy) => proxy,
-      None => return Err(serde::de::Error::missing_field("proxy_type")),
-    };
-    let tag = match tag {
-      Some(tag) => tag,
-      None => return Err(serde::de::Error::missing_field("tag")),
-    };
-    let state = match state {
-      Some(state) => state,
-      None => return Err(serde::de::Error::missing_field("state")),
-    };
-
-    let state = match proxy_type {
-      ProxyType::HTTP => {
-        let http_proxy: HttpProxy = try!(serde_json::from_value(state).or(Err(serde::de::Error::custom("http_proxy"))));
-        ConfigState::Http(http_proxy)
-      },
-      ProxyType::HTTPS => {
-        let tls_proxy: TlsProxy = try!(serde_json::from_value(state).or(Err(serde::de::Error::custom("tls_proxy"))));
-        ConfigState::Tls(tls_proxy)
-      },
-      ProxyType::TCP => {
-        ConfigState::Tcp
-      }
-    };
-
-    Ok(ProxyDeserializer {
-      tag: tag,
-      state: state,
-    })
-  }
-}
-
-impl serde::Deserialize for ProxyDeserializer {
-  fn deserialize<D>(deserializer: D) -> Result<ProxyDeserializer, D::Error>
-        where D: serde::de::Deserializer {
-    static FIELDS: &'static [&'static str] = &["tag", "proxy_type", "state"];
-    deserializer.deserialize_struct("Proxy", FIELDS, ProxyDeserializerVisitor)
-  }
-}
-
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize)]
 pub enum ConfigCommand {
   ProxyConfiguration(Order),
@@ -176,17 +70,15 @@ pub struct ConfigMessage {
   pub id:       String,
   pub version:  u8,
   pub data:     ConfigCommand,
-  pub proxy:    Option<String>,
   pub proxy_id: Option<u32>,
 }
 
 impl ConfigMessage {
-  pub fn new(id: String, data: ConfigCommand, proxy: Option<String>, proxy_id: Option<u32>) -> ConfigMessage {
+  pub fn new(id: String, data: ConfigCommand, proxy_id: Option<u32>) -> ConfigMessage {
     ConfigMessage {
       id:       id,
       version:  PROTOCOL_VERSION,
       data:     data,
-      proxy:    proxy,
       proxy_id: proxy_id,
     }
   }
@@ -236,8 +128,6 @@ pub enum RunState {
 pub struct WorkerInfo {
   pub id:         u32,
   pub pid:        i32,
-  pub tag:        String,
-  pub proxy_type: ProxyType,
   pub run_state:  RunState,
 }
 
@@ -249,7 +139,6 @@ struct SaveStateData {
 enum ConfigMessageField {
   Id,
   Version,
-  Proxy,
   ProxyId,
   Type,
   Data,
@@ -263,7 +152,7 @@ impl serde::Deserialize for ConfigMessageField {
       type Value = ConfigMessageField;
 
       fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("expected id, version, proxy, type or data")
+        formatter.write_str("expected id, version, proxy id, type or data")
       }
 
       fn visit_str<E>(self, value: &str) -> Result<ConfigMessageField, E>
@@ -272,10 +161,9 @@ impl serde::Deserialize for ConfigMessageField {
           "id"       => Ok(ConfigMessageField::Id),
           "version"  => Ok(ConfigMessageField::Version),
           "type"     => Ok(ConfigMessageField::Type),
-          "proxy"    => Ok(ConfigMessageField::Proxy),
           "proxy_id" => Ok(ConfigMessageField::ProxyId),
           "data"     => Ok(ConfigMessageField::Data),
-          e => Err(serde::de::Error::custom(format!("expected id, version, proxy, type or data, got: {}", e))),
+          e => Err(serde::de::Error::custom(format!("expected id, version, proxy id, type or data, got: {}", e))),
         }
       }
     }
@@ -296,7 +184,6 @@ impl serde::de::Visitor for ConfigMessageVisitor {
         where V: serde::de::MapVisitor {
     let mut id:Option<String>              = None;
     let mut version:Option<u8>             = None;
-    let mut proxy: Option<String>          = None;
     let mut proxy_id: Option<u32>          = None;
     let mut config_type:Option<String>     = None;
     let mut data:Option<serde_json::Value> = None;
@@ -306,7 +193,6 @@ impl serde::de::Visitor for ConfigMessageVisitor {
         Some(ConfigMessageField::Type)    => { config_type = Some(try!(visitor.visit_value())); }
         Some(ConfigMessageField::Id)      => { id = Some(try!(visitor.visit_value())); }
         Some(ConfigMessageField::Version) => { version = Some(try!(visitor.visit_value())); }
-        Some(ConfigMessageField::Proxy)   => { proxy = Some(try!(visitor.visit_value())); }
         Some(ConfigMessageField::ProxyId) => { proxy_id = Some(try!(visitor.visit_value())); }
         Some(ConfigMessageField::Data)    => { data = Some(try!(visitor.visit_value())); }
         None => { break; }
@@ -368,7 +254,6 @@ impl serde::de::Visitor for ConfigMessageVisitor {
       id:      id,
       version: PROTOCOL_VERSION,
       data:    data,
-      proxy:   proxy,
       proxy_id: proxy_id,
     })
   }
@@ -377,7 +262,7 @@ impl serde::de::Visitor for ConfigMessageVisitor {
 impl serde::Deserialize for ConfigMessage {
   fn deserialize<D>(deserializer: D) -> Result<ConfigMessage, D::Error>
     where D: serde::de::Deserializer {
-    static FIELDS: &'static [&'static str] = &["id", "version", "proxy", "type", "data"];
+    static FIELDS: &'static [&'static str] = &["id", "version", "proxy_id", "type", "data"];
     deserializer.deserialize_struct("ConfigMessage", FIELDS, ConfigMessageVisitor)
   }
 }
@@ -392,21 +277,13 @@ impl serde::Serialize for ConfigMessage {
       where S: serde::Serializer,
   {
     let mut count = 4;
-    if self.proxy.is_some() {
-      count += 1;
-    }
     if self.proxy_id.is_some() {
       count += 1;
     }
     let mut map = try!(serializer.serialize_map(Some(count)));
 
     try!(map.serialize_entry("id", &self.id));
-
     try!(map.serialize_entry("version", &self.version));
-
-    if self.proxy.is_some() {
-      try!(map.serialize_entry("proxy", self.proxy.as_ref().unwrap()));
-    }
 
     if self.proxy_id.is_some() {
       try!(map.serialize_entry("proxy_id", self.proxy_id.as_ref().unwrap()));
@@ -453,10 +330,9 @@ mod tests {
 
   #[test]
   fn config_message_test() {
-    let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "proxy": "HTTP", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}} }"#;
+    let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}} }"#;
     let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", message);
-    assert_eq!(message.proxy, Some(String::from("HTTP")));
     assert_eq!(message.data, ConfigCommand::ProxyConfiguration(Order::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
@@ -469,7 +345,6 @@ mod tests {
     let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "SAVE_STATE", "data":{ "path": "./config_dump.json"} }"#;
     let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", message);
-    assert_eq!(message.proxy, None);
     assert_eq!(message.data, ConfigCommand::SaveState(String::from("./config_dump.json")));
   }
 
@@ -482,7 +357,6 @@ mod tests {
     let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
     println!("C");
     println!("{:?}", message);
-    assert_eq!(message.proxy, None);
     println!("D");
     assert_eq!(message.data, ConfigCommand::DumpState);
   }

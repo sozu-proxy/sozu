@@ -43,11 +43,8 @@ impl From<FrontToken> for usize {
 }
 
 pub struct Worker {
-  pub tag:           String,
   pub id:            u32,
-  pub proxy_type:    ProxyType,
   pub channel:       Channel<ProxyOrder,ServerMessage>,
-  pub state:         ConfigState,
   pub token:         Option<Token>,
   pub pid:           pid_t,
   pub run_state:     RunState,
@@ -55,19 +52,10 @@ pub struct Worker {
 }
 
 impl Worker {
-  pub fn new(tag: String, id: u32, pid: pid_t, proxy_type: ProxyType, ip_address: String, port: u16, channel: Channel<ProxyOrder,ServerMessage>) -> Worker {
-    let state = match proxy_type {
-      ProxyType::HTTP  => ConfigState::Http(HttpProxy::new(ip_address, port)),
-      ProxyType::HTTPS => ConfigState::Tls(TlsProxy::new(ip_address, port)),
-      _                => unimplemented!(),
-    };
-
+  pub fn new(id: u32, pid: pid_t, channel: Channel<ProxyOrder,ServerMessage>, config: &Config) -> Worker {
     Worker {
-      tag:        tag,
       id:         id,
-      proxy_type: proxy_type,
       channel:    channel,
-      state:      state,
       token:      None,
       pid:        pid,
       run_state:  RunState::Running,
@@ -78,31 +66,14 @@ impl Worker {
 
 impl fmt::Debug for Worker {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    write!(f, "Worker {{ tag: {}, proxy_type: {:?}, state: {:?} }}", self.tag, self.proxy_type, self.state)
-  }
-}
-
-#[derive(Clone,Deserialize,Serialize,Debug)]
-pub struct StoredProxy {
-  pub tag:        String,
-  pub proxy_type: ProxyType,
-  pub state:      ConfigState,
-}
-
-impl StoredProxy {
-  pub fn from_worker(proxy: &Worker) -> StoredProxy {
-    StoredProxy {
-      tag:        proxy.tag.clone(),
-      proxy_type: proxy.proxy_type.clone(),
-      state:      proxy.state.clone(),
-    }
+    write!(f, "Worker {{ id: {}, run_state: {:?} }}", self.id, self.run_state)
   }
 }
 
 #[derive(Deserialize,Serialize,Debug)]
 pub struct ProxyConfiguration {
-  id:      String,
-  proxies: Vec<StoredProxy>,
+  id:    String,
+  state: ConfigState,
 }
 
 pub type Tag = String;
@@ -112,9 +83,9 @@ pub struct CommandServer {
   buffer_size:     usize,
   max_buffer_size: usize,
   conns:           Slab<CommandClient,FrontToken>,
-  proxies:         HashMap<Token, (Tag, Worker)>,
-  next_ids:        HashMap<Tag,u32>,
-  state:           HashMap<Tag, StoredProxy>,
+  proxies:         HashMap<Token, Worker>,
+  next_id:         u32,
+  state:           ConfigState,
   pub poll:        Poll,
   timer:           Timer<Token>,
   config:          Config,
@@ -155,29 +126,24 @@ impl CommandServer {
     }
   }
 
-  fn new(srv: UnixListener, config: Config, proxies_map: HashMap<String, Vec<Worker>>, poll: Poll) -> CommandServer {
+  fn new(srv: UnixListener, config: Config, mut proxy_vec: Vec<Worker>, poll: Poll) -> CommandServer {
     //FIXME: verify this
     poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
 
-    let mut next_ids: HashMap<String, u32> = HashMap::new();
-    for (ref tag, ref value) in &proxies_map {
-      next_ids.insert(tag.to_string(), (value.len() - 1) as u32);
-    }
+    let mut next_id = proxy_vec.len();
 
     let mut proxies = HashMap::new();
-    let mut state   = HashMap::new();
 
     let mut token_count = 0;
-    for (ref tag, ref mut proxy_list) in proxies_map {
-      for proxy in proxy_list.drain(..) {
-        if !state.contains_key(tag) {
-          state.insert(tag.to_string(), StoredProxy::from_worker(&proxy));
-        }
+    //FIXME: verify there's at least one worker
+    //TODO: make config state from Config ADD IP ADDRESSES AND PORTS
+    let state: ConfigState = Default::default();
 
-        token_count += 1;
-        poll.register(&proxy.channel.sock, Token(token_count), Ready::all(), PollOpt::edge()).unwrap();
-        proxies.insert(Token(token_count), (tag.to_string(), proxy));
-      }
+
+    for proxy in proxy_vec.drain(..) {
+      token_count += 1;
+      poll.register(&proxy.channel.sock, Token(token_count), Ready::all(), PollOpt::edge()).unwrap();
+      proxies.insert(Token(token_count), proxy);
     }
 
     //let mut timer = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
@@ -194,7 +160,7 @@ impl CommandServer {
       max_buffer_size: config.max_command_buffer_size.unwrap_or(buffer_size * 2),
       conns:           Slab::with_capacity(128),
       proxies:         proxies,
-      next_ids:        next_ids,
+      next_id:         next_id as u32,
       state:           state,
       poll:            poll,
       timer:           timer,
@@ -237,7 +203,7 @@ impl CommandServer {
       },
       Token(i) if i < HALF_USIZE + 1 => {
         let mut messages = {
-          let &mut (_, ref mut proxy) =  self.proxies.get_mut(&Token(i)).unwrap();
+          let ref mut proxy =  self.proxies.get_mut(&Token(i)).unwrap();
           proxy.channel.handle_events(events);
           proxy.channel.run();
 
@@ -259,7 +225,7 @@ impl CommandServer {
         }
 
         {
-          let &mut (_, ref mut proxy) =  self.proxies.get_mut(&Token(i)).unwrap();
+          let ref mut proxy =  self.proxies.get_mut(&Token(i)).unwrap();
           proxy.channel.run();
         }
 
@@ -308,7 +274,7 @@ impl CommandServer {
   fn proxy_handle_message(&mut self, token: Token, msg: ServerMessage) {
     //println!("got answer msg: {:?}", msg);
     if msg.status != ServerMessageStatus::Processing {
-      if let Some(&mut (_, ref mut proxy)) = self.proxies.get_mut(&token) {
+      if let Some(ref mut proxy) = self.proxies.get_mut(&token) {
         if let Some(order) = proxy.inflight.remove(&msg.id) {
           info!("REMOVING INFLIGHT MESSAGE {}: {:?}", msg.id, order);
           // handle message completion here
@@ -348,7 +314,7 @@ impl CommandServer {
 
 }
 
-pub fn start(config: Config, proxies: HashMap<String, Vec<Worker>>) {
+pub fn start(config: Config, proxies: Vec<Worker>) {
   let saved_state     = config.saved_state.clone();
 
   let event_loop = Poll::new().unwrap();

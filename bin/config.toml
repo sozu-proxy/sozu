@@ -7,24 +7,22 @@ log_target     = "stdout"
 #log_target     = "udp://127.0.0.1:9876"
 #log_target     = "tcp://127.0.0.1:9876"
 command_buffer_size = 16384
+worker_count = 2
 
 [metrics]
 address = "192.168.59.103"
 port = 8125
 
-[proxies]
-
-[proxies.HTTP]
+[http]
 address = "127.0.0.1"
 proxy_type = "HTTP"
 max_connections = 500
 port = 8080
 buffer_size = 16384
-worker_count = 2
 #answer_404 = "./404.html"
 #answer_503 = "./503.html"
 
-[proxies.TLS]
+[https]
 address = "127.0.0.1"
 proxy_type = "HTTPS"
 max_connections = 500

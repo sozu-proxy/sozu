@@ -21,7 +21,7 @@ use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 
-use super::{CommandServer,FrontToken,ProxyConfiguration,StoredProxy,Worker};
+use super::{CommandServer,FrontToken,ProxyConfiguration,Worker};
 use super::client::parse;
 use worker::start_worker;
 use upgrade::{start_new_master_process,SerializedWorker,UpgradeData};
@@ -34,20 +34,17 @@ impl CommandServer {
         if let Ok(mut f) = fs::File::create(&path) {
 
           let mut counter = 0usize;
-          for proxy in self.state.values() {
-            for command in proxy.state.generate_orders() {
-              let message = ConfigMessage::new(
-                format!("SAVE-{}", counter),
-                ConfigCommand::ProxyConfiguration(command),
-                Some(proxy.tag.to_string()),
-                None
-              );
-              f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()));
-              f.write_all(&b"\n\0"[..]);
-              counter += 1;
-            }
-            f.sync_all();
+          for command in self.state.generate_orders() {
+            let message = ConfigMessage::new(
+              format!("SAVE-{}", counter),
+              ConfigCommand::ProxyConfiguration(command),
+              None
+            );
+            f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()));
+            f.write_all(&b"\n\0"[..]);
+            counter += 1;
           }
+          f.sync_all();
           self.conns[token].write_message(&ConfigMessageAnswer::new(
             message.id.clone(),
             ConfigMessageStatus::Ok,
@@ -67,8 +64,8 @@ impl CommandServer {
       ConfigCommand::DumpState => {
 
         let conf = ProxyConfiguration {
-          id:      message.id.clone(),
-          proxies: self.state.values().cloned().collect(),
+          id:    message.id.clone(),
+          state: self.state.clone(),
         };
         //let encoded = serde_json::to_string(&conf).map(|s| s.into_bytes()).unwrap_or(vec!());
         self.conns[token].write_message(&ConfigMessageAnswer::new(
@@ -89,11 +86,9 @@ impl CommandServer {
         ));
       },
       ConfigCommand::ListWorkers => {
-        let workers: Vec<WorkerInfo> = self.proxies.values().map(|&(_, ref proxy)| {
+        let workers: Vec<WorkerInfo> = self.proxies.values().map(|ref proxy| {
           WorkerInfo {
-            tag:        proxy.tag.clone(),
             id:         proxy.id,
-            proxy_type: proxy.proxy_type,
             pid:        proxy.pid,
             run_state:  proxy.run_state.clone(),
           }
@@ -108,8 +103,8 @@ impl CommandServer {
       ConfigCommand::LaunchWorker(tag) => {
         info!("received LaunchWorker with tag \"{}\"", tag);
 
-        let id = self.next_ids.get(&tag).unwrap_or(&0) + 1;
-        if let Some(mut worker) = self.config.proxies.get(&tag).and_then(|config| start_worker(&tag, config, id)) {
+        let id = self.next_id + 1;
+        if let Some(mut worker) = start_worker(id, &self.config) {
           self.conns[token].write_message(&ConfigMessageAnswer::new(
             message.id.clone(),
             ConfigMessageStatus::Processing,
@@ -118,25 +113,25 @@ impl CommandServer {
           ));
           info!("created new worker");
 
-          *self.next_ids.get_mut(&tag).unwrap() += 1;
+          self.next_id += 1;
 
           let worker_token = self.token_count + 1;
           self.token_count = worker_token;
           worker.token     = Some(Token(worker_token));
 
-          if let Some(&(_, ref previous)) = self.proxies.values().filter(|&&(ref ptag, ref proxy)| {
-            ptag == &tag && proxy.run_state == RunState::Running
+          if let Some(ref previous) = self.proxies.values().filter(|ref proxy| {
+            proxy.run_state == RunState::Running
           }).next() {
             worker.channel.set_blocking(true);
 
             let mut counter = 0u32;
-            for order in previous.state.generate_orders() {
+            for order in self.state.generate_orders() {
               let message_id = format!("LAUNCH-CONF-{}", counter);
               worker.inflight.insert(message_id.clone(), order.clone());
               let o = order.clone();
               //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
               self.conns[token].add_message_id(message_id.clone());
-              worker.state.handle_order(&o);
+              //worker.state.handle_order(&o);
               if !worker.channel.write_message(&ProxyOrder { id: message_id.clone(), order: o }) {
                 error!("could not send to new worker({}-{}): {}", tag, worker.id, message_id);
               }
@@ -152,7 +147,7 @@ impl CommandServer {
           info!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
             worker_token, tag, worker.id, worker.channel.sock.take_error());
           self.poll.register(&worker.channel.sock, Token(worker_token), Ready::all(), PollOpt::edge()).unwrap();
-          self.proxies.insert(Token(worker_token), (tag, worker));
+          self.proxies.insert(Token(worker_token), worker);
 
           self.conns[token].write_message(&ConfigMessageAnswer::new(
             message.id.clone(),
@@ -204,47 +199,39 @@ impl CommandServer {
         }
       },
       ConfigCommand::ProxyConfiguration(order) => {
-        if let Some(ref tag) = message.proxy {
-          if let &Order::AddTlsFront(ref data) = &order {
-            info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
-            data.app_id, data.hostname, data.path_begin, tag);
-          } else {
-            info!("received client order {:?} with tag {:?}", order, tag);
-          }
+        if let &Order::AddTlsFront(ref data) = &order {
+          info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
+          data.app_id, data.hostname, data.path_begin);
+        } else {
+          info!("received client order {:?}", order);
+        }
 
-          self.state.get_mut(tag).map(|st| st.state.handle_order(&order));
+        self.state.handle_order(&order);
 
-          let mut found = false;
-          for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
-            if tag == proxy_tag {
-              if let Some(id) = message.proxy_id {
-                if id != proxy.id {
-                  continue;
-                }
-              }
-
-              if order == Order::SoftStop || order == Order::HardStop {
-                proxy.run_state = RunState::Stopping;
-              }
-
-              proxy.inflight.insert(message.id.clone(), order.clone());
-              let o = order.clone();
-              self.conns[token].add_message_id(message.id.clone());
-              proxy.state.handle_order(&o);
-              proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), order: o });
-              proxy.channel.run();
-              found = true;
+        let mut found = false;
+        for ref mut proxy in self.proxies.values_mut() {
+          if let Some(id) = message.proxy_id {
+            if id != proxy.id {
+              continue;
             }
           }
 
-          if !found {
-            // FIXME: should send back error here
-            error!("no proxy found for tag: {}", tag);
+          if order == Order::SoftStop || order == Order::HardStop {
+            proxy.run_state = RunState::Stopping;
           }
 
-        } else {
+          proxy.inflight.insert(message.id.clone(), order.clone());
+          let o = order.clone();
+          self.conns[token].add_message_id(message.id.clone());
+          //proxy.state.handle_order(&o);
+          proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), order: o });
+          proxy.channel.run();
+          found = true;
+        }
+
+        if !found {
           // FIXME: should send back error here
-          error!("expecting proxy tag");
+          error!("no proxy found");
         }
       }
     }
@@ -285,34 +272,26 @@ impl CommandServer {
               for message in o {
                 if let ConfigCommand::ProxyConfiguration(order) = message.data {
 
-                  if let Some(ref tag) = message.proxy {
-                    self.state.get_mut(tag).map(|st| st.state.handle_order(&order));
+                  self.state.handle_order(&order);
 
-                    if let &Order::AddTlsFront(ref data) = &order {
-                      info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
-                      data.app_id, data.hostname, data.path_begin, tag);
-                    } else {
-                      info!("received {:?} with tag {:?}", order, tag);
-                    }
-                    let mut found = false;
-                    for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
-                      if tag == proxy_tag {
-                        let o = order.clone();
-                        proxy.state.handle_order(&o);
-                        proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), order: o });
-                        proxy.channel.run();
-                        found = true;
-                      }
-                    }
-
-                    if !found {
-                      // FIXME: should send back error here
-                      error!("no proxy found for tag: {}", tag);
-                    }
-
+                  if let &Order::AddTlsFront(ref data) = &order {
+                    info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
+                    data.app_id, data.hostname, data.path_begin);
                   } else {
+                    info!("received {:?}", order);
+                  }
+                  let mut found = false;
+                  for ref mut proxy in self.proxies.values_mut() {
+                    let o = order.clone();
+                    //proxy.state.handle_order(&o);
+                    proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), order: o });
+                    proxy.channel.run();
+                    found = true;
+                  }
+
+                  if !found {
                     // FIXME: should send back error here
-                     error!("expecting proxy tag");
+                    error!("no proxy found");
                   }
                 }
               }
@@ -338,41 +317,33 @@ impl CommandServer {
     //FIXME: too many loops, this could be cleaner
     for message in self.config.generate_config_messages() {
       if let ConfigCommand::ProxyConfiguration(order) = message.data {
-        if let Some(ref tag) = message.proxy {
-          self.state.get_mut(tag).map(|st| st.state.handle_order(&order));
+        self.state.handle_order(&order);
 
-          if let &Order::AddTlsFront(ref data) = &order {
-            info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }}) with tag {:?}",
-            data.app_id, data.hostname, data.path_begin, tag);
-          } else {
-            info!("received {:?} with tag {:?}", order, tag);
-          }
-          let mut found = false;
-          for &mut (ref proxy_tag, ref mut proxy) in self.proxies.values_mut() {
-            if tag == proxy_tag {
-              let o = order.clone();
-              proxy.state.handle_order(&o);
-              proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), order: o });
-              proxy.channel.run();
-              found = true;
-            }
-          }
-
-          if !found {
-            // FIXME: should send back error here
-            error!("no proxy found for tag: {}", tag);
-          }
-
+        if let &Order::AddTlsFront(ref data) = &order {
+          info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
+          data.app_id, data.hostname, data.path_begin);
         } else {
+          info!("received {:?}", order);
+        }
+        let mut found = false;
+        for ref mut proxy in self.proxies.values_mut() {
+          let o = order.clone();
+          //proxy.state.handle_order(&o);
+          proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), order: o });
+          proxy.channel.run();
+          found = true;
+        }
+
+        if !found {
           // FIXME: should send back error here
-          error!("expecting proxy tag");
+          error!("no proxy found");
         }
       }
     }
   }
 
   pub fn disable_cloexec_before_upgrade(&mut self) {
-    for &mut (_, ref mut proxy) in self.proxies.values_mut() {
+    for ref mut proxy in self.proxies.values() {
       if proxy.run_state == RunState::Running {
         let flags = fcntl(proxy.channel.sock.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
         let mut new_flags = FdFlag::from_bits(flags).unwrap();
@@ -388,7 +359,7 @@ impl CommandServer {
   }
 
   pub fn enable_cloexec_after_upgrade(&mut self) {
-    for &mut (_, ref mut proxy) in self.proxies.values_mut() {
+    for ref mut proxy in self.proxies.values() {
       if proxy.run_state == RunState::Running {
         let flags = fcntl(proxy.channel.sock.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
         let mut new_flags = FdFlag::from_bits(flags).unwrap();
@@ -403,23 +374,16 @@ impl CommandServer {
   }
 
   pub fn generate_upgrade_data(&self) -> UpgradeData {
-    let workers: Vec<SerializedWorker> = self.proxies.values().map(|&(_,ref proxy)| SerializedWorker::from_proxy(proxy)).collect();
-    let mut seen = HashSet::new();
-    let mut state: HashMap<String, StoredProxy> = HashMap::new();
-
-    for &(ref tag, ref proxy) in  self.proxies.values() {
-      if !seen.contains(&tag) {
-        seen.insert(tag);
-        state.insert(tag.to_string(), StoredProxy::from_worker(&proxy) );
-      }
-    }
+    let workers: Vec<SerializedWorker> = self.proxies.values().map(|ref proxy| SerializedWorker::from_proxy(proxy)).collect();
+    //FIXME: ensure there's at least one worker
+    let state = self.state.clone();
 
     UpgradeData {
       command:     self.sock.as_raw_fd(),
       config:      self.config.clone(),
       workers:     workers,
       state:       state,
-      next_ids:    self.next_ids.clone(),
+      next_id:     self.next_id,
       token_count: self.token_count,
     }
   }
@@ -431,7 +395,7 @@ impl CommandServer {
       config,
       workers,
       state,
-      next_ids,
+      next_id,
       token_count,
     } = upgrade_data;
 
@@ -443,40 +407,29 @@ impl CommandServer {
     let buffer_size     = config.command_buffer_size.unwrap_or(10000);
     let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
 
-    let workers: HashMap<Token, (String, Worker)> = workers.iter().filter_map(|serialized| {
+    let workers: HashMap<Token, Worker> = workers.iter().filter_map(|serialized| {
       let stream = unsafe { UnixStream::from_raw_fd(serialized.fd) };
       if let Some(token) = serialized.token {
         info!("registering: {:?}", poll.register(&stream, Token(token), Ready::all(), PollOpt::edge()));
-        let worker_state = state.get(&serialized.tag).map(|ser| ser.state.clone()).expect("worker state should be there");
+        let worker_state = state.clone();
         Some(
           (
             Token(token),
-            (serialized.tag.clone(), Worker {
-              tag:        serialized.tag.clone(),
+            Worker {
               id:         serialized.id,
-              proxy_type: serialized.proxy_type,
               channel:    Channel::new(stream, buffer_size, buffer_size * 2),
               token:      Some(Token(token)),
               pid:        serialized.pid,
               run_state:  serialized.run_state.clone(),
-              state:      worker_state,
               //FIXME: transmit those as well?
               inflight:   HashMap::new()
-            })
+            }
           )
         )
       } else { None }
     }).collect();
 
-    let config_state: HashMap<String, StoredProxy> = state.values().map(|st| {
-      (st.tag.to_string(),
-        StoredProxy {
-          tag:        st.tag.to_string(),
-          proxy_type: st.proxy_type,
-          state:      st.state.clone()
-        }
-      )
-    }).collect();
+    let config_state = state.clone();
 
     let mut timer = timer::Timer::default();
     timer.set_timeout(Duration::from_millis(700), Token(0));
@@ -491,7 +444,7 @@ impl CommandServer {
       //FIXME: deserialize client connections as well, otherwise they might leak?
       conns:           Slab::with_capacity(128),
       proxies:         workers,
-      next_ids:        next_ids,
+      next_id:         next_id,
       state:           config_state,
       token_count:     token_count,
     }

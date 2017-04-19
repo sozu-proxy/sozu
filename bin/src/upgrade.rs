@@ -9,11 +9,12 @@ use nix::unistd::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 
 use sozu::channel::Channel;
-use sozu_command::data::{ProxyType,RunState};
 use sozu_command::config::Config;
+use sozu_command::state::ConfigState;
+use sozu_command::data::{ProxyType,RunState};
 
 use logging;
-use command::{CommandServer,StoredProxy,Worker};
+use command::{CommandServer,Worker};
 use worker::get_executable_path;
 
 #[derive(Deserialize,Serialize,Debug)]
@@ -21,8 +22,6 @@ pub struct SerializedWorker {
   pub fd:         i32,
   pub pid:        i32,
   pub id:         u32,
-  pub tag:        String,
-  pub proxy_type: ProxyType,
   pub run_state:  RunState,
   pub token:      Option<usize>,
 }
@@ -33,8 +32,6 @@ impl SerializedWorker {
       fd:         proxy.channel.sock.as_raw_fd(),
       pid:        proxy.pid,
       id:         proxy.id,
-      tag:        proxy.tag.clone(),
-      proxy_type: proxy.proxy_type.clone(),
       run_state:  proxy.run_state.clone(),
       token:      proxy.token.clone().map(|Token(t)| t),
     }
@@ -47,8 +44,8 @@ pub struct UpgradeData {
   //clients: ????
   pub config:      Config,
   pub workers:     Vec<SerializedWorker>,
-  pub state:       HashMap<String, StoredProxy>,
-  pub next_ids:    HashMap<String,u32>,
+  pub state:       ConfigState,
+  pub next_id:     u32,
   pub token_count: usize,
 }
 

@@ -1,4 +1,5 @@
 use mio_uds::UnixStream;
+use mio::Poll;
 use libc::{self,c_char,uint32_t,int32_t,pid_t};
 use std::io;
 use std::ffi::CString;
@@ -10,80 +11,30 @@ use std::os::unix::io::{AsRawFd,FromRawFd};
 use nix::unistd::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 
-use sozu::network::{ProxyOrder,ServerMessage,http,tls};
 use sozu::channel::Channel;
+use sozu::network::proxy::Server;
+use sozu::network::session::Session;
+use sozu::network::{ProxyOrder,ServerMessage,http,tls};
 use sozu_command::data::ProxyType;
-use sozu_command::config::ProxyConfig;
+use sozu_command::config::{Config,ProxyConfig};
 
 use logging;
 use command::Worker;
 
-pub fn start_workers(tag: &str, ls: &ProxyConfig) -> Option<Vec<Worker>> {
-  match ls.proxy_type {
-    ProxyType::HTTP => {
-      //FIXME: make safer
-      if ls.to_http().is_some() {
-        let mut http_proxies = Vec::new();
-        for index in 1..ls.worker_count.unwrap_or(1) {
-          let (pid, command) = start_worker_process(ls, tag, &index.to_string());
-          let l =  Worker::new(tag.to_string(), index as u32, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
-          http_proxies.push(l);
-        }
-
-        let (pid, command) = start_worker_process(ls, tag, &0.to_string());
-        let l =  Worker::new(tag.to_string(), 0, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
-        http_proxies.push(l);
-
-        Some(http_proxies)
-      } else {
-        None
-      }
-    },
-    ProxyType::HTTPS => {
-      if ls.to_tls().is_some() {
-        let mut tls_proxies = Vec::new();
-        for index in 1..ls.worker_count.unwrap_or(1) {
-          let (pid, command) = start_worker_process(ls, tag, &index.to_string());
-          let l =  Worker::new(tag.to_string(), index as u32, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
-          tls_proxies.push(l);
-        }
-
-        let (pid, command) = start_worker_process(ls, tag, &0.to_string());
-        let l =  Worker::new(tag.to_string(), 0, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
-        tls_proxies.push(l);
-
-        Some(tls_proxies)
-      } else {
-        None
-      }
-    },
-    _ => unimplemented!()
+pub fn start_workers(config: &Config) -> Vec<Worker> {
+  let mut workers = Vec::new();
+  for index in 0..config.worker_count.unwrap_or(1) {
+    let (pid, command) = start_worker_process(&index.to_string(), config);
+    let w =  Worker::new(index as u32, pid, command, config);
+    workers.push(w);
   }
+  workers
 }
 
-pub fn start_worker(tag: &str, ls: &ProxyConfig, id: u32) -> Option<Worker> {
-  match ls.proxy_type {
-    ProxyType::HTTP => {
-      if ls.to_http().is_some() {
-        let (pid, command) = start_worker_process(ls, tag, &id.to_string());
-        let worker = Worker::new(tag.to_string(), id, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
-        Some(worker)
-      } else {
-        None
-      }
-    },
-    ProxyType::HTTPS => {
-      if ls.to_tls().is_some() {
-        let (pid, command) = start_worker_process(ls, tag, &id.to_string());
-        let worker =  Worker::new(tag.to_string(), id, pid, ls.proxy_type, ls.address.clone(), ls.port, command);
-
-        Some(worker)
-      } else {
-        None
-      }
-    },
-    _ => unimplemented!()
-  }
+pub fn start_worker(id: u32, config: &Config) -> Option<Worker> {
+  let (pid, command) = start_worker_process(&id.to_string(), config);
+  let w =  Worker::new(id, pid, command, config);
+  Some(w)
 }
 
 fn generate_channels() -> io::Result<(Channel<ProxyOrder,ServerMessage>, Channel<ServerMessage,ProxyOrder>)> {
@@ -94,8 +45,8 @@ fn generate_channels() -> io::Result<(Channel<ProxyOrder,ServerMessage>, Channel
   Ok((command_channel, proxy_channel))
 }
 
-pub fn begin_worker_process(fd: i32, id: &str, tag: &str, channel_buffer_size: usize) {
-  let mut command: Channel<ServerMessage,ProxyConfig> = Channel::new(
+pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
+  let mut command: Channel<ServerMessage,Config> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
     channel_buffer_size,
     channel_buffer_size * 2
@@ -106,27 +57,38 @@ pub fn begin_worker_process(fd: i32, id: &str, tag: &str, channel_buffer_size: u
   let proxy_config = command.read_message().expect("worker could not read configuration from socket");
   //println!("got message: {:?}", proxy_config);
 
-  logging::setup(format!("{}-{}", tag, id), &proxy_config.log_level, &proxy_config.log_target);
+  logging::setup(format!("{}-{}", "TAG", id), &proxy_config.log_level, &proxy_config.log_target);
 
   command.set_nonblocking(true);
   let command: Channel<ServerMessage,ProxyOrder> = command.into();
 
-  match proxy_config.proxy_type {
-    ProxyType::HTTP => {
-      if let Some(config) = proxy_config.to_http() {
-        http::start(config, command);
-      }
-    },
-    ProxyType::HTTPS => {
-      if let Some(config) = proxy_config.to_tls() {
-        tls::start(config, command);
-      }
-    },
-    _ => unimplemented!()
-  }
+
+  let mut event_loop  = Poll::new().expect("could not create event loop");
+
+  let http_session = proxy_config.http.and_then(|conf| conf.to_http()).and_then(|http_conf| {
+    let max_connections = http_conf.max_connections;
+    let max_listeners = 1;
+    http::ServerConfiguration::new(http_conf, &mut event_loop, 1 + max_listeners).map(|configuration| {
+      Session::new(1, max_connections, 0, configuration, &mut event_loop)
+    }).ok()
+  });
+
+  let https_session = proxy_config.https.and_then(|conf| conf.to_tls()).and_then(|https_conf| {
+    let max_connections = https_conf.max_connections;
+    let max_listeners   = 1;
+    tls::ServerConfiguration::new(https_conf, 6148914691236517205, &mut event_loop, 1 + max_listeners).map(|configuration| {
+      Session::new(max_listeners, max_connections, 6148914691236517205, configuration, &mut event_loop)
+    }).ok()
+  });
+  //TODO: implement for TCP
+
+  let mut server = Server::new(event_loop, command, http_session, https_session, None);
+  info!("starting event loop");
+  server.run();
+  info!("ending event loop");
 }
 
-pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t, Channel<ProxyOrder,ServerMessage>) {
+pub fn start_worker_process(id: &str, config: &Config) -> (pid_t, Channel<ProxyOrder,ServerMessage>) {
   trace!("parent({})", unsafe { libc::getpid() });
 
   let (server, client) = UnixStream::pair().unwrap();
@@ -142,7 +104,7 @@ pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t
   let channel_buffer_size = config.channel_buffer_size.unwrap_or(10000);
   let channel_max_buffer_size = channel_buffer_size * 2;
 
-  let mut command: Channel<ProxyConfig,ServerMessage> = Channel::new(
+  let mut command: Channel<Config,ServerMessage> = Channel::new(
     server,
     channel_buffer_size,
     channel_max_buffer_size
@@ -168,8 +130,6 @@ pub fn start_worker_process(config: &ProxyConfig, tag: &str, id: &str) -> (pid_t
         .arg("worker")
         .arg("--fd")
         .arg(client.as_raw_fd().to_string())
-        .arg("--tag")
-        .arg(tag)
         .arg("--id")
         .arg(id)
         .arg("--channel-buffer-size")

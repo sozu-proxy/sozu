@@ -21,19 +21,15 @@ pub struct ProxyConfig {
   pub port:                      u16,
   pub max_connections:           usize,
   pub buffer_size:               usize,
-  pub channel_buffer_size:       Option<usize>,
   pub answer_404:                Option<String>,
   pub answer_503:                Option<String>,
-  pub tls_versions:              Option<Vec<String>>,
   pub cipher_list:               Option<String>,
-  pub worker_count:              Option<u16>,
   pub default_name:              Option<String>,
   pub default_app_id:            Option<String>,
   pub default_certificate:       Option<String>,
   pub default_certificate_chain: Option<String>,
   pub default_key:               Option<String>,
-  pub log_level:                 Option<String>,
-  pub log_target:                Option<String>,
+  pub tls_versions:              Option<Vec<String>>,
 }
 
 impl ProxyConfig {
@@ -191,7 +187,6 @@ pub struct AppConfig {
   pub certificate:       Option<String>,
   pub key:               Option<String>,
   pub certificate_chain: Option<String>,
-  pub frontends:         Vec<String>,
   pub backends:          Vec<String>,
 }
 
@@ -200,11 +195,14 @@ pub struct Config {
   pub command_socket:          String,
   pub command_buffer_size:     Option<usize>,
   pub max_command_buffer_size: Option<usize>,
+  pub channel_buffer_size:     Option<usize>,
   pub saved_state:             Option<String>,
-  pub metrics:                 MetricsConfig,
-  pub proxies:                 HashMap<String, ProxyConfig>,
   pub log_level:               Option<String>,
   pub log_target:              Option<String>,
+  pub worker_count:            Option<u16>,
+  pub metrics:                 MetricsConfig,
+  pub http:                    Option<ProxyConfig>,
+  pub https:                   Option<ProxyConfig>,
   pub applications:            HashMap<String, AppConfig>,
 }
 
@@ -213,17 +211,7 @@ impl Config {
     let data = try!(Config::load_file(path));
 
     match toml::from_str(&data) {
-      Ok(config) => {
-          let mut c: Config = config;
-          let log_level:  Option<String> = c.log_level.clone();
-          let log_target: Option<String> = c.log_target.clone();
-
-          for ref mut proxy in c.proxies.values_mut() {
-            proxy.log_level  = log_level.clone();
-            proxy.log_target = log_target.clone();
-          };
-          Ok(c)
-      },
+      Ok(config) => Ok(config),
       Err(e)     => {
         println!("decoding error: {:?}", e);
         Err(Error::new(
@@ -239,113 +227,100 @@ impl Config {
     let mut count = 0u8;
     for (ref id, ref app) in &self.applications {
 
-      for tag in &app.frontends {
-        let path_begin = app.path_begin.as_ref().unwrap_or(&String::new()).clone();
+      let path_begin = app.path_begin.as_ref().unwrap_or(&String::new()).clone();
 
-        //FIXME: TCP should be handled as well
-        if let Some(ref proxy) = self.proxies.get(tag).as_ref() {
-          if proxy.proxy_type == ProxyType::HTTPS {
-            let key_opt         = app.key.as_ref().and_then(|path| Config::load_file(&path).ok());
-            let certificate_opt = app.certificate.as_ref().and_then(|path| Config::load_file(&path).ok());
-            let chain_opt       = app.certificate_chain.as_ref().and_then(|path| Config::load_file(&path).ok())
-              .map(Config::split_certificate_chain);
+      //FIXME: TCP should be handled as well
+      let key_opt         = app.key.as_ref().and_then(|path| Config::load_file(&path).ok());
+      let certificate_opt = app.certificate.as_ref().and_then(|path| Config::load_file(&path).ok());
+      let chain_opt       = app.certificate_chain.as_ref().and_then(|path| Config::load_file(&path).ok())
+        .map(Config::split_certificate_chain);
 
-            if key_opt.is_none() {
-              error!("cannot read the key at {:?}", app.key);
-              continue;
-            }
-            if certificate_opt.is_none() {
-              error!("cannot read the certificate at {:?}", app.certificate);
-              continue;
-            }
-            if chain_opt.is_none() {
-              error!("cannot read the certificate chain at {:?}", app.certificate_chain);
-              continue;
-            }
-            let certificate = certificate_opt.unwrap();
-            let fingerprint = match X509::from_pem(&certificate.as_bytes()[..]).and_then(|cert| cert.fingerprint(MessageDigest::sha256())) {
-              Ok(f)  => f,
-              Err(e) => {
-                error!("cannot obtain the certificate's fingerprint: {:?}", e);
-                continue;
-              }
-            };
+      if key_opt.is_none() && certificate_opt.is_none() && chain_opt.is_none() {
+        let order = Order::AddHttpFront(HttpFront {
+          app_id:     id.to_string(),
+          hostname:   app.hostname.clone(),
+          path_begin: path_begin,
+        });
+        v.push(ConfigMessage {
+          id:       format!("CONFIG-{}", count),
+          version:  PROTOCOL_VERSION,
+          proxy_id: None,
+          data:     ConfigCommand::ProxyConfiguration(order),
+        });
+        count += 1;
+      } else {
 
-            let certificate_order = Order::AddCertificate(CertificateAndKey {
-              key:               key_opt.unwrap(),
-              certificate:       certificate,
-              certificate_chain: chain_opt.unwrap(),
-            });
-            v.push(ConfigMessage {
-              id:       format!("CONFIG-{}", count),
-              version:  PROTOCOL_VERSION,
-              proxy:    Some(tag.clone()),
-              proxy_id: None,
-              data:     ConfigCommand::ProxyConfiguration(certificate_order),
-            });
-            count += 1;
-            let front_order = Order::AddTlsFront(TlsFront {
-              app_id:      id.to_string(),
-              hostname:    app.hostname.clone(),
-              path_begin:  path_begin,
-              fingerprint: fingerprint,
-            });
-            v.push(ConfigMessage {
-              id:       format!("CONFIG-{}", count),
-              version:  PROTOCOL_VERSION,
-              proxy:    Some(tag.clone()),
-              proxy_id: None,
-              data:     ConfigCommand::ProxyConfiguration(front_order),
-            });
-            count += 1;
-          } else {
-            let order = Order::AddHttpFront(HttpFront {
-              app_id:     id.to_string(),
-              hostname:   app.hostname.clone(),
-              path_begin: path_begin,
-            });
-            v.push(ConfigMessage {
-              id:       format!("CONFIG-{}", count),
-              version:  PROTOCOL_VERSION,
-              proxy:    Some(tag.clone()),
-              proxy_id: None,
-              data:     ConfigCommand::ProxyConfiguration(order),
-            });
-            count += 1;
-          };
-
-
-        } else {
-          error!("invalid proxy name: {}", tag);
+        if key_opt.is_none() {
+          error!("cannot read the key at {:?}", app.key);
           continue;
         }
-
-
-        for address_str in app.backends.iter() {
-          if let Ok(address_list) = address_str.to_socket_addrs() {
-            for address in address_list {
-              let ip   = format!("{}", address.ip());
-              let port = address.port();
-
-              let backend_order = Order::AddInstance(Instance {
-                app_id:     id.to_string(),
-                ip_address: ip,
-                port:       port
-              });
-
-              v.push(ConfigMessage {
-                id:       format!("CONFIG-{}", count),
-                version:  PROTOCOL_VERSION,
-                proxy:    Some(tag.clone()),
-                proxy_id: None,
-                data:     ConfigCommand::ProxyConfiguration(backend_order),
-              });
-
-              count += 1;
-            }
-          } else {
-            error!("could not parse address: {}", address_str);
+        if certificate_opt.is_none() {
+          error!("cannot read the certificate at {:?}", app.certificate);
+          continue;
+        }
+        if chain_opt.is_none() {
+          error!("cannot read the certificate chain at {:?}", app.certificate_chain);
+          continue;
+        }
+        let certificate = certificate_opt.unwrap();
+        let fingerprint = match X509::from_pem(&certificate.as_bytes()[..]).and_then(|cert| cert.fingerprint(MessageDigest::sha256())) {
+          Ok(f)  => f,
+          Err(e) => {
+            error!("cannot obtain the certificate's fingerprint: {:?}", e);
+            continue;
           }
+        };
+
+        let certificate_order = Order::AddCertificate(CertificateAndKey {
+          key:               key_opt.unwrap(),
+          certificate:       certificate,
+          certificate_chain: chain_opt.unwrap(),
+        });
+        v.push(ConfigMessage {
+          id:       format!("CONFIG-{}", count),
+          version:  PROTOCOL_VERSION,
+          proxy_id: None,
+          data:     ConfigCommand::ProxyConfiguration(certificate_order),
+        });
+        count += 1;
+        let front_order = Order::AddTlsFront(TlsFront {
+          app_id:      id.to_string(),
+          hostname:    app.hostname.clone(),
+          path_begin:  path_begin,
+          fingerprint: fingerprint,
+        });
+        v.push(ConfigMessage {
+          id:       format!("CONFIG-{}", count),
+          version:  PROTOCOL_VERSION,
+          proxy_id: None,
+          data:     ConfigCommand::ProxyConfiguration(front_order),
+        });
+        count += 1;
+      }
+
+      for address_str in app.backends.iter() {
+        if let Ok(address_list) = address_str.to_socket_addrs() {
+          for address in address_list {
+            let ip   = format!("{}", address.ip());
+            let port = address.port();
+
+            let backend_order = Order::AddInstance(Instance {
+              app_id:     id.to_string(),
+              ip_address: ip,
+              port:       port
+            });
+
+            v.push(ConfigMessage {
+              id:       format!("CONFIG-{}", count),
+              version:  PROTOCOL_VERSION,
+              proxy_id: None,
+              data:     ConfigCommand::ProxyConfiguration(backend_order),
+            });
+
+            count += 1;
+          }
+        } else {
+          error!("could not parse address: {}", address_str);
         }
       }
     }
@@ -386,52 +361,47 @@ mod tests {
 
   #[test]
   fn serialize() {
-    let mut map = HashMap::new();
-    map.insert(String::from("HTTP"), ProxyConfig {
+    let http = ProxyConfig {
       proxy_type: ProxyType::HTTP,
       address: String::from("127.0.0.1"),
       port: 8080,
       max_connections: 500,
       buffer_size: 16384,
-      channel_buffer_size: Some(10000),
       answer_404: Some(String::from("404.html")),
       answer_503: None,
       public_address: None,
       tls_versions: None,
       cipher_list: None,
-      worker_count: None,
       default_app_id: None,
       default_certificate: None,
       default_certificate_chain: None,
       default_key: None,
       default_name: None,
-      log_level:    None,
-      log_target:   None,
-    });
-    map.insert(String::from("TLS"), ProxyConfig {
+    };
+    println!("http: {:?}", to_string(&http));
+    let https = ProxyConfig {
       proxy_type: ProxyType::HTTPS,
       address: String::from("127.0.0.1"),
       port: 8080,
       max_connections: 500,
       buffer_size: 16384,
-      channel_buffer_size: Some(10000),
       answer_404: Some(String::from("404.html")),
       answer_503: None,
       public_address: None,
       tls_versions: None,
       cipher_list: None,
-      worker_count: None,
       default_app_id: None,
       default_certificate: None,
       default_certificate_chain: None,
       default_key: None,
       default_name: None,
-      log_level:    None,
-      log_target:   None,
-    });
+    };
+    println!("https: {:?}", to_string(&https));
     let config = Config {
       command_socket: String::from("./command_folder/sock"),
       saved_state: None,
+      worker_count: Some(2),
+      channel_buffer_size: Some(10000),
       command_buffer_size: None,
       max_command_buffer_size: None,
       log_level:  None,
@@ -440,10 +410,12 @@ mod tests {
         address: String::from("192.168.59.103"),
         port:    8125,
       },
-      proxies: map,
-      applications: HashMap::new()
+      http:  Some(http),
+      https: Some(https),
+      applications: HashMap::new(),
     };
 
+    println!("config: {:?}", to_string(&config));
     let encoded = to_string(&config).unwrap();
     println!("conf:\n{}", encoded);
   }

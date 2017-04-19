@@ -48,8 +48,6 @@ fn main() {
                                         .required(true)))
                         .subcommand(SubCommand::with_name("worker")
                                     .about("start a worker (internal command, should not be used directly)")
-                                    .arg(Arg::with_name("tag").long("tag")
-                                         .takes_value(true).required(true).help("worker configuration tag"))
                                     .arg(Arg::with_name("id").long("id")
                                          .takes_value(true).required(true).help("worker identifier"))
                                     .arg(Arg::with_name("fd").long("fd")
@@ -68,12 +66,11 @@ fn main() {
     let fd  = matches.value_of("fd").expect("needs a file descriptor")
       .parse::<i32>().expect("the file descriptor must be a number");
     let id  = matches.value_of("id").expect("needs a worker id");
-    let tag = matches.value_of("tag").expect("needs a configuration tag");
     let buffer_size = matches.value_of("channel-buffer-size")
       .and_then(|size| size.parse::<usize>().ok())
       .unwrap_or(10000);
 
-    begin_worker_process(fd, id, tag, buffer_size);
+    begin_worker_process(fd, id, buffer_size);
     return;
   }
 
@@ -101,16 +98,10 @@ fn main() {
     METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
     let metrics_guard = ProxyMetrics::run();
 
-    let mut proxies:HashMap<String,Vec<Worker>> = HashMap::new();
-
     if check_process_limits(&config) {
-      for (ref tag, ref ls) in &config.proxies {
-        if let Some(workers) = start_workers(&tag, ls) {
-          proxies.insert(tag.to_string(), workers);
-        }
-      };
-      info!("created proxies: {:?}", proxies);
-      command::start(config, proxies);
+      let workers: Vec<Worker> = start_workers(&config);
+      info!("created workers: {:?}", workers);
+      command::start(config, workers);
     }
 
     info!("master process stopped");
