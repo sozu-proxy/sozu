@@ -705,7 +705,7 @@ pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel) {
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
   if let Ok(configuration) = ServerConfiguration::new(config, &mut event_loop, 1 + max_listeners) {
     let mut session = Session::new(max_listeners, max_connections, 0, configuration, &mut event_loop);
-    let mut server: Server<Client> = Server::new(max_listeners, max_connections, event_loop, channel, Some(session), None, None);
+    let mut server  = Server::new(event_loop, channel, Some(session), None, None);
 
     info!("starting event loop");
     server.run();

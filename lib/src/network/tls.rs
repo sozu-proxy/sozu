@@ -1040,7 +1040,7 @@ pub fn start(config: TlsProxyConfiguration, channel: ProxyChannel) {
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
   if let Ok(configuration) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop, 1 + max_listeners) {
     let mut session = Session::new(max_listeners, max_connections, 6148914691236517205, configuration, &mut event_loop);
-    let mut server: Server<TlsClient> = Server::new(max_listeners, max_connections, event_loop, channel, None, Some(session), None);
+    let mut server  = Server::new(event_loop, channel, None, Some(session), None);
 
     info!("starting event loop");
     server.run();

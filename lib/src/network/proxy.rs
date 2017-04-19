@@ -40,11 +40,7 @@ enum ProxyType {
   TCP,
 }
 
-pub struct Server<Client> {
-  clients:         Slab<Client,FrontToken>,
-  backend:         Slab<FrontToken,BackToken>,
-  max_listeners:   usize,
-  max_connections: usize,
+pub struct Server {
   pub poll:        Poll,
   timer:           Timer<Token>,
   shutting_down:   Option<MessageId>,
@@ -56,9 +52,10 @@ pub struct Server<Client> {
   tcp:             Option<Session<tcp::ServerConfiguration, tcp::Client>>,
 }
 
-impl<Client:ProxyClient> Server<Client> {
-  pub fn new(max_listeners: usize, max_connections: usize, poll: Poll, channel: ProxyChannel,
-    http: Option<Session<http::ServerConfiguration, http::Client>>, https: Option<Session<tls::ServerConfiguration, tls::TlsClient>>,
+impl Server {
+  pub fn new(poll: Poll, channel: ProxyChannel,
+    http: Option<Session<http::ServerConfiguration, http::Client>>,
+    https: Option<Session<tls::ServerConfiguration, tls::TlsClient>>,
     tcp: Option<Session<tcp::ServerConfiguration, tcp::Client>>) -> Self {
     poll.register(
       &channel,
@@ -67,17 +64,11 @@ impl<Client:ProxyClient> Server<Client> {
       PollOpt::edge()
     ).expect("should register the channel");
 
-    let clients = Slab::with_capacity(max_connections);
-    let backend = Slab::with_capacity(max_connections);
     //let timer   = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
     let timer   = Timer::default();
     //FIXME: registering the timer makes the timer thread spin too much
     //poll.register(&timer, Token(1), Ready::readable(), PollOpt::edge()).expect("should register the timer");
     Server {
-      clients:         clients,
-      backend:         backend,
-      max_listeners:   max_listeners,
-      max_connections: max_connections,
       poll:            poll,
       timer:           timer,
       shutting_down:   None,
@@ -89,28 +80,12 @@ impl<Client:ProxyClient> Server<Client> {
       tcp:             tcp,
     }
   }
-
-  pub fn to_front(&self, token: Token) -> FrontToken {
-    FrontToken(token.0 - 2 - self.max_listeners)
-  }
-
-  pub fn to_back(&self, token: Token) -> BackToken {
-    BackToken(token.0 - 2 - self.max_listeners - self.max_connections)
-  }
-
-  pub fn from_front(&self, token: FrontToken) -> Token {
-    Token(token.0 + 2 + self.max_listeners )
-  }
-
-  pub fn from_back(&self, token: BackToken) -> Token {
-    Token(token.0 + 2 + self.max_listeners + self.max_connections)
-  }
 }
 
 //type Timeout = usize;
 type Message = ProxyOrder;
 
-impl<Client:ProxyClient> Server<Client> {
+impl Server {
   pub fn run(&mut self) {
     //FIXME: make those parameters configurable?
     let mut events = Events::with_capacity(1024);
@@ -203,7 +178,7 @@ impl<Client:ProxyClient> Server<Client> {
         self.timeout(token);
       }
 
-      if self.shutting_down.is_some() && self.clients.len() == 0 {
+      if self.shutting_down.is_some() {
         info!("last client stopped, shutting down!");
         self.channel.write_message(&ServerMessage{ id: self.shutting_down.take().expect("should have shut down correctly"), status: ServerMessageStatus::Ok});
         self.channel.run();

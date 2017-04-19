@@ -582,7 +582,7 @@ pub fn start_example() -> Channel<ProxyOrder,ServerMessage> {
     let mut poll = Poll::new().expect("could not create event loop");
     let configuration = ServerConfiguration::new(10, 12297829382473034410);
     let session = Session::new(10, 500, 12297829382473034410, configuration, &mut poll);
-    let mut s: Server<Client> = Server::new(10, 500, poll, channel, None, None, Some(session));
+    let mut s   = Server::new(poll, channel, None, None, Some(session));
     info!("will run");
     s.run();
     info!("ending event loop");
@@ -620,10 +620,10 @@ pub fn start_example() -> Channel<ProxyOrder,ServerMessage> {
 }
 
 pub fn start(max_listeners: usize, max_connections: usize, channel: ProxyChannel) {
-  let mut poll                   = Poll::new().expect("could not create event loop");
-  let configuration              = ServerConfiguration::new(max_listeners, 12297829382473034410);
-  let session                    = Session::new(max_listeners, max_connections, 12297829382473034410, configuration, &mut poll);
-  let mut server: Server<Client> = Server::new(max_listeners, max_connections, poll, channel, None, None, Some(session));
+  let mut poll          = Poll::new().expect("could not create event loop");
+  let configuration     = ServerConfiguration::new(max_listeners, 12297829382473034410);
+  let session           = Session::new(max_listeners, max_connections, 12297829382473034410, configuration, &mut poll);
+  let mut server        = Server::new(poll, channel, None, None, Some(session));
   let front: SocketAddr = FromStr::from_str("127.0.0.1:8443").expect("could not parse address");
 
   info!("starting event loop");
