@@ -16,7 +16,7 @@ serde = "^0.9.13"
 serde_json = "^0.9.9"
 serde_derive = "^0.9.13"
 openssl = "^0.9.5"
-sozu-lib = "^0.1"
+sozu-lib = { version = "^0.1", path = "../lib" }
 
 [dependencies.toml]
 version = "^0.3"

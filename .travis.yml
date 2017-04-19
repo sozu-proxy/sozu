@@ -16,7 +16,6 @@ before_install:
 
 before_script:
   - pip install 'travis-cargo<0.2' --user && export PATH=$HOME/.local/bin:$PATH
-  - sed -e '/^sozu-lib/s/=.*$/= {path="..\/lib"}/' -e '/^sozu-command-lib/s/=.*$/= {path="..\/command"}/' -i $ROOT_PATH/*/Cargo.toml
 
 script:
   - cd $ROOT_PATH/lib     && travis-cargo --only nightly test
