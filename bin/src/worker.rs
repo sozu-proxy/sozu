@@ -76,7 +76,7 @@ pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
   let https_session = proxy_config.https.and_then(|conf| conf.to_tls()).and_then(|https_conf| {
     let max_connections = https_conf.max_connections;
     let max_listeners   = 1;
-    tls::ServerConfiguration::new(https_conf, 6148914691236517205, &mut event_loop, 1 + max_listeners).map(|configuration| {
+    tls::ServerConfiguration::new(https_conf, 6148914691236517205, &mut event_loop, 1 + max_listeners + 6148914691236517205).map(|configuration| {
       Session::new(max_listeners, max_connections, 6148914691236517205, configuration, &mut event_loop)
     }).ok()
   });
