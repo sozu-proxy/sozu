@@ -31,7 +31,7 @@ To start the reverse proxy:
 
 ```
 cd bin;
-./target/debug/sozu start -c config.toml
+../target/debug/sozu start -c config.toml
 ```
 
 You can edit the reverse proxy's configuration with the `config.toml` file. You can declare
