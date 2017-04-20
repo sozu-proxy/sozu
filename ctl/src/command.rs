@@ -18,7 +18,6 @@ pub fn save_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
     id.clone(),
     ConfigCommand::SaveState(path.to_string()),
     None,
-    None,
   ));
 
   match channel.read_message() {
@@ -50,7 +49,6 @@ pub fn load_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
   channel.write_message(&ConfigMessage::new(
     id.clone(),
     ConfigCommand::LoadState(path.to_string()),
-    None,
     None,
   ));
 
@@ -84,7 +82,6 @@ pub fn dump_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
     id.clone(),
     ConfigCommand::DumpState,
     None,
-    None,
   ));
 
   match channel.read_message() {
@@ -112,43 +109,33 @@ pub fn dump_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
 }
 
 pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config: &Config) {
-  let mut tags: HashMap<String,String> = HashMap::from_iter(config.proxies.keys().map(|tag| {
-    println!("shutting down proxy \"{}\"", tag);
-    let id = generate_id();
-    channel.write_message(&ConfigMessage::new(
-      id.clone(),
-      ConfigCommand::ProxyConfiguration(Order::SoftStop),
-      Some(tag.clone()),
-      //FIXME: we should be able to soft stop one specific worker
-      None,
-    ));
-    (id, tag.clone())
-  }));
+  println!("shutting down proxy");
+  let id = generate_id();
+  channel.write_message(&ConfigMessage::new(
+    id.clone(),
+    ConfigCommand::ProxyConfiguration(Order::SoftStop),
+    //FIXME: we should be able to soft stop one specific worker
+    None,
+  ));
 
   loop {
-    if tags.is_empty() {
-      println!("all proxies shut down");
-      break;
-    }
-
     match channel.read_message() {
       None          => println!("the proxy didn't answer"),
       Some(message) => {
-        if !tags.contains_key(&message.id) {
+        if &id != &message.id {
           println!("received message with invalid id: {:?}", message);
           return;
         }
         match message.status {
           ConfigMessageStatus::Processing => {
-            tags.get(&message.id).map(|tag| println!("Proxy {} is processing: {}", tag, message.message));
+            println!("Proxy is processing: {}", message.message);
           },
           ConfigMessageStatus::Error => {
             println!("could not stop the proxy: {}", message.message);
           },
           ConfigMessageStatus::Ok => {
-            if let Some(tag) = tags.remove(&message.id) {
-              println!("Proxy {} shut down: {}", tag, message.message);
-            }
+            println!("Proxy shut down: {}", message.message);
+            break;
           }
         }
       }
@@ -157,43 +144,30 @@ pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, confi
 }
 
 pub fn hard_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config: &Config) {
-  let mut tags: HashMap<String,String> = HashMap::from_iter(config.proxies.keys().map(|tag| {
-    println!("shutting down proxy \"{}\"", tag);
-    let id = generate_id();
-    channel.write_message(&ConfigMessage::new(
-      id.clone(),
-      ConfigCommand::ProxyConfiguration(Order::HardStop),
-      Some(tag.clone()),
-      //FIXME: we should be able to soft stop one specific worker
-      None,
-    ));
-    (id, tag.clone())
-  }));
-
+  println!("shutting down proxy");
+  let id = generate_id();
+  channel.write_message(&ConfigMessage::new(
+    id.clone(),
+    ConfigCommand::ProxyConfiguration(Order::HardStop),
+    //FIXME: we should be able to soft stop one specific worker
+    None,
+  ));
 
   loop {
-    if tags.is_empty() {
-      println!("all proxies shut down");
-      break;
-    }
-
     match channel.read_message() {
       None          => println!("the proxy didn't answer"),
       Some(message) => {
-        if !tags.contains_key(&message.id) {
-          println!("received message with invalid id: {:?}", message);
-          return;
-        }
         match message.status {
           ConfigMessageStatus::Processing => {
-            tags.get(&message.id).map(|tag| println!("Proxy {} is processing: {}", tag, message.message));
+            println!("Proxy is processing: {}", message.message);
           },
           ConfigMessageStatus::Error => {
             println!("could not stop the proxy: {}", message.message);
           },
           ConfigMessageStatus::Ok => {
-            if let Some(tag) = tags.remove(&message.id) {
-              println!("Proxy {} shut down: {}", tag, message.message);
+            if &id == &message.id {
+              println!("Proxy shut down: {}", message.message);
+              break;
             }
           }
         }
@@ -207,7 +181,6 @@ pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config:
   channel.write_message(&ConfigMessage::new(
     id.clone(),
     ConfigCommand::ListWorkers,
-    None,
     None,
   ));
 
@@ -237,8 +210,7 @@ pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config:
               let id = generate_id();
               let msg = ConfigMessage::new(
                 id.clone(),
-                ConfigCommand::LaunchWorker(worker.tag.to_string()),
-                None,
+                ConfigCommand::LaunchWorker("BLAH".to_string()),
                 None,
               );
               println!("sending message: {:?}", msg);
@@ -251,7 +223,6 @@ pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config:
               let msg = ConfigMessage::new(
                 id.clone(),
                 ConfigCommand::ProxyConfiguration(Order::SoftStop),
-                Some(worker.tag.to_string()),
                 Some(worker.id),
               );
               println!("sending message: {:?}", msg);
@@ -304,7 +275,6 @@ pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config:
               id.clone(),
               ConfigCommand::UpgradeMaster,
               None,
-              None,
             ));
 
             loop {
@@ -344,7 +314,6 @@ pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config: 
     id.clone(),
     ConfigCommand::ListWorkers,
     None,
-    None,
   ));
 
   match channel.read_message() {
@@ -373,7 +342,6 @@ pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config: 
               let msg = ConfigMessage::new(
                 id.clone(),
                 ConfigCommand::ProxyConfiguration(Order::Status),
-                Some(worker.tag.to_string()),
                 Some(worker.id),
               );
               println!("sending message: {:?}", msg);
