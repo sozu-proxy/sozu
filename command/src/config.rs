@@ -11,11 +11,10 @@ use toml;
 
 use sozu::messages::{CertificateAndKey,Order,HttpFront,TlsFront,Instance,HttpProxyConfiguration,TlsProxyConfiguration};
 
-use data::{ConfigCommand,ConfigMessage,ProxyType,PROTOCOL_VERSION};
+use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct ProxyConfig {
-  pub proxy_type:                ProxyType,
   pub address:                   String,
   pub public_address:            Option<String>,
   pub port:                      u16,
@@ -358,12 +357,10 @@ mod tests {
   use super::*;
   use std::collections::HashMap;
   use toml::to_string;
-  use data::ProxyType;
 
   #[test]
   fn serialize() {
     let http = ProxyConfig {
-      proxy_type: ProxyType::HTTP,
       address: String::from("127.0.0.1"),
       port: 8080,
       max_connections: 500,
@@ -381,7 +378,6 @@ mod tests {
     };
     println!("http: {:?}", to_string(&http));
     let https = ProxyConfig {
-      proxy_type: ProxyType::HTTPS,
       address: String::from("127.0.0.1"),
       port: 8080,
       max_connections: 500,

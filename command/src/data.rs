@@ -6,54 +6,6 @@ use std::fmt;
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
-#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash)]
-pub enum ProxyType {
-  HTTP,
-  HTTPS,
-  TCP
-}
-
-impl serde::Serialize for ProxyType {
-  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-      where S: serde::Serializer,
-  {
-    match *self {
-      ProxyType::HTTP  => serializer.serialize_str("HTTP"),
-      ProxyType::HTTPS => serializer.serialize_str("HTTPS"),
-      ProxyType::TCP   => serializer.serialize_str("TCP"),
-    }
-  }
-}
-
-impl serde::Deserialize for ProxyType {
-  fn deserialize<D>(deserializer: D) -> Result<ProxyType, D::Error>
-    where D: serde::de::Deserializer
-  {
-    struct ProxyTypeVisitor;
-
-    impl serde::de::Visitor for ProxyTypeVisitor {
-      type Value = ProxyType;
-
-      fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("expected HTTP, HTTPS or TCP proxy type")
-      }
-
-      fn visit_str<E>(self, value: &str) -> Result<ProxyType, E>
-        where E: serde::de::Error
-        {
-          match value {
-            "HTTP"  => Ok(ProxyType::HTTP),
-            "HTTPS" => Ok(ProxyType::HTTPS),
-            "TCP"   => Ok(ProxyType::TCP),
-            _ => Err(serde::de::Error::custom("expected HTTP, HTTPS or TCP proxy type")),
-          }
-        }
-    }
-
-    deserializer.deserialize(ProxyTypeVisitor)
-  }
-}
-
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize)]
 pub enum ConfigCommand {
   ProxyConfiguration(Order),

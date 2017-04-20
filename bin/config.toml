@@ -15,7 +15,6 @@ port = 8125
 
 [http]
 address = "127.0.0.1"
-proxy_type = "HTTP"
 max_connections = 500
 port = 8080
 buffer_size = 16384
@@ -24,7 +23,6 @@ buffer_size = 16384
 
 [https]
 address = "127.0.0.1"
-proxy_type = "HTTPS"
 max_connections = 500
 port = 8443
 buffer_size = 16384
