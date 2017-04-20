@@ -5,7 +5,7 @@ repository = "https://github.com/sozu-proxy/sozu"
 readme = "README.md"
 documentation = "https://docs.rs/sozu"
 homepage = "http://sozu.io"
-version = "0.1.1"
+version = "0.2.0"
 license = "AGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
@@ -29,8 +29,8 @@ clap = "^2.19.0"
 slab = "^0.3.0"
 libc = "^0.2"
 rand = "^0.3.14"
-sozu-lib = { version = "^0.1", path = "../lib" }
-sozu-command-lib = { version = "^0.1", path = "../command" }
+sozu-lib = { version = "^0.2", path = "../lib" }
+sozu-command-lib = { version = "^0.2", path = "../command" }
 
 #[target.'cfg(target_os="linux")'.dependencies]
 #procinfo = { git = "https://github.com/BlackYoup/procinfo-rs", branch = "limits" }
