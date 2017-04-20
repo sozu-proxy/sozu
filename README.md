@@ -1,4 +1,4 @@
-# sozu HTTP reverse proxy
+# sōzu HTTP reverse proxy
 
 [![Join the chat at https://gitter.im/sozu-proxy/sozu](https://badges.gitter.im/sozu-proxy/sozu.svg)](https://gitter.im/sozu-proxy/sozu?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
