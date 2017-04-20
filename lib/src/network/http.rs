@@ -508,7 +508,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         return Err(ConnectionError::ToBeDefined);
       }
 
-
       //FIXME: we should check that the port is right too
 
       if port == Some(&b"80"[..]) {
@@ -718,7 +717,7 @@ mod tests {
   extern crate tiny_http;
   use super::*;
   use slab::Slab;
-  use mio::{channel,Poll};
+  use mio::Poll;
   use std::collections::HashMap;
   use std::net::{TcpListener, TcpStream, Shutdown};
   use std::io::{Read,Write};

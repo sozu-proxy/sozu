@@ -1,6 +1,6 @@
 use mio::*;
 use mio::timer::Timer;
-use mio_uds::{UnixListener,UnixStream};
+use mio_uds::UnixListener;
 use slab::Slab;
 use std::fs;
 use std::fmt;
@@ -10,13 +10,12 @@ use std::os::unix::fs::PermissionsExt;
 use std::collections::HashMap;
 use std::time::Duration;
 use libc::pid_t;
-use serde_json;
 
 use sozu::messages::Order;
 use sozu::network::{ProxyOrder,ServerMessage,ServerMessageStatus};
 use sozu::channel::Channel;
-use sozu_command::state::{HttpProxy,TlsProxy,ConfigState};
-use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,ProxyType,RunState};
+use sozu_command::state::ConfigState;
+use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 use sozu_command::config::Config;
 
 pub mod orders;
@@ -76,8 +75,6 @@ pub struct ProxyConfiguration {
   state: ConfigState,
 }
 
-pub type Tag = String;
-
 pub struct CommandServer {
   sock:            UnixListener,
   buffer_size:     usize,
@@ -130,7 +127,7 @@ impl CommandServer {
     //FIXME: verify this
     poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
 
-    let mut next_id = proxy_vec.len();
+    let next_id = proxy_vec.len();
 
     let mut proxies = HashMap::new();
 

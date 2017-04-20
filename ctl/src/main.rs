@@ -69,16 +69,16 @@ fn main() {
     ("shutdown", Some(sub)) => {
       let hard_shutdown = sub.is_present("hard");
       if hard_shutdown {
-        hard_stop(&mut channel, &config);
+        hard_stop(&mut channel);
       } else {
-        soft_stop(&mut channel, &config);
+        soft_stop(&mut channel);
       }
     },
-    ("upgrade", Some(sub)) => {
-      upgrade(&mut channel, &config);
+    ("upgrade", Some(_)) => {
+      upgrade(&mut channel);
     },
-    ("status", Some(sub)) => {
-      status(&mut channel, &config);
+    ("status", Some(_)) => {
+      status(&mut channel);
     },
     ("state", Some(sub))    => {
       match sub.subcommand() {

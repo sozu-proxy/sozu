@@ -15,8 +15,7 @@ use sozu::channel::Channel;
 use sozu::network::proxy::Server;
 use sozu::network::session::Session;
 use sozu::network::{ProxyOrder,ServerMessage,http,tls};
-use sozu_command::data::ProxyType;
-use sozu_command::config::{Config,ProxyConfig};
+use sozu_command::config::Config;
 
 use logging;
 use command::Worker;

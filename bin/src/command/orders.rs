@@ -5,7 +5,7 @@ use std::io::Read;
 use std::io::Write;
 use std::thread::sleep;
 use std::time::Duration;
-use std::collections::{HashMap,HashSet};
+use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd,FromRawFd};
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 use slab::Slab;

@@ -172,8 +172,6 @@ pub struct Session<ServerConfiguration,Client> {
 
 impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<ServerConfiguration,Client> {
   pub fn new(max_listeners: usize, max_connections: usize, base_token: usize, configuration: ServerConfiguration, poll: &mut Poll) -> Self {
-    let mut configuration = configuration;
-
     let clients = Slab::with_capacity(max_connections);
     let backend = Slab::with_capacity(max_connections);
     //let timer   = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();

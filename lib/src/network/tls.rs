@@ -567,7 +567,7 @@ impl ServerConfiguration {
 
         {
           let mut contexts = unwrap_msg!(self.contexts.lock());
-          let mut domains  = unwrap_msg!(self.domains.lock());
+          let domains  = unwrap_msg!(self.domains.lock());
           let must_delete = contexts.get_mut(&front.cert_fingerprint).map(|tls_data| {
             tls_data.refcount -= 1;
             tls_data.refcount == 0
@@ -1039,7 +1039,7 @@ pub fn start(config: TlsProxyConfiguration, channel: ProxyChannel) {
 
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
   if let Ok(configuration) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop, 1 + max_listeners) {
-    let mut session = Session::new(max_listeners, max_connections, 6148914691236517205, configuration, &mut event_loop);
+    let session = Session::new(max_listeners, max_connections, 6148914691236517205, configuration, &mut event_loop);
     let mut server  = Server::new(event_loop, channel, None, Some(session), None);
 
     info!("starting event loop");

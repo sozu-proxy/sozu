@@ -23,7 +23,6 @@ mod upgrade;
 mod limits;
 
 use std::net::{UdpSocket,ToSocketAddrs};
-use std::collections::HashMap;
 use std::env;
 use sozu::network::metrics::{METRICS,ProxyMetrics};
 use sozu_command::config::Config;

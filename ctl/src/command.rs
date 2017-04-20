@@ -1,10 +1,8 @@
 use sozu::channel::Channel;
 use sozu::messages::Order;
-use sozu_command::config::Config;
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 
-use std::iter::FromIterator;
-use std::collections::{HashMap,HashSet};
+use std::collections::HashSet;
 use rand::{thread_rng, Rng};
 
 fn generate_id() -> String {
@@ -108,7 +106,7 @@ pub fn dump_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   }
 }
 
-pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config: &Config) {
+pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   println!("shutting down proxy");
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
@@ -143,7 +141,7 @@ pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, confi
   }
 }
 
-pub fn hard_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config: &Config) {
+pub fn hard_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   println!("shutting down proxy");
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
@@ -176,7 +174,7 @@ pub fn hard_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, confi
   }
 }
 
-pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config: &Config) {
+pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
@@ -308,7 +306,7 @@ pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config:
   }
 }
 
-pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, config: &Config) {
+pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
