@@ -1,5 +1,5 @@
 use sozu::channel::Channel;
-use sozu::messages::Order;
+use sozu::messages::{Order, Instance};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 
 use std::collections::HashSet;
@@ -380,6 +380,79 @@ pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
 
             println!("worker upgrade done");
           }
+        }
+      }
+    }
+  }
+}
+
+pub fn remove_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip: &str, port: u16) {
+  let id = generate_id();
+  channel.write_message(&ConfigMessage::new(
+    id.clone(),
+    ConfigCommand::ProxyConfiguration(Order::RemoveInstance(Instance {
+      app_id: String::from(app_id),
+      ip_address: String::from(ip),
+      port: port
+    })),
+    None,
+  ));
+
+  match channel.read_message() {
+    None          => println!("the proxy didn't answer"),
+    Some(message) => {
+      if id != message.id {
+        println!("received message with invalid id: {:?}", message);
+        return;
+      }
+      match message.status {
+        ConfigMessageStatus::Processing => {
+          // do nothing here
+          // for other messages, we would loop over read_message
+          // until an error or ok message was sent
+        },
+        ConfigMessageStatus::Error => {
+          println!("could not remove backend : {}", message.message);
+        },
+        ConfigMessageStatus::Ok => {
+          println!("backend {}:{} removed for app : {} ", ip, port, app_id);
+        }
+      }
+    }
+  }
+}
+
+
+pub fn add_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip: &str, port: u16) {
+  let id = generate_id();
+  channel.write_message(&ConfigMessage::new(
+    id.clone(),
+    ConfigCommand::ProxyConfiguration(Order::AddInstance(Instance {
+      app_id: String::from(app_id),
+      ip_address: String::from(ip),
+      port: port
+    })),
+    None,
+  ));
+
+  match channel.read_message() {
+    None          => println!("the proxy didn't answer"),
+    Some(message) => {
+      if id != message.id {
+        println!("received message with invalid id: {:?}", message);
+        return;
+      }
+      match message.status {
+        ConfigMessageStatus::Processing => {
+          // do nothing here
+          // for other messages, we would loop over read_message
+          // until an error or ok message was sent
+        },
+        ConfigMessageStatus::Error => {
+          println!("could not add backend : {}", message.message);
+        },
+        ConfigMessageStatus::Ok => {
+          println!("backend {}:{} added for app : {} ", ip, port, app_id);
         }
       }
     }
