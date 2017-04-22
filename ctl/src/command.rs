@@ -393,7 +393,7 @@ pub fn remove_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, 
       port: port
     };
 
-    backend_command(channel, Order::RemoveInstance(instance.clone()), instance, "remove");
+    order_command(channel, Order::RemoveInstance(instance));
 }
 
 
@@ -404,14 +404,14 @@ pub fn add_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app
       port: port
     };
 
-  backend_command(channel, Order::AddInstance(instance.clone()), instance, "add");
+  order_command(channel, Order::AddInstance(instance));
 }
 
-fn backend_command(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, order: Order, instance: Instance, action: &str) {
+fn order_command(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, order: Order) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
-    ConfigCommand::ProxyConfiguration(order),
+    ConfigCommand::ProxyConfiguration(order.clone()),
     None,
   ));
 
@@ -429,10 +429,22 @@ fn backend_command(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, ord
           // until an error or ok message was sent
         },
         ConfigMessageStatus::Error => {
-          println!("could not {} backend : {}", action, message.message);
+          match order {
+            Order::AddInstance(_) => println!("could not add backend : {}", message.message),
+            Order::RemoveInstance(_) => println!("could not remove backend : {}", message.message),
+            _ => {
+              // do nothing for now 
+            }
+          }
         },
         ConfigMessageStatus::Ok => {
-          println!("backend {}:{} {} for app : {} ", instance.ip_address, instance.port, action, instance.app_id);
+          match order {
+            Order::AddInstance(i) => println!("backend {}:{} added for app : {} ", i.ip_address, i.port, i.app_id),
+            Order::RemoveInstance(i) => println!("backend {}:{} removed for app : {} ", i.ip_address, i.port, i.app_id),
+            _ => {
+              // do nothing for now 
+            }
+          }
         }
       }
     }
