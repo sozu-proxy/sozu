@@ -13,7 +13,8 @@ extern crate nix;
 #[macro_use] extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
 
-//#[cfg(target_os="linux")]
+#[cfg(target_os = "linux")]
+extern crate num_cpus;
 //extern crate procinfo;
 
 mod command;
@@ -23,10 +24,13 @@ mod upgrade;
 mod limits;
 
 use std::net::{UdpSocket,ToSocketAddrs};
-use std::env;
+use std::{mem,env};
 use sozu::network::metrics::{METRICS,ProxyMetrics};
 use sozu_command::config::Config;
 use clap::{App,Arg,SubCommand};
+
+#[cfg(target_os = "linux")]
+use libc::{cpu_set_t,pid_t};
 
 use command::Worker;
 use worker::{begin_worker_process,start_workers};
@@ -102,6 +106,15 @@ fn main() {
         Ok(workers) => {
           info!("created workers: {:?}", workers);
 
+          let handle_process_affinity = match config.handle_process_affinity {
+            Some(val) => val,
+            None => false
+          };
+
+          if cfg!(target_os = "linux") && handle_process_affinity {
+            set_workers_affinity(&workers);
+          }
+
           command::start(config, workers);
         },
         Err(e) => error!("Error while creating workers: {}", e)
@@ -112,6 +125,50 @@ fn main() {
   } else {
     error!("could not load configuration file at '{}', stopping", config_file);
   }
+}
+
+/// Set workers process affinity, see man sched_setaffinity
+/// Bind each worker (including the master) process to a CPU core.
+/// Can bind multiple processes to a CPU core if there are more processes
+/// than CPU cores. Only works on Linux.
+#[cfg(target_os = "linux")]
+fn set_workers_affinity(workers: &Vec<Worker>) {
+  let mut cpu_count = 0;
+  let max_cpu = num_cpus::get();
+
+  // +1 for the master process that will also be bound to its CPU core
+  if (workers.len() + 1) > max_cpu {
+    warn!("There are more workers than available CPU cores, \
+          multiple workers will be bound to the same CPU core. \
+          This may impact performances");
+  }
+
+  let master_pid = unsafe { libc::getpid() };
+  set_process_affinity(master_pid, cpu_count);
+  cpu_count = cpu_count + 1;
+
+  for ref worker in workers {
+    if cpu_count >= max_cpu {
+      cpu_count = 0;
+    }
+
+    set_process_affinity(worker.pid, cpu_count);
+
+    cpu_count = cpu_count + 1;
+  }
+}
+
+/// Set a specific process to run onto a specific CPU core
+#[cfg(target_os = "linux")]
+fn set_process_affinity(pid: pid_t, cpu: usize) {
+  unsafe {
+    let mut cpu_set: cpu_set_t = mem::zeroed();
+    let size_cpu_set = mem::size_of::<cpu_set_t>();
+    libc::CPU_SET(cpu, &mut cpu_set);
+    libc::sched_setaffinity(pid, size_cpu_set, &mut cpu_set);
+
+    debug!("Worker {} bound to CPU core {}", pid, cpu);
+  };
 }
 
 /* FIXME: uncomment this feature once code has been merged back into the procinfo crate
