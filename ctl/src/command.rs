@@ -387,51 +387,31 @@ pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
 }
 
 pub fn remove_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip: &str, port: u16) {
-  let id = generate_id();
-  channel.write_message(&ConfigMessage::new(
-    id.clone(),
-    ConfigCommand::ProxyConfiguration(Order::RemoveInstance(Instance {
+    let instance = Instance {
       app_id: String::from(app_id),
       ip_address: String::from(ip),
       port: port
-    })),
-    None,
-  ));
+    };
 
-  match channel.read_message() {
-    None          => println!("the proxy didn't answer"),
-    Some(message) => {
-      if id != message.id {
-        println!("received message with invalid id: {:?}", message);
-        return;
-      }
-      match message.status {
-        ConfigMessageStatus::Processing => {
-          // do nothing here
-          // for other messages, we would loop over read_message
-          // until an error or ok message was sent
-        },
-        ConfigMessageStatus::Error => {
-          println!("could not remove backend : {}", message.message);
-        },
-        ConfigMessageStatus::Ok => {
-          println!("backend {}:{} removed for app : {} ", ip, port, app_id);
-        }
-      }
-    }
-  }
+    backend_command(channel, Order::RemoveInstance(instance.clone()), instance, "remove");
 }
 
 
 pub fn add_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip: &str, port: u16) {
-  let id = generate_id();
-  channel.write_message(&ConfigMessage::new(
-    id.clone(),
-    ConfigCommand::ProxyConfiguration(Order::AddInstance(Instance {
+  let instance = Instance {
       app_id: String::from(app_id),
       ip_address: String::from(ip),
       port: port
-    })),
+    };
+
+  backend_command(channel, Order::AddInstance(instance.clone()), instance, "add");
+}
+
+fn backend_command(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, order: Order, instance: Instance, action: &str) {
+  let id = generate_id();
+  channel.write_message(&ConfigMessage::new(
+    id.clone(),
+    ConfigCommand::ProxyConfiguration(order),
     None,
   ));
 
@@ -449,10 +429,10 @@ pub fn add_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app
           // until an error or ok message was sent
         },
         ConfigMessageStatus::Error => {
-          println!("could not add backend : {}", message.message);
+          println!("could not {} backend : {}", action, message.message);
         },
         ConfigMessageStatus::Ok => {
-          println!("backend {}:{} added for app : {} ", ip, port, app_id);
+          println!("backend {}:{} {} for app : {} ", instance.ip_address, instance.port, action, instance.app_id);
         }
       }
     }
