@@ -98,9 +98,14 @@ fn main() {
     let metrics_guard = ProxyMetrics::run();
 
     if check_process_limits(&config) {
-      let workers: Vec<Worker> = start_workers(&config);
-      info!("created workers: {:?}", workers);
-      command::start(config, workers);
+      match start_workers(&config) {
+        Ok(workers) => {
+          info!("created workers: {:?}", workers);
+
+          command::start(config, workers);
+        },
+        Err(e) => error!("Error while creating workers: {}", e)
+      }
     }
 
     info!("master process stopped");
