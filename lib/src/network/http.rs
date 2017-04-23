@@ -338,9 +338,8 @@ impl ServerConfiguration {
           pool:          Rc::new(RefCell::new(
                            Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size))
           )),
-          //FIXME: make the timeout values configurable
-          front_timeout: 5000,
-          back_timeout:  5000,
+          front_timeout: config.front_timeout,
+          back_timeout:  config.back_timeout,
           answers:       default,
           config:        config,
         })

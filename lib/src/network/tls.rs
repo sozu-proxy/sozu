@@ -399,8 +399,8 @@ impl ServerConfiguration {
           pool:            Rc::new(RefCell::new(
                              Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size))
           )),
-          front_timeout:   50000,
-          back_timeout:    50000,
+          front_timeout:   config.front_timeout,
+          back_timeout:    config.back_timeout,
           answers:         default,
           base_token:      base_token,
           config:          config,

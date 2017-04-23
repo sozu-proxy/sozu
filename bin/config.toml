@@ -20,6 +20,8 @@ port = 8080
 buffer_size = 16384
 #answer_404 = "./404.html"
 #answer_503 = "./503.html"
+#front_timeout = 5000
+#back_timeout = 5000
 
 [https]
 address = "127.0.0.1"
@@ -35,6 +37,8 @@ default_app_id = "MyApp"
 
 #answer_404 = "../lib/assets/404.html"
 #answer_503 = "../lib/assets/503.html"
+#front_timeout = 5000
+#back_timeout = 5000
 
 [applications]
 

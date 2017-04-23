@@ -29,6 +29,8 @@ pub struct ProxyConfig {
   pub default_certificate_chain: Option<String>,
   pub default_key:               Option<String>,
   pub tls_versions:              Option<Vec<String>>,
+  pub back_timeout:              Option<u64>,
+  pub front_timeout:             Option<u64>,
 }
 
 impl ProxyConfig {
@@ -66,6 +68,14 @@ impl ProxyConfig {
         .and_then(|mut file| file.read_to_string(&mut answer_503).ok()).is_some() {
         configuration.answer_503 = answer_503;
       }
+
+      if let Some(back_timeout) = self.back_timeout {
+        configuration.back_timeout = back_timeout;
+      }
+      if let Some(front_timeout) = self.front_timeout {
+        configuration.front_timeout = front_timeout;
+      }
+
       configuration
     })
   }
@@ -167,8 +177,14 @@ impl ProxyConfig {
         configuration.default_key = Some(default_key);
       }
 
-      configuration
+      if let Some(back_timeout) = self.back_timeout {
+        configuration.back_timeout = back_timeout;
+      }
+      if let Some(front_timeout) = self.front_timeout {
+        configuration.front_timeout = front_timeout;
+      }
 
+      configuration
     })
   }
 }
@@ -367,6 +383,8 @@ mod tests {
       buffer_size: 16384,
       answer_404: Some(String::from("404.html")),
       answer_503: None,
+      front_timeout: None,
+      back_timeout: None,
       public_address: None,
       tls_versions: None,
       cipher_list: None,
@@ -384,6 +402,8 @@ mod tests {
       buffer_size: 16384,
       answer_404: Some(String::from("404.html")),
       answer_503: None,
+      front_timeout: None,
+      back_timeout: None,
       public_address: None,
       tls_versions: None,
       cipher_list: None,
