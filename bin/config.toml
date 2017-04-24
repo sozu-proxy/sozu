@@ -8,6 +8,7 @@ log_target     = "stdout"
 #log_target     = "tcp://127.0.0.1:9876"
 command_buffer_size = 16384
 worker_count = 2
+handle_process_affinity = false
 
 [metrics]
 address = "192.168.59.103"

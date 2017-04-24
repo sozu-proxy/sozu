@@ -104,7 +104,7 @@ impl CommandServer {
         info!("received LaunchWorker with tag \"{}\"", tag);
 
         let id = self.next_id + 1;
-        if let Some(mut worker) = start_worker(id, &self.config) {
+        if let Ok(mut worker) = start_worker(id, &self.config) {
           self.conns[token].write_message(&ConfigMessageAnswer::new(
             message.id.clone(),
             ConfigMessageStatus::Processing,

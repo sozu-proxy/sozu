@@ -203,6 +203,7 @@ pub struct Config {
   pub http:                    Option<ProxyConfig>,
   pub https:                   Option<ProxyConfig>,
   pub applications:            HashMap<String, AppConfig>,
+  pub handle_process_affinity: Option<bool>
 }
 
 impl Config {
@@ -398,6 +399,7 @@ mod tests {
       command_socket: String::from("./command_folder/sock"),
       saved_state: None,
       worker_count: Some(2),
+      handle_process_affinity: None,
       channel_buffer_size: Some(10000),
       command_buffer_size: None,
       max_command_buffer_size: None,

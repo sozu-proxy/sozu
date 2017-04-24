@@ -32,7 +32,8 @@ rand = "^0.3.14"
 sozu-lib = { version = "^0.2", path = "../lib" }
 sozu-command-lib = { version = "^0.2", path = "../command" }
 
-#[target.'cfg(target_os="linux")'.dependencies]
+[target.'cfg(target_os="linux")'.dependencies]
+num_cpus = "^1.3.0"
 #procinfo = { git = "https://github.com/BlackYoup/procinfo-rs", branch = "limits" }
 
 [features]

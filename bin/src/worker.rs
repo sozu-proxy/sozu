@@ -8,6 +8,7 @@ use std::ptr::null_mut;
 use std::process::Command;
 use std::os::unix::process::CommandExt;
 use std::os::unix::io::{AsRawFd,FromRawFd};
+use nix;
 use nix::unistd::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 
@@ -20,20 +21,28 @@ use sozu_command::config::Config;
 use logging;
 use command::Worker;
 
-pub fn start_workers(config: &Config) -> Vec<Worker> {
+pub fn start_workers(config: &Config) -> nix::Result<Vec<Worker>> {
   let mut workers = Vec::new();
   for index in 0..config.worker_count.unwrap_or(1) {
-    let (pid, command) = start_worker_process(&index.to_string(), config);
-    let w =  Worker::new(index as u32, pid, command, config);
-    workers.push(w);
+    match start_worker_process(&index.to_string(), config) {
+      Ok((pid, command)) => {
+        let w =  Worker::new(index as u32, pid, command, config);
+        workers.push(w);
+      },
+      Err(e) => return Err(e)
+    };
   }
-  workers
+  Ok(workers)
 }
 
-pub fn start_worker(id: u32, config: &Config) -> Option<Worker> {
-  let (pid, command) = start_worker_process(&id.to_string(), config);
-  let w =  Worker::new(id, pid, command, config);
-  Some(w)
+pub fn start_worker(id: u32, config: &Config) -> nix::Result<Worker> {
+  match start_worker_process(&id.to_string(), config) {
+    Ok((pid, command)) => {
+      let w = Worker::new(id, pid, command, config);
+      Ok(w)
+    },
+    Err(e) => Err(e)
+  }
 }
 
 fn generate_channels() -> io::Result<(Channel<ProxyOrder,ServerMessage>, Channel<ServerMessage,ProxyOrder>)> {
@@ -87,7 +96,7 @@ pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
   info!("ending event loop");
 }
 
-pub fn start_worker_process(id: &str, config: &Config) -> (pid_t, Channel<ProxyOrder,ServerMessage>) {
+pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Channel<ProxyOrder,ServerMessage>)> {
   trace!("parent({})", unsafe { libc::getpid() });
 
   let (server, client) = UnixStream::pair().unwrap();
@@ -113,17 +122,16 @@ pub fn start_worker_process(id: &str, config: &Config) -> (pid_t, Channel<ProxyO
   let path = unsafe { get_executable_path() };
 
   info!("launching worker");
-  //FIXME: remove the expect, return a result?
-  match fork().expect("fork failed") {
-    ForkResult::Parent{ child } => {
+  match fork() {
+    Ok(ForkResult::Parent{ child }) => {
       info!("worker launched: {}", child);
       command.write_message(config);
       command.set_nonblocking(true);
 
       let command: Channel<ProxyOrder,ServerMessage> = command.into();
-      return (child, command);
-    }
-    ForkResult::Child => {
+      Ok((child, command))
+    },
+    Ok(ForkResult::Child) => {
       trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
       Command::new(path.to_str().unwrap())
         .arg("worker")
@@ -136,6 +144,10 @@ pub fn start_worker_process(id: &str, config: &Config) -> (pid_t, Channel<ProxyO
         .exec();
 
       unreachable!();
+    },
+    Err(e) => {
+      error!("Error during fork(): {}", e);
+      Err(e)
     }
   }
 }
