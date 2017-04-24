@@ -1,5 +1,5 @@
 use sozu::channel::Channel;
-use sozu::messages::{Order, Instance};
+use sozu::messages::{Order, Instance, HttpFront, CertificateAndKey, CertFingerprint, TcpFront};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 
 use std::collections::HashSet;
@@ -387,24 +387,56 @@ pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
 }
 
 pub fn remove_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip: &str, port: u16) {
-    let instance = Instance {
+    order_command(channel, Order::RemoveInstance(Instance {
       app_id: String::from(app_id),
       ip_address: String::from(ip),
       port: port
-    };
-
-    order_command(channel, Order::RemoveInstance(instance));
+    }));
 }
 
 
 pub fn add_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip: &str, port: u16) {
-  let instance = Instance {
+  order_command(channel, Order::AddInstance(Instance {
       app_id: String::from(app_id),
       ip_address: String::from(ip),
       port: port
-    };
+    }));
+}
 
-  order_command(channel, Order::AddInstance(instance));
+pub fn add_front(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str) {
+  order_command(channel, Order::AddHttpFront(HttpFront {
+    app_id: String::from(app_id),
+    hostname: String::from(hostname),
+    path_begin: String::from(path_begin)
+  }));
+}
+
+pub fn add_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, certificate: &str, certificate_chain: Vec<String>, key: &str) {
+  order_command(channel, Order::AddCertificate(CertificateAndKey {
+    certificate: String::from(certificate),
+    certificate_chain: certificate_chain,
+    key: String::from(key)
+  }));
+}
+
+pub fn remove_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, cert_fingerprint: CertFingerprint) {
+  order_command(channel, Order::RemoveCertificate(cert_fingerprint));
+}
+
+pub fn add_tcp_front(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip_address: &str, port: u16) {
+  order_command(channel, Order::AddTcpFront(TcpFront {
+    app_id: String::from(app_id),
+    ip_address: String::from(ip_address),
+    port: port
+  }));
+}
+
+pub fn remove_tcp_front(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip_address: &str, port: u16) {
+  order_command(channel, Order::RemoveTcpFront(TcpFront {
+    app_id: String::from(app_id),
+    ip_address: String::from(ip_address),
+    port: port
+  }));
 }
 
 fn order_command(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, order: Order) {
@@ -429,18 +461,16 @@ fn order_command(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, order
           // until an error or ok message was sent
         },
         ConfigMessageStatus::Error => {
-          match order {
-            Order::AddInstance(_) => println!("could not add backend : {}", message.message),
-            Order::RemoveInstance(_) => println!("could not remove backend : {}", message.message),
-            _ => {
-              // do nothing for now 
-            }
-          }
+          println!("could not execute order: {}", message.message);
         },
         ConfigMessageStatus::Ok => {
           match order {
-            Order::AddInstance(i) => println!("backend {}:{} added for app : {} ", i.ip_address, i.port, i.app_id),
-            Order::RemoveInstance(i) => println!("backend {}:{} removed for app : {} ", i.ip_address, i.port, i.app_id),
+            Order::AddInstance(_) => println!("backend added : {}", message.message),
+            Order::RemoveInstance(_) => println!("backend removed : {} ", message.message),
+            Order::AddCertificate(_) => println!("certificate added: {}", message.message),
+            Order::RemoveCertificate(_) => println!("certificate removed: {}", message.message),
+            Order::AddHttpFront(_) => println!("front added: {}", message.message),
+            Order::RemoveHttpFront(_) => println!("front removed: {}", message.message),
             _ => {
               // do nothing for now 
             }
