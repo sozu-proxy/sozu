@@ -143,7 +143,6 @@ impl ConfigState {
       }
     }
 
-    let mut v = Vec::new();
     for certificate_and_key in (&self.certificates).values() {
       v.push(Order::AddCertificate(certificate_and_key.clone()));
     }
