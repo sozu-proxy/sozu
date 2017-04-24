@@ -167,9 +167,7 @@ The data attribute will contain one of the proxy orders.
       "app_id":      "xxx",
       "hostname":    "yyy",
       "path_begin":  "xxx",
-      "certificate": "<PEM data>",
-      "key":         "<PEM data>",
-      "certificate_chain": [ "<PEM data>", "<PEM data>" ]
+      "fingerprint": CertFingerprint
     }
   }
 }
@@ -222,10 +220,7 @@ The data attribute will contain one of the proxy orders.
       "app_id":      "xxx",
       "hostname":    "yyy",
       "path_begin":  "xxx",
-      //FIXME: see issue #113, those should not appear in the remove message
-      "certificate": "<PEM data>",
-      "key":         "<PEM data>",
-      "certificate_chain": [ "<PEM data>", "<PEM data>" ]
+      "fingerprint": CertFingerprint
     }
   }
 }
