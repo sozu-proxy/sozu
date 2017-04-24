@@ -158,6 +158,14 @@ fn set_workers_affinity(workers: &Vec<Worker>) {
   }
 }
 
+/// Set workers process affinity, see man sched_setaffinity
+/// Bind each worker (including the master) process to a CPU core.
+/// Can bind multiple processes to a CPU core if there are more processes
+/// than CPU cores. Only works on Linux.
+#[cfg(not(target_os = "linux"))]
+fn set_workers_affinity(_: &Vec<Worker>) {
+}
+
 /// Set a specific process to run onto a specific CPU core
 #[cfg(target_os = "linux")]
 fn set_process_affinity(pid: pid_t, cpu: usize) {
