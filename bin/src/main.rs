@@ -15,7 +15,7 @@ extern crate sozu_command_lib as sozu_command;
 
 #[cfg(target_os = "linux")]
 extern crate num_cpus;
-//extern crate procinfo;
+extern crate procinfo;
 
 mod command;
 mod worker;
@@ -100,8 +100,9 @@ fn main() {
     let metrics_host   = (&config.metrics.address[..], config.metrics.port).to_socket_addrs().unwrap().next().unwrap();
     METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
     let metrics_guard = ProxyMetrics::run();
+    let process_limits_ok = if cfg!(target_os = "linux") { check_process_limits(config.clone()) } else { true };
 
-    if check_process_limits(&config) {
+    if process_limits_ok {
       match start_workers(&config) {
         Ok(workers) => {
           info!("created workers: {:?}", workers);
@@ -179,39 +180,37 @@ fn set_process_affinity(pid: pid_t, cpu: usize) {
   };
 }
 
-/* FIXME: uncomment this feature once code has been merged back into the procinfo crate
 #[cfg(target_os="linux")]
-fn check_process_limits(config: &Config) -> bool {
-  let process_limits = procinfo::pid::limits_self().expect("Couldn't read /proc/self/limits to determine max open file descriptors limit");
-  // We check the hard_limit. The soft_limit can be changed at runtime
-  // by the process. hard_limit can only be changed by root
-  let hard_limit = process_limits.max_open_files.hard_limit;
+// We check the hard_limit. The soft_limit can be changed at runtime
+// by the process or any user. hard_limit can only be changed by root
+fn check_process_limits(config: Config) -> bool {
+  let process_limits = procinfo::pid::limits_self()
+    .expect("Couldn't read /proc/self/limits to determine max open file descriptors limit");
 
   // If limit is "unlimited"
-  if hard_limit == -1 {
+  if process_limits.max_open_files.hard.is_none() {
     return true;
   }
 
-  let max_limit_per_proxy = config.proxies.values().all(|proxy| (proxy.max_connections as isize) <= hard_limit);
-  if !max_limit_per_proxy {
-    error!("At least one proxy can't have that much of connections. Current max file descriptor hard limit is: {}", hard_limit);
+  let hard_limit = process_limits.max_open_files.hard.unwrap();
+  let http_max_cons = config.http.and_then(|proxy| Some(proxy.max_connections)).unwrap_or(0);
+  let https_max_cons = config.https.and_then(|proxy| Some(proxy.max_connections)).unwrap_or(0);
+
+  // check if all proxies are under the hard limit
+  if http_max_cons > hard_limit || https_max_cons > hard_limit {
+    error!("At least one proxy can't have that much of connections.\
+            Current max file descriptor hard limit is: {}", hard_limit);
     return false;
   }
 
-  let total_proxies_connections = config.proxies.values().fold(0, |acc, ref proxy| acc + proxy.max_connections);
+  let total_proxies_connections = http_max_cons + https_max_cons;
   let system_max_fd = limits::limits_file_max().expect("Couldn't read /proc/sys/fs/file-max");
 
   if total_proxies_connections > system_max_fd {
-    error!("Proxies total max_connections can't be higher than system's file-max limit. Current limit: {}, current value: {}",
-           system_max_fd, total_proxies_connections);
+    error!("Proxies total max_connections can't be higher than system's file-max limit.\
+            Current limit: {}, current value: {}", system_max_fd, total_proxies_connections);
     return false;
   }
 
-  true
-}
-*/
-
-//#[cfg(not(target_os="linux"))]
-fn check_process_limits(_: &Config) -> bool {
   true
 }
