@@ -96,11 +96,12 @@ enum ConfigMessageField {
   Data,
 }
 
-impl serde::Deserialize for ConfigMessageField {
+impl<'de> serde::Deserialize<'de> for ConfigMessageField {
   fn deserialize<D>(deserializer: D) -> Result<ConfigMessageField, D::Error>
-        where D: serde::de::Deserializer {
+        where D: serde::de::Deserializer<'de> {
     struct ConfigMessageFieldVisitor;
-    impl serde::de::Visitor for ConfigMessageFieldVisitor {
+
+    impl<'de> serde::de::Visitor<'de> for ConfigMessageFieldVisitor {
       type Value = ConfigMessageField;
 
       fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -120,20 +121,21 @@ impl serde::Deserialize for ConfigMessageField {
       }
     }
 
-    deserializer.deserialize(ConfigMessageFieldVisitor)
+    deserializer.deserialize_any(ConfigMessageFieldVisitor)
   }
 }
 
 struct ConfigMessageVisitor;
-impl serde::de::Visitor for ConfigMessageVisitor {
+impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
   type Value = ConfigMessage;
 
   fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
     formatter.write_str("")
   }
 
-  fn visit_map<V>(self, mut visitor: V) -> Result<ConfigMessage, V::Error>
-        where V: serde::de::MapVisitor {
+  fn visit_map<M>(self, mut visitor: M) -> Result<ConfigMessage, M::Error>
+    where M: serde::de::MapAccess<'de> {
+
     let mut id:Option<String>              = None;
     let mut version:Option<u8>             = None;
     let mut proxy_id: Option<u32>          = None;
@@ -141,12 +143,12 @@ impl serde::de::Visitor for ConfigMessageVisitor {
     let mut data:Option<serde_json::Value> = None;
 
     loop {
-      match try!(visitor.visit_key()) {
-        Some(ConfigMessageField::Type)    => { config_type = Some(try!(visitor.visit_value())); }
-        Some(ConfigMessageField::Id)      => { id = Some(try!(visitor.visit_value())); }
-        Some(ConfigMessageField::Version) => { version = Some(try!(visitor.visit_value())); }
-        Some(ConfigMessageField::ProxyId) => { proxy_id = Some(try!(visitor.visit_value())); }
-        Some(ConfigMessageField::Data)    => { data = Some(try!(visitor.visit_value())); }
+      match try!(visitor.next_key()) {
+        Some(ConfigMessageField::Type)    => { config_type = Some(try!(visitor.next_value())); }
+        Some(ConfigMessageField::Id)      => { id = Some(try!(visitor.next_value())); }
+        Some(ConfigMessageField::Version) => { version = Some(try!(visitor.next_value())); }
+        Some(ConfigMessageField::ProxyId) => { proxy_id = Some(try!(visitor.next_value())); }
+        Some(ConfigMessageField::Data)    => { data = Some(try!(visitor.next_value())); }
         None => { break; }
       }
     }
@@ -211,9 +213,9 @@ impl serde::de::Visitor for ConfigMessageVisitor {
   }
 }
 
-impl serde::Deserialize for ConfigMessage {
+impl<'de> serde::Deserialize<'de> for ConfigMessage {
   fn deserialize<D>(deserializer: D) -> Result<ConfigMessage, D::Error>
-    where D: serde::de::Deserializer {
+    where D: serde::de::Deserializer<'de> {
     static FIELDS: &'static [&'static str] = &["id", "version", "proxy_id", "type", "data"];
     deserializer.deserialize_struct("ConfigMessage", FIELDS, ConfigMessageVisitor)
   }
