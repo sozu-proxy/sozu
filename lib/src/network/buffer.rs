@@ -183,7 +183,7 @@ impl Read for Buffer {
   fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
     let len = cmp::min(self.available_data(), buf.len());
     unsafe {
-      ptr::copy((&self.memory[self.position..len]).as_ptr(), buf.as_mut_ptr(), len);
+      ptr::copy((&self.memory[self.position..self.position+len]).as_ptr(), buf.as_mut_ptr(), len);
       self.position += len;
     }
     Ok(len)
