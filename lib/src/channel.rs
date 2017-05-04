@@ -10,7 +10,7 @@ use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd,RawFd};
 use std::cmp::min;
 use serde_json;
 use serde::ser::Serialize;
-use serde::de::Deserialize;
+use serde::de::DeserializeOwned;
 
 use network::buffer::Buffer;
 
@@ -33,7 +33,7 @@ pub struct Channel<Tx,Rx> {
   phantom_rx:      PhantomData<Rx>,
 }
 
-impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
+impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
   pub fn new(sock: UnixStream, buffer_size: usize, max_buffer_size: usize) -> Channel<Tx,Rx> {
     Channel {
       sock:            sock,
@@ -48,7 +48,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
     }
   }
 
-  pub fn into<Tx2: Debug+Serialize, Rx2: Debug+Deserialize>(self) -> Channel<Tx2,Rx2> {
+  pub fn into<Tx2: Debug+Serialize, Rx2: Debug+DeserializeOwned>(self) -> Channel<Tx2,Rx2> {
     Channel {
       sock:            self.sock,
       front_buf:       self.front_buf,
@@ -328,7 +328,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Channel<Tx,Rx> {
   }
 }
 
-impl<Tx: Debug+Deserialize+Serialize, Rx: Debug+Deserialize+Serialize> Channel<Tx,Rx> {
+impl<Tx: Debug+DeserializeOwned+Serialize, Rx: Debug+DeserializeOwned+Serialize> Channel<Tx,Rx> {
   pub fn generate(buffer_size: usize, max_buffer_size: usize) -> io::Result<(Channel<Tx,Rx>, Channel<Rx,Tx>)> {
     let     (command,proxy) = try!(UnixStream::pair());
     let     proxy_channel   = Channel::new(proxy, buffer_size, max_buffer_size);
@@ -345,7 +345,7 @@ impl<Tx: Debug+Deserialize+Serialize, Rx: Debug+Deserialize+Serialize> Channel<T
   }
 }
 
-impl<Tx: Debug+Serialize, Rx: Debug+Deserialize> Iterator for Channel<Tx,Rx> {
+impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Iterator for Channel<Tx,Rx> {
   type Item = Rx;
   fn next(&mut self) -> Option<Self::Item> {
     self.read_message()

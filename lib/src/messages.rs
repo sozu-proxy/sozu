@@ -184,11 +184,11 @@ enum OrderField {
 }
 
 
-impl serde::Deserialize for OrderField {
+impl<'de> serde::Deserialize<'de> for OrderField {
   fn deserialize<D>(deserializer: D) -> Result<OrderField, D::Error>
-        where D: serde::de::Deserializer {
+        where D: serde::de::Deserializer<'de> {
     struct OrderFieldVisitor;
-    impl serde::de::Visitor for OrderFieldVisitor {
+    impl<'de> serde::de::Visitor<'de> for OrderFieldVisitor {
       type Value = OrderField;
 
       fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -205,12 +205,12 @@ impl serde::Deserialize for OrderField {
       }
     }
 
-    deserializer.deserialize(OrderFieldVisitor)
+    deserializer.deserialize_any(OrderFieldVisitor)
   }
 }
 
 struct OrderVisitor;
-impl serde::de::Visitor for OrderVisitor {
+impl<'de> serde::de::Visitor<'de> for OrderVisitor {
   type Value = Order;
 
   fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -218,14 +218,14 @@ impl serde::de::Visitor for OrderVisitor {
   }
 
   fn visit_map<V>(self, mut visitor: V) -> Result<Order, V::Error>
-        where V: serde::de::MapVisitor {
+        where V: serde::de::MapAccess<'de> {
     let mut command_type:Option<String>    = None;
     let mut data:Option<serde_json::Value> = None;
 
     loop {
-      match try!(visitor.visit_key()) {
-        Some(OrderField::Type) => { command_type = Some(try!(visitor.visit_value())); }
-        Some(OrderField::Data) => { data = Some(try!(visitor.visit_value())); }
+      match try!(visitor.next_key()) {
+        Some(OrderField::Type) => { command_type = Some(try!(visitor.next_value())); }
+        Some(OrderField::Data) => { data = Some(try!(visitor.next_value())); }
         None => { break; }
       }
     }
@@ -291,9 +291,9 @@ impl serde::de::Visitor for OrderVisitor {
   }
 }
 
-impl serde::Deserialize for Order {
+impl<'de> serde::Deserialize<'de> for Order {
   fn deserialize<D>(deserializer: D) -> Result<Order, D::Error>
-        where D: serde::de::Deserializer {
+        where D: serde::de::Deserializer<'de> {
     static FIELDS: &'static [&'static str] = &["type", "data"];
     deserializer.deserialize_struct("Order", FIELDS, OrderVisitor)
   }
