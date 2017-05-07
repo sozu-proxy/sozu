@@ -30,7 +30,7 @@ script:
   - cd $ROOT_PATH/ctl     && travis-cargo --only beta    build
 
 after_success:
-  - cargo coveralls
+  - cargo coveralls --all
 
     #env:
   #  global:
