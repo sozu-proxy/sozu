@@ -15,7 +15,9 @@ before_install:
   - sudo dpkg -i libssl-dev_1.0.2g-1ubuntu4.6_amd64.deb
 
 before_script:
-  - pip install 'travis-cargo<0.2' --user && export PATH=$HOME/.local/bin:$PATH
+  - |
+      cargo install cargo-travis &&
+      export PATH=$HOME/.cargo/bin:$PATH
 
 script:
   - cd $ROOT_PATH/lib     && travis-cargo --only nightly test
@@ -28,7 +30,7 @@ script:
   - cd $ROOT_PATH/ctl     && travis-cargo --only beta    build
 
 after_success:
-  - travis-cargo coveralls --no-sudo
+  - cargo coveralls
 
     #env:
   #  global:
