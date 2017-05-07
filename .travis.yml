@@ -20,22 +20,15 @@ before_script:
       export PATH=$HOME/.cargo/bin:$PATH
 
 script:
-  - cd $ROOT_PATH/lib     && travis-cargo --only nightly test
-  - cd $ROOT_PATH/command && travis-cargo --only nightly test
-  - cd $ROOT_PATH/bin     && travis-cargo --only nightly build
-  - cd $ROOT_PATH/ctl     && travis-cargo --only nightly build
-  - cd $ROOT_PATH/lib     && travis-cargo --only beta    build
-  - cd $ROOT_PATH/command && travis-cargo --only beta    build
-  - cd $ROOT_PATH/bin     && travis-cargo --only beta    build
-  - cd $ROOT_PATH/ctl     && travis-cargo --only beta    build
+  - cd $ROOT_PATH/lib     && cargo test
+  - cd $ROOT_PATH/command && cargo test
+  - cd $ROOT_PATH/bin     && cargo build
+  - cd $ROOT_PATH/ctl     && cargo build
 
 after_success:
-  - cargo coveralls --all
-
-    #env:
-  #  global:
-    # override the default `--features unstable` used for the nightly branch (optional)
-    #    - TRAVIS_CARGO_NIGHTLY_FEATURE=nightly
+  - if [ "$TRAVIS_RUST_VERSION" == "nightly" ]; then
+      cargo coveralls --all --verbose;
+    fi
 
 dist: trusty
 
