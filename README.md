@@ -17,7 +17,11 @@ Build the most reliable reverse proxy ever:
 - you set up a limit on the number of concurrent connections to a worker
   - the reverse proxy will refuse new connections over that limit, instead of requesting unavailable ressources like memory
 
+
 ## Building and starting
+
+Requirements:
+- openssl 1.0.1 or above
 
 You can create the required executables like this:
 
