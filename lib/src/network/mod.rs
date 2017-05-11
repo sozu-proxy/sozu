@@ -21,46 +21,12 @@ pub mod proxy;
 pub mod session;
 
 use mio::Token;
-use messages::Order;
-
-pub type MessageId = String;
 
 #[derive(Debug)]
 pub enum Protocol {
   HTTP,
   TLS,
   TCP
-}
-
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct ServerMessage {
-  pub id:     MessageId,
-  pub status: ServerMessageStatus,
-}
-
-impl fmt::Display for ServerMessage {
-  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    write!(f, "{}-{:?}", self.id, self.status)
-  }
-}
-
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub enum ServerMessageStatus {
-  Ok,
-  Processing,
-  Error(String),
-}
-
-#[derive(Debug,Clone,Serialize,Deserialize)]
-pub struct ProxyOrder {
-  pub id:    MessageId,
-  pub order: Order,
-}
-
-impl fmt::Display for ProxyOrder {
-  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    write!(f, "{}-{:?}", self.id, self.order)
-  }
 }
 
 #[derive(Debug,PartialEq,Eq)]

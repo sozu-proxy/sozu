@@ -16,13 +16,13 @@ use uuid::Uuid;
 use nom::{HexDisplay,IResult};
 use rand::random;
 
-use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
+use network::{Backend,ClientResult,ConnectionError,RequiredEvents,Protocol};
 use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
 use network::socket::{SocketHandler,SocketResult,server_bind};
-use messages::{self,Order,HttpFront,HttpProxyConfiguration};
+use messages::{self,Order,HttpFront,HttpProxyConfiguration,ProxyOrder,ServerMessage,ServerMessageStatus};
 use channel::Channel;
 use parser::http11::hostname_and_port;
 use util::UnwrapLog;

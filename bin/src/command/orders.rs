@@ -15,9 +15,8 @@ use mio::timer;
 use mio::{Poll,PollOpt,Ready,Token};
 use nom::{HexDisplay,IResult,Offset};
 
-use sozu::messages::Order;
+use sozu::messages::{Order,ProxyOrder};
 use sozu::channel::Channel;
-use sozu::network::ProxyOrder;
 use sozu::network::buffer::Buffer;
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 

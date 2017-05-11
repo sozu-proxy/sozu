@@ -20,11 +20,11 @@ use time::precise_time_ns;
 use std::time::Duration;
 use rand::random;
 
-use network::{ClientResult,MessageId,ServerMessage,ServerMessageStatus,ConnectionError,
-  SocketType,Protocol,ProxyOrder,RequiredEvents};
+use network::{ClientResult,ConnectionError,
+  SocketType,Protocol,RequiredEvents};
 use network::{http,tls,tcp};
 use network::session::{BackToken,FrontToken,ListenToken,ProxyClient,ProxyConfiguration,Readiness,Session};
-use messages::{self,TcpFront,Order,Instance};
+use messages::{self,TcpFront,Order,Instance,MessageId,ServerMessage,ServerMessageStatus,ProxyOrder};
 use channel::Channel;
 
 const SERVER: Token = Token(0);

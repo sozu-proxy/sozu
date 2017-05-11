@@ -11,8 +11,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use libc::pid_t;
 
-use sozu::messages::Order;
-use sozu::network::{ProxyOrder,ServerMessage,ServerMessageStatus};
+use sozu::messages::{Order,ProxyOrder,ServerMessage,ServerMessageStatus};
 use sozu::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};

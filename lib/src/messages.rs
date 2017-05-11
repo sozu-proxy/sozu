@@ -7,6 +7,66 @@ use std::default::Default;
 use std::convert::From;
 use std::fmt;
 
+pub type MessageId = String;
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct ServerMessage {
+  pub id:     MessageId,
+  pub status: ServerMessageStatus,
+}
+
+impl fmt::Display for ServerMessage {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    write!(f, "{}-{:?}", self.id, self.status)
+  }
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub enum ServerMessageStatus {
+  Ok,
+  Processing,
+  Error(String),
+}
+
+#[derive(Debug,Clone,Serialize,Deserialize)]
+pub struct ProxyOrder {
+  pub id:    MessageId,
+  pub order: Order,
+}
+
+impl fmt::Display for ProxyOrder {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    write!(f, "{}-{:?}", self.id, self.order)
+  }
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash)]
+pub enum Order {
+    AddHttpFront(HttpFront),
+    RemoveHttpFront(HttpFront),
+
+    AddTlsFront(TlsFront),
+    RemoveTlsFront(TlsFront),
+
+    AddCertificate(CertificateAndKey),
+    RemoveCertificate(CertFingerprint),
+
+    AddTcpFront(TcpFront),
+    RemoveTcpFront(TcpFront),
+
+    AddInstance(Instance),
+    RemoveInstance(Instance),
+
+    HttpProxy(HttpProxyConfiguration),
+    TlsProxy(TlsProxyConfiguration),
+
+    SoftStop,
+    HardStop,
+
+    Status
+}
+
+
 //FIXME: make fixed size depending on hash algorithm
 pub type CertFingerprint = Vec<u8>;
 
@@ -130,31 +190,6 @@ impl Default for TlsProxyConfiguration {
   }
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash)]
-pub enum Order {
-    AddHttpFront(HttpFront),
-    RemoveHttpFront(HttpFront),
-
-    AddTlsFront(TlsFront),
-    RemoveTlsFront(TlsFront),
-
-    AddCertificate(CertificateAndKey),
-    RemoveCertificate(CertFingerprint),
-
-    AddTcpFront(TcpFront),
-    RemoveTcpFront(TcpFront),
-
-    AddInstance(Instance),
-    RemoveInstance(Instance),
-
-    HttpProxy(HttpProxyConfiguration),
-    TlsProxy(TlsProxyConfiguration),
-
-    SoftStop,
-    HardStop,
-
-    Status
-}
 
 impl Order {
   pub fn get_topics(&self) -> Vec<Topic> {

@@ -15,7 +15,8 @@ use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 use sozu::channel::Channel;
 use sozu::network::proxy::Server;
 use sozu::network::session::Session;
-use sozu::network::{ProxyOrder,ServerMessage,http,tls};
+use sozu::messages::{ProxyOrder,ServerMessage};
+use sozu::network::{http,tls};
 use sozu_command::config::Config;
 
 use logging;

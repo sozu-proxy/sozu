@@ -30,10 +30,12 @@ use nom::IResult;
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
-use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,Protocol};
+use network::{Backend,ClientResult,ConnectionError,Protocol};
 use network::proxy::{Server,ProxyChannel};
-use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
-use messages::{self,CertFingerprint,CertificateAndKey,Order,TlsFront,TlsProxyConfiguration};
+use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,
+  Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
+use messages::{self,CertFingerprint,CertificateAndKey,Order,TlsFront,TlsProxyConfiguration,ProxyOrder,
+  ServerMessage,ServerMessageStatus};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;

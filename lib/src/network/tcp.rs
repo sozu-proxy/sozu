@@ -17,7 +17,7 @@ use std::str::FromStr;
 use time::{Duration,precise_time_s};
 use rand::random;
 use uuid::Uuid;
-use network::{Backend,ClientResult,ServerMessage,ServerMessageStatus,ConnectionError,ProxyOrder,RequiredEvents,Protocol};
+use network::{Backend,ClientResult,ConnectionError,RequiredEvents,Protocol};
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
 use network::buffer::Buffer;
@@ -25,7 +25,7 @@ use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use pool::{Pool,Checkout,Reset};
 
-use messages::{self,TcpFront,Order,Instance};
+use messages::{self,TcpFront,Order,Instance,ProxyOrder,ServerMessage,ServerMessageStatus};
 use channel::Channel;
 use util::UnwrapLog;
 
