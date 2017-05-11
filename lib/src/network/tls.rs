@@ -34,8 +34,8 @@ use network::{Backend,ClientResult,ConnectionError,Protocol};
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,
   Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
-use messages::{self,CertFingerprint,CertificateAndKey,Order,TlsFront,TlsProxyConfiguration,ProxyOrder,
-  ServerMessage,ServerMessageStatus};
+use messages::{self,CertFingerprint,CertificateAndKey,Order,TlsFront,TlsProxyConfiguration,OrderMessage,
+  OrderMessageAnswer,OrderMessageStatus};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
@@ -412,7 +412,7 @@ impl ServerConfiguration {
         let formatted_err = format!("could not create listener {:?}: {:?}", fronts, e);
         error!("{}", formatted_err);
         //FIXME: send message if we could not create the listener
-        //channel.write_message(&ServerMessage{id: String::from("listener_failed"), status: ServerMessageStatus::Error(formatted_err)});
+        //channel.write_message(&OrderMessageAnswer{id: String::from("listener_failed"), status: OrderMessageStatus::Error(formatted_err)});
         //channel.run();
         Err(e)
       }
@@ -939,29 +939,29 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     }
   }
 
-  fn notify(&mut self, event_loop: &mut Poll, channel: &mut ProxyChannel, message: ProxyOrder) {
+  fn notify(&mut self, event_loop: &mut Poll, channel: &mut ProxyChannel, message: OrderMessage) {
     trace!("{} notified", message);
     match message.order {
       Order::AddTlsFront(front) => {
         //info!("TLS\t{} add front {:?}", id, front);
           self.add_tls_front(front, event_loop);
-          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
       },
       Order::RemoveTlsFront(front) => {
         //info!("TLS\t{} remove front {:?}", id, front);
         self.remove_tls_front(front, event_loop);
-        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
       },
       Order::AddCertificate(certificate_and_key) => {
         //info!("TLS\t{} add certificate: {:?}", id, certificate_and_key);
           self.add_certificate(certificate_and_key, event_loop);
-          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
       },
       Order::RemoveCertificate(fingerprint) => {
         //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
         self.remove_certificate(fingerprint, event_loop);
         //FIXME: should return an error if certificate still has fronts referencing it
-        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
       },
       Order::AddInstance(instance) => {
         info!("{} add instance {:?}", message.id, instance);
@@ -969,9 +969,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
         } else {
-          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Order::RemoveInstance(instance) => {
@@ -980,9 +980,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
         } else {
-          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Order::HttpProxy(configuration) => {
@@ -993,24 +993,24 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
         };
-        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
         event_loop.deregister(&self.listener);
-        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing});
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
-        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
       },
       Order::Status => {
         info!("{} status", message.id);
-        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
       },
       command => {
         error!("{} unsupported message, ignoring {:?}", message.id, command);
-        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message"))});
       }
     }
   }
@@ -1070,9 +1070,9 @@ mod tests {
   use pool::Pool;
   use network::buffer::Buffer;
   use network::buffer_queue::BufferQueue;
-  use network::{ProxyOrder,ServerMessage};
   use network::http::DefaultAnswers;
   use network::trie::TrieNode;
+  use messages::{OrderMessage,OrderMessageAnswer};
   use openssl::ssl::{SslContext, SslMethod, Ssl, SslStream};
   use openssl::x509::X509;
 
@@ -1082,12 +1082,12 @@ mod tests {
   fn mi() {
     thread::spawn(|| { start_server(); });
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
-    let (tx,rx) = channel::<ServerMessage>();
+    let (tx,rx) = channel::<OrderMessageAnswer>();
     let (sender, jg) = start_listener(front, 10, 10, tx.clone());
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
-    sender.send(ProxyOrder::Order(Order::AddHttpFront(front)));
+    sender.send(OrderMessage::Order(Order::AddHttpFront(front)));
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
-    sender.send(ProxyOrder::Order(Order::AddInstance(instance)));
+    sender.send(OrderMessage::Order(Order::AddInstance(instance)));
     println!("test received: {:?}", rx.recv());
     println!("test received: {:?}", rx.recv());
     thread::sleep_ms(300);

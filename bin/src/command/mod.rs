@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use libc::pid_t;
 
-use sozu::messages::{Order,ProxyOrder,ServerMessage,ServerMessageStatus};
+use sozu::messages::{Order,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 use sozu::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
@@ -42,7 +42,7 @@ impl From<FrontToken> for usize {
 
 pub struct Worker {
   pub id:            u32,
-  pub channel:       Channel<ProxyOrder,ServerMessage>,
+  pub channel:       Channel<OrderMessage,OrderMessageAnswer>,
   pub token:         Option<Token>,
   pub pid:           pid_t,
   pub run_state:     RunState,
@@ -50,7 +50,7 @@ pub struct Worker {
 }
 
 impl Worker {
-  pub fn new(id: u32, pid: pid_t, channel: Channel<ProxyOrder,ServerMessage>, config: &Config) -> Worker {
+  pub fn new(id: u32, pid: pid_t, channel: Channel<OrderMessage,OrderMessageAnswer>, config: &Config) -> Worker {
     Worker {
       id:         id,
       channel:    channel,
@@ -267,9 +267,9 @@ impl CommandServer {
     }
   }
 
-  fn proxy_handle_message(&mut self, token: Token, msg: ServerMessage) {
+  fn proxy_handle_message(&mut self, token: Token, msg: OrderMessageAnswer) {
     //println!("got answer msg: {:?}", msg);
-    if msg.status != ServerMessageStatus::Processing {
+    if msg.status != OrderMessageStatus::Processing {
       if let Some(ref mut proxy) = self.proxies.get_mut(&token) {
         if let Some(order) = proxy.inflight.remove(&msg.id) {
           info!("REMOVING INFLIGHT MESSAGE {}: {:?}", msg.id, order);
@@ -285,12 +285,12 @@ impl CommandServer {
     let answer = ConfigMessageAnswer::new(
       msg.id.clone(),
       match msg.status {
-        ServerMessageStatus::Error(_)   => ConfigMessageStatus::Error,
-        ServerMessageStatus::Ok         => ConfigMessageStatus::Ok,
-        ServerMessageStatus::Processing => ConfigMessageStatus::Processing,
+        OrderMessageStatus::Error(_)   => ConfigMessageStatus::Error,
+        OrderMessageStatus::Ok         => ConfigMessageStatus::Ok,
+        OrderMessageStatus::Processing => ConfigMessageStatus::Processing,
       },
       match msg.status {
-        ServerMessageStatus::Error(s) => s.clone(),
+        OrderMessageStatus::Error(s) => s.clone(),
         _                             => String::new(),
       },
       None,

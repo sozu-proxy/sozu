@@ -10,31 +10,31 @@ use std::fmt;
 pub type MessageId = String;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct ServerMessage {
+pub struct OrderMessageAnswer {
   pub id:     MessageId,
-  pub status: ServerMessageStatus,
+  pub status: OrderMessageStatus,
 }
 
-impl fmt::Display for ServerMessage {
+impl fmt::Display for OrderMessageAnswer {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
     write!(f, "{}-{:?}", self.id, self.status)
   }
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub enum ServerMessageStatus {
+pub enum OrderMessageStatus {
   Ok,
   Processing,
   Error(String),
 }
 
 #[derive(Debug,Clone,Serialize,Deserialize)]
-pub struct ProxyOrder {
+pub struct OrderMessage {
   pub id:    MessageId,
   pub order: Order,
 }
 
-impl fmt::Display for ProxyOrder {
+impl fmt::Display for OrderMessage {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
     write!(f, "{}-{:?}", self.id, self.order)
   }

@@ -22,7 +22,7 @@ use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
 use network::socket::{SocketHandler,SocketResult,server_bind};
-use messages::{self,Order,HttpFront,HttpProxyConfiguration,ProxyOrder,ServerMessage,ServerMessageStatus};
+use messages::{self,Order,HttpFront,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 use channel::Channel;
 use parser::http11::hostname_and_port;
 use util::UnwrapLog;
@@ -349,7 +349,7 @@ impl ServerConfiguration {
         let formatted_err = format!("could not create listener {:?}: {:?}", front, e);
         error!("{}", formatted_err);
         //FIXME: return an error if listener creation failed
-        //channel.write_message(&ServerMessage{id: String::from("listener_failed"), status: ServerMessageStatus::Error(formatted_err)});
+        //channel.write_message(&OrderMessageAnswer{id: String::from("listener_failed"), status: OrderMessageStatus::Error(formatted_err)});
         //channel.run();
         Err(e)
       }
@@ -586,19 +586,19 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn notify(&mut self, event_loop: &mut Poll, channel: &mut ProxyChannel, message: ProxyOrder) {
+  fn notify(&mut self, event_loop: &mut Poll, channel: &mut ProxyChannel, message: OrderMessage) {
   // ToDo temporary
     trace!("{} notified", message);
     match message.order {
       Order::AddHttpFront(front) => {
         info!("{} add front {:?}", message.id, front);
           self.add_http_front(front, event_loop);
-          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
       },
       Order::RemoveHttpFront(front) => {
         info!("{} front {:?}", message.id, front);
         self.remove_http_front(front, event_loop);
-        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
       },
       Order::AddInstance(instance) => {
         info!("{} add instance {:?}", message.id, instance);
@@ -606,9 +606,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
         } else {
-          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Order::RemoveInstance(instance) => {
@@ -617,9 +617,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
         } else {
-          channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("cannot parse the address"))});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address"))});
         }
       },
       Order::HttpProxy(configuration) => {
@@ -630,28 +630,28 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
         };
-        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
         event_loop.deregister(&self.listener);
-        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Processing});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing});
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
       },
       Order::Status => {
         info!("{} status", message.id);
-        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
       },
       command => {
         debug!("{} unsupported message, ignoring: {:?}", message.id, command);
-        channel.write_message(&ServerMessage{ id: message.id, status: ServerMessageStatus::Error(String::from("unsupported message"))});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message"))});
       }
     }
   }
@@ -726,8 +726,7 @@ mod tests {
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
-  use messages::{Order,HttpFront,Instance,HttpProxyConfiguration};
-  use network::{ProxyOrder,ServerMessage};
+  use messages::{Order,HttpFront,Instance,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer};
   use network::buffer_queue::BufferQueue;
   use pool::Pool;
 
@@ -750,9 +749,9 @@ mod tests {
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
-    command.write_message(&ProxyOrder { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
+    command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
-    command.write_message(&ProxyOrder { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
+    command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
 
     println!("test received: {:?}", command.read_message());
     println!("test received: {:?}", command.read_message());
@@ -804,9 +803,9 @@ mod tests {
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
-    command.write_message(&ProxyOrder { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
+    command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1028 };
-    command.write_message(&ProxyOrder { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
+    command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
 
     println!("test received: {:?}", command.read_message());
     println!("test received: {:?}", command.read_message());

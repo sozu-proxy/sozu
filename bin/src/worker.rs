@@ -15,7 +15,7 @@ use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 use sozu::channel::Channel;
 use sozu::network::proxy::Server;
 use sozu::network::session::Session;
-use sozu::messages::{ProxyOrder,ServerMessage};
+use sozu::messages::{OrderMessage,OrderMessageAnswer};
 use sozu::network::{http,tls};
 use sozu_command::config::Config;
 
@@ -46,7 +46,7 @@ pub fn start_worker(id: u32, config: &Config) -> nix::Result<Worker> {
   }
 }
 
-fn generate_channels() -> io::Result<(Channel<ProxyOrder,ServerMessage>, Channel<ServerMessage,ProxyOrder>)> {
+fn generate_channels() -> io::Result<(Channel<OrderMessage,OrderMessageAnswer>, Channel<OrderMessageAnswer,OrderMessage>)> {
   let (command,proxy) = try!(UnixStream::pair());
   //FIXME: configurable buffer size
   let proxy_channel   = Channel::new(proxy, 10000, 20000);
@@ -55,7 +55,7 @@ fn generate_channels() -> io::Result<(Channel<ProxyOrder,ServerMessage>, Channel
 }
 
 pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
-  let mut command: Channel<ServerMessage,Config> = Channel::new(
+  let mut command: Channel<OrderMessageAnswer,Config> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
     channel_buffer_size,
     channel_buffer_size * 2
@@ -69,7 +69,7 @@ pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
   logging::setup(format!("{}-{}", "TAG", id), &proxy_config.log_level, &proxy_config.log_target);
 
   command.set_nonblocking(true);
-  let command: Channel<ServerMessage,ProxyOrder> = command.into();
+  let command: Channel<OrderMessageAnswer,OrderMessage> = command.into();
 
 
   let mut event_loop  = Poll::new().expect("could not create event loop");
@@ -97,7 +97,7 @@ pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
   info!("ending event loop");
 }
 
-pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Channel<ProxyOrder,ServerMessage>)> {
+pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Channel<OrderMessage,OrderMessageAnswer>)> {
   trace!("parent({})", unsafe { libc::getpid() });
 
   let (server, client) = UnixStream::pair().unwrap();
@@ -113,7 +113,7 @@ pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Ch
   let channel_buffer_size = config.channel_buffer_size.unwrap_or(10000);
   let channel_max_buffer_size = channel_buffer_size * 2;
 
-  let mut command: Channel<Config,ServerMessage> = Channel::new(
+  let mut command: Channel<Config,OrderMessageAnswer> = Channel::new(
     server,
     channel_buffer_size,
     channel_max_buffer_size
@@ -129,7 +129,7 @@ pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Ch
       command.write_message(config);
       command.set_nonblocking(true);
 
-      let command: Channel<ProxyOrder,ServerMessage> = command.into();
+      let command: Channel<OrderMessage,OrderMessageAnswer> = command.into();
       Ok((child, command))
     },
     Ok(ForkResult::Child) => {

@@ -57,12 +57,12 @@
 //!   port:       8080
 //! };
 //!
-//! command.write_message(network::ProxyOrder {
+//! command.write_message(&messages::OrderMessage {
 //!   id:    String::from("ID_ABCD"),
 //!   order: messages::Order::AddHttpFront(http_front)
 //! ));
 //!
-//! command.write_message(network::ProxyOrder {
+//! command.write_message(&messages::OrderMessage {
 //!   id:    String::from("ID_EFGH"),
 //!   order: messages::Order::AddInstance(http_instance)
 //! ));
@@ -131,12 +131,12 @@
 //!     port:       8080
 //!   };
 //!
-//!   command.write_message(network::ProxyOrder {
+//!   command.write_message(&messages::OrderMessage {
 //!     id:    String::from("ID_ABCD"),
 //!     order: messages::Order::AddHttpFront(http_front)
 //!   ));
 //!
-//!   command.write_message(network::ProxyOrder {
+//!   command.write_message(&messages::OrderMessage {
 //!     id:    String::from("ID_EFGH"),
 //!     order: messages::Order::AddInstance(http_instance)
 //!   ));

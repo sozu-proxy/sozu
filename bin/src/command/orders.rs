@@ -15,7 +15,7 @@ use mio::timer;
 use mio::{Poll,PollOpt,Ready,Token};
 use nom::{HexDisplay,IResult,Offset};
 
-use sozu::messages::{Order,ProxyOrder};
+use sozu::messages::{Order,OrderMessage};
 use sozu::channel::Channel;
 use sozu::network::buffer::Buffer;
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
@@ -131,7 +131,7 @@ impl CommandServer {
               //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
               self.conns[token].add_message_id(message_id.clone());
               //worker.state.handle_order(&o);
-              if !worker.channel.write_message(&ProxyOrder { id: message_id.clone(), order: o }) {
+              if !worker.channel.write_message(&OrderMessage { id: message_id.clone(), order: o }) {
                 error!("could not send to new worker({}-{}): {}", tag, worker.id, message_id);
               }
 
@@ -199,10 +199,10 @@ impl CommandServer {
       },
       ConfigCommand::ProxyConfiguration(order) => {
         if let &Order::AddTlsFront(ref data) = &order {
-          info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
+          info!("proxyconfig client order AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
           data.app_id, data.hostname, data.path_begin);
         } else {
-          info!("received client order {:?}", order);
+          info!("proxyconfig client order {:?}", order);
         }
 
         self.state.handle_order(&order);
@@ -223,7 +223,7 @@ impl CommandServer {
           let o = order.clone();
           self.conns[token].add_message_id(message.id.clone());
           //proxy.state.handle_order(&o);
-          proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), order: o });
+          proxy.channel.write_message(&OrderMessage { id: message.id.clone(), order: o });
           proxy.channel.run();
           found = true;
         }
@@ -274,16 +274,16 @@ impl CommandServer {
                   self.state.handle_order(&order);
 
                   if let &Order::AddTlsFront(ref data) = &order {
-                    info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
+                    info!("load state AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
                     data.app_id, data.hostname, data.path_begin);
                   } else {
-                    info!("received {:?}", order);
+                    info!("load state {:?}", order);
                   }
                   let mut found = false;
                   for ref mut proxy in self.proxies.values_mut() {
                     let o = order.clone();
                     //proxy.state.handle_order(&o);
-                    proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), order: o });
+                    proxy.channel.write_message(&OrderMessage { id: message.id.clone(), order: o });
                     proxy.channel.run();
                     found = true;
                   }
@@ -319,16 +319,16 @@ impl CommandServer {
         self.state.handle_order(&order);
 
         if let &Order::AddTlsFront(ref data) = &order {
-          info!("received AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
+          info!("config generated AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
           data.app_id, data.hostname, data.path_begin);
         } else {
-          info!("received {:?}", order);
+          info!("config generated {:?}", order);
         }
         let mut found = false;
         for ref mut proxy in self.proxies.values_mut() {
           let o = order.clone();
           //proxy.state.handle_order(&o);
-          proxy.channel.write_message(&ProxyOrder { id: message.id.clone(), order: o });
+          proxy.channel.write_message(&OrderMessage { id: message.id.clone(), order: o });
           proxy.channel.run();
           found = true;
         }

@@ -22,15 +22,15 @@ use rand::random;
 
 use network::{ClientResult,ConnectionError,
   SocketType,Protocol,RequiredEvents};
-use messages::{self,TcpFront,Order,Instance,MessageId,ProxyOrder,
-  ServerMessage,ServerMessageStatus};
+use messages::{self,TcpFront,Order,Instance,MessageId,OrderMessage,
+  OrderMessageAnswer,OrderMessageStatus};
 use channel::Channel;
 
 const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
 const DEFAULT_BACK_TIMEOUT:  u64 = 50000;
 
-pub type ProxyChannel = Channel<ServerMessage,ProxyOrder>;
+pub type ProxyChannel = Channel<OrderMessageAnswer,OrderMessage>;
 
 #[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
 pub struct ListenToken(pub usize);
@@ -151,7 +151,7 @@ pub enum AcceptError {
 
 pub trait ProxyConfiguration<Client> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client:&mut Client) ->Result<BackendConnectAction,ConnectionError>;
-  fn notify(&mut self, event_loop: &mut Poll, channel: &mut ProxyChannel, message: ProxyOrder);
+  fn notify(&mut self, event_loop: &mut Poll, channel: &mut ProxyChannel, message: OrderMessage);
   fn accept(&mut self, token: ListenToken) -> Result<(Client, bool), AcceptError>;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
   fn front_timeout(&self) -> u64;
@@ -375,7 +375,6 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
 }
 
 //type Timeout = usize;
-type Message = ProxyOrder;
 
 impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<ServerConfiguration,Client> {
 
@@ -552,7 +551,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
     }
   }
 
-  fn notify(&mut self, poll: &mut Poll, channel: &mut ProxyChannel, message: Message) {
+  fn notify(&mut self, poll: &mut Poll, channel: &mut ProxyChannel, message: OrderMessage) {
     self.configuration.notify(poll, channel, message);
   }
 

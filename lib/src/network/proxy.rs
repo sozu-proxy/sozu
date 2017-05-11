@@ -24,14 +24,14 @@ use network::{ClientResult,ConnectionError,
   SocketType,Protocol,RequiredEvents};
 use network::{http,tls,tcp};
 use network::session::{BackToken,FrontToken,ListenToken,ProxyClient,ProxyConfiguration,Readiness,Session};
-use messages::{self,TcpFront,Order,Instance,MessageId,ServerMessage,ServerMessageStatus,ProxyOrder};
+use messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageStatus,OrderMessage};
 use channel::Channel;
 
 const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
 const DEFAULT_BACK_TIMEOUT:  u64 = 50000;
 
-pub type ProxyChannel = Channel<ServerMessage,ProxyOrder>;
+pub type ProxyChannel = Channel<OrderMessageAnswer,OrderMessage>;
 
 #[derive(Debug,Clone,PartialEq)]
 enum ProxyType {
@@ -83,7 +83,6 @@ impl Server {
 }
 
 //type Timeout = usize;
-type Message = ProxyOrder;
 
 impl Server {
   pub fn run(&mut self) {
@@ -180,14 +179,14 @@ impl Server {
 
       if self.shutting_down.is_some() {
         info!("last client stopped, shutting down!");
-        self.channel.write_message(&ServerMessage{ id: self.shutting_down.take().expect("should have shut down correctly"), status: ServerMessageStatus::Ok});
+        self.channel.write_message(&OrderMessageAnswer{ id: self.shutting_down.take().expect("should have shut down correctly"), status: OrderMessageStatus::Ok});
         self.channel.run();
         return;
       }
     }
   }
 
-  fn notify(&mut self, message: Message) {
+  fn notify(&mut self, message: OrderMessage) {
     if let Some(mut http) = self.http.take() {
       http.configuration().notify(&mut self.poll, &mut self.channel, message.clone());
       self.http = Some(http);
