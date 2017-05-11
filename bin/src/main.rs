@@ -15,6 +15,7 @@ extern crate sozu_command_lib as sozu_command;
 
 #[cfg(target_os = "linux")]
 extern crate num_cpus;
+#[cfg(target_os = "linux")]
 extern crate procinfo;
 
 mod command;
@@ -98,10 +99,9 @@ fn main() {
     let metrics_socket = UdpSocket::bind("0.0.0.0:0").unwrap();
     let metrics_host   = (&config.metrics.address[..], config.metrics.port).to_socket_addrs().unwrap().next().unwrap();
     METRICS.lock().unwrap().set_up_remote(metrics_socket, metrics_host);
-    let metrics_guard = ProxyMetrics::run();
-    let process_limits_ok = if cfg!(target_os = "linux") { check_process_limits(config.clone()) } else { true };
+    let metrics_guard  = ProxyMetrics::run();
 
-    if process_limits_ok {
+    if check_process_limits(config.clone()) {
       match start_workers(&config) {
         Ok(workers) => {
           info!("created workers: {:?}", workers);
@@ -212,5 +212,10 @@ fn check_process_limits(config: Config) -> bool {
     return false;
   }
 
+  true
+}
+
+#[cfg(not(target_os = "linux"))]
+fn check_process_limits(_: Config) -> bool {
   true
 }
