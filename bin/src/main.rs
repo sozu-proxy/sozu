@@ -21,7 +21,6 @@ mod command;
 mod worker;
 mod logging;
 mod upgrade;
-mod limits;
 
 use std::net::{UdpSocket,ToSocketAddrs};
 use std::{mem,env};
@@ -198,16 +197,17 @@ fn check_process_limits(config: Config) -> bool {
 
   // check if all proxies are under the hard limit
   if http_max_cons > hard_limit || https_max_cons > hard_limit {
-    error!("At least one proxy can't have that much of connections.\
+    error!("At least one proxy can't have that much of connections. \
             Current max file descriptor hard limit is: {}", hard_limit);
     return false;
   }
 
   let total_proxies_connections = http_max_cons + https_max_cons;
-  let system_max_fd = limits::limits_file_max().expect("Couldn't read /proc/sys/fs/file-max");
+  let system_max_fd = procinfo::sys::fs::file_max::file_max()
+    .expect("Couldn't read /proc/sys/fs/file-max") as usize;
 
   if total_proxies_connections > system_max_fd {
-    error!("Proxies total max_connections can't be higher than system's file-max limit.\
+    error!("Proxies total max_connections can't be higher than system's file-max limit. \
             Current limit: {}, current value: {}", system_max_fd, total_proxies_connections);
     return false;
   }
