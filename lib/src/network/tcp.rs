@@ -470,29 +470,29 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let addr_string = tcp_front.ip_address + ":" + &tcp_front.port.to_string();
         if let Ok(front) = addr_string.parse() {
           if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, event_loop) {
-            channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+            channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
           } else {
             error!("Couldn't add tcp front");
-            channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot add tcp front"))});
+            channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot add tcp front")), data: None});
           }
         } else {
           error!("Couldn't parse tcp front address");
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address"))});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None});
         }
       },
       Order::RemoveTcpFront(front) => {
         trace!("{:?}", front);
         let _ = self.remove_tcp_front(front.app_id, event_loop);
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
       },
       Order::AddInstance(instance) => {
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.add_instance(&instance.app_id, addr, event_loop) {
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
         } else {
           error!("Couldn't add tcp instance");
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot add tcp instance"))});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot add tcp instance")), data: None});
         }
       },
       Order::RemoveInstance(instance) => {
@@ -500,10 +500,10 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let addr = &addr_string.parse().unwrap();
         if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
         } else {
           error!("Couldn't remove tcp instance");
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot remove tcp instance"))});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot remove tcp instance")), data: None});
         }
       },
       Order::SoftStop => {
@@ -511,19 +511,19 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         for listener in self.listeners.iter() {
           event_loop.deregister(&listener.sock);
         }
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None});
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
       },
       Order::Status => {
         info!("{} status", message.id);
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
       },
       _ => {
         error!("unsupported message, ignoring");
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message"))});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message")), data: None});
       }
     }
   }

@@ -179,7 +179,7 @@ impl Server {
 
       if self.shutting_down.is_some() {
         info!("last client stopped, shutting down!");
-        self.channel.write_message(&OrderMessageAnswer{ id: self.shutting_down.take().expect("should have shut down correctly"), status: OrderMessageStatus::Ok});
+        self.channel.write_message(&OrderMessageAnswer{ id: self.shutting_down.take().expect("should have shut down correctly"), status: OrderMessageStatus::Ok, data: None});
         self.channel.run();
         return;
       }

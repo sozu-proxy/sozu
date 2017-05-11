@@ -13,6 +13,7 @@ pub type MessageId = String;
 pub struct OrderMessageAnswer {
   pub id:     MessageId,
   pub status: OrderMessageStatus,
+  pub data:   Option<OrderMessageAnswerData>
 }
 
 impl fmt::Display for OrderMessageAnswer {
@@ -26,6 +27,12 @@ pub enum OrderMessageStatus {
   Ok,
   Processing,
   Error(String),
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub enum OrderMessageAnswerData {
+  //placeholder for now
+  Metrics,
 }
 
 #[derive(Debug,Clone,Serialize,Deserialize)]

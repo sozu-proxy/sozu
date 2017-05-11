@@ -945,23 +945,23 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       Order::AddTlsFront(front) => {
         //info!("TLS\t{} add front {:?}", id, front);
           self.add_tls_front(front, event_loop);
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
       },
       Order::RemoveTlsFront(front) => {
         //info!("TLS\t{} remove front {:?}", id, front);
         self.remove_tls_front(front, event_loop);
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
       },
       Order::AddCertificate(certificate_and_key) => {
         //info!("TLS\t{} add certificate: {:?}", id, certificate_and_key);
           self.add_certificate(certificate_and_key, event_loop);
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
       },
       Order::RemoveCertificate(fingerprint) => {
         //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
         self.remove_certificate(fingerprint, event_loop);
         //FIXME: should return an error if certificate still has fronts referencing it
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
       },
       Order::AddInstance(instance) => {
         info!("{} add instance {:?}", message.id, instance);
@@ -969,9 +969,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
         } else {
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address"))});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None});
         }
       },
       Order::RemoveInstance(instance) => {
@@ -980,9 +980,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
         } else {
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address"))});
+          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None});
         }
       },
       Order::HttpProxy(configuration) => {
@@ -993,24 +993,24 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
         };
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
         event_loop.deregister(&self.listener);
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None});
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
       },
       Order::Status => {
         info!("{} status", message.id);
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
       },
       command => {
         error!("{} unsupported message, ignoring {:?}", message.id, command);
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message"))});
+        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message")), data: None});
       }
     }
   }

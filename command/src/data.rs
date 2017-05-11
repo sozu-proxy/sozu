@@ -46,6 +46,7 @@ pub enum ConfigMessageStatus {
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub enum AnswerData {
   Workers(Vec<WorkerInfo>),
+  Metrics,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]

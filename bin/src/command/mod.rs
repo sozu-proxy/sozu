@@ -11,10 +11,10 @@ use std::collections::HashMap;
 use std::time::Duration;
 use libc::pid_t;
 
-use sozu::messages::{Order,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
+use sozu::messages::{Order,OrderMessage,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus};
 use sozu::channel::Channel;
 use sozu_command::state::ConfigState;
-use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
+use sozu_command::data::{AnswerData,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 use sozu_command::config::Config;
 
 pub mod orders;
@@ -282,6 +282,11 @@ impl CommandServer {
       }
     }
 
+    let data = match msg.data {
+      None => None,
+      Some(OrderMessageAnswerData::Metrics) => Some(AnswerData::Metrics),
+    };
+
     let answer = ConfigMessageAnswer::new(
       msg.id.clone(),
       match msg.status {
@@ -293,7 +298,7 @@ impl CommandServer {
         OrderMessageStatus::Error(s) => s.clone(),
         _                             => String::new(),
       },
-      None,
+      data,
     );
 
     info!("sending: {:?}", answer);
