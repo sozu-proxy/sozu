@@ -1040,7 +1040,7 @@ fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
       return Err(e)
     }
   };
-  ctx._set_ecdh_auto(true)
+  ctx.set_ecdh_auto(true)
 }
 
 #[cfg(ossl110)]

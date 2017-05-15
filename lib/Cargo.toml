@@ -34,7 +34,7 @@ libc = "^0.2"
 slab = "^0.3.0"
 pool = "^0.1"
 hex  = "^0.2"
-openssl = "^0.9.5"
+openssl = {version="^0.9.5", features= ["v102"]}
 openssl-sys = "^0.9.5"
 
 [dev-dependencies]
