@@ -25,6 +25,7 @@ use openssl::dh::Dh;
 use openssl::pkey::PKey;
 use openssl::hash::MessageDigest;
 use openssl::nid;
+use openssl::error::ErrorStack;
 use nom::IResult;
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
@@ -432,15 +433,9 @@ impl ServerConfiguration {
 
     context.set_cipher_list(&config.cipher_list);
 
-    match Dh::get_2048_256() {
-      Ok(dh) => context.set_tmp_dh(&dh),
-      Err(e) => {
-        //return Err(io::Error::new(io::ErrorKind::Other, e.description()))
-        return None
-      }
-    };
-
-    context.set_ecdh_auto(true);
+    if let Err(e) = setup_curves(&mut context) {
+      error!("could not setup curves for openssl");
+    }
 
     //FIXME: get the default cert and key from the configuration
     let cert_read = config.default_certificate.as_ref().map(|vec| &vec[..]).unwrap_or(&include_bytes!("../../assets/certificate.pem")[..]);
@@ -586,14 +581,9 @@ impl ServerConfiguration {
     let mut ctx = c.expect("should have built a correct SSL context");
     let opt = ctx.set_options(unwrap_msg!(SslOption::from_bits(self.config.options)));
 
-    match Dh::get_2048_256() {
-      Ok(dh) => ctx.set_tmp_dh(&dh),
-      Err(e) => {
-        return false;
-      }
-    };
-
-    ctx.set_ecdh_auto(true);
+    if let Err(e) = setup_curves(&mut ctx) {
+      error!("could not setup curves for openssl");
+    }
 
     let mut cert_read  = &certificate_and_key.certificate.as_bytes()[..];
     let mut key_read   = &certificate_and_key.key.as_bytes()[..];
@@ -1030,6 +1020,32 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   fn back_timeout(&self)  -> u64 {
     self.back_timeout
   }
+}
+
+
+#[cfg(ossl101)]
+pub fn setup_curves(ctx: SslContextBuilder) -> Result<(), ErrorStack> {
+  use ec::EcKey;
+  use nid;
+
+  let curve = try!(EcKey::from_curve_name(nid::X9_62_PRIME256V1));
+  ctx.set_tmp_ecdh(&curve)
+}
+
+#[cfg(ossl102)]
+fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
+  match Dh::get_2048_256() {
+    Ok(dh) => context.set_tmp_dh(&dh),
+    Err(e) => {
+      return Err(e)
+    }
+  };
+  ctx._set_ecdh_auto(true)
+}
+
+#[cfg(ossl110)]
+fn setup_curves(_: &mut SslContextBuilder) -> Result<(), ErrorStack> {
+  Ok(())
 }
 
 pub type TlsServer = Session<ServerConfiguration,TlsClient>;
