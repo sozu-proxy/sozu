@@ -1035,7 +1035,7 @@ pub fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
 #[cfg(ossl102)]
 fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
   match Dh::get_2048_256() {
-    Ok(dh) => context.set_tmp_dh(&dh),
+    Ok(dh) => ctx.set_tmp_dh(&dh),
     Err(e) => {
       return Err(e)
     }
