@@ -1024,9 +1024,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
 
 #[cfg(ossl101)]
-pub fn setup_curves(ctx: SslContextBuilder) -> Result<(), ErrorStack> {
-  use ec::EcKey;
-  use nid;
+pub fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
+  use openssl::ec::EcKey;
+  use openssl::nid;
 
   let curve = try!(EcKey::from_curve_name(nid::X9_62_PRIME256V1));
   ctx.set_tmp_ecdh(&curve)
