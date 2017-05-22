@@ -1,11 +1,5 @@
-
 FROM alpine:edge
 
-#COPY ["Cargo.*", "/source/"]
-#COPY bin/ /source/bin/
-#COPY command/ /source/command/
-#COPY lib/ /source/lib/
-#COPY ctl/ /source/ctl/
 COPY . /source/
 COPY bin/config.toml /etc/sozu/sozu.toml
 
@@ -31,4 +25,4 @@ RUN apk add --no-cache --virtual .build-dependencies \
 EXPOSE 80
 EXPOSE 443
 
-ENTRYPOINT ["/bin/sozu"]
+CMD ["/bin/sozu", "--help"]
