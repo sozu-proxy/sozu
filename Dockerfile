@@ -14,8 +14,8 @@ RUN apk add --no-cache --virtual .build-dependencies \
   cargo build --release && \
   cd ../bin && \
   cargo build --release && \
-  cp /source/target/release/sozu /bin/sozu && \
-  cp /source/target/release/sozuctl /bin/sozuctl && \
+  cp /source/target/release/sozu /sozu && \
+  cp /source/target/release/sozuctl /sozuctl && \
   cd / && \
   apk del .build-dependencies && \
   apk del && \
@@ -25,4 +25,4 @@ RUN apk add --no-cache --virtual .build-dependencies \
 EXPOSE 80
 EXPOSE 443
 
-CMD ["/bin/sozu", "--help"]
+CMD ["/sozu", "--help"]
