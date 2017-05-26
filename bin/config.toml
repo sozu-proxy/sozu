@@ -1,7 +1,7 @@
 # sozu proxy test config file
 
-command_socket = "/var/run/sozu/socket"
-saved_state    = "/var/run/sozu/state.json"
+command_socket = "./command_folder/sock"
+saved_state    = "./state.json"
 log_level      = "info"
 log_target     = "stdout"
 #log_target     = "udp://127.0.0.1:9876"
@@ -47,3 +47,4 @@ key = "../lib/assets/key.pem" # optional
 certificate_chain = "../lib/assets/certificate_chain.pem" # optional
 frontends = ["HTTP", "TLS"] # list of proxy tags
 backends  = [ "127.0.0.1:1026" ] # list of IP/port
+
