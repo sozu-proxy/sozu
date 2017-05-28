@@ -19,8 +19,8 @@ address = "127.0.0.1"
 max_connections = 500
 port = 8080
 buffer_size = 16384
-#answer_404 = "__DATA_DIR__/html/404.html"
-#answer_503 = "__DATA_DIR__/html/503.html"
+answer_404 = "__DATA_DIR__/html/404.html"
+answer_503 = "__DATA_DIR__/html/503.html"
 
 [https]
 address = "127.0.0.1"
@@ -34,8 +34,8 @@ default_app_id = "MyApp"
 #default_certificate_chain = "../lib/assets/cert__chain_test.pem"
 #default_key = "../lib/assets/key_test.pem"
 
-#answer_404 = "__DATA_DIR__/html/404.html"
-#answer_503 = "__DATA_DIR__/html/503.html"
+answer_404 = "__DATA_DIR__/html/404.html"
+answer_503 = "__DATA_DIR__/html/503.html"
 
 [applications]
 

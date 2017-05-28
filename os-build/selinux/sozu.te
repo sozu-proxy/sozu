@@ -1,0 +1,54 @@
+policy_module(sozu, 0.1.0)
+
+########################################
+#
+# Declarations
+#
+
+## <desc>
+##     <p>
+##     Determine whether sozu can
+##     connect to all TCP ports.
+##     </p>
+## </desc>
+gen_tunable(sozu_connect_any, false)
+
+type sozu_t;
+domain_type(sozu_t)
+
+type sozu_exec_t;
+files_type(sozu_exec_t)
+
+type sozu_var_run_t;
+files_type(sozu_var_run_t)
+
+type sozu_unit_file_t;
+systemd_unit_file(sozu_unit_file_t)
+
+#============= sozu_t ==================
+allow sozu_t self:capability kill;
+allow sozu_t self:process fork;
+
+allow sozu_t self:unix_stream_socket create_stream_socket_perms;
+allow sozu_t self:tcp_socket create_stream_socket_perms;
+
+manage_dirs_pattern(sozu_t, sozu_var_run_t, sozu_var_run_t)
+manage_files_pattern(sozu_t, sozu_var_run_t, sozu_var_run_t)
+manage_sock_files_pattern(sozu_t, sozu_var_run_t, sozu_var_run_t)
+
+corenet_sendrecv_unlabeled_packets(sozu_t)
+corenet_tcp_bind_http_port(sozu_t)
+corenet_tcp_bind_http_cache_port(sozu_t)
+
+dev_read_rand(sozu_t)
+dev_read_urand(sozu_t)
+
+sysnet_dns_name_resolve(sozu_t)
+
+tunable_policy(`sozu_connect_any',`
+    corenet_tcp_connect_all_ports(sozu_t)
+	corenet_tcp_bind_all_ports(sozu_t)
+	corenet_sendrecv_all_packets(sozu_t)
+	corenet_tcp_sendrecv_all_ports(sozu_t)
+')
+
