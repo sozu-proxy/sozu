@@ -27,17 +27,28 @@ pub struct TlsProxy {
 
 #[derive(Debug,Default,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct ConfigState {
-  instances: HashMap<AppId, Vec<Instance>>,
-  http_fronts: HashMap<AppId, Vec<HttpFront>>,
-  https_fronts: HashMap<AppId, Vec<TlsFront>>,
-  certificates: HashMap<CertFingerprint, CertificateAndKey>,
+  instances:       HashMap<AppId, Vec<Instance>>,
+  http_fronts:     HashMap<AppId, Vec<HttpFront>>,
+  https_fronts:    HashMap<AppId, Vec<TlsFront>>,
+  certificates:    HashMap<CertFingerprint, CertificateAndKey>,
   //ip, port
-  http_addresses: Vec<(String, u16)>,
+  http_addresses:  Vec<(String, u16)>,
   https_addresses: Vec<(String, u16)>,
   //tcp:
 }
 
 impl ConfigState {
+  pub fn new() -> ConfigState {
+    ConfigState {
+      instances:       HashMap::new(),
+      http_fronts:     HashMap::new(),
+      https_fronts:    HashMap::new(),
+      certificates:    HashMap::new(),
+      http_addresses:  Vec::new(),
+      https_addresses: Vec::new(),
+    }
+  }
+
   pub fn add_http_address(&mut self, ip_address: String, port: u16) {
     self.http_addresses.push((ip_address, port))
   }
