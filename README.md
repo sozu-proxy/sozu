@@ -83,7 +83,7 @@ RUST_LOG=info,sozu_lib::parser::http11=trace ./target/debug/sozu
 
 ## License
 
-Copyright (C) 2015-2016 Geoffroy Couprie, Clément Delafargue
+Copyright (C) 2015-2017 Geoffroy Couprie, Clément Delafargue
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU Affero General Public License as published by the Free
