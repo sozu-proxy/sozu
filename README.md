@@ -21,7 +21,7 @@ Build the most reliable reverse proxy ever:
 ## Building and starting
 
 Requirements:
-- openssl 1.0.1 or above (More informations to update/upgrade openssl libs on your distrib [here] (https://libraries.io/cargo/openssl-sys/). Default is 0.9.x and need to update to build project.
+- openssl 1.0.1 or above (More informations to update/upgrade openssl libs on your distrib [here](https://libraries.io/cargo/openssl-sys/). Default is 0.9.x and need to update to build project.
 
 You can create the required executables like this:
 
