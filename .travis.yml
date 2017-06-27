@@ -15,7 +15,6 @@ addons:
       - libelf-dev
       - libdw-dev
       - binutils-dev
-      - libbfd-dev
       - cmake
     sources:
       - kalakris-cmake
