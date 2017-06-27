@@ -137,9 +137,10 @@ impl CommandServer {
     let state: ConfigState = Default::default();
 
 
-    for proxy in proxy_vec.drain(..) {
+    for mut proxy in proxy_vec.drain(..) {
       token_count += 1;
       poll.register(&proxy.channel.sock, Token(token_count), Ready::all(), PollOpt::edge()).unwrap();
+      proxy.token = Some(Token(token_count));
       proxies.insert(Token(token_count), proxy);
     }
 

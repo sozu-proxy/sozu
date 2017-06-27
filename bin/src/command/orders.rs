@@ -151,6 +151,7 @@ impl CommandServer {
           info!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
             worker_token, tag, worker.id, worker.channel.sock.take_error());
           self.poll.register(&worker.channel.sock, Token(worker_token), Ready::all(), PollOpt::edge()).unwrap();
+          worker.token = Some(Token(worker_token));
           self.proxies.insert(Token(worker_token), worker);
 
           self.conns[token].write_message(&ConfigMessageAnswer::new(
