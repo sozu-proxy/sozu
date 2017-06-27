@@ -3,9 +3,10 @@ use std::str;
 use std::process;
 use std::io::Read;
 use std::io::Write;
+use std::iter::FromIterator;
 use std::thread::sleep;
 use std::time::Duration;
-use std::collections::HashMap;
+use std::collections::{HashMap,HashSet};
 use std::os::unix::io::{AsRawFd,FromRawFd};
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 use slab::Slab;
@@ -127,6 +128,10 @@ impl CommandServer {
             for order in self.state.generate_orders() {
               let message_id = format!("LAUNCH-CONF-{}", counter);
               worker.inflight.insert(message_id.clone(), order.clone());
+              let mut hs = HashSet::new();
+              hs.insert(worker_token);
+              self.inflight.insert(message_id.clone(), hs);
+
               let o = order.clone();
               //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
               self.conns[token].add_message_id(message_id.clone());
@@ -219,6 +224,13 @@ impl CommandServer {
             proxy.run_state = RunState::Stopping;
           }
 
+          if self.inflight.contains_key(&message.id) {
+            self.inflight.get_mut(&message.id).map(|hs| hs.insert(token.0));
+          } else {
+            let mut hs = HashSet::new();
+            hs.insert(token.0);
+            self.inflight.insert(message.id.clone(), hs);
+          }
           proxy.inflight.insert(message.id.clone(), order.clone());
           let o = order.clone();
           self.conns[token].add_message_id(message.id.clone());
@@ -384,6 +396,7 @@ impl CommandServer {
       state:       state,
       next_id:     self.next_id,
       token_count: self.token_count,
+      inflight:    self.inflight.clone(),
     }
   }
 
@@ -396,6 +409,7 @@ impl CommandServer {
       state,
       next_id,
       token_count,
+      inflight,
     } = upgrade_data;
 
     println!("listener is: {}", command);
@@ -446,6 +460,7 @@ impl CommandServer {
       next_id:         next_id,
       state:           config_state,
       token_count:     token_count,
+      inflight:        inflight,
     }
   }
 }

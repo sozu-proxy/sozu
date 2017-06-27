@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::io::{self,ErrorKind};
 use std::os::unix::fs::PermissionsExt;
-use std::collections::HashMap;
+use std::collections::{HashMap,HashSet};
 use std::time::Duration;
 use libc::pid_t;
 
@@ -86,6 +86,7 @@ pub struct CommandServer {
   timer:           Timer<Token>,
   config:          Config,
   token_count:     usize,
+  inflight:        HashMap<String,HashSet<usize>>
 }
 
 impl CommandServer {
@@ -162,6 +163,7 @@ impl CommandServer {
       timer:           timer,
       config:          config,
       token_count:     token_count,
+      inflight:        HashMap::new(),
     }
   }
 
@@ -279,6 +281,14 @@ impl CommandServer {
             proxy.run_state = RunState::Stopped
           }
         }
+      }
+
+      if let Some(ref mut workers) = self.inflight.get_mut(&msg.id)  {
+        workers.remove(&token.0);
+      }
+
+      if self.inflight.get(&msg.id).map(|set| set.len()).unwrap_or(0) == 0 {
+        self.inflight.remove(&msg.id);
       }
     }
 

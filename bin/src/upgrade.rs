@@ -1,6 +1,7 @@
 use mio_uds::UnixStream;
 use mio::Token;
 use libc::{self,pid_t};
+use std::collections::{HashMap,HashSet};
 use std::process::Command;
 use std::os::unix::process::CommandExt;
 use std::os::unix::io::{AsRawFd,FromRawFd};
@@ -46,6 +47,7 @@ pub struct UpgradeData {
   pub state:       ConfigState,
   pub next_id:     u32,
   pub token_count: usize,
+  pub inflight:    HashMap<String, HashSet<usize>>,
 }
 
 pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<UpgradeData,bool>) {
