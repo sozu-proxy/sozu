@@ -226,10 +226,12 @@ impl CommandServer {
           }
 
           if self.inflight.contains_key(&message.id) {
-            self.inflight.get_mut(&message.id).map(|hs| hs.insert(token.0));
+            self.inflight.get_mut(&message.id).map(|hs| hs.insert(proxy.token.expect("worker should have a valid token").0));
+            trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.inflight);
           } else {
             let mut hs = HashSet::new();
-            hs.insert(token.0);
+            hs.insert(proxy.token.expect("worker should have a valid token").0);
+            trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.inflight);
             self.inflight.insert(message.id.clone(), hs);
           }
           proxy.inflight.insert(message.id.clone(), order.clone());

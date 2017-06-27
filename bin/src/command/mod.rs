@@ -271,25 +271,34 @@ impl CommandServer {
   }
 
   fn proxy_handle_message(&mut self, token: Token, msg: OrderMessageAnswer) {
-    //println!("got answer msg: {:?}", msg);
+    //info!("token {:?} got answer msg: {:?}", token, msg);
+    //info!("inflight: {:?}", self.inflight);
     if msg.status != OrderMessageStatus::Processing {
+      let mut stopping = false;
       if let Some(ref mut proxy) = self.proxies.get_mut(&token) {
         if let Some(order) = proxy.inflight.remove(&msg.id) {
           info!("REMOVING INFLIGHT MESSAGE {}: {:?}", msg.id, order);
           // handle message completion here
           // there will probably be other cases to handle in the future
           if order == Order::SoftStop || order == Order::HardStop {
+            stopping = true;
             proxy.run_state = RunState::Stopped
           }
         }
       }
 
       if let Some(ref mut workers) = self.inflight.get_mut(&msg.id)  {
+        //info!("will remove token {} for id {}", token.0, msg.id);
         workers.remove(&token.0);
       }
+      //info!("inflight is now: {:?}", self.inflight);
 
       if self.inflight.get(&msg.id).map(|set| set.len()).unwrap_or(0) == 0 {
         self.inflight.remove(&msg.id);
+
+        if stopping {
+          panic!("proxy ending, maybe stop cleanly instead of panicking?");
+        }
       }
     }
 
