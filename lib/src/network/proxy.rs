@@ -24,7 +24,7 @@ use network::{ClientResult,ConnectionError,
   SocketType,Protocol,RequiredEvents};
 use network::{http,tls,tcp};
 use network::session::{BackToken,FrontToken,ListenToken,ProxyClient,ProxyConfiguration,Readiness,Session};
-use messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageStatus,OrderMessage};
+use messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageStatus,OrderMessage,Topic};
 use channel::Channel;
 
 const SERVER: Token = Token(0);
@@ -187,17 +187,25 @@ impl Server {
   }
 
   fn notify(&mut self, message: OrderMessage) {
-    if let Some(mut http) = self.http.take() {
-      http.configuration().notify(&mut self.poll, &mut self.channel, message.clone());
-      self.http = Some(http);
+    let topics = message.order.get_topics();
+
+    if topics.contains(&Topic::HttpProxyConfig) {
+      if let Some(mut http) = self.http.take() {
+        http.configuration().notify(&mut self.poll, &mut self.channel, message.clone());
+        self.http = Some(http);
+      }
     }
-    if let Some(mut https) = self.https.take() {
-      https.configuration().notify(&mut self.poll, &mut self.channel, message.clone());
-      self.https = Some(https);
+    if topics.contains(&Topic::TlsProxyConfig) {
+      if let Some(mut https) = self.https.take() {
+        https.configuration().notify(&mut self.poll, &mut self.channel, message.clone());
+        self.https = Some(https);
+      }
     }
-    if let Some(mut tcp) = self.tcp.take() {
-      tcp.configuration().notify(&mut self.poll, &mut self.channel, message);
-      self.tcp = Some(tcp);
+    if topics.contains(&Topic::TcpProxyConfig) {
+      if let Some(mut tcp) = self.tcp.take() {
+        tcp.configuration().notify(&mut self.poll, &mut self.channel, message);
+        self.tcp = Some(tcp);
+      }
     }
   }
 

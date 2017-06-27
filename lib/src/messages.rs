@@ -3,6 +3,7 @@ use serde::ser::SerializeMap;
 use serde_json;
 use openssl::ssl;
 use std::net::{IpAddr,SocketAddr};
+use std::collections::HashSet;
 use std::default::Default;
 use std::convert::From;
 use std::fmt;
@@ -199,23 +200,23 @@ impl Default for TlsProxyConfiguration {
 
 
 impl Order {
-  pub fn get_topics(&self) -> Vec<Topic> {
+  pub fn get_topics(&self) -> HashSet<Topic> {
     match *self {
-      Order::AddHttpFront(_)      => vec![Topic::HttpProxyConfig                       ],
-      Order::RemoveHttpFront(_)   => vec![Topic::HttpProxyConfig                       ],
-      Order::AddTlsFront(_)       => vec![Topic::TlsProxyConfig                        ],
-      Order::RemoveTlsFront(_)    => vec![Topic::TlsProxyConfig                        ],
-      Order::AddCertificate(_)    => vec![Topic::TlsProxyConfig                        ],
-      Order::RemoveCertificate(_) => vec![Topic::TlsProxyConfig                        ],
-      Order::AddTcpFront(_)       => vec![Topic::TcpProxyConfig                        ],
-      Order::RemoveTcpFront(_)    => vec![Topic::TcpProxyConfig                        ],
-      Order::AddInstance(_)       => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
-      Order::RemoveInstance(_)    => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
-      Order::HttpProxy(_)         => vec![Topic::HttpProxyConfig],
-      Order::TlsProxy(_)          => vec![Topic::TlsProxyConfig],
-      Order::SoftStop             => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
-      Order::HardStop             => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
-      Order::Status               => vec![Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig],
+      Order::AddHttpFront(_)      => [Topic::HttpProxyConfig].iter().cloned().collect(),
+      Order::RemoveHttpFront(_)   => [Topic::HttpProxyConfig].iter().cloned().collect(),
+      Order::AddTlsFront(_)       => [Topic::TlsProxyConfig].iter().cloned().collect(),
+      Order::RemoveTlsFront(_)    => [Topic::TlsProxyConfig].iter().cloned().collect(),
+      Order::AddCertificate(_)    => [Topic::TlsProxyConfig].iter().cloned().collect(),
+      Order::RemoveCertificate(_) => [Topic::TlsProxyConfig].iter().cloned().collect(),
+      Order::AddTcpFront(_)       => [Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::RemoveTcpFront(_)    => [Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::AddInstance(_)       => [Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::RemoveInstance(_)    => [Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::HttpProxy(_)         => [Topic::HttpProxyConfig].iter().cloned().collect(),
+      Order::TlsProxy(_)          => [Topic::TlsProxyConfig].iter().cloned().collect(),
+      Order::SoftStop             => [Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::HardStop             => [Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::Status               => [Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
     }
   }
 }
