@@ -464,6 +464,7 @@ impl CommandServer {
       state:           config_state,
       token_count:     token_count,
       inflight:        inflight,
+      must_stop:       false,
     }
   }
 }

@@ -86,7 +86,8 @@ pub struct CommandServer {
   timer:           Timer<Token>,
   config:          Config,
   token_count:     usize,
-  inflight:        HashMap<String,HashSet<usize>>
+  inflight:        HashMap<String,HashSet<usize>>,
+  must_stop:       bool,
 }
 
 impl CommandServer {
@@ -165,6 +166,7 @@ impl CommandServer {
       config:          config,
       token_count:     token_count,
       inflight:        HashMap::new(),
+      must_stop:       false,
     }
   }
 
@@ -186,6 +188,11 @@ impl CommandServer {
       self.poll.poll(&mut events, poll_timeout).unwrap();
       for event in events.iter() {
         self.ready(event.token(), event.kind());
+      }
+
+      if self.must_stop {
+        info!("stopping...");
+        break;
       }
     }
   }
@@ -297,7 +304,7 @@ impl CommandServer {
         self.inflight.remove(&msg.id);
 
         if stopping {
-          panic!("proxy ending, maybe stop cleanly instead of panicking?");
+          self.must_stop = true;
         }
       }
     }
