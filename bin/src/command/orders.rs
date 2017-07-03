@@ -20,6 +20,7 @@ use sozu::messages::{Order,OrderMessage};
 use sozu::channel::Channel;
 use sozu::network::buffer::Buffer;
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
+use sozu_command::state::ConfigState;
 
 use super::{CommandServer,FrontToken,ProxyConfiguration,Worker};
 use super::client::parse;
@@ -209,7 +210,7 @@ impl CommandServer {
 
           let mut offset = 0;
           match parse(buffer.data()) {
-            IResult::Done(i, o) => {
+            IResult::Done(i, orders) => {
               if i.len() > 0 {
                 info!("could not parse {} bytes", i.len());
                 if previous == buffer.available_data() {
@@ -218,30 +219,41 @@ impl CommandServer {
               }
               offset = buffer.data().offset(i);
 
-              for message in o {
+              let mut new_state = ConfigState::new();
+              for message in orders {
                 if let ConfigCommand::ProxyConfiguration(order) = message.data {
+                  new_state.handle_order(&order);
+                }
+              }
 
-                  self.state.handle_order(&order);
+              let diff = self.state.diff(&new_state);
+              let mut counter = 0;
+              for order in diff {
+                self.state.handle_order(&order);
 
-                  if let &Order::AddTlsFront(ref data) = &order {
-                    info!("load state AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
-                    data.app_id, data.hostname, data.path_begin);
-                  } else {
-                    info!("load state {:?}", order);
-                  }
-                  let mut found = false;
-                  for ref mut proxy in self.proxies.values_mut() {
-                    let o = order.clone();
-                    //proxy.state.handle_order(&o);
-                    proxy.channel.write_message(&OrderMessage { id: message.id.clone(), order: o });
-                    proxy.channel.run();
-                    found = true;
-                  }
+                if let &Order::AddTlsFront(ref data) = &order {
+                  info!("load state AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
+                  data.app_id, data.hostname, data.path_begin);
+                } else {
+                  info!("load state {:?}", order);
+                }
 
-                  if !found {
-                    // FIXME: should send back error here
-                    error!("no proxy found");
-                  }
+                let mut found = false;
+                let id = format!("LOAD-STATE-{}", counter);
+
+                for ref mut proxy in self.proxies.values_mut() {
+                  let o = order.clone();
+                  //proxy.state.handle_order(&o);
+                  proxy.channel.write_message(&OrderMessage { id: id.clone(), order: o });
+                  proxy.channel.run();
+                  found = true;
+
+                  counter += 1;
+                }
+
+                if !found {
+                  // FIXME: should send back error here
+                  error!("no proxy found");
                 }
               }
             },
