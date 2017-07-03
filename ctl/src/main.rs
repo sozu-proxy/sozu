@@ -17,7 +17,7 @@ use sozu::channel::Channel;
 use sozu_command::config::Config;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 
-use command::{dump_state,load_state,save_state,soft_stop,hard_stop,upgrade,status};
+use command::{dump_state,load_state,save_state,soft_stop,hard_stop,upgrade,status, remove_backend, add_backend};
 
 fn main() {
   let matches = App::new("sozuctl")
@@ -56,6 +56,44 @@ fn main() {
                                                     .help("Save state to that file")
                                                     .takes_value(true)))
                                     .subcommand(SubCommand::with_name("dump")))
+                        .subcommand(SubCommand::with_name("backend")
+                                                .about("backend management")
+                                                .subcommand(SubCommand::with_name("remove")
+                                                  .arg(Arg::with_name("id")
+                                                      .short("i")
+                                                      .long("id")
+                                                      .value_name("app id of the backend")
+                                                      .takes_value(true)
+                                                      .required(true))
+                                                  .arg(Arg::with_name("ip")
+                                                      .long("ip")
+                                                      .value_name("ip of the backend")
+                                                      .takes_value(true)
+                                                      .required(true))
+                                                  .arg(Arg::with_name("port")
+                                                      .long("port")
+                                                      .short("p")
+                                                      .value_name("port of the backend")
+                                                      .takes_value(true)
+                                                      .required(true)))
+                                                .subcommand(SubCommand::with_name("add")
+                                                  .arg(Arg::with_name("id")
+                                                      .short("i")
+                                                      .long("id")
+                                                      .value_name("app id of the backend")
+                                                      .takes_value(true)
+                                                      .required(true))
+                                                  .arg(Arg::with_name("ip")
+                                                      .long("ip")
+                                                      .value_name("ip of the backend")
+                                                      .takes_value(true)
+                                                      .required(true))
+                                                  .arg(Arg::with_name("port")
+                                                      .long("port")
+                                                      .short("p")
+                                                      .value_name("port of the backend")
+                                                      .takes_value(true)
+                                                      .required(true))))
                         .get_matches();
 
   let config_file = matches.value_of("config").expect("required config file");
@@ -94,6 +132,23 @@ fn main() {
           dump_state(&mut channel);
         },
         _                   => println!("unknown state management command")
+      }
+    },
+    ("backend", Some(sub)) => {
+      match sub.subcommand() {
+        ("remove", Some(backend_sub)) => {
+          let id = backend_sub.value_of("id").expect("missing id");
+          let ip = backend_sub.value_of("ip").expect("missing backend ip");
+          let port: u16 = backend_sub.value_of("port").expect("mssing backend port").parse().unwrap();
+          remove_backend(&mut channel, id, ip, port);
+        }
+        ("add", Some(backend_sub)) => {
+          let id = backend_sub.value_of("id").expect("missing id");
+          let ip = backend_sub.value_of("ip").expect("missing backend ip");
+          let port: u16 = backend_sub.value_of("port").expect("mssing backend port").parse().unwrap();
+          add_backend(&mut channel, id, ip, port);
+        }
+        _ => println!("unknown backend management command")
       }
     },
     _                => println!("unknown subcommand")
