@@ -102,72 +102,7 @@ impl CommandServer {
       },
       ConfigCommand::LaunchWorker(tag) => {
         info!("received LaunchWorker with tag \"{}\"", tag);
-
-        let id = self.next_id + 1;
-        if let Ok(mut worker) = start_worker(id, &self.config) {
-          self.conns[token].write_message(&ConfigMessageAnswer::new(
-            message.id.clone(),
-            ConfigMessageStatus::Processing,
-            "sending configuration orders".to_string(),
-            None
-          ));
-          info!("created new worker");
-
-          self.next_id += 1;
-
-          let worker_token = self.token_count + 1;
-          self.token_count = worker_token;
-          worker.token     = Some(Token(worker_token));
-
-          if let Some(ref previous) = self.proxies.values().filter(|ref proxy| {
-            proxy.run_state == RunState::Running
-          }).next() {
-            worker.channel.set_blocking(true);
-
-            let mut counter = 0u32;
-            for order in self.state.generate_orders() {
-              let message_id = format!("LAUNCH-CONF-{}", counter);
-              worker.inflight.insert(message_id.clone(), order.clone());
-              let mut hs = HashSet::new();
-              hs.insert(worker_token);
-              self.inflight.insert(message_id.clone(), hs);
-
-              let o = order.clone();
-              //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
-              self.conns[token].add_message_id(message_id.clone());
-              //worker.state.handle_order(&o);
-              if !worker.channel.write_message(&OrderMessage { id: message_id.clone(), order: o }) {
-                error!("could not send to new worker({}-{}): {}", tag, worker.id, message_id);
-              }
-
-              let received = worker.channel.read_message();
-              info!("worker ({}-{}) sent: {:?}", tag, worker.id, received);
-              //worker.channel.run();
-              counter += 1;
-            }
-            worker.channel.set_blocking(false);
-          }
-
-          info!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
-            worker_token, tag, worker.id, worker.channel.sock.take_error());
-          self.poll.register(&worker.channel.sock, Token(worker_token), Ready::all(), PollOpt::edge()).unwrap();
-          worker.token = Some(Token(worker_token));
-          self.proxies.insert(Token(worker_token), worker);
-
-          self.conns[token].write_message(&ConfigMessageAnswer::new(
-            message.id.clone(),
-            ConfigMessageStatus::Ok,
-            "".to_string(),
-            None
-          ));
-        } else {
-          self.conns[token].write_message(&ConfigMessageAnswer::new(
-            message.id.clone(),
-            ConfigMessageStatus::Error,
-            "failed creating worker".to_string(),
-            None
-          ));
-        }
+        self.launch_worker(&tag, token, message);
       },
       ConfigCommand::UpgradeMaster => {
         self.disable_cloexec_before_upgrade();
@@ -325,6 +260,75 @@ impl CommandServer {
         }
       }
     }
+  }
+
+  pub fn launch_worker(&mut self, tag: &str, token: FrontToken, message: &ConfigMessage) {
+    let id = self.next_id + 1;
+    if let Ok(mut worker) = start_worker(id, &self.config) {
+      self.conns[token].write_message(&ConfigMessageAnswer::new(
+          message.id.clone(),
+          ConfigMessageStatus::Processing,
+          "sending configuration orders".to_string(),
+          None
+          ));
+      info!("created new worker");
+
+      self.next_id += 1;
+
+      let worker_token = self.token_count + 1;
+      self.token_count = worker_token;
+      worker.token     = Some(Token(worker_token));
+
+      if let Some(ref previous) = self.proxies.values().filter(|ref proxy| {
+        proxy.run_state == RunState::Running
+      }).next() {
+        worker.channel.set_blocking(true);
+
+        let mut counter = 0u32;
+        for order in self.state.generate_orders() {
+          let message_id = format!("LAUNCH-CONF-{}", counter);
+          worker.inflight.insert(message_id.clone(), order.clone());
+          let mut hs = HashSet::new();
+          hs.insert(worker_token);
+          self.inflight.insert(message_id.clone(), hs);
+
+          let o = order.clone();
+          //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
+          self.conns[token].add_message_id(message_id.clone());
+          //worker.state.handle_order(&o);
+          if !worker.channel.write_message(&OrderMessage { id: message_id.clone(), order: o }) {
+            error!("could not send to new worker({}-{}): {}", tag, worker.id, message_id);
+          }
+
+          let received = worker.channel.read_message();
+          info!("worker ({}-{}) sent: {:?}", tag, worker.id, received);
+          //worker.channel.run();
+          counter += 1;
+        }
+        worker.channel.set_blocking(false);
+      }
+
+      info!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
+      worker_token, tag, worker.id, worker.channel.sock.take_error());
+      self.poll.register(&worker.channel.sock, Token(worker_token), Ready::all(), PollOpt::edge()).unwrap();
+      worker.token = Some(Token(worker_token));
+      self.proxies.insert(Token(worker_token), worker);
+
+      self.conns[token].write_message(&ConfigMessageAnswer::new(
+          message.id.clone(),
+          ConfigMessageStatus::Ok,
+          "".to_string(),
+          None
+          ));
+    } else {
+      self.conns[token].write_message(&ConfigMessageAnswer::new(
+          message.id.clone(),
+          ConfigMessageStatus::Error,
+          "failed creating worker".to_string(),
+          None
+          ));
+    }
+
   }
 
   pub fn load_static_application_configuration(&mut self) {
