@@ -65,14 +65,10 @@ impl ConfigState {
           hostname:   front.hostname.clone(),
           path_begin: front.path_begin.clone(),
         };
-        if self.http_fronts.contains_key(&front.app_id) {
-          self.http_fronts.get_mut(&front.app_id).map(|front| {
-            if !front.contains(&f) {
-              front.push(f);
-            }
-          });
-        } else {
-          self.http_fronts.insert(front.app_id.clone(), vec!(f));
+
+        let front = self.http_fronts.entry(front.app_id.clone()).or_insert(vec!());
+        if !front.contains(&f) {
+          front.push(f);
         }
       },
       &Order::RemoveHttpFront(ref front) => {
@@ -109,28 +105,18 @@ impl ConfigState {
           path_begin:  front.path_begin.clone(),
           fingerprint: front.fingerprint.clone(),
         };
-        if self.https_fronts.contains_key(&front.app_id) {
-          self.https_fronts.get_mut(&front.app_id).map(|front| {
-            if !front.contains(&f) {
-              front.push(f);
-            }
-          });
-        } else {
-          self.https_fronts.insert(front.app_id.clone(), vec!(f));
+        let front = self.https_fronts.entry(front.app_id.clone()).or_insert(vec!());
+        if !front.contains(&f) {
+          front.push(f);
         }
       },
       &Order::RemoveTlsFront(ref front) => {
         self.https_fronts.remove(&front.app_id);
       },
       &Order::AddInstance(ref instance)  => {
-        if self.instances.contains_key(&instance.app_id) {
-          self.instances.get_mut(&instance.app_id).map(|instance_vec| {
-            if !instance_vec.contains(&instance) {
-              instance_vec.push(instance.clone());
-            }
-          });
-        } else {
-          self.instances.insert(instance.app_id.clone(), vec!(instance.clone()));
+        let instance_vec = self.instances.entry(instance.app_id.clone()).or_insert(vec!());
+        if !instance_vec.contains(&instance) {
+          instance_vec.push(instance.clone());
         }
       },
       &Order::RemoveInstance(ref instance) => {
