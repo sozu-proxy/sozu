@@ -1,8 +1,7 @@
 use std::collections::{HashMap,HashSet};
 
 use std::iter::FromIterator;
-use openssl::x509::X509;
-use openssl::hash::MessageDigest;
+use certificate::calculate_fingerprint;
 
 use sozu::messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,TlsFront,Instance};
 
@@ -82,8 +81,7 @@ impl ConfigState {
           certificate_chain: certificate_and_key.certificate_chain.clone(),
           key:               certificate_and_key.key.clone(),
         };
-        let fingerprint = match X509::from_pem(&certificate_and_key.certificate.as_bytes()[..]).and_then(|cert|
-                                  cert.fingerprint(MessageDigest::sha256())) {
+        let fingerprint = match calculate_fingerprint(&certificate_and_key.certificate.as_bytes()[..]) {
           Ok(f)  => f,
           Err(e) => {
             error!("cannot obtain the certificate's fingerprint: {:?}", e);

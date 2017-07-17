@@ -4,9 +4,8 @@ use std::str::FromStr;
 use std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::io::{self,Error,ErrorKind,Read};
+use certificate::calculate_fingerprint;
 use openssl::ssl;
-use openssl::x509::X509;
-use openssl::hash::MessageDigest;
 use toml;
 
 use sozu::messages::{CertificateAndKey,Order,HttpFront,TlsFront,Instance,HttpProxyConfiguration,TlsProxyConfiguration};
@@ -264,7 +263,7 @@ impl Config {
           continue;
         }
         let certificate = certificate_opt.unwrap();
-        let fingerprint = match X509::from_pem(&certificate.as_bytes()[..]).and_then(|cert| cert.fingerprint(MessageDigest::sha256())) {
+        let fingerprint = match calculate_fingerprint(&certificate.as_bytes()[..]) {
           Ok(f)  => f,
           Err(e) => {
             error!("cannot obtain the certificate's fingerprint: {:?}", e);

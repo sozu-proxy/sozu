@@ -7,6 +7,7 @@ extern crate serde_json;
 extern crate openssl;
 extern crate sozu_lib as sozu;
 
+pub mod certificate;
 pub mod config;
 pub mod data;
 pub mod state;
