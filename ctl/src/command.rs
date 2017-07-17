@@ -1,6 +1,8 @@
 use sozu::channel::Channel;
 use sozu::messages::{Order, Instance, HttpFront, CertificateAndKey, CertFingerprint, TcpFront};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
+use sozu_command::config::Config;
+use sozu_command::certificate::calculate_fingerprint;
 
 use std::collections::HashSet;
 use rand::{thread_rng, Rng};
@@ -419,16 +421,40 @@ pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, ap
   }));
 }
 
-pub fn add_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, certificate: &str, certificate_chain: Vec<String>, key: &str) {
-  order_command(channel, Order::AddCertificate(CertificateAndKey {
-    certificate: String::from(certificate),
-    certificate_chain: certificate_chain,
-    key: String::from(key)
-  }));
+pub fn add_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, certificate_path: &str, certificate_chain_path: &str, key_path: &str) {
+  match Config::load_file(certificate_path) {
+    Err(e) => println!("could not load certificate: {:?}", e),
+    Ok(certificate) => {
+      match Config::load_file(certificate_chain_path).map(Config::split_certificate_chain) {
+        Err(e) => println!("could not load certificate chain: {:?}", e),
+        Ok(certificate_chain) => {
+          match Config::load_file(key_path) {
+            Err(e) => println!("could not load key: {:?}", e),
+            Ok(key) => {
+              order_command(channel, Order::AddCertificate(CertificateAndKey {
+                certificate: certificate,
+                certificate_chain: certificate_chain,
+                key: key
+              }));
+
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
-pub fn remove_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, cert_fingerprint: CertFingerprint) {
-  order_command(channel, Order::RemoveCertificate(cert_fingerprint));
+pub fn remove_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, certificate_path: &str) {
+  match Config::load_file_bytes(certificate_path) {
+    Ok(data) => {
+      match calculate_fingerprint(&data) {
+        Ok(fingerprint) => order_command(channel, Order::RemoveCertificate(fingerprint)),
+        Err(e)          => println!("could not calculate finrprint for certificate: {:?}", e)
+      }
+    },
+    Err(e) => println!("could not load file: {:?}", e)
+  }
 }
 
 pub fn add_tcp_front(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip_address: &str, port: u16) {

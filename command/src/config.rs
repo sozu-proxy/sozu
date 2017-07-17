@@ -335,6 +335,13 @@ impl Config {
     Ok(data)
   }
 
+  pub fn load_file_bytes(path: &str) -> io::Result<Vec<u8>> {
+    let mut f = try!(File::open(path));
+    let mut data = Vec::new();
+    try!(f.read_to_end(&mut data));
+    Ok(data)
+  }
+
   pub fn split_certificate_chain(mut chain: String) -> Vec<String> {
     let mut v = Vec::new();
 
