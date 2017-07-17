@@ -423,7 +423,6 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
               //FIXME: there should probably be a circuit breaker per client too
               error!("error connecting to backend, trying again");
               self.connect_to_backend(poll, tok);
-              return;
             } else {
               self.clients[tok].set_back_connected(BackendConnectionStatus::Connected);
             }
