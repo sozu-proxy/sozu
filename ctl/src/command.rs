@@ -403,7 +403,15 @@ pub fn add_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app
     }));
 }
 
-pub fn add_front(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str) {
+pub fn remove_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str) {
+  order_command(channel, Order::RemoveHttpFront(HttpFront {
+    app_id: String::from(app_id),
+    hostname: String::from(hostname),
+    path_begin: String::from(path_begin)
+  }));
+}
+
+pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str) {
   order_command(channel, Order::AddHttpFront(HttpFront {
     app_id: String::from(app_id),
     hostname: String::from(hostname),

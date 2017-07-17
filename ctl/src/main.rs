@@ -17,7 +17,7 @@ use sozu::channel::Channel;
 use sozu_command::config::Config;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 
-use command::{dump_state,load_state,save_state,soft_stop,hard_stop,upgrade,status, remove_backend, add_backend};
+use command::{dump_state,load_state,save_state,soft_stop,hard_stop,upgrade,status, remove_backend, add_backend, remove_frontend, add_frontend};
 
 fn main() {
   let matches = App::new("sozuctl")
@@ -94,6 +94,45 @@ fn main() {
                                                       .value_name("port of the backend")
                                                       .takes_value(true)
                                                       .required(true))))
+                        .subcommand(SubCommand::with_name("frontend")
+                                                .about("frontend management")
+                                                .subcommand(SubCommand::with_name("add")
+                                                  .arg(Arg::with_name("id")
+                                                      .short("i")
+                                                      .long("id")
+                                                      .value_name("app id of the frontend")
+                                                      .takes_value(true)
+                                                      .required(true))
+                                                  .arg(Arg::with_name("hostname")
+                                                      .short("host")
+                                                      .long("hostname")
+                                                      .value_name("hostname of the frontend")
+                                                      .takes_value(true)
+                                                      .required(true))
+                                                  .arg(Arg::with_name("path_begin")
+                                                      .long("path_begin")
+                                                      .value_name("URL prefix of the frontend")
+                                                      .takes_value(true)
+                                                      .required(false)))
+                                                .subcommand(SubCommand::with_name("remove")
+                                                  .arg(Arg::with_name("id")
+                                                      .short("i")
+                                                      .long("id")
+                                                      .value_name("app id of the frontend")
+                                                      .takes_value(true)
+                                                      .required(true))
+                                                  .arg(Arg::with_name("hostname")
+                                                      .short("host")
+                                                      .long("hostname")
+                                                      .value_name("hostname of the frontend")
+                                                      .takes_value(true)
+                                                      .required(true))
+                                                  .arg(Arg::with_name("path_begin")
+                                                      .long("path_begin")
+                                                      .value_name("URL prefix of the frontend")
+                                                      .takes_value(true)
+                                                      .required(false)))
+                                                )
                         .get_matches();
 
   let config_file = matches.value_of("config").expect("required config file");
@@ -147,6 +186,23 @@ fn main() {
           let ip = backend_sub.value_of("ip").expect("missing backend ip");
           let port: u16 = backend_sub.value_of("port").expect("mssing backend port").parse().unwrap();
           add_backend(&mut channel, id, ip, port);
+        }
+        _ => println!("unknown backend management command")
+      }
+    },
+    ("frontend", Some(sub)) => {
+      match sub.subcommand() {
+        ("remove", Some(frontend_sub)) => {
+          let id         = frontend_sub.value_of("id").expect("missing id");
+          let hostname   = frontend_sub.value_of("hostname").expect("missing frontend hostname");
+          let path_begin = frontend_sub.value_of("path_begin").unwrap_or("");
+          remove_frontend(&mut channel, id, hostname, path_begin);
+        },
+        ("add", Some(frontend_sub)) => {
+          let id         = frontend_sub.value_of("id").expect("missing id");
+          let hostname   = frontend_sub.value_of("hostname").expect("missing frontend hostname");
+          let path_begin = frontend_sub.value_of("path_begin").unwrap_or("");
+          add_frontend(&mut channel, id, hostname, path_begin);
         }
         _ => println!("unknown backend management command")
       }
