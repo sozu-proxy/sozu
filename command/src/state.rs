@@ -3,7 +3,7 @@ use std::collections::{HashMap,HashSet};
 use std::iter::FromIterator;
 use certificate::calculate_fingerprint;
 
-use sozu::messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,TlsFront,Instance};
+use sozu::messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,Instance};
 
 pub type AppId = String;
 
@@ -16,11 +16,11 @@ pub struct HttpProxy {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize, Deserialize)]
-pub struct TlsProxy {
+pub struct HttpsProxy {
   ip_address:   String,
   port:         u16,
   certificates: HashMap<CertFingerprint, CertificateAndKey>,
-  fronts:       HashMap<AppId, Vec<TlsFront>>,
+  fronts:       HashMap<AppId, Vec<HttpsFront>>,
   instances:    HashMap<AppId, Vec<Instance>>,
 }
 
@@ -28,7 +28,7 @@ pub struct TlsProxy {
 pub struct ConfigState {
   instances:       HashMap<AppId, Vec<Instance>>,
   http_fronts:     HashMap<AppId, Vec<HttpFront>>,
-  https_fronts:    HashMap<AppId, Vec<TlsFront>>,
+  https_fronts:    HashMap<AppId, Vec<HttpsFront>>,
   certificates:    HashMap<CertFingerprint, CertificateAndKey>,
   //ip, port
   http_addresses:  Vec<(String, u16)>,
@@ -96,8 +96,8 @@ impl ConfigState {
       &Order::RemoveCertificate(ref fingerprint) => {
         self.certificates.remove(fingerprint);
       },
-      &Order::AddTlsFront(ref front) => {
-        let f = TlsFront {
+      &Order::AddHttpsFront(ref front) => {
+        let f = HttpsFront {
           app_id:      front.app_id.clone(),
           hostname:    front.hostname.clone(),
           path_begin:  front.path_begin.clone(),
@@ -108,7 +108,7 @@ impl ConfigState {
           front.push(f);
         }
       },
-      &Order::RemoveTlsFront(ref front) => {
+      &Order::RemoveHttpsFront(ref front) => {
         self.https_fronts.remove(&front.app_id);
       },
       &Order::AddInstance(ref instance)  => {
@@ -144,7 +144,7 @@ impl ConfigState {
 
     for (app_id, front_list) in &self.https_fronts {
       for front in front_list {
-        v.push(Order::AddTlsFront(TlsFront {
+        v.push(Order::AddHttpsFront(HttpsFront {
           app_id:      app_id.clone(),
           hostname:    front.hostname.clone(),
           path_begin:  front.path_begin.clone(),
@@ -179,13 +179,13 @@ impl ConfigState {
     let removed_http_fronts = my_fronts.difference(&their_fronts);
     let added_http_fronts   = their_fronts.difference(&my_fronts);
 
-    let mut my_fronts: HashSet<(&AppId, &TlsFront)> = HashSet::new();
+    let mut my_fronts: HashSet<(&AppId, &HttpsFront)> = HashSet::new();
     for (ref app_id, ref front_list) in self.https_fronts.iter() {
       for ref front in front_list.iter() {
         my_fronts.insert((&app_id, &front));
       }
     }
-    let mut their_fronts: HashSet<(&AppId, &TlsFront)> = HashSet::new();
+    let mut their_fronts: HashSet<(&AppId, &HttpsFront)> = HashSet::new();
     for (ref app_id, ref front_list) in other.https_fronts.iter() {
       for ref front in front_list.iter() {
         their_fronts.insert((&app_id, &front));
@@ -232,7 +232,7 @@ impl ConfigState {
     }
 
     for &(app_id, front) in removed_https_fronts {
-     v.push(Order::RemoveTlsFront(TlsFront {
+     v.push(Order::RemoveHttpsFront(HttpsFront {
        app_id:      app_id.clone(),
        hostname:    front.hostname.clone(),
        path_begin:  front.path_begin.clone(),
@@ -257,7 +257,7 @@ impl ConfigState {
     }
 
     for &(app_id, front) in added_https_fronts {
-      v.push(Order::AddTlsFront(TlsFront {
+      v.push(Order::AddHttpsFront(HttpsFront {
         app_id:      app_id.clone(),
         hostname:    front.hostname.clone(),
         path_begin:  front.path_begin.clone(),

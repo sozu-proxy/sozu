@@ -140,8 +140,8 @@ impl CommandServer {
         }
       },
       ConfigCommand::ProxyConfiguration(order) => {
-        if let &Order::AddTlsFront(ref data) = &order {
-          info!("proxyconfig client order AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
+        if let &Order::AddHttpsFront(ref data) = &order {
+          info!("proxyconfig client order AddHttpsFront(HttpsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
           data.app_id, data.hostname, data.path_begin);
         } else {
           info!("proxyconfig client order {:?}", order);
@@ -231,8 +231,8 @@ impl CommandServer {
               for order in diff {
                 self.state.handle_order(&order);
 
-                if let &Order::AddTlsFront(ref data) = &order {
-                  info!("load state AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
+                if let &Order::AddHttpsFront(ref data) = &order {
+                  info!("load state AddHttpsFront(HttpsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
                   data.app_id, data.hostname, data.path_begin);
                 } else {
                   info!("load state {:?}", order);
@@ -349,8 +349,8 @@ impl CommandServer {
       if let ConfigCommand::ProxyConfiguration(order) = message.data {
         self.state.handle_order(&order);
 
-        if let &Order::AddTlsFront(ref data) = &order {
-          info!("config generated AddTlsFront(TlsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
+        if let &Order::AddHttpsFront(ref data) = &order {
+          info!("config generated AddHttpsFront(HttpsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
           data.app_id, data.hostname, data.path_begin);
         } else {
           info!("config generated {:?}", order);

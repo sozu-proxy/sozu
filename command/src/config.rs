@@ -8,7 +8,7 @@ use certificate::calculate_fingerprint;
 use openssl::ssl;
 use toml;
 
-use sozu::messages::{CertificateAndKey,Order,HttpFront,TlsFront,Instance,HttpProxyConfiguration,TlsProxyConfiguration};
+use sozu::messages::{CertificateAndKey,Order,HttpFront,HttpsFront,Instance,HttpProxyConfiguration,HttpsProxyConfiguration};
 
 use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
 
@@ -69,7 +69,7 @@ impl ProxyConfig {
     })
   }
 
-  pub fn to_tls(&self) -> Option<TlsProxyConfiguration> {
+  pub fn to_tls(&self) -> Option<HttpsProxyConfiguration> {
     let mut address = self.address.clone();
     address.push(':');
     address.push_str(&self.port.to_string());
@@ -123,7 +123,7 @@ impl ProxyConfig {
     trace!("parsed tls options: {:?}", default_options);
 
     tls_proxy_configuration.map(|addr| {
-      let mut configuration = TlsProxyConfiguration {
+      let mut configuration = HttpsProxyConfiguration {
         front:           addr,
         public_address:  public_address,
         max_connections: self.max_connections,
@@ -283,7 +283,7 @@ impl Config {
           data:     ConfigCommand::ProxyConfiguration(certificate_order),
         });
         count += 1;
-        let front_order = Order::AddTlsFront(TlsFront {
+        let front_order = Order::AddHttpsFront(HttpsFront {
           app_id:      id.to_string(),
           hostname:    app.hostname.clone(),
           path_begin:  path_begin,

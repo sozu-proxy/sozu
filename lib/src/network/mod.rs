@@ -25,7 +25,7 @@ use mio::Token;
 #[derive(Debug)]
 pub enum Protocol {
   HTTP,
-  TLS,
+  HTTPS,
   TCP
 }
 

@@ -52,7 +52,7 @@ fn main() {
   info!("MAIN\tHTTP -> {:?}", command.read_message());
 
 
-  let config = messages::TlsProxyConfiguration {
+  let config = messages::HttpsProxyConfiguration {
     front: "127.0.0.1:8443".parse().expect("could not parse address"),
     max_connections: 500,
     buffer_size: 16384,
@@ -94,13 +94,13 @@ fn main() {
     order: messages::Order::AddCertificate(certificate_and_key)
   });
 
-  let tls_front = messages::TlsFront {
+  let tls_front = messages::HttpsFront {
     app_id:      String::from("app_1"),
     hostname:    String::from("lolcatho.st"),
     path_begin:  String::from("/"),
     fingerprint: hex::FromHex::from_hex("AB2618B674E15243FD02A5618C66509E4840BA60E7D64CEBEC84CDBFECEEE0C5").unwrap()
   };
-  command2.write_message(&messages::OrderMessage { id: String::from("ID_IJKL2"), order: messages::Order::AddTlsFront(tls_front) });
+  command2.write_message(&messages::OrderMessage { id: String::from("ID_IJKL2"), order: messages::Order::AddHttpsFront(tls_front) });
   let tls_instance = messages::Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 };
   command2.write_message(&messages::OrderMessage { id: String::from("ID_MNOP"), order: messages::Order::AddInstance(tls_instance) });
 
@@ -116,13 +116,13 @@ fn main() {
     id:    String::from("ID_QRST1"),
     order: messages::Order::AddCertificate(certificate_and_key2)
   });
-  let tls_front2 = messages::TlsFront {
+  let tls_front2 = messages::HttpsFront {
     app_id:     String::from("app_2"),
     hostname:   String::from("test.local"),
     path_begin: String::from("/"),
     fingerprint: hex::FromHex::from_hex("7E8EBF9AD0645AB755A2E51EB3734B91D4ACACEF1F28AD9D96D9385487FAE6E6").unwrap()
   };
-  command2.write_message(&messages::OrderMessage { id: String::from("ID_QRST2"), order: messages::Order::AddTlsFront(tls_front2) });
+  command2.write_message(&messages::OrderMessage { id: String::from("ID_QRST2"), order: messages::Order::AddHttpsFront(tls_front2) });
   let tls_instance2 = messages::Instance { app_id: String::from("app_2"), ip_address: String::from("127.0.0.1"), port: 1026 };
   command2.write_message(&messages::OrderMessage { id: String::from("ID_UVWX"), order: messages::Order::AddInstance(tls_instance2) });
 

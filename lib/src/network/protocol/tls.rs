@@ -105,7 +105,7 @@ impl TlsHandshake {
   }
 
   fn protocol(&self)           -> Protocol {
-    Protocol::TLS
+    Protocol::HTTPS
   }
 }
 

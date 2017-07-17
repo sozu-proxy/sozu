@@ -130,9 +130,9 @@ impl<Front:SocketHandler> Http<Front> {
       public_address.or(self.front_socket().local_addr().map(|addr| addr.ip()).ok())
     ) {
       let proto = match self.protocol() {
-        Protocol::HTTP => "http",
-        Protocol::TLS  => "https",
-        _              => unreachable!()
+        Protocol::HTTP  => "http",
+        Protocol::HTTPS => "https",
+        _               => unreachable!()
       };
 
       //FIXME: in the "for", we don't put the other values we could get from a preexisting forward header

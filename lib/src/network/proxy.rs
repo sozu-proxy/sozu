@@ -195,7 +195,7 @@ impl Server {
         self.http = Some(http);
       }
     }
-    if topics.contains(&Topic::TlsProxyConfig) {
+    if topics.contains(&Topic::HttpsProxyConfig) {
       if let Some(mut https) = self.https.take() {
         https.configuration().notify(&mut self.poll, &mut self.channel, message.clone());
         self.https = Some(https);

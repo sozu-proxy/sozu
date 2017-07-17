@@ -35,7 +35,7 @@ use network::{Backend,ClientResult,ConnectionError,Protocol};
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,
   Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
-use messages::{self,CertFingerprint,CertificateAndKey,Order,TlsFront,TlsProxyConfiguration,OrderMessage,
+use messages::{self,CertFingerprint,CertificateAndKey,Order,HttpsFront,HttpsProxyConfiguration,OrderMessage,
   OrderMessageAnswer,OrderMessageStatus};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -316,7 +316,7 @@ impl ProxyClient for TlsClient {
   }
 
   fn protocol(&self)           -> Protocol {
-    Protocol::TLS
+    Protocol::HTTPS
   }
 }
 
@@ -346,12 +346,12 @@ pub struct ServerConfiguration {
   answers:         DefaultAnswers,
   front_timeout:   u64,
   back_timeout:    u64,
-  config:          TlsProxyConfiguration,
+  config:          HttpsProxyConfiguration,
   base_token:      usize,
 }
 
 impl ServerConfiguration {
-  pub fn new(config: TlsProxyConfiguration, base_token: usize, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
+  pub fn new(config: HttpsProxyConfiguration, base_token: usize, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let     domains  = TrieNode::root();
     let mut fronts   = HashMap::new();
@@ -420,7 +420,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn create_default_context(config: &TlsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>)> {
+  pub fn create_default_context(config: &HttpsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>)> {
     let ctx = SslContext::builder(SslMethod::tls());
     if let Err(e) = ctx {
       //return Err(io::Error::new(io::ErrorKind::Other, e.description()));
@@ -520,7 +520,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_tls_front(&mut self, tls_front: TlsFront, event_loop: &mut Poll) -> bool {
+  pub fn add_https_front(&mut self, tls_front: HttpsFront, event_loop: &mut Poll) -> bool {
     {
       let mut contexts = unwrap_msg!(self.contexts.lock());
 
@@ -555,7 +555,7 @@ impl ServerConfiguration {
     true
   }
 
-  pub fn remove_tls_front(&mut self, front: TlsFront, event_loop: &mut Poll) {
+  pub fn remove_https_front(&mut self, front: HttpsFront, event_loop: &mut Poll) {
     info!("removing tls_front {:?}", front);
 
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
@@ -932,18 +932,18 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   fn notify(&mut self, event_loop: &mut Poll, channel: &mut ProxyChannel, message: OrderMessage) {
     trace!("{} notified", message);
     match message.order {
-      Order::AddTlsFront(front) => {
-        //info!("TLS\t{} add front {:?}", id, front);
-          self.add_tls_front(front, event_loop);
+      Order::AddHttpsFront(front) => {
+        //info!("HTTPS\t{} add front {:?}", id, front);
+          self.add_https_front(front, event_loop);
           channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
       },
-      Order::RemoveTlsFront(front) => {
-        //info!("TLS\t{} remove front {:?}", id, front);
-        self.remove_tls_front(front, event_loop);
+      Order::RemoveHttpsFront(front) => {
+        //info!("HTTPS\t{} remove front {:?}", id, front);
+        self.remove_https_front(front, event_loop);
         channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
       },
       Order::AddCertificate(certificate_and_key) => {
-        //info!("TLS\t{} add certificate: {:?}", id, certificate_and_key);
+        //info!("HTTPS\t{} add certificate: {:?}", id, certificate_and_key);
           self.add_certificate(certificate_and_key, event_loop);
           channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
       },
@@ -1050,7 +1050,7 @@ fn setup_curves(_: &mut SslContextBuilder) -> Result<(), ErrorStack> {
 
 pub type TlsServer = Session<ServerConfiguration,TlsClient>;
 
-pub fn start(config: TlsProxyConfiguration, channel: ProxyChannel) {
+pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel) {
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_connections = config.max_connections;
   let max_listeners   = 1;
@@ -1081,7 +1081,7 @@ mod tests {
   use std::rc::{Rc,Weak};
   use std::sync::{Arc,Mutex};
   use std::cell::RefCell;
-  use messages::{Order,TlsFront,Instance};
+  use messages::{Order,HttpsFront,Instance};
   use slab::Slab;
   use pool::Pool;
   use network::buffer::Buffer;

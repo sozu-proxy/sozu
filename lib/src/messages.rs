@@ -53,8 +53,8 @@ pub enum Order {
     AddHttpFront(HttpFront),
     RemoveHttpFront(HttpFront),
 
-    AddTlsFront(TlsFront),
-    RemoveTlsFront(TlsFront),
+    AddHttpsFront(HttpsFront),
+    RemoveHttpsFront(HttpsFront),
 
     AddCertificate(CertificateAndKey),
     RemoveCertificate(CertFingerprint),
@@ -66,7 +66,7 @@ pub enum Order {
     RemoveInstance(Instance),
 
     HttpProxy(HttpProxyConfiguration),
-    TlsProxy(TlsProxyConfiguration),
+    HttpsProxy(HttpsProxyConfiguration),
 
     SoftStop,
     HardStop,
@@ -93,7 +93,7 @@ pub struct CertificateAndKey {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct TlsFront {
+pub struct HttpsFront {
     pub app_id:       String,
     pub hostname:     String,
     pub path_begin:   String,
@@ -142,7 +142,7 @@ impl Default for HttpProxyConfiguration {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct TlsProxyConfiguration {
+pub struct HttpsProxyConfiguration {
     pub front:                     SocketAddr,
     pub front_timeout:             u64,
     pub back_timeout:              u64,
@@ -160,9 +160,9 @@ pub struct TlsProxyConfiguration {
     pub default_certificate_chain: Option<String>,
 }
 
-impl Default for TlsProxyConfiguration {
-  fn default() -> TlsProxyConfiguration {
-    TlsProxyConfiguration {
+impl Default for HttpsProxyConfiguration {
+  fn default() -> HttpsProxyConfiguration {
+    HttpsProxyConfiguration {
       front:           "127.0.0.1:8443".parse().expect("could not parse address"),
       front_timeout:   5000,
       back_timeout:    5000,
@@ -204,19 +204,19 @@ impl Order {
     match *self {
       Order::AddHttpFront(_)      => [Topic::HttpProxyConfig].iter().cloned().collect(),
       Order::RemoveHttpFront(_)   => [Topic::HttpProxyConfig].iter().cloned().collect(),
-      Order::AddTlsFront(_)       => [Topic::TlsProxyConfig].iter().cloned().collect(),
-      Order::RemoveTlsFront(_)    => [Topic::TlsProxyConfig].iter().cloned().collect(),
-      Order::AddCertificate(_)    => [Topic::TlsProxyConfig].iter().cloned().collect(),
-      Order::RemoveCertificate(_) => [Topic::TlsProxyConfig].iter().cloned().collect(),
+      Order::AddHttpsFront(_)     => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::RemoveHttpsFront(_)  => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::AddCertificate(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::RemoveCertificate(_) => [Topic::HttpsProxyConfig].iter().cloned().collect(),
       Order::AddTcpFront(_)       => [Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::RemoveTcpFront(_)    => [Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::AddInstance(_)       => [Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::RemoveInstance(_)    => [Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::AddInstance(_)       => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::RemoveInstance(_)    => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::HttpProxy(_)         => [Topic::HttpProxyConfig].iter().cloned().collect(),
-      Order::TlsProxy(_)          => [Topic::TlsProxyConfig].iter().cloned().collect(),
-      Order::SoftStop             => [Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::HardStop             => [Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::Status               => [Topic::HttpProxyConfig, Topic::TlsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::HttpsProxy(_)        => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::SoftStop             => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::HardStop             => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::Status               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
     }
   }
 }
@@ -307,12 +307,12 @@ impl<'de> serde::de::Visitor<'de> for OrderVisitor {
     } else if &command_type == "REMOVE_CERTIFICATE" {
       let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("remove_certificate"))));
       Ok(Order::RemoveCertificate(acl))
-    } else if &command_type == "ADD_TLS_FRONT" {
-      let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("add_tls_front"))));
-      Ok(Order::AddTlsFront(acl))
-    } else if &command_type == "REMOVE_TLS_FRONT" {
-      let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("remove_tls_front"))));
-      Ok(Order::RemoveTlsFront(acl))
+    } else if &command_type == "ADD_HTTPS_FRONT" {
+      let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("add_https_front"))));
+      Ok(Order::AddHttpsFront(acl))
+    } else if &command_type == "REMOVE_HTTPS_FRONT" {
+      let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("remove_https_front"))));
+      Ok(Order::RemoveHttpsFront(acl))
     } else if &command_type == "ADD_TCP_FRONT" {
       let acl = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("add_tcp_front"))));
       Ok(Order::AddTcpFront(acl))
@@ -357,12 +357,12 @@ impl serde::Serialize for Order {
         try!(map.serialize_entry("type", "REMOVE_HTTP_FRONT"));
         try!(map.serialize_entry("data", front));
       },
-      &Order::AddTlsFront(ref front) => {
-        try!(map.serialize_entry("type", "ADD_TLS_FRONT"));
+      &Order::AddHttpsFront(ref front) => {
+        try!(map.serialize_entry("type", "ADD_HTTPS_FRONT"));
         try!(map.serialize_entry("data", front));
       },
-      &Order::RemoveTlsFront(ref front) => {
-        try!(map.serialize_entry("type", "REMOVE_TLS_FRONT"));
+      &Order::RemoveHttpsFront(ref front) => {
+        try!(map.serialize_entry("type", "REMOVE_HTTPS_FRONT"));
         try!(map.serialize_entry("data", front));
       },
       &Order::AddCertificate(ref certificate_and_key) => {
@@ -393,8 +393,8 @@ impl serde::Serialize for Order {
         try!(map.serialize_entry("type", "CONFIGURE_HTTP_PROXY"));
         try!(map.serialize_entry("data", config));
       },
-      &Order::TlsProxy(ref config) => {
-        try!(map.serialize_entry("type", "CONFIGURE_HTTP_PROXY"));
+      &Order::HttpsProxy(ref config) => {
+        try!(map.serialize_entry("type", "CONFIGURE_HTTPS_PROXY"));
         try!(map.serialize_entry("data", config));
       },
       &Order::SoftStop => {
@@ -415,7 +415,7 @@ impl serde::Serialize for Order {
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub enum Topic {
     HttpProxyConfig,
-    TlsProxyConfig,
+    HttpsProxyConfig,
     TcpProxyConfig
 }
 
