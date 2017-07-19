@@ -17,7 +17,8 @@ use sozu::channel::Channel;
 use sozu_command::config::Config;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 
-use command::{dump_state,load_state,save_state,soft_stop,hard_stop,upgrade,status, remove_backend, add_backend, remove_frontend, add_frontend};
+use command::{dump_state,load_state,save_state,soft_stop,hard_stop,upgrade,status,
+  remove_backend, add_backend, remove_frontend, add_frontend, add_certificate, remove_certificate};
 
 fn main() {
   let matches = App::new("sozuctl")
@@ -228,6 +229,21 @@ fn main() {
           let path_begin = frontend_sub.value_of("path_begin").unwrap_or("");
           add_frontend(&mut channel, id, hostname, path_begin);
         }
+        _ => println!("unknown backend management command")
+      }
+    },
+    ("certificate", Some(sub)) => {
+      match sub.subcommand() {
+        ("add", Some(cert_sub)) => {
+          let certificate = cert_sub.value_of("certificate").expect("missing certificate path");
+          let chain       = cert_sub.value_of("certificate-chain").expect("missing certificate chain path");
+          let key         = cert_sub.value_of("key").unwrap_or("missing key path");
+          add_certificate(&mut channel, certificate, chain, key);
+        }
+        ("remove", Some(cert_sub)) => {
+          let certificate = cert_sub.value_of("certificate").expect("missing certificate path");
+          remove_certificate(&mut channel, certificate);
+        },
         _ => println!("unknown backend management command")
       }
     },
