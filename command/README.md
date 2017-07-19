@@ -15,10 +15,10 @@ You send a `ConfigMessage`, defined as follows:
 
 ```rust
 pub struct ConfigMessage {
-  pub id:      String,
-  pub version: u8,
-  pub data:    ConfigCommand,
-  pub proxy:   Option<String>,
+  pub id:       String,
+  pub version:  u8,
+  pub data:     ConfigCommand,
+  pub proxy_id: Option<String>,
 }
 ```
 
@@ -26,16 +26,18 @@ When serialized to JSON it looks like this:
 
 ```json
 {
-  "id":      "ID_TEST",
-  "version": 0,
-  "type":    "<ConfigCommand enum name>",
-  "data":    { <ConfigCommand data> }
+  "id":       "ID_TEST",
+  "version":  0,
+  "proxy_id": 0,
+  "type":     "<ConfigCommand enum name>",
+  "data":     { <ConfigCommand data> }
 }"
 ```
 
 The type indicates which kind of message it wraps. The id field will be used
 for answers. Since the protocol is asynchronous, this is used to identify
 answers to a specific message (you can receive multiple answers to one message).
+The `proxy_id` field is used to target a specific worker.
 
 An answer has the format `ConfigMessageAnswer`, defined as follows:
 
@@ -98,6 +100,19 @@ The save state message is defined as follows:
 If the specified path is relative, it will be calculated relative to the current
 working directory of the proxy.
 
+#### Load state message
+
+```json
+{
+  "id":   "ID_TEST",
+  "version": 0,
+  "type": "LOAD_STATE",
+  "data": {
+    "path": "./config_dump.json"
+  }
+}
+```
+
 #### Dump state message
 
 This message will gather the same information as the save state message, but
@@ -113,6 +128,54 @@ The dump state message is defined like this:
 }
 ```
 
+#### Soft shutdown
+
+```json
+{
+  "id":      "ID_TEST",
+  "version": 0,
+  "data": {
+    "type": "SOFT_STOP",
+  }
+}
+```
+
+#### Hard shutdown
+
+```json
+{
+  "id":      "ID_TEST",
+  "version": 0,
+  "data": {
+    "type": "HARD_STOP",
+  }
+}
+```
+
+#### Status
+
+```json
+{
+  "id":      "ID_TEST",
+  "version": 0,
+  "data": {
+    "type": "STATUS",
+  }
+}
+```
+
+#### Binary upgrade
+
+```json
+{
+  "id":      "ID_TEST",
+  "version": 0,
+  "data": {
+    "type": "UPGRADE_MASTER",
+  }
+}
+```
+
 ### Worker configuration messages
 
 The proxy's configuration can be altered at runtime, without restarts,
@@ -124,30 +187,18 @@ the `HELLO` proxy).
 
 The data attribute will contain one of the proxy orders.
 
-#### HTTP proxy configuration
-
-```json
-```
-
-#### HTTPS proxy configuration
-
-```json
-```
-
 #### Adding a new HTTP front
 
 ```json
 {
-  "id":      "ID_TEST",
-  "version": 0,
-  "type":    "PROXY",
-  "proxy":   "HTTP",
+  "id":       "ID_TEST",
+  "version":  0,
   "data": {
     "type": "ADD_HTTP_FRONT",
     "data": {
       "app_id":     "xxx",
-      "hostname":   "yyy",
-      "path_begin": "xxx"
+      "hostname":   "example.com",
+      "path_begin": "/hello"
     }
   }
 }
@@ -157,36 +208,34 @@ The data attribute will contain one of the proxy orders.
 
 ```json
 {
-  "id":      "ID_TEST",
-  "version": 0,
-  "type":    "PROXY",
-  "proxy":   "TLS",
+  "id":       "ID_TEST",
+  "version":  0,
   "data": {
-    "type": "ADD_TLS_FRONT",
+    "type": "ADD_HTTPS_FRONT",
     "data": {
       "app_id":      "xxx",
-      "hostname":    "yyy",
-      "path_begin":  "xxx",
-      "fingerprint": CertFingerprint
+      "hostname":    "example.com",
+      "path_begin":  "/hello",
+      "fingerprint": "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
     }
   }
 }
 ```
 
+The fingerprint is the hexadecimal representation of the SHA256 hash of the certificate.
+
 #### Adding a new backend server
 
 ```json
 {
-  "id": "ID_ABCD",
-  "version": 0,
-  "type": "PROXY",
-  "proxy": "HTTP",
+  "id":       "ID_ABCD",
+  "version":  0,
   "data":{
     "type": "ADD_INSTANCE",
     "data": {
       "app_id": "xxx",
       "ip_address": "127.0.0.1",
-      "port": 1026
+      "port": 8080
     }
   }
 }
@@ -196,8 +245,10 @@ The data attribute will contain one of the proxy orders.
 
 ```json
 {
-  "type": "REMOVE_HTTP_FRONT",
+  "id":       "ID_ABCD",
+  "version":  0,
   "data": {
+    "type": "REMOVE_HTTP_FRONT",
     "app_id": "xxx",
     "hostname": "yyy",
     "path_begin": "xxx",
@@ -212,15 +263,13 @@ The data attribute will contain one of the proxy orders.
 {
   "id":      "ID_TEST",
   "version": 0,
-  "type":    "PROXY",
-  "proxy":   "TLS",
   "data": {
-    "type": "REMOVE_TLS_FRONT",
+    "type": "REMOVE_HTTPS_FRONT",
     "data": {
       "app_id":      "xxx",
       "hostname":    "yyy",
       "path_begin":  "xxx",
-      "fingerprint": CertFingerprint
+      "fingerprint": "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
     }
   }
 }
@@ -230,44 +279,46 @@ The data attribute will contain one of the proxy orders.
 
 ```json
 {
-  "id": "ID_789",
-  "type": "PROXY",
-  "proxy": "HTTP",
+  "id":      "ID_789",
+  "version": 0,
   "data": {
     "type": "REMOVE_INSTANCE",
     "data": {
       "app_id": "xxx",
       "ip_address": "127.0.0.1",
-      "port": 1026
+      "port": 8080
     }
   }
 }
 ```
 
-#### Soft shutdown
+#### Adding a new certificate
 
 ```json
 {
-  "id":      "ID_TEST",
+  "id":      "ID_789",
   "version": 0,
-  "type":    "PROXY",
-  "proxy":   "HTTP",
   "data": {
-    "type": "SOFT_STOP",
+    "type": "ADD_CERTIFICATE",
+    "data": {
+      "certificate": "<PEM certificate>",
+      "certificate_chain": ["<PEM certificate>", "<PEM certificate>"],
+      "key": "<PEM private key>"
+    }
   }
 }
 ```
 
-#### Hard shutdown
+#### Removing a certificate
 
 ```json
 {
-  "id":      "ID_TEST",
+  "id":      "ID_789",
   "version": 0,
-  "type":    "PROXY",
-  "proxy":   "HTTP",
   "data": {
-    "type": "HARD_STOP",
+    "type": "REMOVE_CERTIFICATE",
+    "data": "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
   }
 }
 ```
+
