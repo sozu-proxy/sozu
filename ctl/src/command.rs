@@ -1,5 +1,5 @@
 use sozu::channel::Channel;
-use sozu::messages::{Order, Instance, HttpFront, CertificateAndKey, CertFingerprint, TcpFront};
+use sozu::messages::{Order, Instance, HttpFront, HttpsFront, CertificateAndKey, CertFingerprint, TcpFront};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 use sozu_command::config::Config;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
@@ -388,12 +388,59 @@ pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   }
 }
 
-pub fn remove_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip: &str, port: u16) {
-    order_command(channel, Order::RemoveInstance(Instance {
+
+pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<&str>) {
+  if let Some(certificate_path) = certificate {
+    match Config::load_file_bytes(certificate_path) {
+      Ok(data) => {
+        match calculate_fingerprint(&data) {
+          Err(e)          => println!("could not calculate finrprint for certificate: {:?}", e),
+          Ok(fingerprint) => {
+            order_command(channel, Order::AddHttpsFront(HttpsFront {
+              app_id: String::from(app_id),
+              hostname: String::from(hostname),
+              path_begin: String::from(path_begin),
+              fingerprint: CertFingerprint(fingerprint)
+            }));
+          },
+        }
+      },
+      Err(e) => println!("could not load file: {:?}", e)
+    }
+  } else {
+    order_command(channel, Order::AddHttpFront(HttpFront {
       app_id: String::from(app_id),
-      ip_address: String::from(ip),
-      port: port
+      hostname: String::from(hostname),
+      path_begin: String::from(path_begin)
     }));
+  }
+}
+
+pub fn remove_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<&str>) {
+  if let Some(certificate_path) = certificate {
+    match Config::load_file_bytes(certificate_path) {
+      Ok(data) => {
+        match calculate_fingerprint(&data) {
+          Err(e)          => println!("could not calculate finrprint for certificate: {:?}", e),
+          Ok(fingerprint) => {
+            order_command(channel, Order::RemoveHttpsFront(HttpsFront {
+              app_id: String::from(app_id),
+              hostname: String::from(hostname),
+              path_begin: String::from(path_begin),
+              fingerprint: CertFingerprint(fingerprint)
+            }));
+          },
+        }
+      },
+      Err(e) => println!("could not load file: {:?}", e)
+    }
+  } else {
+    order_command(channel, Order::RemoveHttpFront(HttpFront {
+      app_id: String::from(app_id),
+      hostname: String::from(hostname),
+      path_begin: String::from(path_begin)
+    }));
+  }
 }
 
 
@@ -405,20 +452,12 @@ pub fn add_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app
     }));
 }
 
-pub fn remove_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str) {
-  order_command(channel, Order::RemoveHttpFront(HttpFront {
-    app_id: String::from(app_id),
-    hostname: String::from(hostname),
-    path_begin: String::from(path_begin)
-  }));
-}
-
-pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str) {
-  order_command(channel, Order::AddHttpFront(HttpFront {
-    app_id: String::from(app_id),
-    hostname: String::from(hostname),
-    path_begin: String::from(path_begin)
-  }));
+pub fn remove_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip: &str, port: u16) {
+    order_command(channel, Order::RemoveInstance(Instance {
+      app_id: String::from(app_id),
+      ip_address: String::from(ip),
+      port: port
+    }));
 }
 
 pub fn add_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, certificate_path: &str, certificate_chain_path: &str, key_path: &str) {

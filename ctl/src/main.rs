@@ -115,6 +115,11 @@ fn main() {
                                                       .value_name("URL prefix of the frontend")
                                                       .takes_value(true)
                                                       .required(false)))
+                                                  .arg(Arg::with_name("certificate")
+                                                      .long("certificate")
+                                                      .value_name("path to a certificate file")
+                                                      .takes_value(true)
+                                                      .required(false))
                                                 .subcommand(SubCommand::with_name("remove")
                                                   .arg(Arg::with_name("id")
                                                       .short("i")
@@ -132,7 +137,12 @@ fn main() {
                                                       .long("path_begin")
                                                       .value_name("URL prefix of the frontend")
                                                       .takes_value(true)
-                                                      .required(false))))
+                                                      .required(false)))
+                                                  .arg(Arg::with_name("certificate")
+                                                      .long("certificate")
+                                                      .value_name("path to a certificate file")
+                                                      .takes_value(true)
+                                                      .required(false)))
                         .subcommand(SubCommand::with_name("certificate")
                                                 .about("certificate management")
                                                 .subcommand(SubCommand::with_name("add")
@@ -218,16 +228,18 @@ fn main() {
     ("frontend", Some(sub)) => {
       match sub.subcommand() {
         ("remove", Some(frontend_sub)) => {
-          let id         = frontend_sub.value_of("id").expect("missing id");
-          let hostname   = frontend_sub.value_of("hostname").expect("missing frontend hostname");
-          let path_begin = frontend_sub.value_of("path_begin").unwrap_or("");
-          remove_frontend(&mut channel, id, hostname, path_begin);
+          let id          = frontend_sub.value_of("id").expect("missing id");
+          let hostname    = frontend_sub.value_of("hostname").expect("missing frontend hostname");
+          let path_begin  = frontend_sub.value_of("path_begin").unwrap_or("");
+          let certificate = frontend_sub.value_of("certificate");
+          remove_frontend(&mut channel, id, hostname, path_begin, certificate);
         },
         ("add", Some(frontend_sub)) => {
-          let id         = frontend_sub.value_of("id").expect("missing id");
-          let hostname   = frontend_sub.value_of("hostname").expect("missing frontend hostname");
-          let path_begin = frontend_sub.value_of("path_begin").unwrap_or("");
-          add_frontend(&mut channel, id, hostname, path_begin);
+          let id          = frontend_sub.value_of("id").expect("missing id");
+          let hostname    = frontend_sub.value_of("hostname").expect("missing frontend hostname");
+          let path_begin  = frontend_sub.value_of("path_begin").unwrap_or("");
+          let certificate = frontend_sub.value_of("certificate");
+          add_frontend(&mut channel, id, hostname, path_begin, certificate);
         }
         _ => println!("unknown backend management command")
       }
