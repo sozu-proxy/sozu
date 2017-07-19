@@ -1173,21 +1173,21 @@ mod tests {
     fronts.insert("lolcatho.st".to_owned(), vec![
       TlsApp {
         app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1,
-        cert_fingerprint: vec!()
+        cert_fingerprint: CertFingerprint(vec!())
       },
       TlsApp {
         app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2,
-        cert_fingerprint: vec!()
+        cert_fingerprint: CertFingerprint(vec!())
       },
       TlsApp {
         app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3,
-        cert_fingerprint: vec!()
+        cert_fingerprint: CertFingerprint(vec!())
       }
     ]);
     fronts.insert("other.domain".to_owned(), vec![
       TlsApp {
         app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(),
-        cert_fingerprint: vec!()
+        cert_fingerprint: CertFingerprint(vec!())
       },
     ]);
 
