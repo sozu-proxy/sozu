@@ -1,6 +1,8 @@
-use serde;
+use serde::{self,Serialize};
 use serde::ser::SerializeMap;
+use serde::de::{self, Visitor};
 use serde_json;
+use hex::{FromHex,ToHex};
 use openssl::ssl;
 use std::net::{IpAddr,SocketAddr};
 use std::collections::HashSet;
@@ -76,7 +78,46 @@ pub enum Order {
 
 
 //FIXME: make fixed size depending on hash algorithm
-pub type CertFingerprint = Vec<u8>;
+#[derive(Clone,PartialEq,Eq,Hash)]
+pub struct CertFingerprint(pub Vec<u8>);
+
+impl fmt::Debug for CertFingerprint {
+  fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    write!(f, "CertFingerprint({})", self.0.to_hex())
+  }
+}
+impl serde::Serialize for CertFingerprint {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+      where S: serde::Serializer,
+  {
+    serializer.serialize_str(&self.0.to_hex())
+  }
+}
+
+struct CertFingerprintVisitor;
+
+impl<'de> Visitor<'de> for CertFingerprintVisitor {
+  type Value = CertFingerprint;
+
+  fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    formatter.write_str("the certificate fingerprint must be in hexadecimal format")
+  }
+
+  fn visit_str<E>(self, value: &str) -> Result<CertFingerprint, E>
+    where E: de::Error
+  {
+    FromHex::from_hex(value)
+      .map_err(|e| E::custom(format!("could not deserialize hex: {:?}", e)))
+      .map(|v:Vec<u8>| CertFingerprint(v))
+  }
+}
+
+impl<'de> serde::Deserialize<'de> for CertFingerprint {
+  fn deserialize<D>(deserializer: D) -> Result<CertFingerprint, D::Error>
+        where D: serde::de::Deserializer<'de> {
+    deserializer.deserialize_str(CertFingerprintVisitor{})
+  }
+}
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpFront {

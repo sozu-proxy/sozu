@@ -361,7 +361,7 @@ impl ServerConfiguration {
     let ref_domains  = rc_domains.clone();
     let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
 
-    let (fingerprint, tls_data, names):(Vec<u8>,TlsData, Vec<String>) = Self::create_default_context(&config, ref_ctx, ref_domains, default_name).expect("could not create default context");
+    let (fingerprint, tls_data, names):(CertFingerprint,TlsData, Vec<String>) = Self::create_default_context(&config, ref_ctx, ref_domains, default_name).expect("could not create default context");
     let cert = try!(X509::from_pem(&tls_data.certificate));
 
     let common_name: Option<String> = get_cert_common_name(&cert);
@@ -371,7 +371,7 @@ impl ServerConfiguration {
       app_id:           config.default_app_id.clone().unwrap_or(String::new()),
       hostname:         config.default_name.clone().unwrap_or(String::new()),
       path_begin:       String::new(),
-      cert_fingerprint: fingerprint.clone(),
+      cert_fingerprint: fingerprint,
     };
     fronts.insert(config.default_name.clone().unwrap_or(String::from("")), vec![app]);
 
@@ -445,7 +445,7 @@ impl ServerConfiguration {
     }
 
     if let (Ok(cert), Ok(key)) = (X509::from_pem(&cert_read[..]), PKey::private_key_from_pem(&key_read[..])) {
-      if let Ok(fingerprint) = cert.fingerprint(MessageDigest::sha256()) {
+      if let Ok(fingerprint) = cert.fingerprint(MessageDigest::sha256()).map(|v| CertFingerprint(v)) {
         context.set_certificate(&cert);
         context.set_private_key(&key);
 
@@ -595,7 +595,7 @@ impl ServerConfiguration {
       //FIXME: would need more logs here
 
       //FIXME
-      let fingerprint = unwrap_msg!(cert.fingerprint(MessageDigest::sha256()));
+      let fingerprint = CertFingerprint(unwrap_msg!(cert.fingerprint(MessageDigest::sha256())));
       let common_name: Option<String> = get_cert_common_name(&cert);
       info!("got common name: {:?}", common_name);
 
