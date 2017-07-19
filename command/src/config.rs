@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::io::{self,Error,ErrorKind,Read};
-use certificate::calculate_fingerprint;
+use certificate::{calculate_fingerprint,split_certificate_chain};
 use openssl::ssl;
 use toml;
 
@@ -232,7 +232,7 @@ impl Config {
       let key_opt         = app.key.as_ref().and_then(|path| Config::load_file(&path).ok());
       let certificate_opt = app.certificate.as_ref().and_then(|path| Config::load_file(&path).ok());
       let chain_opt       = app.certificate_chain.as_ref().and_then(|path| Config::load_file(&path).ok())
-        .map(Config::split_certificate_chain);
+        .map(split_certificate_chain);
 
       //create the front both for HTTP and HTTPS if possible
       let order = Order::AddHttpFront(HttpFront {
@@ -340,22 +340,6 @@ impl Config {
     let mut data = Vec::new();
     try!(f.read_to_end(&mut data));
     Ok(data)
-  }
-
-  pub fn split_certificate_chain(mut chain: String) -> Vec<String> {
-    let mut v = Vec::new();
-
-    let end = "-----END CERTIFICATE-----";
-    loop {
-      match chain.find(end) {
-        Some(sz) => {
-          let cert: String = chain.drain(..sz+end.len()).collect();
-          v.push(cert.trim().to_string());
-        },
-        None     => break,
-      }
-    }
-    v
   }
 }
 
