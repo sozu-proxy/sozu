@@ -2,7 +2,7 @@ use sozu::channel::Channel;
 use sozu::messages::{Order, Instance, HttpFront, CertificateAndKey, CertFingerprint, TcpFront};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 use sozu_command::config::Config;
-use sozu_command::certificate::calculate_fingerprint;
+use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 
 use std::collections::HashSet;
 use rand::{thread_rng, Rng};
@@ -425,7 +425,7 @@ pub fn add_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>,
   match Config::load_file(certificate_path) {
     Err(e) => println!("could not load certificate: {:?}", e),
     Ok(certificate) => {
-      match Config::load_file(certificate_chain_path).map(Config::split_certificate_chain) {
+      match Config::load_file(certificate_chain_path).map(split_certificate_chain) {
         Err(e) => println!("could not load certificate chain: {:?}", e),
         Ok(certificate_chain) => {
           match Config::load_file(key_path) {

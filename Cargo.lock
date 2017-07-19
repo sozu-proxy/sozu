@@ -465,6 +465,7 @@ dependencies = [
 name = "sozu-command-lib"
 version = "0.2.0"
 dependencies = [
+ "hex 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "log 0.3.8 (registry+https://github.com/rust-lang/crates.io-index)",
  "openssl 0.9.14 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde 1.0.9 (registry+https://github.com/rust-lang/crates.io-index)",
