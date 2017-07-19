@@ -82,7 +82,7 @@ impl ConfigState {
           key:               certificate_and_key.key.clone(),
         };
         let fingerprint = match calculate_fingerprint(&certificate_and_key.certificate.as_bytes()[..]) {
-          Ok(f)  => f,
+          Ok(f)  => CertFingerprint(f),
           Err(e) => {
             error!("cannot obtain the certificate's fingerprint: {:?}", e);
             return;

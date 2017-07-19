@@ -8,7 +8,7 @@ use certificate::calculate_fingerprint;
 use openssl::ssl;
 use toml;
 
-use sozu::messages::{CertificateAndKey,Order,HttpFront,HttpsFront,Instance,HttpProxyConfiguration,HttpsProxyConfiguration};
+use sozu::messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,Instance,HttpProxyConfiguration,HttpsProxyConfiguration};
 
 use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
 
@@ -264,7 +264,7 @@ impl Config {
         }
         let certificate = certificate_opt.unwrap();
         let fingerprint = match calculate_fingerprint(&certificate.as_bytes()[..]) {
-          Ok(f)  => f,
+          Ok(f)  => CertFingerprint(f),
           Err(e) => {
             error!("cannot obtain the certificate's fingerprint: {:?}", e);
             continue;

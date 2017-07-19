@@ -449,7 +449,7 @@ pub fn remove_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswe
   match Config::load_file_bytes(certificate_path) {
     Ok(data) => {
       match calculate_fingerprint(&data) {
-        Ok(fingerprint) => order_command(channel, Order::RemoveCertificate(fingerprint)),
+        Ok(fingerprint) => order_command(channel, Order::RemoveCertificate(CertFingerprint(fingerprint))),
         Err(e)          => println!("could not calculate finrprint for certificate: {:?}", e)
       }
     },
