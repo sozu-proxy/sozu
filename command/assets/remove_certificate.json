@@ -1,0 +1,9 @@
+{
+  "id": "ID_TEST",
+  "version": 0,
+  "type": "PROXY",
+  "data": {
+    "type": "REMOVE_CERTIFICATE",
+    "data": "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"
+  }
+}

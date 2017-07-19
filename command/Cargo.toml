@@ -23,6 +23,9 @@ version = "^0.4"
 default-features = false
 features = ["serde"]
 
+[dev-dependencies]
+hex = "^0.2"
+
 [features]
 unstable = []
 

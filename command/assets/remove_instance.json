@@ -1,0 +1,13 @@
+{
+  "id": "ID_TEST",
+  "version": 0,
+  "type": "PROXY",
+  "data": {
+    "type": "REMOVE_INSTANCE",
+    "data": {
+      "app_id": "xxx",
+      "ip_address": "127.0.0.1",
+      "port": 8080
+    }
+  }
+}

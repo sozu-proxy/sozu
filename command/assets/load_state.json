@@ -1,0 +1,8 @@
+{
+  "id": "ID_TEST",
+  "version": 0,
+  "type": "LOAD_STATE",
+  "data": {
+    "path": "./config_dump.json"
+  }
+}

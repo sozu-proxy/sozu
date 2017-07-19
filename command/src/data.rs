@@ -279,7 +279,9 @@ impl serde::Serialize for ConfigMessage {
 mod tests {
   use super::*;
   use serde_json;
-  use sozu::messages::{Order,HttpFront};
+  use hex::FromHex;
+  use certificate::split_certificate_chain;
+  use sozu::messages::{CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Instance};
 
   #[test]
   fn config_message_test() {
@@ -293,24 +295,167 @@ mod tests {
     })));
   }
 
-  #[test]
-  fn save_state_test() {
-    let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "SAVE_STATE", "data":{ "path": "./config_dump.json"} }"#;
-    let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
-    println!("{:?}", message);
-    assert_eq!(message.data, ConfigCommand::SaveState(String::from("./config_dump.json")));
-  }
+  macro_rules! test_message (
+    ($name: ident, $filename: expr, $expected_message: expr) => (
 
-  #[test]
-  fn dump_state_test() {
-    println!("A");
-    //let raw_json = r#"{ "id": "ID_TEST", "type": "DUMP_STATE" }"#;
-    let raw_json = "{ \"id\": \"ID_TEST\", \"version\": 0, \"type\": \"DUMP_STATE\" }";
-    println!("B");
-    let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
-    println!("C");
-    println!("{:?}", message);
-    println!("D");
-    assert_eq!(message.data, ConfigCommand::DumpState);
-  }
+      #[test]
+      fn $name() {
+        let data = include_str!($filename);
+        let pretty_print = serde_json::to_string_pretty(&$expected_message).expect("should have serialized");
+        assert_eq!(&pretty_print, data, "\nserialized message:\n{}\n\nexpected message:\n{}", pretty_print, data);
+
+        let message: ConfigMessage = serde_json::from_str(data).unwrap();
+        assert_eq!(message, $expected_message, "\ndeserialized message:\n{:#?}\n\nexpected message:\n{:#?}", message, $expected_message);
+
+      }
+
+    )
+  );
+
+  test_message!(add_http_front, "../assets/add_http_front.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::ProxyConfiguration(Order::AddHttpFront(HttpFront{
+                  app_id: String::from("xxx"),
+                  hostname: String::from("yyy"),
+                  path_begin: String::from("xxx"),
+      })),
+      proxy_id: None
+    });
+
+  test_message!(remove_http_front, "../assets/remove_http_front.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::ProxyConfiguration(Order::RemoveHttpFront(HttpFront{
+                  app_id: String::from("xxx"),
+                  hostname: String::from("yyy"),
+                  path_begin: String::from("xxx"),
+      })),
+      proxy_id: None
+    });
+
+  test_message!(add_https_front, "../assets/add_https_front.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::ProxyConfiguration(Order::AddHttpsFront(HttpsFront{
+                  app_id: String::from("xxx"),
+                  hostname: String::from("yyy"),
+                  path_begin: String::from("xxx"),
+                  fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap())
+      })),
+      proxy_id: None
+    });
+
+  test_message!(remove_https_front, "../assets/remove_https_front.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::ProxyConfiguration(Order::RemoveHttpsFront(HttpsFront{
+                  app_id: String::from("xxx"),
+                  hostname: String::from("yyy"),
+                  path_begin: String::from("xxx"),
+                  fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap())
+      })),
+      proxy_id: None
+    });
+
+  const KEY        : &'static str = include_str!("../../lib/assets/key.pem");
+  const CERTIFICATE: &'static str = include_str!("../../lib/assets/certificate.pem");
+  const CHAIN      : &'static str = include_str!("../../lib/assets/certificate_chain.pem");
+
+  test_message!(add_certificate, "../assets/add_certificate.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::ProxyConfiguration(Order::AddCertificate(CertificateAndKey {
+                  certificate: String::from(CERTIFICATE),
+                  certificate_chain: split_certificate_chain(String::from(CHAIN)),
+                  key: String::from(KEY),
+      })),
+      proxy_id: None
+    });
+
+  test_message!(remove_certificate, "../assets/remove_certificate.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::ProxyConfiguration(Order::RemoveCertificate(
+          CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()))),
+      proxy_id: None
+    });
+
+  test_message!(add_instance, "../assets/add_instance.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::ProxyConfiguration(Order::AddInstance(Instance{
+                  app_id: String::from("xxx"),
+                  ip_address: String::from("127.0.0.1"),
+                  port: 8080,
+      })),
+      proxy_id: None
+    });
+
+  test_message!(remove_instance, "../assets/remove_instance.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::ProxyConfiguration(Order::RemoveInstance(Instance{
+                  app_id: String::from("xxx"),
+                  ip_address: String::from("127.0.0.1"),
+                  port: 8080,
+      })),
+      proxy_id: None
+    });
+
+  test_message!(soft_stop, "../assets/soft_stop.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::ProxyConfiguration(Order::SoftStop),
+      proxy_id: Some(0),
+    });
+
+  test_message!(hard_stop, "../assets/hard_stop.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::ProxyConfiguration(Order::HardStop),
+      proxy_id: Some(0),
+    });
+
+  test_message!(status, "../assets/status.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::ProxyConfiguration(Order::Status),
+      proxy_id: Some(0),
+    });
+
+  test_message!(load_state, "../assets/load_state.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::LoadState(String::from("./config_dump.json")),
+      proxy_id: None
+    });
+
+  test_message!(save_state, "../assets/save_state.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::SaveState(String::from("./config_dump.json")),
+      proxy_id: None
+    });
+
+  test_message!(dump_state, "../assets/dump_state.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::DumpState,
+      proxy_id: None
+    });
+
+  test_message!(list_workers, "../assets/list_workers.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::ListWorkers,
+      proxy_id: None
+    });
+
+  test_message!(upgrade_master, "../assets/upgrade_master.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::UpgradeMaster,
+      proxy_id: None
+    });
 }
