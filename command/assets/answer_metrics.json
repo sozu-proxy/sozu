@@ -1,0 +1,9 @@
+{
+  "id": "ID_TEST",
+  "version": 0,
+  "status": "OK",
+  "message": "",
+  "data": {
+    "type": "METRICS"
+  }
+}

@@ -37,6 +37,7 @@ impl ConfigMessage {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ConfigMessageStatus {
   Ok,
   Processing,
@@ -44,6 +45,7 @@ pub enum ConfigMessageStatus {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AnswerData {
   Workers(Vec<WorkerInfo>),
   Metrics,
@@ -71,6 +73,7 @@ impl ConfigMessageAnswer {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum RunState {
   Running,
   Stopping,
@@ -312,6 +315,23 @@ mod tests {
     )
   );
 
+  macro_rules! test_message_answer (
+    ($name: ident, $filename: expr, $expected_message: expr) => (
+
+      #[test]
+      fn $name() {
+        let data = include_str!($filename);
+        let pretty_print = serde_json::to_string_pretty(&$expected_message).expect("should have serialized");
+        assert_eq!(&pretty_print, data, "\nserialized message:\n{}\n\nexpected message:\n{}", pretty_print, data);
+
+        let message: ConfigMessageAnswer = serde_json::from_str(data).unwrap();
+        assert_eq!(message, $expected_message, "\ndeserialized message:\n{:#?}\n\nexpected message:\n{:#?}", message, $expected_message);
+
+      }
+
+    )
+  );
+
   test_message!(add_http_front, "../assets/add_http_front.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
@@ -457,5 +477,32 @@ mod tests {
       version:  0,
       data:     ConfigCommand::UpgradeMaster,
       proxy_id: None
+    });
+
+  test_message_answer!(answer_metrics, "../assets/answer_metrics.json", ConfigMessageAnswer {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      status:   ConfigMessageStatus::Ok,
+      message:  String::from(""),
+      data:     Some(AnswerData::Metrics),
+    });
+
+  test_message_answer!(answer_workers_status, "../assets/answer_workers_status.json", ConfigMessageAnswer {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      status:   ConfigMessageStatus::Ok,
+      message:  String::from(""),
+      data:     Some(AnswerData::Workers(vec!(
+        WorkerInfo {
+          id:        1,
+          pid:       5678,
+          run_state: RunState::Running,
+        },
+        WorkerInfo {
+          id:        0,
+          pid:       1234,
+          run_state: RunState::Stopping,
+        },
+      ))),
     });
 }

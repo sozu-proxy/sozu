@@ -1,0 +1,21 @@
+{
+  "id": "ID_TEST",
+  "version": 0,
+  "status": "OK",
+  "message": "",
+  "data": {
+    "type": "WORKERS",
+    "data": [
+      {
+        "id": 1,
+        "pid": 5678,
+        "run_state": "RUNNING"
+      },
+      {
+        "id": 0,
+        "pid": 1234,
+        "run_state": "STOPPING"
+      }
+    ]
+  }
+}
