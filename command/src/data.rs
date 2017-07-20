@@ -6,7 +6,7 @@ use std::fmt;
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub enum ConfigCommand {
   ProxyConfiguration(Order),
   SaveState(String),
