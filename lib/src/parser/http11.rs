@@ -470,6 +470,13 @@ impl<'a> Header<'a> {
       b"forwarded" | b"x-forwarded-for" | b"x-forwarded-proto" | b"x-forwarded-port" => {
         HeaderValue::Forwarded
       },
+      b"expect" => {
+        if &self.value.to_ascii_lowercase() == b"100-continue" {
+          HeaderValue::ExpectContinue
+        } else {
+          HeaderValue::Error
+        }
+      }
       /*b"forwarded" => {
         match comma_separated_header_value(self.value) {
           Some(forwarded) => HeaderValue::Forwarded(forwarded),
@@ -537,6 +544,7 @@ pub enum HeaderValue<'a> {
   Upgrade(&'a[u8]),
   Other(&'a[u8],&'a[u8]),
   Forwarded,
+  ExpectContinue,
   /*
   Forwarded(Vec<&'a[u8]>),
   XForwardedFor(Vec<&'a[u8]>),
@@ -562,6 +570,11 @@ pub enum LengthInformation {
   //Compressed
 }
 
+#[derive(Debug,Clone,PartialEq)]
+pub enum Continue {
+  None,
+  Expects,
+}
 /*
 #[derive(Debug,Clone,PartialEq)]
 pub enum Connection {
@@ -574,10 +587,11 @@ pub enum Connection {
 
 #[derive(Debug,Clone,PartialEq)]
 pub struct Connection {
-  pub keep_alive:  Option<bool>,
-  pub has_upgrade: bool,
-  pub upgrade:     Option<String>,
-  pub to_delete:   HashSet<String>,
+  pub keep_alive:   Option<bool>,
+  pub has_upgrade:  bool,
+  pub upgrade:      Option<String>,
+  pub to_delete:    HashSet<String>,
+  pub continues:    Continue,
 }
 
 impl Connection {
@@ -586,6 +600,7 @@ impl Connection {
       keep_alive:  None,
       has_upgrade: false,
       upgrade:     None,
+      continues:   Continue::None,
       to_delete:   HashSet::new(),
     }
   }
@@ -595,6 +610,7 @@ impl Connection {
       keep_alive:  Some(true),
       has_upgrade: false,
       upgrade:     None,
+      continues:   Continue::None,
       to_delete:   HashSet::new(),
     }
   }
@@ -604,6 +620,7 @@ impl Connection {
       keep_alive:  Some(false),
       has_upgrade: false,
       upgrade:     None,
+      continues:   Continue::None,
       to_delete:   HashSet::new(),
     }
   }
@@ -889,6 +906,20 @@ impl HttpState {
     self.request.as_ref().map(|r| r.get_keep_alive()).expect("there should be a request")
   }
 
+  pub fn must_continue(&self) -> Option<usize> {
+    if self.request.as_ref().map(|r| r.get_keep_alive().map(|conn| conn.continues == Continue::Expects).unwrap_or(false)).unwrap_or(false) &&
+        self.response.as_ref().map(|r| r.get_status_line().map(|st| st.status == 100).unwrap_or(false)).unwrap_or(false) {
+
+      if let Some(&RequestState::RequestWithBody(_, _, _, sz)) = self.request.as_ref() {
+        Some(sz)
+      } else {
+        None
+      }
+
+    } else {
+      None
+    }
+  }
   /*
   pub fn front_should_copy(&self) -> Option<usize> {
     if self.req_position == 0 {
@@ -1012,6 +1043,20 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
         _                                                   => RequestState::Error(ErrorState::InvalidHttp)
       }
     },
+    HeaderValue::ExpectContinue => {
+      let mut conn = state.get_keep_alive().unwrap_or(Connection::new());
+      conn.continues = Continue::Expects;
+
+      match state {
+        RequestState::HasRequestLine(rl, _)                 => RequestState::HasRequestLine(rl, conn),
+        RequestState::HasHost(rl, _, host)                  => RequestState::HasHost(rl, conn, host),
+        RequestState::HasLength(rl, _, length)              => RequestState::HasLength(rl, conn, length),
+        RequestState::HasHostAndLength(rl, _, host, length) => RequestState::HasHostAndLength(rl, conn, host, length),
+        RequestState::Request(rl, _, host)                  => RequestState::Request(rl, conn, host),
+        RequestState::RequestWithBody(rl, _, host, length)  => RequestState::RequestWithBody(rl, conn, host, length),
+        _                                                   => RequestState::Error(ErrorState::InvalidHttp)
+      }
+    }
 
     /*
     HeaderValue::Forwarded(_)  => RequestState::Error(ErrorState::InvalidHttp),
@@ -1216,6 +1261,10 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
     */
     HeaderValue::Forwarded   => state,
     HeaderValue::Other(_,_)  => state,
+    HeaderValue::ExpectContinue => {
+      // we should not get that one from the server
+      ResponseState::Error(ErrorState::InvalidHttp)
+    }
     HeaderValue::Error       => ResponseState::Error(ErrorState::InvalidHttp)
   }
 }
@@ -1353,11 +1402,17 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
               buf.insert_output(Vec::from(rs.added_req_header.as_bytes()));
               buf.slice_output(sz);
             },
-            RequestState::RequestWithBody(_,_,_,content_length) => {
+            RequestState::RequestWithBody(_,ref conn,_,content_length) => {
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_req_header.as_bytes()));
-              buf.slice_output(sz+content_length);
-              buf.consume_parsed_data(content_length);
+
+              // If we got "Expects: 100-continue", the body will be sent later
+              if conn.continues == Continue::Expects {
+                buf.slice_output(sz);
+              } else {
+                buf.slice_output(sz+content_length);
+                buf.consume_parsed_data(content_length);
+              }
             },
             _ => {
               buf.slice_output(sz);
@@ -2679,6 +2734,7 @@ mod tests {
               keep_alive:  Some(true),
               has_upgrade: true,
               upgrade:     Some("WebSocket".to_string()),
+              continues:   Continue::None,
               to_delete:   HashSet::new(),
             },
             String::from("localhost:8888"),

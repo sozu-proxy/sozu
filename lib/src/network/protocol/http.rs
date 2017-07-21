@@ -8,7 +8,7 @@ use pool::{Pool,Checkout,Reset};
 use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
 use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop,
-  BufferMove, RequestState, ResponseState, Chunk};
+  BufferMove, RequestState, ResponseState, Chunk, Continue};
 use network::{ClientResult,Protocol};
 use network::buffer_queue::BufferQueue;
 use network::session::Readiness;
@@ -452,6 +452,18 @@ impl<Front:SocketHandler> Http<Front> {
       return ClientResult::Continue;
     }
 
+    //handle this case separately as its cumbersome to do from the pattern match
+    if let Some(sz) = self.state.as_ref().map(|st| st.must_continue()).unwrap_or(None) {
+      self.readiness.front_interest.insert(Ready::readable());
+      self.readiness.front_interest.remove(Ready::writable());
+
+      // we must now copy the body from front to back
+      ytace!("100-Continue => copying {} of body from front to back", sz);
+      self.front_buf.slice_output(sz);
+      self.front_buf.consume_parsed_data(sz);
+      return ClientResult::Continue;
+    }
+
     match unwrap_msg!(self.state.as_ref()).response {
       // FIXME: should only restart parsing if we are using keepalive
       Some(ResponseState::Response(_,_))                            |
@@ -651,6 +663,15 @@ impl<Front:SocketHandler> Http<Front> {
       } else {
         //FIXME: should we upgrade to a pipe or send an error?
         return (ProtocolResult::Continue, ClientResult::Continue);
+      }
+    }
+
+    if let Some(sz) = self.state.as_ref().map(|st| st.must_continue()).unwrap_or(None) {
+      trace!("100 continue wrote {} bytes to backend, resetting response state", sz);
+      if let Some(ref mut state) = self.state.as_mut() {
+        state.request.as_mut().map(|r| r.get_mut_connection().map(|mut conn| conn.continues = Continue::None));
+        state.response       = Some(ResponseState::Initial);
+        state.res_header_end = None;
       }
     }
 
