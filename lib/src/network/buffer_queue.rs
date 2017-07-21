@@ -80,10 +80,10 @@ impl BufferQueue {
   pub fn sliced_input(&mut self, count: usize) {
     let needed = self.start_parsing_position - self.parsed_position;
     if needed > 0 {
-      if count >= needed {
+      if count > needed {
         self.parsed_position = self.start_parsing_position;
         self.input_queue.push(InputElement::Slice(count - needed));
-      } else {
+      } else if count < needed {
         self.parsed_position += count;
       }
     } else {
