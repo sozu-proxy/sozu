@@ -9,7 +9,7 @@ use std::io::{self,ErrorKind};
 use std::os::unix::fs::PermissionsExt;
 use std::collections::{HashMap,HashSet};
 use std::time::Duration;
-use libc::pid_t;
+use libc::{pid_t,kill};
 
 use sozu::messages::{Order,OrderMessage,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus};
 use sozu::channel::Channel;
@@ -339,7 +339,6 @@ impl CommandServer {
       client.channel.run();
     }
   }
-
 }
 
 pub fn start(config: Config, proxies: Vec<Worker>) {
@@ -376,8 +375,13 @@ pub fn start(config: Config, proxies: Vec<Worker>) {
       server.run();
       //event_loop.run(&mut CommandServer::new(srv, proxies, buffer_size, max_buffer_size)).unwrap()
     },
-      Err(e) => {
-        error!("could not create unix socket: {:?}", e);
+    Err(e) => {
+      error!("could not create unix socket: {:?}", e);
+      // the workers did not even get the configuration, we can kill them right away
+      for proxy in proxies {
+        error!("killing worker n°{} (PID {})", proxy.id, proxy.pid);
+        unsafe { kill(proxy.pid, 9); }
       }
+    }
   }
 }
