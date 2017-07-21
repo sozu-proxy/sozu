@@ -472,12 +472,20 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
 
         self.interpret_client_order(poll, client_token, order);
         //self.clients[client_token].readiness().front_readiness.remove(Ready::readable());
+        if !self.clients.contains(client_token) {
+          break;
+        }
+
       }
 
       if back_interest.is_writable() {
         let order = self.clients[client_token].back_writable();
         self.interpret_client_order(poll, client_token, order);
         //self.clients[client_token].readiness().back_readiness.remove(Ready::writable());
+        if !self.clients.contains(client_token) {
+          break;
+        }
+
       }
 
       if back_interest.is_readable() {
@@ -499,6 +507,10 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
 
         self.interpret_client_order(poll, client_token, order);
         //self.clients[client_token].readiness().back_readiness.remove(Ready::readable());
+        if !self.clients.contains(client_token) {
+          break;
+        }
+
       }
 
       if front_interest.is_writable() {
