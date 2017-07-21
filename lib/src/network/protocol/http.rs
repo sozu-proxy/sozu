@@ -458,7 +458,7 @@ impl<Front:SocketHandler> Http<Front> {
       self.readiness.front_interest.remove(Ready::writable());
 
       // we must now copy the body from front to back
-      ytace!("100-Continue => copying {} of body from front to back", sz);
+      trace!("100-Continue => copying {} of body from front to back", sz);
       self.front_buf.slice_output(sz);
       self.front_buf.consume_parsed_data(sz);
       return ClientResult::Continue;
