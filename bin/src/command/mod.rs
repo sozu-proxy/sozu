@@ -86,7 +86,7 @@ pub struct CommandServer {
   timer:           Timer<Token>,
   config:          Config,
   token_count:     usize,
-  inflight:        HashMap<String,HashSet<usize>>,
+  order_state:     HashMap<String,HashSet<usize>>,
   must_stop:       bool,
 }
 
@@ -165,7 +165,7 @@ impl CommandServer {
       timer:           timer,
       config:          config,
       token_count:     token_count,
-      inflight:        HashMap::new(),
+      order_state:     HashMap::new(),
       must_stop:       false,
     }
   }
@@ -294,14 +294,14 @@ impl CommandServer {
         }
       }
 
-      if let Some(ref mut workers) = self.inflight.get_mut(&msg.id)  {
+      if let Some(ref mut workers) = self.order_state.get_mut(&msg.id)  {
         //info!("will remove token {} for id {}", token.0, msg.id);
         workers.remove(&token.0);
       }
       //info!("inflight is now: {:?}", self.inflight);
 
-      if self.inflight.get(&msg.id).map(|set| set.len()).unwrap_or(0) == 0 {
-        self.inflight.remove(&msg.id);
+      if self.order_state.get(&msg.id).map(|set| set.len()).unwrap_or(0) == 0 {
+        self.order_state.remove(&msg.id);
 
         if stopping {
           self.must_stop = true;

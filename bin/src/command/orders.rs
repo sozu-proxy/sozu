@@ -237,7 +237,7 @@ impl CommandServer {
           worker.inflight.insert(message_id.clone(), order.clone());
           let mut hs = HashSet::new();
           hs.insert(worker_token);
-          self.inflight.insert(message_id.clone(), hs);
+          self.order_state.insert(message_id.clone(), hs);
 
           let o = order.clone();
           //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
@@ -313,14 +313,14 @@ impl CommandServer {
         proxy.run_state = RunState::Stopping;
       }
 
-      if self.inflight.contains_key(message_id) {
-        self.inflight.get_mut(message_id).map(|hs| hs.insert(proxy.token.expect("worker should have a valid token").0));
-        trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.inflight);
+      if self.order_state.contains_key(message_id) {
+        self.order_state.get_mut(message_id).map(|hs| hs.insert(proxy.token.expect("worker should have a valid token").0));
+        trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
       } else {
         let mut hs = HashSet::new();
         hs.insert(proxy.token.expect("worker should have a valid token").0);
-        trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.inflight);
-        self.inflight.insert(String::from(message_id), hs);
+        trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
+        self.order_state.insert(String::from(message_id), hs);
       }
       proxy.inflight.insert(String::from(message_id), order.clone());
       let o = order.clone();
@@ -409,7 +409,7 @@ impl CommandServer {
       state:       state,
       next_id:     self.next_id,
       token_count: self.token_count,
-      inflight:    self.inflight.clone(),
+      order_state: self.order_state.clone(),
     }
   }
 
@@ -422,7 +422,7 @@ impl CommandServer {
       state,
       next_id,
       token_count,
-      inflight,
+      order_state,
     } = upgrade_data;
 
     println!("listener is: {}", command);
@@ -473,7 +473,7 @@ impl CommandServer {
       next_id:         next_id,
       state:           config_state,
       token_count:     token_count,
-      inflight:        inflight,
+      order_state:     order_state,
       must_stop:       false,
     }
   }
