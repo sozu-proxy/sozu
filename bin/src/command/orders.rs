@@ -313,15 +313,11 @@ impl CommandServer {
         proxy.run_state = RunState::Stopping;
       }
 
-      if self.order_state.contains_key(message_id) {
-        self.order_state.get_mut(message_id).map(|hs| hs.insert(proxy.token.expect("worker should have a valid token").0));
-        trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
-      } else {
-        let mut hs = HashSet::new();
-        hs.insert(proxy.token.expect("worker should have a valid token").0);
-        trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
-        self.order_state.insert(String::from(message_id), hs);
-      }
+
+      self.order_state.entry(String::from(message_id)).or_insert(HashSet::new())
+          .insert(proxy.token.expect("worker should have a valid token").0);
+      trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
+
       proxy.inflight.insert(String::from(message_id), order.clone());
       let o = order.clone();
       self.conns[token].add_message_id(String::from(message_id));
