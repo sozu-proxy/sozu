@@ -32,50 +32,10 @@ impl CommandServer {
     let config_command = message.data.clone();
     match config_command {
       ConfigCommand::SaveState(path) => {
-        if let Ok(mut f) = fs::File::create(&path) {
-
-          let mut counter = 0usize;
-          for command in self.state.generate_orders() {
-            let message = ConfigMessage::new(
-              format!("SAVE-{}", counter),
-              ConfigCommand::ProxyConfiguration(command),
-              None
-            );
-            f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()));
-            f.write_all(&b"\n\0"[..]);
-            counter += 1;
-          }
-          f.sync_all();
-          self.conns[token].write_message(&ConfigMessageAnswer::new(
-            message.id.clone(),
-            ConfigMessageStatus::Ok,
-            format!("saved to {}", path),
-            None
-          ));
-        } else {
-          error!("could not open file: {}", &path);
-          self.conns[token].write_message(&ConfigMessageAnswer::new(
-            message.id.clone(),
-            ConfigMessageStatus::Error,
-            "could not open file".to_string(),
-            None
-          ));
-        }
+        self.save_state(token, &message.id, &path);
       },
       ConfigCommand::DumpState => {
-
-        let conf = ProxyConfiguration {
-          id:    message.id.clone(),
-          state: self.state.clone(),
-        };
-        //let encoded = serde_json::to_string(&conf).map(|s| s.into_bytes()).unwrap_or(vec!());
-        self.conns[token].write_message(&ConfigMessageAnswer::new(
-          message.id.clone(),
-          ConfigMessageStatus::Ok,
-          serde_json::to_string(&conf).unwrap_or(String::new()),
-          None
-        ));
-        //self.conns[token].write_message(&encoded);
+        self.dump_state(token, &message.id);
       },
       ConfigCommand::LoadState(path) => {
         self.load_state(&message.id, &path);
@@ -87,104 +47,65 @@ impl CommandServer {
         ));
       },
       ConfigCommand::ListWorkers => {
-        let workers: Vec<WorkerInfo> = self.proxies.values().map(|ref proxy| {
-          WorkerInfo {
-            id:         proxy.id,
-            pid:        proxy.pid,
-            run_state:  proxy.run_state.clone(),
-          }
-        }).collect();
-        self.conns[token].write_message(&ConfigMessageAnswer::new(
-          message.id.clone(),
-          ConfigMessageStatus::Ok,
-          "".to_string(),
-          Some(AnswerData::Workers(workers))
-        ));
+        self.list_workers(token, &message.id);
       },
       ConfigCommand::LaunchWorker(tag) => {
         info!("received LaunchWorker with tag \"{}\"", tag);
-        self.launch_worker(&tag, token, message);
+        self.launch_worker(token, message, &tag);
       },
       ConfigCommand::UpgradeMaster => {
-        self.disable_cloexec_before_upgrade();
-        self.conns[token].channel.set_blocking(true);
-        self.conns[token].write_message(&ConfigMessageAnswer::new(
-          message.id.clone(),
-          ConfigMessageStatus::Processing,
-          "".to_string(),
-          None
-        ));
-        let (pid, mut channel) = start_new_master_process(self.generate_upgrade_data());
-        channel.set_blocking(true);
-        let res = channel.read_message();
-        info!("upgrade channel sent: {:?}", res);
-        if let Some(true) = res {
-          self.conns[token].write_message(&ConfigMessageAnswer::new(
-            message.id.clone(),
-            ConfigMessageStatus::Ok,
-            "new master process launched, closing the old one".to_string(),
-            None
-          ));
-          info!("wrote final message, closing");
-          //FIXME: should do some cleanup before exiting
-          sleep(Duration::from_secs(2));
-          process::exit(0);
-        } else {
-          self.conns[token].write_message(&ConfigMessageAnswer::new(
-            message.id.clone(),
-            ConfigMessageStatus::Error,
-            "could not upgrade master process".to_string(),
-            None
-          ));
-
-        }
+        self.upgrade_master(token, &message.id);
       },
       ConfigCommand::ProxyConfiguration(order) => {
-        if let &Order::AddHttpsFront(ref data) = &order {
-          info!("proxyconfig client order AddHttpsFront(HttpsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
-          data.app_id, data.hostname, data.path_begin);
-        } else {
-          info!("proxyconfig client order {:?}", order);
-        }
-
-        self.state.handle_order(&order);
-
-        let mut found = false;
-        for ref mut proxy in self.proxies.values_mut() {
-          if let Some(id) = message.proxy_id {
-            if id != proxy.id {
-              continue;
-            }
-          }
-
-          if order == Order::SoftStop || order == Order::HardStop {
-            proxy.run_state = RunState::Stopping;
-          }
-
-          if self.inflight.contains_key(&message.id) {
-            self.inflight.get_mut(&message.id).map(|hs| hs.insert(proxy.token.expect("worker should have a valid token").0));
-            trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.inflight);
-          } else {
-            let mut hs = HashSet::new();
-            hs.insert(proxy.token.expect("worker should have a valid token").0);
-            trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.inflight);
-            self.inflight.insert(message.id.clone(), hs);
-          }
-          proxy.inflight.insert(message.id.clone(), order.clone());
-          let o = order.clone();
-          self.conns[token].add_message_id(message.id.clone());
-          //proxy.state.handle_order(&o);
-          proxy.channel.write_message(&OrderMessage { id: message.id.clone(), order: o });
-          proxy.channel.run();
-          found = true;
-        }
-
-        if !found {
-          // FIXME: should send back error here
-          error!("no proxy found");
-        }
+        self.worker_order(token, &message.id, order, message.proxy_id);
       }
     }
+  }
+
+  pub fn save_state(&mut self, token: FrontToken, message_id: &str, path: &str) {
+    if let Ok(mut f) = fs::File::create(&path) {
+
+      let mut counter = 0usize;
+      for command in self.state.generate_orders() {
+        let message = ConfigMessage::new(
+          format!("SAVE-{}", counter),
+          ConfigCommand::ProxyConfiguration(command),
+          None
+          );
+        f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()));
+        f.write_all(&b"\n\0"[..]);
+        counter += 1;
+      }
+      f.sync_all();
+      self.conns[token].write_message(&ConfigMessageAnswer::new(
+          String::from(message_id),
+          ConfigMessageStatus::Ok,
+          format!("saved to {}", path),
+          None
+          ));
+    } else {
+      error!("could not open file: {}", &path);
+      self.conns[token].write_message(&ConfigMessageAnswer::new(
+          String::from(message_id),
+          ConfigMessageStatus::Error,
+          "could not open file".to_string(),
+          None
+          ));
+    }
+  }
+
+  pub fn dump_state(&mut self, token: FrontToken, message_id: &str) {
+    let conf = ProxyConfiguration {
+      id:    String::from(message_id),
+      state: self.state.clone(),
+    };
+    //let encoded = serde_json::to_string(&conf).map(|s| s.into_bytes()).unwrap_or(vec!());
+    self.conns[token].write_message(&ConfigMessageAnswer::new(
+      String::from(message_id),
+      ConfigMessageStatus::Ok,
+      serde_json::to_string(&conf).unwrap_or(String::new()),
+      None
+    ));
   }
 
   pub fn load_state(&mut self, message_id: &str, path: &str) {
@@ -274,7 +195,23 @@ impl CommandServer {
     }
   }
 
-  pub fn launch_worker(&mut self, tag: &str, token: FrontToken, message: &ConfigMessage) {
+  pub fn list_workers(&mut self, token: FrontToken, message_id: &str) {
+    let workers: Vec<WorkerInfo> = self.proxies.values().map(|ref proxy| {
+      WorkerInfo {
+        id:         proxy.id,
+        pid:        proxy.pid,
+        run_state:  proxy.run_state.clone(),
+      }
+    }).collect();
+    self.conns[token].write_message(&ConfigMessageAnswer::new(
+      String::from(message_id),
+      ConfigMessageStatus::Ok,
+      "".to_string(),
+      Some(AnswerData::Workers(workers))
+    ));
+  }
+
+  pub fn launch_worker(&mut self, token: FrontToken, message: &ConfigMessage, tag: &str) {
     let id = self.next_id + 1;
     if let Ok(mut worker) = start_worker(id, &self.config) {
       self.conns[token].write_message(&ConfigMessageAnswer::new(
@@ -327,20 +264,99 @@ impl CommandServer {
       self.proxies.insert(Token(worker_token), worker);
 
       self.conns[token].write_message(&ConfigMessageAnswer::new(
-          message.id.clone(),
-          ConfigMessageStatus::Ok,
-          "".to_string(),
-          None
-          ));
+        message.id.clone(),
+        ConfigMessageStatus::Ok,
+        "".to_string(),
+        None
+      ));
     } else {
       self.conns[token].write_message(&ConfigMessageAnswer::new(
-          message.id.clone(),
-          ConfigMessageStatus::Error,
-          "failed creating worker".to_string(),
-          None
-          ));
+        message.id.clone(),
+        ConfigMessageStatus::Error,
+        "failed creating worker".to_string(),
+        None
+      ));
+    }
+  }
+
+  pub fn upgrade_master(&mut self, token: FrontToken, message_id: &str) {
+    self.disable_cloexec_before_upgrade();
+    self.conns[token].channel.set_blocking(true);
+    self.conns[token].write_message(&ConfigMessageAnswer::new(
+        String::from(message_id),
+        ConfigMessageStatus::Processing,
+        "".to_string(),
+        None
+        ));
+    let (pid, mut channel) = start_new_master_process(self.generate_upgrade_data());
+    channel.set_blocking(true);
+    let res = channel.read_message();
+    info!("upgrade channel sent: {:?}", res);
+    if let Some(true) = res {
+      self.conns[token].write_message(&ConfigMessageAnswer::new(
+        String::from(message_id),
+        ConfigMessageStatus::Ok,
+        "new master process launched, closing the old one".to_string(),
+        None
+      ));
+      info!("wrote final message, closing");
+      //FIXME: should do some cleanup before exiting
+      sleep(Duration::from_secs(2));
+      process::exit(0);
+    } else {
+      self.conns[token].write_message(&ConfigMessageAnswer::new(
+        String::from(message_id),
+        ConfigMessageStatus::Error,
+        "could not upgrade master process".to_string(),
+        None
+      ));
+    }
+  }
+
+  pub fn worker_order(&mut self, token: FrontToken, message_id: &str, order: Order, proxy_id: Option<u32>) {
+    if let &Order::AddHttpsFront(ref data) = &order {
+      info!("proxyconfig client order AddHttpsFront(HttpsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
+      data.app_id, data.hostname, data.path_begin);
+    } else {
+      info!("proxyconfig client order {:?}", order);
     }
 
+    self.state.handle_order(&order);
+
+    let mut found = false;
+    for ref mut proxy in self.proxies.values_mut() {
+      if let Some(id) = proxy_id {
+        if id != proxy.id {
+          continue;
+        }
+      }
+
+      if order == Order::SoftStop || order == Order::HardStop {
+        proxy.run_state = RunState::Stopping;
+      }
+
+      if self.inflight.contains_key(message_id) {
+        self.inflight.get_mut(message_id).map(|hs| hs.insert(proxy.token.expect("worker should have a valid token").0));
+        trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.inflight);
+      } else {
+        let mut hs = HashSet::new();
+        hs.insert(proxy.token.expect("worker should have a valid token").0);
+        trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.inflight);
+        self.inflight.insert(String::from(message_id), hs);
+      }
+      proxy.inflight.insert(String::from(message_id), order.clone());
+      let o = order.clone();
+      self.conns[token].add_message_id(String::from(message_id));
+      //proxy.state.handle_order(&o);
+      proxy.channel.write_message(&OrderMessage { id: String::from(message_id), order: o });
+      proxy.channel.run();
+      found = true;
+    }
+
+    if !found {
+      // FIXME: should send back error here
+      error!("no proxy found");
+    }
   }
 
   pub fn load_static_application_configuration(&mut self) {
