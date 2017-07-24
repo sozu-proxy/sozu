@@ -4,6 +4,7 @@ use std::process;
 use std::io::Read;
 use std::io::Write;
 use std::iter::FromIterator;
+use std::convert::Into;
 use std::thread::sleep;
 use std::time::Duration;
 use std::collections::{HashMap,HashSet};
@@ -39,12 +40,7 @@ impl CommandServer {
       },
       ConfigCommand::LoadState(path) => {
         self.load_state(&message.id, &path);
-        self.conns[token].write_message(&ConfigMessageAnswer::new(
-          message.id.clone(),
-          ConfigMessageStatus::Ok,
-          "loaded the configuration".to_string(),
-          None
-        ));
+        self.answer_success(token, message.id.as_str(), "loaded the configuration", None);
       },
       ConfigCommand::ListWorkers => {
         self.list_workers(token, &message.id);
@@ -62,6 +58,29 @@ impl CommandServer {
     }
   }
 
+  pub fn answer_success<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<AnswerData>)
+    where T: Into<String>,
+          U: Into<String> {
+    self.conns[token].write_message(&ConfigMessageAnswer::new(
+      id.into(),
+      ConfigMessageStatus::Ok,
+      message.into(),
+      data
+    ));
+  }
+
+  pub fn answer_error<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<AnswerData>)
+    where T: Into<String>,
+          U: Into<String> {
+    self.conns[token].write_message(&ConfigMessageAnswer::new(
+      id.into(),
+      ConfigMessageStatus::Error,
+      message.into(),
+      data
+    ));
+
+  }
+
   pub fn save_state(&mut self, token: FrontToken, message_id: &str, path: &str) {
     if let Ok(mut f) = fs::File::create(&path) {
 
@@ -77,20 +96,10 @@ impl CommandServer {
         counter += 1;
       }
       f.sync_all();
-      self.conns[token].write_message(&ConfigMessageAnswer::new(
-          String::from(message_id),
-          ConfigMessageStatus::Ok,
-          format!("saved to {}", path),
-          None
-          ));
+      self.answer_success(token, message_id, format!("saved to {}", path), None);
     } else {
       error!("could not open file: {}", &path);
-      self.conns[token].write_message(&ConfigMessageAnswer::new(
-          String::from(message_id),
-          ConfigMessageStatus::Error,
-          "could not open file".to_string(),
-          None
-          ));
+      self.answer_error(token, message_id, "could not open file", None);
     }
   }
 
@@ -99,13 +108,7 @@ impl CommandServer {
       id:    String::from(message_id),
       state: self.state.clone(),
     };
-    //let encoded = serde_json::to_string(&conf).map(|s| s.into_bytes()).unwrap_or(vec!());
-    self.conns[token].write_message(&ConfigMessageAnswer::new(
-      String::from(message_id),
-      ConfigMessageStatus::Ok,
-      serde_json::to_string(&conf).unwrap_or(String::new()),
-      None
-    ));
+    self.answer_success(token, message_id, serde_json::to_string(&conf).unwrap_or(String::new()), None);
   }
 
   pub fn load_state(&mut self, message_id: &str, path: &str) {
@@ -203,12 +206,7 @@ impl CommandServer {
         run_state:  proxy.run_state.clone(),
       }
     }).collect();
-    self.conns[token].write_message(&ConfigMessageAnswer::new(
-      String::from(message_id),
-      ConfigMessageStatus::Ok,
-      "".to_string(),
-      Some(AnswerData::Workers(workers))
-    ));
+    self.answer_success(token, message_id, "", Some(AnswerData::Workers(workers)));
   }
 
   pub fn launch_worker(&mut self, token: FrontToken, message: &ConfigMessage, tag: &str) {
@@ -263,19 +261,9 @@ impl CommandServer {
       worker.token = Some(Token(worker_token));
       self.proxies.insert(Token(worker_token), worker);
 
-      self.conns[token].write_message(&ConfigMessageAnswer::new(
-        message.id.clone(),
-        ConfigMessageStatus::Ok,
-        "".to_string(),
-        None
-      ));
+      self.answer_success(token, message.id.as_str(), "", None);
     } else {
-      self.conns[token].write_message(&ConfigMessageAnswer::new(
-        message.id.clone(),
-        ConfigMessageStatus::Error,
-        "failed creating worker".to_string(),
-        None
-      ));
+      self.answer_error(token, message.id.as_str(), "failed creating worker", None);
     }
   }
 
@@ -293,23 +281,13 @@ impl CommandServer {
     let res = channel.read_message();
     info!("upgrade channel sent: {:?}", res);
     if let Some(true) = res {
-      self.conns[token].write_message(&ConfigMessageAnswer::new(
-        String::from(message_id),
-        ConfigMessageStatus::Ok,
-        "new master process launched, closing the old one".to_string(),
-        None
-      ));
+      self.answer_success(token, message_id, "new master process launched, closing the old one", None);
       info!("wrote final message, closing");
       //FIXME: should do some cleanup before exiting
       sleep(Duration::from_secs(2));
       process::exit(0);
     } else {
-      self.conns[token].write_message(&ConfigMessageAnswer::new(
-        String::from(message_id),
-        ConfigMessageStatus::Error,
-        "could not upgrade master process".to_string(),
-        None
-      ));
+      self.answer_error(token, message_id, "could not upgrade master process", None);
     }
   }
 
