@@ -25,6 +25,7 @@ use sozu_command::state::ConfigState;
 
 use super::{CommandServer,FrontToken,ProxyConfiguration,Worker};
 use super::client::parse;
+use super::state::InflightOrders;
 use worker::start_worker;
 use upgrade::{start_new_master_process,SerializedWorker,UpgradeData};
 
@@ -235,9 +236,7 @@ impl CommandServer {
         for order in self.state.generate_orders() {
           let message_id = format!("LAUNCH-CONF-{}", counter);
           worker.inflight.insert(message_id.clone(), order.clone());
-          let mut hs = HashSet::new();
-          hs.insert(worker_token);
-          self.order_state.insert(message_id.clone(), hs);
+          self.order_state.insert(message.id.as_str(), Token(worker_token));
 
           let o = order.clone();
           //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
@@ -314,8 +313,7 @@ impl CommandServer {
       }
 
 
-      self.order_state.entry(String::from(message_id)).or_insert(HashSet::new())
-          .insert(proxy.token.expect("worker should have a valid token").0);
+      self.order_state.insert(message_id, proxy.token.expect("worker should have a valid token"));
       trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
 
       proxy.inflight.insert(String::from(message_id), order.clone());
@@ -405,7 +403,7 @@ impl CommandServer {
       state:       state,
       next_id:     self.next_id,
       token_count: self.token_count,
-      order_state: self.order_state.clone(),
+      order_state: self.order_state.state.clone(),
     }
   }
 
@@ -469,7 +467,9 @@ impl CommandServer {
       next_id:         next_id,
       state:           config_state,
       token_count:     token_count,
-      order_state:     order_state,
+      order_state:     InflightOrders {
+        state: order_state
+      },
       must_stop:       false,
     }
   }

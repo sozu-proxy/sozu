@@ -19,6 +19,7 @@ use sozu_command::config::Config;
 
 pub mod orders;
 pub mod client;
+pub mod state;
 
 use self::client::CommandClient;
 
@@ -86,7 +87,7 @@ pub struct CommandServer {
   timer:           Timer<Token>,
   config:          Config,
   token_count:     usize,
-  order_state:     HashMap<String,HashSet<usize>>,
+  order_state:     state::InflightOrders,
   must_stop:       bool,
 }
 
@@ -165,7 +166,7 @@ impl CommandServer {
       timer:           timer,
       config:          config,
       token_count:     token_count,
-      order_state:     HashMap::new(),
+      order_state:     state::InflightOrders::new(),
       must_stop:       false,
     }
   }
@@ -294,18 +295,8 @@ impl CommandServer {
         }
       }
 
-      if let Some(ref mut workers) = self.order_state.get_mut(&msg.id)  {
-        //info!("will remove token {} for id {}", token.0, msg.id);
-        workers.remove(&token.0);
-      }
-      //info!("inflight is now: {:?}", self.inflight);
-
-      if self.order_state.get(&msg.id).map(|set| set.len()).unwrap_or(0) == 0 {
-        self.order_state.remove(&msg.id);
-
-        if stopping {
-          self.must_stop = true;
-        }
+      if self.order_state.remove(&msg.id, token) && stopping {
+        self.must_stop = true;
       }
     }
 
