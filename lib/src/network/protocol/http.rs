@@ -347,6 +347,7 @@ impl<Front:SocketHandler> Http<Front> {
             self.readiness.front_interest.remove(Ready::readable());
           }
         }
+        self.readiness.back_interest.insert(Ready::writable());
         ClientResult::Continue
       },
     _ => {
@@ -713,8 +714,8 @@ impl<Front:SocketHandler> Http<Front> {
           if let Some(&Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended))) = self.state.as_ref().map(|s| &s.response) {
             self.readiness.back_interest.remove(Ready::readable());
           }
-          self.readiness.front_interest.insert(Ready::writable());
         }
+        self.readiness.front_interest.insert(Ready::writable());
         (ProtocolResult::Continue, ClientResult::Continue)
       },
       Some(ResponseState::Error(_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
