@@ -236,11 +236,11 @@ impl ProxyClient for TlsClient {
   }
 
   fn front_hup(&mut self)     -> ClientResult {
-    unwrap_msg!(self.http()).front_hup()
+    self.http().map(|h| h.front_hup()).unwrap_or(ClientResult::CloseClient)
   }
 
   fn back_hup(&mut self)      -> ClientResult {
-    unwrap_msg!(self.http()).back_hup()
+    self.http().map(|h| h.back_hup()).unwrap_or(ClientResult::CloseClient)
   }
 
   fn readable(&mut self)      -> ClientResult {
