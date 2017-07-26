@@ -15,7 +15,7 @@ use sozu::messages::{Order,OrderMessage,OrderMessageAnswer,OrderMessageAnswerDat
 use sozu::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::data::{AnswerData,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
-use sozu_command::config::Config;
+use sozu_command::config::{Config, AppConfig};
 
 pub mod orders;
 pub mod client;

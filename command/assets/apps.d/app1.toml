@@ -1,0 +1,8 @@
+appname = "App1"
+hostname   = "localhost1"
+#path_begin = "/api" # optional
+certificate = "../lib/assets/certificate.pem" # optional
+key = "../lib/assets/key.pem" # optional
+certificate_chain = "../lib/assets/certificate_chain.pem" # optional
+frontends = ["HTTP", "HTTPS"] # list of proxy tags
+backends  = [ "localhost:3002" ] # list of IP/port
