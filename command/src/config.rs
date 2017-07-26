@@ -230,8 +230,8 @@ pub struct Config {
     pub metrics: MetricsConfig,
     pub http: Option<ProxyConfig>,
     pub https: Option<ProxyConfig>,
-//    pub applications: HashMap<String, AppConfig>,
-    pub handle_process_affinity: Option<bool>
+    pub handle_process_affinity: Option<bool>,
+    pub apps_dir: Option<String>,
 }
 
 pub struct ConfigUtils {}

@@ -1,0 +1,1 @@
+cd ctl && cargo build; cd ../bin && cargo build; cd ..;

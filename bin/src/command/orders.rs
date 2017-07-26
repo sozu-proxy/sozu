@@ -335,7 +335,8 @@ impl CommandServer {
   pub fn load_static_application_configuration(&mut self) {
     //FIXME: too many loops, this could be cleaner
     //TODO: path should be read from config
-    let init_apps = AppConfig::load_apps("/Users/ssarabadani/projects/rust/sozu/command/assets/apps.d").unwrap();
+    let apps_dir = self.config.apps_dir.clone().unwrap_or(String::from("apps.d"));
+    let init_apps = AppConfig::load_apps(apps_dir.as_str()).unwrap();
     for message in self.config.generate_config_messages(&init_apps) {
       if let ConfigCommand::ProxyConfiguration(order) = message.data {
         self.state.handle_order(&order);

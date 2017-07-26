@@ -36,4 +36,5 @@ default_app_id = "MyApp"
 
 #answer_404 = "../lib/assets/404.html"
 #answer_503 = "../lib/assets/503.html"
+apps_dir= "apps.d"
 
