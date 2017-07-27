@@ -61,6 +61,11 @@ impl Worker {
       queue:      VecDeque::new(),
     }
   }
+
+  pub fn push_message(&mut self, message: OrderMessage) {
+    self.queue.push_back(message);
+    self.channel.interest.insert(Ready::writable());
+  }
 }
 
 impl fmt::Debug for Worker {
@@ -212,18 +217,36 @@ impl CommandServer {
         let mut messages = {
           let ref mut proxy =  self.proxies.get_mut(&Token(i)).unwrap();
           proxy.channel.handle_events(events);
-          proxy.channel.run();
+          //proxy.channel.run();
 
           let mut messages = Vec::new();
           loop {
-            let msg = proxy.channel.read_message();
-            if msg.is_none() {
-              break;
-            } else {
-              messages.push(msg.unwrap());
-            }
-          }
+            info!("worker readiness[{}] = {:#?}", i, proxy.channel.readiness());
 
+            if proxy.channel.readiness() == Ready::empty() {
+              break;
+            }
+
+            if proxy.channel.readiness().is_readable() {
+              proxy.channel.readable();
+
+              loop {
+                if let Some(msg) = proxy.channel.read_message() {
+                  messages.push(msg);
+                } else {
+                  break;
+                }
+              }
+            }
+
+            if proxy.channel.readiness().is_writable() {
+              if let Some(msg) = proxy.queue.pop_front() {
+                proxy.channel.write_message(&msg);
+                proxy.channel.writable();
+              }
+            }
+
+          }
           messages
         };
 
@@ -231,48 +254,51 @@ impl CommandServer {
           self.proxy_handle_message(Token(i), msg);
         }
 
-        {
-          let ref mut proxy =  self.proxies.get_mut(&Token(i)).unwrap();
-          proxy.channel.run();
-        }
-
       },
       _ => {
         let conn_token = self.to_front(token);
         if self.clients.contains(conn_token) {
           self.clients[conn_token].channel.handle_events(events);
-          self.clients[conn_token].channel.run();
-
-          //FIXME: handle deconnection
-          loop {
-            let message = self.clients[conn_token].channel.read_message();
-
-            // if the message was too large, we grow the buffer and retry to read if possible
-            if message.is_none() {
-              if self.clients[conn_token].channel.readiness.is_hup() {
-                break;
-              }
-
-              if (self.clients[conn_token].channel.interest & self.clients[conn_token].channel.readiness).is_readable() {
-                self.clients[conn_token].channel.run();
-                continue;
-              } else {
-                break;
-              }
-            }
-
-            let message = message.unwrap();
-            self.handle_client_message(conn_token, &message);
-
-          }
-
-          self.clients[conn_token].channel.run();
+          //self.clients[conn_token].channel.run();
 
           if self.clients[conn_token].channel.readiness.is_hup() {
             self.poll.deregister(&self.clients[conn_token].channel.sock);
             self.clients.remove(conn_token);
             trace!("closed client [{}]", token.0);
+          } else {
+            loop {
+              info!("client complete readiness[{}] = {:#?} (r = {:#?}, i = {:#?})", token.0,
+                self.clients[conn_token].channel.readiness(),
+                self.clients[conn_token].channel.readiness,
+                self.clients[conn_token].channel.interest
+              );
+
+              if self.clients[conn_token].channel.readiness() == Ready::empty() {
+                break;
+              }
+
+              if self.clients[conn_token].channel.readiness().is_writable() {
+                if let Some(msg) = self.clients[conn_token].queue.pop_front() {
+                  self.clients[conn_token].channel.write_message(&msg);
+                  self.clients[conn_token].channel.writable();
+                }
+              }
+
+              if self.clients[conn_token].channel.readiness().is_readable() {
+                self.clients[conn_token].channel.readable();
+                loop {
+                  if let Some(message) = self.clients[conn_token].channel.read_message() {
+                    //self.proxy_handle_message(Token(i), msg);
+                    self.handle_client_message(conn_token, &message);
+                  } else {
+                    break;
+                  }
+                }
+              }
+
+            }
           }
+
         }
       }
     }

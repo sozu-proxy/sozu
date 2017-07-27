@@ -60,9 +60,10 @@ impl CommandServer {
   }
 
   pub fn answer_success<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<AnswerData>)
-    where T: Into<String>,
-          U: Into<String> {
-    self.clients[token].queue.push_back(ConfigMessageAnswer::new(
+    where T: Clone+Into<String>,
+          U: Clone+Into<String> {
+    trace!("answer_success for front token {:?} id {}, message {:#?} data {:#?}", token, id.clone().into(), message.clone().into(), data);
+    self.clients[token].push_message(ConfigMessageAnswer::new(
       id.into(),
       ConfigMessageStatus::Ok,
       message.into(),
@@ -71,9 +72,10 @@ impl CommandServer {
   }
 
   pub fn answer_error<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<AnswerData>)
-    where T: Into<String>,
-          U: Into<String> {
-    self.clients[token].queue.push_back(ConfigMessageAnswer::new(
+    where T: Clone+Into<String>,
+          U: Clone+Into<String> {
+    trace!("answer_error for front token {:?} id {}, message {:#?} data {:#?}", token, id.clone().into(), message.clone().into(), data);
+    self.clients[token].push_message(ConfigMessageAnswer::new(
       id.into(),
       ConfigMessageStatus::Error,
       message.into(),
@@ -168,7 +170,7 @@ impl CommandServer {
 
                 for ref mut proxy in self.proxies.values_mut() {
                   let o = order.clone();
-                  proxy.queue.push_back(OrderMessage { id: id.clone(), order: o });
+                  proxy.push_message(OrderMessage { id: id.clone(), order: o });
                   found = true;
 
                   counter += 1;
@@ -211,7 +213,7 @@ impl CommandServer {
   pub fn launch_worker(&mut self, token: FrontToken, message: &ConfigMessage, tag: &str) {
     let id = self.next_id + 1;
     if let Ok(mut worker) = start_worker(id, &self.config) {
-      self.clients[token].queue.push_back(ConfigMessageAnswer::new(
+      self.clients[token].push_message(ConfigMessageAnswer::new(
           message.id.clone(),
           ConfigMessageStatus::Processing,
           "sending configuration orders".to_string(),
@@ -238,7 +240,7 @@ impl CommandServer {
           let o = order.clone();
           //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
           self.clients[token].add_message_id(message_id.clone());
-          worker.queue.push_back(OrderMessage { id: message_id.clone(), order: o });
+          worker.push_message(OrderMessage { id: message_id.clone(), order: o });
 
           let received = worker.channel.read_message();
           info!("worker ({}-{}) sent: {:?}", tag, worker.id, received);
@@ -313,7 +315,7 @@ impl CommandServer {
 
       let o = order.clone();
       self.clients[token].add_message_id(String::from(message_id));
-      proxy.queue.push_back(OrderMessage { id: String::from(message_id), order: o });
+      proxy.push_message(OrderMessage { id: String::from(message_id), order: o });
       found = true;
     }
 
@@ -338,7 +340,7 @@ impl CommandServer {
         let mut found = false;
         for ref mut proxy in self.proxies.values_mut() {
           let o = order.clone();
-          proxy.queue.push_back(OrderMessage { id: message.id.clone(), order: o });
+          proxy.push_message(OrderMessage { id: message.id.clone(), order: o });
           found = true;
         }
 

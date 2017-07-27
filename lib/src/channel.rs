@@ -84,6 +84,10 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
     self.readiness = self.readiness | events;
   }
 
+  pub fn readiness(&self) -> Ready {
+    self.readiness & self.interest
+  }
+
   pub fn run(&mut self) {
     let interest = self.interest & self.readiness;
 

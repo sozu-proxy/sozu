@@ -54,6 +54,10 @@ impl CommandClient {
     self.channel.write_message(message)
   }
 
+  pub fn push_message(&mut self, message: ConfigMessageAnswer) {
+    self.queue.push_back(message);
+    self.channel.interest.insert(Ready::writable());
+  }
 }
 
 pub fn parse(input: &[u8]) -> IResult<&[u8], Vec<ConfigMessage>> {
