@@ -305,27 +305,88 @@ impl CommandServer {
   }
 
   fn proxy_handle_message(&mut self, token: Token, msg: OrderMessageAnswer) {
-    //info!("token {:?} got answer msg: {:?}", token, msg);
-    //info!("inflight: {:?}", self.inflight);
+    info!("proxy handle message: token {:?} got answer msg: {:?}", token, msg);
     if msg.status != OrderMessageStatus::Processing {
       let mut stopping = false;
       if let Some(ref mut proxy) = self.proxies.get_mut(&token) {
-        if let Some(order) = proxy.inflight.remove(&msg.id) {
-          info!("REMOVING INFLIGHT MESSAGE {}: {:?}", msg.id, order);
-          // handle message completion here
-          // there will probably be other cases to handle in the future
-          if order == Order::SoftStop || order == Order::HardStop {
-            stopping = true;
-            proxy.run_state = RunState::Stopped
+        //FIXME:  handle STOP order here
+        //if order == Order::SoftStop || order == Order::HardStop {
+        //  stopping = true;
+        //  proxy.run_state = RunState::Stopped
+        //}
+      }
+
+      match msg.status {
+        OrderMessageStatus::Processing => {
+          //FIXME: right now, do nothing with the curent tasks
+        },
+        OrderMessageStatus::Error(s) => {
+          if self.order_state.error(&msg.id, token) {
+            //FIXME: send message to client here
+
+            if let Some(task) = self.order_state.task(&msg.id) {
+              let data = match msg.data {
+                None => None,
+                Some(OrderMessageAnswerData::Metrics) => Some(AnswerData::Metrics),
+              };
+
+              let answer = ConfigMessageAnswer::new(
+                msg.id.clone(),
+                ConfigMessageStatus::Error,
+                format!("ok: {:#?}, error: {:#?}, message: {}", task.ok, task.error, s.clone()),
+                data,
+              );
+
+              if let Some(client_token) = task.client {
+                info!("sending: {:?}", answer);
+                self.clients[client_token].push_message(answer);
+              }
+            }
+          }
+        },
+        OrderMessageStatus::Ok => {
+          if self.order_state.ok(&msg.id, token) {
+            //FIXME: send message to client here
+            if let Some(task) = self.order_state.task(&msg.id) {
+              let answer = if task.error.is_empty() {
+                let data = match msg.data {
+                  None => None,
+                  Some(OrderMessageAnswerData::Metrics) => Some(AnswerData::Metrics),
+                };
+
+                ConfigMessageAnswer::new(
+                  msg.id.clone(),
+                  ConfigMessageStatus::Ok,
+                  format!("ok: {:#?}, error: {:#?}", task.ok, task.error),
+                  data,
+                )
+              } else {
+                ConfigMessageAnswer::new(
+                  msg.id.clone(),
+                  ConfigMessageStatus::Error,
+                  format!("ok: {:#?}, error: {:#?}", task.ok, task.error),
+                  None,
+                )
+              };
+
+              if let Some(client_token) = task.client {
+                info!("sending: {:?}", answer);
+                self.clients[client_token].push_message(answer);
+              }
+            }
+
+            //FIXME: the task should hold the message type,
+            //so we can know it's a stop message
+            if stopping {
+              self.must_stop = true;
+
+            }
           }
         }
       }
-
-      if self.order_state.remove(&msg.id, token) && stopping {
-        self.must_stop = true;
-      }
     }
 
+    /*
     let data = match msg.data {
       None => None,
       Some(OrderMessageAnswerData::Metrics) => Some(AnswerData::Metrics),
@@ -355,6 +416,7 @@ impl CommandServer {
       }
       client.channel.run();
     }
+    */
   }
 }
 

@@ -235,7 +235,7 @@ impl CommandServer {
         let mut counter = 0u32;
         for order in self.state.generate_orders() {
           let message_id = format!("LAUNCH-CONF-{}", counter);
-          self.order_state.insert(message.id.as_str(), Token(worker_token));
+          self.order_state.insert(message.id.as_str(), Some(token), Token(worker_token));
 
           let o = order.clone();
           //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
@@ -310,8 +310,8 @@ impl CommandServer {
       }
 
 
-      self.order_state.insert(message_id, proxy.token.expect("worker should have a valid token"));
-      trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
+      self.order_state.insert(message_id, Some(token), proxy.token.expect("worker should have a valid token"));
+      trace!("sending to {:?}, inflight is now {:#?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
 
       let o = order.clone();
       self.clients[token].add_message_id(String::from(message_id));
@@ -395,7 +395,7 @@ impl CommandServer {
       state:       state,
       next_id:     self.next_id,
       token_count: self.token_count,
-      order_state: self.order_state.state.clone(),
+      //order_state: self.order_state.state.clone(),
     }
   }
 
@@ -408,7 +408,7 @@ impl CommandServer {
       state,
       next_id,
       token_count,
-      order_state,
+      //order_state,
     } = upgrade_data;
 
     println!("listener is: {}", command);
@@ -458,9 +458,9 @@ impl CommandServer {
       next_id:         next_id,
       state:           config_state,
       token_count:     token_count,
-      order_state:     OrderState {
-        state: order_state
-      },
+
+      //FIXME: deserialize this as well
+      order_state:     OrderState::new(),
       must_stop:       false,
     }
   }
