@@ -9,6 +9,7 @@ use nix::unistd::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 
 use sozu::channel::Channel;
+use sozu::messages::{Order,OrderMessage};
 use sozu_command::config::Config;
 use sozu_command::state::ConfigState;
 use sozu_command::data::RunState;
@@ -24,6 +25,7 @@ pub struct SerializedWorker {
   pub id:         u32,
   pub run_state:  RunState,
   pub token:      Option<usize>,
+  pub queue:      Vec<OrderMessage>,
 }
 
 impl SerializedWorker {
@@ -34,6 +36,7 @@ impl SerializedWorker {
       id:         proxy.id,
       run_state:  proxy.run_state.clone(),
       token:      proxy.token.clone().map(|Token(t)| t),
+      queue:      proxy.queue.clone().into(),
     }
   }
 }

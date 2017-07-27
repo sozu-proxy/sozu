@@ -62,7 +62,7 @@ impl CommandServer {
   pub fn answer_success<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<AnswerData>)
     where T: Into<String>,
           U: Into<String> {
-    self.clients[token].write_message(&ConfigMessageAnswer::new(
+    self.clients[token].queue.push_back(ConfigMessageAnswer::new(
       id.into(),
       ConfigMessageStatus::Ok,
       message.into(),
@@ -73,7 +73,7 @@ impl CommandServer {
   pub fn answer_error<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<AnswerData>)
     where T: Into<String>,
           U: Into<String> {
-    self.clients[token].write_message(&ConfigMessageAnswer::new(
+    self.clients[token].queue.push_back(ConfigMessageAnswer::new(
       id.into(),
       ConfigMessageStatus::Error,
       message.into(),
@@ -168,9 +168,7 @@ impl CommandServer {
 
                 for ref mut proxy in self.proxies.values_mut() {
                   let o = order.clone();
-                  //proxy.state.handle_order(&o);
-                  proxy.channel.write_message(&OrderMessage { id: id.clone(), order: o });
-                  proxy.channel.run();
+                  proxy.queue.push_back(OrderMessage { id: id.clone(), order: o });
                   found = true;
 
                   counter += 1;
@@ -213,7 +211,7 @@ impl CommandServer {
   pub fn launch_worker(&mut self, token: FrontToken, message: &ConfigMessage, tag: &str) {
     let id = self.next_id + 1;
     if let Ok(mut worker) = start_worker(id, &self.config) {
-      self.clients[token].write_message(&ConfigMessageAnswer::new(
+      self.clients[token].queue.push_back(ConfigMessageAnswer::new(
           message.id.clone(),
           ConfigMessageStatus::Processing,
           "sending configuration orders".to_string(),
@@ -235,16 +233,12 @@ impl CommandServer {
         let mut counter = 0u32;
         for order in self.state.generate_orders() {
           let message_id = format!("LAUNCH-CONF-{}", counter);
-          worker.inflight.insert(message_id.clone(), order.clone());
           self.order_state.insert(message.id.as_str(), Token(worker_token));
 
           let o = order.clone();
           //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
           self.clients[token].add_message_id(message_id.clone());
-          //worker.state.handle_order(&o);
-          if !worker.channel.write_message(&OrderMessage { id: message_id.clone(), order: o }) {
-            error!("could not send to new worker({}-{}): {}", tag, worker.id, message_id);
-          }
+          worker.queue.push_back(OrderMessage { id: message_id.clone(), order: o });
 
           let received = worker.channel.read_message();
           info!("worker ({}-{}) sent: {:?}", tag, worker.id, received);
@@ -268,8 +262,9 @@ impl CommandServer {
 
   pub fn upgrade_master(&mut self, token: FrontToken, message_id: &str) {
     self.disable_cloexec_before_upgrade();
+    //FIXME: do we need to be blocking here?
     self.clients[token].channel.set_blocking(true);
-    self.clients[token].write_message(&ConfigMessageAnswer::new(
+    self.clients[token].channel.write_message(&ConfigMessageAnswer::new(
         String::from(message_id),
         ConfigMessageStatus::Processing,
         "".to_string(),
@@ -316,12 +311,9 @@ impl CommandServer {
       self.order_state.insert(message_id, proxy.token.expect("worker should have a valid token"));
       trace!("sending to {:?}, inflight is now {:?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
 
-      proxy.inflight.insert(String::from(message_id), order.clone());
       let o = order.clone();
       self.clients[token].add_message_id(String::from(message_id));
-      //proxy.state.handle_order(&o);
-      proxy.channel.write_message(&OrderMessage { id: String::from(message_id), order: o });
-      proxy.channel.run();
+      proxy.queue.push_back(OrderMessage { id: String::from(message_id), order: o });
       found = true;
     }
 
@@ -346,9 +338,7 @@ impl CommandServer {
         let mut found = false;
         for ref mut proxy in self.proxies.values_mut() {
           let o = order.clone();
-          //proxy.state.handle_order(&o);
-          proxy.channel.write_message(&OrderMessage { id: message.id.clone(), order: o });
-          proxy.channel.run();
+          proxy.queue.push_back(OrderMessage { id: message.id.clone(), order: o });
           found = true;
         }
 
@@ -441,8 +431,7 @@ impl CommandServer {
               token:      Some(Token(token)),
               pid:        serialized.pid,
               run_state:  serialized.run_state.clone(),
-              //FIXME: transmit those as well?
-              inflight:   HashMap::new()
+              queue:      serialized.queue.clone().into(),
             }
           )
         )

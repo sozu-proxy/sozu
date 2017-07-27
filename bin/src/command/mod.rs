@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::io::{self,ErrorKind};
 use std::os::unix::fs::PermissionsExt;
-use std::collections::{HashMap,HashSet};
+use std::collections::{HashMap,HashSet,VecDeque};
 use std::time::Duration;
 use libc::{pid_t,kill};
 
@@ -47,7 +47,7 @@ pub struct Worker {
   pub token:         Option<Token>,
   pub pid:           pid_t,
   pub run_state:     RunState,
-  pub inflight:      HashMap<String,Order>,
+  pub queue:         VecDeque<OrderMessage>,
 }
 
 impl Worker {
@@ -58,7 +58,7 @@ impl Worker {
       token:      None,
       pid:        pid,
       run_state:  RunState::Running,
-      inflight:   HashMap::new(),
+      queue:      VecDeque::new(),
     }
   }
 }
