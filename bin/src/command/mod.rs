@@ -79,7 +79,7 @@ pub struct CommandServer {
   sock:            UnixListener,
   buffer_size:     usize,
   max_buffer_size: usize,
-  conns:           Slab<CommandClient,FrontToken>,
+  clients:         Slab<CommandClient,FrontToken>,
   proxies:         HashMap<Token, Worker>,
   next_id:         u32,
   state:           ConfigState,
@@ -98,16 +98,16 @@ impl CommandServer {
     let acc = self.sock.accept();
     if let Ok(Some((sock, _))) = acc {
       let conn = CommandClient::new(sock, self.buffer_size, self.max_buffer_size);
-      let tok = self.conns.insert(conn)
+      let tok = self.clients.insert(conn)
         .ok().expect("could not add connection to slab");
 
       // Register the connection
       let token = self.from_front(tok);
-      self.conns[tok].token = Some(token);
+      self.clients[tok].token = Some(token);
       let mut interest = Ready::hup();
       interest.insert(Ready::readable());
       interest.insert(Ready::writable());
-      self.poll.register(&self.conns[tok].channel.sock, token, interest, PollOpt::edge())
+      self.poll.register(&self.clients[tok].channel.sock, token, interest, PollOpt::edge())
         .ok().expect("could not register socket with event loop");
 
       let accept_interest = Ready::readable();
@@ -158,7 +158,7 @@ impl CommandServer {
       sock:            srv,
       buffer_size:     buffer_size,
       max_buffer_size: config.max_command_buffer_size.unwrap_or(buffer_size * 2),
-      conns:           Slab::with_capacity(128),
+      clients:         Slab::with_capacity(128),
       proxies:         proxies,
       next_id:         next_id as u32,
       state:           state,
@@ -239,22 +239,22 @@ impl CommandServer {
       },
       _ => {
         let conn_token = self.to_front(token);
-        if self.conns.contains(conn_token) {
-          self.conns[conn_token].channel.handle_events(events);
-          self.conns[conn_token].channel.run();
+        if self.clients.contains(conn_token) {
+          self.clients[conn_token].channel.handle_events(events);
+          self.clients[conn_token].channel.run();
 
           //FIXME: handle deconnection
           loop {
-            let message = self.conns[conn_token].channel.read_message();
+            let message = self.clients[conn_token].channel.read_message();
 
             // if the message was too large, we grow the buffer and retry to read if possible
             if message.is_none() {
-              if self.conns[conn_token].channel.readiness.is_hup() {
+              if self.clients[conn_token].channel.readiness.is_hup() {
                 break;
               }
 
-              if (self.conns[conn_token].channel.interest & self.conns[conn_token].channel.readiness).is_readable() {
-                self.conns[conn_token].channel.run();
+              if (self.clients[conn_token].channel.interest & self.clients[conn_token].channel.readiness).is_readable() {
+                self.clients[conn_token].channel.run();
                 continue;
               } else {
                 break;
@@ -266,11 +266,11 @@ impl CommandServer {
 
           }
 
-          self.conns[conn_token].channel.run();
+          self.clients[conn_token].channel.run();
 
-          if self.conns[conn_token].channel.readiness.is_hup() {
-            self.poll.deregister(&self.conns[conn_token].channel.sock);
-            self.conns.remove(conn_token);
+          if self.clients[conn_token].channel.readiness.is_hup() {
+            self.poll.deregister(&self.clients[conn_token].channel.sock);
+            self.clients.remove(conn_token);
             trace!("closed client [{}]", token.0);
           }
         }
@@ -320,7 +320,7 @@ impl CommandServer {
     );
 
     info!("sending: {:?}", answer);
-    for client in self.conns.iter_mut() {
+    for client in self.clients.iter_mut() {
       if let Some(index) = client.has_message_id(&msg.id) {
         client.write_message(&answer);
         if answer.status != ConfigMessageStatus::Processing {

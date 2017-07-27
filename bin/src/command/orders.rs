@@ -62,7 +62,7 @@ impl CommandServer {
   pub fn answer_success<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<AnswerData>)
     where T: Into<String>,
           U: Into<String> {
-    self.conns[token].write_message(&ConfigMessageAnswer::new(
+    self.clients[token].write_message(&ConfigMessageAnswer::new(
       id.into(),
       ConfigMessageStatus::Ok,
       message.into(),
@@ -73,7 +73,7 @@ impl CommandServer {
   pub fn answer_error<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<AnswerData>)
     where T: Into<String>,
           U: Into<String> {
-    self.conns[token].write_message(&ConfigMessageAnswer::new(
+    self.clients[token].write_message(&ConfigMessageAnswer::new(
       id.into(),
       ConfigMessageStatus::Error,
       message.into(),
@@ -213,7 +213,7 @@ impl CommandServer {
   pub fn launch_worker(&mut self, token: FrontToken, message: &ConfigMessage, tag: &str) {
     let id = self.next_id + 1;
     if let Ok(mut worker) = start_worker(id, &self.config) {
-      self.conns[token].write_message(&ConfigMessageAnswer::new(
+      self.clients[token].write_message(&ConfigMessageAnswer::new(
           message.id.clone(),
           ConfigMessageStatus::Processing,
           "sending configuration orders".to_string(),
@@ -240,7 +240,7 @@ impl CommandServer {
 
           let o = order.clone();
           //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
-          self.conns[token].add_message_id(message_id.clone());
+          self.clients[token].add_message_id(message_id.clone());
           //worker.state.handle_order(&o);
           if !worker.channel.write_message(&OrderMessage { id: message_id.clone(), order: o }) {
             error!("could not send to new worker({}-{}): {}", tag, worker.id, message_id);
@@ -268,8 +268,8 @@ impl CommandServer {
 
   pub fn upgrade_master(&mut self, token: FrontToken, message_id: &str) {
     self.disable_cloexec_before_upgrade();
-    self.conns[token].channel.set_blocking(true);
-    self.conns[token].write_message(&ConfigMessageAnswer::new(
+    self.clients[token].channel.set_blocking(true);
+    self.clients[token].write_message(&ConfigMessageAnswer::new(
         String::from(message_id),
         ConfigMessageStatus::Processing,
         "".to_string(),
@@ -318,7 +318,7 @@ impl CommandServer {
 
       proxy.inflight.insert(String::from(message_id), order.clone());
       let o = order.clone();
-      self.conns[token].add_message_id(String::from(message_id));
+      self.clients[token].add_message_id(String::from(message_id));
       //proxy.state.handle_order(&o);
       proxy.channel.write_message(&OrderMessage { id: String::from(message_id), order: o });
       proxy.channel.run();
@@ -462,7 +462,7 @@ impl CommandServer {
       buffer_size:     buffer_size,
       max_buffer_size: max_buffer_size,
       //FIXME: deserialize client connections as well, otherwise they might leak?
-      conns:           Slab::with_capacity(128),
+      clients:         Slab::with_capacity(128),
       proxies:         workers,
       next_id:         next_id,
       state:           config_state,
