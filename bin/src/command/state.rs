@@ -1,16 +1,18 @@
-use mio::Token;
+use mio::{Ready,Token};
 use std::collections::{HashMap,HashSet};
 
-use sozu_command::data::ConfigMessage;
+use sozu::messages::Order;
+use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
+use command::FrontToken;
 
 #[derive(Clone,Debug)]
-pub struct InflightOrders {
+pub struct OrderState {
   pub state: HashMap<String, HashSet<usize>>,
 }
 
-impl InflightOrders {
-  pub fn new() -> InflightOrders {
-    InflightOrders {
+impl OrderState {
+  pub fn new() -> OrderState {
+    OrderState {
       state: HashMap::new()
     }
   }
@@ -33,13 +35,8 @@ impl InflightOrders {
   }
 }
 
-pub struct OrderState {
-  pub message: ConfigMessage,
-  pub workers: HashSet<usize>,
-}
-
-impl OrderState {
-
-
-}
+/*
+pub struct Task {
+  Status,
+}*/
 

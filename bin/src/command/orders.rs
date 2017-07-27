@@ -25,7 +25,7 @@ use sozu_command::state::ConfigState;
 
 use super::{CommandServer,FrontToken,ProxyConfiguration,Worker};
 use super::client::parse;
-use super::state::InflightOrders;
+use super::state::OrderState;
 use worker::start_worker;
 use upgrade::{start_new_master_process,SerializedWorker,UpgradeData};
 
@@ -458,7 +458,7 @@ impl CommandServer {
       next_id:         next_id,
       state:           config_state,
       token_count:     token_count,
-      order_state:     InflightOrders {
+      order_state:     OrderState {
         state: order_state
       },
       must_stop:       false,

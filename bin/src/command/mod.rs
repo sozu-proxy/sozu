@@ -92,7 +92,7 @@ pub struct CommandServer {
   timer:           Timer<Token>,
   config:          Config,
   token_count:     usize,
-  order_state:     state::InflightOrders,
+  order_state:     state::OrderState,
   must_stop:       bool,
 }
 
@@ -171,7 +171,7 @@ impl CommandServer {
       timer:           timer,
       config:          config,
       token_count:     token_count,
-      order_state:     state::InflightOrders::new(),
+      order_state:     state::OrderState::new(),
       must_stop:       false,
     }
   }
