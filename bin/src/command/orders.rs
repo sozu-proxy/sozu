@@ -119,9 +119,10 @@ impl CommandServer {
       Err(e)   => error!("cannot open file at path '{}': {:?}", path, e),
       Ok(mut file) => {
         //let mut data = vec!();
-        let mut buffer = Buffer::with_capacity(16384);
+        let mut buffer = Buffer::with_capacity(200000);
         self.order_state.insert_task(message_id, token_opt);
 
+        let mut counter = 0;
         loop {
           let previous = buffer.available_data();
           //FIXME: we should read in streaming here
@@ -156,7 +157,6 @@ impl CommandServer {
               }
 
               let diff = self.state.diff(&new_state);
-              let mut counter = 0;
               for order in diff {
                 self.state.handle_order(&order);
 
@@ -176,8 +176,8 @@ impl CommandServer {
                   self.order_state.insert_worker_message(message_id, &id, proxy.token.expect("worker should have a token"));
                   found = true;
 
-                  counter += 1;
                 }
+                counter += 1;
 
                 if !found {
                   // FIXME: should send back error here
