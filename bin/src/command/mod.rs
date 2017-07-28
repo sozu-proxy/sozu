@@ -211,13 +211,11 @@ impl CommandServer {
           }
           let messages: Vec<usize> = self.clients.iter().map(|client| client.queue.len()).collect();
 
-          info!("will handle clients: {:#?} (message queues: {:#?})", tokens, messages);
+          //info!("will handle clients: {:#?} (message queues: {:#?})", tokens, messages);
           for token in tokens {
             let front = self.to_front(token);
             self.handle_client_events(front);
           }
-
-
         }
 
         {
@@ -227,12 +225,12 @@ impl CommandServer {
             did_something = true;
           }
 
-          for (ref token, ref worker) in self.proxies.iter() {
+          /*for (ref token, ref worker) in self.proxies.iter() {
             info!("worker {}, readiness = {:#?}, interest = {:#?}, queue = {:#?}", token.0, worker.channel.readiness,
               worker.channel.interest, worker.queue);
-          }
+          }*/
 
-          info!("will handle workers: {:#?}", tokens);
+          //info!("will handle workers: {:#?}", tokens);
           for token in tokens {
             self.handle_worker_events(token);
           }
@@ -248,6 +246,7 @@ impl CommandServer {
         break;
       }
     }
+
   }
 
   fn ready(&mut self, token: Token, events: Ready) {
@@ -277,7 +276,7 @@ impl CommandServer {
         self.handle_client_events(conn_token);
       }
     }
-    trace!("ready end: {:?} -> {:?}", token, events);
+    //trace!("ready end: {:?} -> {:?}", token, events);
   }
 
   pub fn handle_worker_events(&mut self, token: Token) {
@@ -285,8 +284,8 @@ impl CommandServer {
       let mut messages = Vec::new();
       let ref mut proxy = self.proxies.get_mut(&token).unwrap();
       loop {
-        trace!("worker[{}] readiness = {:#?}, interest = {:#?}, queue = {} messages", token.0, proxy.channel.readiness,
-          proxy.channel.interest, proxy.queue.len());
+        //trace!("worker[{}] readiness = {:#?}, interest = {:#?}, queue = {} messages", token.0, proxy.channel.readiness,
+        //  proxy.channel.interest, proxy.queue.len());
 
         if proxy.channel.readiness() == Ready::empty() {
           break;
@@ -333,11 +332,11 @@ impl CommandServer {
         trace!("closed client [{}]", conn_token.0);
       } else {
         loop {
-          trace!("client complete readiness[{}] = {:#?} (r = {:#?}, i = {:#?})", conn_token.0,
+          /*trace!("client complete readiness[{}] = {:#?} (r = {:#?}, i = {:#?})", conn_token.0,
           self.clients[conn_token].channel.readiness(),
           self.clients[conn_token].channel.readiness,
           self.clients[conn_token].channel.interest
-          );
+          );*/
 
           if self.clients[conn_token].channel.readiness() == Ready::empty() {
             break;
@@ -386,33 +385,36 @@ impl CommandServer {
           //FIXME: right now, do nothing with the curent tasks
         },
         OrderMessageStatus::Error(s) => {
-          if self.order_state.error(&msg.id, token) {
+          if let Some(client_message_id) = self.order_state.error(&msg.id, token) {
             //FIXME: send message to client here
 
-            if let Some(task) = self.order_state.task(&msg.id) {
+            if let Some(task) = self.order_state.task(&client_message_id) {
+              //info!("TERMINATING task: {:#?}", task);
               let data = match msg.data {
                 None => None,
                 Some(OrderMessageAnswerData::Metrics) => Some(AnswerData::Metrics),
               };
 
               let answer = ConfigMessageAnswer::new(
-                msg.id.clone(),
+                client_message_id,
                 ConfigMessageStatus::Error,
                 format!("ok: {:#?}, error: {:#?}, message: {}", task.ok, task.error, s.clone()),
                 data,
               );
 
               if let Some(client_token) = task.client {
-                info!("sending: {:?}", answer);
+                //info!("SENDING to client[{}]: {:#?}", client_token.0, answer);
                 self.clients[client_token].push_message(answer);
               }
             }
           }
         },
         OrderMessageStatus::Ok => {
-          if self.order_state.ok(&msg.id, token) {
+          if let Some(client_message_id) = self.order_state.ok(&msg.id, token) {
             //FIXME: send message to client here
-            if let Some(task) = self.order_state.task(&msg.id) {
+            if let Some(task) = self.order_state.task(&client_message_id) {
+              //info!("TERMINATING task: {:#?}", task);
+
               let answer = if task.error.is_empty() {
                 let data = match msg.data {
                   None => None,
@@ -420,7 +422,7 @@ impl CommandServer {
                 };
 
                 ConfigMessageAnswer::new(
-                  msg.id.clone(),
+                  client_message_id,
                   ConfigMessageStatus::Ok,
                   format!("ok: {:#?}, error: {:#?}", task.ok, task.error),
                   data,
@@ -435,7 +437,7 @@ impl CommandServer {
               };
 
               if let Some(client_token) = task.client {
-                info!("sending: {:?}", answer);
+                //info!("SENDING to client[{}]: {:#?}", client_token.0, answer);
                 self.clients[client_token].push_message(answer);
               }
             }
@@ -450,38 +452,6 @@ impl CommandServer {
         }
       }
     }
-
-    /*
-    let data = match msg.data {
-      None => None,
-      Some(OrderMessageAnswerData::Metrics) => Some(AnswerData::Metrics),
-    };
-
-    let answer = ConfigMessageAnswer::new(
-      msg.id.clone(),
-      match msg.status {
-        OrderMessageStatus::Error(_)   => ConfigMessageStatus::Error,
-        OrderMessageStatus::Ok         => ConfigMessageStatus::Ok,
-        OrderMessageStatus::Processing => ConfigMessageStatus::Processing,
-      },
-      match msg.status {
-        OrderMessageStatus::Error(s) => s.clone(),
-        _                             => String::new(),
-      },
-      data,
-    );
-
-    info!("sending: {:?}", answer);
-    for client in self.clients.iter_mut() {
-      if let Some(index) = client.has_message_id(&msg.id) {
-        client.write_message(&answer);
-        if answer.status != ConfigMessageStatus::Processing {
-          client.remove_message_id(index);
-        }
-      }
-      client.channel.run();
-    }
-    */
   }
 }
 
@@ -512,7 +482,7 @@ pub fn start(config: Config, proxies: Vec<Worker>) {
       server.load_static_application_configuration();
 
       saved_state.as_ref().map(|state_path| {
-        server.load_state("INITIALIZATION", state_path);
+        server.load_state(None, "INITIALIZATION", state_path);
       });
 
       info!("listen for connections");

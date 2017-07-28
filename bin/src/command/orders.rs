@@ -40,8 +40,8 @@ impl CommandServer {
         self.dump_state(token, &message.id);
       },
       ConfigCommand::LoadState(path) => {
-        self.load_state(&message.id, &path);
-        self.answer_success(token, message.id.as_str(), "loaded the configuration", None);
+        self.load_state(Some(token), &message.id, &path);
+        //self.answer_success(token, message.id.as_str(), "loaded the configuration", None);
       },
       ConfigCommand::ListWorkers => {
         self.list_workers(token, &message.id);
@@ -114,12 +114,14 @@ impl CommandServer {
     self.answer_success(token, message_id, serde_json::to_string(&conf).unwrap_or(String::new()), None);
   }
 
-  pub fn load_state(&mut self, message_id: &str, path: &str) {
+  pub fn load_state(&mut self, token_opt: Option<FrontToken>, message_id: &str, path: &str) {
     match fs::File::open(&path) {
       Err(e)   => error!("cannot open file at path '{}': {:?}", path, e),
       Ok(mut file) => {
         //let mut data = vec!();
         let mut buffer = Buffer::with_capacity(16384);
+        self.order_state.insert_task(message_id, token_opt);
+
         loop {
           let previous = buffer.available_data();
           //FIXME: we should read in streaming here
@@ -166,11 +168,12 @@ impl CommandServer {
                 }
 
                 let mut found = false;
-                let id = format!("LOAD-STATE-{}", counter);
+                let id = format!("LOAD-STATE-{}-{}", message_id, counter);
 
                 for ref mut proxy in self.proxies.values_mut() {
                   let o = order.clone();
                   proxy.push_message(OrderMessage { id: id.clone(), order: o });
+                  self.order_state.insert_worker_message(message_id, &id, proxy.token.expect("worker should have a token"));
                   found = true;
 
                   counter += 1;
@@ -232,15 +235,16 @@ impl CommandServer {
       }).next() {
         worker.channel.set_blocking(true);
 
+        self.order_state.insert_task(message.id.as_str(), Some(token));
         let mut counter = 0u32;
         for order in self.state.generate_orders() {
-          let message_id = format!("LAUNCH-CONF-{}", counter);
-          self.order_state.insert(message.id.as_str(), Some(token), Token(worker_token));
+          let worker_message_id = format!("LAUNCH-CONF-{}", counter);
+          self.order_state.insert_worker_message(message.id.as_str(), worker_message_id.as_str(), Token(worker_token));
 
           let o = order.clone();
           //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
-          self.clients[token].add_message_id(message_id.clone());
-          worker.push_message(OrderMessage { id: message_id.clone(), order: o });
+          self.clients[token].add_message_id(worker_message_id.clone());
+          worker.push_message(OrderMessage { id: worker_message_id.clone(), order: o });
 
           let received = worker.channel.read_message();
           info!("worker ({}-{}) sent: {:?}", tag, worker.id, received);
@@ -296,6 +300,7 @@ impl CommandServer {
     }
 
     self.state.handle_order(&order);
+    self.order_state.insert_task(message_id, Some(token));
 
     let mut found = false;
     for ref mut proxy in self.proxies.values_mut() {
@@ -310,7 +315,7 @@ impl CommandServer {
       }
 
 
-      self.order_state.insert(message_id, Some(token), proxy.token.expect("worker should have a valid token"));
+      self.order_state.insert_worker_message(message_id, message_id, proxy.token.expect("worker should have a valid token"));
       trace!("sending to {:?}, inflight is now {:#?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
 
       let o = order.clone();

@@ -5,58 +5,71 @@ use sozu::messages::Order;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 use command::FrontToken;
 
+pub type ClientMessageId  = String;
+pub type WorkerMessageId  = String;
+pub type WorkerMessageKey = (WorkerMessageId, usize);
+
 #[derive(Clone,Debug)]
 pub struct OrderState {
-  pub state: HashMap<String, Task>,
+  pub message_match: HashMap<WorkerMessageKey, ClientMessageId>,
+  pub state:         HashMap<ClientMessageId, Task>,
 }
 
 impl OrderState {
   pub fn new() -> OrderState {
     OrderState {
-      state: HashMap::new()
+      message_match: HashMap::new(),
+      state:         HashMap::new(),
     }
   }
 
- /* pub fn remove(&mut self, id: &str, token: Token) -> bool {
-    if let Some(ref mut workers) = self.state.get_mut(id) {
-      workers.remove(&token.0);
-    }
-
-    if self.state.get(id).map(|set| set.len()).unwrap_or(0) == 0 {
-      self.state.remove(id);
-      true
-    } else {
-      false
-    }
-  }*/
-
-  pub fn insert(&mut self, id: &str, client_token: Option<FrontToken>, worker_token: Token) {
-    self.state.entry(String::from(id)).or_insert(Task::new(String::from(id), client_token)).insert(worker_token.0);
+  pub fn insert_task(&mut self, client_message_id: &str, client_token: Option<FrontToken>) {
+    self.state.insert(String::from(client_message_id), Task::new(String::from(client_message_id), client_token));
   }
 
-  pub fn ok(&mut self, id: &str, token: Token) -> bool {
-    if let Some(ref mut task) = self.state.get_mut(id) {
-      task.processing.remove(&token.0);
-      task.ok.insert(token.0);
-      task.processing.is_empty()
-    } else {
-      false
-    }
+  pub fn insert_worker_message(&mut self, client_message_id: &str, worker_message_id: &str, worker_token: Token) {
+    let key:WorkerMessageKey = (worker_message_id.to_string(), worker_token.0);
+
+    self.message_match.insert(key.clone(), client_message_id.to_string());
+    self.state.get_mut(client_message_id).map(|task| {
+      task.processing.insert(key);
+    });
   }
 
-  pub fn error(&mut self, id: &str, token: Token) -> bool {
-    if let Some(ref mut task) = self.state.get_mut(id) {
-      task.processing.remove(&token.0);
-      task.error.insert(token.0);
-      task.processing.is_empty()
-    } else {
-      false
+  pub fn ok(&mut self, worker_message_id: &str, worker_token: Token) -> Option<ClientMessageId> {
+    let key:WorkerMessageKey = (worker_message_id.to_string(), worker_token.0);
+
+    if let Some(client_message_id) = self.message_match.remove(&key) {
+      if let Some(ref mut task) = self.state.get_mut(&client_message_id) {
+        task.processing.remove(&key);
+        task.ok.insert(key.clone());
+        if task.processing.is_empty() {
+          return Some(client_message_id);
+        }
+      }
     }
 
+    None
   }
 
-  pub fn task(&mut self, id: &str) -> Option<Task> {
-    self.state.remove(id)
+  pub fn error(&mut self, worker_message_id: &str, worker_token: Token) -> Option<ClientMessageId> {
+    let key:WorkerMessageKey = (worker_message_id.to_string(), worker_token.0);
+
+    if let Some(client_message_id) = self.message_match.remove(&key) {
+      if let Some(ref mut task) = self.state.get_mut(&client_message_id) {
+        task.processing.remove(&key);
+        task.error.insert(key.clone());
+        if task.processing.is_empty() {
+          return Some(client_message_id);
+        }
+      }
+    }
+
+    None
+  }
+
+  pub fn task(&mut self, client_message_id: &str) -> Option<Task> {
+    self.state.remove(client_message_id)
   }
 }
 
@@ -78,12 +91,12 @@ pub enum MessageState {
 
 #[derive(Clone,Debug)]
 pub struct Task {
-  id:         String,
+  id:             String,
   pub client:     Option<FrontToken>,
   //state: MessageState,
-  pub processing: HashSet<usize>,
-  pub ok:         HashSet<usize>,
-  pub error:      HashSet<usize>,
+  pub processing: HashSet<WorkerMessageKey>,
+  pub ok:         HashSet<WorkerMessageKey>,
+  pub error:      HashSet<WorkerMessageKey>,
 }
 
 impl Task {
@@ -96,10 +109,6 @@ impl Task {
       ok:         HashSet::new(),
       error:      HashSet::new(),
     }
-  }
-
-  pub fn insert(&mut self, token: usize) {
-    self.processing.insert(token);
   }
 }
 
