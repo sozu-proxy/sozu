@@ -35,7 +35,7 @@ Requires:	sozu
 %setup -q
 
 %build
-#cargo build --release --all
+cargo build --release --all
 
 %install
 rm -rf %{buildroot}
