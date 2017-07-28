@@ -66,6 +66,10 @@ impl Worker {
     self.queue.push_back(message);
     self.channel.interest.insert(Ready::writable());
   }
+
+  pub fn can_handle_events(&self) -> bool {
+    self.channel.readiness().is_readable() || (!self.queue.is_empty() && self.channel.readiness().is_writable())
+  }
 }
 
 impl fmt::Debug for Worker {
@@ -196,6 +200,49 @@ impl CommandServer {
         self.ready(event.token(), event.kind());
       }
 
+      //info!("will handle remaining");
+      loop {
+        let mut did_something = false;
+        {
+          let tokens: Vec<Token> = self.clients.iter().filter(|client| client.can_handle_events()).map(|client| client.token.unwrap()).collect();
+
+          if ! tokens.is_empty() {
+            did_something = true;
+          }
+          let messages: Vec<usize> = self.clients.iter().map(|client| client.queue.len()).collect();
+
+          info!("will handle clients: {:#?} (message queues: {:#?})", tokens, messages);
+          for token in tokens {
+            let front = self.to_front(token);
+            self.handle_client_events(front);
+          }
+
+
+        }
+
+        {
+          let tokens: Vec<Token> = self.proxies.iter().filter(|&(_, worker)| worker.can_handle_events()).map(|(token, _)| token.clone()).collect();
+
+          if ! tokens.is_empty() {
+            did_something = true;
+          }
+
+          for (ref token, ref worker) in self.proxies.iter() {
+            info!("worker {}, readiness = {:#?}, interest = {:#?}, queue = {:#?}", token.0, worker.channel.readiness,
+              worker.channel.interest, worker.queue);
+          }
+
+          info!("will handle workers: {:#?}", tokens);
+          for token in tokens {
+            self.handle_worker_events(token);
+          }
+        }
+
+        if ! did_something {
+          break;
+        }
+      }
+
       if self.must_stop {
         info!("stopping...");
         break;
@@ -214,91 +261,109 @@ impl CommandServer {
         }
       },
       Token(i) if i < HALF_USIZE + 1 => {
-        let mut messages = {
-          let ref mut proxy =  self.proxies.get_mut(&Token(i)).unwrap();
+        if let Some(ref mut proxy) =self.proxies.get_mut(&Token(i)) {
           proxy.channel.handle_events(events);
-          //proxy.channel.run();
-
-          let mut messages = Vec::new();
-          loop {
-            info!("worker readiness[{}] = {:#?}", i, proxy.channel.readiness());
-
-            if proxy.channel.readiness() == Ready::empty() {
-              break;
-            }
-
-            if proxy.channel.readiness().is_readable() {
-              proxy.channel.readable();
-
-              loop {
-                if let Some(msg) = proxy.channel.read_message() {
-                  messages.push(msg);
-                } else {
-                  break;
-                }
-              }
-            }
-
-            if proxy.channel.readiness().is_writable() {
-              if let Some(msg) = proxy.queue.pop_front() {
-                proxy.channel.write_message(&msg);
-                proxy.channel.writable();
-              }
-            }
-
-          }
-          messages
-        };
-
-        for msg in messages.drain(..) {
-          self.proxy_handle_message(Token(i), msg);
         }
+
+        self.handle_worker_events(Token(i));
 
       },
       _ => {
         let conn_token = self.to_front(token);
         if self.clients.contains(conn_token) {
           self.clients[conn_token].channel.handle_events(events);
-          //self.clients[conn_token].channel.run();
+        }
 
-          if self.clients[conn_token].channel.readiness.is_hup() {
-            self.poll.deregister(&self.clients[conn_token].channel.sock);
-            self.clients.remove(conn_token);
-            trace!("closed client [{}]", token.0);
-          } else {
-            loop {
-              info!("client complete readiness[{}] = {:#?} (r = {:#?}, i = {:#?})", token.0,
-                self.clients[conn_token].channel.readiness(),
-                self.clients[conn_token].channel.readiness,
-                self.clients[conn_token].channel.interest
-              );
+        self.handle_client_events(conn_token);
+      }
+    }
+    trace!("ready end: {:?} -> {:?}", token, events);
+  }
 
-              if self.clients[conn_token].channel.readiness() == Ready::empty() {
-                break;
-              }
+  pub fn handle_worker_events(&mut self, token: Token) {
+    let mut messages = {
+      let mut messages = Vec::new();
+      let ref mut proxy = self.proxies.get_mut(&token).unwrap();
+      loop {
+        trace!("worker[{}] readiness = {:#?}, interest = {:#?}, queue = {} messages", token.0, proxy.channel.readiness,
+          proxy.channel.interest, proxy.queue.len());
 
-              if self.clients[conn_token].channel.readiness().is_writable() {
-                if let Some(msg) = self.clients[conn_token].queue.pop_front() {
-                  self.clients[conn_token].channel.write_message(&msg);
-                  self.clients[conn_token].channel.writable();
-                }
-              }
+        if proxy.channel.readiness() == Ready::empty() {
+          break;
+        }
 
-              if self.clients[conn_token].channel.readiness().is_readable() {
-                self.clients[conn_token].channel.readable();
-                loop {
-                  if let Some(message) = self.clients[conn_token].channel.read_message() {
-                    //self.proxy_handle_message(Token(i), msg);
-                    self.handle_client_message(conn_token, &message);
-                  } else {
-                    break;
-                  }
-                }
-              }
+        if proxy.channel.readiness().is_readable() {
+          proxy.channel.readable();
 
+          loop {
+            if let Some(msg) = proxy.channel.read_message() {
+              messages.push(msg);
+            } else {
+              break;
+            }
+          }
+        }
+
+        if proxy.channel.readiness().is_writable() {
+          if let Some(msg) = proxy.queue.pop_front() {
+            proxy.channel.write_message(&msg);
+            proxy.channel.writable();
+          }
+
+          if !proxy.queue.is_empty() {
+            proxy.channel.interest.insert(Ready::writable());
+          }
+        }
+
+      }
+      messages
+    };
+
+    for msg in messages.drain(..) {
+      self.proxy_handle_message(token, msg);
+    }
+  }
+
+  pub fn handle_client_events(&mut self, conn_token: FrontToken) {
+    if self.clients.contains(conn_token) {
+
+      if self.clients[conn_token].channel.readiness.is_hup() {
+        self.poll.deregister(&self.clients[conn_token].channel.sock);
+        self.clients.remove(conn_token);
+        trace!("closed client [{}]", conn_token.0);
+      } else {
+        loop {
+          trace!("client complete readiness[{}] = {:#?} (r = {:#?}, i = {:#?})", conn_token.0,
+          self.clients[conn_token].channel.readiness(),
+          self.clients[conn_token].channel.readiness,
+          self.clients[conn_token].channel.interest
+          );
+
+          if self.clients[conn_token].channel.readiness() == Ready::empty() {
+            break;
+          }
+
+          if self.clients[conn_token].channel.readiness().is_writable() {
+            if let Some(msg) = self.clients[conn_token].queue.pop_front() {
+              self.clients[conn_token].channel.write_message(&msg);
+              self.clients[conn_token].channel.writable();
+            }
+
+            if !self.clients[conn_token].queue.is_empty() {
+               self.clients[conn_token].channel.interest.insert(Ready::writable());
             }
           }
 
+          if self.clients[conn_token].channel.readiness().is_readable() {
+            self.clients[conn_token].channel.readable();
+            loop {
+              if let Some(message) = self.clients[conn_token].channel.read_message() {
+                self.handle_client_message(conn_token, &message);
+              } else {
+                break;
+              }
+            }
+          }
         }
       }
     }

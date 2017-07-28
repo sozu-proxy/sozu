@@ -58,6 +58,10 @@ impl CommandClient {
     self.queue.push_back(message);
     self.channel.interest.insert(Ready::writable());
   }
+
+  pub fn can_handle_events(&self) -> bool {
+    self.channel.readiness().is_readable() || (!self.queue.is_empty() && self.channel.readiness().is_writable())
+  }
 }
 
 pub fn parse(input: &[u8]) -> IResult<&[u8], Vec<ConfigMessage>> {
