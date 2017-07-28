@@ -66,10 +66,10 @@ pub fn load_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
           // until an error or ok message was sent
         },
         ConfigMessageStatus::Error => {
-          println!("could not save proxy state: {}", message.message);
+          println!("could not load proxy state: {}", message.message);
         },
         ConfigMessageStatus::Ok => {
-          println!("Proxy state saved to {}", path);
+          println!("Proxy state loaded successfully from {}", path);
         }
       }
     }
