@@ -21,7 +21,7 @@ Build the most reliable reverse proxy ever:
 ## Building and starting
 
 Requirements:
-- openssl 1.0.1 or above
+- openssl 1.0.1 or above (including libraries/includes, ie apt install libssl-dev / rpm install openssl-devel
 
 You can create the required executables like this:
 
