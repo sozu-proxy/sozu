@@ -209,9 +209,14 @@ impl CommandServer {
           if ! tokens.is_empty() {
             did_something = true;
           }
-          let messages: Vec<usize> = self.clients.iter().map(|client| client.queue.len()).collect();
+          //let messages: Vec<usize> = self.clients.iter().map(|client| client.queue.len()).collect();
 
-          //info!("will handle clients: {:#?} (message queues: {:#?})", tokens, messages);
+          //for ref client in self.clients.iter() {
+          //  let ids: Vec<&str> = client.queue.iter().map(|msg| msg.id.as_str()).collect();
+            //info!("client readiness = {:#?}, interest = {:#?}, queue = {}", client.channel.readiness,
+            //  client.channel.interest, ids.len());
+          //}
+          //info!("will handle clients: {:#?} (message queues: {:?})", tokens, messages);
           for token in tokens {
             let front = self.to_front(token);
             self.handle_client_events(front);
@@ -225,12 +230,13 @@ impl CommandServer {
             did_something = true;
           }
 
-          /*for (ref token, ref worker) in self.proxies.iter() {
-            info!("worker {}, readiness = {:#?}, interest = {:#?}, queue = {:#?}", token.0, worker.channel.readiness,
-              worker.channel.interest, worker.queue);
-          }*/
+          //for (ref token, ref worker) in self.proxies.iter() {
+          //  let ids: Vec<&str> = worker.queue.iter().map(|msg| msg.id.as_str()).collect();
+            //info!("worker {}, readiness = {:#?}, interest = {:#?}, queue = {}", token.0, worker.channel.readiness,
+            //  worker.channel.interest, ids.len());
+          //}
 
-          //info!("will handle workers: {:#?}", tokens);
+          //info!("will handle workers: {:?}", tokens);
           for token in tokens {
             self.handle_worker_events(token);
           }
