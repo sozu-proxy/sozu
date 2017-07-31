@@ -169,7 +169,8 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
               self.interest.remove(Ready::writable());
               break;
             },
-            _ => {
+            e => {
+              error!("channel write error: {:?}", e);
               self.interest  = Ready::empty();
               self.readiness = Ready::empty();
               return Err(ConnError::SocketError);

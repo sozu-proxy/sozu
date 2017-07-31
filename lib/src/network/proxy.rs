@@ -7,7 +7,7 @@ use mio::net::*;
 use mio::*;
 use mio::unix::UnixReady;
 use mio::timer::{Timer,Timeout};
-use std::collections::{HashSet,HashMap};
+use std::collections::{HashSet,HashMap,VecDeque};
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
 use std::error::Error;
@@ -47,6 +47,7 @@ pub struct Server {
   accept_ready:    HashSet<ListenToken>,
   can_accept:      bool,
   channel:         ProxyChannel,
+  queue:           VecDeque<OrderMessageAnswer>,
   http:            Option<Session<http::ServerConfiguration, http::Client>>,
   https:           Option<Session<tls::ServerConfiguration, tls::TlsClient>>,
   tcp:             Option<Session<tcp::ServerConfiguration, tcp::Client>>,
@@ -75,6 +76,7 @@ impl Server {
       accept_ready:    HashSet::new(),
       can_accept:      true,
       channel:         channel,
+      queue:           VecDeque::new(),
       http:            http,
       https:           https,
       tcp:             tcp,
@@ -104,38 +106,64 @@ impl Server {
             continue;
           }
           self.channel.handle_events(kind);
-          self.channel.run();
+          //self.channel.run();
 
           // loop here because iterations has borrow issues
           loop {
-            let msg = self.channel.read_message();
-            //info!("got message: {:?}", msg);
+            //info!("WORKER channel readiness={:?}, interest={:?}, queue={} elements",
+            //  self.channel.readiness, self.channel.interest, self.queue.len());
+            if self.channel.readiness() == Ready::empty() {
+              break;
+            }
 
-            // if the message was too large, we grow the buffer and retry to read if possible
-            if msg.is_none() {
-              if (self.channel.interest & self.channel.readiness).is_readable() {
-                self.channel.run();
-                continue;
-              } else {
-                break;
+            if self.channel.readiness().is_readable() {
+
+              loop {
+                let msg = self.channel.read_message();
+                //info!("got message: {:?}", msg);
+
+                // if the message was too large, we grow the buffer and retry to read if possible
+                if msg.is_none() {
+                  if (self.channel.interest & self.channel.readiness).is_readable() {
+                    self.channel.readable();
+                    continue;
+                  } else {
+                    break;
+                  }
+                }
+
+                let msg = msg.expect("the message should be valid");
+                if let Order::HardStop = msg.order {
+                  self.notify(msg);
+                  //self.channel.run();
+                  //FIXME: it's a bit brutal
+                  return;
+                } else if let Order::SoftStop = msg.order {
+                  self.shutting_down = Some(msg.id.clone());
+                  self.notify(msg);
+                } else {
+                  self.notify(msg);
+                }
+
               }
             }
 
-            let msg = msg.expect("the message should be valid");
-            if let Order::HardStop = msg.order {
-              self.notify(msg);
-              self.channel.run();
-              //FIXME: it's a bit brutal
-              return;
-            } else if let Order::SoftStop = msg.order {
-              self.shutting_down = Some(msg.id.clone());
-              self.notify(msg);
-            } else {
-              self.notify(msg);
+            if !self.queue.is_empty() {
+              self.channel.interest.insert(Ready::writable());
+            }
+
+            if self.channel.readiness().is_writable() {
+              if let Some(msg) = self.queue.pop_front() {
+                info!("master queue has {} messages, sending {:#?}", self.queue.len(), msg);
+                if !self.channel.write_message(&msg) {
+                  self.queue.push_front(msg);
+                }
+              }
+              self.channel.writable();
             }
           }
 
-          self.channel.run();
+          //self.channel.run();
         } else if event.token() == Token(1) {
           while let Some(token) = self.timer.poll() {
             self.timeout(token);
@@ -191,19 +219,19 @@ impl Server {
 
     if topics.contains(&Topic::HttpProxyConfig) {
       if let Some(mut http) = self.http.take() {
-        http.configuration().notify(&mut self.poll, &mut self.channel, message.clone());
+        self.queue.push_back(http.configuration().notify(&mut self.poll, message.clone()));
         self.http = Some(http);
       }
     }
     if topics.contains(&Topic::HttpsProxyConfig) {
       if let Some(mut https) = self.https.take() {
-        https.configuration().notify(&mut self.poll, &mut self.channel, message.clone());
+        self.queue.push_back(https.configuration().notify(&mut self.poll, message.clone()));
         self.https = Some(https);
       }
     }
     if topics.contains(&Topic::TcpProxyConfig) {
       if let Some(mut tcp) = self.tcp.take() {
-        tcp.configuration().notify(&mut self.poll, &mut self.channel, message);
+        self.queue.push_back(tcp.configuration().notify(&mut self.poll, message));
         self.tcp = Some(tcp);
       }
     }

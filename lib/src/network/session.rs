@@ -151,7 +151,7 @@ pub enum AcceptError {
 
 pub trait ProxyConfiguration<Client> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client:&mut Client) ->Result<BackendConnectAction,ConnectionError>;
-  fn notify(&mut self, event_loop: &mut Poll, channel: &mut ProxyChannel, message: OrderMessage);
+  fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
   fn accept(&mut self, token: ListenToken) -> Result<(Client, bool), AcceptError>;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
   fn front_timeout(&self) -> u64;
@@ -562,8 +562,8 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
     }
   }
 
-  fn notify(&mut self, poll: &mut Poll, channel: &mut ProxyChannel, message: OrderMessage) {
-    self.configuration.notify(poll, channel, message);
+  fn notify(&mut self, poll: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
+    self.configuration.notify(poll, message)
   }
 
   fn timeout(&mut self, poll: &mut Poll, token: Token) {

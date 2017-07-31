@@ -586,19 +586,20 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn notify(&mut self, event_loop: &mut Poll, channel: &mut ProxyChannel, message: OrderMessage) {
+  fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
+    info!("TLS\tgot msg {}", message.id);
   // ToDo temporary
-    trace!("{} notified", message);
+    //trace!("{} notified", message);
     match message.order {
       Order::AddHttpFront(front) => {
         info!("{} add front {:?}", message.id, front);
-          self.add_http_front(front, event_loop);
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
+        self.add_http_front(front, event_loop);
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::RemoveHttpFront(front) => {
         info!("{} front {:?}", message.id, front);
         self.remove_http_front(front, event_loop);
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::AddInstance(instance) => {
         info!("{} add instance {:?}", message.id, instance);
@@ -606,9 +607,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.add_instance(&instance.app_id, &addr, event_loop);
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
+          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None});
+          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }
         }
       },
       Order::RemoveInstance(instance) => {
@@ -617,9 +618,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
           self.remove_instance(&instance.app_id, &addr, event_loop);
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
+          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
-          channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None});
+          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }
         }
       },
       Order::HttpProxy(configuration) => {
@@ -630,28 +631,28 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
         };
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
         event_loop.deregister(&self.listener);
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None});
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None }
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::Status => {
         info!("{} status", message.id);
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None});
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       command => {
         debug!("{} unsupported message, ignoring: {:?}", message.id, command);
-        channel.write_message(&OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message")), data: None});
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message")), data: None }
       }
     }
   }
