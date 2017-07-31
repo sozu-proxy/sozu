@@ -653,7 +653,7 @@ impl ServerConfiguration {
     let mut contexts = unwrap_msg!(self.contexts.lock());
     let mut domains  = unwrap_msg!(self.domains.lock());
     let must_delete = contexts.get_mut(&fingerprint).map(|tls_data| {
-      tls_data.refcount -= 1;
+      if tls_data.refcount > 0 { tls_data.refcount -= 1; }
       tls_data.refcount == 0 || !tls_data.initialized
     });
 
