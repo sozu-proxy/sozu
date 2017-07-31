@@ -200,7 +200,6 @@ impl CommandServer {
         self.ready(event.token(), event.kind());
       }
 
-      //info!("will handle remaining");
       loop {
         let mut did_something = false;
         {
@@ -344,6 +343,7 @@ impl CommandServer {
           }
         }
       }
+
       messages
     };
 

@@ -106,7 +106,6 @@ impl Server {
             continue;
           }
           self.channel.handle_events(kind);
-          //self.channel.run();
 
           // loop here because iterations has borrow issues
           loop {
@@ -114,19 +113,17 @@ impl Server {
               self.channel.interest.insert(Ready::writable());
             }
 
-            info!("WORKER[{}] channel readiness={:?}, interest={:?}, queue={} elements",
-              line!(), self.channel.readiness, self.channel.interest, self.queue.len());
+            //trace!("WORKER[{}] channel readiness={:?}, interest={:?}, queue={} elements",
+            //  line!(), self.channel.readiness, self.channel.interest, self.queue.len());
             if self.channel.readiness() == Ready::empty() {
               break;
             }
 
             if self.channel.readiness().is_readable() {
-            //info!("WORKER[{}] channel readiness={:?}, interest={:?}, queue={} elements", line!(), self.channel.readiness, self.channel.interest, self.queue.len());
               self.channel.readable();
 
               loop {
                 let msg = self.channel.read_message();
-                //info!("got message: {:?}", msg);
 
                 // if the message was too large, we grow the buffer and retry to read if possible
                 if msg.is_none() {
@@ -141,7 +138,6 @@ impl Server {
                 let msg = msg.expect("the message should be valid");
                 if let Order::HardStop = msg.order {
                   self.notify(msg);
-                  //self.channel.run();
                   //FIXME: it's a bit brutal
                   return;
                 } else if let Order::SoftStop = msg.order {
@@ -158,12 +154,10 @@ impl Server {
               self.channel.interest.insert(Ready::writable());
             }
             if self.channel.readiness.is_writable() {
-            //info!("WORKER[{}] channel readiness={:?}, interest={:?}, queue={} elements", line!(), self.channel.readiness, self.channel.interest, self.queue.len());
 
               loop {
 
                 if let Some(msg) = self.queue.pop_front() {
-                  //info!("master queue has {} messages, sending {:?}", self.queue.len(), msg.id);
                   if !self.channel.write_message(&msg) {
                     self.queue.push_front(msg);
                   }
@@ -184,7 +178,6 @@ impl Server {
             }
           }
 
-          //self.channel.run();
         } else if event.token() == Token(1) {
           while let Some(token) = self.timer.poll() {
             self.timeout(token);

@@ -24,7 +24,7 @@ pub enum ConnError {
 pub struct Channel<Tx,Rx> {
   pub sock:        UnixStream,
   front_buf:       Buffer,
-  back_buf:        Buffer,
+  pub back_buf:    Buffer,
   max_buffer_size: usize,
   pub readiness:   Ready,
   pub interest:    Ready,

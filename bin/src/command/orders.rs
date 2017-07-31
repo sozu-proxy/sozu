@@ -31,6 +31,7 @@ use upgrade::{start_new_master_process,SerializedWorker,UpgradeData};
 
 impl CommandServer {
   pub fn handle_client_message(&mut self, token: FrontToken, message: &ConfigMessage) {
+    //info!("handle_client_message: front token = {:?}, message = {:#?}", token, message);
     let config_command = message.data.clone();
     match config_command {
       ConfigCommand::SaveState(path) => {
@@ -160,12 +161,12 @@ impl CommandServer {
               for order in diff {
                 self.state.handle_order(&order);
 
-                if let &Order::AddHttpsFront(ref data) = &order {
+                /* if let &Order::AddHttpsFront(ref data) = &order {
                   info!("load state AddHttpsFront(HttpsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
-                  data.app_id, data.hostname, data.path_begin);
+                    data.app_id, data.hostname, data.path_begin);
                 } else {
                   info!("load state {:?}", order);
-                }
+                } */
 
                 let mut found = false;
                 let id = format!("LOAD-STATE-{}-{}", message_id, counter);

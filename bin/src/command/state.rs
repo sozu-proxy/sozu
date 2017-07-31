@@ -38,6 +38,7 @@ impl OrderState {
 
   pub fn ok(&mut self, worker_message_id: &str, worker_token: Token) -> Option<ClientMessageId> {
     let key:WorkerMessageKey = (worker_message_id.to_string(), worker_token.0);
+    //info!("state::ok: waiting for {} messages", self.message_match.len());
 
     if let Some(client_message_id) = self.message_match.remove(&key) {
       if let Some(ref mut task) = self.state.get_mut(&client_message_id) {
@@ -54,6 +55,7 @@ impl OrderState {
 
   pub fn error(&mut self, worker_message_id: &str, worker_token: Token) -> Option<ClientMessageId> {
     let key:WorkerMessageKey = (worker_message_id.to_string(), worker_token.0);
+    //info!("state::error: waiting for {} messages", self.message_match.len());
 
     if let Some(client_message_id) = self.message_match.remove(&key) {
       if let Some(ref mut task) = self.state.get_mut(&client_message_id) {

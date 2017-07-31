@@ -587,8 +587,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   }
 
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
-    info!("TLS\tgot msg {}", message.id);
-  // ToDo temporary
+    // ToDo temporary
     //trace!("{} notified", message);
     match message.order {
       Order::AddHttpFront(front) => {
