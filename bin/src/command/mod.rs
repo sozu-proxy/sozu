@@ -298,22 +298,28 @@ impl CommandServer {
             if let Some(msg) = proxy.channel.read_message() {
               messages.push(msg);
             } else {
-              break;
+              if (proxy.channel.interest & proxy.channel.readiness).is_readable() {
+                proxy.channel.readable();
+                continue;
+              } else {
+                break;
+              }
             }
           }
         }
 
-        if proxy.channel.readiness().is_writable() {
-          if let Some(msg) = proxy.queue.pop_front() {
-            proxy.channel.write_message(&msg);
-            proxy.channel.writable();
-          }
-
-          if !proxy.queue.is_empty() {
-            proxy.channel.interest.insert(Ready::writable());
-          }
+        if !proxy.queue.is_empty() {
+          proxy.channel.interest.insert(Ready::writable());
         }
 
+        if proxy.channel.readiness().is_writable() {
+          if let Some(msg) = proxy.queue.pop_front() {
+            if !proxy.channel.write_message(&msg) {
+              proxy.queue.push_front(msg);
+            }
+          }
+          proxy.channel.writable();
+        }
       }
       messages
     };
@@ -344,7 +350,9 @@ impl CommandServer {
 
           if self.clients[conn_token].channel.readiness().is_writable() {
             if let Some(msg) = self.clients[conn_token].queue.pop_front() {
-              self.clients[conn_token].channel.write_message(&msg);
+              if! self.clients[conn_token].channel.write_message(&msg) {
+                self.clients[conn_token].queue.push_front(msg);
+              }
               self.clients[conn_token].channel.writable();
             }
 
