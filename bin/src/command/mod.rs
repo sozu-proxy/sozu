@@ -116,7 +116,7 @@ impl CommandServer {
       let mut interest = Ready::hup();
       interest.insert(Ready::readable());
       interest.insert(Ready::writable());
-      self.poll.register(&self.clients[tok].channel.sock, token, interest, PollOpt::edge())
+      self.poll.register(&self.clients[tok].channel.sock, token, Ready::all(), PollOpt::edge())
         .ok().expect("could not register socket with event loop");
 
       let accept_interest = Ready::readable();
