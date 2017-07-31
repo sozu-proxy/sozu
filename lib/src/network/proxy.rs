@@ -110,13 +110,19 @@ impl Server {
 
           // loop here because iterations has borrow issues
           loop {
-            //info!("WORKER channel readiness={:?}, interest={:?}, queue={} elements",
-            //  self.channel.readiness, self.channel.interest, self.queue.len());
+            if !self.queue.is_empty() {
+              self.channel.interest.insert(Ready::writable());
+            }
+
+            info!("WORKER[{}] channel readiness={:?}, interest={:?}, queue={} elements",
+              line!(), self.channel.readiness, self.channel.interest, self.queue.len());
             if self.channel.readiness() == Ready::empty() {
               break;
             }
 
             if self.channel.readiness().is_readable() {
+            //info!("WORKER[{}] channel readiness={:?}, interest={:?}, queue={} elements", line!(), self.channel.readiness, self.channel.interest, self.queue.len());
+              self.channel.readable();
 
               loop {
                 let msg = self.channel.read_message();
@@ -151,15 +157,30 @@ impl Server {
             if !self.queue.is_empty() {
               self.channel.interest.insert(Ready::writable());
             }
+            if self.channel.readiness.is_writable() {
+            //info!("WORKER[{}] channel readiness={:?}, interest={:?}, queue={} elements", line!(), self.channel.readiness, self.channel.interest, self.queue.len());
 
-            if self.channel.readiness().is_writable() {
-              if let Some(msg) = self.queue.pop_front() {
-                info!("master queue has {} messages, sending {:#?}", self.queue.len(), msg);
-                if !self.channel.write_message(&msg) {
-                  self.queue.push_front(msg);
+              loop {
+
+                if let Some(msg) = self.queue.pop_front() {
+                  //info!("master queue has {} messages, sending {:?}", self.queue.len(), msg.id);
+                  if !self.channel.write_message(&msg) {
+                    self.queue.push_front(msg);
+                  }
+                }
+
+                if self.channel.back_buf.available_data() > 0 {
+                  self.channel.writable();
+                }
+
+                if !self.channel.readiness.is_writable() {
+                  break;
+                }
+
+                if self.channel.back_buf.available_data() == 0 && self.queue.len() == 0 {
+                  break;
                 }
               }
-              self.channel.writable();
             }
           }
 

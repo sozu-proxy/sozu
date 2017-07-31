@@ -284,8 +284,12 @@ impl CommandServer {
       let mut messages = Vec::new();
       let ref mut proxy = self.proxies.get_mut(&token).unwrap();
       loop {
-        //trace!("worker[{}] readiness = {:#?}, interest = {:#?}, queue = {} messages", token.0, proxy.channel.readiness,
-        //  proxy.channel.interest, proxy.queue.len());
+        if !proxy.queue.is_empty() {
+          proxy.channel.interest.insert(Ready::writable());
+        }
+
+        info!("worker[{}] readiness = {:#?}, interest = {:#?}, queue = {} messages", token.0, proxy.channel.readiness,
+          proxy.channel.interest, proxy.queue.len());
 
         if proxy.channel.readiness() == Ready::empty() {
           break;
@@ -312,13 +316,26 @@ impl CommandServer {
           proxy.channel.interest.insert(Ready::writable());
         }
 
-        if proxy.channel.readiness().is_writable() {
-          if let Some(msg) = proxy.queue.pop_front() {
-            if !proxy.channel.write_message(&msg) {
-              proxy.queue.push_front(msg);
+        if proxy.channel.readiness.is_writable() {
+          loop {
+            if let Some(msg) = proxy.queue.pop_front() {
+              if !proxy.channel.write_message(&msg) {
+                proxy.queue.push_front(msg);
+              }
+            }
+
+            if proxy.channel.back_buf.available_data() > 0 {
+              proxy.channel.writable();
+            }
+
+            if !proxy.channel.readiness.is_writable() {
+              break;
+            }
+
+            if proxy.channel.back_buf.available_data() == 0 && proxy.queue.len() == 0 {
+              break;
             }
           }
-          proxy.channel.writable();
         }
       }
       messages
@@ -377,7 +394,7 @@ impl CommandServer {
   }
 
   fn proxy_handle_message(&mut self, token: Token, msg: OrderMessageAnswer) {
-    info!("proxy handle message: token {:?} got answer msg: {:?}", token, msg);
+    //info!("proxy handle message: token {:?} got answer msg: {:?}", token, msg);
     if msg.status != OrderMessageStatus::Processing {
       let mut stopping = false;
       if let Some(ref mut proxy) = self.proxies.get_mut(&token) {
@@ -406,12 +423,12 @@ impl CommandServer {
               let answer = ConfigMessageAnswer::new(
                 client_message_id,
                 ConfigMessageStatus::Error,
-                format!("ok: {:#?}, error: {:#?}, message: {}", task.ok, task.error, s.clone()),
+                format!("ok: {} messages, error: {:?}, message: {}", task.ok.len(), task.error, s.clone()),
                 data,
               );
 
               if let Some(client_token) = task.client {
-                //info!("SENDING to client[{}]: {:#?}", client_token.0, answer);
+                info!("SENDING to client[{}]: {:#?}", client_token.0, answer);
                 self.clients[client_token].push_message(answer);
               }
             }
@@ -432,7 +449,7 @@ impl CommandServer {
                 ConfigMessageAnswer::new(
                   client_message_id,
                   ConfigMessageStatus::Ok,
-                  format!("ok: {:#?}, error: {:#?}", task.ok, task.error),
+                  format!("ok: {} messages, error: {:#?}", task.ok.len(), task.error),
                   data,
                 )
               } else {
@@ -445,7 +462,7 @@ impl CommandServer {
               };
 
               if let Some(client_token) = task.client {
-                //info!("SENDING to client[{}]: {:#?}", client_token.0, answer);
+                info!("SENDING to client[{}]: {:#?}", client_token.0, answer);
                 self.clients[client_token].push_message(answer);
               }
             }
