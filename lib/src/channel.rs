@@ -166,7 +166,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
         Err(e) => {
           match e.kind() {
             ErrorKind::WouldBlock => {
-              self.interest.remove(Ready::writable());
+              self.readiness.remove(Ready::writable());
               break;
             },
             e => {
