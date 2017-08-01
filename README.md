@@ -22,6 +22,7 @@ Build the most reliable reverse proxy ever:
 
 Requirements:
 - openssl 1.0.1 or above
+- cargo (rust package manager)
 
 You can create the required executables like this:
 
