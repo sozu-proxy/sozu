@@ -150,7 +150,7 @@ impl CommandServer {
               }
               offset = buffer.data().offset(i);
 
-              let mut new_state = ConfigState::new();
+              let mut new_state = self.state.clone();
               for message in orders {
                 if let ConfigCommand::ProxyConfiguration(order) = message.data {
                   new_state.handle_order(&order);
