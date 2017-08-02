@@ -199,6 +199,23 @@ impl CommandServer {
           }
           buffer.consume(offset);
         }
+        if counter > 0 {
+        info!("state loaded from {}, will start sending {} ùessages to workers", path, counter);
+        } else {
+          info!("no messages sent to workers: local state already had those messages");
+          if let Some(task) = self.order_state.task(message_id) {
+            if let Some(token) = token_opt {
+              let answer = ConfigMessageAnswer::new(
+                message_id.to_string(),
+                ConfigMessageStatus::Ok,
+                format!("ok: 0 messages, error: 0"),
+                None
+              );
+              self.clients[token].push_message(answer);
+            }
+
+          }
+        }
       }
     }
   }
