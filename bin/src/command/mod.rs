@@ -293,8 +293,8 @@ impl CommandServer {
           proxy.channel.interest.insert(Ready::writable());
         }
 
-        info!("worker[{}] readiness = {:#?}, interest = {:#?}, queue = {} messages", token.0, proxy.channel.readiness,
-          proxy.channel.interest, proxy.queue.len());
+        //trace!("worker[{}] readiness = {:#?}, interest = {:#?}, queue = {} messages", token.0, proxy.channel.readiness,
+        //  proxy.channel.interest, proxy.queue.len());
 
         if proxy.channel.readiness() == Ready::empty() {
           break;
@@ -361,10 +361,11 @@ impl CommandServer {
         trace!("closed client [{}]", conn_token.0);
       } else {
         loop {
-          /*trace!("client complete readiness[{}] = {:#?} (r = {:#?}, i = {:#?})", conn_token.0,
-          self.clients[conn_token].channel.readiness(),
-          self.clients[conn_token].channel.readiness,
-          self.clients[conn_token].channel.interest
+          /*trace!("client complete readiness[{}] = {:#?} (r = {:#?}, i = {:#?}), queue={} elements", conn_token.0,
+            self.clients[conn_token].channel.readiness(),
+            self.clients[conn_token].channel.readiness,
+            self.clients[conn_token].channel.interest,
+            self.clients[conn_token].queue.len()
           );*/
 
           if self.clients[conn_token].channel.readiness() == Ready::empty() {
@@ -400,7 +401,7 @@ impl CommandServer {
   }
 
   fn proxy_handle_message(&mut self, token: Token, msg: OrderMessageAnswer) {
-    //info!("proxy handle message: token {:?} got answer msg: {:?}", token, msg);
+    trace!("proxy handle message: token {:?} got answer msg: {:?}", token, msg);
     if msg.status != OrderMessageStatus::Processing {
       let mut stopping = false;
       if let Some(ref mut proxy) = self.proxies.get_mut(&token) {

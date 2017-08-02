@@ -123,6 +123,8 @@ impl CommandServer {
         let mut buffer = Buffer::with_capacity(200000);
         self.order_state.insert_task(message_id, token_opt);
 
+        info!("starting to load state from {}", path);
+
         let mut counter = 0;
         loop {
           let previous = buffer.available_data();
@@ -143,7 +145,7 @@ impl CommandServer {
           match parse(buffer.data()) {
             IResult::Done(i, orders) => {
               if i.len() > 0 {
-                info!("could not parse {} bytes", i.len());
+                //info!("could not parse {} bytes", i.len());
                 if previous == buffer.available_data() {
                   break;
                 }
