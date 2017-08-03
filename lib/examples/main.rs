@@ -26,11 +26,13 @@ fn main() {
   }
 
   info!("MAIN\tstarting up");
-  let metrics_socket = UdpSocket::bind("0.0.0.0:0").expect("could not parse address");
-  let metrics_host   = ("192.168.59.103", 8125).to_socket_addrs().expect("could not parse address").next().expect("could not get first address");
-  METRICS.lock().expect("could not get metrics instance").set_up_remote(metrics_socket, metrics_host);
-  let metrics_guard = ProxyMetrics::run();
-  METRICS.lock().expect("could not get metrics instance").gauge("TEST", 42);
+
+  metrics_set_up!("127.0.0.1", 8125);
+  METRICS.with(|metrics| {
+    (*metrics.borrow_mut()).gauge("sozu.TEST", 42);
+    (*metrics.borrow_mut()).send();
+    info!("metric sent");
+  });
 
   let config = messages::HttpProxyConfiguration {
     front: "127.0.0.1:8080".parse().expect("could not parse address"),

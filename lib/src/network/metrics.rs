@@ -1,16 +1,19 @@
 use std::str;
 use std::thread;
 use std::sync::Mutex;
+use std::cell::RefCell;
 use std::time::Duration;
 use std::fmt::Arguments;
 use std::net::{UdpSocket,SocketAddr};
 use std::io::{self,Write,Error,ErrorKind};
+use nom::HexDisplay;
 
 use network::buffer::Buffer;
 
-lazy_static! {
-  pub static ref METRICS: Mutex<ProxyMetrics> = Mutex::new(ProxyMetrics::new(String::from("sozu")));
+thread_local! {
+  pub static METRICS: RefCell<ProxyMetrics> = RefCell::new(ProxyMetrics::new(String::from("sozu")))
 }
+
 
 pub struct ProxyMetrics {
   pub buffer: Buffer,
@@ -27,6 +30,7 @@ impl ProxyMetrics {
     }
   }
 
+  /*
   pub fn run() -> thread::JoinHandle<()> {
     thread::spawn(move || {
       loop {
@@ -34,7 +38,7 @@ impl ProxyMetrics {
         METRICS.lock().unwrap().send();
       }
     })
-  }
+  }*/
 
   pub fn set_up_remote(&mut self, socket: UdpSocket, addr: SocketAddr) {
     self.remote = Some((addr, socket));
@@ -47,8 +51,8 @@ impl ProxyMetrics {
   }
 
   pub fn send(&mut self) -> io::Result<usize> {
-    if self.buffer.available_data() >= 512 {
-      if let Some((ref addr, ref socket)) = self.remote {
+    //let res = if self.buffer.available_data() >= 512 {
+    let res = if let Some((ref addr, ref socket)) = self.remote {
         match socket.send_to(self.buffer.data(), addr) {
           Ok(sz) => {
             self.buffer.consume(sz);
@@ -60,10 +64,12 @@ impl ProxyMetrics {
         }
       } else {
         Err(Error::new(ErrorKind::NotConnected, "metrics socket not set up"))
-      }
-    } else {
-      Err(Error::new(ErrorKind::Other, "no data to send"))
-    }
+      };
+    //} else {
+    //  Err(Error::new(ErrorKind::Other, "no data to send"))
+    //};
+
+    res
   }
 
   fn emit(&mut self, metric: &str) -> io::Result<usize> {
@@ -97,10 +103,24 @@ impl ProxyMetrics {
 }
 
 #[macro_export]
+macro_rules! metrics_set_up (
+  ($host:expr, $port: expr) => {
+    let metrics_socket = UdpSocket::bind("0.0.0.0:0").expect("could not parse address");
+    info!("setting up metrics: local address = {:#?}", metrics_socket.local_addr());
+    let metrics_host   = ($host, $port).to_socket_addrs().expect("could not parse address").next().expect("could not get first address");
+    METRICS.with(|metrics| {
+      (*metrics.borrow_mut()).set_up_remote(metrics_socket, metrics_host);
+    });
+  }
+);
+
+#[macro_export]
 macro_rules! count (
   ($key:expr, $value: expr) => {
-    let mut metrics = ::network::metrics::METRICS.lock().unwrap();
-    metrics.write(format_args!("{}.{}:{}|c\n", *$crate::logging::TAG, $key, $value));
+    let v = $value;
+    ::network::metrics::METRICS.with(|metrics| {
+      (*metrics.borrow_mut()).write(format_args!("{}.{}:{}|c\n", *$crate::logging::TAG, $key, v));
+    });
   }
 );
 
@@ -117,23 +137,29 @@ macro_rules! decr (
 #[macro_export]
 macro_rules! time (
   ($key:expr, $value: expr) => {
-    let mut metrics = ::network::metrics::METRICS.lock().unwrap();
-    metrics.write(format_args!("{}.{}:{}|ms\n", *$crate::logging::TAG, $key, $value));
+    let v = $value;
+    ::network::metrics::METRICS.with(|metrics| {
+      (*metrics.borrow_mut()).write(format_args!("{}.{}:{}|ms\n", *$crate::logging::TAG, $key, v));
+    });
   }
 );
 
 #[macro_export]
 macro_rules! gauge (
   ($key:expr, $value: expr) => {
-    let mut metrics = ::network::metrics::METRICS.lock().unwrap();
-    metrics.write(format_args!("{}.{}:{}|g\n", *$crate::logging::TAG, $key, $value));
+    let v = $value;
+    ::network::metrics::METRICS.with(|metrics| {
+      (*metrics.borrow_mut()).write(format_args!("{}.{}:{}|g\n", *$crate::logging::TAG, $key, v));
+    });
   }
 );
 
 #[macro_export]
 macro_rules! meter (
   ($key:expr, $value: expr) =>  {
-    let mut metrics = ::network::metrics::METRICS.lock().unwrap();
-    metrics.write(format_args!("{}.{}:{}|m\n", *$crate::logging::TAG, $key, $value));
+    let v = $value;
+    ::network::metrics::METRICS.with(|metrics| {
+      (*metrics.borrow_mut()).write(format_args!("{}.{}:{}|m\n", *$crate::logging::TAG, $key, v));
+    });
   }
 );

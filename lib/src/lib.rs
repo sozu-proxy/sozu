@@ -172,7 +172,7 @@ extern crate mio_uds;
 
 #[macro_use] pub mod util;
 #[macro_use] pub mod logging;
-pub mod network;
+#[macro_use] pub mod network;
 pub mod parser;
 pub mod messages;
 pub mod channel;

@@ -6,6 +6,7 @@ use std::ffi::CString;
 use std::iter::repeat;
 use std::ptr::null_mut;
 use std::process::Command;
+use std::net::{ToSocketAddrs,UdpSocket};
 use std::os::unix::process::CommandExt;
 use std::os::unix::io::{AsRawFd,FromRawFd};
 use nix;
@@ -16,6 +17,7 @@ use sozu::channel::Channel;
 use sozu::network::proxy::Server;
 use sozu::network::session::Session;
 use sozu::messages::{OrderMessage,OrderMessageAnswer};
+use sozu::network::metrics::{METRICS,ProxyMetrics};
 use sozu::network::{http,tls};
 use sozu_command::config::Config;
 
@@ -71,6 +73,13 @@ pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
   command.set_nonblocking(true);
   let command: Channel<OrderMessageAnswer,OrderMessage> = command.into();
 
+
+  metrics_set_up!(&proxy_config.metrics.address[..], proxy_config.metrics.port);
+  METRICS.with(|metrics| {
+    (*metrics.borrow_mut()).gauge("sozu.TEST", 42);
+    (*metrics.borrow_mut()).send();
+    info!("metric sent");
+  });
 
   let mut event_loop  = Poll::new().expect("could not create event loop");
 
