@@ -75,11 +75,7 @@ pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
 
 
   metrics_set_up!(&proxy_config.metrics.address[..], proxy_config.metrics.port);
-  METRICS.with(|metrics| {
-    (*metrics.borrow_mut()).gauge("sozu.TEST", 42);
-    (*metrics.borrow_mut()).send();
-    info!("metric sent");
-  });
+  gauge!("sozu.TEST", 42);
 
   let mut event_loop  = Poll::new().expect("could not create event loop");
 

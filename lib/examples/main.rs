@@ -28,11 +28,7 @@ fn main() {
   info!("MAIN\tstarting up");
 
   metrics_set_up!("127.0.0.1", 8125);
-  METRICS.with(|metrics| {
-    (*metrics.borrow_mut()).gauge("sozu.TEST", 42);
-    (*metrics.borrow_mut()).send();
-    info!("metric sent");
-  });
+  gauge!("sozu.TEST", 42);
 
   let config = messages::HttpProxyConfiguration {
     front: "127.0.0.1:8080".parse().expect("could not parse address"),

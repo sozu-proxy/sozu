@@ -97,11 +97,7 @@ fn main() {
     info!("starting up");
 
     metrics_set_up!(&config.metrics.address[..], config.metrics.port);
-    METRICS.with(|metrics| {
-      (*metrics.borrow_mut()).gauge("sozu.TEST", 42);
-      (*metrics.borrow_mut()).send();
-      info!("metric sent");
-    });
+    gauge!("sozu.TEST", 42);
 
     if check_process_limits(config.clone()) {
       match start_workers(&config) {

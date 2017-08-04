@@ -300,7 +300,7 @@ impl<Front:SocketHandler> Http<Front> {
         &mut self.front_buf));
       if unwrap_msg!(self.state.as_ref()).is_front_error() {
         error!("{}\t[{:?}] front parsing error, closing the connection", self.log_ctx, self.token);
-        time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+        //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
         self.readiness.front_interest.remove(Ready::readable());
         return ClientResult::CloseClient;
       }
@@ -343,7 +343,7 @@ impl<Front:SocketHandler> Http<Front> {
 
           if unwrap_msg!(self.state.as_ref()).is_front_error() {
             error!("{}\t[{:?}] front chunk parsing error, closing the connection", self.log_ctx, self.token);
-            time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+            //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             self.readiness.reset();
             return ClientResult::CloseClient;
           }
@@ -361,7 +361,7 @@ impl<Front:SocketHandler> Http<Front> {
 
         if unwrap_msg!(self.state.as_ref()).is_front_error() {
           error!("{}\t[{:?}] front parsing error, closing the connection", self.log_ctx, self.token);
-          time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+          //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
           self.readiness.reset();
           return ClientResult::CloseClient;
         }
@@ -711,7 +711,7 @@ impl<Front:SocketHandler> Http<Front> {
 
           if unwrap_msg!(self.state.as_ref()).is_back_error() {
             error!("{}\tback socket chunk parse error, closing connection", self.log_ctx);
-            time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+            //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             self.readiness.reset();
             return (ProtocolResult::Continue, ClientResult::CloseBothFailure);
           }
@@ -730,7 +730,7 @@ impl<Front:SocketHandler> Http<Front> {
 
         if unwrap_msg!(self.state.as_ref()).is_back_error() {
           error!("{}\tback socket parse error, closing connection", self.log_ctx);
-          time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
+          //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
           self.readiness.reset();
           return (ProtocolResult::Continue, ClientResult::CloseBothFailure);
         }
