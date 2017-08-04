@@ -1,4 +1,4 @@
-FROM alpine:edge
+FROM alpine:edge as builder
 
 COPY . /source/
 COPY bin/config.toml /etc/sozu/sozu.toml
@@ -8,19 +8,20 @@ RUN apk add --no-cache --virtual .build-dependencies \
   g++ \
   gcc \
   musl-dev \
-  rust && \
-  apk add --no-cache openssl-dev llvm-libunwind && \
-  cd /source && cd ctl && \
-  cargo build --release && \
-  cd ../bin && \
-  cargo build --release && \
-  cp /source/target/release/sozu /sozu && \
-  cp /source/target/release/sozuctl /sozuctl && \
-  cd / && \
-  apk del .build-dependencies && \
-  apk del && \
-  rm -rf /source && \
-  rm -rf /root/.cargo
+  rust
+RUN apk add --no-cache openssl-dev llvm-libunwind
+WORKDIR /source/ctl
+RUN cargo build --release
+WORKDIR /source/bin
+RUN cargo build --release
+
+
+
+FROM alpine:edge
+COPY bin/config.toml /etc/sozu/sozu.toml
+RUN apk add --no-cache openssl llvm-libunwind
+COPY --from=builder /source/target/release/sozu /sozu
+COPY --from=builder /source/target/release/sozuctl /sozuctl
 
 EXPOSE 80
 EXPOSE 443
