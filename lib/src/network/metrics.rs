@@ -3,7 +3,7 @@ use std::thread;
 use std::sync::Mutex;
 use std::cell::RefCell;
 use std::time::{Duration,Instant};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt::Arguments;
 use std::net::SocketAddr;
 use mio::net::UdpSocket;
@@ -42,7 +42,7 @@ pub struct ProxyMetrics {
   pub buffer:      Buffer,
   pub prefix:      String,
   pub created:     Instant,
-  pub data:        HashMap<String, StoredMetricData>,
+  pub data:        BTreeMap<String, StoredMetricData>,
   pub is_writable: bool,
   remote:          Option<(SocketAddr, UdpSocket)>,
 }
@@ -53,7 +53,7 @@ impl ProxyMetrics {
       buffer:      Buffer::with_capacity(2048),
       prefix:      prefix,
       created:     Instant::now(),
-      data:        HashMap::new(),
+      data:        BTreeMap::new(),
       remote:      None,
       is_writable: false,
     }
@@ -73,7 +73,7 @@ impl ProxyMetrics {
     self.send();
   }
 
-  pub fn dump_data(&self) -> HashMap<String, FilteredData> {
+  pub fn dump_data(&self) -> BTreeMap<String, FilteredData> {
     self.data.iter().filter(|&(_, ref value)| {
       if let MetricData::Time(_,None) = value.data {
         false

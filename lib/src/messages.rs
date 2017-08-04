@@ -5,7 +5,7 @@ use serde_json;
 use hex::{FromHex,ToHex};
 use openssl::ssl;
 use std::net::{IpAddr,SocketAddr};
-use std::collections::{HashMap,HashSet};
+use std::collections::{BTreeMap,HashSet};
 use std::default::Default;
 use std::convert::From;
 use std::fmt;
@@ -38,7 +38,7 @@ pub enum OrderMessageStatus {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderMessageAnswerData {
   //placeholder for now
-  Metrics(HashMap<String,FilteredData>)
+  Metrics(BTreeMap<String,FilteredData>)
 }
 
 #[derive(Debug,Clone,Serialize,Deserialize)]
