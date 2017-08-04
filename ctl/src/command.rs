@@ -379,8 +379,86 @@ pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
                 }
               }
             }
+          }
+        }
+      }
+    }
+  }
+}
 
-            println!("worker upgrade done");
+pub fn metrics(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
+  let id = generate_id();
+  channel.write_message(&ConfigMessage::new(
+    id.clone(),
+    ConfigCommand::ListWorkers,
+    None,
+  ));
+
+  match channel.read_message() {
+    None          => println!("the proxy didn't answer"),
+    Some(message) => {
+      if id != message.id {
+        println!("received message with invalid id: {:?}", message);
+        return;
+      }
+      match message.status {
+        ConfigMessageStatus::Processing => {
+          println!("should have obtained an answer immediately");
+          return;
+        },
+        ConfigMessageStatus::Error => {
+          println!("could not get the worker list: {}", message.message);
+          return
+        },
+        ConfigMessageStatus::Ok => {
+          println!("Worker list:\n{:?}", message.data);
+          if let Some(AnswerData::Workers(ref workers)) = message.data {
+            let mut expecting: HashSet<String> = HashSet::new();
+
+            for ref worker in workers.iter().filter(|worker| worker.run_state == RunState::Running) {
+              let id = generate_id();
+              let msg = ConfigMessage::new(
+                id.clone(),
+                ConfigCommand::ProxyConfiguration(Order::Metrics),
+                Some(worker.id),
+              );
+              println!("sending message: {:?}", msg);
+              channel.write_message(&msg);
+              expecting.insert(id);
+            }
+
+
+            loop {
+              println!("expecting: {:?}", expecting);
+              if expecting.is_empty() {
+                break;
+              }
+              match channel.read_message() {
+                None          => println!("the proxy didn't answer"),
+                Some(message) => {
+                  println!("received message: {:?}", message);
+                  match message.status {
+                    ConfigMessageStatus::Processing => {
+                    },
+                    ConfigMessageStatus::Error => {
+                      println!("error for message[{}]: {}", message.id, message.message);
+                      if expecting.contains(&message.id) {
+                        expecting.remove(&message.id);
+                      }
+                    },
+                    ConfigMessageStatus::Ok => {
+                      if expecting.contains(&message.id) {
+                        expecting.remove(&message.id);
+                        println!("metricd message with ID {} done", message.id);
+                      }
+                      if let Some(data) = message.data {
+                        println!("got a metrics message:\n{:#?}", data);
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
         }
       }
