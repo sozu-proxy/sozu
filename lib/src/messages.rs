@@ -5,14 +5,16 @@ use serde_json;
 use hex::{FromHex,ToHex};
 use openssl::ssl;
 use std::net::{IpAddr,SocketAddr};
-use std::collections::HashSet;
+use std::collections::{HashMap,HashSet};
 use std::default::Default;
 use std::convert::From;
 use std::fmt;
 
+use network::metrics::FilteredData;
+
 pub type MessageId = String;
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
 pub struct OrderMessageAnswer {
   pub id:     MessageId,
   pub status: OrderMessageStatus,
@@ -32,10 +34,11 @@ pub enum OrderMessageStatus {
   Error(String),
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderMessageAnswerData {
   //placeholder for now
-  Metrics,
+  Metrics(HashMap<String,FilteredData>)
 }
 
 #[derive(Debug,Clone,Serialize,Deserialize)]
@@ -74,7 +77,8 @@ pub enum Order {
     SoftStop,
     HardStop,
 
-    Status
+    Status,
+    Metrics,
 }
 
 
@@ -259,6 +263,7 @@ impl Order {
       Order::SoftStop             => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::HardStop             => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::Status               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::Metrics              => HashSet::new(),
     }
   }
 }

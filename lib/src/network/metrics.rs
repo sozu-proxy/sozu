@@ -23,6 +23,14 @@ pub enum MetricData {
   Time(Instant, Option<Instant>),
 }
 
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FilteredData {
+  Gauge(usize),
+  Count(i64),
+  Time(usize),
+}
+
 #[derive(Debug,Clone)]
 pub struct StoredMetricData {
   last_sent: Instant,
@@ -63,6 +71,28 @@ impl ProxyMetrics {
     //FIXME: error handling
     self.buffer.write_fmt(args);
     self.send();
+  }
+
+  pub fn dump_data(&self) -> HashMap<String, FilteredData> {
+    self.data.iter().filter(|&(_, ref value)| {
+      if let MetricData::Time(_,None) = value.data {
+        false
+      } else {
+        true
+      }
+    }).map(|(ref key, ref value)| {
+      let val = match value.data {
+        MetricData::Gauge(i) => FilteredData::Gauge(i),
+        MetricData::Count(i) => FilteredData::Count(i),
+        MetricData::Time(begin, Some(end)) => {
+          let duration = end.duration_since(begin);
+          let millis = duration.as_secs() * 1000 + (duration.subsec_nanos() / 1000000) as u64;
+          FilteredData::Time(millis as usize)
+        },
+        _ => unreachable!()
+      };
+      (key.to_string(), val)
+    }).collect()
   }
 
   pub fn count_add(&mut self, key: &str, count_value: i64) {

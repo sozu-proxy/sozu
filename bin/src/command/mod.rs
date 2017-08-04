@@ -442,7 +442,7 @@ impl CommandServer {
               //info!("TERMINATING task: {:#?}", task);
               let data = match msg.data {
                 None => None,
-                Some(OrderMessageAnswerData::Metrics) => Some(AnswerData::Metrics),
+                Some(OrderMessageAnswerData::Metrics(data)) => Some(AnswerData::Metrics(data)),
               };
 
               let answer = ConfigMessageAnswer::new(
@@ -468,7 +468,7 @@ impl CommandServer {
               let answer = if task.error.is_empty() {
                 let data = match msg.data {
                   None => None,
-                  Some(OrderMessageAnswerData::Metrics) => Some(AnswerData::Metrics),
+                  Some(OrderMessageAnswerData::Metrics(data)) => Some(AnswerData::Metrics(data)),
                 };
 
                 ConfigMessageAnswer::new(

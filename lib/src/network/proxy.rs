@@ -25,7 +25,7 @@ use network::{ClientResult,ConnectionError,
 use network::{http,tls,tcp};
 use network::metrics::METRICS;
 use network::session::{BackToken,FrontToken,ListenToken,ProxyClient,ProxyConfiguration,Readiness,Session};
-use messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageStatus,OrderMessage,Topic};
+use messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic};
 use channel::Channel;
 
 const SERVER: Token = Token(0);
@@ -243,6 +243,21 @@ impl Server {
   }
 
   fn notify(&mut self, message: OrderMessage) {
+    if let Order::Metrics = message.order {
+      let q = &mut self.queue;
+      //let id = message.id.clone();
+      let msg = METRICS.with(|metrics| {
+        q.push_back(OrderMessageAnswer {
+          id:     message.id.clone(),
+          status: OrderMessageStatus::Ok,
+          data:   Some(OrderMessageAnswerData::Metrics(
+            (*metrics.borrow()).dump_data()
+          ))
+        });
+      });
+      return;
+    }
+
     let topics = message.order.get_topics();
 
     if topics.contains(&Topic::HttpProxyConfig) {
