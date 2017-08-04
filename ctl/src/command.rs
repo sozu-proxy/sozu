@@ -37,7 +37,7 @@ pub fn save_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
           println!("could not save proxy state: {}", message.message);
         },
         ConfigMessageStatus::Ok => {
-          println!("Proxy state saved to {}", path);
+          println!("Proxy state saved to {}: {}", path, message.message);
         }
       }
     }
@@ -394,7 +394,7 @@ pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, ap
     match Config::load_file_bytes(certificate_path) {
       Ok(data) => {
         match calculate_fingerprint(&data) {
-          Err(e)          => println!("could not calculate finrprint for certificate: {:?}", e),
+          Err(e)          => println!("could not calculate fingerprint for certificate: {:?}", e),
           Ok(fingerprint) => {
             order_command(channel, Order::AddHttpsFront(HttpsFront {
               app_id: String::from(app_id),
@@ -421,7 +421,7 @@ pub fn remove_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>,
     match Config::load_file_bytes(certificate_path) {
       Ok(data) => {
         match calculate_fingerprint(&data) {
-          Err(e)          => println!("could not calculate finrprint for certificate: {:?}", e),
+          Err(e)          => println!("could not calculate fingerprint for certificate: {:?}", e),
           Ok(fingerprint) => {
             order_command(channel, Order::RemoveHttpsFront(HttpsFront {
               app_id: String::from(app_id),
