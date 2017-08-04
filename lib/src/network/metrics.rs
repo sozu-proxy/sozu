@@ -19,6 +19,7 @@ thread_local! {
 pub struct ProxyMetrics {
   pub buffer: Buffer,
   pub prefix: String,
+  pub is_writable: bool,
   remote: Option<(SocketAddr, UdpSocket)>,
 }
 
@@ -28,6 +29,7 @@ impl ProxyMetrics {
       buffer: Buffer::with_capacity(2048),
       prefix: prefix,
       remote:   None,
+      is_writable: false,
     }
   }
 
@@ -45,10 +47,24 @@ impl ProxyMetrics {
     self.remote = Some((addr, socket));
   }
 
+  pub fn socket(&self) -> Option<&UdpSocket> {
+    self.remote.as_ref().map(|remote| &remote.1)
+  }
+
   pub fn write(&mut self, args: Arguments) {
     //FIXME: error handling
     self.buffer.write_fmt(args);
     self.send();
+  }
+
+  pub fn writable(&mut self) {
+    info!("called METRICS WRITABLE");
+
+    self.is_writable = true;
+  }
+
+  pub fn send_data(&mut self) {
+    //info!("called METRICS SEND DATA");
   }
 
   pub fn send(&mut self) -> io::Result<usize> {

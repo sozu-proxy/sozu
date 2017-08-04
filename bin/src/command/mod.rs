@@ -13,6 +13,7 @@ use libc::{pid_t,kill};
 
 use sozu::messages::{Order,OrderMessage,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus};
 use sozu::channel::Channel;
+use sozu::network::metrics::METRICS;
 use sozu_command::state::ConfigState;
 use sozu_command::data::{AnswerData,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 use sozu_command::config::Config;
@@ -137,12 +138,20 @@ impl CommandServer {
   fn new(srv: UnixListener, config: Config, mut proxy_vec: Vec<Worker>, poll: Poll) -> CommandServer {
     //FIXME: verify this
     poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
+    METRICS.with(|metrics| {
+      if let Some(sock) = (*metrics.borrow()).socket() {
+        poll.register(sock, Token(1), Ready::writable(), PollOpt::edge()).expect("should register the metrics socket");
+      } else {
+        error!("could not register metrics socket");
+      }
+    });
+
 
     let next_id = proxy_vec.len();
 
     let mut proxies = HashMap::new();
 
-    let mut token_count = 0;
+    let mut token_count = 1;
     //FIXME: verify there's at least one worker
     //TODO: make config state from Config ADD IP ADDRESSES AND PORTS
     let state: ConfigState = Default::default();
@@ -181,11 +190,11 @@ impl CommandServer {
   }
 
   pub fn to_front(&self, token: Token) -> FrontToken {
-    FrontToken(token.0 - HALF_USIZE - 1)
+    FrontToken(token.0 - HALF_USIZE - 2)
   }
 
   pub fn from_front(&self, token: FrontToken) -> Token {
-    Token(token.0 + HALF_USIZE + 1)
+    Token(token.0 + HALF_USIZE + 2)
   }
 
 }
@@ -246,6 +255,10 @@ impl CommandServer {
         }
       }
 
+      METRICS.with(|metrics| {
+        (*metrics.borrow_mut()).send_data();
+      });
+
       if self.must_stop {
         info!("stopping...");
         break;
@@ -263,6 +276,11 @@ impl CommandServer {
         } else {
           error!("received writable for token 0");
         }
+      },
+      Token(1) => {
+        METRICS.with(|metrics| {
+          (*metrics.borrow_mut()).writable();
+        });
       },
       Token(i) if i < HALF_USIZE + 1 => {
         if let Some(ref mut proxy) =self.proxies.get_mut(&Token(i)) {

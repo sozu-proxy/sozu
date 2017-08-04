@@ -23,6 +23,7 @@ use rand::random;
 use network::{ClientResult,ConnectionError,
   SocketType,Protocol,RequiredEvents};
 use network::{http,tls,tcp};
+use network::metrics::METRICS;
 use network::session::{BackToken,FrontToken,ListenToken,ProxyClient,ProxyConfiguration,Readiness,Session};
 use messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageStatus,OrderMessage,Topic};
 use channel::Channel;
@@ -55,15 +56,24 @@ pub struct Server {
 
 impl Server {
   pub fn new(poll: Poll, channel: ProxyChannel,
-    http: Option<Session<http::ServerConfiguration, http::Client>>,
+    http:  Option<Session<http::ServerConfiguration, http::Client>>,
     https: Option<Session<tls::ServerConfiguration, tls::TlsClient>>,
-    tcp: Option<Session<tcp::ServerConfiguration, tcp::Client>>) -> Self {
+    tcp:  Option<Session<tcp::ServerConfiguration, tcp::Client>>) -> Self {
+
     poll.register(
       &channel,
       Token(0),
       Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
       PollOpt::edge()
     ).expect("should register the channel");
+
+    METRICS.with(|metrics| {
+      if let Some(sock) = (*metrics.borrow()).socket() {
+        poll.register(sock, Token(1), Ready::writable(), PollOpt::edge()).expect("should register the metrics socket");
+      } else {
+        error!("could not register metrics socket");
+      }
+    });
 
     //let timer   = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
     let timer   = Timer::default();
@@ -179,9 +189,9 @@ impl Server {
           }
 
         } else if event.token() == Token(1) {
-          while let Some(token) = self.timer.poll() {
-            self.timeout(token);
-          }
+          METRICS.with(|metrics| {
+            (*metrics.borrow_mut()).writable();
+          });
         } else {
           //self.ready(event.token(), event.readiness());
           match proxy_type(event.token().0) {
@@ -213,6 +223,10 @@ impl Server {
         tcp.handle_remaining_readiness(&mut self.poll);
         self.tcp = Some(tcp);
       }
+
+      METRICS.with(|metrics| {
+        (*metrics.borrow_mut()).send_data();
+      });
 
       //FIXME: manually call the timer instead of relying on a separate thread
       while let Some(token) = self.timer.poll() {
