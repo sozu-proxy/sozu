@@ -84,6 +84,7 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn reset(&mut self) {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     debug!("{} RESET TO {}", self.log_ctx, request_id);
+    decr!("http.requests");
     self.state.as_mut().map(|state| state.reset());
     let req_header = self.added_request_header(self.public_address);
     let res_header = self.added_response_header();
@@ -310,6 +311,10 @@ impl<Front:SocketHandler> Http<Front> {
       } else {
         return ClientResult::Continue;
       }
+    }
+
+    if unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial) {
+      incr!("http.requests");
     }
 
     self.readiness.back_interest.insert(Ready::writable());

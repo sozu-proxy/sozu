@@ -4,7 +4,8 @@ use std::sync::Mutex;
 use std::cell::RefCell;
 use std::time::Duration;
 use std::fmt::Arguments;
-use std::net::{UdpSocket,SocketAddr};
+use std::net::SocketAddr;
+use mio::net::UdpSocket;
 use std::io::{self,Write,Error,ErrorKind};
 use nom::HexDisplay;
 
@@ -105,7 +106,7 @@ impl ProxyMetrics {
 #[macro_export]
 macro_rules! metrics_set_up (
   ($host:expr, $port: expr) => {
-    let metrics_socket = UdpSocket::bind("0.0.0.0:0").expect("could not parse address");
+    let metrics_socket = ::mio::net::UdpSocket::bind(&("0.0.0.0:0".parse().unwrap())).expect("could not parse address");
     info!("setting up metrics: local address = {:#?}", metrics_socket.local_addr());
     let metrics_host   = ($host, $port).to_socket_addrs().expect("could not parse address").next().expect("could not get first address");
     METRICS.with(|metrics| {
@@ -120,6 +121,7 @@ macro_rules! count (
     let v = $value;
     ::network::metrics::METRICS.with(|metrics| {
       (*metrics.borrow_mut()).write(format_args!("{}.{}:{}|c\n", *$crate::logging::TAG, $key, v));
+      (*metrics.borrow_mut()).send();
     });
   }
 );
@@ -140,6 +142,7 @@ macro_rules! time (
     let v = $value;
     ::network::metrics::METRICS.with(|metrics| {
       (*metrics.borrow_mut()).write(format_args!("{}.{}:{}|ms\n", *$crate::logging::TAG, $key, v));
+      (*metrics.borrow_mut()).send();
     });
   }
 );
@@ -149,7 +152,9 @@ macro_rules! gauge (
   ($key:expr, $value: expr) => {
     let v = $value;
     ::network::metrics::METRICS.with(|metrics| {
+      info!("gauge {} -> {}", $key, v);
       (*metrics.borrow_mut()).write(format_args!("{}.{}:{}|g\n", *$crate::logging::TAG, $key, v));
+      (*metrics.borrow_mut()).send();
     });
   }
 );
@@ -160,6 +165,7 @@ macro_rules! meter (
     let v = $value;
     ::network::metrics::METRICS.with(|metrics| {
       (*metrics.borrow_mut()).write(format_args!("{}.{}:{}|m\n", *$crate::logging::TAG, $key, v));
+      (*metrics.borrow_mut()).send();
     });
   }
 );
