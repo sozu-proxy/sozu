@@ -2,7 +2,7 @@ use serde;
 use serde::ser::SerializeMap;
 use serde_json;
 use std::fmt;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use sozu::messages::Order;
 use sozu::network::metrics::FilteredData;
@@ -51,7 +51,7 @@ pub enum ConfigMessageStatus {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AnswerData {
   Workers(Vec<WorkerInfo>),
-  Metrics(HashMap<String,FilteredData>),
+  Metrics(BTreeMap<String,FilteredData>),
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
