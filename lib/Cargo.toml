@@ -13,10 +13,10 @@ categories = ["network-programming"]
 include = [
   "README.md",
   "Cargo.toml",
-  "src/*.rs",
-  "examples/main.rs",
-  "examples/minimal.rs",
-  "assets/*"
+  "/src",
+  "/examples/main.rs",
+  "/examples/minimal.rs",
+  "/assets"
 ]
 
 [dependencies]
