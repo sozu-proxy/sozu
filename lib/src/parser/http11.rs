@@ -629,41 +629,45 @@ pub enum Connection {
 
 #[derive(Debug,Clone,PartialEq)]
 pub struct Connection {
-  pub keep_alive:   Option<bool>,
-  pub has_upgrade:  bool,
-  pub upgrade:      Option<String>,
-  pub to_delete:    HashSet<String>,
-  pub continues:    Continue,
+  pub keep_alive:     Option<bool>,
+  pub has_upgrade:    bool,
+  pub upgrade:        Option<String>,
+  pub to_delete:      HashSet<String>,
+  pub continues:      Continue,
+  pub sticky_session: Option<String>,
 }
 
 impl Connection {
   pub fn new() -> Connection {
     Connection {
-      keep_alive:  None,
-      has_upgrade: false,
-      upgrade:     None,
-      continues:   Continue::None,
-      to_delete:   HashSet::new(),
+      keep_alive:     None,
+      has_upgrade:    false,
+      upgrade:        None,
+      continues:      Continue::None,
+      to_delete:      HashSet::new(),
+      sticky_session: None,
     }
   }
 
   pub fn keep_alive() -> Connection {
     Connection {
-      keep_alive:  Some(true),
-      has_upgrade: false,
-      upgrade:     None,
-      continues:   Continue::None,
-      to_delete:   HashSet::new(),
+      keep_alive:     Some(true),
+      has_upgrade:    false,
+      upgrade:        None,
+      continues:      Continue::None,
+      to_delete:      HashSet::new(),
+      sticky_session: None,
     }
   }
 
   pub fn close() -> Connection {
     Connection {
-      keep_alive:  Some(false),
-      has_upgrade: false,
-      upgrade:     None,
-      continues:   Continue::None,
-      to_delete:   HashSet::new(),
+      keep_alive:     Some(false),
+      has_upgrade:    false,
+      upgrade:        None,
+      continues:      Continue::None,
+      to_delete:      HashSet::new(),
+      sticky_session: None
     }
   }
 }
@@ -1116,7 +1120,18 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
       st.get_mut_connection().map(|conn| conn.upgrade = Some(str::from_utf8(s).expect("should be ascii").to_string()));
       st
     },
-    HeaderValue::Cookie(cookies) => state,
+    HeaderValue::Cookie(cookies) => {
+      let sticky_session_header = cookies.into_iter().find(|ref cookie| &cookie.name[..] == b"SOZUBALANCEID");
+      if let Some(sticky_session) = sticky_session_header {
+        let mut st = state;
+        let val = str::from_utf8(sticky_session.name).expect("sticky_session value should be ascii").to_string();
+        st.get_mut_connection().map(|conn| conn.sticky_session = Some(val));
+
+        return st;
+      }
+
+      return state;
+    },
     HeaderValue::Error       => RequestState::Error(ErrorState::InvalidHttp)
   }
 }
