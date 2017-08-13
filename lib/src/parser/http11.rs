@@ -271,6 +271,14 @@ pub fn request_cookies(input: &[u8]) -> Option<Vec<CookieValue>> {
   }
 }
 
+named!(parse_sticky_session_header<(&[u8], (&[u8], Option<&[u8]>))>,
+  do_parse!(
+    before: take_until!("SOZUBALANCEID=") >>
+    cookie: pair!(take_while!(is_cookie_value_char), opt!(tag!(" "))) >>
+    (before, cookie)
+  )
+);
+
 use std::str::{from_utf8, FromStr};
 use nom::{Err,ErrorKind,Needed};
 
@@ -567,6 +575,43 @@ impl<'a> Header<'a> {
       &lowercase[..] == b"x-forwarded-port"  ||
       &lowercase[..] == b"request-id"        ||
       conn.to_delete.contains(unsafe {str::from_utf8_unchecked(&self.value.to_ascii_lowercase()[..])})
+    }
+  }
+
+  pub fn must_mutate(&self) -> bool {
+    let lowercase = self.name.to_ascii_lowercase();
+    match &lowercase[..] {
+      b"cookie" => true,
+      _ => false
+    }
+  }
+
+  pub fn mutate_and_advance(&self, offset: usize) -> Vec<BufferMove> {
+    let value_length = self.value.len();
+    let res = parse_sticky_session_header(self.value);
+
+    match res {
+      IResult::Done(_, (before, (cookie, extra_space))) => {
+        let extra_space_len = if extra_space.is_some() { 1 } else { 0 };
+        // header_length is the header size: Cookie:(space), -2 is to count \n\n
+        let header_length = offset - value_length - 2;
+        // here we add header_length to the number of matched bytes before the searched cookie
+        let start = header_length + before.len();
+        // here we calculate how much we have to drop
+        let drop = cookie.len() + extra_space_len;
+        // we do the diff between the first Advance and the Drop, to know how much it remains
+        let end = offset - (start + drop);
+        vec![
+          BufferMove::Advance(start),
+          BufferMove::Delete(drop),
+          BufferMove::Advance(end)
+        ]
+      },
+      IResult::Incomplete(needed) => {
+        error!("header.mutate_and_advance: incomplete data to parse sticky session cookie");
+        Vec::new()
+      },
+      IResult::Error(e) => vec![BufferMove::Advance(offset)] // Can't be found
     }
   }
 }
@@ -1029,7 +1074,9 @@ pub enum BufferMove {
   /// length
   Advance(usize),
   /// length
-  Delete(usize)
+  Delete(usize),
+  /// Vec of BufferMove operations
+  Multiple(Vec<BufferMove>)
 }
 
 pub fn default_request_result<O>(state: RequestState, res: IResult<&[u8], O>) -> (BufferMove, RequestState) {
@@ -1181,6 +1228,8 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
         IResult::Done(i, header) => {
           if header.should_delete(&conn) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
+          } else if header.must_mutate() {
+            (BufferMove::Multiple(header.mutate_and_advance(buf.offset(i))), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
           }
@@ -1193,6 +1242,8 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
         IResult::Done(i, header) => {
           if header.should_delete(&conn) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
+          } else if header.must_mutate() {
+            (BufferMove::Multiple(header.mutate_and_advance(buf.offset(i))), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
           }
@@ -1216,6 +1267,8 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
         IResult::Done(i, header) => {
           if header.should_delete(&conn) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
+          } else if header.must_mutate() {
+            (BufferMove::Multiple(header.mutate_and_advance(buf.offset(i))), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
           }
@@ -1518,6 +1571,24 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
           buf.delete_output(length);
         }
       },
+      BufferMove::Multiple(buffer_moves) => {
+        for buffer_move in buffer_moves {
+          match buffer_move {
+            BufferMove::Advance(length) => {
+              buf.consume_parsed_data(length);
+              buf.slice_output(length);
+            },
+            BufferMove::Delete(length) => {
+              buf.consume_parsed_data(length);
+              buf.delete_output(length);
+            },
+            e => {
+              error!("BufferMove {:?} isn't implemented", e);
+              unimplemented!();
+            }
+          }
+        }
+      }
       _ => break
     }
 
