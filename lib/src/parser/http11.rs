@@ -3,6 +3,7 @@
 
 use sozu_command::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
+use network::protocol::StickySession;
 
 use nom::{HexDisplay,IResult,Offset};
 use nom::IResult::*;
@@ -679,7 +680,7 @@ pub struct Connection {
   pub upgrade:        Option<String>,
   pub to_delete:      HashSet<String>,
   pub continues:      Continue,
-  pub sticky_session: Option<String>,
+  pub sticky_session: Option<u32>,
 }
 
 impl Connection {
@@ -997,6 +998,10 @@ impl HttpState {
     self.request.as_ref().map(|r| r.get_keep_alive()).expect("there should be a request")
   }
 
+  pub fn get_request_sticky_session(&self) -> Option<u32> {
+    self.request.as_ref().and_then(|r| r.get_keep_alive()).and_then(|con| con.sticky_session)
+  }
+
   pub fn must_continue(&self) -> Option<usize> {
     if self.request.as_ref().map(|r| r.get_keep_alive().map(|conn| conn.continues == Continue::Expects).unwrap_or(false)).unwrap_or(false) &&
         self.response.as_ref().map(|r| r.get_status_line().map(|st| st.status == 100).unwrap_or(false)).unwrap_or(false) {
@@ -1171,8 +1176,8 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
       let sticky_session_header = cookies.into_iter().find(|ref cookie| &cookie.name[..] == b"SOZUBALANCEID");
       if let Some(sticky_session) = sticky_session_header {
         let mut st = state;
-        let val = str::from_utf8(sticky_session.name).expect("sticky_session value should be ascii").to_string();
-        st.get_mut_connection().map(|conn| conn.sticky_session = Some(val));
+        let backend_id = u32::from_str_radix(unsafe { str::from_utf8_unchecked(sticky_session.value) }, 10);
+        st.get_mut_connection().map(|conn| conn.sticky_session = backend_id.ok());
 
         return st;
       }
@@ -1607,7 +1612,7 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
 }
 
 #[allow(unused_variables)]
-pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue) -> HttpState {
+pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue, sticky_session: Option<StickySession>) -> HttpState {
   let mut current_state = rs.response.take().expect("the response state should never be None outside of this function");
   let mut header_end    = rs.res_header_end;
   let is_head = rs.request.as_ref().map(|request| request.is_head()).unwrap_or(false);
@@ -1630,11 +1635,16 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
             ResponseState::ResponseWithBodyChunks(_,_,_) => {
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
+              add_sticky_session_to_response(&mut rs, buf, sticky_session);
+
               buf.slice_output(sz);
             },
             ResponseState::ResponseWithBody(_,_,content_length) => {
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
+
+              add_sticky_session_to_response(&mut rs, buf, sticky_session);
+
               buf.slice_output(sz+content_length);
               buf.consume_parsed_data(content_length);
             },
@@ -1657,12 +1667,16 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
               //println!("FOUND HEADER END (delete):{}", buf.start_parsing_position);
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
+              add_sticky_session_to_response(&mut rs, buf, sticky_session);
+
               buf.delete_output(length);
             },
             ResponseState::ResponseWithBody(_,_,content_length) => {
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
               buf.delete_output(length);
+
+              add_sticky_session_to_response(&mut rs, buf, sticky_session);
 
               buf.slice_output(content_length);
               buf.consume_parsed_data(content_length);
@@ -1692,6 +1706,24 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
   rs.res_header_end = header_end;
 
   rs
+}
+
+fn add_sticky_session_to_response(rs: &mut HttpState, buf: &mut BufferQueue, sticky_session: Option<StickySession>) {
+  if let Some(sticky_backend) = sticky_session {
+    // if the client has a sticky session that's different from the current backend
+    // (because the backend can no longer exist)
+    let send_sticky_to_client = rs.request
+      .as_ref()
+      .and_then(|request| request.get_keep_alive())
+      .and_then(|conn| conn.sticky_session)
+      .map(|sticky_client| sticky_client != sticky_backend.backend_id)
+      .unwrap_or(true);
+
+    if send_sticky_to_client {
+      let sticky_cookie = format!("Set-Cookie: SOZUBALANCEID={}; Path=/\r\n", sticky_session.unwrap().backend_id);
+      buf.insert_output(Vec::from(sticky_cookie.as_bytes()));
+    }
+  }
 }
 
 #[cfg(test)]
@@ -2552,7 +2584,7 @@ mod tests {
       buf.write(&input[..78]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_response_until_stop(initial, "", &mut buf);
+      let result = parse_response_until_stop(initial, "", &mut buf, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 81);
       assert_eq!(
@@ -2575,7 +2607,7 @@ mod tests {
       buf.write(&input[81..100]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_response_until_stop(result, "", &mut buf);
+      let result = parse_response_until_stop(result, "", &mut buf, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 110);
       assert_eq!(
@@ -2598,7 +2630,7 @@ mod tests {
       println!("remaining:\n{}", &input[110..].to_hex(16));
       buf.write(&input[110..116]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf);
+      let result = parse_response_until_stop(result, "", &mut buf, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 115);
       assert_eq!(
@@ -2620,7 +2652,7 @@ mod tests {
       //buf.consume(5);
       buf.write(&input[116..]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf);
+      let result = parse_response_until_stop(result, "", &mut buf, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 117);
       assert_eq!(
@@ -2674,7 +2706,7 @@ mod tests {
       buf.write(&input[..74]);
       buf.consume_parsed_data(72);
       //println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(initial, "", &mut buf);
+      let result = parse_response_until_stop(initial, "", &mut buf, None);
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("initial input:\n{}", &input[..72].to_hex(8));
@@ -2700,7 +2732,7 @@ mod tests {
       // we got the chunk header, but not the chunk content
       buf.write(&input[74..77]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf);
+      let result = parse_response_until_stop(result, "", &mut buf, None);
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 81);
       assert_eq!(
@@ -2725,7 +2757,7 @@ mod tests {
       // the external code copied the chunk content directly, starting at next chunk end
       buf.write(&input[81..115]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf);
+      let result = parse_response_until_stop(result, "", &mut buf, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 115);
       assert_eq!(
@@ -2745,7 +2777,7 @@ mod tests {
       );
       buf.write(&input[115..]);
       println!("parsing\n{}", &input[115..].to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf);
+      let result = parse_response_until_stop(result, "", &mut buf, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 117);
       assert_eq!(
@@ -2780,7 +2812,7 @@ mod tests {
 
     let new_header = b"Request-Id: 123456789\r\n";
     initial.added_res_header = String::from("Request-Id: 123456789\r\n");
-    let result = parse_response_until_stop(initial, "", &mut buf);
+    let result = parse_response_until_stop(initial, "", &mut buf, None);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
@@ -2827,7 +2859,7 @@ mod tests {
 
     let new_header = b"Request-Id: 123456789\r\n";
     initial.added_res_header = String::from("Request-Id: 123456789\r\n");
-    let result = parse_response_until_stop(initial, "", &mut buf);
+    let result = parse_response_until_stop(initial, "", &mut buf, None);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
@@ -2886,7 +2918,7 @@ mod tests {
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
-      let result = parse_response_until_stop(initial, "", &mut buf);
+      let result = parse_response_until_stop(initial, "", &mut buf, None);
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);
