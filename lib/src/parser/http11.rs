@@ -7,7 +7,7 @@ use network::buffer_queue::BufferQueue;
 use nom::{HexDisplay,IResult,Offset};
 use nom::IResult::*;
 
-use nom::{digit,is_alphanumeric,is_space};
+use nom::{digit,is_alphanumeric,is_space,space};
 
 use url::Url;
 
@@ -237,6 +237,39 @@ fn is_hostname_char(i: u8) -> bool {
 
 named!(pub hostname_and_port<(&[u8],Option<&[u8]>)>, pair!(take_while!(is_hostname_char), opt!(complete!(preceded!(tag!(":"), digit)))));
 
+#[derive(Debug)]
+pub struct CookieValue<'a> {
+  name: &'a [u8],
+  value: &'a [u8]
+}
+
+pub fn is_cookie_value_char(chr: u8) -> bool {
+  // chars: (space) , ;
+  chr != 32 && chr != 44 && chr != 59
+}
+
+named!(pub single_request_cookie<CookieValue>,
+  do_parse!(
+    opt!(tag!(";")) >>
+    opt!(space) >>
+    name: take_until_and_consume!("=") >>
+    value: take_while!(is_cookie_value_char) >>
+    (CookieValue {
+      name: name,
+      value: value
+    })
+  )
+);
+
+pub fn request_cookies(input: &[u8]) -> Option<Vec<CookieValue>> {
+  let res: IResult<&[u8], Vec<CookieValue>> = many0!(input, single_request_cookie);
+
+  if let IResult::Done(_, o) = res {
+    Some(o)
+  } else {
+    None
+  }
+}
 
 use std::str::{from_utf8, FromStr};
 use nom::{Err,ErrorKind,Needed};
@@ -478,7 +511,13 @@ impl<'a> Header<'a> {
         } else {
           HeaderValue::Error
         }
-      }
+      },
+      b"cookie" => {
+        match request_cookies(self.value) {
+          Some(cookies) => HeaderValue::Cookie(cookies),
+          None          => HeaderValue::Error
+        }
+      },
       /*b"forwarded" => {
         match comma_separated_header_value(self.value) {
           Some(forwarded) => HeaderValue::Forwarded(forwarded),
@@ -544,6 +583,7 @@ pub enum HeaderValue<'a> {
   //FIXME: are the references in Connection still valid after we delete that part of the headers?
   Connection(Vec<&'a [u8]>),
   Upgrade(&'a[u8]),
+  Cookie(Vec<CookieValue<'a>>),
   Other(&'a[u8],&'a[u8]),
   Forwarded,
   ExpectContinue,
@@ -1076,6 +1116,7 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
       st.get_mut_connection().map(|conn| conn.upgrade = Some(str::from_utf8(s).expect("should be ascii").to_string()));
       st
     },
+    HeaderValue::Cookie(cookies) => state,
     HeaderValue::Error       => RequestState::Error(ErrorState::InvalidHttp)
   }
 }
@@ -1276,7 +1317,8 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
     HeaderValue::ExpectContinue => {
       // we should not get that one from the server
       ResponseState::Error(ErrorState::InvalidHttp)
-    }
+    },
+    HeaderValue::Cookie(cookies) => state,
     HeaderValue::Error       => ResponseState::Error(ErrorState::InvalidHttp)
   }
 }
