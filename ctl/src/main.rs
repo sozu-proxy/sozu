@@ -19,6 +19,8 @@ use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 use command::{dump_state,load_state,save_state,soft_stop,hard_stop,upgrade,status,metrics,
   remove_backend, add_backend, remove_frontend, add_frontend, add_certificate, remove_certificate};
 
+use std::str::FromStr;
+
 fn main() {
   let matches = App::new("sozuctl")
                         .version(crate_version!())
@@ -120,6 +122,11 @@ fn main() {
                                                       .long("certificate")
                                                       .value_name("path to a certificate file")
                                                       .takes_value(true)
+                                                      .required(false))
+                                                  .arg(Arg::with_name("sticky_session")
+                                                      .long("sticky session")
+                                                      .value_name("the frontend should do sticky session")
+                                                      .takes_value(true)
                                                       .required(false)))
                                                 .subcommand(SubCommand::with_name("remove")
                                                   .arg(Arg::with_name("id")
@@ -142,6 +149,11 @@ fn main() {
                                                   .arg(Arg::with_name("certificate")
                                                       .long("certificate")
                                                       .value_name("path to a certificate file")
+                                                      .takes_value(true)
+                                                      .required(false))
+                                                  .arg(Arg::with_name("sticky_session")
+                                                      .long("sticky session")
+                                                      .value_name("the frontend should do sticky session")
                                                       .takes_value(true)
                                                       .required(false))))
                         .subcommand(SubCommand::with_name("certificate")
@@ -232,18 +244,20 @@ fn main() {
     ("frontend", Some(sub)) => {
       match sub.subcommand() {
         ("remove", Some(frontend_sub)) => {
-          let id          = frontend_sub.value_of("id").expect("missing id");
-          let hostname    = frontend_sub.value_of("hostname").expect("missing frontend hostname");
-          let path_begin  = frontend_sub.value_of("path_begin").unwrap_or("");
-          let certificate = frontend_sub.value_of("certificate");
-          remove_frontend(&mut channel, id, hostname, path_begin, certificate);
+          let id              = frontend_sub.value_of("id").expect("missing id");
+          let hostname        = frontend_sub.value_of("hostname").expect("missing frontend hostname");
+          let path_begin      = frontend_sub.value_of("path_begin").unwrap_or("");
+          let certificate     = frontend_sub.value_of("certificate");
+          let sticky_session  = frontend_sub.value_of("sticky_session").and_then(|b| bool::from_str(b).ok()).unwrap_or(false);
+          remove_frontend(&mut channel, id, hostname, path_begin, certificate, sticky_session);
         },
         ("add", Some(frontend_sub)) => {
-          let id          = frontend_sub.value_of("id").expect("missing id");
-          let hostname    = frontend_sub.value_of("hostname").expect("missing frontend hostname");
-          let path_begin  = frontend_sub.value_of("path_begin").unwrap_or("");
-          let certificate = frontend_sub.value_of("certificate");
-          add_frontend(&mut channel, id, hostname, path_begin, certificate);
+          let id              = frontend_sub.value_of("id").expect("missing id");
+          let hostname        = frontend_sub.value_of("hostname").expect("missing frontend hostname");
+          let path_begin      = frontend_sub.value_of("path_begin").unwrap_or("");
+          let certificate     = frontend_sub.value_of("certificate");
+          let sticky_session  = frontend_sub.value_of("sticky_session").and_then(|b| bool::from_str(b).ok()).unwrap_or(false);
+          add_frontend(&mut channel, id, hostname, path_begin, certificate, sticky_session);
         }
         _ => println!("unknown backend management command")
       }

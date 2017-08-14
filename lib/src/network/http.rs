@@ -749,7 +749,7 @@ mod tests {
       start(config, channel);
     });
 
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
+    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/"), sticky_session: false };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
@@ -803,7 +803,7 @@ mod tests {
       start(config, channel);
     });
 
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
+    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/"), sticky_session: false };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1028 };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
@@ -897,12 +897,12 @@ mod tests {
 
     let mut fronts = HashMap::new();
     fronts.insert("lolcatho.st".to_owned(), vec![
-      HttpFront { app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1 },
-      HttpFront { app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2 },
-      HttpFront { app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3 }
+      HttpFront { app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1, sticky_session: false },
+      HttpFront { app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2, sticky_session: false },
+      HttpFront { app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3, sticky_session: false }
     ]);
     fronts.insert("other.domain".to_owned(), vec![
-      HttpFront { app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned() },
+      HttpFront { app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(), sticky_session: false },
     ]);
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");

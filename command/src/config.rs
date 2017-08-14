@@ -186,6 +186,7 @@ pub struct AppConfig {
   pub key:               Option<String>,
   pub certificate_chain: Option<String>,
   pub backends:          Vec<String>,
+  pub sticky_session:    Option<bool>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
@@ -236,9 +237,10 @@ impl Config {
 
       //create the front both for HTTP and HTTPS if possible
       let order = Order::AddHttpFront(HttpFront {
-        app_id:     id.to_string(),
-        hostname:   app.hostname.clone(),
-        path_begin: path_begin.clone(),
+        app_id:         id.to_string(),
+        hostname:       app.hostname.clone(),
+        path_begin:     path_begin.clone(),
+        sticky_session: app.sticky_session.unwrap_or(false),
       });
       v.push(ConfigMessage {
         id:       format!("CONFIG-{}", count),
@@ -284,10 +286,11 @@ impl Config {
         });
         count += 1;
         let front_order = Order::AddHttpsFront(HttpsFront {
-          app_id:      id.to_string(),
-          hostname:    app.hostname.clone(),
-          path_begin:  path_begin,
-          fingerprint: fingerprint,
+          app_id:         id.to_string(),
+          hostname:       app.hostname.clone(),
+          path_begin:     path_begin,
+          fingerprint:    fingerprint,
+          sticky_session: app.sticky_session.unwrap_or(false),
         });
         v.push(ConfigMessage {
           id:       format!("CONFIG-{}", count),

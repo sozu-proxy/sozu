@@ -467,7 +467,7 @@ pub fn metrics(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
 }
 
 
-pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<&str>) {
+pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<&str>, sticky_session: bool) {
   if let Some(certificate_path) = certificate {
     match Config::load_file_bytes(certificate_path) {
       Ok(data) => {
@@ -478,7 +478,8 @@ pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, ap
               app_id: String::from(app_id),
               hostname: String::from(hostname),
               path_begin: String::from(path_begin),
-              fingerprint: CertFingerprint(fingerprint)
+              fingerprint: CertFingerprint(fingerprint),
+              sticky_session: sticky_session
             }));
           },
         }
@@ -489,12 +490,13 @@ pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, ap
     order_command(channel, Order::AddHttpFront(HttpFront {
       app_id: String::from(app_id),
       hostname: String::from(hostname),
-      path_begin: String::from(path_begin)
+      path_begin: String::from(path_begin),
+      sticky_session: sticky_session
     }));
   }
 }
 
-pub fn remove_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<&str>) {
+pub fn remove_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<&str>, sticky_session: bool) {
   if let Some(certificate_path) = certificate {
     match Config::load_file_bytes(certificate_path) {
       Ok(data) => {
@@ -505,7 +507,8 @@ pub fn remove_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>,
               app_id: String::from(app_id),
               hostname: String::from(hostname),
               path_begin: String::from(path_begin),
-              fingerprint: CertFingerprint(fingerprint)
+              fingerprint: CertFingerprint(fingerprint),
+              sticky_session: sticky_session
             }));
           },
         }
@@ -516,7 +519,8 @@ pub fn remove_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>,
     order_command(channel, Order::RemoveHttpFront(HttpFront {
       app_id: String::from(app_id),
       hostname: String::from(hostname),
-      path_begin: String::from(path_begin)
+      path_begin: String::from(path_begin),
+      sticky_session: sticky_session
     }));
   }
 }

@@ -2868,6 +2868,7 @@ mod tests {
               upgrade:     Some("WebSocket".to_string()),
               continues:   Continue::None,
               to_delete:   HashSet::new(),
+              sticky_session: None
             },
             String::from("localhost:8888"),
           )),
