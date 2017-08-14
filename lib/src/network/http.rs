@@ -311,7 +311,6 @@ pub struct ServerConfiguration {
 
 impl ServerConfiguration {
   pub fn new(config: HttpProxyConfiguration, event_loop: &mut Poll, start_at:usize) -> io::Result<ServerConfiguration> {
-    count!("pouet", 1);
     let front = config.front;
     match server_bind(&config.front) {
       Ok(sock) => {
