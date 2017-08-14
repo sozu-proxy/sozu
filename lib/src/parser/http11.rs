@@ -568,6 +568,9 @@ impl<'a> Header<'a> {
         Some(tokens) => ! tokens.iter().any(|value| &value.to_ascii_lowercase()[..] == b"upgrade"),
         None         => true
       }
+    } else if &lowercase[..] == b"set-cookie" {
+      let look_for = b"SOZUBALANCEID=";
+      &self.value[0..look_for.len()] == look_for
     } else {
       &lowercase[..] == b"connection" && &self.value.to_ascii_lowercase()[..] != b"upgrade" ||
       &lowercase[..] == b"forwarded"         ||
