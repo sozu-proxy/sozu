@@ -2,6 +2,7 @@ use sozu::channel::Channel;
 use sozu::messages::{Order, Instance, HttpFront, HttpsFront, CertificateAndKey, CertFingerprint, TcpFront};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 use sozu_command::config::Config;
+use sozu_command::config::ConfigUtils;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 
 use std::collections::HashSet;
@@ -539,13 +540,13 @@ pub fn remove_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, 
 }
 
 pub fn add_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, certificate_path: &str, certificate_chain_path: &str, key_path: &str) {
-  match Config::load_file(certificate_path) {
+  match ConfigUtils::load_file(certificate_path) {
     Err(e) => println!("could not load certificate: {:?}", e),
     Ok(certificate) => {
-      match Config::load_file(certificate_chain_path).map(split_certificate_chain) {
+      match ConfigUtils::load_file(certificate_chain_path).map(split_certificate_chain) {
         Err(e) => println!("could not load certificate chain: {:?}", e),
         Ok(certificate_chain) => {
-          match Config::load_file(key_path) {
+          match ConfigUtils::load_file(key_path) {
             Err(e) => println!("could not load key: {:?}", e),
             Ok(key) => {
               order_command(channel, Order::AddCertificate(CertificateAndKey {

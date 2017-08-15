@@ -17,7 +17,7 @@ port = 8125
 [http]
 address = "127.0.0.1"
 max_connections = 500
-port = 8080
+port = 8081
 buffer_size = 16384
 #answer_404 = "./404.html"
 #answer_503 = "./503.html"
@@ -36,15 +36,5 @@ default_app_id = "MyApp"
 
 #answer_404 = "../lib/assets/404.html"
 #answer_503 = "../lib/assets/503.html"
-
-[applications]
-
-[applications.MyApp]
-hostname   = "lolcatho.st"
-#path_begin = "/api" # optional
-certificate = "../lib/assets/certificate.pem" # optional
-key = "../lib/assets/key.pem" # optional
-certificate_chain = "../lib/assets/certificate_chain.pem" # optional
-frontends = ["HTTP", "HTTPS"] # list of proxy tags
-backends  = [ "127.0.0.1:1026" ] # list of IP/port
+apps_dir= "apps.d"
 

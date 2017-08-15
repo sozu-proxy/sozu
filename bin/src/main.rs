@@ -24,7 +24,7 @@ mod logging;
 mod upgrade;
 
 use std::net::{UdpSocket,ToSocketAddrs};
-use std::{mem,env};
+use std::env;
 use sozu::network::metrics::{METRICS,ProxyMetrics};
 use sozu_command::config::Config;
 use clap::{App,Arg,SubCommand};
