@@ -142,6 +142,7 @@ pub enum BackendStatus {
 
 #[derive(Debug,PartialEq,Eq)]
 pub struct Backend {
+  pub id:                 u32,
   pub address:            SocketAddr,
   pub status:             BackendStatus,
   pub active_connections: usize,
@@ -149,8 +150,9 @@ pub struct Backend {
 }
 
 impl Backend {
-  pub fn new(addr: SocketAddr) -> Backend {
+  pub fn new(addr: SocketAddr, id: u32) -> Backend {
     Backend {
+      id:                 id,
       address:            addr,
       status:             BackendStatus::Normal,
       active_connections: 0,

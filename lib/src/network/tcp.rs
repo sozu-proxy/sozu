@@ -14,6 +14,7 @@ use std::error::Error;
 use slab::Slab;
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::borrow::BorrowMut;
 use time::{Duration,precise_time_s};
 use rand::random;
 use uuid::Uuid;
@@ -420,14 +421,15 @@ impl ServerConfiguration {
 
   pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken> {
     if let Some(addrs) = self.instances.get_mut(app_id) {
-      let backend = Backend::new(*instance_address);
+      let id = addrs.last().map(|mut b| (*b.borrow_mut()).id ).unwrap_or(0) + 1;
+      let backend = Backend::new(*instance_address, id);
       if !addrs.contains(&backend) {
         addrs.push(backend);
       }
     }
 
     if self.instances.get(app_id).is_none() {
-      let backend = Backend::new(*instance_address);
+      let backend = Backend::new(*instance_address, 0);
       self.instances.insert(String::from(app_id), vec![backend]);
     }
 

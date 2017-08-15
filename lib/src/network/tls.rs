@@ -682,14 +682,15 @@ impl ServerConfiguration {
 
   pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
     if let Some(addrs) = self.instances.get_mut(app_id) {
-      let backend = Rc::new(RefCell::new(Backend::new(*instance_address)));
+      let id = addrs.last().map(|b| (*b.borrow_mut()).id ).unwrap_or(0) + 1;
+      let backend = Rc::new(RefCell::new(Backend::new(*instance_address, id)));
       if !addrs.contains(&backend) {
         addrs.push(backend);
       }
     }
 
     if self.instances.get(app_id).is_none() {
-      let backend = Backend::new(*instance_address);
+      let backend = Backend::new(*instance_address, 0);
       self.instances.insert(String::from(app_id), vec![Rc::new(RefCell::new(backend))]);
     }
   }
