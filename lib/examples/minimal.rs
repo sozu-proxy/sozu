@@ -1,5 +1,6 @@
 #![allow(unused_variables,unused_must_use)]
 #[macro_use] extern crate sozu_lib as sozu;
+extern crate sozu_command_lib as sozu_command;
 extern crate openssl;
 extern crate mio;
 extern crate mio_uds;
@@ -9,8 +10,8 @@ use std::env;
 use std::thread;
 use std::io::stdout;
 use sozu::network;
-use sozu::messages;
-use sozu::channel::Channel;
+use sozu_command::messages;
+use sozu_command::channel::Channel;
 use sozu::logging::{Logger,LoggerBackend};
 
 fn main() {

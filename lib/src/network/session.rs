@@ -20,11 +20,12 @@ use time::precise_time_ns;
 use std::time::Duration;
 use rand::random;
 
+use sozu_command::channel::Channel;
+use sozu_command::messages::{self,TcpFront,Order,Instance,MessageId,OrderMessage,
+  OrderMessageAnswer,OrderMessageStatus};
+
 use network::{ClientResult,ConnectionError,
   SocketType,Protocol,RequiredEvents};
-use messages::{self,TcpFront,Order,Instance,MessageId,OrderMessage,
-  OrderMessageAnswer,OrderMessageStatus};
-use channel::Channel;
 
 const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;

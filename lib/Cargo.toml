@@ -36,6 +36,7 @@ pool = "^0.1"
 hex  = "^0.2"
 openssl = {version="^0.9.5", features= ["v102"]}
 openssl-sys = "^0.9.5"
+sozu-command-lib = { version = "^0.2", path = "../command" }
 
 [dev-dependencies]
 tiny_http = "^0.4"

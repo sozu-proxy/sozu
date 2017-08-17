@@ -9,8 +9,8 @@ use std::net::SocketAddr;
 use mio::net::UdpSocket;
 use std::io::{self,Write,Error,ErrorKind};
 use nom::HexDisplay;
-
-use network::buffer::Buffer;
+use sozu_command::buffer::Buffer;
+use sozu_command::messages::FilteredData;
 
 thread_local! {
   pub static METRICS: RefCell<ProxyMetrics> = RefCell::new(ProxyMetrics::new(String::from("sozu")))
@@ -21,14 +21,6 @@ pub enum MetricData {
   Gauge(usize),
   Count(i64),
   Time(Instant, Option<Instant>),
-}
-
-#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum FilteredData {
-  Gauge(usize),
-  Count(i64),
-  Time(usize),
 }
 
 #[derive(Debug,Clone)]

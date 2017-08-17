@@ -11,12 +11,12 @@ use std::collections::{HashMap,HashSet,VecDeque};
 use std::time::Duration;
 use libc::{pid_t,kill};
 
-use sozu::messages::{Order,OrderMessage,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus};
-use sozu::channel::Channel;
 use sozu::network::metrics::METRICS;
+use sozu_command::config::Config;
+use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::data::{AnswerData,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
-use sozu_command::config::Config;
+use sozu_command::messages::{Order,OrderMessage,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus};
 
 pub mod orders;
 pub mod client;

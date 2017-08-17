@@ -13,13 +13,13 @@ use nix;
 use nix::unistd::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 
-use sozu::channel::Channel;
-use sozu::network::proxy::Server;
+use sozu_command::config::Config;
+use sozu_command::channel::Channel;
 use sozu::network::session::Session;
-use sozu::messages::{OrderMessage,OrderMessageAnswer};
+use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
 use sozu::network::metrics::{METRICS,ProxyMetrics};
 use sozu::network::{http,tls};
-use sozu_command::config::Config;
+use sozu::network::proxy::Server;
 
 use logging;
 use command::Worker;

@@ -8,11 +8,11 @@ use std::os::unix::io::{AsRawFd,FromRawFd};
 use nix::unistd::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 
-use sozu::channel::Channel;
-use sozu::messages::{Order,OrderMessage};
 use sozu_command::config::Config;
-use sozu_command::state::ConfigState;
 use sozu_command::data::RunState;
+use sozu_command::channel::Channel;
+use sozu_command::state::ConfigState;
+use sozu_command::messages::{Order,OrderMessage};
 
 use logging;
 use command::{CommandServer,Worker};

@@ -96,14 +96,15 @@
 //! #[macro_use] extern crate log;
 //! extern crate env_logger;
 //! extern crate sozu_lib as sozu;
+//! extern crate sozu_command_lib as sozu_command;
 //! extern crate openssl;
 //! extern crate mio;
 //!
 //! use std::thread;
 //! use std::sync::mpsc;
-//! use sozu::messages;
+//! use sozu_command::messages;
+//! use sozu_command::channel::Channel;
 //! use sozu::network;
-//! use sozu::channel::Channel;
 //!
 //! fn main() {
 //!   env_logger::init().unwrap();
@@ -169,10 +170,9 @@ extern crate net2;
 extern crate libc;
 extern crate slab;
 extern crate mio_uds;
+extern crate sozu_command_lib as sozu_command;
 
 #[macro_use] pub mod util;
 #[macro_use] pub mod logging;
 #[macro_use] pub mod network;
 pub mod parser;
-pub mod messages;
-pub mod channel;

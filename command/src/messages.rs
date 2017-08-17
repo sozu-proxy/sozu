@@ -10,8 +10,6 @@ use std::default::Default;
 use std::convert::From;
 use std::fmt;
 
-use network::metrics::FilteredData;
-
 pub type MessageId = String;
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
@@ -39,6 +37,14 @@ pub enum OrderMessageStatus {
 pub enum OrderMessageAnswerData {
   //placeholder for now
   Metrics(BTreeMap<String,FilteredData>)
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FilteredData {
+  Gauge(usize),
+  Count(i64),
+  Time(usize),
 }
 
 #[derive(Debug,Clone,Serialize,Deserialize)]
@@ -237,8 +243,8 @@ impl Default for HttpsProxyConfiguration {
       default_name:        Some(String::from("lolcatho.st")),
       default_app_id:      None,
 
-      default_certificate: Some(Vec::from(&include_bytes!("../assets/certificate.pem")[..])),
-      default_key:         Some(Vec::from(&include_bytes!("../assets/key.pem")[..])),
+      default_certificate: Some(Vec::from(&include_bytes!("../../lib/assets/certificate.pem")[..])),
+      default_key:         Some(Vec::from(&include_bytes!("../../lib/assets/key.pem")[..])),
       default_certificate_chain: None,
     }
   }

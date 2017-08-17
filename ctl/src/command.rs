@@ -1,8 +1,8 @@
-use sozu::channel::Channel;
-use sozu::messages::{Order, Instance, HttpFront, HttpsFront, CertificateAndKey, CertFingerprint, TcpFront};
-use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 use sozu_command::config::Config;
+use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
+use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
+use sozu_command::messages::{Order, Instance, HttpFront, HttpsFront, CertificateAndKey, CertFingerprint, TcpFront};
 
 use std::collections::HashSet;
 use rand::{thread_rng, Rng};

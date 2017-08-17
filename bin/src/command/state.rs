@@ -1,7 +1,7 @@
 use mio::{Ready,Token};
 use std::collections::{HashMap,HashSet};
 
-use sozu::messages::Order;
+use sozu_command::messages::Order;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 use command::FrontToken;
 

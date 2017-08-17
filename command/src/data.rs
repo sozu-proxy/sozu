@@ -4,8 +4,7 @@ use serde_json;
 use std::fmt;
 use std::collections::BTreeMap;
 
-use sozu::messages::Order;
-use sozu::network::metrics::FilteredData;
+use messages::{FilteredData,Order};
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
@@ -287,7 +286,7 @@ mod tests {
   use serde_json;
   use hex::FromHex;
   use certificate::split_certificate_chain;
-  use sozu::messages::{CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Instance};
+  use messages::{CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Instance};
 
   #[test]
   fn config_message_test() {

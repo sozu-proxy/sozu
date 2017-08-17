@@ -5,16 +5,15 @@ extern crate nix;
 extern crate libc;
 extern crate time;
 extern crate rand;
-extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
 
 mod command;
 
 use mio_uds::UnixStream;
 use clap::{App,Arg,SubCommand};
-use sozu::channel::Channel;
 
 use sozu_command::config::Config;
+use sozu_command::channel::Channel;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 
 use command::{dump_state,load_state,save_state,soft_stop,hard_stop,upgrade,status,metrics,

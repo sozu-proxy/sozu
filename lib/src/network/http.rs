@@ -16,14 +16,15 @@ use uuid::Uuid;
 use nom::{HexDisplay,IResult};
 use rand::random;
 
+use sozu_command::channel::Channel;
+use sozu_command::messages::{self,Order,HttpFront,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
+
 use network::{Backend,ClientResult,ConnectionError,RequiredEvents,Protocol};
 use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
 use network::socket::{SocketHandler,SocketResult,server_bind};
-use messages::{self,Order,HttpFront,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
-use channel::Channel;
 use parser::http11::hostname_and_port;
 use util::UnwrapLog;
 
@@ -725,7 +726,7 @@ mod tests {
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
-  use messages::{Order,HttpFront,Instance,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer};
+  use sozu_command::messages::{Order,HttpFront,Instance,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer};
   use network::buffer_queue::BufferQueue;
   use pool::Pool;
 

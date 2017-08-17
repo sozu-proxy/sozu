@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use nom::IResult;
 use serde_json::from_str;
 
-use sozu::channel::Channel;
+use sozu_command::channel::Channel;
 
 use super::{ConfigMessage,ConfigMessageAnswer};
 

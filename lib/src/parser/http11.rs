@@ -1,7 +1,7 @@
 #![allow(unused_imports)]
 #![allow(dead_code)]
 
-use network::buffer::Buffer;
+use sozu_command::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 
 use nom::{HexDisplay,IResult,Offset};
@@ -1560,7 +1560,7 @@ mod tests {
   use super::*;
   use nom::IResult::*;
   use nom::HexDisplay;
-  use network::buffer::Buffer;
+  use sozu_command::buffer::Buffer;
   use network::buffer_queue::{BufferQueue,OutputElement};
   use std::str;
   use std::io::Write;

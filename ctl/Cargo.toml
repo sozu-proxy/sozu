@@ -18,7 +18,6 @@ nix     = "^0.8"
 mio     = "^0.6"
 mio-uds = "^0.6"
 rand    = "^0.3"
-sozu-lib = { version = "^0.2", path = "../lib" }
 sozu-command-lib = { version = "^0.2", path = "../command" }
 
 [features]

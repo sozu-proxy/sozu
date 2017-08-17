@@ -17,11 +17,11 @@ use mio::timer;
 use mio::{Poll,PollOpt,Ready,Token};
 use nom::{HexDisplay,IResult,Offset};
 
-use sozu::messages::{Order,OrderMessage};
-use sozu::channel::Channel;
-use sozu::network::buffer::Buffer;
-use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
+use sozu_command::buffer::Buffer;
+use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
+use sozu_command::messages::{Order,OrderMessage};
+use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 
 use super::{CommandServer,FrontToken,ProxyConfiguration,Worker};
 use super::client::parse;

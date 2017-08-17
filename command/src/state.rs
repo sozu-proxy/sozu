@@ -3,7 +3,7 @@ use std::collections::{HashMap,HashSet};
 use std::iter::FromIterator;
 use certificate::calculate_fingerprint;
 
-use sozu::messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,Instance};
+use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,Instance};
 
 pub type AppId = String;
 
@@ -275,7 +275,7 @@ impl ConfigState {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use sozu::messages::{Order,HttpFront,Instance};
+  use messages::{Order,HttpFront,Instance};
 
   #[test]
   fn serialize() {

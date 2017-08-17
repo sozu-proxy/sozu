@@ -1,4 +1,4 @@
-use network::buffer::Buffer;
+use sozu_command::buffer::Buffer;
 use pool::Reset;
 use nom::HexDisplay;
 use std::io::{self,Write};
@@ -418,7 +418,7 @@ impl Reset for BufferQueue {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use network::buffer::Buffer;
+  use sozu_command::buffer::Buffer;
   use nom::HexDisplay;
   use std::io::Write;
 

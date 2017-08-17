@@ -4,7 +4,6 @@ use mio;
 use std::fmt;
 use std::net::SocketAddr;
 
-pub mod buffer;
 pub mod buffer_queue;
 #[macro_use] pub mod metrics;
 pub mod socket;

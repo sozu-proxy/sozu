@@ -28,22 +28,23 @@ use openssl::nid;
 use openssl::error::ErrorStack;
 use nom::IResult;
 
+use sozu_command::buffer::Buffer;
+use sozu_command::channel::Channel;
+use sozu_command::messages::{self,CertFingerprint,CertificateAndKey,Order,HttpsFront,HttpsProxyConfiguration,OrderMessage,
+  OrderMessageAnswer,OrderMessageStatus};
+
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
-use network::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::{Backend,ClientResult,ConnectionError,Protocol};
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,
   Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
-use messages::{self,CertFingerprint,CertificateAndKey,Order,HttpsFront,HttpsProxyConfiguration,OrderMessage,
-  OrderMessageAnswer,OrderMessageStatus};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
 use util::UnwrapLog;
 
-use channel::Channel;
 
 type BackendToken = Token;
 
@@ -1083,14 +1084,13 @@ mod tests {
   use std::rc::{Rc,Weak};
   use std::sync::{Arc,Mutex};
   use std::cell::RefCell;
-  use messages::{Order,HttpsFront,Instance};
   use slab::Slab;
   use pool::Pool;
-  use network::buffer::Buffer;
+  use sozu_command::buffer::Buffer;
   use network::buffer_queue::BufferQueue;
   use network::http::DefaultAnswers;
   use network::trie::TrieNode;
-  use messages::{OrderMessage,OrderMessageAnswer};
+  use sozu_command::messages::{Order,HttpsFront,Instance,OrderMessage,OrderMessageAnswer};
   use openssl::ssl::{SslContext, SslMethod, Ssl, SslStream};
   use openssl::x509::X509;
 
