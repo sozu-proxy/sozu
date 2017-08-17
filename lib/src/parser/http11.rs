@@ -7,7 +7,7 @@ use network::buffer_queue::BufferQueue;
 use nom::{HexDisplay,IResult,Offset};
 use nom::IResult::*;
 
-use nom::{digit,is_alphanumeric};
+use nom::{digit,is_alphanumeric,is_space};
 
 use url::Url;
 
@@ -196,7 +196,7 @@ named!(pub message_header<Header>,
        chain!(
          name: token ~
          tag!(":")   ~
-         opt!(sp)    ~
+         opt!(take_while!(is_space))    ~
          value: take_while!(is_header_value_char) ~ // ToDo handle folding?
          crlf, || {
            Header {
