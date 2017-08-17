@@ -241,7 +241,18 @@ named!(pub hostname_and_port<(&[u8],Option<&[u8]>)>, pair!(take_while!(is_hostna
 #[derive(Debug)]
 pub struct CookieValue<'a> {
   name: &'a [u8],
-  value: &'a [u8]
+  value: &'a [u8],
+  semicolon: Option<&'a [u8]>,
+  spaces: Option<&'a [u8]>
+}
+
+impl<'a> CookieValue<'a> {
+  pub fn get_full_length(&self) -> usize {
+    let semicolon = if self.semicolon.is_some() { 1 } else { 0 };
+    let space = self.spaces.map(|sp| sp.len()).unwrap_or(0);
+
+    self.name.len() + self.value.len() + semicolon + space + 1 // +1 is for =
+  }
 }
 
 pub fn is_cookie_value_char(chr: u8) -> bool {
@@ -251,13 +262,15 @@ pub fn is_cookie_value_char(chr: u8) -> bool {
 
 named!(pub single_request_cookie<CookieValue>,
   do_parse!(
-    opt!(tag!(";")) >>
-    opt!(space) >>
     name: take_until_and_consume!("=") >>
     value: take_while!(is_cookie_value_char) >>
+    semicolon: opt!(complete!(tag!(";"))) >>
+    spaces: opt!(complete!(take_while!(is_space))) >>
     (CookieValue {
       name: name,
-      value: value
+      value: value,
+      semicolon: semicolon,
+      spaces: spaces
     })
   )
 );
@@ -271,14 +284,6 @@ pub fn request_cookies(input: &[u8]) -> Option<Vec<CookieValue>> {
     None
   }
 }
-
-named!(parse_sticky_session_header<(&[u8], (&[u8], Option<&[u8]>))>,
-  do_parse!(
-    before: take_until!("SOZUBALANCEID=") >>
-    cookie: pair!(take_while!(is_cookie_value_char), opt!(tag!(" "))) >>
-    (before, cookie)
-  )
-);
 
 use std::str::{from_utf8, FromStr};
 use nom::{Err,ErrorKind,Needed};
@@ -590,33 +595,75 @@ impl<'a> Header<'a> {
     }
   }
 
-  pub fn mutate_and_advance(&self, offset: usize) -> Vec<BufferMove> {
-    let value_length = self.value.len();
-    let res = parse_sticky_session_header(self.value);
-
-    match res {
-      IResult::Done(_, (before, (cookie, extra_space))) => {
-        let extra_space_len = if extra_space.is_some() { 1 } else { 0 };
-        // header_length is the header size: Cookie:(space), -2 is to count \n\n
-        let header_length = offset - value_length - 2;
-        // here we add header_length to the number of matched bytes before the searched cookie
-        let start = header_length + before.len();
-        // here we calculate how much we have to drop
-        let drop = cookie.len() + extra_space_len;
-        // we do the diff between the first Advance and the Drop, to know how much it remains
-        let end = offset - (start + drop);
-        vec![
-          BufferMove::Advance(start),
-          BufferMove::Delete(drop),
-          BufferMove::Advance(end)
-        ]
-      },
-      IResult::Incomplete(needed) => {
-        error!("header.mutate_and_advance: incomplete data to parse sticky session cookie");
-        Vec::new()
-      },
-      IResult::Error(e) => vec![BufferMove::Advance(offset)] // Can't be found
+  pub fn mutate_header(&self, buf: &[u8], offset: usize) -> Vec<BufferMove> {
+    match &self.name.to_ascii_lowercase()[..] {
+      b"cookie" => self.remove_sticky_cookie_in_request(buf, offset),
+      _ => vec![BufferMove::Advance(offset)]
     }
+  }
+
+  pub fn remove_sticky_cookie_in_request(&self, buf: &[u8], offset: usize) -> Vec<BufferMove> {
+    if let Some(cookies) = request_cookies(self.value) {
+      // if we don't find the cookie, don't go further
+      if let Some(sozu_balance_position) = cookies.iter().position(|cookie| &cookie.name[..] == b"SOZUBALANCEID") {
+        // If we have only one cookie and that's the one, then we drop the whole header
+        if cookies.len() == 1 {
+          return vec![BufferMove::Delete(offset)];
+        }
+        // we want to advance the buffer for the header's name
+        // +1 is to count ":"
+        let header_length = self.name.len() + 1;
+        // we calculate how much chars there is between the : and the first cookie
+        let length_until_value = match take_while!(&buf[header_length..buf.len()], is_space) {
+          IResult::Done(_, spaces) => spaces,
+          IResult::Incomplete(_) | IResult::Error(_) => {
+            // if there is not enough data or an error, we completely remove the header.
+            return vec![BufferMove::Advance(offset)];
+          }
+        };
+
+        // Our iterator over the cookies
+        let mut iter = cookies.iter();
+        // Our return value
+        let mut moves = Vec::new();
+        // The current number of cookie parsed
+        let mut current_cookie = 1;
+        // If the cookie SOZUBALANCEID is the last of the cookie chain
+        let sozu_balance_is_last = if (sozu_balance_position + 1) == cookies.len() { true } else { false };
+
+        moves.push(BufferMove::Advance(header_length + length_until_value.len()));
+
+        loop {
+          match iter.next() {
+            Some(cookie) => {
+              if &cookie.name[..] == b"SOZUBALANCEID" {
+                moves.push(BufferMove::Delete(cookie.get_full_length()));
+              } else if sozu_balance_is_last {
+                // if sozublanceid is the last element, we want to delete the "; " chars from
+                // the before last cookie
+                let next = current_cookie + 1;
+                let cookie_length = cookie.get_full_length();
+                if next == sozu_balance_position {
+                  moves.push(BufferMove::Advance(cookie_length - 2));
+                } else {
+                  moves.push(BufferMove::Advance(cookie_length));
+                }
+              } else {
+                moves.push(BufferMove::Advance(cookie.get_full_length()));
+              }
+            },
+            None => {
+              moves.push(BufferMove::Advance(2)); // advance of 2 for the header's \r\n
+              return moves;
+            }
+          }
+
+          current_cookie += 1;
+        }
+      }
+    }
+
+    vec![BufferMove::Advance(offset)]
   }
 }
 
@@ -1237,7 +1284,7 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
           if header.should_delete(&conn) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
           } else if header.must_mutate() {
-            (BufferMove::Multiple(header.mutate_and_advance(buf.offset(i))), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
+            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i))), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
           }
@@ -1251,7 +1298,7 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
           if header.should_delete(&conn) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
           } else if header.must_mutate() {
-            (BufferMove::Multiple(header.mutate_and_advance(buf.offset(i))), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
+            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i))), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
           }
@@ -1276,7 +1323,7 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
           if header.should_delete(&conn) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
           } else if header.must_mutate() {
-            (BufferMove::Multiple(header.mutate_and_advance(buf.offset(i))), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
+            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i))), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
           }
