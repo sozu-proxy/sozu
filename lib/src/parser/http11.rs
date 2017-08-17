@@ -9,6 +9,8 @@ use nom::IResult::*;
 
 use nom::{digit,is_alphanumeric};
 
+use url::Url;
+
 use std::str;
 use std::cmp::min;
 use std::convert::From;
@@ -560,7 +562,7 @@ pub type Host = String;
 pub enum ErrorState {
   InvalidHttp,
   MissingHost,
-  TooMuchDataCopied
+  TooMuchDataCopied,
 }
 
 #[derive(Debug,Clone,PartialEq)]
@@ -1092,15 +1094,25 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
       match request_line(buf) {
         IResult::Done(i, r)    => {
           if let Some(rl) = RRequestLine::from_request_line(r) {
+
             let conn = Connection::new();
-            /*let conn = if rl.version == "11" {
-              Connection::keep_alive()
+            //FIXME: what if it's not absolute path or complete URL, but an authority with CONNECT?
+            if rl.uri.len() > 0 && rl.uri.as_bytes()[0] != '/' as u8 {
+              if let Some(host) = Url::parse(&rl.uri).ok().and_then(|u| u.host_str().map(|s| s.to_string())) {
+                (BufferMove::Advance(buf.offset(i)), RequestState::HasHost(rl, conn, host))
+              } else {
+                (BufferMove::None, RequestState::Error(ErrorState::InvalidHttp))
+              }
             } else {
-              Connection::close()
-            };
-            */
-            let s = (BufferMove::Advance(buf.offset(i)), RequestState::HasRequestLine(rl, conn));
-            s
+              /*let conn = if rl.version == "11" {
+                Connection::keep_alive()
+              } else {
+                Connection::close()
+              };
+              */
+              let s = (BufferMove::Advance(buf.offset(i)), RequestState::HasRequestLine(rl, conn));
+              s
+            }
           } else {
             (BufferMove::None, RequestState::Error(ErrorState::InvalidHttp))
           }
@@ -1687,6 +1699,84 @@ mod tests {
           name: b"User-Agent",
           value: b"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:44.0) Gecko/20100101 Firefox/44.0"
         })
+      );
+  }
+
+  #[test]
+  fn parse_state_host_in_url_test() {
+      let input =
+          b"GET http://example.com:8888/index.html HTTP/1.1\r\n\
+            User-Agent: curl/7.43.0\r\n\
+            Accept: */*\r\n\
+            Content-Length: 200\r\n\
+            \r\n";
+      let initial = HttpState::new();
+      let mut buf = BufferQueue::with_capacity(2048);
+      buf.write(&input[..]);
+      println!("buffer input: {:?}", buf.input_queue);
+
+      //let result = parse_request(initial, input);
+      let result = parse_request_until_stop(initial, "", &mut buf);
+      println!("result: {:?}", result);
+      println!("input length: {}", input.len());
+      println!("buffer input: {:?}", buf.input_queue);
+      println!("buffer output: {:?}", buf.output_queue);
+      assert_eq!(buf.output_queue, vec!(
+        OutputElement::Slice(49), OutputElement::Slice(25),
+        OutputElement::Slice(13), OutputElement::Slice(21),
+        OutputElement::Insert(vec!()), OutputElement::Slice(202)));
+      assert_eq!(buf.start_parsing_position, 310);
+      assert_eq!(
+        result,
+        HttpState {
+          req_header_end: Some(110),
+          res_header_end: None,
+          request: Some(RequestState::RequestWithBody(
+            RRequestLine { method: String::from("GET"), uri: String::from("http://example.com:8888/index.html"), version: String::from("11") },
+            Connection::new(),
+            String::from("example.com"),
+            200
+          )),
+          response: Some(ResponseState::Initial),
+          added_req_header: String::from(""),
+          added_res_header: String::from(""),
+        }
+      );
+  }
+
+  #[test]
+  fn parse_state_host_in_url_conflict_test() {
+      let input =
+          b"GET http://example.com:8888/index.html HTTP/1.1\r\n\
+            Host: test.org\r\n\
+            User-Agent: curl/7.43.0\r\n\
+            Accept: */*\r\n\
+            Content-Length: 200\r\n\
+            \r\n";
+      let initial = HttpState::new();
+      let mut buf = BufferQueue::with_capacity(2048);
+      buf.write(&input[..]);
+      println!("buffer input: {:?}", buf.input_queue);
+
+      //let result = parse_request(initial, input);
+      let result = parse_request_until_stop(initial, "", &mut buf);
+      println!("result: {:?}", result);
+      println!("input length: {}", input.len());
+      println!("buffer input: {:?}", buf.input_queue);
+      println!("buffer output: {:?}", buf.output_queue);
+      assert_eq!(buf.output_queue, vec!(
+        OutputElement::Slice(49), OutputElement::Slice(16)));
+      assert_eq!(buf.start_parsing_position, 65);
+      assert_eq!(
+        result,
+        HttpState {
+          req_header_end: None,
+          res_header_end: None,
+          request: Some(RequestState::Error(ErrorState::InvalidHttp)),
+          response: Some(ResponseState::Initial),
+          added_req_header: String::from(""),
+          added_res_header: String::from(""),
+        }
       );
   }
 

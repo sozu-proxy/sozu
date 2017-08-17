@@ -159,6 +159,7 @@ extern crate test;
 #[macro_use] extern crate serde_derive;
 extern crate mio;
 extern crate hex;
+extern crate url;
 extern crate time;
 extern crate serde;
 extern crate serde_json;
