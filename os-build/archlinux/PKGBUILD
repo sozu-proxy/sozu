@@ -1,0 +1,63 @@
+# Maintainer: Jan-Erik Rediger <badboy at archlinux dot us>
+
+pkgname=sozu-git
+pkgver=0.1.1.r169.g0935643
+pkgrel=1
+pkgdesc="HTTP reverse proxy, configurable at runtime, fast and safe, built in Rust"
+arch=('i686' 'x86_64')
+url="https://github.com/sozu-proxy/sozu"
+license=('GPL')
+depends=('openssl>=1.0.1')
+makedepends=('cargo')
+backup=('etc/sozu/config.toml')
+source=(
+  'git://github.com/sozu-proxy/sozu'
+  'config.toml'
+  'sozu.service'
+)
+sha1sums=(
+  'SKIP'
+  'fdd860bf0ae5328eccd4665ecaebb46a096d163c'
+  '63fba328c23712d3b83e36187d3016382c3c3a73'
+)
+
+_gitname='sozu'
+
+pkgver() {
+  cd "$srcdir/$_gitname"
+  git describe --tags | sed 's/\([^-]*-g\)/r\1/;s/-/./g'
+}
+
+build() {
+  cd "$srcdir/$_gitname"
+
+  cargo build --release --all
+}
+
+package() {
+  cd "$srcdir/$_gitname"
+
+  install -Dm755 "target/release/sozu" "$pkgdir/usr/bin/sozu"
+  install -Dm755 "target/release/sozuctl" "$pkgdir/usr/bin/sozuctl"
+
+  install -d "$pkgdir/var/lib/sozu"
+
+  install -d "$pkgdir/etc/sozu"
+  install -d "$pkgdir/etc/sozu/ssl"
+  install -d "$pkgdir/etc/sozu/html"
+
+  install -Dm644 "$srcdir/config.toml" "$pkgdir/etc/sozu/config.toml"
+  for file in certificate.pem key.pem certificate_chain.pem; do
+    install -Dm644 "lib/assets/$file" "$pkgdir/etc/sozu/ssl/$file"
+  done
+  for file in 404.html 503.html; do
+    install -Dm644 "lib/assets/$file" "$pkgdir/etc/sozu/html/$file"
+  done
+
+  install -Dm644 "README.md" "$pkgdir/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/${pkgname}/LICENSE-MIT"
+
+  install -Dm644 ../sozu.service "$pkgdir"/usr/lib/systemd/system/sozu.service
+}
+
+# vim:set ts=2 sw=2 sts=2 et:
