@@ -73,9 +73,10 @@ pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
   command.set_nonblocking(true);
   let command: Channel<OrderMessageAnswer,OrderMessage> = command.into();
 
-
-  metrics_set_up!(&proxy_config.metrics.address[..], proxy_config.metrics.port);
-  gauge!("sozu.TEST", 42);
+  if let Some(ref metrics) = proxy_config.metrics.as_ref() {
+    metrics_set_up!(&metrics.address[..], metrics.port);
+    gauge!("sozu.TEST", 42);
+  }
 
   let mut event_loop  = Poll::new().expect("could not create event loop");
 
