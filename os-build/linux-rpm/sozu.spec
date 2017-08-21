@@ -4,21 +4,25 @@ Summary:	A runtime-configurable HTTP/S reverse proxy.
 Name:		sozu
 Version:	0.1.1
 Release:	1%{?dist}
-Epoch:		1
 License:	AGPL-3.0
 Group:		System Environment/Daemons
 URL:		https://github.com/sozu-proxy/sozu
 
 Source0:	https://github.com/sozu-proxy/sozu/archive/%{version}.tar.gz
 
+ExclusiveArch:  %{rust_arches}
+
 Requires:	openssl >= 1.0.1
 
+%if 0%{?fedora}
+# We have OpenSSL 1.1 in Fedora 26 and higher. This is just a compatibility library.
+BuildRequires:  compat-openssl10-devel
+%else
 BuildRequires:	openssl-devel >= 1.0.1
+%endif
 BuildRequires:	m4
 BuildRequires:	selinux-policy-devel
-# BuildRequires: 	rust
-BuildRoot:	%{_tmppath}/%{name}-%{version}-%{release}-root
-
+BuildRequires:  rust-packaging
 
 %description
 %{summary}
@@ -38,8 +42,6 @@ Requires:	sozu
 cargo build --release --all
 
 %install
-rm -rf %{buildroot}
-
 #service config file
 mkdir -p %{buildroot}%{_sysconfdir}/%{name}/
 #cp -p bin/config.toml %{buildroot}%{_sysconfdir}/%{name}/%{name}.toml
@@ -76,11 +78,6 @@ bzip2 -z sozu.pp
 
 mkdir -p %{buildroot}%{_datadir}/selinux/packages
 cp -p sozu.pp.bz2 %{buildroot}%{_datadir}/selinux/packages
-
-
-%clean
-rm -rf %{buildroot}
-
 
 %post
 semodule -i %{_datadir}/selinux/packages/sozu.pp.bz2
