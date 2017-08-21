@@ -1,0 +1,50 @@
+# sozu proxy test config file
+
+command_socket = "/var/lib/sozu/sock"
+saved_state    = "/var/lib/sozu/state.json"
+log_level      = "info"
+log_target     = "stdout"
+#log_target     = "udp://127.0.0.1:9876"
+#log_target     = "tcp://127.0.0.1:9876"
+command_buffer_size = 16384
+worker_count = 2
+handle_process_affinity = false
+
+[metrics]
+address = "127.0.0.1"
+port = 8125
+
+[http]
+address = "127.0.0.1"
+max_connections = 500
+port = 8080
+buffer_size = 16384
+answer_404 = "/etc/sozu/html/404.html"
+answer_503 = "/etc/sozu/html/503.html"
+
+[https]
+address = "127.0.0.1"
+max_connections = 500
+port = 8443
+buffer_size = 16384
+default_app_id = "MyApp"
+#tls_versions = ["TLSv1.2"]
+#cipher_list = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256"
+#default_certificate = "../lib/assets/cert_test.pem"
+#default_certificate_chain = "../lib/assets/cert__chain_test.pem"
+#default_key = "../lib/assets/key_test.pem"
+
+#answer_404 = "../lib/assets/404.html"
+#answer_503 = "../lib/assets/503.html"
+
+[applications]
+
+[applications.MyApp]
+hostname   = "lolcatho.st"
+#path_begin = "/api" # optional
+certificate = "/etc/sozu/ssl/certificate.pem" # optional
+key = "/etc/sozu/ssl/key.pem" # optional
+certificate_chain = "/etc/sozu/ssl/certificate_chain.pem" # optional
+frontends = ["HTTP", "TLS"] # list of proxy tags
+backends  = [ "127.0.0.1:1026" ] # list of IP/port
+
