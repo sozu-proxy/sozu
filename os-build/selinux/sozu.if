@@ -1,0 +1,19 @@
+#####################################
+## <summary>
+##     Connect to haproxy over a unix domain
+##     stream socket.
+## </summary>
+## <param name="domain">
+##     <summary>
+##     </summary>
+## </param>
+#
+interface(`stream_connect_sozu',`
+       gen_require(`
+               type sozu_t, sozu_var_run_t;
+       ')
+
+       files_search_pids($1)
+       stream_connect_pattern($1, sozu_var_run_t, sozu_var_run_t, sozu_t)
+')
+
