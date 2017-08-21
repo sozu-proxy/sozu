@@ -392,8 +392,22 @@ impl CommandServer {
 
           if self.clients[conn_token].channel.readiness().is_writable() {
             if let Some(msg) = self.clients[conn_token].queue.pop_front() {
-              if! self.clients[conn_token].channel.write_message(&msg) {
-                self.clients[conn_token].queue.push_front(msg);
+              let write_res = self.clients[conn_token].channel.write_message(&msg);
+              let capacity = self.clients[conn_token].channel.back_buf.capacity();
+              if !write_res {
+                if self.clients[conn_token].channel.back_buf.capacity() == capacity {
+                  //we cannot grow the channel further
+                  error!("cannot write message back to config client: message is larger than max_buffer_size");
+                  self.clients[conn_token].push_message(ConfigMessageAnswer::new(
+                    msg.id,
+                    ConfigMessageStatus::Error,
+                    "cannot write message back to config client because message is larger than max_buffer_size".to_string(),
+                    None
+                  ));
+
+                } else {
+                  self.clients[conn_token].queue.push_front(msg);
+                }
               }
               self.clients[conn_token].channel.writable();
             }
