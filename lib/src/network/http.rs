@@ -502,7 +502,7 @@ impl ServerConfiguration {
   pub fn backend_from_sticky_session(&mut self, client: &mut Client, app_id: &str, sticky_session: u32) -> Option<Result<TcpStream,ConnectionError>> {
     let max_failures_per_backend = 10;
     if let Some(ref mut app_instances) = self.instances.get_mut(app_id) {
-      let mut sticky_backend: Option<&mut Rc<RefCell<Backend>>> = app_instances.iter_mut().find(|b| {
+      let sticky_backend: Option<&mut Rc<RefCell<Backend>>> = app_instances.iter_mut().find(|b| {
         let backend = &*b.borrow();
         backend.id == sticky_session && backend.can_open(max_failures_per_backend)
       });
@@ -747,8 +747,8 @@ pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel) {
 
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
   if let Ok(configuration) = ServerConfiguration::new(config, &mut event_loop, 1 + max_listeners) {
-    let mut session = Session::new(max_listeners, max_connections, 0, configuration, &mut event_loop);
-    let mut server  = Server::new(event_loop, channel, Some(session), None, None);
+    let session    = Session::new(max_listeners, max_connections, 0, configuration, &mut event_loop);
+    let mut server = Server::new(event_loop, channel, Some(session), None, None);
 
     info!("starting event loop");
     server.run();

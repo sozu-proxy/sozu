@@ -1,7 +1,6 @@
 use mio_uds::UnixStream;
 use mio::Token;
 use libc::{self,pid_t};
-use std::collections::{HashMap,HashSet};
 use std::process::Command;
 use std::os::unix::process::CommandExt;
 use std::os::unix::io::{AsRawFd,FromRawFd};
@@ -12,7 +11,7 @@ use sozu_command::config::Config;
 use sozu_command::data::RunState;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
-use sozu_command::messages::{Order,OrderMessage};
+use sozu_command::messages::OrderMessage;
 
 use logging;
 use command::{CommandServer,Worker};

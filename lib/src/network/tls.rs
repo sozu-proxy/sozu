@@ -814,7 +814,7 @@ impl ServerConfiguration {
   pub fn backend_from_sticky_session(&mut self, client: &mut TlsClient, app_id: &str, sticky_session: u32) -> Option<Result<TcpStream,ConnectionError>> {
     let max_failures_per_backend = 10;
     if let Some(ref mut app_instances) = self.instances.get_mut(app_id) {
-      let mut sticky_backend: Option<&mut Rc<RefCell<Backend>>> = app_instances.iter_mut().find(|b| {
+      let sticky_backend: Option<&mut Rc<RefCell<Backend>>> = app_instances.iter_mut().find(|b| {
         let backend = &*b.borrow();
         backend.id == sticky_session && backend.can_open(max_failures_per_backend)
       });

@@ -1441,7 +1441,7 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
       // we should not get that one from the server
       ResponseState::Error(ErrorState::InvalidHttp)
     },
-    HeaderValue::Cookie(cookies) => state,
+    HeaderValue::Cookie(_)   => state,
     HeaderValue::Error       => ResponseState::Error(ErrorState::InvalidHttp)
   }
 }

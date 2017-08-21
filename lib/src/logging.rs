@@ -299,7 +299,7 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
 
     let mut parts = spec.split('/');
     let mods = parts.next();
-    let filter = parts.next();
+    let _    = parts.next();
     if parts.next().is_some() {
         println!("warning: invalid logging spec '{}', \
                  ignoring it (too many '/'s)", spec);
