@@ -165,6 +165,8 @@ fn set_workers_affinity(_: &Vec<Worker>) {
 
 /// Set a specific process to run onto a specific CPU core
 #[cfg(target_os = "linux")]
+use std::mem;
+#[cfg(target_os = "linux")]
 fn set_process_affinity(pid: pid_t, cpu: usize) {
   unsafe {
     let mut cpu_set: cpu_set_t = mem::zeroed();
