@@ -156,13 +156,9 @@ extern crate test;
 
 #[macro_use] extern crate nom;
 #[macro_use] extern crate lazy_static;
-#[macro_use] extern crate serde_derive;
 extern crate mio;
-extern crate hex;
 extern crate url;
 extern crate time;
-extern crate serde;
-extern crate serde_json;
 extern crate rand;
 extern crate openssl;
 extern crate pool;
