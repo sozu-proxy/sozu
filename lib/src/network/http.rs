@@ -21,7 +21,7 @@ use sozu_command::messages::{self,Order,HttpFront,HttpProxyConfiguration,OrderMe
 
 use network::{Backend,ClientResult,ConnectionError,RequiredEvents,Protocol};
 use network::buffer_queue::BufferQueue;
-use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
+use network::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -52,6 +52,7 @@ pub struct Client {
   back_connected: BackendConnectionStatus,
   protocol:       Option<State>,
   pool:           Weak<RefCell<Pool<BufferQueue>>>,
+  sticky_session: bool,
 }
 
 impl Client {
@@ -77,6 +78,7 @@ impl Client {
         protocol:       Some(State::Http(http)),
         frontend:       sock,
         pool:           pool,
+        sticky_session: false
       };
 
     client
@@ -382,14 +384,15 @@ impl ServerConfiguration {
 
   pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
     if let Some(addrs) = self.instances.get_mut(app_id) {
-      let backend = Rc::new(RefCell::new(Backend::new(*instance_address)));
+      let id = addrs.last().map(|b| (*b.borrow_mut()).id ).unwrap_or(0) + 1;
+      let backend = Rc::new(RefCell::new(Backend::new(*instance_address, id)));
       if !addrs.contains(&backend) {
         addrs.push(backend);
       }
     }
 
     if self.instances.get(app_id).is_none() {
-      let backend = Backend::new(*instance_address);
+      let backend = Backend::new(*instance_address, 0);
       self.instances.insert(String::from(app_id), vec![Rc::new(RefCell::new(backend))]);
     }
   }
@@ -445,7 +448,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_app_id(&mut self, client: &mut Client, app_id: &str) -> Result<TcpStream,ConnectionError> {
+  pub fn backend_from_app_id(&mut self, client: &mut Client, app_id: &str, front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
     // FIXME: the app id clone here is probably very inefficient
     //if let Some(app_id) = self.frontend_from_request(host, uri).map(|ref front| front.http.app_id.clone()) {
     client.http().map(|h| h.app_id = Some(String::from(app_id)));
@@ -482,6 +485,9 @@ impl ServerConfiguration {
           if conn.is_ok() {
             client.back_connected = BackendConnectionStatus::Connecting;
             client.instance = Some(b.clone());
+            if front_should_stick {
+              client.http().map(|mut http| http.sticky_session = Some(StickySession::new(backend.id.clone())));
+            }
           }
 
           conn
@@ -495,6 +501,36 @@ impl ServerConfiguration {
     } else {
       Err(ConnectionError::NoBackendAvailable)
     }
+  }
+
+  pub fn backend_from_sticky_session(&mut self, client: &mut Client, app_id: &str, sticky_session: u32) -> Option<Result<TcpStream,ConnectionError>> {
+    let max_failures_per_backend = 10;
+    if let Some(ref mut app_instances) = self.instances.get_mut(app_id) {
+      let mut sticky_backend: Option<&mut Rc<RefCell<Backend>>> = app_instances.iter_mut().find(|b| {
+        let backend = &*b.borrow();
+        backend.id == sticky_session && backend.can_open(max_failures_per_backend)
+      });
+
+      if let Some(b) = sticky_backend {
+        //FIXME: hardcoded for now, these should come from configuration
+        let ref mut backend = *b.borrow_mut();
+        let conn = backend.try_connect(max_failures_per_backend);
+        info!("{}\tConnecting {} -> {:?} using session {}", client.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
+        if backend.failures >= max_failures_per_backend {
+          error!("{}\tbackend {:?} connections failed {} times, disabling it", client.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), (backend.address, backend.active_connections), backend.failures);
+        }
+        if conn.is_ok() {
+          client.back_connected = BackendConnectionStatus::Connecting;
+          client.instance = Some(b.clone());
+          client.http().map(|mut http| http.sticky_session = Some(StickySession::new(backend.id.clone())));
+        }
+
+        return Some(conn);
+      }
+    }
+
+    debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
+    None
   }
 }
 
@@ -523,9 +559,11 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       return Err(ConnectionError::ToBeDefined);
     };
 
+    let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();
+
     //FIXME: too many unwraps here
     let rl     = try!(client.http().unwrap().state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-    if let Some(app_id) = self.frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
+    if let Some((app_id, front_should_stick)) = self.frontend_from_request(&host, &rl.uri).map(|ref front| { (front.app_id.clone(), front.sticky_session.clone()) }) {
       if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
         //matched on keepalive
         return Ok(BackendConnectAction::Reuse);
@@ -552,7 +590,17 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         sock.shutdown(Shutdown::Both);
       }
 
-      let conn   = self.backend_from_app_id(client, &app_id);
+      let conn = match (front_should_stick, sticky_session) {
+        (true, Some(session)) => {
+          if let Some(conn) = self.backend_from_sticky_session(client, &app_id, session) {
+            conn
+          } else {
+            self.backend_from_app_id(client, &app_id, front_should_stick)
+          }
+        },
+        (_, _) => self.backend_from_app_id(client, &app_id, front_should_stick)
+      };
+
       match conn {
         Ok(socket) => {
           socket.set_nodelay(true);
@@ -748,7 +796,7 @@ mod tests {
       start(config, channel);
     });
 
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
+    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/"), sticky_session: false };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
@@ -802,7 +850,7 @@ mod tests {
       start(config, channel);
     });
 
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
+    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/"), sticky_session: false };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1028 };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
@@ -896,12 +944,12 @@ mod tests {
 
     let mut fronts = HashMap::new();
     fronts.insert("lolcatho.st".to_owned(), vec![
-      HttpFront { app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1 },
-      HttpFront { app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2 },
-      HttpFront { app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3 }
+      HttpFront { app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1, sticky_session: false },
+      HttpFront { app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2, sticky_session: false },
+      HttpFront { app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3, sticky_session: false }
     ]);
     fronts.insert("other.domain".to_owned(), vec![
-      HttpFront { app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned() },
+      HttpFront { app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(), sticky_session: false },
     ]);
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");

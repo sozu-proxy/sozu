@@ -16,6 +16,19 @@ use network::socket::{SocketHandler,SocketResult};
 use network::protocol::ProtocolResult;
 use util::UnwrapLog;
 
+#[derive(Copy, Clone)]
+pub struct StickySession {
+  pub backend_id: u32
+}
+
+impl StickySession {
+  pub fn new(backend_id: u32) -> StickySession {
+    StickySession {
+      backend_id: backend_id
+    }
+  }
+}
+
 type BackendToken = Token;
 
 #[derive(PartialEq)]
@@ -45,6 +58,7 @@ pub struct Http<Front:SocketHandler> {
   pub readiness:      Readiness,
   pub log_ctx:        String,
   pub public_address: Option<IpAddr>,
+  pub sticky_session: Option<StickySession>,
 }
 
 impl<Front:SocketHandler> Http<Front> {
@@ -72,6 +86,7 @@ impl<Front:SocketHandler> Http<Front> {
       readiness:          Readiness::new(),
       log_ctx:            log_ctx,
       public_address:     public_address,
+      sticky_session:     None,
     };
     let req_header = client.added_request_header(public_address);
     let res_header = client.added_response_header();
@@ -707,7 +722,7 @@ impl<Front:SocketHandler> Http<Front> {
       Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
         if ! self.back_buf.needs_input() {
           self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-          &mut self.back_buf));
+          &mut self.back_buf, self.sticky_session.take()));
 
           if unwrap_msg!(self.state.as_ref()).is_back_error() {
             error!("{}\tback socket chunk parse error, closing connection", self.log_ctx);
@@ -726,7 +741,7 @@ impl<Front:SocketHandler> Http<Front> {
       Some(ResponseState::Error(_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
       _ => {
         self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-        &mut self.back_buf));
+        &mut self.back_buf, self.sticky_session.take()));
 
         if unwrap_msg!(self.state.as_ref()).is_back_error() {
           error!("{}\tback socket parse error, closing connection", self.log_ctx);

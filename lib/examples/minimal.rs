@@ -37,7 +37,8 @@ fn main() {
   let http_front = messages::HttpFront {
     app_id:     String::from("test"),
     hostname:   String::from("example.com"),
-    path_begin: String::from("/")
+    path_begin: String::from("/"),
+    sticky_session: false
   };
   let http_instance = messages::Instance {
     app_id:     String::from("test"),

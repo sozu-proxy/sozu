@@ -60,9 +60,10 @@ impl ConfigState {
     match order {
       &Order::AddHttpFront(ref front) => {
         let f = HttpFront {
-          app_id:     front.app_id.clone(),
-          hostname:   front.hostname.clone(),
-          path_begin: front.path_begin.clone(),
+          app_id:         front.app_id.clone(),
+          hostname:       front.hostname.clone(),
+          path_begin:     front.path_begin.clone(),
+          sticky_session: front.sticky_session.clone(),
         };
 
         let front = self.http_fronts.entry(front.app_id.clone()).or_insert(vec!());
@@ -98,10 +99,11 @@ impl ConfigState {
       },
       &Order::AddHttpsFront(ref front) => {
         let f = HttpsFront {
-          app_id:      front.app_id.clone(),
-          hostname:    front.hostname.clone(),
-          path_begin:  front.path_begin.clone(),
-          fingerprint: front.fingerprint.clone(),
+          app_id:         front.app_id.clone(),
+          hostname:       front.hostname.clone(),
+          path_begin:     front.path_begin.clone(),
+          fingerprint:    front.fingerprint.clone(),
+          sticky_session: front.sticky_session.clone(),
         };
         let front = self.https_fronts.entry(front.app_id.clone()).or_insert(vec!());
         if !front.contains(&f) {
@@ -131,9 +133,10 @@ impl ConfigState {
     for (app_id, front_list) in self.http_fronts.iter() {
       for front in front_list {
         v.push(Order::AddHttpFront(HttpFront {
-          app_id:     app_id.clone(),
-          hostname:   front.hostname.clone(),
-          path_begin: front.path_begin.clone(),
+          app_id:         app_id.clone(),
+          hostname:       front.hostname.clone(),
+          path_begin:     front.path_begin.clone(),
+          sticky_session: front.sticky_session.clone(),
         }));
       }
     }
@@ -145,10 +148,11 @@ impl ConfigState {
     for (app_id, front_list) in &self.https_fronts {
       for front in front_list {
         v.push(Order::AddHttpsFront(HttpsFront {
-          app_id:      app_id.clone(),
-          hostname:    front.hostname.clone(),
-          path_begin:  front.path_begin.clone(),
-          fingerprint: front.fingerprint.clone(),
+          app_id:         app_id.clone(),
+          hostname:       front.hostname.clone(),
+          path_begin:     front.path_begin.clone(),
+          fingerprint:    front.fingerprint.clone(),
+          sticky_session: front.sticky_session.clone(),
         }));
       }
     }
@@ -225,18 +229,20 @@ impl ConfigState {
 
     for &(app_id, front) in removed_http_fronts {
      v.push(Order::RemoveHttpFront(HttpFront {
-       app_id:     app_id.clone(),
-       hostname:   front.hostname.clone(),
-       path_begin: front.path_begin.clone(),
+       app_id:         app_id.clone(),
+       hostname:       front.hostname.clone(),
+       path_begin:     front.path_begin.clone(),
+       sticky_session: front.sticky_session.clone(),
       }));
     }
 
     for &(app_id, front) in removed_https_fronts {
      v.push(Order::RemoveHttpsFront(HttpsFront {
-       app_id:      app_id.clone(),
-       hostname:    front.hostname.clone(),
-       path_begin:  front.path_begin.clone(),
-       fingerprint: front.fingerprint.clone(),
+       app_id:         app_id.clone(),
+       hostname:       front.hostname.clone(),
+       path_begin:     front.path_begin.clone(),
+       fingerprint:    front.fingerprint.clone(),
+       sticky_session: front.sticky_session.clone(),
       }));
     }
 
@@ -250,18 +256,20 @@ impl ConfigState {
 
     for &(app_id, front) in added_http_fronts {
       v.push(Order::AddHttpFront(HttpFront {
-        app_id:     app_id.clone(),
-        hostname:   front.hostname.clone(),
-        path_begin: front.path_begin.clone(),
+        app_id:         app_id.clone(),
+        hostname:       front.hostname.clone(),
+        path_begin:     front.path_begin.clone(),
+        sticky_session: front.sticky_session.clone(),
       }));
     }
 
     for &(app_id, front) in added_https_fronts {
       v.push(Order::AddHttpsFront(HttpsFront {
-        app_id:      app_id.clone(),
-        hostname:    front.hostname.clone(),
-        path_begin:  front.path_begin.clone(),
-        fingerprint: front.fingerprint.clone(),
+        app_id:         app_id.clone(),
+        hostname:       front.hostname.clone(),
+        path_begin:     front.path_begin.clone(),
+        fingerprint:    front.fingerprint.clone(),
+        sticky_session: front.sticky_session.clone(),
       }));
     }
 
@@ -280,8 +288,8 @@ mod tests {
   #[test]
   fn serialize() {
     let mut state:ConfigState = Default::default();
-    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") }));
-    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc") }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), sticky_session: false }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc"), sticky_session: false }));
     state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 }));
     state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
     state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_2"), ip_address: String::from("192.167.1.2"), port: 1026 }));
@@ -302,20 +310,20 @@ mod tests {
   #[test]
   fn diff() {
     let mut state:ConfigState = Default::default();
-    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") }));
-    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc") }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), sticky_session: false }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc"), sticky_session: false }));
     state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 }));
     state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
     state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_2"), ip_address: String::from("192.167.1.2"), port: 1026 }));
 
     let mut state2:ConfigState = Default::default();
-    state2.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") }));
+    state2.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), sticky_session: false }));
     state2.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 }));
     state2.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
     state2.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1028 }));
 
    let e = vec!(
-     Order::RemoveHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc") }),
+     Order::RemoveHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc"), sticky_session: false }),
      Order::RemoveInstance(Instance { app_id: String::from("app_2"), ip_address: String::from("192.167.1.2"), port: 1026 }),
      Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1028 }),
    );

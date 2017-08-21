@@ -42,7 +42,7 @@ use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
-use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe};
+use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
 use util::UnwrapLog;
 
 
@@ -56,6 +56,7 @@ pub struct TlsApp {
   pub hostname:         String,
   pub path_begin:       String,
   pub cert_fingerprint: CertFingerprint,
+  pub sticky_session:   bool,
 }
 
 pub enum State {
@@ -75,6 +76,7 @@ pub struct TlsClient {
   public_address: Option<IpAddr>,
   ssl:            Option<Ssl>,
   pool:           Weak<RefCell<Pool<BufferQueue>>>,
+  sticky_session: bool,
 }
 
 impl TlsClient {
@@ -94,6 +96,7 @@ impl TlsClient {
       public_address: public_address,
       ssl:            None,
       pool:           pool,
+      sticky_session: false,
     }
   }
 
@@ -373,6 +376,7 @@ impl ServerConfiguration {
       hostname:         config.default_name.clone().unwrap_or(String::new()),
       path_begin:       String::new(),
       cert_fingerprint: fingerprint,
+      sticky_session:   false,
     };
     fronts.insert(config.default_name.clone().unwrap_or(String::from("")), vec![app]);
 
@@ -542,6 +546,7 @@ impl ServerConfiguration {
       hostname:         tls_front.hostname.clone(),
       path_begin:       tls_front.path_begin.clone(),
       cert_fingerprint: tls_front.fingerprint.clone(),
+      sticky_session:   tls_front.sticky_session.clone(),
     };
 
     if let Some(fronts) = self.fronts.get_mut(&tls_front.hostname) {
@@ -682,14 +687,15 @@ impl ServerConfiguration {
 
   pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
     if let Some(addrs) = self.instances.get_mut(app_id) {
-      let backend = Rc::new(RefCell::new(Backend::new(*instance_address)));
+      let id = addrs.last().map(|b| (*b.borrow_mut()).id ).unwrap_or(0) + 1;
+      let backend = Rc::new(RefCell::new(Backend::new(*instance_address, id)));
       if !addrs.contains(&backend) {
         addrs.push(backend);
       }
     }
 
     if self.instances.get(app_id).is_none() {
-      let backend = Backend::new(*instance_address);
+      let backend = Backend::new(*instance_address, 0);
       self.instances.insert(String::from(app_id), vec![Rc::new(RefCell::new(backend))]);
     }
   }
@@ -740,7 +746,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_request(&mut self, client: &mut TlsClient, host: &str, uri: &str) -> Result<TcpStream,ConnectionError> {
+  pub fn backend_from_request(&mut self, client: &mut TlsClient, host: &str, uri: &str, front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
     trace!("looking for backend for host: {}", host);
     let real_host = if let Some(h) = host.split(":").next() {
       h
@@ -784,6 +790,9 @@ impl ServerConfiguration {
            if conn.is_ok() {
              client.back_connected = BackendConnectionStatus::Connecting;
              client.instance = Some(b.clone());
+              if front_should_stick {
+                client.http().map(|mut http| http.sticky_session = Some(StickySession::new(backend.id.clone())));
+              }
            }
 
             conn
@@ -800,6 +809,36 @@ impl ServerConfiguration {
     } else {
       Err(ConnectionError::HostNotFound)
     }
+  }
+
+  pub fn backend_from_sticky_session(&mut self, client: &mut TlsClient, app_id: &str, sticky_session: u32) -> Option<Result<TcpStream,ConnectionError>> {
+    let max_failures_per_backend = 10;
+    if let Some(ref mut app_instances) = self.instances.get_mut(app_id) {
+      let mut sticky_backend: Option<&mut Rc<RefCell<Backend>>> = app_instances.iter_mut().find(|b| {
+        let backend = &*b.borrow();
+        backend.id == sticky_session && backend.can_open(max_failures_per_backend)
+      });
+
+      if let Some(b) = sticky_backend {
+        //FIXME: hardcoded for now, these should come from configuration
+        let ref mut backend = *b.borrow_mut();
+        let conn = backend.try_connect(max_failures_per_backend);
+        info!("{}\tConnecting {} -> {:?} using session {}", client.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
+        if backend.failures >= max_failures_per_backend {
+          error!("{}\tbackend {:?} connections failed {} times, disabling it", client.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), (backend.address, backend.active_connections), backend.failures);
+        }
+        if conn.is_ok() {
+          client.back_connected = BackendConnectionStatus::Connecting;
+          client.instance = Some(b.clone());
+          client.http().map(|mut http| http.sticky_session = Some(StickySession::new(backend.id.clone())));
+        }
+
+        return Some(conn);
+      }
+    }
+
+    debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
+    None
   }
 }
 
@@ -861,74 +900,88 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     };
 
     let rl:RRequestLine = try!(unwrap_msg!(client.http()).state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-    if let Some(app_id) = self.frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
+    if let Some((app_id, front_should_stick)) = self.frontend_from_request(&host, &rl.uri).map(|ref front| (front.app_id.clone(), front.sticky_session.clone())) {
       if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
         //matched on keepalive
         return Ok(BackendConnectAction::Reuse);
       }
-    }
 
-    // circuit breaker
-    if client.back_connected == BackendConnectionStatus::Connecting {
-      client.instance.as_ref().map(|instance| {
-        let ref mut backend = *instance.borrow_mut();
-        backend.failures += 1;
-        backend.dec_connections();
-      });
-    }
-    info!("instances: {:?}", self.instances);
-
-    let reused = client.http().map(|http| http.app_id.is_some()).unwrap_or(false);
-    //deregister back socket if it is the wrong one or if it was not connecting
-    if reused || client.back_connected == BackendConnectionStatus::Connecting {
-      client.instance = None;
-      client.back_connected = BackendConnectionStatus::NotConnected;
-      client.readiness().back_interest  = UnixReady::from(Ready::empty());
-      client.readiness().back_readiness = UnixReady::from(Ready::empty());
-      client.back_socket().as_ref().map(|sock| {
-        event_loop.deregister(*sock);
-        sock.shutdown(Shutdown::Both);
-      });
-    }
-
-    let conn   = try!(unwrap_msg!(client.http()).state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
-    let conn   = self.backend_from_request(client, &host, &rl.uri);
-
-    match conn {
-      Ok(socket) => {
-        let req_state = unwrap_msg!(client.http()).state().request.clone();
-        let req_header_end = unwrap_msg!(client.http()).state().req_header_end;
-        let res_header_end = unwrap_msg!(client.http()).state().res_header_end;
-        let added_req_header = unwrap_msg!(client.http()).state().added_req_header.clone();
-        let added_res_header = unwrap_msg!(client.http()).state().added_res_header.clone();
-        // FIXME: is this still needed?
-        unwrap_msg!(client.http()).set_state(HttpState {
-          req_header_end: req_header_end,
-          res_header_end: res_header_end,
-          request:  req_state,
-          response: Some(ResponseState::Initial),
-          added_req_header: added_req_header,
-          added_res_header: added_res_header,
+      // circuit breaker
+      if client.back_connected == BackendConnectionStatus::Connecting {
+        client.instance.as_ref().map(|instance| {
+          let ref mut backend = *instance.borrow_mut();
+          backend.failures += 1;
+          backend.dec_connections();
         });
+      }
+      info!("instances: {:?}", self.instances);
 
-        client.set_back_socket(socket);
-        if reused {
-          Ok(BackendConnectAction::Replace)
-        } else {
-          Ok(BackendConnectAction::New)
-        }
-      },
-      Err(ConnectionError::NoBackendAvailable) => {
-        unwrap_msg!(client.http()).set_answer(&self.answers.ServiceUnavailable);
-        client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
-        Err(ConnectionError::NoBackendAvailable)
-      },
-      Err(ConnectionError::HostNotFound) => {
-        unwrap_msg!(client.http()).set_answer(&self.answers.NotFound);
-        client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
-        Err(ConnectionError::HostNotFound)
-      },
-      e => panic!(e)
+      let reused = client.http().map(|http| http.app_id.is_some()).unwrap_or(false);
+      //deregister back socket if it is the wrong one or if it was not connecting
+      if reused || client.back_connected == BackendConnectionStatus::Connecting {
+        client.instance = None;
+        client.back_connected = BackendConnectionStatus::NotConnected;
+        client.readiness().back_interest  = UnixReady::from(Ready::empty());
+        client.readiness().back_readiness = UnixReady::from(Ready::empty());
+        client.back_socket().as_ref().map(|sock| {
+          event_loop.deregister(*sock);
+          sock.shutdown(Shutdown::Both);
+        });
+      }
+
+      let conn   = try!(unwrap_msg!(client.http()).state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
+      let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();
+      let conn = match (front_should_stick, sticky_session) {
+        (true, Some(session)) => {
+          if let Some(conn) = self.backend_from_sticky_session(client, &app_id, session) {
+            conn
+          } else {
+            self.backend_from_request(client, &host, &rl.uri, front_should_stick)
+          }
+        },
+        (_, _) => self.backend_from_request(client, &host, &rl.uri, front_should_stick)
+      };
+
+      match conn {
+        Ok(socket) => {
+          let req_state = unwrap_msg!(client.http()).state().request.clone();
+          let req_header_end = unwrap_msg!(client.http()).state().req_header_end;
+          let res_header_end = unwrap_msg!(client.http()).state().res_header_end;
+          let added_req_header = unwrap_msg!(client.http()).state().added_req_header.clone();
+          let added_res_header = unwrap_msg!(client.http()).state().added_res_header.clone();
+          // FIXME: is this still needed?
+          unwrap_msg!(client.http()).set_state(HttpState {
+            req_header_end: req_header_end,
+            res_header_end: res_header_end,
+            request:  req_state,
+            response: Some(ResponseState::Initial),
+            added_req_header: added_req_header,
+            added_res_header: added_res_header,
+          });
+
+          client.set_back_socket(socket);
+          if reused {
+            Ok(BackendConnectAction::Replace)
+          } else {
+            Ok(BackendConnectAction::New)
+          }
+        },
+        Err(ConnectionError::NoBackendAvailable) => {
+          unwrap_msg!(client.http()).set_answer(&self.answers.ServiceUnavailable);
+          client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+          Err(ConnectionError::NoBackendAvailable)
+        },
+        Err(ConnectionError::HostNotFound) => {
+          unwrap_msg!(client.http()).set_answer(&self.answers.NotFound);
+          client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+          Err(ConnectionError::HostNotFound)
+        },
+        e => panic!(e)
+      }
+    } else {
+      unwrap_msg!(client.http()).set_answer(&self.answers.NotFound);
+      client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+      Err(ConnectionError::HostNotFound)
     }
   }
 
@@ -1173,21 +1226,25 @@ mod tests {
     fronts.insert("lolcatho.st".to_owned(), vec![
       TlsApp {
         app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1,
-        cert_fingerprint: CertFingerprint(vec!())
+        cert_fingerprint: CertFingerprint(vec!()),
+        sticky_session: false
       },
       TlsApp {
         app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2,
-        cert_fingerprint: CertFingerprint(vec!())
+        cert_fingerprint: CertFingerprint(vec!()),
+        sticky_session: false
       },
       TlsApp {
         app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3,
-        cert_fingerprint: CertFingerprint(vec!())
+        cert_fingerprint: CertFingerprint(vec!()),
+        sticky_session: false
       }
     ]);
     fronts.insert("other.domain".to_owned(), vec![
       TlsApp {
         app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(),
-        cert_fingerprint: CertFingerprint(vec!())
+        cert_fingerprint: CertFingerprint(vec!()),
+        sticky_session: false
       },
     ]);
 

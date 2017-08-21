@@ -3,11 +3,12 @@
 
 use sozu_command::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
+use network::protocol::StickySession;
 
 use nom::{HexDisplay,IResult,Offset};
 use nom::IResult::*;
 
-use nom::{digit,is_alphanumeric,is_space};
+use nom::{digit,is_alphanumeric,is_space,space};
 
 use url::Url;
 
@@ -237,6 +238,52 @@ fn is_hostname_char(i: u8) -> bool {
 
 named!(pub hostname_and_port<(&[u8],Option<&[u8]>)>, pair!(take_while!(is_hostname_char), opt!(complete!(preceded!(tag!(":"), digit)))));
 
+#[derive(Debug)]
+pub struct CookieValue<'a> {
+  name: &'a [u8],
+  value: &'a [u8],
+  semicolon: Option<&'a [u8]>,
+  spaces: Option<&'a [u8]>
+}
+
+impl<'a> CookieValue<'a> {
+  pub fn get_full_length(&self) -> usize {
+    let semicolon = if self.semicolon.is_some() { 1 } else { 0 };
+    let space = self.spaces.map(|sp| sp.len()).unwrap_or(0);
+
+    self.name.len() + self.value.len() + semicolon + space + 1 // +1 is for =
+  }
+}
+
+pub fn is_cookie_value_char(chr: u8) -> bool {
+  // chars: (space) , ;
+  chr != 32 && chr != 44 && chr != 59
+}
+
+named!(pub single_request_cookie<CookieValue>,
+  do_parse!(
+    name: take_until_and_consume!("=") >>
+    value: take_while!(is_cookie_value_char) >>
+    semicolon: opt!(complete!(tag!(";"))) >>
+    spaces: opt!(complete!(take_while!(is_space))) >>
+    (CookieValue {
+      name: name,
+      value: value,
+      semicolon: semicolon,
+      spaces: spaces
+    })
+  )
+);
+
+pub fn request_cookies(input: &[u8]) -> Option<Vec<CookieValue>> {
+  let res: IResult<&[u8], Vec<CookieValue>> = many0!(input, single_request_cookie);
+
+  if let IResult::Done(_, o) = res {
+    Some(o)
+  } else {
+    None
+  }
+}
 
 use std::str::{from_utf8, FromStr};
 use nom::{Err,ErrorKind,Needed};
@@ -478,7 +525,13 @@ impl<'a> Header<'a> {
         } else {
           HeaderValue::Error
         }
-      }
+      },
+      b"cookie" => {
+        match request_cookies(self.value) {
+          Some(cookies) => HeaderValue::Cookie(cookies),
+          None          => HeaderValue::Error
+        }
+      },
       /*b"forwarded" => {
         match comma_separated_header_value(self.value) {
           Some(forwarded) => HeaderValue::Forwarded(forwarded),
@@ -520,6 +573,9 @@ impl<'a> Header<'a> {
         Some(tokens) => ! tokens.iter().any(|value| &value.to_ascii_lowercase()[..] == b"upgrade"),
         None         => true
       }
+    } else if &lowercase[..] == b"set-cookie" {
+      let look_for = b"SOZUBALANCEID=";
+      &self.value[0..look_for.len()] == look_for
     } else {
       &lowercase[..] == b"connection" && &self.value.to_ascii_lowercase()[..] != b"upgrade" ||
       &lowercase[..] == b"forwarded"         ||
@@ -529,6 +585,85 @@ impl<'a> Header<'a> {
       &lowercase[..] == b"request-id"        ||
       conn.to_delete.contains(unsafe {str::from_utf8_unchecked(&self.value.to_ascii_lowercase()[..])})
     }
+  }
+
+  pub fn must_mutate(&self) -> bool {
+    let lowercase = self.name.to_ascii_lowercase();
+    match &lowercase[..] {
+      b"cookie" => true,
+      _ => false
+    }
+  }
+
+  pub fn mutate_header(&self, buf: &[u8], offset: usize) -> Vec<BufferMove> {
+    match &self.name.to_ascii_lowercase()[..] {
+      b"cookie" => self.remove_sticky_cookie_in_request(buf, offset),
+      _ => vec![BufferMove::Advance(offset)]
+    }
+  }
+
+  pub fn remove_sticky_cookie_in_request(&self, buf: &[u8], offset: usize) -> Vec<BufferMove> {
+    if let Some(cookies) = request_cookies(self.value) {
+      // if we don't find the cookie, don't go further
+      if let Some(sozu_balance_position) = cookies.iter().position(|cookie| &cookie.name[..] == b"SOZUBALANCEID") {
+        // If we have only one cookie and that's the one, then we drop the whole header
+        if cookies.len() == 1 {
+          return vec![BufferMove::Delete(offset)];
+        }
+        // we want to advance the buffer for the header's name
+        // +1 is to count ":"
+        let header_length = self.name.len() + 1;
+        // we calculate how much chars there is between the : and the first cookie
+        let length_until_value = match take_while!(&buf[header_length..buf.len()], is_space) {
+          IResult::Done(_, spaces) => spaces,
+          IResult::Incomplete(_) | IResult::Error(_) => {
+            // if there is not enough data or an error, we completely remove the header.
+            return vec![BufferMove::Advance(offset)];
+          }
+        };
+
+        // Our iterator over the cookies
+        let mut iter = cookies.iter();
+        // Our return value
+        let mut moves = Vec::new();
+        // The current number of cookie parsed
+        let mut current_cookie = 1;
+        // If the cookie SOZUBALANCEID is the last of the cookie chain
+        let sozu_balance_is_last = if (sozu_balance_position + 1) == cookies.len() { true } else { false };
+
+        moves.push(BufferMove::Advance(header_length + length_until_value.len()));
+
+        loop {
+          match iter.next() {
+            Some(cookie) => {
+              if &cookie.name[..] == b"SOZUBALANCEID" {
+                moves.push(BufferMove::Delete(cookie.get_full_length()));
+              } else if sozu_balance_is_last {
+                // if sozublanceid is the last element, we want to delete the "; " chars from
+                // the before last cookie
+                let next = current_cookie + 1;
+                let cookie_length = cookie.get_full_length();
+                if next == sozu_balance_position {
+                  moves.push(BufferMove::Advance(cookie_length - 2));
+                } else {
+                  moves.push(BufferMove::Advance(cookie_length));
+                }
+              } else {
+                moves.push(BufferMove::Advance(cookie.get_full_length()));
+              }
+            },
+            None => {
+              moves.push(BufferMove::Advance(2)); // advance of 2 for the header's \r\n
+              return moves;
+            }
+          }
+
+          current_cookie += 1;
+        }
+      }
+    }
+
+    vec![BufferMove::Advance(offset)]
   }
 }
 
@@ -544,6 +679,7 @@ pub enum HeaderValue<'a> {
   //FIXME: are the references in Connection still valid after we delete that part of the headers?
   Connection(Vec<&'a [u8]>),
   Upgrade(&'a[u8]),
+  Cookie(Vec<CookieValue<'a>>),
   Other(&'a[u8],&'a[u8]),
   Forwarded,
   ExpectContinue,
@@ -589,41 +725,45 @@ pub enum Connection {
 
 #[derive(Debug,Clone,PartialEq)]
 pub struct Connection {
-  pub keep_alive:   Option<bool>,
-  pub has_upgrade:  bool,
-  pub upgrade:      Option<String>,
-  pub to_delete:    HashSet<String>,
-  pub continues:    Continue,
+  pub keep_alive:     Option<bool>,
+  pub has_upgrade:    bool,
+  pub upgrade:        Option<String>,
+  pub to_delete:      HashSet<String>,
+  pub continues:      Continue,
+  pub sticky_session: Option<u32>,
 }
 
 impl Connection {
   pub fn new() -> Connection {
     Connection {
-      keep_alive:  None,
-      has_upgrade: false,
-      upgrade:     None,
-      continues:   Continue::None,
-      to_delete:   HashSet::new(),
+      keep_alive:     None,
+      has_upgrade:    false,
+      upgrade:        None,
+      continues:      Continue::None,
+      to_delete:      HashSet::new(),
+      sticky_session: None,
     }
   }
 
   pub fn keep_alive() -> Connection {
     Connection {
-      keep_alive:  Some(true),
-      has_upgrade: false,
-      upgrade:     None,
-      continues:   Continue::None,
-      to_delete:   HashSet::new(),
+      keep_alive:     Some(true),
+      has_upgrade:    false,
+      upgrade:        None,
+      continues:      Continue::None,
+      to_delete:      HashSet::new(),
+      sticky_session: None,
     }
   }
 
   pub fn close() -> Connection {
     Connection {
-      keep_alive:  Some(false),
-      has_upgrade: false,
-      upgrade:     None,
-      continues:   Continue::None,
-      to_delete:   HashSet::new(),
+      keep_alive:     Some(false),
+      has_upgrade:    false,
+      upgrade:        None,
+      continues:      Continue::None,
+      to_delete:      HashSet::new(),
+      sticky_session: None
     }
   }
 }
@@ -908,6 +1048,10 @@ impl HttpState {
     self.request.as_ref().map(|r| r.get_keep_alive()).expect("there should be a request")
   }
 
+  pub fn get_request_sticky_session(&self) -> Option<u32> {
+    self.request.as_ref().and_then(|r| r.get_keep_alive()).and_then(|con| con.sticky_session)
+  }
+
   pub fn must_continue(&self) -> Option<usize> {
     if self.request.as_ref().map(|r| r.get_keep_alive().map(|conn| conn.continues == Continue::Expects).unwrap_or(false)).unwrap_or(false) &&
         self.response.as_ref().map(|r| r.get_status_line().map(|st| st.status == 100).unwrap_or(false)).unwrap_or(false) {
@@ -985,7 +1129,9 @@ pub enum BufferMove {
   /// length
   Advance(usize),
   /// length
-  Delete(usize)
+  Delete(usize),
+  /// Vec of BufferMove operations
+  Multiple(Vec<BufferMove>)
 }
 
 pub fn default_request_result<O>(state: RequestState, res: IResult<&[u8], O>) -> (BufferMove, RequestState) {
@@ -1076,6 +1222,18 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
       st.get_mut_connection().map(|conn| conn.upgrade = Some(str::from_utf8(s).expect("should be ascii").to_string()));
       st
     },
+    HeaderValue::Cookie(cookies) => {
+      let sticky_session_header = cookies.into_iter().find(|ref cookie| &cookie.name[..] == b"SOZUBALANCEID");
+      if let Some(sticky_session) = sticky_session_header {
+        let mut st = state;
+        let backend_id = u32::from_str_radix(unsafe { str::from_utf8_unchecked(sticky_session.value) }, 10);
+        st.get_mut_connection().map(|conn| conn.sticky_session = backend_id.ok());
+
+        return st;
+      }
+
+      return state;
+    },
     HeaderValue::Error       => RequestState::Error(ErrorState::InvalidHttp)
   }
 }
@@ -1125,6 +1283,8 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
         IResult::Done(i, header) => {
           if header.should_delete(&conn) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
+          } else if header.must_mutate() {
+            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i))), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
           }
@@ -1137,6 +1297,8 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
         IResult::Done(i, header) => {
           if header.should_delete(&conn) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
+          } else if header.must_mutate() {
+            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i))), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
           }
@@ -1160,6 +1322,8 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
         IResult::Done(i, header) => {
           if header.should_delete(&conn) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
+          } else if header.must_mutate() {
+            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i))), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
           }
@@ -1276,7 +1440,8 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
     HeaderValue::ExpectContinue => {
       // we should not get that one from the server
       ResponseState::Error(ErrorState::InvalidHttp)
-    }
+    },
+    HeaderValue::Cookie(cookies) => state,
     HeaderValue::Error       => ResponseState::Error(ErrorState::InvalidHttp)
   }
 }
@@ -1461,6 +1626,24 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
           buf.delete_output(length);
         }
       },
+      BufferMove::Multiple(buffer_moves) => {
+        for buffer_move in buffer_moves {
+          match buffer_move {
+            BufferMove::Advance(length) => {
+              buf.consume_parsed_data(length);
+              buf.slice_output(length);
+            },
+            BufferMove::Delete(length) => {
+              buf.consume_parsed_data(length);
+              buf.delete_output(length);
+            },
+            e => {
+              error!("BufferMove {:?} isn't implemented", e);
+              unimplemented!();
+            }
+          }
+        }
+      }
       _ => break
     }
 
@@ -1479,7 +1662,7 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
 }
 
 #[allow(unused_variables)]
-pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue) -> HttpState {
+pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue, sticky_session: Option<StickySession>) -> HttpState {
   let mut current_state = rs.response.take().expect("the response state should never be None outside of this function");
   let mut header_end    = rs.res_header_end;
   let is_head = rs.request.as_ref().map(|request| request.is_head()).unwrap_or(false);
@@ -1502,11 +1685,16 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
             ResponseState::ResponseWithBodyChunks(_,_,_) => {
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
+              add_sticky_session_to_response(&mut rs, buf, sticky_session);
+
               buf.slice_output(sz);
             },
             ResponseState::ResponseWithBody(_,_,content_length) => {
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
+
+              add_sticky_session_to_response(&mut rs, buf, sticky_session);
+
               buf.slice_output(sz+content_length);
               buf.consume_parsed_data(content_length);
             },
@@ -1529,12 +1717,16 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
               //println!("FOUND HEADER END (delete):{}", buf.start_parsing_position);
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
+              add_sticky_session_to_response(&mut rs, buf, sticky_session);
+
               buf.delete_output(length);
             },
             ResponseState::ResponseWithBody(_,_,content_length) => {
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
               buf.delete_output(length);
+
+              add_sticky_session_to_response(&mut rs, buf, sticky_session);
 
               buf.slice_output(content_length);
               buf.consume_parsed_data(content_length);
@@ -1564,6 +1756,24 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
   rs.res_header_end = header_end;
 
   rs
+}
+
+fn add_sticky_session_to_response(rs: &mut HttpState, buf: &mut BufferQueue, sticky_session: Option<StickySession>) {
+  if let Some(sticky_backend) = sticky_session {
+    // if the client has a sticky session that's different from the current backend
+    // (because the backend can no longer exist)
+    let send_sticky_to_client = rs.request
+      .as_ref()
+      .and_then(|request| request.get_keep_alive())
+      .and_then(|conn| conn.sticky_session)
+      .map(|sticky_client| sticky_client != sticky_backend.backend_id)
+      .unwrap_or(true);
+
+    if send_sticky_to_client {
+      let sticky_cookie = format!("Set-Cookie: SOZUBALANCEID={}; Path=/\r\n", sticky_session.unwrap().backend_id);
+      buf.insert_output(Vec::from(sticky_cookie.as_bytes()));
+    }
+  }
 }
 
 #[cfg(test)]
@@ -2424,7 +2634,7 @@ mod tests {
       buf.write(&input[..78]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_response_until_stop(initial, "", &mut buf);
+      let result = parse_response_until_stop(initial, "", &mut buf, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 81);
       assert_eq!(
@@ -2447,7 +2657,7 @@ mod tests {
       buf.write(&input[81..100]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_response_until_stop(result, "", &mut buf);
+      let result = parse_response_until_stop(result, "", &mut buf, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 110);
       assert_eq!(
@@ -2470,7 +2680,7 @@ mod tests {
       println!("remaining:\n{}", &input[110..].to_hex(16));
       buf.write(&input[110..116]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf);
+      let result = parse_response_until_stop(result, "", &mut buf, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 115);
       assert_eq!(
@@ -2492,7 +2702,7 @@ mod tests {
       //buf.consume(5);
       buf.write(&input[116..]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf);
+      let result = parse_response_until_stop(result, "", &mut buf, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 117);
       assert_eq!(
@@ -2546,7 +2756,7 @@ mod tests {
       buf.write(&input[..74]);
       buf.consume_parsed_data(72);
       //println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(initial, "", &mut buf);
+      let result = parse_response_until_stop(initial, "", &mut buf, None);
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("initial input:\n{}", &input[..72].to_hex(8));
@@ -2572,7 +2782,7 @@ mod tests {
       // we got the chunk header, but not the chunk content
       buf.write(&input[74..77]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf);
+      let result = parse_response_until_stop(result, "", &mut buf, None);
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 81);
       assert_eq!(
@@ -2597,7 +2807,7 @@ mod tests {
       // the external code copied the chunk content directly, starting at next chunk end
       buf.write(&input[81..115]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf);
+      let result = parse_response_until_stop(result, "", &mut buf, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 115);
       assert_eq!(
@@ -2617,7 +2827,7 @@ mod tests {
       );
       buf.write(&input[115..]);
       println!("parsing\n{}", &input[115..].to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf);
+      let result = parse_response_until_stop(result, "", &mut buf, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 117);
       assert_eq!(
@@ -2652,7 +2862,7 @@ mod tests {
 
     let new_header = b"Request-Id: 123456789\r\n";
     initial.added_res_header = String::from("Request-Id: 123456789\r\n");
-    let result = parse_response_until_stop(initial, "", &mut buf);
+    let result = parse_response_until_stop(initial, "", &mut buf, None);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
@@ -2699,7 +2909,7 @@ mod tests {
 
     let new_header = b"Request-Id: 123456789\r\n";
     initial.added_res_header = String::from("Request-Id: 123456789\r\n");
-    let result = parse_response_until_stop(initial, "", &mut buf);
+    let result = parse_response_until_stop(initial, "", &mut buf, None);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
@@ -2758,7 +2968,7 @@ mod tests {
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
-      let result = parse_response_until_stop(initial, "", &mut buf);
+      let result = parse_response_until_stop(initial, "", &mut buf, None);
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);
@@ -2826,6 +3036,7 @@ mod tests {
               upgrade:     Some("WebSocket".to_string()),
               continues:   Continue::None,
               to_delete:   HashSet::new(),
+              sticky_session: None
             },
             String::from("localhost:8888"),
           )),

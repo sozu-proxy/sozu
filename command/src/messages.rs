@@ -132,9 +132,10 @@ impl<'de> serde::Deserialize<'de> for CertFingerprint {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpFront {
-    pub app_id:     String,
-    pub hostname:   String,
-    pub path_begin: String,
+    pub app_id:         String,
+    pub hostname:       String,
+    pub path_begin:     String,
+    pub sticky_session: bool,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -146,10 +147,11 @@ pub struct CertificateAndKey {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpsFront {
-    pub app_id:       String,
-    pub hostname:     String,
-    pub path_begin:   String,
-    pub fingerprint:  CertFingerprint,
+    pub app_id:         String,
+    pub hostname:       String,
+    pub path_begin:     String,
+    pub fingerprint:    CertFingerprint,
+    pub sticky_session: bool,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -288,25 +290,27 @@ mod tests {
 
   #[test]
   fn add_acl_test() {
-    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}}"#;
+    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242, "sticky_session": false}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
+      sticky_session: false,
     }));
   }
 
   #[test]
   fn remove_acl_test() {
-    let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}}"#;
+    let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242, "sticky_session": false}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::RemoveHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
+      sticky_session: false,
     }));
   }
 
@@ -337,25 +341,27 @@ mod tests {
 
   #[test]
   fn http_front_crash_test() {
-    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "aa", "hostname": "cltdl.fr", "path_begin": ""}}"#;
+    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "aa", "hostname": "cltdl.fr", "path_begin": "", "sticky_session": false}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::AddHttpFront(HttpFront{
       app_id: String::from("aa"),
       hostname: String::from("cltdl.fr"),
       path_begin: String::from(""),
+      sticky_session: false,
     }));
   }
 
   #[test]
   fn http_front_crash_test2() {
-    let raw_json = r#"{"app_id": "aa", "hostname": "cltdl.fr", "path_begin": ""}"#;
+    let raw_json = r#"{"app_id": "aa", "hostname": "cltdl.fr", "path_begin": "", "sticky_session": false}"#;
     let front: HttpFront = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}",front);
     assert!(front == HttpFront{
       app_id: String::from("aa"),
       hostname: String::from("cltdl.fr"),
       path_begin: String::from(""),
+      sticky_session: false,
     });
   }
 }
