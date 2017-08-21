@@ -367,13 +367,12 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
   pub fn interpret_client_order(&mut self, poll: &mut Poll, token: FrontToken, order: ClientResult) {
     //println!("INTERPRET ORDER: {:?}", order);
     match order {
-      ClientResult::CloseClient      => self.close_client(poll, token),
+      ClientResult::CloseClient     => self.close_client(poll, token),
       //FIXME: we do not deregister in close_backend
-      ClientResult::CloseBackend     => self.close_backend(token),
-      ClientResult::CloseBothSuccess => self.close_client(poll, token),
-      ClientResult::CloseBothFailure => self.close_client(poll, token),
-      ClientResult::ConnectBackend   => self.connect_to_backend(poll, token),
-      ClientResult::Continue         => {}
+      ClientResult::CloseBackend    => self.close_backend(token),
+      ClientResult::CloseBoth       => self.close_client(poll, token),
+      ClientResult::ConnectBackend  => self.connect_to_backend(poll, token),
+      ClientResult::Continue        => {}
     }
   }
 }

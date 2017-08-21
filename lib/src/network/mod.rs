@@ -111,8 +111,7 @@ impl RequiredEvents {
 pub enum ClientResult {
   CloseClient,
   CloseBackend,
-  CloseBothSuccess,
-  CloseBothFailure,
+  CloseBoth,
   Continue,
   ConnectBackend
 }

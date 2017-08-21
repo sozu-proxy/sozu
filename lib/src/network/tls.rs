@@ -292,7 +292,7 @@ impl ProxyClient for TlsClient {
         _ => result
       }
       } else {
-        ClientResult::CloseBothFailure
+        ClientResult::CloseBoth
       }
     }
   }

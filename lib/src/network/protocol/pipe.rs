@@ -259,7 +259,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       SocketResult::Error => {
         error!("{}\tback socket write error, closing connection", self.log_ctx);
         self.readiness.reset();
-        return ClientResult::CloseBothFailure;
+        return ClientResult::CloseBoth;
       },
       SocketResult::WouldBlock => {
         self.readiness.back_readiness.remove(Ready::writable());
@@ -299,7 +299,7 @@ impl<Front:SocketHandler> Pipe<Front> {
     if r == SocketResult::Error {
       error!("{}\tback socket read error, closing connection", self.log_ctx);
       self.readiness.reset();
-      return ClientResult::CloseBothFailure;
+      return ClientResult::CloseBoth;
     }
 
     ClientResult::Continue

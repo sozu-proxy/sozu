@@ -516,7 +516,7 @@ impl<Front:SocketHandler> Http<Front> {
         } else {
           info!("{}\t[{:?}] request ended successfully, closing front and back connections", self.log_ctx, self.token);
           self.readiness.reset();
-          ClientResult::CloseBothSuccess
+          ClientResult::CloseBoth
         }
       },
       // restart parsing, since there will be other chunks next
@@ -533,7 +533,7 @@ impl<Front:SocketHandler> Http<Front> {
       },
       _ => {
         self.readiness.reset();
-        ClientResult::CloseBothFailure
+        ClientResult::CloseBoth
       }
     }
   }
@@ -560,7 +560,7 @@ impl<Front:SocketHandler> Http<Front> {
     if self.backend.is_none() {
       error!("{}\tback socket not found, closing connection", self.log_ctx);
       self.readiness.reset();
-      return ClientResult::CloseBothFailure;
+      return ClientResult::CloseBoth;
     }
 
     let sock = unwrap_msg!(self.backend.as_mut());
@@ -588,7 +588,7 @@ impl<Front:SocketHandler> Http<Front> {
       SocketResult::Error => {
         error!("{}\tback socket write error, closing connection", self.log_ctx);
         self.readiness.reset();
-        return ClientResult::CloseBothFailure;
+        return ClientResult::CloseBoth;
       },
       SocketResult::WouldBlock => {
         self.readiness.back_readiness.remove(Ready::writable());
@@ -624,7 +624,7 @@ impl<Front:SocketHandler> Http<Front> {
         ref s => {
           error!("{}\tinvalid state, closing connection: {:?}", self.log_ctx, s);
           self.readiness.reset();
-          ClientResult::CloseBothFailure
+          ClientResult::CloseBoth
         }
       }
     } else {
@@ -654,7 +654,7 @@ impl<Front:SocketHandler> Http<Front> {
     if self.backend.is_none() {
       error!("{}\tback socket not found, closing connection", self.log_ctx);
       self.readiness.reset();
-      return (ProtocolResult::Continue, ClientResult::CloseBothFailure);
+      return (ProtocolResult::Continue, ClientResult::CloseBoth);
     }
 
     let sock = unwrap_msg!(self.backend.as_mut());
@@ -673,7 +673,7 @@ impl<Front:SocketHandler> Http<Front> {
     if r == SocketResult::Error {
       error!("{}\tback socket read error, closing connection", self.log_ctx);
       self.readiness.reset();
-      return (ProtocolResult::Continue, ClientResult::CloseBothFailure);
+      return (ProtocolResult::Continue, ClientResult::CloseBoth);
     }
 
     // isolate that here because the "ref protocol" and the self.state = " make borrowing conflicts
@@ -728,7 +728,7 @@ impl<Front:SocketHandler> Http<Front> {
             error!("{}\tback socket chunk parse error, closing connection", self.log_ctx);
             //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             self.readiness.reset();
-            return (ProtocolResult::Continue, ClientResult::CloseBothFailure);
+            return (ProtocolResult::Continue, ClientResult::CloseBoth);
           }
 
           if let Some(&Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended))) = self.state.as_ref().map(|s| &s.response) {
@@ -747,7 +747,7 @@ impl<Front:SocketHandler> Http<Front> {
           error!("{}\tback socket parse error, closing connection", self.log_ctx);
           //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
           self.readiness.reset();
-          return (ProtocolResult::Continue, ClientResult::CloseBothFailure);
+          return (ProtocolResult::Continue, ClientResult::CloseBoth);
         }
 
         if let Some(ResponseState::Response(_,_)) = unwrap_msg!(self.state.as_ref()).response {

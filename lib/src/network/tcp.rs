@@ -241,7 +241,7 @@ impl ProxyClient for Client {
      match socket_res {
        SocketResult::Error => {
          self.readiness.reset();
-         ClientResult::CloseBothFailure
+         ClientResult::CloseBoth
        },
        SocketResult::WouldBlock => {
          self.readiness.front_readiness.remove(Ready::writable());
@@ -284,7 +284,7 @@ impl ProxyClient for Client {
       }
     } else {
       self.readiness.reset();
-      ClientResult::CloseBothFailure
+      ClientResult::CloseBoth
     }
   }
 
@@ -311,7 +311,7 @@ impl ProxyClient for Client {
      match socket_res {
        SocketResult::Error => {
          self.readiness.reset();
-         ClientResult::CloseBothFailure
+         ClientResult::CloseBoth
        },
        SocketResult::WouldBlock => {
          self.readiness.back_readiness.remove(Ready::writable());
