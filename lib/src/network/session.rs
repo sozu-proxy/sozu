@@ -528,27 +528,29 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
       }
 
       if front_interest.is_hup() {
-        if self.clients[client_token].front_hup() == ClientResult::CloseClient {
-          self.clients[client_token].readiness().front_interest = UnixReady::from(Ready::empty());
-          self.clients[client_token].readiness().back_interest  = UnixReady::from(Ready::empty());
-          self.clients[client_token].readiness().back_readiness.remove(UnixReady::hup());
-          self.close_client(poll, client_token);
-          break;
-        } else {
-          self.clients[client_token].readiness().front_readiness.remove(UnixReady::hup());
+        let order = self.clients[client_token].front_hup();
+        match order {
+          ClientResult::CloseClient |  ClientResult::CloseBoth => {
+            self.close_client(poll, client_token);
+            break;
+          },
+          _ => {
+            self.clients[client_token].readiness().front_readiness.remove(UnixReady::hup());
+          }
         }
       }
 
       if back_interest.is_hup() {
-        if self.clients[client_token].front_hup() == ClientResult::CloseClient {
-          self.clients[client_token].readiness().front_interest = UnixReady::from(Ready::empty());
-          self.clients[client_token].readiness().back_interest  = UnixReady::from(Ready::empty());
-          self.clients[client_token].readiness().front_readiness.remove(UnixReady::hup());
-          self.close_client(poll, client_token);
-          break;
-        } else {
-          self.clients[client_token].readiness().back_readiness.remove(UnixReady::hup());
-        }
+        let order = self.clients[client_token].back_hup();
+        match order {
+          ClientResult::CloseClient |  ClientResult::CloseBoth => {
+            self.close_client(poll, client_token);
+            break;
+          },
+          _ => {
+            self.clients[client_token].readiness().front_readiness.remove(UnixReady::hup());
+          }
+        };
       }
 
       if front_interest.is_error() || back_interest.is_error() {

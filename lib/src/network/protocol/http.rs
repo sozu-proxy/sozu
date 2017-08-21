@@ -238,16 +238,12 @@ impl<Front:SocketHandler> Http<Front> {
     if self.backend_token == None {
       ClientResult::CloseClient
     } else {
-      ClientResult::Continue
+      ClientResult::CloseBoth
     }
   }
 
   pub fn back_hup(&mut self) -> ClientResult {
-    if self.token == None {
-      ClientResult::CloseClient
-    } else {
-      ClientResult::Continue
-    }
+    ClientResult::CloseBoth
   }
 
   // Read content from the client

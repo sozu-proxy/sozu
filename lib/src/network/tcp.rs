@@ -174,19 +174,14 @@ impl ProxyClient for Client {
       ClientResult::CloseClient
     } else {
       self.status = ConnectionStatus::ClientClosed;
-      ClientResult::Continue
+      ClientResult::CloseBoth
     }
 
   }
 
   fn back_hup(&mut self) -> ClientResult {
-    if self.status == ConnectionStatus::ClientClosed {
-      self.status = ConnectionStatus::Closed;
-      ClientResult::CloseClient
-    } else {
-      self.status = ConnectionStatus::ServerClosed;
-      ClientResult::Continue
-    }
+    self.status = ConnectionStatus::Closed;
+    ClientResult::CloseBoth
   }
 
   fn readable(&mut self) -> ClientResult {
