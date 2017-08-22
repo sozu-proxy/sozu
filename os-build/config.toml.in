@@ -1,7 +1,7 @@
 # sozu proxy test config file
 
-command_socket = "__STATE_DIR__/command"
-saved_state    = "__STATE_DIR__/state.json"
+command_socket = "__RUNDIR__/sozu/command"
+saved_state    = "__RUNDIR__/sozu/state.json"
 log_level      = "info"
 log_target     = "stdout"
 #log_target     = "udp://127.0.0.1:9876"
@@ -10,17 +10,17 @@ command_buffer_size = 16384
 worker_count = 2
 handle_process_affinity = false
 
-[metrics]
-address = "127.0.0.1"
-port = 8125
+#[metrics]
+#address = "127.0.0.1"
+#port = 8125
 
 [http]
 address = "127.0.0.1"
 max_connections = 500
 port = 8080
 buffer_size = 16384
-answer_404 = "__DATA_DIR__/html/404.html"
-answer_503 = "__DATA_DIR__/html/503.html"
+answer_404 = "__DATADIR__/html/404.html"
+answer_503 = "__DATADIR__/html/503.html"
 
 [https]
 address = "127.0.0.1"
@@ -34,17 +34,16 @@ default_app_id = "MyApp"
 #default_certificate_chain = "../lib/assets/cert__chain_test.pem"
 #default_key = "../lib/assets/key_test.pem"
 
-answer_404 = "__DATA_DIR__/html/404.html"
-answer_503 = "__DATA_DIR__/html/503.html"
+answer_404 = "__DATADIR__/html/404.html"
+answer_503 = "__DATADIR__/html/503.html"
 
 [applications]
 
 [applications.MyApp]
 hostname   = "lolcatho.st"
 #path_begin = "/api" # optional
-certificate = "__DATA_DIR__/ssl/assets/certificate.pem" # optional
-key = "__DATA_DIR__/ssl/key.pem" # optional
-certificate_chain = "__DATA_DIR__/ssl/certificate_chain.pem" # optional
+certificate = "__DATADIR__/ssl/assets/certificate.pem" # optional
+key = "__DATADIR__/ssl/key.pem" # optional
+certificate_chain = "__DATADIR__/ssl/certificate_chain.pem" # optional
 frontends = ["HTTP", "TLS"] # list of proxy tags
 backends  = [ "127.0.0.1:1026" ] # list of IP/port
-
