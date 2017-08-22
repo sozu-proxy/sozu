@@ -43,7 +43,7 @@ rm -rf %{buildroot}
 #service config file
 mkdir -p %{buildroot}%{_sysconfdir}/%{name}/
 #cp -p bin/config.toml %{buildroot}%{_sysconfdir}/%{name}/%{name}.toml
-m4 -D __DATA_DIR__=%{_datadir}/sozu/ -D __STATE_DIR__=%{_localstatedir}/run/sozu os-build/config.toml.in > %{buildroot}%{_sysconfdir}/%{name}/%{name}.toml
+m4 -D __DATADIR__=%{_datadir}/sozu -D __RUNDIR__=%{_localstatedir}/run os-build/config.toml.in > %{buildroot}%{_sysconfdir}/%{name}/%{name}.toml
 
 #service binary file
 mkdir -p %{buildroot}%{_bindir}/
@@ -66,7 +66,7 @@ echo 'alias sozuctl="`which sozuctl` --config %{_sysconfdir}/%{name}/%{name}.tom
 
 # service file - no check for _libdir as it's a systemd constant.
 mkdir -p %{buildroot}%/usr/lib/systemd/system/
-m4 -D __BIN_DIR__=%{_bindir} -D __STATE_DIR__=%{_localstatedir}/run/sozu os-build/sozu.service.in > %{buildroot}%{_localstatedir}/run/sozu/sozu.service
+m4 -D __BINDIR__=%{_bindir} -D __SYSCONFDIR__=%{_sysconfdir} os-build/systemd/sozu.service.in > %{buildroot}%{_localstatedir}/run/sozu/sozu.service
 
 # selinux
 cd os-build/selinux
