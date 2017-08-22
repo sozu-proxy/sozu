@@ -3,3 +3,4 @@ target
 lib/Cargo.lock
 examples/demo.rs
 examples/websocket.rs
+generated
