@@ -95,8 +95,11 @@ fn main() {
     logging::setup("MASTER".to_string(), &config.log_level, &config.log_target);
     info!("starting up");
 
-    metrics_set_up!(&config.metrics.address[..], config.metrics.port);
-    gauge!("sozu.TEST", 42);
+    if let Some(ref metrics) = config.metrics.as_ref() {
+      metrics_set_up!(&metrics.address[..], metrics.port);
+      gauge!("sozu.TEST", 42);
+    }
+
 
     if check_process_limits(config.clone()) {
       match start_workers(&config) {

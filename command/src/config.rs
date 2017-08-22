@@ -199,7 +199,7 @@ pub struct Config {
   pub log_level:               Option<String>,
   pub log_target:              Option<String>,
   pub worker_count:            Option<u16>,
-  pub metrics:                 MetricsConfig,
+  pub metrics:                 Option<MetricsConfig>,
   pub http:                    Option<ProxyConfig>,
   pub https:                   Option<ProxyConfig>,
   pub applications:            HashMap<String, AppConfig>,
@@ -398,10 +398,10 @@ mod tests {
       max_command_buffer_size: None,
       log_level:  None,
       log_target: None,
-      metrics: MetricsConfig {
+      metrics: Some(MetricsConfig {
         address: String::from("192.168.59.103"),
         port:    8125,
-      },
+      }),
       http:  Some(http),
       https: Some(https),
       applications: HashMap::new(),
