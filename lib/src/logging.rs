@@ -13,6 +13,7 @@ use mio_uds::UnixDatagram;
 
 thread_local! {
   pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());
+  pub static TAG:    String          = LOGGER.with(|logger| (*logger.borrow()).tag.clone());
 }
 
 
@@ -359,14 +360,19 @@ macro_rules! log {
           target: module_path!(),
       };
       {
-        $crate::logging::LOGGER.with(|l| {
-          l.borrow_mut().log(
-            &_META,
-            format_args!(
-              concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
-              ::time::now_utc().rfc3339(), ::time::precise_time_ns(), l.borrow().pid,
-              $level_tag, l.borrow().tag $(, $final_args)*)
-          );
+        $crate::logging::TAG.with(|tag| {
+          //let tag = t.borrow().tag;
+          $crate::logging::LOGGER.with(|l| {
+            let pid = l.borrow().pid;
+
+            l.borrow_mut().log(
+              &_META,
+              format_args!(
+                concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
+                ::time::now_utc().rfc3339(), ::time::precise_time_ns(), pid,
+                $level_tag, tag $(, $final_args)*)
+            );
+          })
         });
       }
     });
