@@ -6,10 +6,6 @@
   "data": {
     "type": "METRICS",
     "data": {
-      "sozu.time": {
-        "type": "TIME",
-        "data": 1234
-      },
       "sozu.count": {
         "type": "COUNT",
         "data": -2
@@ -17,6 +13,10 @@
       "sozu.gauge": {
         "type": "GAUGE",
         "data": 1
+      },
+      "sozu.time": {
+        "type": "TIME",
+        "data": 1234
       }
     }
   }

@@ -505,8 +505,7 @@ mod tests {
       ))),
     });
 
-    //FIXME: since hashmap serialization has no guarantee on the order, the test can fail randomly
-    /*test_message_answer!(answer_metrics, "../assets/answer_metrics.json", ConfigMessageAnswer {
+    test_message_answer!(answer_metrics, "../assets/answer_metrics.json", ConfigMessageAnswer {
       id:       "ID_TEST".to_string(),
       version:  0,
       status:   ConfigMessageStatus::Ok,
@@ -517,24 +516,4 @@ mod tests {
         (String::from("sozu.time"),  FilteredData::Time(1234)),
       ].iter().cloned().collect())),
     });
-    */
-
-    #[test]
-    fn answer_metrics() {
-      let data = include_str!("../assets/answer_metrics.json");
-      let expected_message = ConfigMessageAnswer {
-        id:       "ID_TEST".to_string(),
-        version:  0,
-        status:   ConfigMessageStatus::Ok,
-        message:  String::from(""),
-        data:     Some(AnswerData::Metrics([
-          (String::from("sozu.gauge"), FilteredData::Gauge(1)),
-          (String::from("sozu.count"), FilteredData::Count(-2)),
-          (String::from("sozu.time"),  FilteredData::Time(1234)),
-        ].iter().cloned().collect())),
-      };
-
-      let message: ConfigMessageAnswer = serde_json::from_str(data).unwrap();
-      assert_eq!(message, expected_message, "\ndeserialized message:\n{:#?}\n\nexpected message:\n{:#?}", message, expected_message);
-    }
 }
