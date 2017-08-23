@@ -1,5 +1,6 @@
 use libc;
 use std::str::FromStr;
+ use std::cell::RefCell;
 use std::cmp::{self,Ord};
 use std::sync::Mutex;
 use std::fmt::{Arguments,format};
@@ -10,10 +11,8 @@ use std::net::TcpStream;
 use mio_uds::UnixDatagram;
 
 
-lazy_static! {
-  pub static ref LOGGER: Mutex<Logger> = Mutex::new(Logger::new());
-  pub static ref PID:    i32           = unsafe { libc::getpid() };
-  pub static ref TAG:    String        = LOGGER.lock().unwrap().tag.clone();
+thread_local! {
+  pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());
 }
 
 
@@ -21,6 +20,7 @@ pub struct Logger {
   pub directives: Vec<LogDirective>,
   pub backend:    LoggerBackend,
   pub tag:        String,
+  pub pid:        i32,
 }
 
 impl Logger {
@@ -31,19 +31,20 @@ impl Logger {
         level: LogLevelFilter::Error,
       }),
       backend: LoggerBackend::Stdout(stdout()),
-      tag:     "WAAAAAAAH".to_string()
+      tag:     "SOZU".to_string(),
+      pid:     0,
     }
   }
 
   pub fn init(tag: String, spec: &str, backend: LoggerBackend) {
     let directives = parse_logging_spec(spec);
-    if let Ok(ref mut logger) = LOGGER.lock() {
+    LOGGER.with(|l| {
+      let ref mut logger = *l.borrow_mut();
       logger.set_directives(directives);
       logger.backend = backend;
       logger.tag     = tag;
-    }
-    //trying to init the logger tag
-    let ref t = *TAG;
+      logger.pid     = unsafe { libc::getpid() };
+    });
   }
 
   pub fn log<'a>(&mut self, meta: &LogMetadata, args: Arguments) {
@@ -345,43 +346,37 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
 
 #[macro_export]
 macro_rules! log {
-    (target: $target:expr, $lvl:expr, $format:expr, $level_tag:expr, $($arg:tt)+) => ({
-      use $crate::logging::LOGGER;
+    (__inner__ $target:expr, $lvl:expr, $format:expr, $level_tag:expr,
+     [$($transformed_args:ident),*], [$first_ident:ident $(, $other_idents:ident)*], $first_arg:expr $(, $other_args:expr)*) => ({
+      let $first_ident = &$first_arg;
+      log!(__inner__ $target, $lvl, $format, $level_tag, [$($transformed_args,)* $first_ident], [$($other_idents),*] $(, $other_args)*);
+    });
+
+    (__inner__ $target:expr, $lvl:expr, $format:expr, $level_tag:expr,
+     [$($final_args:ident),*], [$($idents:ident),*]) => ({
       static _META: $crate::logging::LogMetadata = $crate::logging::LogMetadata {
           level:  $lvl,
           target: module_path!(),
       };
       {
-        //FIXME: we will lose logs in multithreading like this
-        if let Ok(mut logger) = LOGGER.try_lock() {
-          logger.log(
+        $crate::logging::LOGGER.with(|l| {
+          l.borrow_mut().log(
             &_META,
             format_args!(
               concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
-              ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
-              $level_tag, *$crate::logging::TAG, $($arg)+));
-        }
+              ::time::now_utc().rfc3339(), ::time::precise_time_ns(), l.borrow().pid,
+              $level_tag, l.borrow().tag $(, $final_args)*)
+          );
+        });
       }
     });
-    (target: $target:expr, $lvl:expr, $format:expr, $level_tag:expr) => ({
-      use $crate::logging::LOGGER;
-      static _META: $crate::logging::LogMetadata = $crate::logging::LogMetadata {
-          level:  $lvl,
-          target: module_path!(),
-      };
-      {
-        //FIXME: we will lose logs in multithreading like this
-        if let Ok(mut logger) = LOGGER.try_lock() {
-          logger.log(
-            &_META,
-            format_args!(
-              concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
-              ::time::now_utc().rfc3339(), ::time::precise_time_ns(), *$crate::logging::PID,
-              $level_tag, *$crate::logging::TAG));
-        }
-      }
-    });
-    ($lvl:expr, $($arg:tt)+) => (log!(target: module_path!(), $lvl, $($arg)+));
+    ($lvl:expr, $format:expr, $level_tag:expr $(, $args:expr)+) => {
+      log!(__inner__ module_path!(), $lvl, $format, $level_tag, [], [a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v]
+                  $(, $args)+)
+    };
+    ($lvl:expr, $format:expr, $level_tag:expr) => {
+      log!(__inner__ module_path!(), $lvl, $format, $level_tag, [], [a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v])
+    };
 }
 
 #[macro_export]
@@ -398,7 +393,6 @@ macro_rules! error {
 macro_rules! warn {
     ($format:expr, $($arg:tt)*) => {
         use time;
-        use logging::PID;
         log!($crate::logging::LogLevel::Warn, $format, "WARN", $($arg)*);
     };
     ($format:expr) => {
@@ -421,12 +415,12 @@ macro_rules! debug {
     ($format:expr, $($arg:tt)*) => {
         #[cfg(debug_assertions)]
         log!($crate::logging::LogLevel::Debug, concat!("{}\t", $format),
-          "DEBUG", module_path!(), $($arg)*);
+          "DEBUG", {module_path!()}, $($arg)*);
     };
     ($format:expr) => {
         #[cfg(debug_assertions)]
         log!($crate::logging::LogLevel::Debug, concat!("{}\t", $format),
-          "DEBUG", module_path!());
+          "DEBUG", {module_path!()});
     }
 }
 
