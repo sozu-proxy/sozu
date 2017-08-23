@@ -31,7 +31,7 @@ fn main() {
                             .value_name("FILE")
                             .help("Sets a custom config file")
                             .takes_value(true)
-                            .required(true))
+                            .required(option_env!("SOZU_CONFIG").is_none()))
                         .subcommand(SubCommand::with_name("shutdown")
                                     .about("shuts down the proxy")
                                     .arg(Arg::with_name("hard").long("hard")
@@ -182,8 +182,11 @@ fn main() {
                                                       .takes_value(true)
                                                       .required(true))))
                         .get_matches();
-
-  let config_file = matches.value_of("config").expect("required config file");
+ 
+  let config_file = match matches.value_of("config"){
+                      Some(config_file) => config_file,
+                      None => option_env!("SOZU_CONFIG").expect("could not find `SOZU_CONFIG` env var at build"),
+                    };
 
   let config = Config::load_from_path(config_file).expect("could not parse configuration file");
   let stream = UnixStream::connect(&config.command_socket).expect("could not connect to the command unix socket");
