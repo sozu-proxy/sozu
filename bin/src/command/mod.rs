@@ -129,12 +129,6 @@ impl CommandServer {
     }
   }
 
-  fn dispatch(&mut self, token: FrontToken, v: Vec<ConfigMessage>) {
-    for message in &v {
-      self.handle_client_message(token, message);
-    }
-  }
-
   fn new(srv: UnixListener, config: Config, mut proxy_vec: Vec<Worker>, poll: Poll) -> CommandServer {
     //FIXME: verify this
     poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
@@ -366,7 +360,7 @@ impl CommandServer {
     };
 
     for msg in messages.drain(..) {
-      self.proxy_handle_message(token, msg);
+      self.handle_worker_message(token, msg);
     }
   }
 
@@ -432,7 +426,7 @@ impl CommandServer {
     }
   }
 
-  fn proxy_handle_message(&mut self, token: Token, msg: OrderMessageAnswer) {
+  fn handle_worker_message(&mut self, token: Token, msg: OrderMessageAnswer) {
     trace!("proxy handle message: token {:?} got answer msg: {:?}", token, msg);
     if msg.status != OrderMessageStatus::Processing {
       let mut stopping = false;

@@ -17,7 +17,6 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu::network::session::Session;
 use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
-use sozu::network::metrics::{METRICS,ProxyMetrics};
 use sozu::network::{http,tls};
 use sozu::network::proxy::Server;
 
