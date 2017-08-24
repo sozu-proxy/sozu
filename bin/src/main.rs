@@ -47,7 +47,7 @@ fn main() {
                                         .value_name("FILE")
                                         .help("Sets a custom config file")
                                         .takes_value(true)
-                                        .required(true)))
+                                        .required(option_env!("SOZU_CONFIG").is_none())))
                         .subcommand(SubCommand::with_name("worker")
                                     .about("start a worker (internal command, should not be used directly)")
                                     .arg(Arg::with_name("id").long("id")
@@ -88,8 +88,11 @@ fn main() {
   }
 
   let submatches = matches.subcommand_matches("start").expect("unknown subcommand");
-  let config_file = submatches.value_of("config").expect("required config file");
-
+  let config_file = match submatches.value_of("config"){
+                      Some(config_file) => config_file,
+                      None => option_env!("SOZU_CONFIG").expect("could not find `SOZU_CONFIG` env var at build"),
+                    };
+                    
   if let Ok(config) = Config::load_from_path(config_file) {
     //FIXME: should have an id for the master too
     logging::setup("MASTER".to_string(), &config.log_level, &config.log_target);
