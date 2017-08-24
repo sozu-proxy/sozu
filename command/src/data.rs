@@ -17,6 +17,7 @@ pub enum ConfigCommand {
   ListWorkers,
   LaunchWorker(String),
   UpgradeMaster,
+  Metrics,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
@@ -204,6 +205,8 @@ impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
       ConfigCommand::LaunchWorker(try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("launch worker")))))
     } else if &config_type == &"UPGRADE_MASTER" {
       ConfigCommand::UpgradeMaster
+    } else if &config_type == &"METRICS" {
+      ConfigCommand::Metrics
     } else {
       return Err(serde::de::Error::custom("unrecognized command"));
     };
@@ -272,6 +275,9 @@ impl serde::Serialize for ConfigMessage {
       },
       ConfigCommand::UpgradeMaster => {
         try!(map.serialize_entry("type", "UPGRADE_MASTER"));
+      },
+      ConfigCommand::Metrics => {
+        try!(map.serialize_entry("type", "METRICS"));
       },
     };
 

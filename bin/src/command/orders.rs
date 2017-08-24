@@ -54,6 +54,9 @@ impl CommandServer {
       ConfigCommand::UpgradeMaster => {
         self.upgrade_master(token, &message.id);
       },
+      ConfigCommand::Metrics => {
+        self.metrics(token, &message.id);
+      },
       ConfigCommand::ProxyConfiguration(order) => {
         self.worker_order(token, &message.id, order, message.proxy_id);
       }
@@ -309,6 +312,19 @@ impl CommandServer {
       process::exit(0);
     } else {
       self.answer_error(token, message_id, "could not upgrade master process", None);
+    }
+  }
+
+  pub fn metrics(&mut self, token: FrontToken, message_id: &str) {
+    self.order_state.insert_task(message_id, MessageType::Metrics, Some(token));
+
+    let mut found = false;
+    for ref mut proxy in self.proxies.values_mut() {
+      self.order_state.insert_worker_message(message_id, message_id, proxy.token.expect("worker should have a valid token"));
+      trace!("sending to {:?}, inflight is now {:#?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
+
+      self.clients[token].add_message_id(String::from(message_id));
+      proxy.push_message(OrderMessage { id: String::from(message_id), order: Order::Metrics });
     }
   }
 
