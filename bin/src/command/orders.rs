@@ -25,7 +25,7 @@ use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAns
 
 use super::{CommandServer,FrontToken,ProxyConfiguration,Worker};
 use super::client::parse;
-use super::state::OrderState;
+use super::state::{MessageType,OrderState};
 use worker::start_worker;
 use upgrade::{start_new_master_process,SerializedWorker,UpgradeData};
 
@@ -122,7 +122,7 @@ impl CommandServer {
       Ok(mut file) => {
         //let mut data = vec!();
         let mut buffer = Buffer::with_capacity(200000);
-        self.order_state.insert_task(message_id, token_opt);
+        self.order_state.insert_task(message_id, MessageType::LoadState, token_opt);
 
         info!("starting to load state from {}", path);
 
@@ -206,7 +206,7 @@ impl CommandServer {
         info!("state loaded from {}, will start sending {} ùessages to workers", path, counter);
         } else {
           info!("no messages sent to workers: local state already had those messages");
-          if let Some(task) = self.order_state.task(message_id) {
+          if let Some(task) = self.order_state.state.remove(message_id) {
             if let Some(token) = token_opt {
               let answer = ConfigMessageAnswer::new(
                 message_id.to_string(),
@@ -256,7 +256,7 @@ impl CommandServer {
       }).next() {
         worker.channel.set_blocking(true);
 
-        self.order_state.insert_task(message.id.as_str(), Some(token));
+        self.order_state.insert_task(message.id.as_str(), MessageType::LaunchWorker, Some(token));
         let mut counter = 0u32;
         for order in self.state.generate_orders() {
           let worker_message_id = format!("LAUNCH-CONF-{}", counter);
@@ -321,7 +321,7 @@ impl CommandServer {
     }
 
     self.state.handle_order(&order);
-    self.order_state.insert_task(message_id, Some(token));
+    self.order_state.insert_task(message_id, MessageType::WorkerOrder, Some(token));
 
     let mut found = false;
     for ref mut proxy in self.proxies.values_mut() {

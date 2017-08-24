@@ -449,61 +449,45 @@ impl CommandServer {
           //FIXME: right now, do nothing with the curent tasks
         },
         OrderMessageStatus::Error(s) => {
-          if let Some(client_message_id) = self.order_state.error(&msg.id, token) {
-            //FIXME: send message to client here
+          if let Some(task) = self.order_state.error(&msg.id, token, msg.data) {
+            let opt_token = task.client.clone();
+            let id        = task.id.clone();
+            let answer = ConfigMessageAnswer::new(
+              id,
+              ConfigMessageStatus::Error,
+              format!("ok: {} messages, error: {:?}, message: {}", task.ok.len(), task.error, s.clone()),
+              task.generate_data(),
+            );
 
-            if let Some(task) = self.order_state.task(&client_message_id) {
-              //info!("TERMINATING task: {:#?}", task);
-              let data = match msg.data {
-                None => None,
-                Some(OrderMessageAnswerData::Metrics(data)) => Some(AnswerData::Metrics(data)),
-              };
-
-              let answer = ConfigMessageAnswer::new(
-                client_message_id,
-                ConfigMessageStatus::Error,
-                format!("ok: {} messages, error: {:?}, message: {}", task.ok.len(), task.error, s.clone()),
-                data,
-              );
-
-              if let Some(client_token) = task.client {
-                info!("SENDING to client[{}]: {:#?}", client_token.0, answer);
-                self.clients[client_token].push_message(answer);
-              }
+            if let Some(client_token) = opt_token {
+              info!("SENDING to client[{}]: {:#?}", client_token.0, answer);
+              self.clients[client_token].push_message(answer);
             }
           }
         },
         OrderMessageStatus::Ok => {
-          if let Some(client_message_id) = self.order_state.ok(&msg.id, token) {
-            //FIXME: send message to client here
-            if let Some(task) = self.order_state.task(&client_message_id) {
-              //info!("TERMINATING task: {:#?}", task);
+          if let Some(task) = self.order_state.ok(&msg.id, token, msg.data) {
+            let opt_token = task.client.clone();
+            let id        = task.id.clone();
+            let answer = if task.error.is_empty() {
+              ConfigMessageAnswer::new(
+                id,
+                ConfigMessageStatus::Ok,
+                format!("ok: {} messages, error: {:#?}", task.ok.len(), task.error),
+                task.generate_data(),
+              )
+            } else {
+              ConfigMessageAnswer::new(
+                id,
+                ConfigMessageStatus::Error,
+                format!("ok: {:#?}, error: {:#?}", task.ok, task.error),
+                None,
+              )
+            };
 
-              let answer = if task.error.is_empty() {
-                let data = match msg.data {
-                  None => None,
-                  Some(OrderMessageAnswerData::Metrics(data)) => Some(AnswerData::Metrics(data)),
-                };
-
-                ConfigMessageAnswer::new(
-                  client_message_id,
-                  ConfigMessageStatus::Ok,
-                  format!("ok: {} messages, error: {:#?}", task.ok.len(), task.error),
-                  data,
-                )
-              } else {
-                ConfigMessageAnswer::new(
-                  msg.id.clone(),
-                  ConfigMessageStatus::Error,
-                  format!("ok: {:#?}, error: {:#?}", task.ok, task.error),
-                  None,
-                )
-              };
-
-              if let Some(client_token) = task.client {
-                info!("SENDING to client[{}]: {:#?}", client_token.0, answer);
-                self.clients[client_token].push_message(answer);
-              }
+            if let Some(client_token) = opt_token {
+              info!("SENDING to client[{}]: {:#?}", client_token.0, answer);
+              self.clients[client_token].push_message(answer);
             }
 
             //FIXME: the task should hold the message type,
