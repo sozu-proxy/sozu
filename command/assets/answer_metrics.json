@@ -6,17 +6,19 @@
   "data": {
     "type": "METRICS",
     "data": {
-      "sozu.count": {
-        "type": "COUNT",
-        "data": -2
-      },
-      "sozu.gauge": {
-        "type": "GAUGE",
-        "data": 1
-      },
-      "sozu.time": {
-        "type": "TIME",
-        "data": 1234
+      "master": {
+        "sozu.count": {
+          "type": "COUNT",
+          "data": -2
+        },
+        "sozu.gauge": {
+          "type": "GAUGE",
+          "data": 1
+        },
+        "sozu.time": {
+          "type": "TIME",
+          "data": 1234
+        }
       }
     }
   }

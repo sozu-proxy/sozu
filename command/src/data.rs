@@ -51,7 +51,7 @@ pub enum ConfigMessageStatus {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AnswerData {
   Workers(Vec<WorkerInfo>),
-  Metrics(BTreeMap<String,FilteredData>),
+  Metrics(BTreeMap<String, BTreeMap<String,FilteredData>>),
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
@@ -517,9 +517,11 @@ mod tests {
       status:   ConfigMessageStatus::Ok,
       message:  String::from(""),
       data:     Some(AnswerData::Metrics([
-        (String::from("sozu.gauge"), FilteredData::Gauge(1)),
-        (String::from("sozu.count"), FilteredData::Count(-2)),
-        (String::from("sozu.time"),  FilteredData::Time(1234)),
+        (String::from("master"), [
+          (String::from("sozu.gauge"), FilteredData::Gauge(1)),
+          (String::from("sozu.count"), FilteredData::Count(-2)),
+          (String::from("sozu.time"),  FilteredData::Time(1234)),
+        ].iter().cloned().collect())
       ].iter().cloned().collect())),
     });
 }

@@ -1,7 +1,8 @@
 use mio::{Ready,Token};
-use std::collections::{HashMap,HashSet};
+use std::collections::{BTreeMap,HashMap,HashSet};
 
-use sozu_command::messages::{Order,OrderMessageAnswerData};
+use sozu::network::metrics::METRICS;
+use sozu_command::messages::{FilteredData,Order,OrderMessageAnswerData};
 use sozu_command::data::{AnswerData,ConfigMessage,ConfigMessageAnswer};
 use command::FrontToken;
 
@@ -36,7 +37,7 @@ impl OrderState {
     });
   }
 
-  pub fn ok(&mut self, worker_message_id: &str, worker_token: Token, data: Option<OrderMessageAnswerData>) -> Option<Task> {
+  pub fn ok(&mut self, worker_message_id: &str, worker_token: Token, tag: String, data: Option<OrderMessageAnswerData>) -> Option<Task> {
     let key:WorkerMessageKey = (worker_message_id.to_string(), worker_token.0);
     //info!("state::ok: waiting for {} messages", self.message_match.len());
 
@@ -45,7 +46,7 @@ impl OrderState {
         task.processing.remove(&key);
         task.ok.insert(key.clone());
         if let Some(d) = data {
-          task.data.push(d);
+          task.data.insert(tag, d);
         }
         task.processing.is_empty()
       }).unwrap_or(false);
@@ -58,7 +59,7 @@ impl OrderState {
     None
   }
 
-  pub fn error(&mut self, worker_message_id: &str, worker_token: Token, data: Option<OrderMessageAnswerData>) -> Option<Task> {
+  pub fn error(&mut self, worker_message_id: &str, worker_token: Token, tag: String, data: Option<OrderMessageAnswerData>) -> Option<Task> {
     let key:WorkerMessageKey = (worker_message_id.to_string(), worker_token.0);
     //info!("state::error: waiting for {} messages", self.message_match.len());
 
@@ -68,7 +69,7 @@ impl OrderState {
         task.error.insert(key.clone());
 
         if let Some(d) = data {
-          task.data.push(d);
+          task.data.insert(tag, d);
         }
 
         task.processing.is_empty()
@@ -99,7 +100,7 @@ pub struct Task {
   pub processing: HashSet<WorkerMessageKey>,
   pub ok:         HashSet<WorkerMessageKey>,
   pub error:      HashSet<WorkerMessageKey>,
-  pub data:       Vec<OrderMessageAnswerData>,
+  pub data:       BTreeMap<String,OrderMessageAnswerData>,
 }
 
 impl Task {
@@ -111,7 +112,7 @@ impl Task {
       processing:   HashSet::new(),
       ok:           HashSet::new(),
       error:        HashSet::new(),
-      data:         Vec::new(),
+      data:         BTreeMap::new(),
     }
   }
 
@@ -119,9 +120,14 @@ impl Task {
     match self.message_type {
       MessageType::LaunchWorker | MessageType::WorkerOrder | MessageType::LoadState => None,
       MessageType::Metrics => {
-        //FIXME: temporary
-        let OrderMessageAnswerData::Metrics(data) = self.data.pop().unwrap();
-        info!("will return data: {:#?}", data);
+        let mut data: BTreeMap<String, BTreeMap<String, FilteredData>> = self.data.into_iter().map(|(tag, metrics)| {
+          let OrderMessageAnswerData::Metrics(d) = metrics;
+          (tag, d)
+        }).collect();
+        let master_metrics = METRICS.with(|metrics| {
+          (*metrics.borrow()).dump_data()
+        });
+        data.insert(String::from("master"), master_metrics);
         Some(AnswerData::Metrics(data))
       }
     }

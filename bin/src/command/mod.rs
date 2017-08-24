@@ -438,12 +438,14 @@ impl CommandServer {
         //}
       }
 
+      let tag = self.proxies.get(&token).map(|worker| worker.id.to_string()).unwrap_or(String::from(""));
+
       match msg.status {
         OrderMessageStatus::Processing => {
           //FIXME: right now, do nothing with the curent tasks
         },
         OrderMessageStatus::Error(s) => {
-          if let Some(task) = self.order_state.error(&msg.id, token, msg.data) {
+          if let Some(task) = self.order_state.error(&msg.id, token, tag, msg.data) {
             let opt_token = task.client.clone();
             let id        = task.id.clone();
             let answer = ConfigMessageAnswer::new(
@@ -460,7 +462,7 @@ impl CommandServer {
           }
         },
         OrderMessageStatus::Ok => {
-          if let Some(task) = self.order_state.ok(&msg.id, token, msg.data) {
+          if let Some(task) = self.order_state.ok(&msg.id, token, tag, msg.data) {
             let opt_token = task.client.clone();
             let id        = task.id.clone();
             let answer = if task.error.is_empty() {
