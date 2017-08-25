@@ -83,7 +83,7 @@ impl BufferQueue {
       if count > needed {
         self.parsed_position = self.start_parsing_position;
         self.input_queue.push(InputElement::Slice(count - needed));
-      } else if count < needed {
+      } else if count <= needed {
         self.parsed_position += count;
       }
     } else {
