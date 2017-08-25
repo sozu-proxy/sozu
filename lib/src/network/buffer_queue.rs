@@ -69,6 +69,15 @@ impl BufferQueue {
     }
   }
 
+  pub fn invariant(&self) {
+    debug_assert!(self.buffer_position <= self.parsed_position,
+      "buffer_position {} should be smaller than parsed_position {}",
+      self.buffer_position, self.parsed_position);
+    debug_assert!(self.parsed_position <= self.start_parsing_position,
+      "parsed_position {} should be smaller than start_parsing_position {}",
+      self.parsed_position, self.start_parsing_position);
+  }
+
   pub fn available_input_data(&self) -> usize {
     self.input_queue.iter().fold(0, |acc, el| {
       acc + match el {
@@ -91,6 +100,8 @@ impl BufferQueue {
         self.input_queue.push(InputElement::Slice(count));
       }
     }
+
+    self.invariant();
     //println!("sliced_input: buffer size: {}, parsed_position: {} start_parsing_position: {}, input_queue: {:?}, output_queue: {:?}",
     //  self.buffer.available_data(), self.parsed_position, self.start_parsing_position,
     //  self.input_queue, self.output_queue);
@@ -191,6 +202,7 @@ impl BufferQueue {
 
     self.parsed_position        += size - to_consume;
     self.start_parsing_position += size;
+    self.invariant();
   }
 
 
@@ -370,6 +382,7 @@ impl BufferQueue {
         Some(el) => { self.output_queue[0] = el; },
       };
     }
+    self.invariant();
   }
 
   pub fn print_unparsed(&self) {
