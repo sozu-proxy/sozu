@@ -48,7 +48,6 @@ pub struct BufferQueue {
   /// position of buffer start in stream
   pub buffer_position:        usize,
   pub parsed_position:        usize,
-  pub output_position:        usize,
   pub start_parsing_position: usize,
   pub buffer:                 Buffer,
   /// Vec<(start, length)>
@@ -61,7 +60,6 @@ impl BufferQueue {
     BufferQueue {
       buffer_position:        0,
       parsed_position:        0,
-      output_position:        0,
       start_parsing_position: 0,
       buffer:                 Buffer::with_capacity(capacity),
       input_queue:            Vec::with_capacity(8),
@@ -109,7 +107,7 @@ impl BufferQueue {
 
   pub fn spliced_input(&mut self, count: usize) {
     //FIXME: do the same thing with needed data as in sliced_input
-    if count >0 {
+    if count > 0 {
       self.input_queue.push(InputElement::Splice(count));
     }
   }
@@ -419,7 +417,6 @@ impl Write for BufferQueue {
 impl Reset for BufferQueue {
   fn reset(&mut self) {
     self.parsed_position = 0;
-    self.output_position = 0;
     self.buffer_position = 0;
     self.start_parsing_position = 0;
     self.buffer.reset();
@@ -439,7 +436,6 @@ mod tests {
   fn consume() {
     let mut b = BufferQueue {
       parsed_position:        0,
-      output_position:        0,
       buffer_position:        0,
       start_parsing_position: 0,
       buffer:                 Buffer::from_slice(b"ABCDEFGHIJ"),
