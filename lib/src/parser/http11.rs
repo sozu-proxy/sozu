@@ -637,11 +637,14 @@ impl<'a> Header<'a> {
           match iter.next() {
             Some(cookie) => {
               if &cookie.name[..] == b"SOZUBALANCEID" {
-                moves.push(BufferMove::Delete(cookie.get_full_length()));
+                // if the cookie is the last one, we left the "; " from the previous cookie, so we
+                // have to delete it too
+                let full_delete = if sozu_balance_is_last { 2 } else { 0 } + cookie.get_full_length();
+                moves.push(BufferMove::Delete(full_delete));
               } else if sozu_balance_is_last {
                 // if sozublanceid is the last element, we want to delete the "; " chars from
                 // the before last cookie
-                let next = current_cookie + 1;
+                let next = current_cookie;
                 let cookie_length = cookie.get_full_length();
                 if next == sozu_balance_position {
                   moves.push(BufferMove::Advance(cookie_length - 2));
