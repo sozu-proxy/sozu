@@ -637,16 +637,21 @@ impl<'a> Header<'a> {
           match iter.next() {
             Some(cookie) => {
               let cookie_length = cookie.get_full_length();
-              if &cookie.name[..] == b"SOZUBALANCEID" {
-                // if the cookie is the last one, we left the "; " from the previous cookie, so we
-                // have to delete it too
-                let full_delete = if sozu_balance_is_last { 2 } else { 0 } + cookie_length;
-                moves.push(BufferMove::Delete(full_delete));
+              // We already know the position of the cookie in the chain, so we avoid
+              // a string comparision and directly check against where we are in the cookies
+              if current_cookie == sozu_balance_position {
+                moves.push(BufferMove::Delete(cookie_length));
               } else if sozu_balance_is_last {
                 // if sozublanceid is the last element, we want to delete the "; " chars from
                 // the before last cookie
                 if (current_cookie + 1) == sozu_balance_position {
-                  moves.push(BufferMove::Advance(cookie_length - 2));
+                  let spaces = cookie.spaces.map(|s| s.len()).unwrap_or(0);
+                  // This one is obvious but I prefer to name the value
+                  let semicolon = 1;
+                  moves.push(BufferMove::Advance(cookie_length - spaces - semicolon));
+                  // We directly do the Delete here to avoid keeping context of 'did the cookie
+                  // before had spaces ?'
+                  moves.push(BufferMove::Delete(semicolon + spaces));
                 } else {
                   moves.push(BufferMove::Advance(cookie_length));
                 }
