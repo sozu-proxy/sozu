@@ -627,7 +627,7 @@ impl<'a> Header<'a> {
         // Our return value
         let mut moves = Vec::new();
         // The current number of cookie parsed
-        let mut current_cookie = 1;
+        let mut current_cookie = 0;
         // If the cookie SOZUBALANCEID is the last of the cookie chain
         let sozu_balance_is_last = if (sozu_balance_position + 1) == cookies.len() { true } else { false };
 
@@ -636,32 +636,31 @@ impl<'a> Header<'a> {
         loop {
           match iter.next() {
             Some(cookie) => {
+              let cookie_length = cookie.get_full_length();
               if &cookie.name[..] == b"SOZUBALANCEID" {
                 // if the cookie is the last one, we left the "; " from the previous cookie, so we
                 // have to delete it too
-                let full_delete = if sozu_balance_is_last { 2 } else { 0 } + cookie.get_full_length();
+                let full_delete = if sozu_balance_is_last { 2 } else { 0 } + cookie_length;
                 moves.push(BufferMove::Delete(full_delete));
               } else if sozu_balance_is_last {
                 // if sozublanceid is the last element, we want to delete the "; " chars from
                 // the before last cookie
-                let next = current_cookie;
-                let cookie_length = cookie.get_full_length();
-                if next == sozu_balance_position {
+                if (current_cookie + 1) == sozu_balance_position {
                   moves.push(BufferMove::Advance(cookie_length - 2));
                 } else {
                   moves.push(BufferMove::Advance(cookie_length));
                 }
               } else {
-                moves.push(BufferMove::Advance(cookie.get_full_length()));
+                moves.push(BufferMove::Advance(cookie_length));
               }
+
+              current_cookie += 1;
             },
             None => {
               moves.push(BufferMove::Advance(2)); // advance of 2 for the header's \r\n
               return moves;
             }
           }
-
-          current_cookie += 1;
         }
       }
     }
