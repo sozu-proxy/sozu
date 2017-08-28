@@ -46,10 +46,36 @@ impl Logger {
       logger.tag     = tag;
       logger.pid     = unsafe { libc::getpid() };
     });
+
+    log::set_logger(|max_log_level| {
+      max_log_level.set(log::LogLevelFilter::Info);
+      Box::new(CompatLogger)
+    });
   }
 
   pub fn log<'a>(&mut self, meta: &LogMetadata, args: Arguments) {
     if self.enabled(meta) {
+      match self.backend {
+        LoggerBackend::Stdout(ref mut stdout) => {
+          stdout.write_fmt(args);
+        },
+        //FIXME: should have a buffer to write to instead of allocating a string
+        LoggerBackend::Unix(ref mut socket) => {
+          socket.send(format(args).as_bytes());
+        },
+        //FIXME: should have a buffer to write to instead of allocating a string
+        LoggerBackend::Udp(ref mut socket, ref address) => {
+          socket.send_to(format(args).as_bytes(), address);
+        }
+        LoggerBackend::Tcp(ref mut socket) => {
+          socket.write_fmt(args);
+        },
+      }
+    }
+  }
+
+  pub fn compat_log<'a>(&mut self, meta: &log::LogMetadata, args: Arguments) {
+    if self.compat_enabled(meta) {
       match self.backend {
         LoggerBackend::Stdout(ref mut stdout) => {
           stdout.write_fmt(args);
@@ -80,6 +106,20 @@ impl Logger {
         Some(ref name) if !meta.target.starts_with(&**name) => {},
         Some(..) | None => {
           return meta.level <= directive.level
+        }
+      }
+    }
+    false
+  }
+
+  fn compat_enabled(&self, meta: &log::LogMetadata) -> bool {
+    // Search for the longest match, the vector is assumed to be pre-sorted.
+    for directive in self.directives.iter().rev() {
+      match directive.name {
+        Some(ref name) if !meta.target().starts_with(&**name) => {},
+        Some(..) | None => {
+          let lvl: LogLevel = meta.level().into();
+          return lvl <= directive.level
         }
       }
     }
@@ -442,6 +482,43 @@ macro_rules! trace {
         log!($crate::logging::LogLevel::Trace, concat!("{}\t", $format),
           "TRACE", module_path!());
     )
+}
+
+use log;
+struct CompatLogger;
+
+impl From<log::LogLevel> for LogLevel {
+  fn from(lvl: log::LogLevel) -> Self {
+    match lvl {
+      log::LogLevel::Error => LogLevel::Error,
+      log::LogLevel::Warn  => LogLevel::Warn,
+      log::LogLevel::Info  => LogLevel::Info,
+      log::LogLevel::Debug => LogLevel::Debug,
+      log::LogLevel::Trace => LogLevel::Trace,
+    }
+  }
+}
+
+impl log::Log for CompatLogger {
+  fn enabled(&self, metadata: &log::LogMetadata) -> bool {
+    true
+  }
+
+  fn log(&self, record: &log::LogRecord) {
+
+    TAG.with(|tag| {
+      LOGGER.with(|l| {
+        let pid = l.borrow().pid;
+        l.borrow_mut().compat_log(
+          record.metadata(),
+          format_args!(
+            concat!("{}\t{}\t{}\t{}\t{}\t{}\n"),
+            ::time::now_utc().rfc3339(), ::time::precise_time_ns(), pid,
+            record.level(), tag, record.args())
+        );
+      })
+    });
+  }
 }
 
 #[macro_export]
