@@ -604,6 +604,9 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
               break;
             }
           }
+        } else {
+          // we don't have any more elements to loop over
+          break;
         }
       }
     }
