@@ -243,13 +243,13 @@ pub struct CookieValue<'a> {
   name: &'a [u8],
   value: &'a [u8],
   semicolon: Option<&'a [u8]>,
-  spaces: Option<&'a [u8]>
+  spaces: &'a [u8]
 }
 
 impl<'a> CookieValue<'a> {
   pub fn get_full_length(&self) -> usize {
     let semicolon = if self.semicolon.is_some() { 1 } else { 0 };
-    let space = self.spaces.map(|sp| sp.len()).unwrap_or(0);
+    let space = self.spaces.len();
 
     self.name.len() + self.value.len() + semicolon + space + 1 // +1 is for =
   }
@@ -265,7 +265,7 @@ named!(pub single_request_cookie<CookieValue>,
     name: take_until_and_consume!("=") >>
     value: take_while!(is_cookie_value_char) >>
     semicolon: opt!(complete!(tag!(";"))) >>
-    spaces: opt!(complete!(take_while!(is_space))) >>
+    spaces: complete!(take_while!(is_space)) >>
     (CookieValue {
       name: name,
       value: value,
@@ -645,7 +645,7 @@ impl<'a> Header<'a> {
                 // if sozublanceid is the last element, we want to delete the "; " chars from
                 // the before last cookie
                 if (current_cookie + 1) == sozu_balance_position {
-                  let spaces = cookie.spaces.map(|s| s.len()).unwrap_or(0);
+                  let spaces = cookie.spaces.len();
                   // This one is obvious but I prefer to name the value
                   let semicolon = 1;
                   moves.push(BufferMove::Advance(cookie_length - spaces - semicolon));
@@ -3075,22 +3075,22 @@ mod tests {
     assert_eq!(some_cookies[0].name, b"FOO");
     assert_eq!(some_cookies[0].value, b"BAR");
     assert_eq!(some_cookies[0].semicolon.is_some(), true);
-    assert_eq!(some_cookies[0].spaces.unwrap().len(), 0);
+    assert_eq!(some_cookies[0].spaces.len(), 0);
 
     assert_eq!(some_cookies[1].name, b"BAR");
     assert_eq!(some_cookies[1].value, b"FOO");
     assert_eq!(some_cookies[1].semicolon.is_some(), true);
-    assert_eq!(some_cookies[1].spaces.unwrap().len(), 1);
+    assert_eq!(some_cookies[1].spaces.len(), 1);
 
     assert_eq!(some_cookies[2].name, b"SOZUBALANCEID");
     assert_eq!(some_cookies[2].value, b"0");
     assert_eq!(some_cookies[2].semicolon.is_some(), true);
-    assert_eq!(some_cookies[2].spaces.unwrap().len(), 3);
+    assert_eq!(some_cookies[2].spaces.len(), 3);
 
     assert_eq!(some_cookies[3].name, b"SOZU");
     assert_eq!(some_cookies[3].value, b"SOZU");
     assert_eq!(some_cookies[3].semicolon.is_some(), false);
-    assert_eq!(some_cookies[3].spaces.unwrap().len(), 0);
+    assert_eq!(some_cookies[3].spaces.len(), 0);
   }
 
   #[test]
