@@ -48,7 +48,7 @@ impl BackendMap {
 
       for _ in 0..self.max_failures {
         //FIXME: it's probably pretty wasteful to refilter every time here
-        let mut instances:Vec<&mut Rc<RefCell<Backend>>> = app_instances.instances.iter_mut().filter(|backend| (*backend.borrow()).can_open(max_failures_per_backend)).collect();
+        let mut instances:Vec<&mut Rc<RefCell<Backend>>> = app_instances.available_instances();
         if instances.is_empty() {
           error!("no more available backends for app {}", app_id);
           return Err(ConnectionError::NoBackendAvailable);
