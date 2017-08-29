@@ -92,26 +92,29 @@ impl BackendMap {
 
   pub fn backend_from_sticky_session(&mut self, app_id: &str, sticky_session: u32) -> Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError> {
     let max_failures_per_backend = 10;
-    if let Some(ref mut app_instances) = self.instances.get_mut(app_id) {
-      let sticky_backend: Option<&mut Rc<RefCell<Backend>>> = app_instances.iter_mut().find(|b| {
+
+    let sticky_conn: Option<Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError>> = self.instances.get_mut(app_id).and_then(|app_instances| {
+      app_instances.iter_mut().find(|b| {
         let backend = &*b.borrow();
         backend.id == sticky_session && backend.can_open(max_failures_per_backend)
-      });
-
-      if let Some(b) = sticky_backend {
-        //FIXME: hardcoded for now, these should come from configuration
-        let ref mut backend = *b.borrow_mut();
-        let conn = backend.try_connect(max_failures_per_backend);
-        info!("Connecting {} -> {:?} using session {}", app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
-        if backend.failures >= max_failures_per_backend {
-          error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
-        }
-
-        return conn.map(|c| (b.clone(), c));
+      })
+    }).map(|b| {
+      //FIXME: hardcoded for now, these should come from configuration
+      let ref mut backend = *b.borrow_mut();
+      let conn = backend.try_connect(max_failures_per_backend);
+      info!("Connecting {} -> {:?} using session {}", app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
+      if backend.failures >= max_failures_per_backend {
+        error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
       }
-    }
 
-    debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
-    Err(ConnectionError::NoBackendAvailable)
+      conn.map(|c| (b.clone(), c))
+    });
+
+    if let Some(res) = sticky_conn {
+      return res;
+    } else {
+      debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
+      return self.backend_from_app_id(app_id);
+    }
   }
 }

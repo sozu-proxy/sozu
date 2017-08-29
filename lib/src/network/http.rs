@@ -526,14 +526,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       }
 
       let conn = match (front_should_stick, sticky_session) {
-        (true, Some(session)) => {
-          if let Ok(conn) = self.backend_from_sticky_session(client, &app_id, session) {
-            Ok(conn)
-          } else {
-            self.backend_from_app_id(client, &app_id, front_should_stick)
-          }
-        },
-        (_, _) => self.backend_from_app_id(client, &app_id, front_should_stick)
+        (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session),
+        _ => self.backend_from_app_id(client, &app_id, front_should_stick),
       };
 
       match conn {

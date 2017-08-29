@@ -882,14 +882,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       let conn   = try!(unwrap_msg!(client.http()).state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
       let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();
       let conn = match (front_should_stick, sticky_session) {
-        (true, Some(session)) => {
-          if let Ok(conn) = self.backend_from_sticky_session(client, &app_id, session) {
-            Ok(conn)
-          } else {
-            self.backend_from_request(client, &host, &rl.uri, front_should_stick)
-          }
-        },
-        (_, _) => self.backend_from_request(client, &host, &rl.uri, front_should_stick)
+        (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session),
+        _ => self.backend_from_request(client, &host, &rl.uri, front_should_stick),
       };
 
       match conn {
