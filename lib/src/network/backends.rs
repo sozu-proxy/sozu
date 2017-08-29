@@ -19,18 +19,7 @@ impl BackendMap {
   }
 
   pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr) {
-    if let Some(addrs) = self.instances.get_mut(app_id) {
-      let id = addrs.instances.last().map(|b| (*b.borrow_mut()).id ).unwrap_or(0) + 1;
-      let backend = Rc::new(RefCell::new(Backend::new(*instance_address, id)));
-      if !addrs.instances.contains(&backend) {
-        addrs.instances.push(backend);
-      }
-    }
-
-    if self.instances.get(app_id).is_none() {
-      let backend = Backend::new(*instance_address, 0);
-      self.instances.insert(String::from(app_id), BackendList { instances: vec![Rc::new(RefCell::new(backend))] });
-    }
+    self.instances.entry(app_id.to_string()).or_insert(BackendList::new()).add_instance(instance_address);
   }
 
   pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr) {
@@ -93,21 +82,18 @@ impl BackendMap {
   pub fn backend_from_sticky_session(&mut self, app_id: &str, sticky_session: u32) -> Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError> {
     let max_failures_per_backend = 10;
 
-    let sticky_conn: Option<Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError>> = self.instances.get_mut(app_id).and_then(|app_instances| {
-      app_instances.instances.iter_mut().find(|b| {
-        let backend = &*b.borrow();
-        backend.id == sticky_session && backend.can_open(max_failures_per_backend)
-      })
-    }).map(|b| {
-      //FIXME: hardcoded for now, these should come from configuration
-      let ref mut backend = *b.borrow_mut();
-      let conn = backend.try_connect(max_failures_per_backend);
-      info!("Connecting {} -> {:?} using session {}", app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
-      if backend.failures >= max_failures_per_backend {
-        error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
-      }
+    let sticky_conn: Option<Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError>> = self.instances
+      .get_mut(app_id)
+      .and_then(|app_instances| app_instances.find_sticky(sticky_session, max_failures_per_backend))
+      .map(|b| {
+        let ref mut backend = *b.borrow_mut();
+        let conn = backend.try_connect(max_failures_per_backend);
+        info!("Connecting {} -> {:?} using session {}", app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
+        if backend.failures >= max_failures_per_backend {
+          error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
+        }
 
-      conn.map(|c| (b.clone(), c))
+        conn.map(|c| (b.clone(), c))
     });
 
     if let Some(res) = sticky_conn {
@@ -121,14 +107,37 @@ impl BackendMap {
 
 pub struct BackendList {
   pub instances: Vec<Rc<RefCell<Backend>>>,
+  pub next_id:   u32,
 }
 
 impl BackendList {
+  pub fn new() -> BackendList {
+    BackendList {
+      instances: Vec::new(),
+      next_id:   0,
+    }
+  }
+
+  pub fn add_instance(&mut self, instance_address: &SocketAddr) {
+    if self.instances.iter().find(|b| &(*b.borrow()).address == instance_address).is_none() {
+      let backend = Rc::new(RefCell::new(Backend::new(*instance_address, self.next_id)));
+      self.instances.push(backend);
+      self.next_id += 1;
+    }
+  }
+
   pub fn remove_instance(&mut self, instance_address: &SocketAddr) {
     self.instances.retain(|backend| &(*backend.borrow()).address != instance_address);
   }
 
   pub fn find_instance(&mut self, instance_address: &SocketAddr) -> Option<&mut Rc<RefCell<Backend>>> {
     self.instances.iter_mut().find(|backend| &(*backend.borrow()).address == instance_address)
+  }
+
+  pub fn find_sticky(&mut self, sticky_session: u32, max_failures_per_backend: usize) -> Option<&mut Rc<RefCell<Backend>>> {
+    self.instances.iter_mut().find(|b| {
+      let backend = &*b.borrow();
+      backend.id == sticky_session && backend.can_open(max_failures_per_backend)
+    })
   }
 }
