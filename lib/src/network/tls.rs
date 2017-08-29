@@ -1207,7 +1207,7 @@ mod tests {
     let server_config = ServerConfiguration {
       listener:  listener,
       address:   front,
-      instances: HashMap::new(),
+      instances: BackendMap::new(),
       fronts:    fronts,
       domains:   rc_domains,
       default_context: tls_data,

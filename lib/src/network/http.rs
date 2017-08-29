@@ -882,7 +882,7 @@ mod tests {
     let server_config = ServerConfiguration {
       listener:  listener,
       address:   front,
-      instances: HashMap::new(),
+      instances: BackendMap::new(),
       fronts:    fronts,
       pool:      Rc::new(RefCell::new(Pool::with_capacity(1,0, || BufferQueue::with_capacity(16384)))),
       front_timeout: 50000,
