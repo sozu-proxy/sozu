@@ -123,10 +123,15 @@ impl BackendList {
   }
 
   pub fn find_sticky(&mut self, sticky_session: u32) -> Option<&mut Rc<RefCell<Backend>>> {
-    self.instances.iter_mut().find(|b| {
-      let backend = &*b.borrow();
-      backend.id == sticky_session && backend.can_open(max_failures_per_backend)
-    })
+    self.instances.iter_mut()
+      .find(|b| b.borrow().id == sticky_session )
+      .and_then(|b| {
+        if b.borrow().can_open(max_failures_per_backend) {
+          Some(b)
+        } else {
+          None
+        }
+      })
   }
 
   pub fn available_instances(&mut self) -> Vec<&mut Rc<RefCell<Backend>>> {
