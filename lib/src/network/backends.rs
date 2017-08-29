@@ -71,10 +71,10 @@ impl BackendMap {
 
         let conn = instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut b| {
           let ref mut backend = *b.borrow_mut();
-          //info!("{}\tConnecting {} -> {:?}", client.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), app_id, (backend.address, backend.active_connections, backend.failures));
+          info!("Connecting {} -> {:?}", app_id, (backend.address, backend.active_connections, backend.failures));
           let conn = backend.try_connect(max_failures_per_backend);
           if backend.failures >= max_failures_per_backend {
-            //error!("{}\tbackend {:?} connections failed {} times, disabling it", client.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), (backend.address, backend.active_connections), backend.failures);
+            error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
           }
 
           conn.map(|c| (b.clone(), c))
@@ -102,9 +102,9 @@ impl BackendMap {
         //FIXME: hardcoded for now, these should come from configuration
         let ref mut backend = *b.borrow_mut();
         let conn = backend.try_connect(max_failures_per_backend);
-        //info!("{}\tConnecting {} -> {:?} using session {}", client.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
+        info!("Connecting {} -> {:?} using session {}", app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
         if backend.failures >= max_failures_per_backend {
-          //error!("{}\tbackend {:?} connections failed {} times, disabling it", client.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), (backend.address, backend.active_connections), backend.failures);
+          error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
         }
 
         return conn.map(|c| (b.clone(), c));
