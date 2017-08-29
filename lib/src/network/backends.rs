@@ -47,16 +47,7 @@ impl BackendMap {
       }
 
       for _ in 0..self.max_failures {
-        //FIXME: it's probably pretty wasteful to refilter every time here
-        let mut instances:Vec<&mut Rc<RefCell<Backend>>> = app_instances.available_instances();
-        if instances.is_empty() {
-          error!("no more available backends for app {}", app_id);
-          return Err(ConnectionError::NoBackendAvailable);
-        }
-        let rnd = random::<usize>();
-        let idx = rnd % instances.len();
-
-        let conn = instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut b| {
+        if let Some(ref mut b) = app_instances.next_available_instance() {
           let ref mut backend = *b.borrow_mut();
           info!("Connecting {} -> {:?}", app_id, (backend.address, backend.active_connections, backend.failures));
           let conn = backend.try_connect();
@@ -64,11 +55,10 @@ impl BackendMap {
             error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
           }
 
-          conn.map(|c| (b.clone(), c))
-        });
-
-        if conn.is_ok() {
-          return conn;
+          return conn.map(|c| (b.clone(), c));
+        } else {
+          error!("no more available backends for app {}", app_id);
+          return Err(ConnectionError::NoBackendAvailable);
         }
       }
       Err(ConnectionError::NoBackendAvailable)
@@ -143,5 +133,17 @@ impl BackendList {
     self.instances.iter_mut()
       .filter(|backend| (*backend.borrow()).can_open(max_failures_per_backend))
       .collect()
+  }
+
+  pub fn next_available_instance(&mut self) -> Option<&mut Rc<RefCell<Backend>>> {
+    let mut instances:Vec<&mut Rc<RefCell<Backend>>> = self.available_instances();
+    if instances.is_empty() {
+      return None;
+    }
+
+    let rnd = random::<usize>();
+    let idx = rnd % instances.len();
+
+    Some(instances.remove(idx))
   }
 }
