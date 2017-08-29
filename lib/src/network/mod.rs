@@ -11,6 +11,7 @@ pub mod trie;
 pub mod protocol;
 pub mod http;
 pub mod tls;
+pub mod backends;
 
 #[cfg(feature = "splice")]
 mod splice;
@@ -20,6 +21,8 @@ pub mod proxy;
 pub mod session;
 
 use mio::Token;
+
+pub type AppId = String;
 
 #[derive(Debug)]
 pub enum Protocol {
