@@ -1,14 +1,14 @@
 use nom::{IResult, is_space};
 
 #[derive(Debug)]
-pub struct CookieValue<'a> {
+pub struct RequestCookie<'a> {
   pub name: &'a [u8],
   pub value: &'a [u8],
   pub semicolon: Option<&'a [u8]>,
   pub spaces: &'a [u8]
 }
 
-impl<'a> CookieValue<'a> {
+impl<'a> RequestCookie<'a> {
   pub fn get_full_length(&self) -> usize {
     let semicolon = if self.semicolon.is_some() { 1 } else { 0 };
     let space = self.spaces.len();
@@ -22,13 +22,13 @@ pub fn is_cookie_value_char(chr: u8) -> bool {
   chr != 32 && chr != 44 && chr != 59
 }
 
-named!(pub single_request_cookie<CookieValue>,
+named!(pub single_request_cookie<RequestCookie>,
   do_parse!(
     name: take_until_and_consume!("=") >>
     value: take_while!(is_cookie_value_char) >>
     semicolon: opt!(complete!(tag!(";"))) >>
     spaces: complete!(take_while!(is_space)) >>
-    (CookieValue {
+    (RequestCookie {
       name: name,
       value: value,
       semicolon: semicolon,
@@ -37,8 +37,8 @@ named!(pub single_request_cookie<CookieValue>,
   )
 );
 
-pub fn parse_request_cookies(input: &[u8]) -> Option<Vec<CookieValue>> {
-  let res: IResult<&[u8], Vec<CookieValue>> = many0!(input, single_request_cookie);
+pub fn parse_request_cookies(input: &[u8]) -> Option<Vec<RequestCookie>> {
+  let res: IResult<&[u8], Vec<RequestCookie>> = many0!(input, single_request_cookie);
 
   if let IResult::Done(_, o) = res {
     Some(o)

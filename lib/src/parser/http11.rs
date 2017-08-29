@@ -4,7 +4,7 @@
 use sozu_command::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::protocol::StickySession;
-use parser::cookies::{CookieValue, parse_request_cookies};
+use parser::cookies::{RequestCookie, parse_request_cookies};
 
 use nom::{HexDisplay,IResult,Offset};
 use nom::IResult::*;
@@ -640,7 +640,7 @@ pub enum HeaderValue<'a> {
   //FIXME: are the references in Connection still valid after we delete that part of the headers?
   Connection(Vec<&'a [u8]>),
   Upgrade(&'a[u8]),
-  Cookie(Vec<CookieValue<'a>>),
+  Cookie(Vec<RequestCookie<'a>>),
   Other(&'a[u8],&'a[u8]),
   Forwarded,
   ExpectContinue,
