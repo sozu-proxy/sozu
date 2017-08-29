@@ -203,8 +203,8 @@ impl Backend {
     }
   }
 
-  pub fn try_connect(&mut self, max_failures: usize) -> Result<mio::tcp::TcpStream, ConnectionError> {
-    if self.failures >= max_failures || self.status == BackendStatus::Closing || self.status == BackendStatus::Closed {
+  pub fn try_connect(&mut self) -> Result<mio::tcp::TcpStream, ConnectionError> {
+    if self.status != BackendStatus::Normal {
       return Err(ConnectionError::NoBackendAvailable);
     }
 

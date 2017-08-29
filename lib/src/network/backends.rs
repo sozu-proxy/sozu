@@ -8,13 +8,15 @@ use mio::net::TcpStream;
 use network::{AppId,Backend,ConnectionError};
 
 pub struct BackendMap {
-  pub instances: HashMap<AppId, BackendList>,
+  pub instances:    HashMap<AppId, BackendList>,
+  pub max_failures: usize,
 }
 
 impl BackendMap {
   pub fn new() -> BackendMap {
     BackendMap {
-      instances: HashMap::new(),
+      instances:    HashMap::new(),
+      max_failures: 3,
     }
   }
 
@@ -44,11 +46,7 @@ impl BackendMap {
         return Err(ConnectionError::NoBackendAvailable);
       }
 
-      //FIXME: hardcoded for now, these should come from configuration
-      let max_failures_per_backend:usize = 10;
-      let max_failures:usize             = 3;
-
-      for _ in 0..max_failures {
+      for _ in 0..self.max_failures {
         //FIXME: it's probably pretty wasteful to refilter every time here
         let mut instances:Vec<&mut Rc<RefCell<Backend>>> = app_instances.instances.iter_mut().filter(|backend| (*backend.borrow()).can_open(max_failures_per_backend)).collect();
         if instances.is_empty() {
@@ -61,7 +59,7 @@ impl BackendMap {
         let conn = instances.get_mut(idx).ok_or(ConnectionError::NoBackendAvailable).and_then(|ref mut b| {
           let ref mut backend = *b.borrow_mut();
           info!("Connecting {} -> {:?}", app_id, (backend.address, backend.active_connections, backend.failures));
-          let conn = backend.try_connect(max_failures_per_backend);
+          let conn = backend.try_connect();
           if backend.failures >= max_failures_per_backend {
             error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
           }
@@ -80,14 +78,12 @@ impl BackendMap {
   }
 
   pub fn backend_from_sticky_session(&mut self, app_id: &str, sticky_session: u32) -> Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError> {
-    let max_failures_per_backend = 10;
-
     let sticky_conn: Option<Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError>> = self.instances
       .get_mut(app_id)
-      .and_then(|app_instances| app_instances.find_sticky(sticky_session, max_failures_per_backend))
+      .and_then(|app_instances| app_instances.find_sticky(sticky_session))
       .map(|b| {
         let ref mut backend = *b.borrow_mut();
-        let conn = backend.try_connect(max_failures_per_backend);
+        let conn = backend.try_connect();
         info!("Connecting {} -> {:?} using session {}", app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
         if backend.failures >= max_failures_per_backend {
           error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
@@ -104,6 +100,8 @@ impl BackendMap {
     }
   }
 }
+
+const max_failures_per_backend: usize = 10;
 
 pub struct BackendList {
   pub instances: Vec<Rc<RefCell<Backend>>>,
@@ -134,10 +132,16 @@ impl BackendList {
     self.instances.iter_mut().find(|backend| &(*backend.borrow()).address == instance_address)
   }
 
-  pub fn find_sticky(&mut self, sticky_session: u32, max_failures_per_backend: usize) -> Option<&mut Rc<RefCell<Backend>>> {
+  pub fn find_sticky(&mut self, sticky_session: u32) -> Option<&mut Rc<RefCell<Backend>>> {
     self.instances.iter_mut().find(|b| {
       let backend = &*b.borrow();
       backend.id == sticky_session && backend.can_open(max_failures_per_backend)
     })
+  }
+
+  pub fn available_instances(&mut self) -> Vec<&mut Rc<RefCell<Backend>>> {
+    self.instances.iter_mut()
+      .filter(|backend| (*backend.borrow()).can_open(max_failures_per_backend))
+      .collect()
   }
 }
