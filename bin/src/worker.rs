@@ -1,5 +1,5 @@
 use mio_uds::UnixStream;
-use mio::Poll;
+use mio::{Poll,Ready};
 use libc::{self,c_char,uint32_t,int32_t,pid_t};
 use std::io;
 use std::ffi::CString;
@@ -68,9 +68,10 @@ pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
   //println!("got message: {:?}", proxy_config);
 
   logging::setup(format!("{}-{}", "TAG", id), &proxy_config.log_level, &proxy_config.log_target);
+  info!("starting...");
 
   command.set_nonblocking(true);
-  let command: Channel<OrderMessageAnswer,OrderMessage> = command.into();
+  let mut command: Channel<OrderMessageAnswer,OrderMessage> = command.into();
 
   if let Some(ref metrics) = proxy_config.metrics.as_ref() {
     metrics_set_up!(&metrics.address[..], metrics.port);
@@ -96,6 +97,7 @@ pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
   });
   //TODO: implement for TCP
 
+  command.readiness.insert(Ready::readable());
   let mut server = Server::new(event_loop, command, http_session, https_session, None);
   info!("starting event loop");
   server.run();
