@@ -306,7 +306,12 @@ impl CommandServer {
     let res = channel.read_message();
     info!("upgrade channel sent: {:?}", res);
     if let Some(true) = res {
-      self.answer_success(token, message_id, "new master process launched, closing the old one", None);
+      self.clients[token].channel.write_message(&ConfigMessageAnswer::new(
+        message_id.into(),
+        ConfigMessageStatus::Ok,
+        "new master process launched, closing the old one".into(),
+        None
+      ));
       info!("wrote final message, closing");
       //FIXME: should do some cleanup before exiting
       sleep(Duration::from_secs(2));
