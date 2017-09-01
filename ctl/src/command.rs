@@ -12,6 +12,12 @@ fn generate_id() -> String {
   format!("ID-{}", s)
 }
 
+fn generate_tagged_id(tag: &str) -> String {
+  let s: String = thread_rng().gen_ascii_chars().take(6).collect();
+  format!("{}-{}", tag, s)
+}
+
+
 pub fn save_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path: &str) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
@@ -177,7 +183,7 @@ pub fn hard_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
 }
 
 pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
-  let id = generate_id();
+  let id = generate_tagged_id("LIST-WORKERS");
   channel.write_message(&ConfigMessage::new(
     id.clone(),
     ConfigCommand::ListWorkers,
@@ -207,7 +213,7 @@ pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
             let mut stopping:  HashSet<String> = HashSet::new();
 
             for ref worker in workers.iter().filter(|worker| worker.run_state == RunState::Running) {
-              let id = generate_id();
+              let id = generate_tagged_id("LAUNCH-WORKER");
               let msg = ConfigMessage::new(
                 id.clone(),
                 ConfigCommand::LaunchWorker("BLAH".to_string()),
@@ -219,7 +225,7 @@ pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
             }
 
             for ref worker in workers.iter().filter(|worker| worker.run_state == RunState::Running) {
-              let id = generate_id();
+              let id = generate_tagged_id("SOFT-STOP-WORKER");
               let msg = ConfigMessage::new(
                 id.clone(),
                 ConfigCommand::ProxyConfiguration(Order::SoftStop),
@@ -270,12 +276,13 @@ pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
             }
 
             println!("worker upgrade done");
-            let id = generate_id();
+            let id = generate_tagged_id("UPGRADE-MASTER");
             channel.write_message(&ConfigMessage::new(
               id.clone(),
               ConfigCommand::UpgradeMaster,
               None,
             ));
+            println!("master upgrade message sent: {}", id);
 
             loop {
               match channel.read_message() {
