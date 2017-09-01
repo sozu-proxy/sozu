@@ -337,7 +337,12 @@ impl CommandServer {
     }
 
     self.state.handle_order(&order);
-    self.order_state.insert_task(message_id, MessageType::WorkerOrder, Some(token));
+
+    if order == Order::SoftStop {
+      self.order_state.insert_task(message_id, MessageType::Stop, Some(token));
+    } else {
+      self.order_state.insert_task(message_id, MessageType::WorkerOrder, Some(token));
+    }
 
     let mut found = false;
     for ref mut proxy in self.proxies.values_mut() {

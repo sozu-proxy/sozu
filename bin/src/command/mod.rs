@@ -23,6 +23,7 @@ pub mod client;
 pub mod state;
 
 use self::client::CommandClient;
+use self::state::MessageType;
 
 const SERVER: Token = Token(0);
 const HALF_USIZE: usize = 0x8000000000000000usize;
@@ -466,6 +467,11 @@ impl CommandServer {
             let opt_token = task.client.clone();
             let id        = task.id.clone();
             let answer = if task.error.is_empty() {
+              if task.message_type == MessageType::Stop {
+                if let Some(ref mut proxy) = self.proxies.get_mut(&token) {
+                  proxy.run_state = RunState::Stopped;
+                }
+              }
               ConfigMessageAnswer::new(
                 id,
                 ConfigMessageStatus::Ok,
@@ -484,13 +490,6 @@ impl CommandServer {
             if let Some(client_token) = opt_token {
               info!("SENDING to client[{}]: {:#?}", client_token.0, answer);
               self.clients[client_token].push_message(answer);
-            }
-
-            //FIXME: the task should hold the message type,
-            //so we can know it's a stop message
-            if stopping {
-              self.must_stop = true;
-
             }
           }
         }

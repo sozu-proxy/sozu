@@ -84,19 +84,20 @@ impl OrderState {
   }
 }
 
-#[derive(Clone,Debug)]
+#[derive(Clone,Debug,PartialEq)]
 pub enum MessageType {
   LaunchWorker,
   LoadState,
   WorkerOrder,
   Metrics,
+  Stop,
 }
 
 #[derive(Clone,Debug)]
 pub struct Task {
   pub id:         String,
   pub client:     Option<FrontToken>,
-  message_type:   MessageType,
+  pub message_type: MessageType,
   pub processing: HashSet<WorkerMessageKey>,
   pub ok:         HashSet<WorkerMessageKey>,
   pub error:      HashSet<WorkerMessageKey>,
@@ -118,7 +119,6 @@ impl Task {
 
   pub fn generate_data(mut self) -> Option<AnswerData> {
     match self.message_type {
-      MessageType::LaunchWorker | MessageType::WorkerOrder | MessageType::LoadState => None,
       MessageType::Metrics => {
         let mut data: BTreeMap<String, BTreeMap<String, FilteredData>> = self.data.into_iter().map(|(tag, metrics)| {
           let OrderMessageAnswerData::Metrics(d) = metrics;
@@ -129,7 +129,8 @@ impl Task {
         });
         data.insert(String::from("master"), master_metrics);
         Some(AnswerData::Metrics(data))
-      }
+      },
+      _ => None,
     }
   }
 }
