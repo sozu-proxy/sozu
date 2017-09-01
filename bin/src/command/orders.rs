@@ -268,7 +268,8 @@ impl CommandServer {
           let o = order.clone();
           //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
           self.clients[token].add_message_id(worker_message_id.clone());
-          worker.push_message(OrderMessage { id: worker_message_id.clone(), order: o });
+          let sending_order = OrderMessage { id: worker_message_id.clone(), order: o };
+          worker.channel.write_message(&sending_order);
 
           let received = worker.channel.read_message();
           info!("worker ({}-{}) sent: {:?}", tag, worker.id, received);
