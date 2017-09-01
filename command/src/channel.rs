@@ -115,6 +115,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
 
       match self.sock.read(self.front_buf.space()) {
         Ok(0) => {
+          self.readiness.remove(Ready::readable());
           break;
         },
         Err(e) => {
