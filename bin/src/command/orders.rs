@@ -238,7 +238,7 @@ impl CommandServer {
   }
 
   pub fn launch_worker(&mut self, token: FrontToken, message: &ConfigMessage, tag: &str) {
-    let id = self.next_id + 1;
+    let id = self.next_id;
     if let Ok(mut worker) = start_worker(id, &self.config) {
       self.clients[token].push_message(ConfigMessageAnswer::new(
           message.id.clone(),
