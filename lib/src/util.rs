@@ -14,7 +14,7 @@ pub trait UnwrapLog<T> {
 impl<T> UnwrapLog<T> for Option<T> {
   fn unwrap_log(self, file: &str, line: u32, module_path: &str, expression: &str) -> T {
     match self {
-      Some(T) => T,
+      Some(t) => t,
       None    => panic!("{}:{} {} this should not have panicked:\ntried to unwrap `None` in:\nunwrap_msg!({})", file, line, module_path, expression)
     }
   }
@@ -23,7 +23,7 @@ impl<T> UnwrapLog<T> for Option<T> {
 impl<T,E:Debug> UnwrapLog<T> for Result<T,E> {
   fn unwrap_log(self, file: &str, line: u32, module_path: &str, expression: &str) -> T {
     match self {
-      Ok(T)  => T,
+      Ok(t)  => t,
       Err(e) => panic!("{}:{} {} this should not have panicked:\ntried to unwrap Err({:?}) in\nunwrap_msg!({})", file, line, module_path, e, expression)
     }
   }

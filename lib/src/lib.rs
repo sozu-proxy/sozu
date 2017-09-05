@@ -155,7 +155,6 @@
 extern crate test;
 
 #[macro_use] extern crate nom;
-#[macro_use] extern crate lazy_static;
 extern crate mio;
 extern crate url;
 extern crate log;

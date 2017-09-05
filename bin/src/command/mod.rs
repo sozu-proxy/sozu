@@ -7,7 +7,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::io::{self,ErrorKind};
 use std::os::unix::fs::PermissionsExt;
-use std::collections::{HashMap,HashSet,VecDeque};
+use std::collections::{HashMap,VecDeque};
 use std::time::Duration;
 use libc::{pid_t,kill};
 
@@ -15,8 +15,8 @@ use sozu::network::metrics::METRICS;
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
-use sozu_command::data::{AnswerData,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
-use sozu_command::messages::{Order,OrderMessage,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus};
+use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
+use sozu_command::messages::{OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 
 pub mod orders;
 pub mod client;
@@ -430,14 +430,6 @@ impl CommandServer {
   fn handle_worker_message(&mut self, token: Token, msg: OrderMessageAnswer) {
     trace!("proxy handle message: token {:?} got answer msg: {:?}", token, msg);
     if msg.status != OrderMessageStatus::Processing {
-      let mut stopping = false;
-      if let Some(ref mut proxy) = self.proxies.get_mut(&token) {
-        //FIXME:  handle STOP order here
-        //if order == Order::SoftStop || order == Order::HardStop {
-        //  stopping = true;
-        //  proxy.run_state = RunState::Stopped
-        //}
-      }
 
       let tag = self.proxies.get(&token).map(|worker| worker.id.to_string()).unwrap_or(String::from(""));
 

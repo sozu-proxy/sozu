@@ -3,7 +3,6 @@
 #[macro_use] extern crate serde_derive;
 extern crate mio;
 extern crate mio_uds;
-extern crate serde;
 extern crate serde_json;
 extern crate time;
 extern crate libc;

@@ -1,9 +1,9 @@
-use mio::{Ready,Token};
+use mio::Token;
 use std::collections::{BTreeMap,HashMap,HashSet};
 
 use sozu::network::metrics::METRICS;
-use sozu_command::messages::{FilteredData,Order,OrderMessageAnswerData};
-use sozu_command::data::{AnswerData,ConfigMessage,ConfigMessageAnswer};
+use sozu_command::messages::{FilteredData,OrderMessageAnswerData};
+use sozu_command::data::AnswerData;
 use command::FrontToken;
 
 pub type ClientMessageId  = String;

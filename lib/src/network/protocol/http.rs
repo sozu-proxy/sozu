@@ -686,7 +686,7 @@ impl<Front:SocketHandler> Http<Front> {
     if let Some(sz) = self.state.as_ref().map(|st| st.must_continue()).unwrap_or(None) {
       trace!("100 continue wrote {} bytes to backend, resetting response state", sz);
       if let Some(ref mut state) = self.state.as_mut() {
-        state.request.as_mut().map(|r| r.get_mut_connection().map(|mut conn| conn.continues = Continue::None));
+        state.request.as_mut().map(|r| r.get_mut_connection().map(|conn| conn.continues = Continue::None));
         state.response       = Some(ResponseState::Initial);
         state.res_header_end = None;
       }

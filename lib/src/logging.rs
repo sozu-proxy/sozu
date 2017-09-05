@@ -1,8 +1,7 @@
 use libc;
 use std::str::FromStr;
- use std::cell::RefCell;
+use std::cell::RefCell;
 use std::cmp::{self,Ord};
-use std::sync::Mutex;
 use std::fmt::{Arguments,format};
 use std::io::{stdout,Stdout,Write};
 use std::ascii::AsciiExt;
@@ -47,7 +46,7 @@ impl Logger {
       logger.pid     = unsafe { libc::getpid() };
     });
 
-    log::set_logger(|max_log_level| {
+    let _ = log::set_logger(|max_log_level| {
       max_log_level.set(log::LogLevelFilter::Info);
       Box::new(CompatLogger)
     });
@@ -500,7 +499,7 @@ impl From<log::LogLevel> for LogLevel {
 }
 
 impl log::Log for CompatLogger {
-  fn enabled(&self, metadata: &log::LogMetadata) -> bool {
+  fn enabled(&self, _: &log::LogMetadata) -> bool {
     true
   }
 

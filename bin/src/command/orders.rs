@@ -3,11 +3,10 @@ use std::str;
 use std::process;
 use std::io::Read;
 use std::io::Write;
-use std::iter::FromIterator;
 use std::convert::Into;
 use std::thread::sleep;
 use std::time::Duration;
-use std::collections::{HashMap,HashSet};
+use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd,FromRawFd};
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 use slab::Slab;
@@ -19,7 +18,6 @@ use nom::{HexDisplay,IResult,Offset};
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
-use sozu_command::state::ConfigState;
 use sozu_command::messages::{Order,OrderMessage};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 
@@ -209,7 +207,7 @@ impl CommandServer {
         info!("state loaded from {}, will start sending {} ùessages to workers", path, counter);
         } else {
           info!("no messages sent to workers: local state already had those messages");
-          if let Some(task) = self.order_state.state.remove(message_id) {
+          if let Some(_) = self.order_state.state.remove(message_id) {
             if let Some(token) = token_opt {
               let answer = ConfigMessageAnswer::new(
                 message_id.to_string(),
@@ -254,7 +252,7 @@ impl CommandServer {
       self.token_count = worker_token;
       worker.token     = Some(Token(worker_token));
 
-      if let Some(ref previous) = self.proxies.values().filter(|ref proxy| {
+      if let Some(_) = self.proxies.values().filter(|ref proxy| {
         proxy.run_state == RunState::Running
       }).next() {
         worker.channel.set_blocking(true);
@@ -309,7 +307,7 @@ impl CommandServer {
       self.clients[token].channel.write_message(&ConfigMessageAnswer::new(
         message_id.into(),
         ConfigMessageStatus::Ok,
-        "new master process launched, closing the old one".into(),
+        format!("new master process launched with pid {}, closing the old one", pid),
         None
       ));
       info!("wrote final message, closing");
@@ -324,7 +322,6 @@ impl CommandServer {
   pub fn metrics(&mut self, token: FrontToken, message_id: &str) {
     self.order_state.insert_task(message_id, MessageType::Metrics, Some(token));
 
-    let mut found = false;
     for ref mut proxy in self.proxies.values_mut() {
       self.order_state.insert_worker_message(message_id, message_id, proxy.token.expect("worker should have a valid token"));
       trace!("sending to {:?}, inflight is now {:#?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
@@ -476,7 +473,6 @@ impl CommandServer {
       let stream = unsafe { UnixStream::from_raw_fd(serialized.fd) };
       if let Some(token) = serialized.token {
         info!("registering: {:?}", poll.register(&stream, Token(token), Ready::all(), PollOpt::edge()));
-        let worker_state = state.clone();
         Some(
           (
             Token(token),
