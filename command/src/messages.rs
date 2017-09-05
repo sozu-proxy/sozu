@@ -1,7 +1,5 @@
-use serde::{self,Serialize};
-use serde::ser::SerializeMap;
+use serde;
 use serde::de::{self, Visitor};
-use serde_json;
 use hex::{FromHex,ToHex};
 use openssl::ssl;
 use std::net::{IpAddr,SocketAddr};

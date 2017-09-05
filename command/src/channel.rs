@@ -67,7 +67,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
       let fd = self.sock.as_raw_fd();
       let stream = net::UnixStream::from_raw_fd(fd);
       stream.set_nonblocking(nonblocking);
-      let fd = stream.into_raw_fd();
+      let _fd = stream.into_raw_fd();
     }
     self.blocking = !nonblocking;
   }
