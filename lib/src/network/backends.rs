@@ -11,7 +11,6 @@ use network::{AppId,Backend,ConnectionError};
 
 pub struct BackendMap {
   pub instances:    HashMap<AppId, BackendList>,
-  pub retry_policy: ExponentialBackoffPolicy,
   pub max_failures: usize,
 }
 
@@ -19,7 +18,6 @@ impl BackendMap {
   pub fn new() -> BackendMap {
     BackendMap {
       instances:    HashMap::new(),
-      retry_policy: ExponentialBackoffPolicy::new(MAX_FAILURES_PER_BACKEND),
       max_failures: 3,
     }
   }
@@ -50,49 +48,41 @@ impl BackendMap {
         return Err(ConnectionError::NoBackendAvailable);
       }
 
-      let mut retry_policy: &mut ExponentialBackoffPolicy = &mut self.retry_policy;
-      retry_policy.try(|| {
+      for _ in 0..self.max_failures {
         if let Some(ref mut b) = app_instances.next_available_instance() {
           let ref mut backend = *b.borrow_mut();
-
           info!("Connecting {} -> {:?}", app_id, (backend.address, backend.active_connections, backend.failures));
-
           let conn = backend.try_connect();
           if backend.failures >= MAX_FAILURES_PER_BACKEND {
             error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
           }
 
           return conn.map(|c| (b.clone(), c));
+        } else {
+          error!("no more available backends for app {}", app_id);
+          return Err(ConnectionError::NoBackendAvailable);
         }
-
-        error!("no more available backends for app {}", app_id);
-        Err(ConnectionError::NoBackendAvailable)
-      })
+      }
+      Err(ConnectionError::NoBackendAvailable)
     } else {
       Err(ConnectionError::NoBackendAvailable)
     }
   }
 
   pub fn backend_from_sticky_session(&mut self, app_id: &str, sticky_session: u32) -> Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError> {
-    let sticky_conn: Option<Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError>>;
-    {
-      let retry_policy: &mut ExponentialBackoffPolicy = &mut self.retry_policy;
-      sticky_conn = self.instances
+    let sticky_conn: Option<Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError>> = self.instances
         .get_mut(app_id)
         .and_then(|app_instances| app_instances.find_sticky(sticky_session))
         .map(|b| {
-          retry_policy.try(|| {
-            let ref mut backend = *b.borrow_mut();
-            let conn = backend.try_connect();
-            info!("Connecting {} -> {:?} using session {}", app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
-            if backend.failures >= MAX_FAILURES_PER_BACKEND {
-              error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
-            }
+          let ref mut backend = *b.borrow_mut();
+          let conn = backend.try_connect();
+          info!("Connecting {} -> {:?} using session {}", app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
+          if backend.failures >= MAX_FAILURES_PER_BACKEND {
+            error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
+          }
 
-            conn.map(|c| (b.clone(), c))
-          })
+          conn.map(|c| (b.clone(), c))
         });
-    }
 
     if let Some(res) = sticky_conn {
       return res;
@@ -108,24 +98,38 @@ const MAX_FAILURES_PER_BACKEND: usize = 10;
 pub trait RetryPolicy {
   fn max_tries(&self) -> usize;
   fn current_tries(&self) -> usize;
-  fn try<T, F: FnMut() -> Result<T, ConnectionError>>(&mut self, action: F) -> Result<T, ConnectionError>;
 
-  fn can_try(&self) -> bool {
-    self.current_tries() <= self.max_tries()
+  fn fail(&mut self);
+  fn succeed(&mut self);
+
+  fn can_try(&self) -> Option<RetryAction> {
+    if self.current_tries() >= self.max_tries() {
+      None
+    } else {
+      Some(RetryAction::OKAY)
+    }
   }
+}
+
+pub enum RetryAction {
+  OKAY, WAIT
 }
 
 #[derive(Debug)]
 pub struct ExponentialBackoffPolicy {
   max_tries: usize,
-  current_tries: usize
+  current_tries: usize,
+  last_try: time::Instant,
+  wait: time::Duration
 }
 
 impl ExponentialBackoffPolicy {
   pub fn new(max_tries: usize) -> Self {
     ExponentialBackoffPolicy {
-      max_tries: max_tries,
-      current_tries: 0
+      max_tries,
+      current_tries: 0,
+      last_try: time::Instant::now(),
+      wait: time::Duration::default()
     }
   }
 }
@@ -139,29 +143,38 @@ impl RetryPolicy for ExponentialBackoffPolicy {
     self.current_tries
   }
 
-  fn try<T, F: FnMut() -> Result<T, ConnectionError>>(&mut self, mut action: F) -> Result<T, ConnectionError> {
-    if self.can_try() {
-      if let Ok(result) = action() {
-        self.current_tries = 0;
+  fn fail(&mut self) {
+    let millis = cmp::max(1, 1 << self.current_tries) * 1000;
+    self.wait = time::Duration::from_millis(millis);
+    self.last_try = time::Instant::now();
+    self.current_tries += 1;
+  }
 
-        return Ok(result)
-      } else {
-        let millis = cmp::max(1, 1 << self.current_tries) * 1000;
-        let sleep_duration = time::Duration::from_millis(millis);
-        thread::sleep(sleep_duration);
+  fn succeed(&mut self) {
+    self.wait = time::Duration::default();
+    self.last_try = time::Instant::now();
+    self.current_tries = 0;
+  }
 
-        self.current_tries += 1;
-        return self.try(action);
-      }
-    } else {
-        return Err(ConnectionError::NoBackendAvailable);
+  fn can_try(&self) -> Option<RetryAction> {
+    if self.current_tries() >= self.max_tries() {
+      return None;
     }
+
+    let action = if self.last_try.elapsed().gt(&self.wait) {
+      RetryAction::OKAY
+    } else {
+      RetryAction::WAIT
+    };
+
+    Some(action)
   }
 }
 
 pub struct BackendList {
   pub instances: Vec<Rc<RefCell<Backend>>>,
   pub next_id:   u32,
+  pub retry_policy: Box<RetryPolicy>,
 }
 
 impl BackendList {
@@ -169,6 +182,7 @@ impl BackendList {
     BackendList {
       instances: Vec::new(),
       next_id:   0,
+      retry_policy: Box::new(ExponentialBackoffPolicy::new(MAX_FAILURES_PER_BACKEND)),
     }
   }
 
