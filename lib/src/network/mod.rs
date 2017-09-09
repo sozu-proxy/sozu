@@ -144,22 +144,22 @@ pub enum BackendStatus {
 }
 
 #[derive(Debug,PartialEq,Eq)]
-pub struct Backend {
+pub struct Backend<T: retry::RetryPolicy> {
   pub id:                 u32,
   pub address:            SocketAddr,
   pub status:             BackendStatus,
-  pub retry_policy:       Box<retry::RetryPolicy>,
+  pub retry_policy:       T,
   pub active_connections: usize,
   pub failures:           usize,
 }
 
-impl Backend {
-  pub fn new(addr: SocketAddr, id: u32) -> Backend {
+impl <T: retry::RetryPolicy> Backend<T> {
+  pub fn new(addr: SocketAddr, id: u32) -> Backend<retry::ExponentialBackoffPolicy> {
     Backend {
       id:                 id,
       address:            addr,
       status:             BackendStatus::Normal,
-      retry_policy:       Box::new(retry::ExponentialBackoffPolicy::new(10)),
+      retry_policy:       retry::ExponentialBackoffPolicy::new(10),
       active_connections: 0,
       failures:           0,
     }

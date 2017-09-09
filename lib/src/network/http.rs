@@ -19,6 +19,7 @@ use rand::random;
 use sozu_command::channel::Channel;
 use sozu_command::messages::{self,Order,HttpFront,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 
+use network::retry::ExponentialBackoffPolicy;
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol};
 use network::backends::BackendMap;
 use network::buffer_queue::BufferQueue;
@@ -49,7 +50,7 @@ pub struct Client {
   backend_token:  Option<Token>,
   front_timeout:  Option<Timeout>,
   back_timeout:   Option<Timeout>,
-  instance:       Option<Rc<RefCell<Backend>>>,
+  instance:       Option<Rc<RefCell<Backend<ExponentialBackoffPolicy>>>>,
   back_connected: BackendConnectionStatus,
   protocol:       Option<State>,
   pool:           Weak<RefCell<Pool<BufferQueue>>>,

@@ -35,6 +35,7 @@ use sozu_command::messages::{self,CertFingerprint,CertificateAndKey,Order,HttpsF
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::buffer_queue::BufferQueue;
+use network::retry::ExponentialBackoffPolicy;
 use network::{AppId,Backend,ClientResult,ConnectionError,Protocol};
 use network::backends::BackendMap;
 use network::proxy::{Server,ProxyChannel};
@@ -71,7 +72,7 @@ pub struct TlsClient {
   front_token:    Option<Token>,
   front_timeout:  Option<Timeout>,
   back_timeout:   Option<Timeout>,
-  instance:       Option<Rc<RefCell<Backend>>>,
+  instance:       Option<Rc<RefCell<Backend<ExponentialBackoffPolicy>>>>,
   back_connected: BackendConnectionStatus,
   protocol:       Option<State>,
   public_address: Option<IpAddr>,
