@@ -27,6 +27,11 @@ pub trait RetryPolicy: Debug + PartialEq + Eq {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+pub enum RetryPolicyWrapper {
+    ExponentialBackoff(ExponentialBackoffPolicy)
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub struct ExponentialBackoffPolicy {
     max_tries: usize,
     current_tries: usize,
@@ -90,9 +95,10 @@ impl RetryPolicy for ExponentialBackoffPolicy {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum RetryPolicyWrapper {
-    ExponentialBackoff(ExponentialBackoffPolicy)
+impl Into<RetryPolicyWrapper> for ExponentialBackoffPolicy {
+    fn into(self) -> RetryPolicyWrapper {
+        RetryPolicyWrapper::ExponentialBackoff(self)
+    }
 }
 
 impl RetryPolicy for RetryPolicyWrapper {

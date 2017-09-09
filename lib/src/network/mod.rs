@@ -162,7 +162,7 @@ impl Backend {
       id:                 id,
       address:            addr,
       status:             BackendStatus::Normal,
-      retry_policy:       retry::RetryPolicyWrapper::ExponentialBackoff(desired_policy),
+      retry_policy:       desired_policy.into(),
       active_connections: 0,
       failures:           0,
     }
