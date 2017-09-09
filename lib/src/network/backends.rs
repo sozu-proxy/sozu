@@ -5,8 +5,6 @@ use std::collections::HashMap;
 use rand::random;
 use mio::net::TcpStream;
 
-use std::{cmp, thread, time};
-
 use network::{AppId,Backend,ConnectionError};
 
 pub struct BackendMap {
@@ -95,86 +93,9 @@ impl BackendMap {
 
 const MAX_FAILURES_PER_BACKEND: usize = 10;
 
-pub trait RetryPolicy {
-  fn max_tries(&self) -> usize;
-  fn current_tries(&self) -> usize;
-
-  fn fail(&mut self);
-  fn succeed(&mut self);
-
-  fn can_try(&self) -> Option<RetryAction> {
-    if self.current_tries() >= self.max_tries() {
-      None
-    } else {
-      Some(RetryAction::OKAY)
-    }
-  }
-}
-
-pub enum RetryAction {
-  OKAY, WAIT
-}
-
-#[derive(Debug)]
-pub struct ExponentialBackoffPolicy {
-  max_tries: usize,
-  current_tries: usize,
-  last_try: time::Instant,
-  wait: time::Duration
-}
-
-impl ExponentialBackoffPolicy {
-  pub fn new(max_tries: usize) -> Self {
-    ExponentialBackoffPolicy {
-      max_tries,
-      current_tries: 0,
-      last_try: time::Instant::now(),
-      wait: time::Duration::default()
-    }
-  }
-}
-
-impl RetryPolicy for ExponentialBackoffPolicy {
-  fn max_tries(&self) -> usize {
-    self.max_tries
-  }
-
-  fn current_tries(&self) -> usize {
-    self.current_tries
-  }
-
-  fn fail(&mut self) {
-    let millis = cmp::max(1, 1 << self.current_tries) * 1000;
-    self.wait = time::Duration::from_millis(millis);
-    self.last_try = time::Instant::now();
-    self.current_tries += 1;
-  }
-
-  fn succeed(&mut self) {
-    self.wait = time::Duration::default();
-    self.last_try = time::Instant::now();
-    self.current_tries = 0;
-  }
-
-  fn can_try(&self) -> Option<RetryAction> {
-    if self.current_tries() >= self.max_tries() {
-      return None;
-    }
-
-    let action = if self.last_try.elapsed().gt(&self.wait) {
-      RetryAction::OKAY
-    } else {
-      RetryAction::WAIT
-    };
-
-    Some(action)
-  }
-}
-
 pub struct BackendList {
   pub instances: Vec<Rc<RefCell<Backend>>>,
   pub next_id:   u32,
-  pub retry_policy: Box<RetryPolicy>,
 }
 
 impl BackendList {
@@ -182,7 +103,6 @@ impl BackendList {
     BackendList {
       instances: Vec::new(),
       next_id:   0,
-      retry_policy: Box::new(ExponentialBackoffPolicy::new(MAX_FAILURES_PER_BACKEND)),
     }
   }
 
@@ -206,7 +126,7 @@ impl BackendList {
     self.instances.iter_mut()
       .find(|b| b.borrow().id == sticky_session )
       .and_then(|b| {
-        if b.borrow().can_open(MAX_FAILURES_PER_BACKEND) {
+        if b.borrow().can_open() {
           Some(b)
         } else {
           None
@@ -216,7 +136,7 @@ impl BackendList {
 
   pub fn available_instances(&mut self) -> Vec<&mut Rc<RefCell<Backend>>> {
     self.instances.iter_mut()
-      .filter(|backend| (*backend.borrow()).can_open(MAX_FAILURES_PER_BACKEND))
+      .filter(|backend| (*backend.borrow()).can_open())
       .collect()
   }
 
