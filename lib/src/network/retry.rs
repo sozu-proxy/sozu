@@ -10,7 +10,7 @@ pub enum RetryAction {
     WAIT
 }
 
-pub trait RetryPolicy : Debug + PartialEq + Eq {
+pub trait RetryPolicy: Debug + PartialEq + Eq {
     fn max_tries(&self) -> usize;
     fn current_tries(&self) -> usize;
 
@@ -55,16 +55,16 @@ impl RetryPolicy for ExponentialBackoffPolicy {
     }
 
     fn fail(&mut self) {
-        {
-            let max_secs = cmp::max(1, 1 << self.current_tries);
-
+        let max_secs = cmp::max(1, 1 << self.current_tries);
+        let wait = if max_secs == 1 {
+            1
+        } else {
             let mut rng = rand::thread_rng();
             let range = Range::new(1, max_secs);
-            let wait = range.ind_sample(&mut rng);
+            range.ind_sample(&mut rng)
+        };
 
-            self.wait = time::Duration::from_secs(wait);
-        }
-
+        self.wait = time::Duration::from_secs(wait);
         self.last_try = time::Instant::now();
         self.current_tries += 1;
     }
@@ -87,5 +87,64 @@ impl RetryPolicy for ExponentialBackoffPolicy {
         };
 
         Some(action)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time;
+
+    use super::{RetryAction, RetryPolicy, ExponentialBackoffPolicy};
+
+    const MAX_FAILS: usize = 10;
+
+    #[test]
+    fn no_fail() {
+        let policy = ExponentialBackoffPolicy::new(MAX_FAILS);
+        let can_try = policy.can_try();
+
+        assert_eq!(Some(RetryAction::OKAY), can_try)
+    }
+
+    #[test]
+    fn single_fail() {
+        let mut policy = ExponentialBackoffPolicy::new(MAX_FAILS);
+        policy.fail();
+        let can_try = policy.can_try();
+
+        // The wait will be >= 1s, so we'll be WAIT by the time we do the assert
+        assert_eq!(Some(RetryAction::WAIT), can_try)
+    }
+
+    #[test]
+    fn max_fails() {
+        let mut policy = ExponentialBackoffPolicy::new(MAX_FAILS);
+
+        for _ in 0..MAX_FAILS {
+            policy.fail();
+        }
+
+        let can_try = policy.can_try();
+
+        assert_eq!(None, can_try)
+    }
+
+    #[test]
+    fn recover_from_fail() {
+        let mut policy = ExponentialBackoffPolicy::new(MAX_FAILS);
+
+        // Stop just before total failure
+        for _ in 0..(MAX_FAILS - 1) {
+            policy.fail();
+        }
+
+        policy.succeed();
+        policy.fail();
+        policy.fail();
+        policy.fail();
+
+        let can_try = policy.can_try();
+
+        assert_eq!(Some(RetryAction::WAIT), can_try)
     }
 }
