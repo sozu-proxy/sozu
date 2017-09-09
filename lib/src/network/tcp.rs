@@ -24,7 +24,6 @@ use sozu_command::channel::Channel;
 use sozu_command::buffer::Buffer;
 use sozu_command::messages::{self,TcpFront,Order,Instance,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 
-use network::retry::ExponentialBackoffPolicy;
 use network::{Backend,ClientResult,ConnectionError,RequiredEvents,Protocol};
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};

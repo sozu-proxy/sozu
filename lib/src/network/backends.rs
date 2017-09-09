@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use rand::random;
 use mio::net::TcpStream;
 
-use network::retry::ExponentialBackoffPolicy;
 use network::{AppId,Backend,ConnectionError};
 
 pub struct BackendMap {
