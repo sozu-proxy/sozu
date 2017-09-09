@@ -70,18 +70,18 @@ impl BackendMap {
 
   pub fn backend_from_sticky_session(&mut self, app_id: &str, sticky_session: u32) -> Result<(Rc<RefCell<Backend<ExponentialBackoffPolicy>>>,TcpStream),ConnectionError> {
     let sticky_conn: Option<Result<(Rc<RefCell<Backend<ExponentialBackoffPolicy>>>,TcpStream),ConnectionError>> = self.instances
-        .get_mut(app_id)
-        .and_then(|app_instances| app_instances.find_sticky(sticky_session))
-        .map(|b| {
-          let ref mut backend = *b.borrow_mut();
-          let conn = backend.try_connect();
-          info!("Connecting {} -> {:?} using session {}", app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
-          if backend.failures >= MAX_FAILURES_PER_BACKEND {
-            error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
-          }
+      .get_mut(app_id)
+      .and_then(|app_instances| app_instances.find_sticky(sticky_session))
+      .map(|b| {
+        let ref mut backend = *b.borrow_mut();
+        let conn = backend.try_connect();
+        info!("Connecting {} -> {:?} using session {}", app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
+        if backend.failures >= MAX_FAILURES_PER_BACKEND {
+          error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
+        }
 
-          conn.map(|c| (b.clone(), c))
-        });
+        conn.map(|c| (b.clone(), c))
+      });
 
     if let Some(res) = sticky_conn {
       return res;
