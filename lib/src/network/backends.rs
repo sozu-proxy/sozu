@@ -41,7 +41,7 @@ impl BackendMap {
     }
   }
 
-  pub fn backend_from_app_id(&mut self, app_id: &str) -> Result<(Rc<RefCell<Backend<ExponentialBackoffPolicy>>>,TcpStream),ConnectionError> {
+  pub fn backend_from_app_id(&mut self, app_id: &str) -> Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError> {
     if let Some(ref mut app_instances) = self.instances.get_mut(app_id) {
       if app_instances.instances.len() == 0 {
         return Err(ConnectionError::NoBackendAvailable);
@@ -68,8 +68,8 @@ impl BackendMap {
     }
   }
 
-  pub fn backend_from_sticky_session(&mut self, app_id: &str, sticky_session: u32) -> Result<(Rc<RefCell<Backend<ExponentialBackoffPolicy>>>,TcpStream),ConnectionError> {
-    let sticky_conn: Option<Result<(Rc<RefCell<Backend<ExponentialBackoffPolicy>>>,TcpStream),ConnectionError>> = self.instances
+  pub fn backend_from_sticky_session(&mut self, app_id: &str, sticky_session: u32) -> Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError> {
+    let sticky_conn: Option<Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError>> = self.instances
       .get_mut(app_id)
       .and_then(|app_instances| app_instances.find_sticky(sticky_session))
       .map(|b| {
@@ -95,7 +95,7 @@ impl BackendMap {
 const MAX_FAILURES_PER_BACKEND: usize = 10;
 
 pub struct BackendList {
-  pub instances: Vec<Rc<RefCell<Backend<ExponentialBackoffPolicy>>>>,
+  pub instances: Vec<Rc<RefCell<Backend>>>,
   pub next_id:   u32,
 }
 
@@ -109,7 +109,7 @@ impl BackendList {
 
   pub fn add_instance(&mut self, instance_address: &SocketAddr) {
     if self.instances.iter().find(|b| &(*b.borrow()).address == instance_address).is_none() {
-      let backend = Rc::new(RefCell::new(Backend::<ExponentialBackoffPolicy>::new(*instance_address, self.next_id)));
+      let backend = Rc::new(RefCell::new(Backend::new(*instance_address, self.next_id)));
       self.instances.push(backend);
       self.next_id += 1;
     }
@@ -119,11 +119,11 @@ impl BackendList {
     self.instances.retain(|backend| &(*backend.borrow()).address != instance_address);
   }
 
-  pub fn find_instance(&mut self, instance_address: &SocketAddr) -> Option<&mut Rc<RefCell<Backend<ExponentialBackoffPolicy>>>> {
+  pub fn find_instance(&mut self, instance_address: &SocketAddr) -> Option<&mut Rc<RefCell<Backend>>> {
     self.instances.iter_mut().find(|backend| &(*backend.borrow()).address == instance_address)
   }
 
-  pub fn find_sticky(&mut self, sticky_session: u32) -> Option<&mut Rc<RefCell<Backend<ExponentialBackoffPolicy>>>> {
+  pub fn find_sticky(&mut self, sticky_session: u32) -> Option<&mut Rc<RefCell<Backend>>> {
     self.instances.iter_mut()
       .find(|b| b.borrow().id == sticky_session )
       .and_then(|b| {
@@ -135,14 +135,14 @@ impl BackendList {
       })
   }
 
-  pub fn available_instances(&mut self) -> Vec<&mut Rc<RefCell<Backend<ExponentialBackoffPolicy>>>> {
+  pub fn available_instances(&mut self) -> Vec<&mut Rc<RefCell<Backend>>> {
     self.instances.iter_mut()
       .filter(|backend| (*backend.borrow()).can_open())
       .collect()
   }
 
-  pub fn next_available_instance(&mut self) -> Option<&mut Rc<RefCell<Backend<ExponentialBackoffPolicy>>>> {
-    let mut instances:Vec<&mut Rc<RefCell<Backend<ExponentialBackoffPolicy>>>> = self.available_instances();
+  pub fn next_available_instance(&mut self) -> Option<&mut Rc<RefCell<Backend>>> {
+    let mut instances:Vec<&mut Rc<RefCell<Backend>>> = self.available_instances();
     if instances.is_empty() {
       return None;
     }

@@ -339,7 +339,7 @@ type ClientToken = Token;
 
 pub struct ServerConfiguration {
   fronts:          HashMap<String, ListenToken>,
-  instances:       HashMap<String, Vec<Backend<ExponentialBackoffPolicy>>>,
+  instances:       HashMap<String, Vec<Backend>>,
   listeners:       Slab<ApplicationListener,ListenToken>,
   pool:            Pool<BufferQueue>,
   base_token:      usize,
@@ -418,14 +418,14 @@ impl ServerConfiguration {
   pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken> {
     if let Some(addrs) = self.instances.get_mut(app_id) {
       let id = addrs.last().map(|mut b| (*b.borrow_mut()).id ).unwrap_or(0) + 1;
-      let backend = Backend::<ExponentialBackoffPolicy>::new(*instance_address, id);
+      let backend = Backend::new(*instance_address, id);
       if !addrs.contains(&backend) {
         addrs.push(backend);
       }
     }
 
     if self.instances.get(app_id).is_none() {
-      let backend = Backend::<ExponentialBackoffPolicy>::new(*instance_address, 0);
+      let backend = Backend::new(*instance_address, 0);
       self.instances.insert(String::from(app_id), vec![backend]);
     }
 

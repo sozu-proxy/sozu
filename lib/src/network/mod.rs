@@ -23,6 +23,8 @@ pub mod session;
 
 use mio::Token;
 
+use self::retry::RetryPolicy;
+
 pub type AppId = String;
 
 #[derive(Debug)]
@@ -144,22 +146,23 @@ pub enum BackendStatus {
 }
 
 #[derive(Debug,PartialEq,Eq)]
-pub struct Backend<T: retry::RetryPolicy> {
+pub struct Backend {
   pub id:                 u32,
   pub address:            SocketAddr,
   pub status:             BackendStatus,
-  pub retry_policy:       T,
+  pub retry_policy:       retry::RetryPolicyWrapper,
   pub active_connections: usize,
   pub failures:           usize,
 }
 
-impl <T: retry::RetryPolicy> Backend<T> {
-  pub fn new(addr: SocketAddr, id: u32) -> Backend<retry::ExponentialBackoffPolicy> {
+impl Backend {
+  pub fn new(addr: SocketAddr, id: u32) -> Backend {
+    let desired_policy = retry::ExponentialBackoffPolicy::new(10);
     Backend {
       id:                 id,
       address:            addr,
       status:             BackendStatus::Normal,
-      retry_policy:       retry::ExponentialBackoffPolicy::new(10),
+      retry_policy:       retry::RetryPolicyWrapper::ExponentialBackoff(desired_policy),
       active_connections: 0,
       failures:           0,
     }

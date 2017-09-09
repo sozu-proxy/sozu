@@ -90,6 +90,43 @@ impl RetryPolicy for ExponentialBackoffPolicy {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum RetryPolicyWrapper {
+    ExponentialBackoff(ExponentialBackoffPolicy)
+}
+
+impl RetryPolicy for RetryPolicyWrapper {
+    fn max_tries(&self) -> usize {
+        match *self {
+            RetryPolicyWrapper::ExponentialBackoff(ref policy) => policy
+        }.max_tries()
+    }
+
+    fn current_tries(&self) -> usize {
+        match *self {
+            RetryPolicyWrapper::ExponentialBackoff(ref policy) => policy
+        }.current_tries()
+    }
+
+    fn fail(&mut self) {
+        match *self {
+            RetryPolicyWrapper::ExponentialBackoff(ref mut policy) => policy
+        }.fail()
+    }
+
+    fn succeed(&mut self) {
+        match *self {
+            RetryPolicyWrapper::ExponentialBackoff(ref mut policy) => policy
+        }.succeed()
+    }
+
+    fn can_try(&self) -> Option<RetryAction> {
+        match *self {
+            RetryPolicyWrapper::ExponentialBackoff(ref policy) => policy
+        }.can_try()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time;

@@ -72,7 +72,7 @@ pub struct TlsClient {
   front_token:    Option<Token>,
   front_timeout:  Option<Timeout>,
   back_timeout:   Option<Timeout>,
-  instance:       Option<Rc<RefCell<Backend<ExponentialBackoffPolicy>>>>,
+  instance:       Option<Rc<RefCell<Backend>>>,
   back_connected: BackendConnectionStatus,
   protocol:       Option<State>,
   public_address: Option<IpAddr>,
