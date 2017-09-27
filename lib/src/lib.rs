@@ -150,6 +150,7 @@
 //! }
 //! ```
 //!
+#![feature(exclusive_range_pattern)]
 #![cfg_attr(feature = "unstable", feature(test))]
 #[cfg(all(feature = "unstable", test))]
 extern crate test;
