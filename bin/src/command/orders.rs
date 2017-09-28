@@ -332,7 +332,7 @@ impl CommandServer {
   }
 
   pub fn worker_order(&mut self, token: FrontToken, message_id: &str, order: Order, proxy_id: Option<u32>) {
-    if let &Order::AddCertificate(ref _) {
+    if let &Order::AddCertificate(_) = &order {
       info!("proxyconfig client order AddCertificate()");
     } else {
       info!("proxyconfig client order {:?}", order);
