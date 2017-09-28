@@ -332,9 +332,8 @@ impl CommandServer {
   }
 
   pub fn worker_order(&mut self, token: FrontToken, message_id: &str, order: Order, proxy_id: Option<u32>) {
-    if let &Order::AddHttpsFront(ref data) = &order {
-      info!("proxyconfig client order AddHttpsFront(HttpsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
-      data.app_id, data.hostname, data.path_begin);
+    if let &Order::AddCertificate(ref _) {
+      info!("proxyconfig client order AddCertificate()");
     } else {
       info!("proxyconfig client order {:?}", order);
     }
