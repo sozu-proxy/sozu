@@ -9,7 +9,7 @@ RUN apk add --no-cache --virtual .build-dependencies \
   gcc \
   musl-dev \
   rust
-RUN apk add --no-cache openssl-dev llvm-libunwind
+RUN apk add --no-cache openssl-dev llvm-libunwind pkgconfig
 WORKDIR /source/ctl
 RUN cargo build --release
 WORKDIR /source/bin
