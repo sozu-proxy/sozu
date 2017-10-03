@@ -498,12 +498,11 @@ impl<Front:SocketHandler> Http<Front> {
     }
 
     
-
     match unwrap_msg!(self.state.as_ref()).response {
       // FIXME: should only restart parsing if we are using keepalive
-      Some(ResponseState::Response(_, _))                            |
-      Some(ResponseState::ResponseWithBody(_, _, _))                  |
-      Some(ResponseState::ResponseWithBodyChunks(_, _, Chunk::Ended)) => {
+      Some(ResponseState::Response(_,_))                            |
+      Some(ResponseState::ResponseWithBody(_,_,_))                  |
+      Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
         let front_keep_alive = self.state.as_ref().map(|st| st.request.as_ref().map(|r| r.should_keep_alive()).unwrap_or(false)).unwrap_or(false);
         let back_keep_alive  = self.state.as_ref().map(|st| st.response.as_ref().map(|r| r.should_keep_alive()).unwrap_or(false)).unwrap_or(false);
 
@@ -513,24 +512,23 @@ impl<Front:SocketHandler> Http<Front> {
         // with no keepalive on backend, we could open a new backend ConnectionError
         // with no keepalive on front but keepalive on backend, we could have
         // a pool of connections
-        if front_keep_alive && back_keep_alive {  
+        if front_keep_alive && back_keep_alive {
           self.reset();
           self.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
           self.readiness.back_interest  = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+          
           info!("{}\t[{:?}] request ended successfully, keep alive for front and back", self.log_ctx, self.token);
           ClientResult::Continue
           //FIXME: issues reusing the backend socket
           //self.readiness.back_interest  = UnixReady::hup() | UnixReady::error();
           //ClientResult::CloseBackend
-        } 
-        else if front_keep_alive && !back_keep_alive {
+        } else if front_keep_alive && !back_keep_alive {
           self.reset();
           self.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
           self.readiness.back_interest  = UnixReady::hup() | UnixReady::error();
           info!("{}\t[{:?}] request ended successfully, keepalive for front", self.log_ctx, self.token);
           ClientResult::CloseBackend
-        } 
-        else {
+        } else {
           info!("{}\t[{:?}] request ended successfully, closing front and back connections", self.log_ctx, self.token);
           self.readiness.reset();
           ClientResult::CloseBoth
@@ -556,7 +554,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   // Forward content to application
-  pub fn back_writable(&mut self) -> ClientResult {    
+  pub fn back_writable(&mut self) -> ClientResult {
     if self.status == ClientStatus::DefaultAnswer {
       error!("{}\tsending default answer, should not write to back", self.log_ctx);
       self.readiness.back_interest.remove(Ready::writable());
@@ -793,11 +791,11 @@ impl<Front:SocketHandler> Http<Front> {
 fn save_http_status_metric(rs_status_line : Option<RStatusLine>) {
   if let Some(rs_status_line) = rs_status_line {
     match rs_status_line.status {
-      100..199 => { incr!("hrsp_1xx"); },
-      200..299 => { incr!("hrsp_2xx"); }, 
-      300..399 => { incr!("hrsp_3xx"); }, 
-      400..499 => { incr!("hrsp_4xx"); }, 
-      500..599 => { incr!("hrsp_5xx"); }, 
+      100...199 => { incr!("hrsp_1xx"); },
+      200...299 => { incr!("hrsp_2xx"); }, 
+      300...399 => { incr!("hrsp_3xx"); }, 
+      400...499 => { incr!("hrsp_4xx"); }, 
+      500...599 => { incr!("hrsp_5xx"); }, 
       _ => { incr!("hrsp_other"); }, // http responses with other codes (protocol error)
     }
   }
