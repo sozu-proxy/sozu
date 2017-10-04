@@ -24,7 +24,7 @@ use mio::Token;
 
 pub type AppId = String;
 
-#[derive(Debug)]
+#[derive(Debug,Clone,Copy)]
 pub enum Protocol {
   HTTP,
   HTTPS,

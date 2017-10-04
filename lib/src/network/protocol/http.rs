@@ -59,6 +59,7 @@ pub struct Http<Front:SocketHandler> {
   pub log_ctx:        String,
   pub public_address: Option<IpAddr>,
   pub sticky_session: Option<StickySession>,
+  pub protocol:       Protocol,
 }
 
 impl<Front:SocketHandler> Http<Front> {
@@ -87,6 +88,7 @@ impl<Front:SocketHandler> Http<Front> {
       log_ctx:            log_ctx,
       public_address:     public_address,
       sticky_session:     None,
+      protocol:           Protocol::HTTP,
     };
     let req_header = client.added_request_header(public_address);
     let res_header = client.added_response_header();
@@ -223,7 +225,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   fn protocol(&self)           -> Protocol {
-    Protocol::HTTP
+    self.protocol
   }
 
   pub fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
