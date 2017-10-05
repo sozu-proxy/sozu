@@ -1,0 +1,12 @@
+{
+  "id": "ID_TEST",
+  "version": 0,
+  "type": "PROXY",
+  "data": {
+    "type": "ADD_APPLICATION",
+    "data": {
+      "app_id": "xxx",
+      "sticky_session": true
+    }
+  }
+}
