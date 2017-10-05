@@ -10,6 +10,12 @@ license = "AGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
 
+include = [
+  "README.md",
+  "Cargo.toml",
+  "/src",
+]
+
 [dependencies]
 hex = "^0.2"
 log = "^0.3"
