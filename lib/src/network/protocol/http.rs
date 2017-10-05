@@ -8,7 +8,7 @@ use pool::{Pool,Checkout,Reset};
 use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
 use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop,
-  BufferMove, RequestState, ResponseState, Chunk, Continue};
+  BufferMove, RequestState, ResponseState, Chunk, Continue, RStatusLine};
 use network::{ClientResult,Protocol};
 use network::buffer_queue::BufferQueue;
 use network::session::Readiness;
@@ -248,6 +248,16 @@ impl<Front:SocketHandler> Http<Front> {
     ClientResult::CloseBoth
   }
 
+  /// Retrieve the response status from the http response state 
+  pub fn get_response_status(&mut self) -> Option<RStatusLine> {
+    if let Some(state) = self.state.as_ref() {
+      state.get_status_line()
+    }
+    else {
+      None
+    }
+  }
+
   // Read content from the client
   pub fn readable(&mut self) -> ClientResult {
     if self.status == ClientStatus::DefaultAnswer {
@@ -266,6 +276,7 @@ impl<Front:SocketHandler> Http<Front> {
         error!("{}\t[{:?}] front buffer full, no backend, closing the connection", self.log_ctx, self.token);
         self.readiness.front_interest = UnixReady::from(Ready::empty());
         self.readiness.back_interest  = UnixReady::from(Ready::empty());
+        incr_ereq!();
         return ClientResult::CloseClient;
       } else {
         self.readiness.front_interest.remove(Ready::readable());
@@ -280,6 +291,7 @@ impl<Front:SocketHandler> Http<Front> {
     if sz > 0 {
       self.front_buf.buffer.fill(sz);
       self.front_buf.sliced_input(sz);
+      count!("bytes_in", sz as i64);
 
       if self.front_buf.start_parsing_position > self.front_buf.parsed_position {
         let to_consume = min(self.front_buf.input_data_size(),
@@ -297,6 +309,7 @@ impl<Front:SocketHandler> Http<Front> {
     match res {
       SocketResult::Error => {
         error!("{}\t[{:?}] front socket error, closing the connection", self.log_ctx, self.token);
+        incr_ereq!();
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
@@ -392,7 +405,6 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn writable(&mut self) -> ClientResult {
 
     assert!(self.front_buf.empty(), "investigating single buffer usage: the front->back buffer should not be used while parsing and forwarding the response");
-
     let output_size = self.back_buf.output_data_size();
     if self.status == ClientStatus::DefaultAnswer {
       if self.back_buf.output_data_size() == 0 {
@@ -416,12 +428,14 @@ impl<Front:SocketHandler> Http<Front> {
       if self.back_buf.buffer.available_data() == 0 {
         self.readiness.reset();
         error!("{}\t[{:?}] cannot write, back buffer was empty", self.log_ctx, self.token);
+        incr_ereq!();
         return ClientResult::CloseClient;
       }
 
       if res == SocketResult::Error {
         self.readiness.reset();
         error!("{}\t[{:?}] error writing to front socket, closing", self.log_ctx, self.token);
+        incr_ereq!();
         return ClientResult::CloseClient;
       } else {
         return ClientResult::Continue;
@@ -448,6 +462,7 @@ impl<Front:SocketHandler> Http<Front> {
       self.back_buf.consume_output_data(current_sz);
       self.back_buf_position += current_sz;
       sz += current_sz;
+      count!("bytes_out", current_sz as i64);
     }
 
     if let Some((front,back)) = self.tokens() {
@@ -457,6 +472,7 @@ impl<Front:SocketHandler> Http<Front> {
     match res {
       SocketResult::Error => {
         error!("{}\t[{:?}] error writing to front socket, closing", self.log_ctx, self.token);
+        incr_ereq!();
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
@@ -483,6 +499,7 @@ impl<Front:SocketHandler> Http<Front> {
       return ClientResult::Continue;
     }
 
+    
     match unwrap_msg!(self.state.as_ref()).response {
       // FIXME: should only restart parsing if we are using keepalive
       Some(ResponseState::Response(_,_))                            |
@@ -490,6 +507,8 @@ impl<Front:SocketHandler> Http<Front> {
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
         let front_keep_alive = self.state.as_ref().map(|st| st.request.as_ref().map(|r| r.should_keep_alive()).unwrap_or(false)).unwrap_or(false);
         let back_keep_alive  = self.state.as_ref().map(|st| st.response.as_ref().map(|r| r.should_keep_alive()).unwrap_or(false)).unwrap_or(false);
+
+        save_http_status_metric(self.get_response_status());
 
         //FIXME: we could get smarter about this
         // with no keepalive on backend, we could open a new backend ConnectionError
@@ -499,7 +518,7 @@ impl<Front:SocketHandler> Http<Front> {
           self.reset();
           self.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
           self.readiness.back_interest  = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
-
+          
           info!("{}\t[{:?}] request ended successfully, keep alive for front and back", self.log_ctx, self.token);
           ClientResult::Continue
           //FIXME: issues reusing the backend socket
@@ -714,6 +733,7 @@ impl<Front:SocketHandler> Http<Front> {
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Error)) => {
         error!("{}\tback read should have stopped on chunk error", self.log_ctx);
+        incr_ereq!();
         self.readiness.reset();
         (ProtocolResult::Continue, ClientResult::CloseClient)
       },
@@ -769,10 +789,23 @@ impl<Front:SocketHandler> Http<Front> {
   }
 }
 
+/// Save the backend http response status code metric
+fn save_http_status_metric(rs_status_line : Option<RStatusLine>) {
+  if let Some(rs_status_line) = rs_status_line {
+    match rs_status_line.status {
+      100...199 => { incr!("hrsp_1xx"); },
+      200...299 => { incr!("hrsp_2xx"); }, 
+      300...399 => { incr!("hrsp_3xx"); }, 
+      400...499 => { incr!("hrsp_4xx"); }, 
+      500...599 => { incr!("hrsp_5xx"); }, 
+      _ => { incr!("hrsp_other"); }, // http responses with other codes (protocol error)
+    }
+  }
+}
+
 
 #[allow(non_snake_case)]
 pub struct DefaultAnswers {
   pub NotFound:           Vec<u8>,
   pub ServiceUnavailable: Vec<u8>
 }
-

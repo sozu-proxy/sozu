@@ -329,3 +329,23 @@ macro_rules! time_end (
   }
 );
 
+///Client-side request errors caused by:
+/// 
+/// * Client terminates before sending request
+/// * Read error from client
+/// * Client timeout
+/// * Client terminated connection
+#[macro_export]
+macro_rules! incr_ereq (
+  () => (incr!("ereq");)
+);
+
+#[macro_export]
+macro_rules! incr_client_cmd (
+  () => (incr!("client_cmd");)
+);
+
+#[macro_export]
+macro_rules! incr_resp_client_cmd (
+  () => (incr!("incr_resp_client_cmd");)
+);
