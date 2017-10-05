@@ -68,15 +68,9 @@ impl ConfigState {
         self.applications.remove(app_id);
       },
       &Order::AddHttpFront(ref front) => {
-        let f = HttpFront {
-          app_id:         front.app_id.clone(),
-          hostname:       front.hostname.clone(),
-          path_begin:     front.path_begin.clone(),
-        };
-
-        let front = self.http_fronts.entry(front.app_id.clone()).or_insert(vec!());
-        if !front.contains(&f) {
-          front.push(f);
+        let front_vec = self.http_fronts.entry(front.app_id.clone()).or_insert(vec!());
+        if !front_vec.contains(front) {
+          front_vec.push(front.clone());
         }
       },
       &Order::RemoveHttpFront(ref front) => {
@@ -85,11 +79,6 @@ impl ConfigState {
         }
       },
       &Order::AddCertificate(ref certificate_and_key) => {
-        let f = CertificateAndKey {
-          certificate:       certificate_and_key.certificate.clone(),
-          certificate_chain: certificate_and_key.certificate_chain.clone(),
-          key:               certificate_and_key.key.clone(),
-        };
         let fingerprint = match calculate_fingerprint(&certificate_and_key.certificate.as_bytes()[..]) {
           Ok(f)  => CertFingerprint(f),
           Err(e) => {
@@ -99,22 +88,16 @@ impl ConfigState {
         };
 
         if !self.certificates.contains_key(&fingerprint) {
-          self.certificates.insert(fingerprint.clone(), f);
+          self.certificates.insert(fingerprint.clone(), certificate_and_key.clone());
         }
       },
       &Order::RemoveCertificate(ref fingerprint) => {
         self.certificates.remove(fingerprint);
       },
       &Order::AddHttpsFront(ref front) => {
-        let f = HttpsFront {
-          app_id:         front.app_id.clone(),
-          hostname:       front.hostname.clone(),
-          path_begin:     front.path_begin.clone(),
-          fingerprint:    front.fingerprint.clone(),
-        };
-        let front = self.https_fronts.entry(front.app_id.clone()).or_insert(vec!());
-        if !front.contains(&f) {
-          front.push(f);
+        let front_vec = self.https_fronts.entry(front.app_id.clone()).or_insert(vec!());
+        if !front_vec.contains(front) {
+          front_vec.push(front.clone());
         }
       },
       &Order::RemoveHttpsFront(ref front) => {
@@ -146,11 +129,7 @@ impl ConfigState {
 
     for (app_id, front_list) in self.http_fronts.iter() {
       for front in front_list {
-        v.push(Order::AddHttpFront(HttpFront {
-          app_id:         app_id.clone(),
-          hostname:       front.hostname.clone(),
-          path_begin:     front.path_begin.clone(),
-        }));
+        v.push(Order::AddHttpFront(front.clone()));
       }
     }
 
@@ -160,12 +139,7 @@ impl ConfigState {
 
     for (app_id, front_list) in &self.https_fronts {
       for front in front_list {
-        v.push(Order::AddHttpsFront(HttpsFront {
-          app_id:         app_id.clone(),
-          hostname:       front.hostname.clone(),
-          path_begin:     front.path_begin.clone(),
-          fingerprint:    front.fingerprint.clone(),
-        }));
+        v.push(Order::AddHttpsFront(front.clone()));
       }
     }
 
@@ -179,8 +153,8 @@ impl ConfigState {
   }
 
   pub fn diff(&self, other:&ConfigState) -> Vec<Order> {
-    let mut my_apps: HashSet<&AppId>    = self.applications.keys().collect();
-    let mut their_apps: HashSet<&AppId> = other.applications.keys().collect();
+    let my_apps: HashSet<&AppId>    = self.applications.keys().collect();
+    let their_apps: HashSet<&AppId> = other.applications.keys().collect();
 
     let removed_apps = my_apps.difference(&their_apps);
     let added_apps: Vec<&Application> = their_apps.difference(&my_apps).filter_map(|app_id| other.applications.get(app_id.as_str())).collect();
@@ -253,21 +227,12 @@ impl ConfigState {
       v.push(Order::AddCertificate(certificate_and_key.clone()));
     }
 
-    for &(app_id, front) in removed_http_fronts {
-     v.push(Order::RemoveHttpFront(HttpFront {
-       app_id:         app_id.clone(),
-       hostname:       front.hostname.clone(),
-       path_begin:     front.path_begin.clone(),
-      }));
+    for &(_, front) in removed_http_fronts {
+     v.push(Order::RemoveHttpFront(front.clone()));
     }
 
-    for &(app_id, front) in removed_https_fronts {
-     v.push(Order::RemoveHttpsFront(HttpsFront {
-       app_id:         app_id.clone(),
-       hostname:       front.hostname.clone(),
-       path_begin:     front.path_begin.clone(),
-       fingerprint:    front.fingerprint.clone(),
-      }));
+    for &(_, front) in removed_https_fronts {
+     v.push(Order::RemoveHttpsFront(front.clone()));
     }
 
     for &(_, instance) in added_instances {
@@ -279,20 +244,11 @@ impl ConfigState {
     }
 
     for &(app_id, front) in added_http_fronts {
-      v.push(Order::AddHttpFront(HttpFront {
-        app_id:         app_id.clone(),
-        hostname:       front.hostname.clone(),
-        path_begin:     front.path_begin.clone(),
-      }));
+      v.push(Order::AddHttpFront(front.clone()));
     }
 
     for &(app_id, front) in added_https_fronts {
-      v.push(Order::AddHttpsFront(HttpsFront {
-        app_id:         app_id.clone(),
-        hostname:       front.hostname.clone(),
-        path_begin:     front.path_begin.clone(),
-        fingerprint:    front.fingerprint.clone(),
-      }));
+      v.push(Order::AddHttpsFront(front.clone()));
     }
 
     for  &(fingerprint, _) in removed_certificates {
