@@ -17,7 +17,7 @@ use nom::{HexDisplay,IResult};
 use rand::random;
 
 use sozu_command::channel::Channel;
-use sozu_command::messages::{self,Order,HttpFront,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
+use sozu_command::messages::{self,Application,Order,HttpFront,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol};
 use network::backends::BackendMap;
@@ -301,6 +301,7 @@ pub struct ServerConfiguration {
   address:         SocketAddr,
   instances:       BackendMap,
   fronts:          HashMap<Hostname, Vec<HttpFront>>,
+  applications:    HashMap<AppId, Application>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
   front_timeout:   u64,
@@ -331,6 +332,7 @@ impl ServerConfiguration {
         Ok(ServerConfiguration {
           listener:      sock,
           address:       config.front,
+          applications:  HashMap::new(),
           instances:     BackendMap::new(),
           fronts:        HashMap::new(),
           pool:          Rc::new(RefCell::new(
@@ -352,6 +354,14 @@ impl ServerConfiguration {
         Err(e)
       }
     }
+  }
+
+  pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
+    self.applications.insert(application.app_id.clone(), application);
+  }
+
+  pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
+    self.applications.remove(app_id);
   }
 
   pub fn add_http_front(&mut self, http_front: HttpFront, event_loop: &mut Poll) {
@@ -498,7 +508,10 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
     //FIXME: too many unwraps here
     let rl     = try!(client.http().unwrap().state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-    if let Some((app_id, front_should_stick)) = self.frontend_from_request(&host, &rl.uri).map(|ref front| { (front.app_id.clone(), front.sticky_session.clone()) }) {
+    if let Some(app_id) = self.frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
+
+      let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
+
       if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
         //matched on keepalive
         return Ok(BackendConnectAction::Reuse);
@@ -567,6 +580,16 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     // ToDo temporary
     //trace!("{} notified", message);
     match message.order {
+      Order::AddApplication(application) => {
+        info!("{} add application {:?}", message.id, application);
+        self.add_application(application, event_loop);
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+      },
+      Order::RemoveApplication(application) => {
+        info!("{} remove application {:?}", message.id, application);
+        self.remove_application(&application, event_loop);
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+      },
       Order::AddHttpFront(front) => {
         info!("{} add front {:?}", message.id, front);
         self.add_http_front(front, event_loop);
@@ -721,7 +744,7 @@ mod tests {
       start(config, channel);
     });
 
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/"), sticky_session: false };
+    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
@@ -775,7 +798,7 @@ mod tests {
       start(config, channel);
     });
 
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/"), sticky_session: false };
+    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
     let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1028 };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
@@ -869,12 +892,12 @@ mod tests {
 
     let mut fronts = HashMap::new();
     fronts.insert("lolcatho.st".to_owned(), vec![
-      HttpFront { app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1, sticky_session: false },
-      HttpFront { app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2, sticky_session: false },
-      HttpFront { app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3, sticky_session: false }
+      HttpFront { app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1 },
+      HttpFront { app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2 },
+      HttpFront { app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3 }
     ]);
     fronts.insert("other.domain".to_owned(), vec![
-      HttpFront { app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(), sticky_session: false },
+      HttpFront { app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned() },
     ]);
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
@@ -882,6 +905,7 @@ mod tests {
     let server_config = ServerConfiguration {
       listener:  listener,
       address:   front,
+      applications: HashMap::new(),
       instances: BackendMap::new(),
       fronts:    fronts,
       pool:      Rc::new(RefCell::new(Pool::with_capacity(1,0, || BufferQueue::with_capacity(16384)))),

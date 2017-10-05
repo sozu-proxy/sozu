@@ -3,7 +3,7 @@ use std::collections::{HashMap,HashSet};
 use std::iter::FromIterator;
 use certificate::calculate_fingerprint;
 
-use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,Instance};
+use messages::{Application,CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,Instance};
 
 pub type AppId = String;
 
@@ -26,6 +26,7 @@ pub struct HttpsProxy {
 
 #[derive(Debug,Default,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct ConfigState {
+  applications:    HashMap<AppId, Application>,
   instances:       HashMap<AppId, Vec<Instance>>,
   http_fronts:     HashMap<AppId, Vec<HttpFront>>,
   https_fronts:    HashMap<AppId, Vec<HttpsFront>>,
@@ -39,6 +40,7 @@ pub struct ConfigState {
 impl ConfigState {
   pub fn new() -> ConfigState {
     ConfigState {
+      applications:    HashMap::new(),
       instances:       HashMap::new(),
       http_fronts:     HashMap::new(),
       https_fronts:    HashMap::new(),
@@ -58,12 +60,18 @@ impl ConfigState {
 
   pub fn handle_order(&mut self, order: &Order) {
     match order {
+      &Order::AddApplication(ref application) => {
+        let app = application.clone();
+        self.applications.insert(app.app_id.clone(), app);
+      },
+      &Order::RemoveApplication(ref app_id) => {
+        self.applications.remove(app_id);
+      },
       &Order::AddHttpFront(ref front) => {
         let f = HttpFront {
           app_id:         front.app_id.clone(),
           hostname:       front.hostname.clone(),
           path_begin:     front.path_begin.clone(),
-          sticky_session: front.sticky_session.clone(),
         };
 
         let front = self.http_fronts.entry(front.app_id.clone()).or_insert(vec!());
@@ -103,7 +111,6 @@ impl ConfigState {
           hostname:       front.hostname.clone(),
           path_begin:     front.path_begin.clone(),
           fingerprint:    front.fingerprint.clone(),
-          sticky_session: front.sticky_session.clone(),
         };
         let front = self.https_fronts.entry(front.app_id.clone()).or_insert(vec!());
         if !front.contains(&f) {
@@ -124,19 +131,25 @@ impl ConfigState {
           instance_list.retain(|el| el.ip_address != instance.ip_address || el.port != instance.port);
         }
       }
-      _ => {}
+      o => {
+        error!("state cannot handle order message: {:#?}", o);
+      }
     }
   }
 
   pub fn generate_orders(&self) -> Vec<Order> {
     let mut v = Vec::new();
+
+    for app in self.applications.values() {
+      v.push(Order::AddApplication(app.clone()));
+    }
+
     for (app_id, front_list) in self.http_fronts.iter() {
       for front in front_list {
         v.push(Order::AddHttpFront(HttpFront {
           app_id:         app_id.clone(),
           hostname:       front.hostname.clone(),
           path_begin:     front.path_begin.clone(),
-          sticky_session: front.sticky_session.clone(),
         }));
       }
     }
@@ -152,7 +165,6 @@ impl ConfigState {
           hostname:       front.hostname.clone(),
           path_begin:     front.path_begin.clone(),
           fingerprint:    front.fingerprint.clone(),
-          sticky_session: front.sticky_session.clone(),
         }));
       }
     }
@@ -167,6 +179,12 @@ impl ConfigState {
   }
 
   pub fn diff(&self, other:&ConfigState) -> Vec<Order> {
+    let mut my_apps: HashSet<&AppId>    = self.applications.keys().collect();
+    let mut their_apps: HashSet<&AppId> = other.applications.keys().collect();
+
+    let removed_apps = my_apps.difference(&their_apps);
+    let added_apps: Vec<&Application> = their_apps.difference(&my_apps).filter_map(|app_id| other.applications.get(app_id.as_str())).collect();
+
     let mut my_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
     for (ref app_id, ref front_list) in self.http_fronts.iter() {
       for ref front in front_list.iter() {
@@ -223,6 +241,14 @@ impl ConfigState {
 
     let mut v = vec!();
 
+    for app_id in removed_apps {
+      v.push(Order::RemoveApplication(app_id.to_string()));
+    }
+
+    for app in added_apps {
+      v.push(Order::AddApplication(app.clone()));
+    }
+
     for &(_, certificate_and_key) in added_certificates {
       v.push(Order::AddCertificate(certificate_and_key.clone()));
     }
@@ -232,7 +258,6 @@ impl ConfigState {
        app_id:         app_id.clone(),
        hostname:       front.hostname.clone(),
        path_begin:     front.path_begin.clone(),
-       sticky_session: front.sticky_session.clone(),
       }));
     }
 
@@ -242,7 +267,6 @@ impl ConfigState {
        hostname:       front.hostname.clone(),
        path_begin:     front.path_begin.clone(),
        fingerprint:    front.fingerprint.clone(),
-       sticky_session: front.sticky_session.clone(),
       }));
     }
 
@@ -259,7 +283,6 @@ impl ConfigState {
         app_id:         app_id.clone(),
         hostname:       front.hostname.clone(),
         path_begin:     front.path_begin.clone(),
-        sticky_session: front.sticky_session.clone(),
       }));
     }
 
@@ -269,7 +292,6 @@ impl ConfigState {
         hostname:       front.hostname.clone(),
         path_begin:     front.path_begin.clone(),
         fingerprint:    front.fingerprint.clone(),
-        sticky_session: front.sticky_session.clone(),
       }));
     }
 
@@ -288,8 +310,8 @@ mod tests {
   #[test]
   fn serialize() {
     let mut state:ConfigState = Default::default();
-    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), sticky_session: false }));
-    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc"), sticky_session: false }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc") }));
     state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 }));
     state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
     state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_2"), ip_address: String::from("192.167.1.2"), port: 1026 }));
@@ -310,29 +332,33 @@ mod tests {
   #[test]
   fn diff() {
     let mut state:ConfigState = Default::default();
-    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), sticky_session: false }));
-    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc"), sticky_session: false }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc") }));
     state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 }));
     state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
     state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_2"), ip_address: String::from("192.167.1.2"), port: 1026 }));
+    state.handle_order(&Order::AddApplication(Application { app_id: String::from("app_2"), sticky_session: true }));
 
     let mut state2:ConfigState = Default::default();
-    state2.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), sticky_session: false }));
+    state2.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") }));
     state2.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1026 }));
     state2.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
     state2.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1028 }));
+    state2.handle_order(&Order::AddApplication(Application { app_id: String::from("app_3"), sticky_session: false }));
 
    let e = vec!(
-     Order::RemoveHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc"), sticky_session: false }),
+     Order::RemoveHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc") }),
      Order::RemoveInstance(Instance { app_id: String::from("app_2"), ip_address: String::from("192.167.1.2"), port: 1026 }),
      Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1028 }),
+     Order::RemoveApplication(String::from("app_2")),
+     Order::AddApplication(Application { app_id: String::from("app_3"), sticky_session: false }),
    );
    let expected_diff:HashSet<&Order> = HashSet::from_iter(e.iter());
 
    let d = state.diff(&state2);
    let diff = HashSet::from_iter(d.iter());
-   println!("diff orders:\n{:?}\n", diff);
-   println!("expected diff orders:\n{:?}\n", expected_diff);
+   println!("diff orders:\n{:#?}\n", diff);
+   println!("expected diff orders:\n{:#?}\n", expected_diff);
 
    assert_eq!(diff, expected_diff);
   }

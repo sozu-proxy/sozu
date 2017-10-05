@@ -8,6 +8,7 @@ use certificate::{calculate_fingerprint,split_certificate_chain};
 use openssl::ssl;
 use toml;
 
+use messages::Application;
 use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,Instance,HttpProxyConfiguration,HttpsProxyConfiguration};
 
 use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
@@ -235,13 +236,26 @@ impl Config {
       let chain_opt       = app.certificate_chain.as_ref().and_then(|path| Config::load_file(&path).ok())
         .map(split_certificate_chain);
 
+      let order = Order::AddApplication(Application {
+        app_id: id.to_string(),
+        sticky_session: app.sticky_session.unwrap_or(false),
+      });
+
+      v.push(ConfigMessage {
+        id:       format!("CONFIG-{}", count),
+        version:  PROTOCOL_VERSION,
+        proxy_id: None,
+        data:     ConfigCommand::ProxyConfiguration(order),
+      });
+      count += 1;
+
       //create the front both for HTTP and HTTPS if possible
       let order = Order::AddHttpFront(HttpFront {
         app_id:         id.to_string(),
         hostname:       app.hostname.clone(),
         path_begin:     path_begin.clone(),
-        sticky_session: app.sticky_session.unwrap_or(false),
       });
+
       v.push(ConfigMessage {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
@@ -290,7 +304,6 @@ impl Config {
           hostname:       app.hostname.clone(),
           path_begin:     path_begin,
           fingerprint:    fingerprint,
-          sticky_session: app.sticky_session.unwrap_or(false),
         });
         v.push(ConfigMessage {
           id:       format!("CONFIG-{}", count),

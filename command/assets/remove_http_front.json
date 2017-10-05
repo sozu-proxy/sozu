@@ -7,8 +7,7 @@
     "data": {
       "app_id": "xxx",
       "hostname": "yyy",
-      "path_begin": "xxx",
-      "sticky_session": false
+      "path_begin": "xxx"
     }
   }
 }

@@ -30,7 +30,7 @@ use nom::IResult;
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
-use sozu_command::messages::{self,CertFingerprint,CertificateAndKey,Order,HttpsFront,HttpsProxyConfiguration,OrderMessage,
+use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,Order,HttpsFront,HttpsProxyConfiguration,OrderMessage,
   OrderMessageAnswer,OrderMessageStatus};
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
@@ -57,7 +57,6 @@ pub struct TlsApp {
   pub hostname:         String,
   pub path_begin:       String,
   pub cert_fingerprint: CertFingerprint,
-  pub sticky_session:   bool,
 }
 
 pub enum State {
@@ -350,6 +349,7 @@ pub struct TlsData {
 pub struct ServerConfiguration {
   listener:        TcpListener,
   address:         SocketAddr,
+  applications:    HashMap<AppId, Application>,
   instances:       BackendMap,
   fronts:          HashMap<HostName, Vec<TlsApp>>,
   domains:         Arc<Mutex<TrieNode<CertFingerprint>>>,
@@ -385,7 +385,6 @@ impl ServerConfiguration {
       hostname:         config.default_name.clone().unwrap_or(String::new()),
       path_begin:       String::new(),
       cert_fingerprint: fingerprint,
-      sticky_session:   false,
     };
     fronts.insert(config.default_name.clone().unwrap_or(String::from("")), vec![app]);
 
@@ -408,6 +407,7 @@ impl ServerConfiguration {
         Ok(ServerConfiguration {
           listener:        listener,
           address:         config.front.clone(),
+          applications:    HashMap::new(),
           instances:       BackendMap::new(),
           fronts:          fronts,
           domains:         rc_domains,
@@ -534,6 +534,14 @@ impl ServerConfiguration {
     }
   }
 
+  pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
+    self.applications.insert(application.app_id.clone(), application);
+  }
+
+  pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
+    self.applications.remove(app_id);
+  }
+
   pub fn add_https_front(&mut self, tls_front: HttpsFront, event_loop: &mut Poll) -> bool {
     {
       let mut contexts = unwrap_msg!(self.contexts.lock());
@@ -555,7 +563,6 @@ impl ServerConfiguration {
       hostname:         tls_front.hostname.clone(),
       path_begin:       tls_front.path_begin.clone(),
       cert_fingerprint: tls_front.fingerprint.clone(),
-      sticky_session:   tls_front.sticky_session.clone(),
     };
 
     if let Some(fronts) = self.fronts.get_mut(&tls_front.hostname) {
@@ -852,7 +859,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     };
 
     let rl:RRequestLine = try!(unwrap_msg!(client.http()).state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-    if let Some((app_id, front_should_stick)) = self.frontend_from_request(&host, &rl.uri).map(|ref front| (front.app_id.clone(), front.sticky_session.clone())) {
+    if let Some(app_id) = self.frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
+
+      let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
+
       if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
         //matched on keepalive
         return Ok(BackendConnectAction::Reuse);
@@ -933,6 +943,16 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
     //trace!("{} notified", message);
     match message.order {
+      Order::AddApplication(application) => {
+        info!("{} add application {:?}", message.id, application);
+        self.add_application(application, event_loop);
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+      },
+      Order::RemoveApplication(application) => {
+        info!("{} remove application {:?}", message.id, application);
+        self.remove_application(&application, event_loop);
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+      },
       Order::AddHttpsFront(front) => {
         //info!("HTTPS\t{} add front {:?}", id, front);
         self.add_https_front(front, event_loop);
@@ -1168,24 +1188,20 @@ mod tests {
       TlsApp {
         app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1,
         cert_fingerprint: CertFingerprint(vec!()),
-        sticky_session: false
       },
       TlsApp {
         app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2,
         cert_fingerprint: CertFingerprint(vec!()),
-        sticky_session: false
       },
       TlsApp {
         app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3,
         cert_fingerprint: CertFingerprint(vec!()),
-        sticky_session: false
       }
     ]);
     fronts.insert("other.domain".to_owned(), vec![
       TlsApp {
         app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(),
         cert_fingerprint: CertFingerprint(vec!()),
-        sticky_session: false
       },
     ]);
 
@@ -1208,6 +1224,7 @@ mod tests {
     let server_config = ServerConfiguration {
       listener:  listener,
       address:   front,
+      applications: HashMap::new(),
       instances: BackendMap::new(),
       fronts:    fronts,
       domains:   rc_domains,

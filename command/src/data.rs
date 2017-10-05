@@ -292,18 +292,17 @@ mod tests {
   use serde_json;
   use hex::FromHex;
   use certificate::split_certificate_chain;
-  use messages::{CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Instance};
+  use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Instance};
 
   #[test]
   fn config_message_test() {
-    let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "sticky_session": false}} }"#;
+    let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}} }"#;
     let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", message);
     assert_eq!(message.data, ConfigCommand::ProxyConfiguration(Order::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
-      sticky_session: false,
     })));
   }
 
@@ -341,6 +340,23 @@ mod tests {
     )
   );
 
+  test_message!(add_application, "../assets/add_application.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::ProxyConfiguration(Order::AddApplication(Application {
+                  app_id: String::from("xxx"),
+                  sticky_session: true,
+      })),
+      proxy_id: None
+    });
+
+  test_message!(remove_application, "../assets/remove_application.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::ProxyConfiguration(Order::RemoveApplication( String::from("xxx") )),
+      proxy_id: None
+    });
+
   test_message!(add_http_front, "../assets/add_http_front.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
@@ -348,7 +364,6 @@ mod tests {
                   app_id: String::from("xxx"),
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
-                  sticky_session: false
       })),
       proxy_id: None
     });
@@ -360,7 +375,6 @@ mod tests {
                   app_id: String::from("xxx"),
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
-                  sticky_session: false
       })),
       proxy_id: None
     });
@@ -373,7 +387,6 @@ mod tests {
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
                   fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
-                  sticky_session: false
       })),
       proxy_id: None
     });
@@ -386,7 +399,6 @@ mod tests {
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
                   fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
-                  sticky_session: false
       })),
       proxy_id: None
     });
