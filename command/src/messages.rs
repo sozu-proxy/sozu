@@ -3,7 +3,7 @@ use serde::de::{self, Visitor};
 use hex::{FromHex,ToHex};
 use openssl::ssl;
 use std::net::{IpAddr,SocketAddr};
-use std::collections::{BTreeMap,HashSet};
+use std::collections::{BTreeMap,HashMap,HashSet};
 use std::default::Default;
 use std::convert::From;
 use std::fmt;
@@ -34,7 +34,8 @@ pub enum OrderMessageStatus {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderMessageAnswerData {
   //placeholder for now
-  Metrics(BTreeMap<String,FilteredData>)
+  Metrics(BTreeMap<String,FilteredData>),
+  Query(QueryAnswer),
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
@@ -80,6 +81,8 @@ pub enum Order {
 
     HttpProxy(HttpProxyConfiguration),
     HttpsProxy(HttpsProxyConfiguration),
+
+    Query(Query),
 
     SoftStop,
     HardStop,
@@ -257,6 +260,32 @@ impl Default for HttpsProxyConfiguration {
   }
 }
 
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Query {
+  Application(String),
+  //Certificate(CertFingerprint),
+  //Certificates,
+  Applications,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum QueryAnswer {
+  Application(QueryAnswerApplication),
+  //Certificate(QueryAnswerCertificate),
+  //Certificates(Vec<CertFingerprint>),
+  /// application id, hash of application information
+  Applications(BTreeMap<String, u64>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct QueryAnswerApplication {
+  pub configuration:   Option<Application>,
+  pub http_frontends:  Vec<HttpFront>,
+  pub https_frontends: Vec<HttpsFront>,
+  pub backends:        Vec<Instance>,
+}
 
 impl Order {
   pub fn get_topics(&self) -> HashSet<Topic> {
@@ -275,6 +304,7 @@ impl Order {
       Order::RemoveInstance(_)    => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::HttpProxy(_)         => [Topic::HttpProxyConfig].iter().cloned().collect(),
       Order::HttpsProxy(_)        => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::Query(_)             => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::SoftStop             => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::HardStop             => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::Status               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),

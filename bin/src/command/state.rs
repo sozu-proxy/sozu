@@ -2,7 +2,8 @@ use mio::Token;
 use std::collections::{BTreeMap,HashMap,HashSet};
 
 use sozu::network::metrics::METRICS;
-use sozu_command::messages::{FilteredData,OrderMessageAnswerData};
+use sozu_command::messages::{FilteredData,OrderMessageAnswerData,QueryAnswer};
+use sozu_command::state::ConfigState;
 use sozu_command::data::AnswerData;
 use command::FrontToken;
 
@@ -90,6 +91,8 @@ pub enum MessageType {
   LoadState,
   WorkerOrder,
   Metrics,
+  QueryApplications,
+  QueryApplication(String),
   Stop,
 }
 
@@ -117,12 +120,16 @@ impl Task {
     }
   }
 
-  pub fn generate_data(mut self) -> Option<AnswerData> {
+  pub fn generate_data(mut self, master_state: &ConfigState) -> Option<AnswerData> {
+    trace!("state generate data: type={:?}, data = {:#?}", self.message_type, self.data);
     match self.message_type {
       MessageType::Metrics => {
-        let mut data: BTreeMap<String, BTreeMap<String, FilteredData>> = self.data.into_iter().map(|(tag, metrics)| {
-          let OrderMessageAnswerData::Metrics(d) = metrics;
-          (tag, d)
+        let mut data: BTreeMap<String, BTreeMap<String, FilteredData>> = self.data.into_iter().filter_map(|(tag, metrics)| {
+           if let OrderMessageAnswerData::Metrics(d) = metrics {
+             Some((tag, d))
+           } else {
+             None
+           }
         }).collect();
         let master_metrics = METRICS.with(|metrics| {
           (*metrics.borrow()).dump_data()
@@ -130,6 +137,33 @@ impl Task {
         data.insert(String::from("master"), master_metrics);
         Some(AnswerData::Metrics(data))
       },
+      MessageType::QueryApplications => {
+        let mut data: BTreeMap<String, QueryAnswer> = self.data.into_iter().filter_map(|(tag, query)| {
+          if let OrderMessageAnswerData::Query(data) = query {
+            Some((tag, data))
+          } else {
+            None
+          }
+        }).collect();
+
+        data.insert(String::from("master"), QueryAnswer::Applications(master_state.hash_state()));
+
+        Some(AnswerData::Query(data))
+      },
+      MessageType::QueryApplication(app_id) => {
+        let mut data: BTreeMap<String, QueryAnswer> = self.data.into_iter().filter_map(|(tag, query)| {
+          if let OrderMessageAnswerData::Query(data) = query {
+            Some((tag, data))
+          } else {
+            None
+          }
+        }).collect();
+
+        data.insert(String::from("master"), QueryAnswer::Application(master_state.application_state(&app_id)));
+
+        Some(AnswerData::Query(data))
+      },
+
       _ => None,
     }
   }

@@ -21,7 +21,8 @@ use std::time::Duration;
 use rand::random;
 
 use sozu_command::channel::Channel;
-use sozu_command::messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic};
+use sozu_command::state::ConfigState;
+use sozu_command::messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer};
 
 use network::{ClientResult,ConnectionError,
   SocketType,Protocol,RequiredEvents};
@@ -53,6 +54,7 @@ pub struct Server {
   http:            Option<Session<http::ServerConfiguration, http::Client>>,
   https:           Option<Session<tls::ServerConfiguration, tls::TlsClient>>,
   tcp:             Option<Session<tcp::ServerConfiguration, tcp::Client>>,
+  config_state:    ConfigState,
 }
 
 impl Server {
@@ -91,6 +93,7 @@ impl Server {
       http:            http,
       https:           https,
       tcp:             tcp,
+      config_state:    ConfigState::new(),
     }
   }
 }
@@ -258,6 +261,32 @@ impl Server {
       });
       return;
     }
+
+    if let Order::Query(ref query) = message.order {
+      match query {
+        &Query::Applications => {
+          self.queue.push_back(OrderMessageAnswer {
+            id:     message.id.clone(),
+            status: OrderMessageStatus::Ok,
+            data:   Some(OrderMessageAnswerData::Query(
+              QueryAnswer::Applications(self.config_state.hash_state())
+            ))
+          });
+        },
+        &Query::Application(ref app_id) => {
+          self.queue.push_back(OrderMessageAnswer {
+            id:     message.id.clone(),
+            status: OrderMessageStatus::Ok,
+            data:   Some(OrderMessageAnswerData::Query(
+              QueryAnswer::Application(self.config_state.application_state(app_id))
+            ))
+          });
+        }
+      }
+      return
+    }
+
+    self.config_state.handle_order(&message.order);
 
     let topics = message.order.get_topics();
 

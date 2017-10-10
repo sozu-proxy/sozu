@@ -447,7 +447,7 @@ impl CommandServer {
               id,
               ConfigMessageStatus::Error,
               format!("ok: {} messages, error: {:?}, message: {}", task.ok.len(), task.error, s.clone()),
-              task.generate_data(),
+              task.generate_data(&self.state),
             );
 
             if let Some(client_token) = opt_token {
@@ -470,7 +470,7 @@ impl CommandServer {
                 id,
                 ConfigMessageStatus::Ok,
                 format!("ok: {} messages, error: {:#?}", task.ok.len(), task.error),
-                task.generate_data(),
+                task.generate_data(&self.state),
               )
             } else {
               ConfigMessageAnswer::new(

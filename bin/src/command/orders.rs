@@ -18,7 +18,7 @@ use nom::{HexDisplay,IResult,Offset};
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
-use sozu_command::messages::{Order,OrderMessage};
+use sozu_command::messages::{Order,OrderMessage,Query};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 
 use super::{CommandServer,FrontToken,ProxyConfiguration,Worker};
@@ -54,6 +54,9 @@ impl CommandServer {
       },
       ConfigCommand::Metrics => {
         self.metrics(token, &message.id);
+      },
+      ConfigCommand::Query(query) => {
+        self.query(token, &message.id, query);
       },
       ConfigCommand::ProxyConfiguration(order) => {
         self.worker_order(token, &message.id, order, message.proxy_id);
@@ -328,6 +331,23 @@ impl CommandServer {
 
       self.clients[token].add_message_id(String::from(message_id));
       proxy.push_message(OrderMessage { id: String::from(message_id), order: Order::Metrics });
+    }
+  }
+
+  pub fn query(&mut self, token: FrontToken, message_id: &str, query: Query) {
+    let message_type = match &query {
+      &Query::Applications            => MessageType::QueryApplications,
+      &Query::Application(ref app_id) => MessageType::QueryApplication(app_id.clone()),
+    };
+
+    self.order_state.insert_task(message_id, message_type, Some(token));
+
+    for ref mut proxy in self.proxies.values_mut() {
+      self.order_state.insert_worker_message(message_id, message_id, proxy.token.expect("worker should have a valid token"));
+      trace!("sending to {:?}, inflight is now {:#?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
+
+      self.clients[token].add_message_id(String::from(message_id));
+      proxy.push_message(OrderMessage { id: String::from(message_id), order: Order::Query(query.clone()) });
     }
   }
 

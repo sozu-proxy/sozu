@@ -4,7 +4,7 @@ use serde_json;
 use std::fmt;
 use std::collections::BTreeMap;
 
-use messages::{FilteredData,Order};
+use messages::{FilteredData,Order,Query,QueryAnswer};
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
@@ -18,6 +18,7 @@ pub enum ConfigCommand {
   LaunchWorker(String),
   UpgradeMaster,
   Metrics,
+  Query(Query),
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
@@ -52,6 +53,7 @@ pub enum ConfigMessageStatus {
 pub enum AnswerData {
   Workers(Vec<WorkerInfo>),
   Metrics(BTreeMap<String, BTreeMap<String,FilteredData>>),
+  Query(BTreeMap<String, QueryAnswer>),
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
@@ -207,6 +209,12 @@ impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
       ConfigCommand::UpgradeMaster
     } else if &config_type == &"METRICS" {
       ConfigCommand::Metrics
+    } else if &config_type == &"QUERY" {
+      let data = match data {
+        Some(data) => data,
+        None => return Err(serde::de::Error::missing_field("data")),
+      };
+      ConfigCommand::Query(try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("launch worker")))))
     } else {
       return Err(serde::de::Error::custom("unrecognized command"));
     };
@@ -278,6 +286,10 @@ impl serde::Serialize for ConfigMessage {
       },
       ConfigCommand::Metrics => {
         try!(map.serialize_entry("type", "METRICS"));
+      },
+      ConfigCommand::Query(ref query) => {
+        try!(map.serialize_entry("type", "QUERY"));
+        try!(map.serialize_entry("data", query));
       },
     };
 

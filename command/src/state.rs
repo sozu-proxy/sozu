@@ -1,9 +1,11 @@
-use std::collections::{HashMap,HashSet};
+use std::collections::{BTreeMap,HashMap,HashSet};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use std::iter::FromIterator;
 use certificate::calculate_fingerprint;
 
-use messages::{Application,CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,Instance};
+use messages::{Application,CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,Instance,QueryAnswerApplication};
 
 pub type AppId = String;
 
@@ -256,6 +258,28 @@ impl ConfigState {
     }
     v
   }
+
+  pub fn hash_state(&self) -> BTreeMap<AppId, u64> {
+    self.instances.keys().map(|app_id| {
+      let mut s = DefaultHasher::new();
+      self.applications.get(app_id).hash(&mut s);
+      self.instances.get(app_id).hash(&mut s);
+      self.http_fronts.get(app_id).hash(&mut s);
+      self.https_fronts.get(app_id).hash(&mut s);
+
+      (app_id.to_string(), s.finish())
+
+    }).collect()
+  }
+
+  pub fn application_state(&self, app_id: &str) -> QueryAnswerApplication {
+    QueryAnswerApplication {
+      configuration:   self.applications.get(app_id).cloned(),
+      http_frontends:  self.http_fronts.get(app_id).cloned().unwrap_or(vec!()),
+      https_frontends: self.https_fronts.get(app_id).cloned().unwrap_or(vec!()),
+      backends:        self.instances.get(app_id).cloned().unwrap_or(vec!()),
+    }
+  }
 }
 
 #[cfg(test)]
@@ -315,6 +339,15 @@ mod tests {
    let diff = HashSet::from_iter(d.iter());
    println!("diff orders:\n{:#?}\n", diff);
    println!("expected diff orders:\n{:#?}\n", expected_diff);
+
+   let hash1 = state.hash_state();
+   let hash2 = state2.hash_state();
+   let mut state3 = state.clone();
+   state3.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.2"), port: 1028 }));
+   let hash3 = state3.hash_state();
+   println!("state 1 hashes: {:#?}", hash1);
+   println!("state 2 hashes: {:#?}", hash2);
+   println!("state 3 hashes: {:#?}", hash3);
 
    assert_eq!(diff, expected_diff);
   }

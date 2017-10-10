@@ -13,7 +13,7 @@ use sozu_command::channel::Channel;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 
 use command::{add_application,remove_application,dump_state,load_state,save_state,soft_stop,hard_stop,upgrade,status,metrics,
-  remove_backend, add_backend, remove_frontend, add_frontend, add_certificate, remove_certificate};
+  remove_backend, add_backend, remove_frontend, add_frontend, add_certificate, remove_certificate, query_application};
 
 use std::str::FromStr;
 
@@ -188,6 +188,15 @@ fn main() {
                                                       .value_name("path to the certificate")
                                                       .takes_value(true)
                                                       .required(true))))
+                        .subcommand(SubCommand::with_name("query")
+                                                .about("configuration state verification")
+                                                .subcommand(SubCommand::with_name("applications")
+                                                  .arg(Arg::with_name("id")
+                                                      .short("i")
+                                                      .long("id")
+                                                      .value_name("application identifier")
+                                                      .takes_value(true)
+                                                      .required(false))))
                         .get_matches();
  
   let config_file = match matches.value_of("config"){
@@ -297,6 +306,15 @@ fn main() {
           remove_certificate(&mut channel, certificate);
         },
         _ => println!("unknown backend management command")
+      }
+    },
+    ("query", Some(sub)) => {
+      match sub.subcommand() {
+        ("applications", Some(frontend_sub)) => {
+          let id              = frontend_sub.value_of("id");
+          query_application(&mut channel, id);
+        },
+        _ => println!("unknown query command")
       }
     },
     _                => println!("unknown subcommand")

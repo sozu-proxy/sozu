@@ -2,7 +2,7 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
-use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront, CertificateAndKey, CertFingerprint, TcpFront};
+use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront, CertificateAndKey, CertFingerprint, TcpFront, Query};
 
 use std::collections::HashSet;
 use rand::{thread_rng, Rng};
@@ -559,6 +559,44 @@ pub fn remove_tcp_front(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>
     port: port
   }));
 }
+
+pub fn query_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, id: Option<&str>) {
+  let command = match id {
+    Some(app_id) => ConfigCommand::Query(Query::Application(app_id.to_string())),
+    None         => ConfigCommand::Query(Query::Applications),
+  };
+
+  let id = generate_id();
+  channel.write_message(&ConfigMessage::new(
+    id.clone(),
+    command,
+    None,
+  ));
+
+  match channel.read_message() {
+    None          => println!("the proxy didn't answer"),
+    Some(message) => {
+      if id != message.id {
+        println!("received message with invalid id: {:?}", message);
+        return;
+      }
+      match message.status {
+        ConfigMessageStatus::Processing => {
+          // do nothing here
+          // for other messages, we would loop over read_message
+          // until an error or ok message was sent
+        },
+        ConfigMessageStatus::Error => {
+          println!("could not query proxy state: {}", message.message);
+        },
+        ConfigMessageStatus::Ok => {
+          println!("Proxy config answer:\n{}\n{:#?}", message.message, message.data);
+        }
+      }
+    }
+  }
+}
+
 
 fn order_command(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, order: Order) {
   let id = generate_id();
