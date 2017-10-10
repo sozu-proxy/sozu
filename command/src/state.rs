@@ -28,14 +28,14 @@ pub struct HttpsProxy {
 
 #[derive(Debug,Default,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct ConfigState {
-  applications:    HashMap<AppId, Application>,
-  instances:       HashMap<AppId, Vec<Instance>>,
-  http_fronts:     HashMap<AppId, Vec<HttpFront>>,
-  https_fronts:    HashMap<AppId, Vec<HttpsFront>>,
-  certificates:    HashMap<CertFingerprint, CertificateAndKey>,
+  pub applications:    HashMap<AppId, Application>,
+  pub instances:       HashMap<AppId, Vec<Instance>>,
+  pub http_fronts:     HashMap<AppId, Vec<HttpFront>>,
+  pub https_fronts:    HashMap<AppId, Vec<HttpsFront>>,
+  pub certificates:    HashMap<CertFingerprint, CertificateAndKey>,
   //ip, port
-  http_addresses:  Vec<(String, u16)>,
-  https_addresses: Vec<(String, u16)>,
+  pub http_addresses:  Vec<(String, u16)>,
+  pub https_addresses: Vec<(String, u16)>,
   //tcp:
 }
 
