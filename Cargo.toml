@@ -1,2 +1,2 @@
 [workspace]
-members = ["lib/", "command/", "bin/", "ctl/"]
+members = ["lib/", "command/", "bin/", "ctl/", "futures/"]
