@@ -358,6 +358,17 @@ impl CommandServer {
       info!("proxyconfig client order {:?}", order);
     }
 
+    if let &Order::Logging(ref logging_filter) = &order {
+      info!("Changing master log level to {}", logging_filter);
+      ::sozu::logging::LOGGER.with(|l| {
+        let directives = ::sozu::logging::parse_logging_spec(&logging_filter);
+        l.borrow_mut().set_directives(directives);
+      });
+      // also change / set the content of RUST_LOG so future workers / main thread
+      // will have the new logging filter value
+      ::std::env::set_var("RUST_LOG", logging_filter);
+    }
+
     self.state.handle_order(&order);
 
     if order == Order::SoftStop {

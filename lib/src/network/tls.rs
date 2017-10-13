@@ -1019,6 +1019,14 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         info!("{} status", message.id);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
+      Order::Logging(logging_filter) => {
+        info!("{} changing logging filter to {}", message.id, logging_filter);
+        ::logging::LOGGER.with(|l| {
+          let directives = ::logging::parse_logging_spec(&logging_filter);
+          l.borrow_mut().set_directives(directives);
+        });
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+      },
       command => {
         error!("{} unsupported message, ignoring {:?}", message.id, command);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message")), data: None }

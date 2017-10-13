@@ -89,6 +89,7 @@ pub enum Order {
 
     Status,
     Metrics,
+    Logging(String),
 }
 
 
@@ -309,6 +310,7 @@ impl Order {
       Order::HardStop             => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::Status               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::Metrics              => HashSet::new(),
+      Order::Logging(_)           => [Topic::HttpsProxyConfig, Topic::HttpProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
     }
   }
 }
