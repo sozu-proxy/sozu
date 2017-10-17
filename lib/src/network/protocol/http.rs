@@ -428,14 +428,14 @@ impl<Front:SocketHandler> Http<Front> {
 
       if self.back_buf.buffer.available_data() == 0 {
         self.readiness.reset();
-        error!("{}\t[{:?}] cannot write, back buffer was empty", self.log_ctx, self.token);
+        error!("{}\t[{:?}] cannot write default answer, back buffer was empty", self.log_ctx, self.token);
         incr_ereq!();
         return ClientResult::CloseClient;
       }
 
       if res == SocketResult::Error {
         self.readiness.reset();
-        error!("{}\t[{:?}] error writing to front socket, closing", self.log_ctx, self.token);
+        error!("{}\t[{:?}] error writing default answer to front socket, closing", self.log_ctx, self.token);
         incr_ereq!();
         return ClientResult::CloseClient;
       } else {
