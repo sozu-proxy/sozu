@@ -115,7 +115,9 @@ impl ConfigState {
         if let Some(instance_list) = self.instances.get_mut(&instance.app_id) {
           instance_list.retain(|el| el.ip_address != instance.ip_address || el.port != instance.port);
         }
-      }
+      },
+      // This is to avoid the error message
+      &Order::Logging(_) => {},
       o => {
         error!("state cannot handle order message: {:#?}", o);
       }

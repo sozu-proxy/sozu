@@ -13,7 +13,8 @@ use sozu_command::channel::Channel;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 
 use command::{add_application,remove_application,dump_state,load_state,save_state,soft_stop,hard_stop,upgrade,status,metrics,
-  remove_backend, add_backend, remove_frontend, add_frontend, add_certificate, remove_certificate, query_application};
+  remove_backend, add_backend, remove_frontend, add_frontend, add_certificate, remove_certificate, query_application,
+  logging_filter};
 
 use std::str::FromStr;
 
@@ -197,6 +198,14 @@ fn main() {
                                                       .value_name("application identifier")
                                                       .takes_value(true)
                                                       .required(false))))
+                        .subcommand(SubCommand::with_name("logging")
+                                                .about("change logging level")
+                                                .arg(Arg::with_name("level")
+                                                  .short("l")
+                                                  .long("level")
+                                                  .value_name("logging level")
+                                                  .takes_value(true)
+                                                  .required(true)))
                         .get_matches();
  
   let config_file = match matches.value_of("config"){
@@ -316,6 +325,10 @@ fn main() {
         },
         _ => println!("unknown query command")
       }
+    },
+    ("logging", Some(sub)) => {
+      let level = sub.value_of("level").expect("missing logging level");
+      logging_filter(&mut channel, level);
     },
     _                => println!("unknown subcommand")
   }

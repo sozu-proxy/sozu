@@ -597,6 +597,9 @@ pub fn query_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer
   }
 }
 
+pub fn logging_filter(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, filter: &str) {
+  order_command(channel, Order::Logging(String::from(filter)));
+}
 
 fn order_command(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, order: Order) {
   let id = generate_id();
