@@ -63,7 +63,8 @@ pub struct Http<Front:SocketHandler> {
 }
 
 impl<Front:SocketHandler> Http<Front> {
-  pub fn new(sock: Front, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<Http<Front>> {
+  pub fn new(sock: Front, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>,
+             protocol: Protocol) -> Option<Http<Front>> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{}\tunknown\t", &request_id);
     let mut client = Http {
@@ -88,7 +89,7 @@ impl<Front:SocketHandler> Http<Front> {
       log_ctx:            log_ctx,
       public_address:     public_address,
       sticky_session:     None,
-      protocol:           Protocol::HTTP,
+      protocol:           protocol,
     };
     let req_header = client.added_request_header(public_address);
     let res_header = client.added_response_header();

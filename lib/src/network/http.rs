@@ -61,7 +61,8 @@ impl Client {
     let protocol = if let Some(pool) = pool.upgrade() {
       let mut p = pool.borrow_mut();
       if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-        Some(Http::new(unwrap_msg!(sock.try_clone()), front_buf, back_buf, public_address).expect("should create a HTTP state"))
+        Some(Http::new(unwrap_msg!(sock.try_clone()), front_buf, back_buf, public_address,
+          Protocol::HTTP).expect("should create a HTTP state"))
       } else { None }
     } else { None };
 
