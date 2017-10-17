@@ -207,7 +207,7 @@ impl CommandServer {
           buffer.consume(offset);
         }
         if counter > 0 {
-        info!("state loaded from {}, will start sending {} ùessages to workers", path, counter);
+        info!("state loaded from {}, will start sending {} messages to workers", path, counter);
         } else {
           info!("no messages sent to workers: local state already had those messages");
           if let Some(_) = self.order_state.state.remove(message_id) {
@@ -411,9 +411,8 @@ impl CommandServer {
       if let ConfigCommand::ProxyConfiguration(order) = message.data {
         self.state.handle_order(&order);
 
-        if let &Order::AddHttpsFront(ref data) = &order {
-          info!("config generated AddHttpsFront(HttpsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
-          data.app_id, data.hostname, data.path_begin);
+        if let &Order::AddCertificate(ref data) = &order {
+          info!("config generated AddCertificate( ... )");
         } else {
           info!("config generated {:?}", order);
         }
