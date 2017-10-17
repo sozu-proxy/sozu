@@ -12,6 +12,7 @@ pub mod protocol;
 pub mod http;
 pub mod tls;
 pub mod backends;
+pub mod retry;
 
 #[cfg(feature = "splice")]
 mod splice;
@@ -21,6 +22,8 @@ pub mod proxy;
 pub mod session;
 
 use mio::Token;
+
+use self::retry::RetryPolicy;
 
 pub type AppId = String;
 
@@ -147,16 +150,19 @@ pub struct Backend {
   pub id:                 u32,
   pub address:            SocketAddr,
   pub status:             BackendStatus,
+  pub retry_policy:       retry::RetryPolicyWrapper,
   pub active_connections: usize,
   pub failures:           usize,
 }
 
 impl Backend {
   pub fn new(addr: SocketAddr, id: u32) -> Backend {
+    let desired_policy = retry::ExponentialBackoffPolicy::new(10);
     Backend {
       id:                 id,
       address:            addr,
       status:             BackendStatus::Normal,
+      retry_policy:       desired_policy.into(),
       active_connections: 0,
       failures:           0,
     }
@@ -166,8 +172,12 @@ impl Backend {
     self.status = BackendStatus::Closing;
   }
 
-  pub fn can_open(&self, max_failures: usize) -> bool {
-    self.status == BackendStatus::Normal && self.failures < max_failures
+  pub fn can_open(&self) -> bool {
+    if let Some(action) = self.retry_policy.can_try() {
+      self.status == BackendStatus::Normal && action == retry::RetryAction::OKAY
+    } else {
+      false
+    }
   }
 
   pub fn inc_connections(&mut self) -> Option<usize> {
@@ -211,8 +221,10 @@ impl Backend {
     //FIXME: what happens if the connect() call fails with EINPROGRESS?
     let conn = mio::tcp::TcpStream::connect(&self.address).map_err(|_| ConnectionError::NoBackendAvailable);
     if conn.is_ok() {
+      self.retry_policy.succeed();
       self.inc_connections();
     } else {
+      self.retry_policy.fail();
       self.failures += 1;
     }
 

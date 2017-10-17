@@ -51,7 +51,7 @@ impl BackendMap {
           let ref mut backend = *b.borrow_mut();
           info!("Connecting {} -> {:?}", app_id, (backend.address, backend.active_connections, backend.failures));
           let conn = backend.try_connect();
-          if backend.failures >= max_failures_per_backend {
+          if backend.failures >= MAX_FAILURES_PER_BACKEND {
             error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
           }
 
@@ -75,12 +75,12 @@ impl BackendMap {
         let ref mut backend = *b.borrow_mut();
         let conn = backend.try_connect();
         info!("Connecting {} -> {:?} using session {}", app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
-        if backend.failures >= max_failures_per_backend {
+        if backend.failures >= MAX_FAILURES_PER_BACKEND {
           error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
         }
 
         conn.map(|c| (b.clone(), c))
-    });
+      });
 
     if let Some(res) = sticky_conn {
       return res;
@@ -91,7 +91,7 @@ impl BackendMap {
   }
 }
 
-const max_failures_per_backend: usize = 10;
+const MAX_FAILURES_PER_BACKEND: usize = 10;
 
 pub struct BackendList {
   pub instances: Vec<Rc<RefCell<Backend>>>,
@@ -126,7 +126,7 @@ impl BackendList {
     self.instances.iter_mut()
       .find(|b| b.borrow().id == sticky_session )
       .and_then(|b| {
-        if b.borrow().can_open(max_failures_per_backend) {
+        if b.borrow().can_open() {
           Some(b)
         } else {
           None
@@ -136,7 +136,7 @@ impl BackendList {
 
   pub fn available_instances(&mut self) -> Vec<&mut Rc<RefCell<Backend>>> {
     self.instances.iter_mut()
-      .filter(|backend| (*backend.borrow()).can_open(max_failures_per_backend))
+      .filter(|backend| (*backend.borrow()).can_open())
       .collect()
   }
 
