@@ -104,7 +104,7 @@ impl SocketHandler for SslStream<TcpStream> {
         Err(Error::WantRead(_))  => return (size, SocketResult::WouldBlock),
         Err(Error::WantWrite(_)) => return (size, SocketResult::WouldBlock),
         Err(Error::Stream(e))    => {
-          error!("SOCKET-TLS\writable TLS socket err={:?}", e);
+          error!("SOCKET-TLS\twritable TLS socket err={:?}", e);
           return (size, SocketResult::Error)
         },
         e => {
