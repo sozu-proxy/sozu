@@ -442,6 +442,11 @@ impl ServerConfiguration {
 
     let mut context = ctx.expect("should have built a correct SSL context");
 
+    let mut mode = ssl::SSL_MODE_ENABLE_PARTIAL_WRITE;
+    mode.insert(ssl::SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    //FIXME: maybe activate ssl::SSL_MODE_RELEASE_BUFFERS to save some memory?
+    context.set_mode(mode);
+
     let opt = context.set_options(unwrap_msg!(SslOption::from_bits(config.options)));
 
     context.set_cipher_list(&config.cipher_list);
