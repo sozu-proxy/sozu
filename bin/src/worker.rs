@@ -164,8 +164,16 @@ pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Ch
 
 #[cfg(target_os = "linux")]
 pub unsafe fn get_executable_path() -> String {
-  let path = fs::read_link("/proc/self/exe").expect("/proc/self/exe doesn't exist");
-  path.into_os_string().into_string().expect("Failed to convert PathBuf to String")
+  let path         = fs::read_link("/proc/self/exe").expect("/proc/self/exe doesn't exist");
+  let mut path_str = path.into_os_string().into_string().expect("Failed to convert PathBuf to String");
+
+  if path_str.ends_with(" (deleted)") {
+    // The kernel appends " (deleted)" to the symlink when the original executable has been replaced
+    let len = path_str.len();
+    path_str.truncate(len - 10)
+  }
+
+  path_str
 }
 
 #[cfg(target_os = "macos")]
