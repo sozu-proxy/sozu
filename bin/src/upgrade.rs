@@ -89,7 +89,7 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<Up
     }
     ForkResult::Child => {
       trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
-      Command::new(path.to_str().unwrap())
+      Command::new(path)
         .arg("upgrade")
         .arg("--fd")
         .arg(client.as_raw_fd().to_string())

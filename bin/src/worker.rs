@@ -3,6 +3,7 @@ use mio::{Poll,Ready};
 use libc::{self,c_char,uint32_t,int32_t,pid_t};
 use std::io;
 use std::ffi::CString;
+use std::fs;
 use std::iter::repeat;
 use std::ptr::null_mut;
 use std::process::Command;
@@ -130,6 +131,7 @@ pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Ch
   let path = unsafe { get_executable_path() };
 
   info!("launching worker");
+  debug!("executable path is {}", path);
   match fork() {
     Ok(ForkResult::Parent{ child }) => {
       info!("worker launched: {}", child);
@@ -141,7 +143,7 @@ pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Ch
     },
     Ok(ForkResult::Child) => {
       trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
-      Command::new(path.to_str().unwrap())
+      Command::new(path)
         .arg("worker")
         .arg("--fd")
         .arg(client.as_raw_fd().to_string())
@@ -161,17 +163,17 @@ pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Ch
 }
 
 #[cfg(target_os = "linux")]
-pub unsafe fn get_executable_path() -> CString {
-  let capacity = 2000;
-  let mut temp:Vec<u8> = Vec::with_capacity(capacity);
-  temp.extend(repeat(0).take(capacity));
-  let mut pathbuf = CString::from_vec_unchecked(temp);
-  let ptr = pathbuf.into_raw();
+pub unsafe fn get_executable_path() -> String {
+  let path         = fs::read_link("/proc/self/exe").expect("/proc/self/exe doesn't exist");
+  let mut path_str = path.into_os_string().into_string().expect("Failed to convert PathBuf to String");
 
-  let proc_path = CString::new("/proc/self/exe").unwrap();
-  let sz = libc::readlink( proc_path.as_ptr(), ptr, 1999);
-  let path = CString::from_raw(ptr);
-  path
+  if path_str.ends_with(" (deleted)") {
+    // The kernel appends " (deleted)" to the symlink when the original executable has been replaced
+    let len = path_str.len();
+    path_str.truncate(len - 10)
+  }
+
+  path_str
 }
 
 #[cfg(target_os = "macos")]
@@ -180,7 +182,7 @@ extern {
 }
 
 #[cfg(target_os = "macos")]
-pub unsafe fn get_executable_path() -> CString {
+pub unsafe fn get_executable_path() -> String {
   let capacity = 2000;
   let mut temp:Vec<u8> = Vec::with_capacity(capacity);
   temp.extend(repeat(0).take(capacity));
@@ -197,7 +199,7 @@ pub unsafe fn get_executable_path() -> CString {
 
     if libc::realpath(ptr, ptr2) != null_mut() {
       let path = CString::from_raw(ptr2);
-      path
+      path.to_str().expect("failed to convert CString to String")
     } else {
       panic!();
     }
