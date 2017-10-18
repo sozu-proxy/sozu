@@ -2,6 +2,12 @@ language: rust
 
 cache: cargo
 
+os:
+  - linux
+  - osx
+
+osx_image: xcode9.1
+
 rust:
   - nightly
   - beta
