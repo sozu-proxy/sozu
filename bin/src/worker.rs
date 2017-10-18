@@ -199,7 +199,7 @@ pub unsafe fn get_executable_path() -> String {
 
     if libc::realpath(ptr, ptr2) != null_mut() {
       let path = CString::from_raw(ptr2);
-      path.to_str().expect("failed to convert CString to String")
+      path.to_str().expect("failed to convert CString to String").to_string()
     } else {
       panic!();
     }
