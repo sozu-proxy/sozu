@@ -486,7 +486,6 @@ impl CommandServer {
             };
 
             if let Some(client_token) = opt_token {
-              info!("SENDING to client[{}]: {:?}", client_token.0, answer);
               self.clients[client_token].push_message(answer);
             }
           }

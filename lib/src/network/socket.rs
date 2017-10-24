@@ -31,7 +31,7 @@ impl SocketHandler for TcpStream {
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
           ErrorKind::BrokenPipe => {
-            debug!("SOCKET\tbroken pipe reading from the socket");
+            error!("SOCKET\tbroken pipe reading from the socket");
             return (size, SocketResult::Error)
           },
           _ => {
@@ -55,7 +55,7 @@ impl SocketHandler for TcpStream {
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
           ErrorKind::BrokenPipe => {
-            debug!("SOCKET\tbroken pipe writing to the socket");
+            error!("SOCKET\tbroken pipe writing to the socket");
             return (size, SocketResult::Error)
           },
           _ => {

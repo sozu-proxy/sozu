@@ -28,7 +28,7 @@ impl BackendMap {
     if let Some(instances) = self.instances.get_mut(app_id) {
       instances.remove_instance(instance_address);
     } else {
-      error!("Instance was already removed");
+      error!("Instance was already removed: app id {}, address {:?}", app_id, instance_address);
     }
   }
 

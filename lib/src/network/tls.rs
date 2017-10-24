@@ -504,7 +504,7 @@ impl ServerConfiguration {
                 debug!("found context for {:?}", servername);
                 if !tls_data.initialized {
                   //FIXME: couldn't we skip to the next cert?
-                  error!("no application is using that certificate");
+                  error!("no application is using that certificate (looking up {})", servername);
                   return Ok(());
                 }
                 let context: &SslContext = &tls_data.context;
