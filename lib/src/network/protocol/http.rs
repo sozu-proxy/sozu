@@ -101,7 +101,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   pub fn reset(&mut self) {
     let request_id = Uuid::new_v4().hyphenated().to_string();
-    debug!("{} RESET TO {}", self.log_ctx, request_id);
+    //info!("{} RESET TO {}", self.log_ctx, request_id);
     decr!("http.requests");
     self.state.as_mut().map(|state| state.reset());
     let req_header = self.added_request_header(self.public_address);
@@ -520,7 +520,7 @@ impl<Front:SocketHandler> Http<Front> {
           self.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
           self.readiness.back_interest  = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
           
-          info!("{}\t[{:?}] request ended successfully, keep alive for front and back", self.log_ctx, self.token);
+          info!("{}\t success, keep alive for front and back", self.log_ctx);
           ClientResult::Continue
           //FIXME: issues reusing the backend socket
           //self.readiness.back_interest  = UnixReady::hup() | UnixReady::error();
@@ -529,10 +529,10 @@ impl<Front:SocketHandler> Http<Front> {
           self.reset();
           self.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
           self.readiness.back_interest  = UnixReady::hup() | UnixReady::error();
-          info!("{}\t[{:?}] request ended successfully, keepalive for front", self.log_ctx, self.token);
+          info!("{}\t success, keepalive for front", self.log_ctx);
           ClientResult::CloseBackend
         } else {
-          info!("{}\t[{:?}] request ended successfully, closing front and back connections", self.log_ctx, self.token);
+          info!("{}\t success, closing front and back", self.log_ctx);
           self.readiness.reset();
           ClientResult::CloseBoth
         }
@@ -696,7 +696,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     // isolate that here because the "ref protocol" and the self.state = " make borrowing conflicts
     if let Some(&Some(ResponseState::ResponseUpgrade(_,_, ref protocol))) = self.state.as_ref().map(|s| &s.response) {
-      info!("got an upgrade state[{}]: {:?}", line!(), protocol);
+      debug!("got an upgrade state[{}]: {:?}", line!(), protocol);
       if protocol == "websocket" {
         return (ProtocolResult::Upgrade, ClientResult::Continue);
       } else {
@@ -774,7 +774,7 @@ impl<Front:SocketHandler> Http<Front> {
         }
 
         if let Some(&Some(ResponseState::ResponseUpgrade(_,_, ref protocol))) = self.state.as_ref().map(|s| &s.response) {
-          info!("got an upgrade state[{}]: {:?}", line!(), protocol);
+          debug!("got an upgrade state[{}]: {:?}", line!(), protocol);
           if protocol == "websocket" {
             return (ProtocolResult::Upgrade, ClientResult::Continue);
           } else {

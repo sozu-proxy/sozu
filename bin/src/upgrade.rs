@@ -89,7 +89,7 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<Up
     }
     ForkResult::Child => {
       trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
-      Command::new(path)
+      let res = Command::new(path)
         .arg("upgrade")
         .arg("--fd")
         .arg(client.as_raw_fd().to_string())
@@ -97,6 +97,7 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<Up
         .arg(channel_buffer_size.to_string())
         .exec();
 
+      error!("exec call failed: {:?}", res);
       unreachable!();
     }
   }
@@ -111,10 +112,10 @@ pub fn begin_new_master_process(fd: i32, channel_buffer_size: usize) {
 
   command.set_blocking(true);
 
-  let upgrade_data = command.read_message().expect("new master could not read upgradz_data from socket");
+  let upgrade_data = command.read_message().expect("new master could not read upgrade_data from socket");
   //FIXME: should have an id for the master too
   logging::setup("MASTER".to_string(), &upgrade_data.config.log_level, &upgrade_data.config.log_target);
-  info!("new master got upgrade data: {:?}", upgrade_data);
+  trace!("new master got upgrade data: {:?}", upgrade_data);
 
   let mut server = CommandServer::from_upgrade_data(upgrade_data);
   server.enable_cloexec_after_upgrade();

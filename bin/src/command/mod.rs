@@ -443,15 +443,17 @@ impl CommandServer {
           if let Some(task) = self.order_state.error(&msg.id, token, tag, msg.data) {
             let opt_token = task.client.clone();
             let id        = task.id.clone();
+            let ok = task.ok.len();
+            let failures = task.error.clone();
             let answer = ConfigMessageAnswer::new(
               id,
               ConfigMessageStatus::Error,
-              format!("ok: {} messages, error: {:?}, message: {}", task.ok.len(), task.error, s.clone()),
+              format!("ok: {} messages, error: {:?}, message: {}", ok, &failures, s.clone()),
               task.generate_data(&self.state),
             );
+            error!("{}: {} successful messages, failures: {:?}, reason: {}", msg.id, ok, &failures, s.clone());
 
             if let Some(client_token) = opt_token {
-              info!("SENDING to client[{}]: {:?}", client_token.0, answer);
               self.clients[client_token].push_message(answer);
             }
           }
@@ -473,6 +475,8 @@ impl CommandServer {
                 task.generate_data(&self.state),
               )
             } else {
+              error!("{}: {} successful messages, failures: {:?}", msg.id, task.ok.len(), task.error);
+
               ConfigMessageAnswer::new(
                 id,
                 ConfigMessageStatus::Error,
@@ -522,7 +526,7 @@ pub fn start(config: Config, proxies: Vec<Worker>) {
         server.load_state(None, "INITIALIZATION", state_path);
       });
 
-      info!("listen for connections");
+      info!("waiting for configuration client connections");
       server.run();
       //event_loop.run(&mut CommandServer::new(srv, proxies, buffer_size, max_buffer_size)).unwrap()
     },

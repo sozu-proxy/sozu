@@ -1402,7 +1402,7 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
         ResponseState::HasStatusLine(rl, _)     => ResponseState::HasStatusLine(rl, conn),
         ResponseState::HasLength(rl, _, length) => ResponseState::HasLength(rl, conn, length),
         ResponseState::HasUpgrade(rl, _, proto) => {
-          info!("has upgrade, got conn: \"{:?}\"", conn);
+          trace!("has upgrade, got conn: \"{:?}\"", conn);
           //FIXME: verify here if the Upgrade header we got is the same as the request Upgrade header
           if conn.has_upgrade {
             ResponseState::HasUpgrade(rl, conn, proto)
@@ -1415,8 +1415,8 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
     },
     HeaderValue::Upgrade(protocol) => {
       let proto = str::from_utf8(protocol).expect("the parsed protocol should be a valid utf8 string").to_string();
-      info!("parsed a protocol: {:?}", proto);
-      info!("state is {:?}", state);
+      trace!("parsed a protocol: {:?}", proto);
+      trace!("state is {:?}", state);
       match state {
         ResponseState::HasStatusLine(sl, mut conn) => {
           conn.upgrade = Some(proto.clone());

@@ -46,7 +46,6 @@ impl CommandServer {
         self.list_workers(token, &message.id);
       },
       ConfigCommand::LaunchWorker(tag) => {
-        info!("received LaunchWorker with tag \"{}\"", tag);
         self.launch_worker(token, message, &tag);
       },
       ConfigCommand::UpgradeMaster => {
@@ -247,7 +246,7 @@ impl CommandServer {
           "sending configuration orders".to_string(),
           None
           ));
-      info!("created new worker");
+      info!("created new worker: {}", id);
 
       self.next_id += 1;
 
@@ -273,14 +272,14 @@ impl CommandServer {
           worker.channel.write_message(&sending_order);
 
           let received = worker.channel.read_message();
-          info!("worker ({}-{}) sent: {:?}", tag, worker.id, received);
+          debug!("worker ({}-{}) sent: {:?}", tag, worker.id, received);
           //worker.channel.run();
           counter += 1;
         }
         worker.channel.set_blocking(false);
       }
 
-      info!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
+      debug!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
       worker_token, tag, worker.id, worker.channel.sock.take_error());
       self.poll.register(&worker.channel.sock, Token(worker_token), Ready::all(), PollOpt::edge()).unwrap();
       worker.token = Some(Token(worker_token));
@@ -305,7 +304,7 @@ impl CommandServer {
     let (pid, mut channel) = start_new_master_process(self.generate_upgrade_data());
     channel.set_blocking(true);
     let res = channel.read_message();
-    info!("upgrade channel sent: {:?}", res);
+    debug!("upgrade channel sent: {:?}", res);
     if let Some(true) = res {
       self.clients[token].channel.write_message(&ConfigMessageAnswer::new(
         message_id.into(),
@@ -353,13 +352,13 @@ impl CommandServer {
 
   pub fn worker_order(&mut self, token: FrontToken, message_id: &str, order: Order, proxy_id: Option<u32>) {
     if let &Order::AddCertificate(_) = &order {
-      info!("proxyconfig client order AddCertificate()");
+      debug!("proxyconfig client order AddCertificate()");
     } else {
-      info!("proxyconfig client order {:?}", order);
+      debug!("proxyconfig client order {:?}", order);
     }
 
     if let &Order::Logging(ref logging_filter) = &order {
-      info!("Changing master log level to {}", logging_filter);
+      debug!("Changing master log level to {}", logging_filter);
       ::sozu::logging::LOGGER.with(|l| {
         let directives = ::sozu::logging::parse_logging_spec(&logging_filter);
         l.borrow_mut().set_directives(directives);
@@ -412,9 +411,9 @@ impl CommandServer {
         self.state.handle_order(&order);
 
         if let &Order::AddCertificate(ref data) = &order {
-          info!("config generated AddCertificate( ... )");
+          debug!("config generated AddCertificate( ... )");
         } else {
-          info!("config generated {:?}", order);
+          debug!("config generated {:?}", order);
         }
         let mut found = false;
         for ref mut proxy in self.proxies.values_mut() {
@@ -440,7 +439,7 @@ impl CommandServer {
         fcntl(proxy.channel.sock.as_raw_fd(), FcntlArg::F_SETFD(new_flags));
       }
     }
-    info!("disabling cloexec on listener: {}", self.sock.as_raw_fd());
+    trace!("disabling cloexec on listener: {}", self.sock.as_raw_fd());
     let flags = fcntl(self.sock.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
     let mut new_flags = FdFlag::from_bits(flags).unwrap();
     new_flags.remove(FD_CLOEXEC);
@@ -490,7 +489,7 @@ impl CommandServer {
       //order_state,
     } = upgrade_data;
 
-    println!("listener is: {}", command);
+    debug!("listener is: {}", command);
     let listener = unsafe { UnixListener::from_raw_fd(command) };
     poll.register(&listener, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).expect("should register listener correctly");
 
@@ -501,7 +500,7 @@ impl CommandServer {
     let workers: HashMap<Token, Worker> = workers.iter().filter_map(|serialized| {
       let stream = unsafe { UnixStream::from_raw_fd(serialized.fd) };
       if let Some(token) = serialized.token {
-        info!("registering: {:?}", poll.register(&stream, Token(token), Ready::all(), PollOpt::edge()));
+        debug!("registering: {:?}", poll.register(&stream, Token(token), Ready::all(), PollOpt::edge()));
         Some(
           (
             Token(token),

@@ -49,13 +49,15 @@ impl BackendMap {
       for _ in 0..self.max_failures {
         if let Some(ref mut b) = app_instances.next_available_instance() {
           let ref mut backend = *b.borrow_mut();
-          info!("Connecting {} -> {:?}", app_id, (backend.address, backend.active_connections, backend.failures));
           let conn = backend.try_connect();
           if backend.failures >= MAX_FAILURES_PER_BACKEND {
             error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
           }
 
-          return conn.map(|c| (b.clone(), c));
+          return conn.map(|c| (b.clone(), c)).map_err(|e| {
+            error!("could not connect {} to {:?} ({} failures)", app_id, backend.address, backend.failures);
+            e
+          });
         } else {
           error!("no more available backends for app {}", app_id);
           return Err(ConnectionError::NoBackendAvailable);
@@ -74,12 +76,15 @@ impl BackendMap {
       .map(|b| {
         let ref mut backend = *b.borrow_mut();
         let conn = backend.try_connect();
-        info!("Connecting {} -> {:?} using session {}", app_id, (backend.address, backend.active_connections, backend.failures), sticky_session);
         if backend.failures >= MAX_FAILURES_PER_BACKEND {
           error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
         }
 
-        conn.map(|c| (b.clone(), c))
+        conn.map(|c| (b.clone(), c)).map_err(|e| {
+          error!("could not connect {} to {:?} using session {} ({} failures)",
+            app_id, backend.address, sticky_session, backend.failures);
+          e
+        })
       });
 
     if let Some(res) = sticky_conn {

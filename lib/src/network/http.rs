@@ -88,10 +88,10 @@ impl Client {
   }
 
   pub fn upgrade(&mut self) {
-    info!("HTTP::upgrade");
+    debug!("HTTP::upgrade");
     let protocol = unwrap_msg!(self.protocol.take());
     if let State::Http(http) = protocol {
-      info!("switching to pipe");
+      debug!("switching to pipe");
       let front_token = unwrap_msg!(http.front_token());
       let back_token  = unwrap_msg!(http.back_token());
 
@@ -383,7 +383,7 @@ impl ServerConfiguration {
   }
 
   pub fn remove_http_front(&mut self, front: HttpFront, event_loop: &mut Poll) {
-    info!("removing http_front {:?}", front);
+    debug!("removing http_front {:?}", front);
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
       fronts.retain(|f| f != &front);
     }
@@ -582,27 +582,27 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     //trace!("{} notified", message);
     match message.order {
       Order::AddApplication(application) => {
-        info!("{} add application {:?}", message.id, application);
+        debug!("{} add application {:?}", message.id, application);
         self.add_application(application, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::RemoveApplication(application) => {
-        info!("{} remove application {:?}", message.id, application);
+        debug!("{} remove application {:?}", message.id, application);
         self.remove_application(&application, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::AddHttpFront(front) => {
-        info!("{} add front {:?}", message.id, front);
+        debug!("{} add front {:?}", message.id, front);
         self.add_http_front(front, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::RemoveHttpFront(front) => {
-        info!("{} front {:?}", message.id, front);
+        debug!("{} front {:?}", message.id, front);
         self.remove_http_front(front, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::AddInstance(instance) => {
-        info!("{} add instance {:?}", message.id, instance);
+        debug!("{} add instance {:?}", message.id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -613,7 +613,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         }
       },
       Order::RemoveInstance(instance) => {
-        info!("{} remove instance {:?}", message.id, instance);
+        debug!("{} remove instance {:?}", message.id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -624,7 +624,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         }
       },
       Order::HttpProxy(configuration) => {
-        info!("{} modifying proxy configuration: {:?}", message.id, configuration);
+        debug!("{} modifying proxy configuration: {:?}", message.id, configuration);
         self.front_timeout = configuration.front_timeout;
         self.back_timeout  = configuration.back_timeout;
         self.answers = DefaultAnswers {
@@ -647,7 +647,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::Status => {
-        info!("{} status", message.id);
+        debug!("{} status", message.id);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::Logging(logging_filter) => {

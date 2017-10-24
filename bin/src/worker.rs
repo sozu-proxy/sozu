@@ -69,7 +69,7 @@ pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
   //println!("got message: {:?}", proxy_config);
 
   logging::setup(format!("{}-{}", "TAG", id), &proxy_config.log_level, &proxy_config.log_target);
-  info!("starting...");
+  info!("worker {} starting...", id);
 
   command.set_nonblocking(true);
   let mut command: Channel<OrderMessageAnswer,OrderMessage> = command.into();
@@ -100,9 +100,9 @@ pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
 
   command.readiness.insert(Ready::readable());
   let mut server = Server::new(event_loop, command, http_session, https_session, None);
-  info!("starting event loop");
+  info!("{} starting event loop", id);
   server.run();
-  info!("ending event loop");
+  info!("{} ending event loop", id);
 }
 
 pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Channel<OrderMessage,OrderMessageAnswer>)> {
@@ -130,11 +130,11 @@ pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Ch
 
   let path = unsafe { get_executable_path() };
 
-  info!("launching worker");
+  info!("{} launching worker", id);
   debug!("executable path is {}", path);
   match fork() {
     Ok(ForkResult::Parent{ child }) => {
-      info!("worker launched: {}", child);
+      info!("{} worker launched: {}", id, child);
       command.write_message(config);
       command.set_nonblocking(true);
 

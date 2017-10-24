@@ -142,7 +142,7 @@ impl TlsClient {
       }
       false
     } else if let State::Http(http) = protocol {
-      info!("https switching to wss");
+      debug!("https switching to wss");
       let front_token = unwrap_msg!(http.front_token());
       let back_token  = unwrap_msg!(http.back_token());
 
@@ -377,7 +377,7 @@ impl ServerConfiguration {
     let cert = try!(X509::from_pem(&tls_data.certificate));
 
     let common_name: Option<String> = get_cert_common_name(&cert);
-    info!("got common name: {:?}", common_name);
+    debug!("got common name for default cert: {:?}", common_name);
 
     let app = TlsApp {
       app_id:           config.default_app_id.clone().unwrap_or(String::new()),
@@ -474,7 +474,7 @@ impl ServerConfiguration {
           ).collect()
         }).unwrap_or(vec!());
 
-        info!("got subject alt names: {:?}", names);
+        debug!("got subject alt names: {:?}", names);
         {
           let mut domains = unwrap_msg!(ref_domains.lock());
           for name in &names {
@@ -483,7 +483,7 @@ impl ServerConfiguration {
         }
 
         if let Some(common_name) = get_cert_common_name(&cert) {
-        info!("got common name: {:?}", common_name);
+        debug!("got common name: {:?}", common_name);
           names.push(common_name);
         }
 
@@ -491,17 +491,17 @@ impl ServerConfiguration {
           let contexts = unwrap_msg!(ref_ctx.lock());
           let domains  = unwrap_msg!(ref_domains.lock());
 
-          info!("ref: {:?}", ssl);
+          trace!("ref: {:?}", ssl);
           if let Some(servername) = ssl.servername().map(|s| s.to_string()) {
-            info!("checking servername: {}", servername);
+            debug!("checking servername: {}", servername);
             if &servername == &default_name {
               return Ok(());
             }
-            info!("looking for fingerprint for {:?}", servername);
+            debug!("looking for fingerprint for {:?}", servername);
             if let Some(kv) = domains.domain_lookup(servername.as_bytes()) {
-              info!("looking for context for {:?} with fingerprint {:?}", servername, kv.1);
+              debug!("looking for context for {:?} with fingerprint {:?}", servername, kv.1);
               if let Some(ref tls_data) = contexts.get(&kv.1) {
-                info!("found context for {:?}", servername);
+                debug!("found context for {:?}", servername);
                 if !tls_data.initialized {
                   //FIXME: couldn't we skip to the next cert?
                   error!("no application is using that certificate");
@@ -509,7 +509,7 @@ impl ServerConfiguration {
                 }
                 let context: &SslContext = &tls_data.context;
                 if let Ok(()) = ssl.set_ssl_context(context) {
-                  info!("servername is now {:?}", ssl.servername());
+                  debug!("servername is now {:?}", ssl.servername());
                   return Ok(());
                 } else {
                   error!("no context found for {:?}", servername);
@@ -582,7 +582,7 @@ impl ServerConfiguration {
   }
 
   pub fn remove_https_front(&mut self, front: HttpsFront, event_loop: &mut Poll) {
-    info!("removing tls_front {:?}", front);
+    debug!("removing tls_front {:?}", front);
 
     if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
       if let Some(pos) = fronts.iter().position(|f| &f.app_id == &front.app_id && &f.cert_fingerprint == &front.fingerprint) {
@@ -625,14 +625,14 @@ impl ServerConfiguration {
       //FIXME
       let fingerprint = CertFingerprint(unwrap_msg!(cert.fingerprint(MessageDigest::sha256())));
       let common_name: Option<String> = get_cert_common_name(&cert);
-      info!("got common name: {:?}", common_name);
+      debug!("got common name: {:?}", common_name);
 
       let names: Vec<String> = cert.subject_alt_names().map(|names| {
         names.iter().filter_map(|general_name|
           general_name.dnsname().map(|name| String::from(name))
         ).collect()
       }).unwrap_or(vec!());
-      info!("got subject alt names: {:?}", names);
+      debug!("got subject alt names: {:?}", names);
 
       ctx.set_certificate(&cert);
       ctx.set_private_key(&key);
@@ -677,7 +677,7 @@ impl ServerConfiguration {
 
   // FIXME: return an error if the cert is still in use
   pub fn remove_certificate(&mut self, fingerprint: CertFingerprint, event_loop: &mut Poll) {
-    info!("removing certificate {:?}", fingerprint);
+    debug!("removing certificate {:?}", fingerprint);
     let mut contexts = unwrap_msg!(self.contexts.lock());
     let mut domains  = unwrap_msg!(self.domains.lock());
     let must_delete = contexts.get_mut(&fingerprint).map(|tls_data| {
@@ -948,12 +948,12 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     //trace!("{} notified", message);
     match message.order {
       Order::AddApplication(application) => {
-        info!("{} add application {:?}", message.id, application);
+        debug!("{} add application {:?}", message.id, application);
         self.add_application(application, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::RemoveApplication(application) => {
-        info!("{} remove application {:?}", message.id, application);
+        debug!("{} remove application {:?}", message.id, application);
         self.remove_application(&application, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
@@ -979,7 +979,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::AddInstance(instance) => {
-        info!("{} add instance {:?}", message.id, instance);
+        debug!("{} add instance {:?}", message.id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -990,7 +990,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         }
       },
       Order::RemoveInstance(instance) => {
-        info!("{} remove instance {:?}", message.id, instance);
+        debug!("{} remove instance {:?}", message.id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
@@ -1001,7 +1001,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         }
       },
       Order::HttpProxy(configuration) => {
-        info!("{} modifying proxy configuration: {:?}", message.id, configuration);
+        debug!("{} modifying proxy configuration: {:?}", message.id, configuration);
         self.front_timeout = configuration.front_timeout;
         self.back_timeout  = configuration.back_timeout;
         self.answers = DefaultAnswers {
@@ -1020,11 +1020,11 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::Status => {
-        info!("{} status", message.id);
+        debug!("{} status", message.id);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::Logging(logging_filter) => {
-        info!("{} changing logging filter to {}", message.id, logging_filter);
+        debug!("{} changing logging filter to {}", message.id, logging_filter);
         ::logging::LOGGER.with(|l| {
           let directives = ::logging::parse_logging_spec(&logging_filter);
           l.borrow_mut().set_directives(directives);

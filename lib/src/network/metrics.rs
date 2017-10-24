@@ -271,7 +271,7 @@ impl ProxyMetrics {
 macro_rules! metrics_set_up (
   ($host:expr, $port: expr) => {
     let metrics_socket = ::mio::net::UdpSocket::bind(&("0.0.0.0:0".parse().unwrap())).expect("could not parse address");
-    info!("setting up metrics: local address = {:#?}", metrics_socket.local_addr());
+    debug!("setting up metrics: local address = {:#?}", metrics_socket.local_addr());
     let metrics_host   = ($host, $port).to_socket_addrs().expect("could not parse address").next().expect("could not get first address");
     $crate::network::metrics::METRICS.with(|metrics| {
       (*metrics.borrow_mut()).set_up_remote(metrics_socket, metrics_host);
@@ -304,7 +304,6 @@ macro_rules! gauge (
   ($key:expr, $value: expr) => {
     let v = $value;
     $crate::network::metrics::METRICS.with(|metrics| {
-      info!("gauge {} -> {}", $key, v);
       //(*metrics.borrow_mut()).write(format_args!("{}.{}:{}|g\n", *$crate::logging::TAG, $key, v));
       (*metrics.borrow_mut()).set_gauge($key, v);
     });
