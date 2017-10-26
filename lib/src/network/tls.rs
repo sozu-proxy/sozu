@@ -879,11 +879,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           backend.failures += 1;
           backend.dec_connections();
         });
-      }
 
-      let reused = client.http().map(|http| http.app_id.is_some()).unwrap_or(false);
-      //deregister back socket if it is the wrong one or if it was not connecting
-      if reused || client.back_connected == BackendConnectionStatus::Connecting {
         client.instance = None;
         client.back_connected = BackendConnectionStatus::NotConnected;
         client.readiness().back_interest  = UnixReady::from(Ready::empty());
@@ -894,6 +890,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         });
       }
 
+      let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
+
       let conn   = try!(unwrap_msg!(client.http()).state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
       let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();
       let conn = match (front_should_stick, sticky_session) {
@@ -903,6 +901,21 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
       match conn {
         Ok(socket) => {
+          let new_app_id = client.http().and_then(|ref http| http.app_id.clone());
+
+          //deregister back socket if it is the wrong one or if it was not connecting
+          if old_app_id.is_some() && old_app_id != new_app_id {
+            client.instance = None;
+            client.back_connected = BackendConnectionStatus::NotConnected;
+            client.readiness().back_readiness = UnixReady::from(Ready::empty());
+            client.back_socket().as_ref().map(|sock| {
+              event_loop.deregister(*sock);
+              sock.shutdown(Shutdown::Both);
+            });
+            // we still want to use the new socket
+            client.readiness().back_interest  = UnixReady::from(Ready::writable());
+          }
+
           let req_state = unwrap_msg!(client.http()).state().request.clone();
           let req_header_end = unwrap_msg!(client.http()).state().req_header_end;
           let res_header_end = unwrap_msg!(client.http()).state().res_header_end;
@@ -919,7 +932,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           });
 
           client.set_back_socket(socket);
-          if reused {
+
+          if old_app_id == new_app_id {
             Ok(BackendConnectAction::Replace)
           } else {
             Ok(BackendConnectAction::New)
