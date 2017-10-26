@@ -241,7 +241,10 @@ impl ProxyClient for Client {
   }
 
   fn back_hup(&mut self) -> ClientResult {
-    ClientResult::CloseBoth
+    match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Http(ref mut http)      => http.back_hup(),
+      State::WebSocket(ref mut pipe) => pipe.back_hup()
+    }
   }
 
   // Read content from the client

@@ -547,8 +547,9 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
             self.close_client(poll, client_token);
             break;
           },
+          ClientResult::Continue => {},
           _ => {
-            self.clients[client_token].readiness().front_readiness.remove(UnixReady::hup());
+            self.clients[client_token].readiness().back_readiness.remove(UnixReady::hup());
           }
         };
       }

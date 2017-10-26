@@ -246,7 +246,12 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn back_hup(&mut self) -> ClientResult {
-    ClientResult::CloseBoth
+    //FIXME: CloseBoth might not be a good idea if we do keep alive here?
+    if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
+      ClientResult::CloseBoth
+    } else {
+      ClientResult::Continue
+    }
   }
 
   /// Retrieve the response status from the http response state 
