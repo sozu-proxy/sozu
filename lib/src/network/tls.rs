@@ -44,6 +44,7 @@ use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
+use network::retry::RetryPolicy;
 use util::UnwrapLog;
 
 
@@ -197,7 +198,9 @@ impl ProxyClient for TlsClient {
 
     if connected == BackendConnectionStatus::Connected {
       self.instance.as_ref().map(|instance| {
-        (*instance.borrow_mut()).failures = 0;
+        let ref mut backend = (*instance.borrow_mut());
+        backend.failures = 0;
+        backend.retry_policy.succeed();
       });
     }
   }
@@ -883,8 +886,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       if client.back_connected == BackendConnectionStatus::Connecting {
         client.instance.as_ref().map(|instance| {
           let ref mut backend = *instance.borrow_mut();
-          backend.failures += 1;
           backend.dec_connections();
+          backend.failures += 1;
+          backend.retry_policy.fail();
         });
 
         client.instance = None;

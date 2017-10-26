@@ -172,6 +172,10 @@ impl Backend {
     self.status = BackendStatus::Closing;
   }
 
+  pub fn retry_policy(&mut self) -> &mut retry::RetryPolicyWrapper {
+    &mut self.retry_policy
+  }
+
   pub fn can_open(&self) -> bool {
     if let Some(action) = self.retry_policy.can_try() {
       self.status == BackendStatus::Normal && action == retry::RetryAction::OKAY
@@ -221,7 +225,7 @@ impl Backend {
     //FIXME: what happens if the connect() call fails with EINPROGRESS?
     let conn = mio::tcp::TcpStream::connect(&self.address).map_err(|_| ConnectionError::NoBackendAvailable);
     if conn.is_ok() {
-      self.retry_policy.succeed();
+      //self.retry_policy.succeed();
       self.inc_connections();
     } else {
       self.retry_policy.fail();

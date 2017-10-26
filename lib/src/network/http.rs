@@ -26,6 +26,7 @@ use network::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
 use network::socket::{SocketHandler,SocketResult,server_bind};
+use network::retry::RetryPolicy;
 use parser::http11::hostname_and_port;
 use util::UnwrapLog;
 
@@ -149,8 +150,10 @@ impl ProxyClient for Client {
     self.back_connected = connected;
     if connected == BackendConnectionStatus::Connected {
       self.instance.as_ref().map(|instance| {
+        let ref mut backend = (*instance.borrow_mut());
         //successful connection, rest failure counter
-        (*instance.borrow_mut()).failures = 0;
+        backend.failures = 0;
+        backend.retry_policy.succeed();
       });
     }
   }
@@ -527,6 +530,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           let ref mut backend = *instance.borrow_mut();
           backend.dec_connections();
           backend.failures += 1;
+          backend.retry_policy.fail();
         });
       }
 
