@@ -252,7 +252,14 @@ impl ProxyClient for TlsClient {
   }
 
   fn back_hup(&mut self)      -> ClientResult {
-    self.http().map(|h| h.back_hup()).unwrap_or(ClientResult::CloseClient)
+    match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Http(ref mut http)      => http.back_hup(),
+      State::WebSocket(ref mut pipe) => pipe.back_hup(),
+      State::Handshake(_)            => {
+        error!("why a backend HUP event while still in frontend handshake?");
+        ClientResult::CloseClient
+      }
+    }
   }
 
   fn readable(&mut self)      -> ClientResult {
