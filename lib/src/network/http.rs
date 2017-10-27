@@ -532,19 +532,19 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           backend.failures += 1;
           backend.retry_policy.fail();
         });
-      }
 
-      let reused = client.http().map(|http| http.app_id.is_some()).unwrap_or(false);
       //deregister back socket if it is the wrong one or if it was not connecting
-      if reused || client.back_connected == BackendConnectionStatus::Connecting {
         client.instance = None;
         client.back_connected = BackendConnectionStatus::NotConnected;
         client.readiness().back_interest  = UnixReady::from(Ready::empty());
         client.readiness().back_readiness = UnixReady::from(Ready::empty());
-        let sock = unwrap_msg!(client.backend.as_ref());
-        event_loop.deregister(sock);
-        sock.shutdown(Shutdown::Both);
+        client.back_socket().as_ref().map(|sock| {
+          event_loop.deregister(*sock);
+          sock.shutdown(Shutdown::Both);
+        });
       }
+
+      let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
 
       let conn = match (front_should_stick, sticky_session) {
         (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session),
@@ -553,12 +553,26 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
       match conn {
         Ok(socket) => {
+          let new_app_id = client.http().and_then(|ref http| http.app_id.clone());
+
+          if old_app_id.is_some() && old_app_id != new_app_id {
+            client.instance = None;
+            client.back_connected = BackendConnectionStatus::NotConnected;
+            client.readiness().back_readiness = UnixReady::from(Ready::empty());
+            client.back_socket().as_ref().map(|sock| {
+              event_loop.deregister(*sock);
+              sock.shutdown(Shutdown::Both);
+            });
+            // we still want to use the new socket
+            client.readiness().back_interest  = UnixReady::from(Ready::writable());
+          }
+
           socket.set_nodelay(true);
           client.set_back_socket(socket);
           client.readiness().back_interest.insert(Ready::writable());
           client.readiness().back_interest.insert(UnixReady::hup());
           client.readiness().back_interest.insert(UnixReady::error());
-          if reused {
+          if old_app_id == new_app_id {
             Ok(BackendConnectAction::Replace)
           } else {
             Ok(BackendConnectAction::New)
