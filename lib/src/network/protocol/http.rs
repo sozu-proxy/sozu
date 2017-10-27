@@ -373,7 +373,7 @@ impl<Front:SocketHandler> Http<Front> {
     if self.front_buf.buffer.available_space() == 0 {
       if self.backend_token == None {
         // We don't have a backend to empty the buffer into, close the connection
-        error!("{}\t[{:?}] front buffer full, no backend, closing the connection", self.log_ctx, self.token);
+        error!("{}\tfront buffer full, no backend, closing the connection", self.log_ctx);
         self.readiness.front_interest = UnixReady::from(Ready::empty());
         self.readiness.back_interest  = UnixReady::from(Ready::empty());
         incr_ereq!();
@@ -386,7 +386,7 @@ impl<Front:SocketHandler> Http<Front> {
     }
 
     let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
-    debug!("{}\tFRONT [{:?}]: read {} bytes", self.log_ctx, self.token, sz);
+    debug!("{}\tFRONT: read {} bytes", self.log_ctx, sz);
 
     if sz > 0 {
       self.front_buf.buffer.fill(sz);
@@ -408,7 +408,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     match res {
       SocketResult::Error => {
-        error!("{}\t[{:?}] front socket error, closing the connection", self.log_ctx, self.token);
+        error!("{}\tfront socket error, closing the connection", self.log_ctx);
         incr_ereq!();
         self.readiness.reset();
         return ClientResult::CloseClient;
@@ -425,7 +425,7 @@ impl<Front:SocketHandler> Http<Front> {
       self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
         &mut self.front_buf));
       if unwrap_msg!(self.state.as_ref()).is_front_error() {
-        error!("{}\t[{:?}] front parsing error, closing the connection", self.log_ctx, self.token);
+        error!("{}\tfront parsing error, closing the connection", self.log_ctx);
         //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
         self.readiness.front_interest.remove(Ready::readable());
         return ClientResult::CloseClient;
@@ -453,12 +453,12 @@ impl<Front:SocketHandler> Http<Front> {
         ClientResult::Continue
       },
       Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
-        error!("{}\t[{:?}] front read should have stopped on chunk ended", self.log_ctx, self.token);
+        error!("{}\tfront read should have stopped on chunk ended", self.log_ctx);
         self.readiness.front_interest.remove(Ready::readable());
         ClientResult::Continue
       },
       Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Error)) => {
-        error!("{}\t[{:?}] front read should have stopped on chunk error", self.log_ctx, self.token);
+        error!("{}\tfront read should have stopped on chunk error", self.log_ctx);
         self.readiness.reset();
         ClientResult::CloseClient
       },
@@ -468,7 +468,7 @@ impl<Front:SocketHandler> Http<Front> {
           &mut self.front_buf));
 
           if unwrap_msg!(self.state.as_ref()).is_front_error() {
-            error!("{}\t[{:?}] front chunk parsing error, closing the connection", self.log_ctx, self.token);
+            error!("{}\tfront chunk parsing error, closing the connection", self.log_ctx);
             //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             self.readiness.reset();
             return ClientResult::CloseClient;
@@ -486,7 +486,7 @@ impl<Front:SocketHandler> Http<Front> {
           &mut self.front_buf));
 
         if unwrap_msg!(self.state.as_ref()).is_front_error() {
-          error!("{}\t[{:?}] front parsing error, closing the connection", self.log_ctx, self.token);
+          error!("{}\tfront parsing error, closing the connection", self.log_ctx);
           //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
           self.readiness.reset();
           return ClientResult::CloseClient;
@@ -534,7 +534,7 @@ impl<Front:SocketHandler> Http<Front> {
 
       if res == SocketResult::Error {
         self.readiness.reset();
-        error!("{}\t[{:?}] error writing default answer to front socket, closing", self.log_ctx, self.token);
+        error!("{}\terror writing default answer to front socket, closing", self.log_ctx);
         incr_ereq!();
         return ClientResult::CloseClient;
       } else {
@@ -571,7 +571,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     match res {
       SocketResult::Error => {
-        error!("{}\t[{:?}] error writing to front socket, closing", self.log_ctx, self.token);
+        error!("{}\terror writing to front socket, closing", self.log_ctx);
         incr_ereq!();
         self.readiness.reset();
         return ClientResult::CloseClient;
