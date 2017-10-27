@@ -44,6 +44,7 @@ use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
+use network::protocol::http::DefaultAnswerStatus;
 use network::retry::RetryPolicy;
 use util::UnwrapLog;
 
@@ -111,10 +112,10 @@ impl TlsClient {
     })
   }
 
-  pub fn set_answer(&mut self, buf: &[u8])  {
+  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: &[u8])  {
     self.protocol.as_mut().map(|protocol| {
       if let &mut State::Http(ref mut http) = protocol {
-        http.set_answer(buf);
+        http.set_answer(answer, buf);
       }
     });
   }
@@ -777,7 +778,7 @@ impl ServerConfiguration {
 
       match self.instances.backend_from_app_id(&app_id) {
         Err(e) => {
-          client.set_answer(&self.answers.ServiceUnavailable);
+          client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
           Err(e)
         },
         Ok((backend, conn))  => {
@@ -801,7 +802,7 @@ impl ServerConfiguration {
     match self.instances.backend_from_sticky_session(app_id, sticky_session) {
       Err(e) => {
         debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
-        client.set_answer(&self.answers.ServiceUnavailable);
+        client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
         Err(e)
       },
       Ok((backend, conn))  => {
@@ -855,7 +856,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       let servername: Option<String> = unwrap_msg!(client.http()).frontend.ssl().servername().map(|s| s.to_string());
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
         error!("TLS SNI hostname '{:?}' and Host header '{}' don't match", servername, hostname_str);
-        unwrap_msg!(client.http()).set_answer(&self.answers.NotFound);
+        unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
         client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
         return Err(ConnectionError::HostNotFound);
       }
@@ -966,19 +967,19 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           }
         },
         Err(ConnectionError::NoBackendAvailable) => {
-          unwrap_msg!(client.http()).set_answer(&self.answers.ServiceUnavailable);
+          unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
           client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::NoBackendAvailable)
         },
         Err(ConnectionError::HostNotFound) => {
-          unwrap_msg!(client.http()).set_answer(&self.answers.NotFound);
+          unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
           client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::HostNotFound)
         },
         e => panic!(e)
       }
     } else {
-      unwrap_msg!(client.http()).set_answer(&self.answers.NotFound);
+      unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
       client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
       Err(ConnectionError::HostNotFound)
     }

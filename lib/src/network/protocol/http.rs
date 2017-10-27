@@ -31,10 +31,16 @@ impl StickySession {
 
 type BackendToken = Token;
 
-#[derive(PartialEq)]
+#[derive(Debug,Clone,Copy,PartialEq)]
 pub enum ClientStatus {
   Normal,
-  DefaultAnswer,
+  DefaultAnswer(DefaultAnswerStatus),
+}
+
+#[derive(Debug,Clone,Copy,PartialEq)]
+pub enum DefaultAnswerStatus {
+  Answer404,
+  Answer503,
 }
 
 pub struct Http<Front:SocketHandler> {
@@ -136,13 +142,13 @@ impl<Front:SocketHandler> Http<Front> {
     self.state = Some(state);
   }
 
-  pub fn set_answer(&mut self, buf: &[u8])  {
+  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: &[u8])  {
     self.front_buf.reset();
     self.back_buf.reset();
     self.back_buf.write(buf);
     self.back_buf.consume_parsed_data(buf.len());
     self.back_buf.slice_output(buf.len());
-    self.status = ClientStatus::DefaultAnswer;
+    self.status = ClientStatus::DefaultAnswer(answer);
   }
 
   pub fn added_request_header(&self, public_address: Option<IpAddr>) -> String {
@@ -335,7 +341,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Read content from the client
   pub fn readable(&mut self) -> ClientResult {
-    if self.status == ClientStatus::DefaultAnswer {
+    if let ClientStatus::DefaultAnswer(_) = self.status {
       self.readiness.front_interest.insert(Ready::writable());
       self.readiness.back_interest.remove(Ready::readable());
       self.readiness.back_interest.remove(Ready::writable());
@@ -481,7 +487,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     assert!(self.front_buf.empty(), "investigating single buffer usage: the front->back buffer should not be used while parsing and forwarding the response");
     let output_size = self.back_buf.output_data_size();
-    if self.status == ClientStatus::DefaultAnswer {
+    if let ClientStatus::DefaultAnswer(answer) = self.status {
       if self.back_buf.output_data_size() == 0 {
         self.readiness.front_interest.remove(Ready::writable());
       }
@@ -630,7 +636,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Forward content to application
   pub fn back_writable(&mut self) -> ClientResult {
-    if self.status == ClientStatus::DefaultAnswer {
+    if let ClientStatus::DefaultAnswer(_) = self.status {
       error!("{}\tsending default answer, should not write to back", self.log_ctx);
       self.readiness.back_interest.remove(Ready::writable());
       self.readiness.front_interest.insert(Ready::writable());
@@ -726,7 +732,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Read content from application
   pub fn back_readable(&mut self) -> (ProtocolResult, ClientResult) {
-    if self.status == ClientStatus::DefaultAnswer {
+    if let ClientStatus::DefaultAnswer(_) = self.status {
       error!("{}\tsending default answer, should not read from back socket", self.log_ctx);
       self.readiness.back_interest.remove(Ready::readable());
       return (ProtocolResult::Continue, ClientResult::Continue);

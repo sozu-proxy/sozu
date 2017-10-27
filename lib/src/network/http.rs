@@ -23,6 +23,7 @@ use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol
 use network::backends::BackendMap;
 use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
+use network::protocol::http::DefaultAnswerStatus;
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -110,9 +111,9 @@ impl Client {
     }
   }
 
-  pub fn set_answer(&mut self, buf: &[u8])  {
+  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: &[u8])  {
     match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http) => http.set_answer(buf),
+      State::Http(ref mut http) => http.set_answer(answer, buf),
       _ => {}
     }
   }
@@ -451,7 +452,7 @@ impl ServerConfiguration {
 
     match self.instances.backend_from_app_id(app_id) {
       Err(e) => {
-        client.set_answer(&self.answers.ServiceUnavailable);
+        client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
         Err(e)
       },
       Ok((backend, conn))  => {
@@ -472,7 +473,7 @@ impl ServerConfiguration {
     match self.instances.backend_from_sticky_session(app_id, sticky_session) {
       Err(e) => {
         debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
-        client.set_answer(&self.answers.ServiceUnavailable);
+        client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
         Err(e)
       },
       Ok((backend, conn))  => {
@@ -595,19 +596,19 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           //Ok(())
         },
         Err(ConnectionError::NoBackendAvailable) => {
-          client.set_answer(&self.answers.ServiceUnavailable);
+          client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
           client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::NoBackendAvailable)
         }
         Err(ConnectionError::HostNotFound) => {
-          client.set_answer(&self.answers.NotFound);
+          client.set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
           client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::HostNotFound)
         }
         e => panic!(e)
       }
     } else {
-      client.set_answer(&self.answers.NotFound);
+      client.set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
       client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
       Err(ConnectionError::HostNotFound)
     }
