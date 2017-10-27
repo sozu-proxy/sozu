@@ -321,13 +321,13 @@ impl<Front:SocketHandler> Http<Front> {
     let status_line  = self.get_response_status().map(|line| format!("{} {}", line.status, line.reason)).unwrap_or(String::from("-"));
 
     if front_keep_alive && back_keep_alive {
-      info!("{}\t {} -> {}\t{} {} {}\t| success, keep alive for front and back", self.log_ctx,
+      info!("{}\t {} -> {}\t{} {} {}\t| keep alive front/back", self.log_ctx,
         client, backend, status_line, host, request_line);
     } else if front_keep_alive && !back_keep_alive {
-      info!("{}\t {} -> {}\t{} {} {}\t| success, keepalive for front", self.log_ctx,
+      info!("{}\t {} -> {}\t{} {} {}\t| keep alive front", self.log_ctx,
         client, backend, status_line, host, request_line);
     } else {
-      info!("{}\t {} -> {}\t{} {} {}\t| success, closing front and back", self.log_ctx,
+      info!("{}\t {} -> {}\t{} {} {}\t| no keep alive", self.log_ctx,
         client, backend, status_line, host, request_line);
     }
   }
