@@ -338,6 +338,25 @@ impl<Front:SocketHandler> Http<Front> {
     }
   }
 
+  pub fn log_default_answer_success(&self) {
+    let client = match self.get_client_address() {
+      None => String::from("-"),
+      Some(SocketAddr::V4(addr)) => format!("{}", addr),
+      Some(SocketAddr::V6(addr)) => format!("{}", addr),
+    };
+
+    let status_line = match self.status {
+      ClientStatus::Normal => "-",
+      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer404) => "404 Not Found",
+      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer503) => "503 Service Unavailable",
+    };
+
+    let host         = self.get_host().unwrap_or(String::from("-"));
+    let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or(String::from("-"));
+
+    info!("{}\t {} -> X\t{} {} {}\t", self.log_ctx,
+        client, status_line, host, request_line);
+  }
 
   // Read content from the client
   pub fn readable(&mut self) -> ClientResult {
@@ -507,8 +526,8 @@ impl<Front:SocketHandler> Http<Front> {
       }
 
       if self.back_buf.buffer.available_data() == 0 {
+        self.log_default_answer_success();
         self.readiness.reset();
-        error!("{}\t[{:?}] cannot write default answer, back buffer was empty", self.log_ctx, self.token);
         incr_ereq!();
         return ClientResult::CloseClient;
       }
