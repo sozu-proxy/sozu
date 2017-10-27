@@ -447,7 +447,7 @@ impl ServerConfiguration {
   }
 
   pub fn backend_from_app_id(&mut self, client: &mut Client, app_id: &str, front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
-    client.http().map(|h| h.app_id = Some(String::from(app_id)));
+    client.http().map(|h| h.set_app_id(String::from(app_id)));
 
     match self.instances.backend_from_app_id(app_id) {
       Err(e) => {
@@ -467,7 +467,7 @@ impl ServerConfiguration {
   }
 
   pub fn backend_from_sticky_session(&mut self, client: &mut Client, app_id: &str, sticky_session: u32) -> Result<TcpStream,ConnectionError> {
-    client.http().map(|h| h.app_id = Some(String::from(app_id)));
+    client.http().map(|h| h.set_app_id(String::from(app_id)));
 
     match self.instances.backend_from_sticky_session(app_id, sticky_session) {
       Err(e) => {

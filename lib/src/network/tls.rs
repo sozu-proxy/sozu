@@ -773,7 +773,7 @@ impl ServerConfiguration {
     trace!("looking for backend for real host: {}", real_host);
 
     if let Some(app_id) = self.frontend_from_request(real_host, uri).map(|ref front| front.app_id.clone()) {
-      client.http().map(|h| h.app_id = Some(app_id.clone()));
+      client.http().map(|h| h.set_app_id(app_id.clone()));
 
       match self.instances.backend_from_app_id(&app_id) {
         Err(e) => {
@@ -796,7 +796,7 @@ impl ServerConfiguration {
   }
 
   pub fn backend_from_sticky_session(&mut self, client: &mut TlsClient, app_id: &str, sticky_session: u32) -> Result<TcpStream,ConnectionError> {
-    client.http().map(|h| h.app_id = Some(String::from(app_id)));
+    client.http().map(|h| h.set_app_id(String::from(app_id)));
 
     match self.instances.backend_from_sticky_session(app_id, sticky_session) {
       Err(e) => {

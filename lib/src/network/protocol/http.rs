@@ -66,7 +66,7 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn new(sock: Front, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>,
              protocol: Protocol) -> Option<Http<Front>> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
-    let log_ctx    = format!("{}\tunknown\t", &request_id);
+    let log_ctx    = format!("-\t{}\tunknown\t", &request_id);
     let mut client = Http {
       frontend:           sock,
       backend:            None,
@@ -114,7 +114,9 @@ impl<Front:SocketHandler> Http<Front> {
     self.back_buf.reset();
     //self.readiness = Readiness::new();
     self.request_id = request_id;
-    self.log_ctx = format!("{}\t{}\t", self.request_id, self.app_id.as_ref().unwrap_or(&String::from("unknown")));
+    self.log_ctx = format!("{}\t{}\t{}\t",
+      self.token.map(|t| t.0.to_string()).unwrap_or(String::from("-")),
+      self.request_id, self.app_id.as_ref().unwrap_or(&String::from("unknown")));
   }
 
   fn tokens(&self) -> Option<(Token,Token)> {
@@ -214,7 +216,18 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn set_front_token(&mut self, token: Token) {
+    self.log_ctx = format!("{}\t{}\t{}\t", token.0,
+      self.request_id, self.app_id.as_ref().unwrap_or(&String::from("unknown")));
+
     self.token         = Some(token);
+  }
+
+  pub fn set_app_id(&mut self, app_id: String) {
+    self.log_ctx = format!("{}\t{}\t{}\t",
+      self.token.map(|t| t.0.to_string()).unwrap_or(String::from("-")),
+      self.request_id, &app_id);
+
+    self.app_id  = Some(app_id);
   }
 
   pub fn set_back_token(&mut self, token: Token) {
