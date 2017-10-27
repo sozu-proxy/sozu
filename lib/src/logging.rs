@@ -407,9 +407,9 @@ macro_rules! log {
             l.borrow_mut().log(
               &_META,
               format_args!(
-                concat!("{}\t{}\t{}\t{}\t{}\t", $format, '\n'),
-                ::time::now_utc().rfc3339(), ::time::precise_time_ns(), pid,
-                $level_tag, tag $(, $final_args)*)
+                concat!("{} {}\t{} {} {}\t", $format, '\n'),
+                ::time::now_utc().rfc3339(), ::time::precise_time_ns(), pid, tag,
+                $level_tag $(, $final_args)*)
             );
           })
         });
@@ -511,9 +511,9 @@ impl log::Log for CompatLogger {
         l.borrow_mut().compat_log(
           record.metadata(),
           format_args!(
-            concat!("{}\t{}\t{}\t{}\t{}\t{}\n"),
-            ::time::now_utc().rfc3339(), ::time::precise_time_ns(), pid,
-            record.level(), tag, record.args())
+            concat!("{} {}\t{} {} {}\t{}\n"),
+            ::time::now_utc().rfc3339(), ::time::precise_time_ns(), pid, tag,
+            record.level(), record.args())
         );
       })
     });
