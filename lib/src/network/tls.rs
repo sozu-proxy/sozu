@@ -956,6 +956,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
             added_res_header: added_res_header,
           });
 
+          socket.set_nodelay(true);
           client.set_back_socket(socket);
 
           if old_app_id == new_app_id {
