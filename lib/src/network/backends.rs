@@ -55,6 +55,8 @@ impl BackendMap {
       for _ in 0..self.max_failures {
         if let Some(ref mut b) = app_instances.next_available_instance() {
           let ref mut backend = *b.borrow_mut();
+
+          debug!("Connecting {} -> {:?}", app_id, (backend.address, backend.active_connections, backend.failures));
           let conn = backend.try_connect();
           if backend.failures >= MAX_FAILURES_PER_BACKEND {
             error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
