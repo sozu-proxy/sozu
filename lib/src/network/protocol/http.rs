@@ -8,7 +8,7 @@ use pool::{Pool,Checkout,Reset};
 use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
 use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop,
-  BufferMove, RequestState, ResponseState, Chunk, Continue, RStatusLine};
+  BufferMove, RequestState, ResponseState, Chunk, Continue, RRequestLine, RStatusLine};
 use network::{ClientResult,Protocol};
 use network::buffer_queue::BufferQueue;
 use network::session::Readiness;
@@ -254,8 +254,8 @@ impl<Front:SocketHandler> Http<Front> {
     }
   }
 
-  /// Retrieve the response status from the http response state 
-  pub fn get_response_status(&mut self) -> Option<RStatusLine> {
+  /// Retrieve the response status from the http response state
+  pub fn get_response_status(&self) -> Option<RStatusLine> {
     if let Some(state) = self.state.as_ref() {
       state.get_status_line()
     }
@@ -263,6 +263,62 @@ impl<Front:SocketHandler> Http<Front> {
       None
     }
   }
+
+  pub fn get_host(&self) -> Option<String> {
+    if let Some(state) = self.state.as_ref() {
+      state.get_host()
+    }
+    else {
+      None
+    }
+  }
+
+  pub fn get_request_line(&self) -> Option<RRequestLine> {
+    if let Some(state) = self.state.as_ref() {
+      state.get_request_line()
+    }
+    else {
+      None
+    }
+  }
+
+  pub fn get_client_address(&self) -> Option<SocketAddr> {
+    self.frontend.socket_ref().peer_addr().ok()
+  }
+
+  pub fn get_backend_address(&self) -> Option<SocketAddr> {
+    self.backend.as_ref().and_then(|backend| backend.peer_addr().ok())
+  }
+
+  pub fn log_request_success(&self, front_keep_alive: bool, back_keep_alive: bool) {
+    let client = match self.get_client_address() {
+      None => String::from("-"),
+      Some(SocketAddr::V4(addr)) => format!("{}", addr),
+      Some(SocketAddr::V6(addr)) => format!("{}", addr),
+    };
+
+    let backend = match self.get_backend_address() {
+      None => String::from("-"),
+      Some(SocketAddr::V4(addr)) => format!("{}", addr),
+      Some(SocketAddr::V6(addr)) => format!("{}", addr),
+    };
+
+    let host         = self.get_host().unwrap_or(String::from("-"));
+    let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or(String::from("-"));
+    let status_line  = self.get_response_status().map(|line| format!("{} {}", line.status, line.reason)).unwrap_or(String::from("-"));
+
+    if front_keep_alive && back_keep_alive {
+      info!("{}\t {} -> {}\t{} {} {}\t| success, keep alive for front and back", self.log_ctx,
+        client, backend, status_line, host, request_line);
+    } else if front_keep_alive && !back_keep_alive {
+      info!("{}\t {} -> {}\t{} {} {}\t| success, keepalive for front", self.log_ctx,
+        client, backend, status_line, host, request_line);
+    } else {
+      info!("{}\t {} -> {}\t{} {} {}\t| success, closing front and back", self.log_ctx,
+        client, backend, status_line, host, request_line);
+    }
+  }
+
 
   // Read content from the client
   pub fn readable(&mut self) -> ClientResult {
@@ -516,6 +572,7 @@ impl<Front:SocketHandler> Http<Front> {
 
         save_http_status_metric(self.get_response_status());
 
+        self.log_request_success(front_keep_alive, back_keep_alive);
         //FIXME: we could get smarter about this
         // with no keepalive on backend, we could open a new backend ConnectionError
         // with no keepalive on front but keepalive on backend, we could have
@@ -525,7 +582,6 @@ impl<Front:SocketHandler> Http<Front> {
           self.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
           self.readiness.back_interest  = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
           
-          info!("{}\t success, keep alive for front and back", self.log_ctx);
           ClientResult::Continue
           //FIXME: issues reusing the backend socket
           //self.readiness.back_interest  = UnixReady::hup() | UnixReady::error();
@@ -534,10 +590,8 @@ impl<Front:SocketHandler> Http<Front> {
           self.reset();
           self.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
           self.readiness.back_interest  = UnixReady::hup() | UnixReady::error();
-          info!("{}\t success, keepalive for front", self.log_ctx);
           ClientResult::CloseBackend
         } else {
-          info!("{}\t success, closing front and back", self.log_ctx);
           self.readiness.reset();
           ClientResult::CloseBoth
         }
