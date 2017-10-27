@@ -878,8 +878,22 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
 
       if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
+        if client.instance.as_ref().map(|instance| {
+           let ref backend = *instance.borrow();
+           self.instances.has_backend(&app_id, backend)
+        }).unwrap_or(false) {
         //matched on keepalive
-        return Ok(BackendConnectAction::Reuse);
+          return Ok(BackendConnectAction::Reuse);
+        } else {
+          client.instance = None;
+          client.back_connected = BackendConnectionStatus::NotConnected;
+          //client.readiness().back_interest  = UnixReady::from(Ready::empty());
+          client.readiness().back_readiness = UnixReady::from(Ready::empty());
+          client.back_socket().as_ref().map(|sock| {
+            event_loop.deregister(*sock);
+            sock.shutdown(Shutdown::Both);
+          });
+        }
       }
 
       // circuit breaker

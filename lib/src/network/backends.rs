@@ -40,6 +40,12 @@ impl BackendMap {
     }
   }
 
+  pub fn has_backend(&self, app_id: &str, backend: &Backend) -> bool {
+    self.instances.get(app_id).map(|backends| {
+      backends.has_instance(&backend.address)
+    }).unwrap_or(false)
+  }
+
   pub fn backend_from_app_id(&mut self, app_id: &str) -> Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError> {
     if let Some(ref mut app_instances) = self.instances.get_mut(app_id) {
       if app_instances.instances.len() == 0 {
@@ -121,6 +127,10 @@ impl BackendList {
 
   pub fn remove_instance(&mut self, instance_address: &SocketAddr) {
     self.instances.retain(|backend| &(*backend.borrow()).address != instance_address);
+  }
+
+  pub fn has_instance(&self, instance_address: &SocketAddr) -> bool {
+    self.instances.iter().any(|backend| &(*backend.borrow()).address == instance_address)
   }
 
   pub fn find_instance(&mut self, instance_address: &SocketAddr) -> Option<&mut Rc<RefCell<Backend>>> {
