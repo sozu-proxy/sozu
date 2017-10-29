@@ -575,7 +575,7 @@ impl<'a> Header<'a> {
       }
     } else if &lowercase[..] == b"set-cookie" {
       let look_for = b"SOZUBALANCEID=";
-      &self.value[0..look_for.len()] == look_for
+      self.value.starts_with(look_for)
     } else {
       &lowercase[..] == b"connection" && &self.value.to_ascii_lowercase()[..] != b"upgrade" ||
       &lowercase[..] == b"forwarded"         ||
