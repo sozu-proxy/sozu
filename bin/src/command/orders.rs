@@ -97,13 +97,20 @@ impl CommandServer {
           format!("SAVE-{}", counter),
           ConfigCommand::ProxyConfiguration(command),
           None
-          );
+        );
+
         f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()));
         f.write_all(&b"\n\0"[..]);
-        f.sync_all();
+
+        if counter % 1000 == 0 {
+          info!("writing command {}", counter);
+          f.sync_all();
+        }
         counter += 1;
       }
       f.sync_all();
+
+      info!("wrote {} commands to {}", counter, path);
       self.answer_success(token, message_id, format!("saved {} config messages to {}", counter, path), None);
     } else {
       error!("could not open file: {}", &path);
