@@ -101,6 +101,7 @@ impl Readiness {
   }
 }
 
+#[derive(Clone,Debug)]
 pub struct SessionMetrics {
   /// date at which we started handling that request
   pub start:        Option<SteadyTime>,
@@ -114,6 +115,11 @@ pub struct SessionMetrics {
   /// date at which we started working on the request
   pub service_start: Option<SteadyTime>,
 
+  pub backend_id:    Option<String>,
+  pub backend_start: Option<SteadyTime>,
+  pub backend_stop:  Option<SteadyTime>,
+  pub backend_bin:   usize,
+  pub backend_bout:  usize,
 }
 
 impl SessionMetrics {
@@ -124,6 +130,11 @@ impl SessionMetrics {
       bin:           0,
       bout:          0,
       service_start: None,
+      backend_id:    None,
+      backend_start: None,
+      backend_stop:  None,
+      backend_bin:   0,
+      backend_bout:  0,
     }
   }
 
@@ -133,6 +144,11 @@ impl SessionMetrics {
     self.bin           = 0;
     self.bout          = 0;
     self.service_start = None;
+    self.backend_id    = None;
+    self.backend_start = None;
+    self.backend_stop  = None;
+    self.backend_bin   = 0;
+    self.backend_bout  = 0;
   }
 
   pub fn start(&mut self) {
@@ -174,6 +190,23 @@ impl SessionMetrics {
     }
   }
 
+  pub fn backend_start(&mut self) {
+    self.backend_start = Some(SteadyTime::now());
+  }
+
+  pub fn backend_stop(&mut self) {
+    self.backend_stop = Some(SteadyTime::now());
+  }
+
+  pub fn backend_response_time(&self) -> Option<Duration> {
+    match (self.backend_start, self.backend_stop) {
+      (Some(start), Some(end)) => {
+        Some(end - start)
+      },
+      (Some(start), None) => Some(SteadyTime::now() - start),
+      _ => None
+    }
+  }
 }
 
 pub trait ProxyClient {

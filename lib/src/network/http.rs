@@ -277,7 +277,7 @@ impl ProxyClient for Client {
   // Forward content to application
   fn back_writable(&mut self) -> ClientResult {
     match *unwrap_msg!(self.protocol.as_mut())  {
-      State::Http(ref mut http)      => http.back_writable(),
+      State::Http(ref mut http)      => http.back_writable(&mut self.metrics),
       State::WebSocket(ref mut pipe) => pipe.back_writable()
     }
   }
@@ -285,7 +285,7 @@ impl ProxyClient for Client {
   // Read content from application
   fn back_readable(&mut self) -> ClientResult {
     let (upgrade, result) = match  *unwrap_msg!(self.protocol.as_mut())  {
-      State::Http(ref mut http)      => http.back_readable(),
+      State::Http(ref mut http)      => http.back_readable(&mut self.metrics),
       State::WebSocket(ref mut pipe) => (ProtocolResult::Continue, pipe.back_readable())
     };
 
@@ -467,6 +467,8 @@ impl ServerConfiguration {
         if front_should_stick {
           client.http().map(|http| http.sticky_session = Some(StickySession::new(backend.borrow().id.clone())));
         }
+        client.metrics.backend_id = Some(backend.borrow().instance_id.clone());
+        client.metrics.backend_start();
         client.instance = Some(backend);
 
         Ok(conn)
@@ -486,6 +488,8 @@ impl ServerConfiguration {
       Ok((backend, conn))  => {
         client.back_connected = BackendConnectionStatus::Connecting;
         client.http().map(|http| http.sticky_session = Some(StickySession::new(backend.borrow().id.clone())));
+        client.metrics.backend_id = Some(backend.borrow().instance_id.clone());
+        client.metrics.backend_start();
         client.instance = Some(backend);
 
         Ok(conn)
@@ -533,6 +537,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           self.instances.has_backend(&app_id, backend)
         }).unwrap_or(false) {
           //matched on keepalive
+          client.metrics.backend_id = client.instance.as_ref().map(|i| i.borrow().instance_id.clone());
+          client.metrics.backend_start();
           return Ok(BackendConnectAction::Reuse);
         } else {
 

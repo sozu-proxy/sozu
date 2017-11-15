@@ -332,6 +332,12 @@ impl<Front:SocketHandler> Http<Front> {
     let app_id = self.app_id.clone().unwrap_or(String::from("-"));
     record_request_time!(&app_id, response_time);
 
+    if let Some(backend_id) = metrics.backend_id.as_ref() {
+      if let Some(backend_response_time) = metrics.backend_response_time() {
+        record_backend_metrics!(backend_id, backend_response_time.num_milliseconds(), metrics.backend_bin, metrics.backend_bout);
+      }
+    }
+
     info!("{}{} -> {}\t{} {} {} {}\t{} {} {}",
       self.log_ctx, client, backend,
       response_time, service_time, metrics.bin, metrics.bout,
@@ -676,7 +682,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   // Forward content to application
-  pub fn back_writable(&mut self) -> ClientResult {
+  pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
     if let ClientStatus::DefaultAnswer(_) = self.status {
       error!("{}\tsending default answer, should not write to back", self.log_ctx);
       self.readiness.back_interest.remove(Ready::writable());
@@ -717,6 +723,8 @@ impl<Front:SocketHandler> Http<Front> {
       self.front_buf_position += current_sz;
       sz += current_sz;
     }
+
+    metrics.backend_bout += sz;
 
     if let Some((front,back)) = tokens {
       debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", self.log_ctx, front.0, back.0, sz, output_size);
@@ -772,7 +780,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   // Read content from application
-  pub fn back_readable(&mut self) -> (ProtocolResult, ClientResult) {
+  pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, ClientResult) {
     if let ClientStatus::DefaultAnswer(_) = self.status {
       error!("{}\tsending default answer, should not read from back socket", self.log_ctx);
       self.readiness.back_interest.remove(Ready::readable());
@@ -798,6 +806,8 @@ impl<Front:SocketHandler> Http<Front> {
     let (sz, r) = sock.socket_read(&mut self.back_buf.buffer.space());
     self.back_buf.buffer.fill(sz);
     self.back_buf.sliced_input(sz);
+
+    metrics.backend_bin += sz;
 
     if let Some((front,back)) = tokens {
       debug!("{}\tBACK  [{}<-{}]: read {} bytes", self.log_ctx, front.0, back.0, sz);

@@ -11,7 +11,7 @@ use std::io::{self,Write,Error,ErrorKind};
 use nom::HexDisplay;
 use hdrsample::Histogram;
 use sozu_command::buffer::Buffer;
-use sozu_command::messages::{FilteredData,MetricsData,Percentiles};
+use sozu_command::messages::{FilteredData,MetricsData,Percentiles,BackendMetricsData};
 
 thread_local! {
   pub static METRICS: RefCell<ProxyMetrics> = RefCell::new(ProxyMetrics::new(String::from("sozu")))
@@ -30,6 +30,23 @@ pub struct StoredMetricData {
   data:      MetricData,
 }
 
+#[derive(Clone,Debug)]
+pub struct BackendMetrics {
+  pub response_time: Histogram<u32>,
+  pub bin:           usize,
+  pub bout:          usize,
+}
+
+impl BackendMetrics {
+  pub fn new(h: Histogram<u32>) -> BackendMetrics {
+    BackendMetrics {
+      response_time: h,
+      bin:           0,
+      bout:          0,
+    }
+  }
+}
+
 #[derive(Debug)]
 pub struct ProxyMetrics {
   pub buffer:      Buffer,
@@ -38,6 +55,8 @@ pub struct ProxyMetrics {
   pub data:        BTreeMap<String, StoredMetricData>,
   /// app_id -> response time histogram (in ms)
   pub app_data:    BTreeMap<String,Histogram<u32>>,
+  /// app_id -> response time histogram (in ms)
+  pub backend_data: BTreeMap<String,BackendMetrics>,
   pub is_writable: bool,
   remote:          Option<(SocketAddr, UdpSocket)>,
 }
@@ -50,6 +69,7 @@ impl ProxyMetrics {
       created:     Instant::now(),
       data:        BTreeMap::new(),
       app_data:    BTreeMap::new(),
+      backend_data: BTreeMap::new(),
       remote:      None,
       is_writable: false,
     }
@@ -108,10 +128,34 @@ impl ProxyMetrics {
     }).collect()
   }
 
+  pub fn dump_backend_data(&self) -> BTreeMap<String, BackendMetricsData> {
+    self.backend_data.iter().map(|(ref backend_id, ref bm)| {
+      let percentiles = Percentiles {
+        samples:  bm.response_time.len(),
+        p_50:     bm.response_time.value_at_percentile(50.0),
+        p_90:     bm.response_time.value_at_percentile(90.0),
+        p_99:     bm.response_time.value_at_percentile(99.0),
+        p_99_9:   bm.response_time.value_at_percentile(99.9),
+        p_99_99:  bm.response_time.value_at_percentile(99.99),
+        p_99_999: bm.response_time.value_at_percentile(99.999),
+        p_100:    bm.response_time.value_at_percentile(100.0),
+      };
+
+      let data = BackendMetricsData {
+        bytes_in:  bm.bin,
+        bytes_out: bm.bout,
+        percentiles: percentiles,
+      };
+
+      (backend_id.to_string(), data)
+    }).collect()
+  }
+
   pub fn dump_metrics_data(&self) -> MetricsData {
     MetricsData {
       proxy:        self.dump_data(),
       applications: self.dump_percentiles(),
+      backends:     self.dump_backend_data(),
     }
   }
 
@@ -373,11 +417,31 @@ macro_rules! record_request_time (
           m.app_data.insert(key.to_string(), hist);
         }
       }
-      /*
-      let hist = m.app_data.entry($app_id).or_insert(::hdrsample::Histogram::new(3));
-      let v = $value as u64;
-      hist.record(v);
-      */
+    });
+  }
+);
+
+#[macro_export]
+macro_rules! record_backend_metrics (
+  ($backend_id:expr, $response_time: expr, $bin: expr, $bout: expr) => {
+    $crate::network::metrics::METRICS.with(|metrics| {
+      let ref mut m = *metrics.borrow_mut();
+      let key: &str = $backend_id;
+
+      if m.backend_data.contains_key(key) {
+        let mut bm = m.backend_data.get_mut(key).unwrap();
+        bm.response_time.record($response_time as u64);
+        bm.bin += $bin;
+        bm.bout += $bout;
+      } else {
+        if let Ok(mut hist) = ::hdrsample::Histogram::new(3) {
+          let mut bm = $crate::network::metrics::BackendMetrics::new(hist);
+          bm.response_time.record($response_time as u64);
+          bm.bin += $bin;
+          bm.bout += $bout;
+          m.backend_data.insert(key.to_string(), bm);
+        }
+      }
     });
   }
 );

@@ -42,6 +42,7 @@ pub enum OrderMessageAnswerData {
 pub struct MetricsData {
   pub proxy:        BTreeMap<String, FilteredData>,
   pub applications: BTreeMap<String, Percentiles>,
+  pub backends:     BTreeMap<String, BackendMetricsData>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
@@ -62,6 +63,13 @@ pub struct Percentiles {
   pub p_99_99:  u64,
   pub p_99_999: u64,
   pub p_100:    u64,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
+pub struct BackendMetricsData {
+  pub bytes_in:  usize,
+  pub bytes_out: usize,
+  pub percentiles: Percentiles,
 }
 
 #[derive(Debug,Clone,Serialize,Deserialize)]
