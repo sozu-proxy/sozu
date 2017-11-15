@@ -3,7 +3,7 @@ use serde::de::{self, Visitor};
 use hex::{FromHex,ToHex};
 use openssl::ssl;
 use std::net::{IpAddr,SocketAddr};
-use std::collections::{BTreeMap,HashMap,HashSet};
+use std::collections::{BTreeMap,HashSet};
 use std::default::Default;
 use std::convert::From;
 use std::fmt;
@@ -29,8 +29,6 @@ pub enum OrderMessageStatus {
   Processing,
   Error(String),
 }
-
-
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
@@ -192,9 +190,10 @@ pub struct TcpFront {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct Instance {
-    pub app_id:     String,
-    pub ip_address: String,
-    pub port:       u16
+    pub app_id:      String,
+    pub instance_id: String,
+    pub ip_address:  String,
+    pub port:        u16
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -374,11 +373,12 @@ mod tests {
 
   #[test]
   fn add_instance_test() {
-    let raw_json = r#"{"type": "ADD_INSTANCE", "data": {"app_id": "xxx", "ip_address": "yyy", "port": 8080}}"#;
+    let raw_json = r#"{"type": "ADD_INSTANCE", "data": {"app_id": "xxx", "instance_id": "xxx-0", "ip_address": "yyy", "port": 8080}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::AddInstance(Instance{
       app_id: String::from("xxx"),
+      instance_id: String::from("xxx-0"),
       ip_address: String::from("yyy"),
       port: 8080
     }));
@@ -386,11 +386,12 @@ mod tests {
 
   #[test]
   fn remove_instance_test() {
-    let raw_json = r#"{"type": "REMOVE_INSTANCE", "data": {"app_id": "xxx", "ip_address": "yyy", "port": 8080}}"#;
+    let raw_json = r#"{"type": "REMOVE_INSTANCE", "data": {"app_id": "xxx", "instance_id": "xxx-0", "ip_address": "yyy", "port": 8080}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::RemoveInstance(Instance{
       app_id: String::from("xxx"),
+      instance_id: String::from("xxx-0"),
       ip_address: String::from("yyy"),
       port: 8080
     }));

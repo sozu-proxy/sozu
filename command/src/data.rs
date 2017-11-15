@@ -443,6 +443,7 @@ mod tests {
       version:  0,
       data:     ConfigCommand::ProxyConfiguration(Order::AddInstance(Instance{
                   app_id: String::from("xxx"),
+                  instance_id: String::from("xxx-0"),
                   ip_address: String::from("127.0.0.1"),
                   port: 8080,
       })),
@@ -454,6 +455,7 @@ mod tests {
       version:  0,
       data:     ConfigCommand::ProxyConfiguration(Order::RemoveInstance(Instance{
                   app_id: String::from("xxx"),
+                  instance_id: String::from("xxx-0"),
                   ip_address: String::from("127.0.0.1"),
                   port: 8080,
       })),

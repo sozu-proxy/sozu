@@ -6,6 +6,7 @@
     "type": "REMOVE_INSTANCE",
     "data": {
       "app_id": "xxx",
+      "instance_id": "xxx-0",
       "ip_address": "127.0.0.1",
       "port": 8080
     }

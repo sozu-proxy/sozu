@@ -314,6 +314,7 @@ impl Config {
         count += 1;
       }
 
+      let mut backend_count = 0usize;
       for address_str in app.backends.iter() {
         if let Ok(address_list) = address_str.to_socket_addrs() {
           for address in address_list {
@@ -322,6 +323,7 @@ impl Config {
 
             let backend_order = Order::AddInstance(Instance {
               app_id:     id.to_string(),
+              instance_id: format!("{}-{}", id, backend_count),
               ip_address: ip,
               port:       port
             });
@@ -334,6 +336,7 @@ impl Config {
             });
 
             count += 1;
+            backend_count += 1;
           }
         } else {
           error!("could not parse address: {}", address_str);

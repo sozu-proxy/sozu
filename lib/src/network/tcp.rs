@@ -608,6 +608,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
     };
     let instance = Instance {
       app_id: String::from("yolo"),
+      instance_id: String::from("yolo-0"),
       ip_address: String::from("127.0.0.1"),
       port: 5678,
     };
@@ -623,6 +624,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
     };
     let instance = Instance {
       app_id: String::from("yolo"),
+      instance_id: String::from("yolo-0"),
       ip_address: String::from("127.0.0.1"),
       port: 5678,
     };
