@@ -629,6 +629,7 @@ impl<Front:SocketHandler> Http<Front> {
         save_http_status_metric(self.get_response_status());
 
         self.log_request_success(&metrics);
+        metrics.reset();
         //FIXME: we could get smarter about this
         // with no keepalive on backend, we could open a new backend ConnectionError
         // with no keepalive on front but keepalive on backend, we could have

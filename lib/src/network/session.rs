@@ -103,7 +103,7 @@ impl Readiness {
 
 pub struct SessionMetrics {
   /// date at which we started handling that request
-  pub start:        SteadyTime,
+  pub start:        Option<SteadyTime>,
   /// time actually spent handling the request
   pub service_time: Duration,
   /// bytes received by the frontend
@@ -119,7 +119,7 @@ pub struct SessionMetrics {
 impl SessionMetrics {
   pub fn new() -> SessionMetrics {
     SessionMetrics {
-      start:         SteadyTime::now(),
+      start:         Some(SteadyTime::now()),
       service_time:  Duration::seconds(0),
       bin:           0,
       bout:          0,
@@ -127,7 +127,25 @@ impl SessionMetrics {
     }
   }
 
+  pub fn reset(&mut self) {
+    self.start         = None;
+    self.service_time  = Duration::seconds(0);
+    self.bin           = 0;
+    self.bout          = 0;
+    self.service_start = None;
+  }
+
+  pub fn start(&mut self) {
+    if self.start.is_none() {
+      self.start = Some(SteadyTime::now());
+    }
+  }
+
   pub fn service_start(&mut self) {
+    if self.start.is_none() {
+      self.start = Some(SteadyTime::now());
+    }
+
     self.service_start = Some(SteadyTime::now());
   }
 
@@ -150,7 +168,10 @@ impl SessionMetrics {
   }
 
   pub fn response_time(&self) -> Duration {
-    SteadyTime::now() - self.start
+    match self.start {
+      Some(start) => SteadyTime::now() - start,
+      None        => Duration::seconds(0),
+    }
   }
 
 }
