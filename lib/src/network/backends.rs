@@ -20,8 +20,8 @@ impl BackendMap {
     }
   }
 
-  pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr) {
-    self.instances.entry(app_id.to_string()).or_insert(BackendList::new()).add_instance(instance_address);
+  pub fn add_instance(&mut self, app_id: &str, instance_id: &str, instance_address: &SocketAddr) {
+    self.instances.entry(app_id.to_string()).or_insert(BackendList::new()).add_instance(instance_id, instance_address);
   }
 
   pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr) {
@@ -119,9 +119,9 @@ impl BackendList {
     }
   }
 
-  pub fn add_instance(&mut self, instance_address: &SocketAddr) {
+  pub fn add_instance(&mut self, instance_id: &str, instance_address: &SocketAddr) {
     if self.instances.iter().find(|b| &(*b.borrow()).address == instance_address).is_none() {
-      let backend = Rc::new(RefCell::new(Backend::new(*instance_address, self.next_id)));
+      let backend = Rc::new(RefCell::new(Backend::new(instance_id, *instance_address, self.next_id)));
       self.instances.push(backend);
       self.next_id += 1;
     }

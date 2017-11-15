@@ -724,8 +724,8 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
-    self.instances.add_instance(app_id, instance_address);
+  pub fn add_instance(&mut self, app_id: &str, instance_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
+    self.instances.add_instance(app_id, instance_id, instance_address);
   }
 
   pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
@@ -1030,7 +1030,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
-          self.add_instance(&instance.app_id, &addr, event_loop);
+          self.add_instance(&instance.app_id, &instance.instance_id, &addr, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }
