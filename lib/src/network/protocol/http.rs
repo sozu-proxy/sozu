@@ -429,6 +429,10 @@ impl<Front:SocketHandler> Http<Front> {
       SocketResult::Continue => {}
     };
 
+    if unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial) {
+      incr!("http.requests");
+    }
+
     // if there's no host, continue parsing until we find it
     let has_host = unwrap_msg!(self.state.as_ref()).has_host();
     if !has_host {
@@ -448,10 +452,6 @@ impl<Front:SocketHandler> Http<Front> {
       } else {
         return ClientResult::Continue;
       }
-    }
-
-    if unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial) {
-      incr!("http.requests");
     }
 
     self.readiness.back_interest.insert(Ready::writable());
