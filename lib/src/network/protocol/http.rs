@@ -309,7 +309,7 @@ impl<Front:SocketHandler> Http<Front> {
     self.backend.as_ref().and_then(|backend| backend.peer_addr().ok())
   }
 
-  pub fn log_request_success(&self, front_keep_alive: bool, back_keep_alive: bool, metrics: &SessionMetrics) {
+  pub fn log_request_success(&self, metrics: &SessionMetrics) {
     let client = match self.get_client_address() {
       None => String::from("-"),
       Some(SocketAddr::V4(addr)) => format!("{}", addr),
@@ -329,19 +329,10 @@ impl<Front:SocketHandler> Http<Front> {
     let response_time = metrics.response_time().num_milliseconds();
     let service_time  = metrics.service_time().num_milliseconds();
 
-    if front_keep_alive && back_keep_alive {
-      info!("{}{} -> {}\t{} {} {}\t| {} {} {} {} keep alive front/back", self.log_ctx,
-        client, backend, status_line, host, request_line,
-        response_time, service_time, metrics.bin, metrics.bout);
-    } else if front_keep_alive && !back_keep_alive {
-      info!("{}{} -> {}\t{} {} {}\t| {} {} {} {} keep alive front", self.log_ctx,
-        client, backend, status_line, host, request_line,
-        response_time, service_time, metrics.bin, metrics.bout);
-    } else {
-      info!("{}{} -> {}\t{} {} {}\t| {} {} {} {} no keep alive", self.log_ctx,
-        client, backend, status_line, host, request_line,
-        response_time, service_time, metrics.bin, metrics.bout);
-    }
+    info!("{}{} -> {}\t{} {} {} {}\t{} {} {}",
+      self.log_ctx, client, backend,
+      response_time, service_time, metrics.bin, metrics.bout,
+      status_line, host, request_line);
   }
 
   pub fn log_default_answer_success(&self, metrics: &SessionMetrics) {
@@ -630,12 +621,13 @@ impl<Front:SocketHandler> Http<Front> {
 
         save_http_status_metric(self.get_response_status());
 
-        self.log_request_success(front_keep_alive, back_keep_alive, &metrics);
+        self.log_request_success(&metrics);
         //FIXME: we could get smarter about this
         // with no keepalive on backend, we could open a new backend ConnectionError
         // with no keepalive on front but keepalive on backend, we could have
         // a pool of connections
         if front_keep_alive && back_keep_alive {
+          debug!("{} keep alive front/back", self.log_ctx);
           self.reset();
           self.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
           self.readiness.back_interest  = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
@@ -645,11 +637,13 @@ impl<Front:SocketHandler> Http<Front> {
           //self.readiness.back_interest  = UnixReady::hup() | UnixReady::error();
           //ClientResult::CloseBackend
         } else if front_keep_alive && !back_keep_alive {
+          debug!("{} keep alive front", self.log_ctx);
           self.reset();
           self.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
           self.readiness.back_interest  = UnixReady::hup() | UnixReady::error();
           ClientResult::CloseBackend
         } else {
+          debug!("{} no keep alive", self.log_ctx);
           self.readiness.reset();
           ClientResult::CloseBoth
         }
