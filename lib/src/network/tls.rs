@@ -39,7 +39,7 @@ use network::{AppId,Backend,ClientResult,ConnectionError,Protocol};
 use network::backends::BackendMap;
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,
-  Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
+  Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
@@ -79,6 +79,7 @@ pub struct TlsClient {
   ssl:            Option<Ssl>,
   pool:           Weak<RefCell<Pool<BufferQueue>>>,
   sticky_session: bool,
+  metrics:        SessionMetrics,
 }
 
 impl TlsClient {
@@ -99,6 +100,7 @@ impl TlsClient {
       ssl:            None,
       pool:           pool,
       sticky_session: false,
+      metrics:        SessionMetrics::new(),
     }
   }
 
@@ -251,6 +253,10 @@ impl ProxyClient for TlsClient {
     self.back_timeout = Some(timeout);
   }
 
+  fn metrics(&mut self)        -> &mut SessionMetrics {
+    &mut self.metrics
+  }
+
   fn front_hup(&mut self)     -> ClientResult {
     self.http().map(|h| h.front_hup()).unwrap_or(ClientResult::CloseClient)
   }
@@ -269,7 +275,7 @@ impl ProxyClient for TlsClient {
   fn readable(&mut self)      -> ClientResult {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Handshake(ref mut handshake) => handshake.readable(),
-      State::Http(ref mut http)           => (ProtocolResult::Continue, http.readable()),
+      State::Http(ref mut http)           => (ProtocolResult::Continue, http.readable(&mut self.metrics)),
       State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.readable()),
     };
 
@@ -278,7 +284,7 @@ impl ProxyClient for TlsClient {
     } else {
         if self.upgrade() {
         match *unwrap_msg!(self.protocol.as_mut()) {
-          State::Http(ref mut http) => http.readable(),
+          State::Http(ref mut http) => http.readable(&mut self.metrics),
           _ => result
         }
       } else {
@@ -290,7 +296,7 @@ impl ProxyClient for TlsClient {
   fn writable(&mut self)      -> ClientResult {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Handshake(ref mut handshake) => ClientResult::CloseClient,
-      State::Http(ref mut http)           => http.writable(),
+      State::Http(ref mut http)           => http.writable(&mut self.metrics),
       State::WebSocket(ref mut pipe)      => pipe.writable(),
     }
   }

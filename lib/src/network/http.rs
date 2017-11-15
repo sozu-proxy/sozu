@@ -15,6 +15,7 @@ use pool::{Pool,Checkout,Reset};
 use uuid::Uuid;
 use nom::{HexDisplay,IResult};
 use rand::random;
+use time::{SteadyTime,Duration};
 
 use sozu_command::channel::Channel;
 use sozu_command::messages::{self,Application,Order,HttpFront,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
@@ -25,7 +26,7 @@ use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
 use network::protocol::http::DefaultAnswerStatus;
 use network::proxy::{Server,ProxyChannel};
-use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
+use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::retry::RetryPolicy;
 use parser::http11::hostname_and_port;
@@ -56,6 +57,7 @@ pub struct Client {
   protocol:       Option<State>,
   pool:           Weak<RefCell<Pool<BufferQueue>>>,
   sticky_session: bool,
+  metrics:        SessionMetrics,
 }
 
 impl Client {
@@ -82,7 +84,8 @@ impl Client {
         protocol:       Some(State::Http(http)),
         frontend:       sock,
         pool:           pool,
-        sticky_session: false
+        sticky_session: false,
+        metrics:        SessionMetrics::new(),
       };
 
     client
@@ -192,6 +195,10 @@ impl ProxyClient for Client {
     self.back_timeout = Some(timeout)
   }
 
+  fn metrics(&mut self)        -> &mut SessionMetrics {
+    &mut self.metrics
+  }
+
   fn set_back_socket(&mut self, socket: TcpStream) {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.set_back_socket(unwrap_msg!(socket.try_clone())),
@@ -254,7 +261,7 @@ impl ProxyClient for Client {
   // Read content from the client
   fn readable(&mut self) -> ClientResult {
     match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http)      => http.readable(),
+      State::Http(ref mut http)      => http.readable(&mut self.metrics),
       State::WebSocket(ref mut pipe) => pipe.readable()
     }
   }
@@ -262,7 +269,7 @@ impl ProxyClient for Client {
   // Forward content to client
   fn writable(&mut self) -> ClientResult {
     match  *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http)      => http.writable(),
+      State::Http(ref mut http)      => http.writable(&mut self.metrics),
       State::WebSocket(ref mut pipe) => pipe.writable()
     }
   }

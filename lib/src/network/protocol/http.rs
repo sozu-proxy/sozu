@@ -11,7 +11,7 @@ use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_st
   BufferMove, RequestState, ResponseState, Chunk, Continue, RRequestLine, RStatusLine};
 use network::{ClientResult,Protocol};
 use network::buffer_queue::BufferQueue;
-use network::session::Readiness;
+use network::session::{Readiness,SessionMetrics};
 use network::socket::{SocketHandler,SocketResult};
 use network::protocol::ProtocolResult;
 use util::UnwrapLog;
@@ -309,7 +309,7 @@ impl<Front:SocketHandler> Http<Front> {
     self.backend.as_ref().and_then(|backend| backend.peer_addr().ok())
   }
 
-  pub fn log_request_success(&self, front_keep_alive: bool, back_keep_alive: bool) {
+  pub fn log_request_success(&self, front_keep_alive: bool, back_keep_alive: bool, metrics: &SessionMetrics) {
     let client = match self.get_client_address() {
       None => String::from("-"),
       Some(SocketAddr::V4(addr)) => format!("{}", addr),
@@ -326,19 +326,25 @@ impl<Front:SocketHandler> Http<Front> {
     let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or(String::from("-"));
     let status_line  = self.get_response_status().map(|line| format!("{} {}", line.status, line.reason)).unwrap_or(String::from("-"));
 
+    let response_time = metrics.response_time().num_milliseconds();
+    let service_time  = metrics.service_time().num_milliseconds();
+
     if front_keep_alive && back_keep_alive {
-      info!("{}{} -> {}\t{} {} {}\t| keep alive front/back", self.log_ctx,
-        client, backend, status_line, host, request_line);
+      info!("{}{} -> {}\t{} {} {}\t| {} {} {} {} keep alive front/back", self.log_ctx,
+        client, backend, status_line, host, request_line,
+        response_time, service_time, metrics.bin, metrics.bout);
     } else if front_keep_alive && !back_keep_alive {
-      info!("{}{} -> {}\t{} {} {}\t| keep alive front", self.log_ctx,
-        client, backend, status_line, host, request_line);
+      info!("{}{} -> {}\t{} {} {}\t| {} {} {} {} keep alive front", self.log_ctx,
+        client, backend, status_line, host, request_line,
+        response_time, service_time, metrics.bin, metrics.bout);
     } else {
-      info!("{}{} -> {}\t{} {} {}\t| no keep alive", self.log_ctx,
-        client, backend, status_line, host, request_line);
+      info!("{}{} -> {}\t{} {} {}\t| {} {} {} {} no keep alive", self.log_ctx,
+        client, backend, status_line, host, request_line,
+        response_time, service_time, metrics.bin, metrics.bout);
     }
   }
 
-  pub fn log_default_answer_success(&self) {
+  pub fn log_default_answer_success(&self, metrics: &SessionMetrics) {
     let client = match self.get_client_address() {
       None => String::from("-"),
       Some(SocketAddr::V4(addr)) => format!("{}", addr),
@@ -354,12 +360,16 @@ impl<Front:SocketHandler> Http<Front> {
     let host         = self.get_host().unwrap_or(String::from("-"));
     let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or(String::from("-"));
 
-    info!("{}\t {} -> X\t{} {} {}\t", self.log_ctx,
-        client, status_line, host, request_line);
+    let response_time = metrics.response_time().num_milliseconds();
+    let service_time  = metrics.service_time().num_milliseconds();
+
+    info!("{}\t {} -> X\t{} {} {}\t | {} {} {} {}", self.log_ctx,
+        client, status_line, host, request_line,
+        response_time, service_time, metrics.bin, metrics.bout);
   }
 
   // Read content from the client
-  pub fn readable(&mut self) -> ClientResult {
+  pub fn readable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
     if let ClientStatus::DefaultAnswer(_) = self.status {
       self.readiness.front_interest.insert(Ready::writable());
       self.readiness.back_interest.remove(Ready::readable());
@@ -392,6 +402,7 @@ impl<Front:SocketHandler> Http<Front> {
       self.front_buf.buffer.fill(sz);
       self.front_buf.sliced_input(sz);
       count!("bytes_in", sz as i64);
+      metrics.bin += sz;
 
       if self.front_buf.start_parsing_position > self.front_buf.parsed_position {
         let to_consume = min(self.front_buf.input_data_size(),
@@ -409,6 +420,7 @@ impl<Front:SocketHandler> Http<Front> {
     match res {
       SocketResult::Error => {
         error!("{}\tfront socket error, closing the connection", self.log_ctx);
+        metrics.service_stop();
         incr_ereq!();
         self.readiness.reset();
         return ClientResult::CloseClient;
@@ -426,6 +438,7 @@ impl<Front:SocketHandler> Http<Front> {
         &mut self.front_buf));
       if unwrap_msg!(self.state.as_ref()).is_front_error() {
         error!("{}\tfront parsing error, closing the connection", self.log_ctx);
+        metrics.service_stop();
         //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
         self.readiness.front_interest.remove(Ready::readable());
         return ClientResult::CloseClient;
@@ -459,6 +472,7 @@ impl<Front:SocketHandler> Http<Front> {
       },
       Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Error)) => {
         error!("{}\tfront read should have stopped on chunk error", self.log_ctx);
+        metrics.service_stop();
         self.readiness.reset();
         ClientResult::CloseClient
       },
@@ -502,7 +516,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   // Forward content to client
-  pub fn writable(&mut self) -> ClientResult {
+  pub fn writable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
 
     assert!(self.front_buf.empty(), "investigating single buffer usage: the front->back buffer should not be used while parsing and forwarding the response");
     let output_size = self.back_buf.output_data_size();
@@ -521,12 +535,15 @@ impl<Front:SocketHandler> Http<Front> {
         sz += current_sz;
       }
 
+      metrics.bout += sz;
+
       if res != SocketResult::Continue {
         self.readiness.front_readiness.remove(Ready::writable());
       }
 
       if self.back_buf.buffer.available_data() == 0 {
-        self.log_default_answer_success();
+        metrics.service_stop();
+        self.log_default_answer_success(&metrics);
         self.readiness.reset();
         incr_ereq!();
         return ClientResult::CloseClient;
@@ -534,6 +551,7 @@ impl<Front:SocketHandler> Http<Front> {
 
       if res == SocketResult::Error {
         self.readiness.reset();
+        metrics.service_stop();
         error!("{}\terror writing default answer to front socket, closing", self.log_ctx);
         incr_ereq!();
         return ClientResult::CloseClient;
@@ -562,8 +580,9 @@ impl<Front:SocketHandler> Http<Front> {
       self.back_buf.consume_output_data(current_sz);
       self.back_buf_position += current_sz;
       sz += current_sz;
-      count!("bytes_out", current_sz as i64);
     }
+    count!("bytes_out", sz as i64);
+    metrics.bout += sz;
 
     if let Some((front,back)) = self.tokens() {
       debug!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}, buffer position {} restart position {}", self.log_ctx, front.0, back.0, sz, output_size, self.back_buf.buffer_position, self.back_buf.start_parsing_position);
@@ -571,6 +590,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     match res {
       SocketResult::Error => {
+        metrics.service_stop();
         error!("{}\terror writing to front socket, closing", self.log_ctx);
         incr_ereq!();
         self.readiness.reset();
@@ -610,7 +630,7 @@ impl<Front:SocketHandler> Http<Front> {
 
         save_http_status_metric(self.get_response_status());
 
-        self.log_request_success(front_keep_alive, back_keep_alive);
+        self.log_request_success(front_keep_alive, back_keep_alive, &metrics);
         //FIXME: we could get smarter about this
         // with no keepalive on backend, we could open a new backend ConnectionError
         // with no keepalive on front but keepalive on backend, we could have

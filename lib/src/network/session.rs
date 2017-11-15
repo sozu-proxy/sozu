@@ -16,8 +16,7 @@ use std::io::Write;
 use std::str::FromStr;
 use std::marker::PhantomData;
 use std::fmt::Debug;
-use time::precise_time_ns;
-use std::time::Duration;
+use time::{precise_time_ns,SteadyTime,Duration};
 use rand::random;
 
 use sozu_command::channel::Channel;
@@ -102,6 +101,59 @@ impl Readiness {
   }
 }
 
+pub struct SessionMetrics {
+  /// date at which we started handling that request
+  pub start:        SteadyTime,
+  /// time actually spent handling the request
+  pub service_time: Duration,
+  /// bytes received by the frontend
+  pub bin:          usize,
+  /// bytes sent by the frontend
+  pub bout:         usize,
+
+  /// date at which we started working on the request
+  pub service_start: Option<SteadyTime>,
+
+}
+
+impl SessionMetrics {
+  pub fn new() -> SessionMetrics {
+    SessionMetrics {
+      start:         SteadyTime::now(),
+      service_time:  Duration::seconds(0),
+      bin:           0,
+      bout:          0,
+      service_start: None,
+    }
+  }
+
+  pub fn service_start(&mut self) {
+    self.service_start = Some(SteadyTime::now());
+  }
+
+  pub fn service_stop(&mut self) {
+    if self.service_start.is_some() {
+      let start = self.service_start.take().unwrap();
+      let duration = SteadyTime::now() - start;
+      self.service_time = self.service_time + duration;
+    }
+  }
+
+  pub fn service_time(&self) -> Duration {
+    match self.service_start {
+      Some(start) => {
+        let last_duration = SteadyTime::now() - start;
+        self.service_time + last_duration,
+      None        => self.service_time,
+    }
+  }
+
+  pub fn response_time(&self) -> Duration {
+    SteadyTime::now() - self.start
+  }
+
+}
+
 pub trait ProxyClient {
   fn front_socket(&self) -> &TcpStream;
   fn back_socket(&self)  -> Option<&TcpStream>;
@@ -127,6 +179,7 @@ pub trait ProxyClient {
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>);
   fn readiness(&mut self)      -> &mut Readiness;
   fn protocol(&self)           -> Protocol;
+  fn metrics(&mut self)        -> &mut SessionMetrics;
 }
 
 #[derive(Clone,Copy,Debug,PartialEq)]
@@ -216,6 +269,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
   }
 
   pub fn close_client(&mut self, poll: &mut Poll, token: FrontToken) {
+    self.clients[token].metrics().service_stop();
     self.clients[token].front_socket().shutdown(Shutdown::Both);
     poll.deregister(self.clients[token].front_socket());
     if let Some(sock) = self.clients[token].back_socket() {
@@ -418,6 +472,8 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
       },
       Some(SocketType::BackClient) => {
         if let Some(tok) = self.get_client_token(token) {
+          self.clients[tok].metrics().service_start();
+
           self.clients[tok].readiness().back_readiness = self.clients[tok].readiness().back_readiness | UnixReady::from(events);
 
           if self.clients[tok].back_connected() == BackendConnectionStatus::Connecting {
@@ -430,6 +486,9 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
               self.clients[tok].set_back_connected(BackendConnectionStatus::Connected);
             }
           }
+
+          self.clients[tok].metrics().service_stop();
+
           tok
         } else {
           return;
@@ -440,6 +499,8 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
       }
     };
 
+
+    self.clients[client_token].metrics().service_start();
     loop {
       let front_interest = self.clients[client_token].readiness().front_interest &
         self.clients[client_token].readiness().front_readiness;
@@ -560,11 +621,16 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
         } else {
           error!("PROXY client {:?} back error, disconnecting", client_token);
         }
+
         self.clients[client_token].readiness().front_interest = UnixReady::from(Ready::empty());
         self.clients[client_token].readiness().back_interest  = UnixReady::from(Ready::empty());
         self.close_client(poll, client_token);
         break;
       }
+    }
+
+    if self.clients.contains(client_token) {
+      self.clients[client_token].metrics().service_stop();
     }
   }
 

@@ -26,7 +26,7 @@ use sozu_command::messages::{self,TcpFront,Order,Instance,OrderMessage,OrderMess
 
 use network::{Backend,ClientResult,ConnectionError,RequiredEvents,Protocol};
 use network::proxy::{Server,ProxyChannel};
-use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session};
+use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
 
@@ -63,6 +63,7 @@ pub struct Client {
   app_id:         Option<String>,
   request_id:     String,
   readiness:      Readiness,
+  metrics:        SessionMetrics,
 }
 
 impl Client {
@@ -86,6 +87,7 @@ impl Client {
       app_id:         None,
       request_id:     Uuid::new_v4().hyphenated().to_string(),
       readiness:      Readiness::new(),
+      metrics:        SessionMetrics::new(),
     }
   }
 }
@@ -153,6 +155,10 @@ impl ProxyClient for Client {
 
   fn set_back_timeout(&mut self, timeout: Timeout) {
     self.back_timeout = Some(timeout)
+  }
+
+  fn metrics(&mut self)        -> &mut SessionMetrics {
+    &mut self.metrics
   }
 
   fn protocol(&self)           -> Protocol {
