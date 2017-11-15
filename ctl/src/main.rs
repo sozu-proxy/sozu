@@ -87,6 +87,11 @@ fn main() {
                                                       .value_name("app id of the backend")
                                                       .takes_value(true)
                                                       .required(true))
+                                                  .arg(Arg::with_name("instance-id")
+                                                      .long("instance-id")
+                                                      .value_name("id of the backend")
+                                                      .takes_value(true)
+                                                      .required(true))
                                                   .arg(Arg::with_name("ip")
                                                       .long("ip")
                                                       .value_name("ip of the backend")
@@ -103,6 +108,11 @@ fn main() {
                                                       .short("i")
                                                       .long("id")
                                                       .value_name("app id of the backend")
+                                                      .takes_value(true)
+                                                      .required(true))
+                                                  .arg(Arg::with_name("instance-id")
+                                                      .long("instance-id")
+                                                      .value_name("id of the backend")
                                                       .takes_value(true)
                                                       .required(true))
                                                   .arg(Arg::with_name("ip")
@@ -270,15 +280,17 @@ fn main() {
       match sub.subcommand() {
         ("remove", Some(backend_sub)) => {
           let id = backend_sub.value_of("id").expect("missing id");
+          let instance_id = backend_sub.value_of("instance_id").expect("missing instance id");
           let ip = backend_sub.value_of("ip").expect("missing backend ip");
           let port: u16 = backend_sub.value_of("port").expect("mssing backend port").parse().unwrap();
-          remove_backend(&mut channel, id, ip, port);
+          remove_backend(&mut channel, id, instance_id, ip, port);
         }
         ("add", Some(backend_sub)) => {
           let id = backend_sub.value_of("id").expect("missing id");
+          let instance_id = backend_sub.value_of("instance_id").expect("missing instance id");
           let ip = backend_sub.value_of("ip").expect("missing backend ip");
           let port: u16 = backend_sub.value_of("port").expect("mssing backend port").parse().unwrap();
-          add_backend(&mut channel, id, ip, port);
+          add_backend(&mut channel, id, instance_id, ip, port);
         }
         _ => println!("unknown backend management command")
       }

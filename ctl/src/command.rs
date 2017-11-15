@@ -492,17 +492,19 @@ pub fn remove_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>,
 }
 
 
-pub fn add_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip: &str, port: u16) {
+pub fn add_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, instance_id: &str, ip: &str, port: u16) {
   order_command(channel, Order::AddInstance(Instance {
       app_id: String::from(app_id),
+      instance_id: String::from(instance_id),
       ip_address: String::from(ip),
       port: port
     }));
 }
 
-pub fn remove_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip: &str, port: u16) {
+pub fn remove_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, instance_id: &str, ip: &str, port: u16) {
     order_command(channel, Order::RemoveInstance(Instance {
       app_id: String::from(app_id),
+      instance_id: String::from(instance_id),
       ip_address: String::from(ip),
       port: port
     }));
