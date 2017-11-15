@@ -255,7 +255,7 @@ impl Server {
           id:     message.id.clone(),
           status: OrderMessageStatus::Ok,
           data:   Some(OrderMessageAnswerData::Metrics(
-            (*metrics.borrow()).dump_data()
+            (*metrics.borrow()).dump_metrics_data()
           ))
         });
       });

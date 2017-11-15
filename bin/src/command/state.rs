@@ -2,7 +2,7 @@ use mio::Token;
 use std::collections::{BTreeMap,HashMap,HashSet};
 
 use sozu::network::metrics::METRICS;
-use sozu_command::messages::{FilteredData,OrderMessageAnswerData,QueryAnswer};
+use sozu_command::messages::{MetricsData,OrderMessageAnswerData,QueryAnswer};
 use sozu_command::state::ConfigState;
 use sozu_command::data::AnswerData;
 use command::FrontToken;
@@ -124,7 +124,7 @@ impl Task {
     trace!("state generate data: type={:?}, data = {:#?}", self.message_type, self.data);
     match self.message_type {
       MessageType::Metrics => {
-        let mut data: BTreeMap<String, BTreeMap<String, FilteredData>> = self.data.into_iter().filter_map(|(tag, metrics)| {
+        let mut data: BTreeMap<String, MetricsData> = self.data.into_iter().filter_map(|(tag, metrics)| {
            if let OrderMessageAnswerData::Metrics(d) = metrics {
              Some((tag, d))
            } else {
@@ -132,7 +132,7 @@ impl Task {
            }
         }).collect();
         let master_metrics = METRICS.with(|metrics| {
-          (*metrics.borrow()).dump_data()
+          (*metrics.borrow()).dump_metrics_data()
         });
         data.insert(String::from("master"), master_metrics);
         Some(AnswerData::Metrics(data))

@@ -30,12 +30,20 @@ pub enum OrderMessageStatus {
   Error(String),
 }
 
+
+
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OrderMessageAnswerData {
   //placeholder for now
-  Metrics(BTreeMap<String,FilteredData>),
+  Metrics(MetricsData),
   Query(QueryAnswer),
+}
+
+#[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
+pub struct MetricsData {
+  pub proxy:        BTreeMap<String, FilteredData>,
+  pub applications: BTreeMap<String, Percentiles>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
@@ -44,6 +52,18 @@ pub enum FilteredData {
   Gauge(usize),
   Count(i64),
   Time(usize),
+}
+
+#[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
+pub struct Percentiles {
+  pub samples:  u64,
+  pub p_50:     u64,
+  pub p_90:     u64,
+  pub p_99:     u64,
+  pub p_99_9:   u64,
+  pub p_99_99:  u64,
+  pub p_99_999: u64,
+  pub p_100:    u64,
 }
 
 #[derive(Debug,Clone,Serialize,Deserialize)]

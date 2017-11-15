@@ -4,7 +4,7 @@ use serde_json;
 use std::fmt;
 use std::collections::BTreeMap;
 
-use messages::{FilteredData,Order,Query,QueryAnswer};
+use messages::{MetricsData,Order,Query,QueryAnswer};
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
@@ -52,7 +52,7 @@ pub enum ConfigMessageStatus {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AnswerData {
   Workers(Vec<WorkerInfo>),
-  Metrics(BTreeMap<String, BTreeMap<String,FilteredData>>),
+  Metrics(BTreeMap<String, MetricsData>),
   Query(BTreeMap<String, QueryAnswer>),
 }
 

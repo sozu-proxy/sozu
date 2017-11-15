@@ -9,8 +9,9 @@ use std::net::SocketAddr;
 use mio::net::UdpSocket;
 use std::io::{self,Write,Error,ErrorKind};
 use nom::HexDisplay;
+use hdrsample::Histogram;
 use sozu_command::buffer::Buffer;
-use sozu_command::messages::FilteredData;
+use sozu_command::messages::{FilteredData,MetricsData,Percentiles};
 
 thread_local! {
   pub static METRICS: RefCell<ProxyMetrics> = RefCell::new(ProxyMetrics::new(String::from("sozu")))
@@ -35,6 +36,8 @@ pub struct ProxyMetrics {
   pub prefix:      String,
   pub created:     Instant,
   pub data:        BTreeMap<String, StoredMetricData>,
+  /// app_id -> response time histogram (in ms)
+  pub app_data:    BTreeMap<String,Histogram<u32>>,
   pub is_writable: bool,
   remote:          Option<(SocketAddr, UdpSocket)>,
 }
@@ -46,6 +49,7 @@ impl ProxyMetrics {
       prefix:      prefix,
       created:     Instant::now(),
       data:        BTreeMap::new(),
+      app_data:    BTreeMap::new(),
       remote:      None,
       is_writable: false,
     }
@@ -85,6 +89,30 @@ impl ProxyMetrics {
       };
       (key.to_string(), val)
     }).collect()
+  }
+
+  pub fn dump_percentiles(&self) -> BTreeMap<String, Percentiles> {
+    self.app_data.iter().map(|(ref app_id, ref hist)| {
+      let percentiles = Percentiles {
+        samples:  hist.len(),
+        p_50:     hist.value_at_percentile(50.0),
+        p_90:     hist.value_at_percentile(90.0),
+        p_99:     hist.value_at_percentile(99.0),
+        p_99_9:   hist.value_at_percentile(99.9),
+        p_99_99:  hist.value_at_percentile(99.99),
+        p_99_999: hist.value_at_percentile(99.999),
+        p_100:    hist.value_at_percentile(100.0),
+      };
+
+      (app_id.to_string(), percentiles)
+    }).collect()
+  }
+
+  pub fn dump_metrics_data(&self) -> MetricsData {
+    MetricsData {
+      proxy:        self.dump_data(),
+      applications: self.dump_percentiles(),
+    }
   }
 
   pub fn count_add(&mut self, key: &str, count_value: i64) {
@@ -328,8 +356,34 @@ macro_rules! time_end (
   }
 );
 
+#[macro_export]
+macro_rules! record_request_time (
+  ($app_id:expr, $value: expr) => {
+    let v = $value;
+    $crate::network::metrics::METRICS.with(|metrics| {
+      let ref mut m = *metrics.borrow_mut();
+      let key: &str = $app_id;
+
+      if m.app_data.contains_key(key) {
+        let hist = m.app_data.get_mut(key).unwrap();
+        hist.record($value as u64);
+      } else {
+        if let Ok(mut hist) = ::hdrsample::Histogram::new(3) {
+          hist.record($value as u64);
+          m.app_data.insert(key.to_string(), hist);
+        }
+      }
+      /*
+      let hist = m.app_data.entry($app_id).or_insert(::hdrsample::Histogram::new(3));
+      let v = $value as u64;
+      hist.record(v);
+      */
+    });
+  }
+);
+
 ///Client-side request errors caused by:
-/// 
+///
 /// * Client terminates before sending request
 /// * Read error from client
 /// * Client timeout

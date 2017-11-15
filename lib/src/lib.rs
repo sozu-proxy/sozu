@@ -167,6 +167,7 @@ extern crate net2;
 extern crate libc;
 extern crate slab;
 extern crate mio_uds;
+extern crate hdrsample;
 extern crate sozu_command_lib as sozu_command;
 
 #[macro_use] pub mod util;

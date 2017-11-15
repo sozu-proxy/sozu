@@ -329,6 +329,9 @@ impl<Front:SocketHandler> Http<Front> {
     let response_time = metrics.response_time().num_milliseconds();
     let service_time  = metrics.service_time().num_milliseconds();
 
+    let app_id = self.app_id.clone().unwrap_or(String::from("-"));
+    record_request_time!(&app_id, response_time);
+
     info!("{}{} -> {}\t{} {} {} {}\t{} {} {}",
       self.log_ctx, client, backend,
       response_time, service_time, metrics.bin, metrics.bout,
@@ -353,6 +356,10 @@ impl<Front:SocketHandler> Http<Front> {
 
     let response_time = metrics.response_time().num_milliseconds();
     let service_time  = metrics.service_time().num_milliseconds();
+
+    if let Some(ref app_id) = self.app_id {
+      record_request_time!(app_id, response_time);
+    }
 
     info!("{}\t {} -> X\t{} {} {}\t | {} {} {} {}", self.log_ctx,
         client, status_line, host, request_line,
