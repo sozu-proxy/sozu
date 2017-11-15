@@ -143,7 +143,8 @@ impl SessionMetrics {
     match self.service_start {
       Some(start) => {
         let last_duration = SteadyTime::now() - start;
-        self.service_time + last_duration,
+        self.service_time + last_duration
+      },
       None        => self.service_time,
     }
   }
