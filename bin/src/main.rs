@@ -69,7 +69,7 @@ fn main() {
     let id  = matches.value_of("id").expect("needs a worker id");
     let buffer_size = matches.value_of("channel-buffer-size")
       .and_then(|size| size.parse::<usize>().ok())
-      .unwrap_or(10000);
+      .unwrap_or(1_000_000);
 
     begin_worker_process(fd, id, buffer_size);
     return;
@@ -80,7 +80,7 @@ fn main() {
       .parse::<i32>().expect("the file descriptor must be a number");
     let buffer_size = matches.value_of("channel-buffer-size")
       .and_then(|size| size.parse::<usize>().ok())
-      .unwrap_or(10000);
+      .unwrap_or(1_000_000);
 
     begin_new_master_process(fd, buffer_size);
     return;

@@ -165,7 +165,7 @@ impl CommandServer {
     //poll.register(&timer, Token(1), Ready::readable(), PollOpt::edge()).unwrap();
     timer.set_timeout(Duration::from_millis(700), Token(0));
 
-    let buffer_size = config.command_buffer_size.unwrap_or(10000);
+    let buffer_size = config.command_buffer_size.unwrap_or(1_000_000);
 
     CommandServer {
       sock:            srv,

@@ -51,8 +51,8 @@ pub fn start_worker(id: u32, config: &Config) -> nix::Result<Worker> {
 fn generate_channels() -> io::Result<(Channel<OrderMessage,OrderMessageAnswer>, Channel<OrderMessageAnswer,OrderMessage>)> {
   let (command,proxy) = try!(UnixStream::pair());
   //FIXME: configurable buffer size
-  let proxy_channel   = Channel::new(proxy, 10000, 20000);
-  let command_channel = Channel::new(command, 10000, 20000);
+  let proxy_channel   = Channel::new(proxy, 1_000_000, 2_000_000);
+  let command_channel = Channel::new(command, 1_000_000, 2_000_000);
   Ok((command_channel, proxy_channel))
 }
 
@@ -118,7 +118,7 @@ pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Ch
   new_cl_flags.remove(FD_CLOEXEC);
   fcntl(client.as_raw_fd(), FcntlArg::F_SETFD(new_cl_flags));
 
-  let channel_buffer_size = config.channel_buffer_size.unwrap_or(10000);
+  let channel_buffer_size = config.channel_buffer_size.unwrap_or(1_000_000);
   let channel_max_buffer_size = channel_buffer_size * 2;
 
   let mut command: Channel<Config,OrderMessageAnswer> = Channel::new(
