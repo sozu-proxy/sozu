@@ -407,7 +407,7 @@ macro_rules! log {
             l.borrow_mut().log(
               &_META,
               format_args!(
-                concat!("{} {}\t{} {} {}\t", $format, '\n'),
+                concat!("{} {} {} {} {}\t", $format, '\n'),
                 ::time::now_utc().rfc3339(), ::time::precise_time_ns(), pid, tag,
                 $level_tag $(, $final_args)*)
             );
@@ -511,7 +511,7 @@ impl log::Log for CompatLogger {
         l.borrow_mut().compat_log(
           record.metadata(),
           format_args!(
-            concat!("{} {}\t{} {} {}\t{}\n"),
+            concat!("{} {} {} {} {}\t{}\n"),
             ::time::now_utc().rfc3339(), ::time::precise_time_ns(), pid, tag,
             record.level(), record.args())
         );
