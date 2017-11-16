@@ -56,7 +56,7 @@ fn generate_channels() -> io::Result<(Channel<OrderMessage,OrderMessageAnswer>, 
   Ok((command_channel, proxy_channel))
 }
 
-pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
+pub fn begin_worker_process(fd: i32, id: i32, channel_buffer_size: usize) {
   let mut command: Channel<OrderMessageAnswer,Config> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
     channel_buffer_size,
@@ -68,7 +68,7 @@ pub fn begin_worker_process(fd: i32, id: &str, channel_buffer_size: usize) {
   let proxy_config = command.read_message().expect("worker could not read configuration from socket");
   //println!("got message: {:?}", proxy_config);
 
-  logging::setup(format!("{}-{}", "TAG", id), &proxy_config.log_level, &proxy_config.log_target);
+  logging::setup(format!("{}-{:02}", "WRK", id), &proxy_config.log_level, &proxy_config.log_target);
   info!("worker {} starting...", id);
 
   command.set_nonblocking(true);

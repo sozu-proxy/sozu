@@ -66,7 +66,8 @@ fn main() {
   if let Some(matches) = matches.subcommand_matches("worker") {
     let fd  = matches.value_of("fd").expect("needs a file descriptor")
       .parse::<i32>().expect("the file descriptor must be a number");
-    let id  = matches.value_of("id").expect("needs a worker id");
+    let id  = matches.value_of("id").expect("needs a worker id")
+      .parse::<i32>().expect("the worker id must be a number");;
     let buffer_size = matches.value_of("channel-buffer-size")
       .and_then(|size| size.parse::<usize>().ok())
       .unwrap_or(1_000_000);
