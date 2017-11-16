@@ -65,13 +65,10 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<Up
   new_cl_flags.remove(FD_CLOEXEC);
   fcntl(client.as_raw_fd(), FcntlArg::F_SETFD(new_cl_flags));
 
-  let channel_buffer_size = upgrade_data.config.command_buffer_size.unwrap_or(10000);
-  let channel_max_buffer_size = channel_buffer_size * 2;
-
   let mut command: Channel<UpgradeData,bool> = Channel::new(
     server,
-    channel_buffer_size,
-    channel_max_buffer_size
+    upgrade_data.config.command_buffer_size,
+    upgrade_data.config.max_command_buffer_size
   );
   command.set_nonblocking(false);
 
@@ -94,7 +91,7 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<Up
         .arg("--fd")
         .arg(client.as_raw_fd().to_string())
         .arg("--channel-buffer-size")
-        .arg(channel_buffer_size.to_string())
+        .arg(upgrade_data.config.command_buffer_size.to_string())
         .exec();
 
       error!("exec call failed: {:?}", res);

@@ -1,5 +1,6 @@
 //! parsing data from the configuration file
 use std::fs::File;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::net::ToSocketAddrs;
 use std::collections::HashMap;
@@ -190,8 +191,9 @@ pub struct AppConfig {
   pub sticky_session:    Option<bool>,
 }
 
+
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
-pub struct Config {
+pub struct FileConfig {
   pub command_socket:          String,
   pub command_buffer_size:     Option<usize>,
   pub max_command_buffer_size: Option<usize>,
@@ -207,8 +209,9 @@ pub struct Config {
   pub handle_process_affinity: Option<bool>
 }
 
-impl Config {
-  pub fn load_from_path(path: &str) -> io::Result<Config> {
+
+impl FileConfig {
+  pub fn load_from_path(path: &str) -> io::Result<FileConfig> {
     let data = try!(Config::load_file(path));
 
     match toml::from_str(&data) {
@@ -221,6 +224,50 @@ impl Config {
         )
       }
     }
+  }
+
+  pub fn into(self, config_path: &str) -> Config {
+
+    Config {
+      config_path:    config_path.to_string(),
+      command_socket: self.command_socket,
+      command_buffer_size: self.command_buffer_size.unwrap_or(1_000_000),
+      max_command_buffer_size: self.max_command_buffer_size.unwrap_or( self.command_buffer_size.unwrap_or(1_000_000) * 2),
+      channel_buffer_size: self.channel_buffer_size.unwrap_or(1_000_000),
+      saved_state: self.saved_state,
+      log_level: self.log_level.unwrap_or(String::from("info")),
+      log_target: self.log_target.unwrap_or(String::from("stdout")),
+      worker_count: self.worker_count.unwrap_or(2),
+      metrics: self.metrics,
+      http: self.http,
+      https: self.https,
+      applications: self.applications,
+      handle_process_affinity: self.handle_process_affinity.unwrap_or(false),
+    }
+  }
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
+pub struct Config {
+  pub config_path:             String,
+  pub command_socket:          String,
+  pub command_buffer_size:     usize,
+  pub max_command_buffer_size: usize,
+  pub channel_buffer_size:     usize,
+  pub saved_state:             Option<String>,
+  pub log_level:               String,
+  pub log_target:              String,
+  pub worker_count:            u16,
+  pub metrics:                 Option<MetricsConfig>,
+  pub http:                    Option<ProxyConfig>,
+  pub https:                   Option<ProxyConfig>,
+  pub applications:            HashMap<String, AppConfig>,
+  pub handle_process_affinity: bool,
+}
+
+impl Config {
+  pub fn load_from_path(path: &str) -> io::Result<Config> {
+    FileConfig::load_from_path(path).map(|config| config.into(path))
   }
 
   pub fn generate_config_messages(&self) -> Vec<ConfigMessage> {
@@ -345,6 +392,45 @@ impl Config {
     }
 
     v
+  }
+
+  pub fn command_socket_path(&self) -> String {
+    let config_path_buf = PathBuf::from(self.config_path.clone());
+    let mut config_folder = config_path_buf.parent().expect("could not get parent folder of configuration file").to_path_buf();
+
+    let socket_path = PathBuf::from(self.command_socket.clone());
+    let mut parent = match socket_path.parent() {
+      None => config_folder,
+      Some(path) => {
+        config_folder.push(path);
+        match config_folder.canonicalize() {
+          Ok(path) => path,
+           Err(e)   => panic!("could not get command socket folder path: {}", e),
+        }
+      }
+    };
+
+    let path = match socket_path.file_name() {
+      None => panic!("could not get command socket file name"),
+      Some(f) => {
+        parent.push(f);
+        parent
+      }
+    };
+
+    path.to_str().map(|s| s.to_string()).expect("could not parse command socket path")
+  }
+
+  pub fn saved_state_path(&self) -> Option<String> {
+    self.saved_state.as_ref().and_then(|path| {
+      let config_path_buf = PathBuf::from(self.config_path.clone());
+      let config_folder = config_path_buf.parent().expect("could not get parent folder of configuration file");
+      let mut saved_state_path_raw = config_folder.to_path_buf();
+      saved_state_path_raw.push(path);
+      saved_state_path_raw.canonicalize().map_err(|e| {
+        error!("could not get saved state path: {}", e);
+      }).ok().and_then(|path| path.to_str().map(|s| s.to_string()))
+    })
   }
 
   pub fn load_file(path: &str) -> io::Result<String> {

@@ -6,15 +6,14 @@ use mio_uds::UnixDatagram;
 use std::net::{TcpStream,UdpSocket,ToSocketAddrs};
 use sozu::logging::{Logger,LoggerBackend};
 
-pub fn setup(tag: String, level: &Option<String>, target: &Option<String>) {
-  let backend: LoggerBackend = target.as_ref().map(|s| {
-    if s == "stdout" {
+pub fn setup(tag: String, level: &str, target: &str) {
+  let backend: LoggerBackend = if target == "stdout" {
       LoggerBackend::Stdout(stdout())
-    } else if s.starts_with("udp://") {
-      let addr_res = (&s[6..]).to_socket_addrs();
+    } else if target.starts_with("udp://") {
+      let addr_res = (&target[6..]).to_socket_addrs();
       match addr_res {
         Err(e) => {
-          println!("invalid log target configuration ({:?}): {}", e, s);
+          println!("invalid log target configuration ({:?}): {}", e, target);
           LoggerBackend::Stdout(stdout())
         },
         Ok(mut addrs) => {
@@ -22,21 +21,21 @@ pub fn setup(tag: String, level: &Option<String>, target: &Option<String>) {
           LoggerBackend::Udp(socket, addrs.next().unwrap())
         }
       }
-    } else if s.starts_with("tcp://") {
-      let addr_res = (&s[6..]).to_socket_addrs();
+    } else if target.starts_with("tcp://") {
+      let addr_res = (&target[6..]).to_socket_addrs();
       match addr_res {
         Err(e) => {
-          println!("invalid log target configuration ({:?}): {}", e, s);
+          println!("invalid log target configuration ({:?}): {}", e, target);
           LoggerBackend::Stdout(stdout())
         },
         Ok(mut addrs) => {
           LoggerBackend::Tcp(TcpStream::connect(addrs.next().unwrap()).unwrap())
         }
       }
-    } else if s.starts_with("unix://") {
-      let path = Path::new(&s[7..]);
+    } else if target.starts_with("unix://") {
+      let path = Path::new(&target[7..]);
       if !path.is_file() {
-        println!("invalid log target configuration: {} is not a file", &s[7..]);
+        println!("invalid log target configuration: {} is not a file", &target[7..]);
         LoggerBackend::Stdout(stdout())
       } else {
         let mut dir = env::temp_dir();
@@ -47,17 +46,16 @@ pub fn setup(tag: String, level: &Option<String>, target: &Option<String>) {
         LoggerBackend::Unix(socket)
       }
     } else {
-      println!("invalid log target configuration: {}", s);
+      println!("invalid log target configuration: {}", target);
       LoggerBackend::Stdout(stdout())
-    }
-  }).unwrap_or(LoggerBackend::Stdout(stdout()));
+    };
 
   if let Ok(log_level) = env::var("RUST_LOG") {
     Logger::init(tag, &log_level, backend);
-  } else if let &Some(ref log_level) = level {
+  } else {
     // We set the env variable so every worker can access it
-    env::set_var("RUST_LOG", &log_level);
-    Logger::init(tag, &log_level, backend);
+    env::set_var("RUST_LOG", level);
+    Logger::init(tag, level, backend);
   }
 }
 

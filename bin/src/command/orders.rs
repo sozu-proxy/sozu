@@ -501,8 +501,8 @@ impl CommandServer {
     poll.register(&listener, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).expect("should register listener correctly");
 
 
-    let buffer_size     = config.command_buffer_size.unwrap_or(1_000_000);
-    let max_buffer_size = config.max_command_buffer_size.unwrap_or(buffer_size * 2);
+    let buffer_size     = config.command_buffer_size;
+    let max_buffer_size = config.max_command_buffer_size;
 
     let workers: HashMap<Token, Worker> = workers.iter().filter_map(|serialized| {
       let stream = unsafe { UnixStream::from_raw_fd(serialized.fd) };

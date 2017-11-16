@@ -26,7 +26,7 @@ use command::Worker;
 
 pub fn start_workers(config: &Config) -> nix::Result<Vec<Worker>> {
   let mut workers = Vec::new();
-  for index in 0..config.worker_count.unwrap_or(1) {
+  for index in 0..config.worker_count {
     match start_worker_process(&index.to_string(), config) {
       Ok((pid, command)) => {
         let w =  Worker::new(index as u32, pid, command, config);
@@ -118,8 +118,9 @@ pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Ch
   new_cl_flags.remove(FD_CLOEXEC);
   fcntl(client.as_raw_fd(), FcntlArg::F_SETFD(new_cl_flags));
 
-  let channel_buffer_size = config.channel_buffer_size.unwrap_or(1_000_000);
-  let channel_max_buffer_size = channel_buffer_size * 2;
+  let channel_buffer_size = config.channel_buffer_size;
+  //FIXME
+  let channel_max_buffer_size = config.channel_buffer_size * 2;
 
   let mut command: Channel<Config,OrderMessageAnswer> = Channel::new(
     server,

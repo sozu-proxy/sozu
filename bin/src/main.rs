@@ -104,21 +104,19 @@ fn main() {
     }
 
 
+    // define this here so we can stop before launching workers if necessary
+    let command_socket_path = config.command_socket_path();
+
     if check_process_limits(config.clone()) {
       match start_workers(&config) {
         Ok(workers) => {
           info!("created workers: {:?}", workers);
 
-          let handle_process_affinity = match config.handle_process_affinity {
-            Some(val) => val,
-            None => false
-          };
-
-          if cfg!(target_os = "linux") && handle_process_affinity {
+          if cfg!(target_os = "linux") && config.handle_process_affinity {
             set_workers_affinity(&workers);
           }
 
-          command::start(config, workers);
+          command::start(config, command_socket_path, workers);
         },
         Err(e) => error!("Error while creating workers: {}", e)
       }

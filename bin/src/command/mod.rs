@@ -165,12 +165,10 @@ impl CommandServer {
     //poll.register(&timer, Token(1), Ready::readable(), PollOpt::edge()).unwrap();
     timer.set_timeout(Duration::from_millis(700), Token(0));
 
-    let buffer_size = config.command_buffer_size.unwrap_or(1_000_000);
-
     CommandServer {
       sock:            srv,
-      buffer_size:     buffer_size,
-      max_buffer_size: config.max_command_buffer_size.unwrap_or(buffer_size * 2),
+      buffer_size:     config.command_buffer_size,
+      max_buffer_size: config.max_command_buffer_size,
       clients:         Slab::with_capacity(128),
       proxies:         proxies,
       next_id:         next_id as u32,
@@ -495,11 +493,11 @@ impl CommandServer {
   }
 }
 
-pub fn start(config: Config, proxies: Vec<Worker>) {
-  let saved_state     = config.saved_state.clone();
+pub fn start(config: Config, command_socket_path: String, proxies: Vec<Worker>) {
+  let saved_state     = config.saved_state_path();
 
   let event_loop = Poll::new().unwrap();
-  let addr = PathBuf::from(&config.command_socket);
+  let addr = PathBuf::from(&command_socket_path);
   if let Err(e) = fs::remove_file(&addr) {
     match e.kind() {
       ErrorKind::NotFound => {},
