@@ -638,6 +638,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       },
       Order::RemoveApplication(application) => {
         debug!("{} remove application {:?}", message.id, application);
+        remove_app_metrics!(&application);
         self.remove_application(&application, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
@@ -664,6 +665,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       },
       Order::RemoveInstance(instance) => {
         debug!("{} remove instance {:?}", message.id, instance);
+        remove_backend_metrics!(&instance.instance_id);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {

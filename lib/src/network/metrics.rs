@@ -434,7 +434,7 @@ macro_rules! record_backend_metrics (
         bm.bin += $bin;
         bm.bout += $bout;
       } else {
-        if let Ok(mut hist) = ::hdrsample::Histogram::new(3) {
+        if let Ok(hist) = ::hdrsample::Histogram::new(3) {
           let mut bm = $crate::network::metrics::BackendMetrics::new(hist);
           bm.response_time.record($response_time as u64);
           bm.bin += $bin;
@@ -442,6 +442,28 @@ macro_rules! record_backend_metrics (
           m.backend_data.insert(key.to_string(), bm);
         }
       }
+    });
+  }
+);
+
+#[macro_export]
+macro_rules! remove_app_metrics (
+  ($app_id:expr) => {
+    $crate::network::metrics::METRICS.with(|metrics| {
+      let ref mut m = *metrics.borrow_mut();
+      let key: &str = $app_id;
+      m.app_data.remove(key);
+    });
+  }
+);
+
+#[macro_export]
+macro_rules! remove_backend_metrics (
+  ($backend_id:expr) => {
+    $crate::network::metrics::METRICS.with(|metrics| {
+      let ref mut m = *metrics.borrow_mut();
+      let key: &str = $backend_id;
+      m.backend_data.remove(key);
     });
   }
 );
