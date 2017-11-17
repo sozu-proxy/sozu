@@ -4,9 +4,12 @@ use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront, CertificateAndKey, CertFingerprint, TcpFront, Query};
 
-use std::collections::HashSet;
+use std::collections::{HashMap,HashSet};
 use std::process::exit;
 use rand::{thread_rng, Rng};
+use prettytable::Table;
+use prettytable::row::Row;
+use prettytable::cell::Cell;
 
 fn generate_id() -> String {
   let s: String = thread_rng().gen_ascii_chars().take(6).collect();
@@ -342,26 +345,30 @@ pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   ));
 
   match channel.read_message() {
-    None          => println!("the proxy didn't answer"),
+    None          => {
+      println!("the proxy didn't answer");
+      exit(1);
+    },
     Some(message) => {
       if id != message.id {
         println!("received message with invalid id: {:?}", message);
-        return;
+        exit(1);
       }
       match message.status {
         ConfigMessageStatus::Processing => {
           println!("should have obtained an answer immediately");
-          return;
+          exit(1);
         },
         ConfigMessageStatus::Error => {
           println!("could not get the worker list: {}", message.message);
-          return
+          exit(1);
         },
         ConfigMessageStatus::Ok => {
           println!("Worker list:\n{:?}", message.data);
           if let Some(AnswerData::Workers(ref workers)) = message.data {
             let mut expecting: HashSet<String> = HashSet::new();
 
+            let mut h = HashMap::new();
             for ref worker in workers.iter().filter(|worker| worker.run_state == RunState::Running) {
               let id = generate_id();
               let msg = ConfigMessage::new(
@@ -369,19 +376,22 @@ pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
                 ConfigCommand::ProxyConfiguration(Order::Status),
                 Some(worker.id),
               );
-              println!("sending message: {:?}", msg);
+              //println!("sending message: {:?}", msg);
               channel.write_message(&msg);
-              expecting.insert(id);
+              expecting.insert(id.clone());
+              h.insert(id, (worker.id, ConfigMessageStatus::Processing));
             }
 
-
             loop {
-              println!("expecting: {:?}", expecting);
+              //println!("expecting: {:?}", expecting);
               if expecting.is_empty() {
                 break;
               }
               match channel.read_message() {
-                None          => println!("the proxy didn't answer"),
+                None          => {
+                  println!("the proxy didn't answer");
+                  exit(1);
+                },
                 Some(message) => {
                   println!("received message: {:?}", message);
                   match message.status {
@@ -392,18 +402,43 @@ pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
                       if expecting.contains(&message.id) {
                         expecting.remove(&message.id);
                         println!("status message with ID {} done", message.id);
+                        if let Some(data) = h.get_mut(&message.id) {
+                          *data = ((*data).0, ConfigMessageStatus::Error);
+                        }
                       }
                     },
                     ConfigMessageStatus::Ok => {
                       if expecting.contains(&message.id) {
                         expecting.remove(&message.id);
                         println!("status message with ID {} done", message.id);
+                        if let Some(data) = h.get_mut(&message.id) {
+                          *data = ((*data).0, ConfigMessageStatus::Ok);
+                        }
                       }
                     }
                   }
                 }
               }
             }
+
+            let mut h2: HashMap<u32, String> = h.values().map(|&(ref id, ref status)| {
+              (*id, String::from(match *status {
+                ConfigMessageStatus::Processing => "processing",
+                ConfigMessageStatus::Error      => "error",
+                ConfigMessageStatus::Ok         => "ok",
+              }))
+            }).collect();
+
+            let mut table = Table::new();
+
+            let empty = "";
+            table.add_row(row!["Worker", "pid", "run state", "answer"]);
+            for ref worker in workers.iter() {
+              let state = format!("{:?}", worker.run_state);
+              table.add_row(row![worker.id, worker.pid, state, h2.get(&worker.id).unwrap_or(&String::from(""))]);
+            }
+
+            table.printstd();
           }
         }
       }

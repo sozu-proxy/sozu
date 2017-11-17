@@ -14,6 +14,7 @@ categories = ["network-programming"]
 clap    = "^2.19.0"
 mio-uds = "^0.6"
 rand    = "^0.3"
+prettytable-rs = "^0.6"
 sozu-command-lib = { version = "^0.2", path = "../command" }
 
 [features]

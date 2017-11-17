@@ -1,4 +1,5 @@
 #[macro_use] extern crate clap;
+#[macro_use] extern crate prettytable;
 extern crate mio_uds;
 extern crate rand;
 extern crate sozu_command_lib as sozu_command;
