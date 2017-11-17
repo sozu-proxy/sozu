@@ -5,6 +5,7 @@ use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAns
 use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront, CertificateAndKey, CertFingerprint, TcpFront, Query};
 
 use std::collections::HashSet;
+use std::process::exit;
 use rand::{thread_rng, Rng};
 
 fn generate_id() -> String {
@@ -27,11 +28,14 @@ pub fn save_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
   ));
 
   match channel.read_message() {
-    None          => println!("the proxy didn't answer"),
+    None          => {
+      println!("the proxy didn't answer");
+      exit(1);
+    },
     Some(message) => {
       if id != message.id {
         println!("received message with invalid id: {:?}", message);
-        return;
+        exit(1);
       }
       match message.status {
         ConfigMessageStatus::Processing => {
@@ -41,9 +45,10 @@ pub fn save_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
         },
         ConfigMessageStatus::Error => {
           println!("could not save proxy state: {}", message.message);
+          exit(1);
         },
         ConfigMessageStatus::Ok => {
-          println!("Proxy state saved to {}: {}", path, message.message);
+          println!("{}", message.message);
         }
       }
     }
@@ -59,11 +64,14 @@ pub fn load_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
   ));
 
   match channel.read_message() {
-    None          => println!("the proxy didn't answer"),
+    None          => {
+      println!("the proxy didn't answer");
+      exit(1);
+    },
     Some(message) => {
       if id != message.id {
         println!("received message with invalid id: {:?}", message);
-        return;
+        exit(1);
       }
       match message.status {
         ConfigMessageStatus::Processing => {
@@ -73,6 +81,7 @@ pub fn load_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
         },
         ConfigMessageStatus::Error => {
           println!("could not load proxy state: {}", message.message);
+          exit(1);
         },
         ConfigMessageStatus::Ok => {
           println!("Proxy state loaded successfully from {}", path);
@@ -91,11 +100,14 @@ pub fn dump_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   ));
 
   match channel.read_message() {
-    None          => println!("the proxy didn't answer"),
+    None          => {
+      println!("the proxy didn't answer");
+      exit(1);
+    },
     Some(message) => {
       if id != message.id {
         println!("received message with invalid id: {:?}", message);
-        return;
+        exit(1);
       }
       match message.status {
         ConfigMessageStatus::Processing => {
@@ -105,9 +117,15 @@ pub fn dump_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
         },
         ConfigMessageStatus::Error => {
           println!("could not dump proxy state: {}", message.message);
+          exit(1);
         },
         ConfigMessageStatus::Ok => {
-          println!("Proxy state:\n{}", message.message);
+          if let Some(AnswerData::State(state)) = message.data {
+            println!("{:#?}", state);
+          } else {
+            println!("state dump was empty");
+            exit(1);
+          }
         }
       }
     }
@@ -626,9 +644,14 @@ fn order_command(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, order
         },
         ConfigMessageStatus::Error => {
           println!("could not execute order: {}", message.message);
+          exit(1);
         },
         ConfigMessageStatus::Ok => {
+          //deactivate success messages for now
+          /*
           match order {
+            Order::AddApplication(_) => println!("application added : {}", message.message),
+            Order::RemoveApplication(_) => println!("application removed : {} ", message.message),
             Order::AddInstance(_) => println!("backend added : {}", message.message),
             Order::RemoveInstance(_) => println!("backend removed : {} ", message.message),
             Order::AddCertificate(_) => println!("certificate added: {}", message.message),
@@ -636,9 +659,10 @@ fn order_command(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, order
             Order::AddHttpFront(_) => println!("front added: {}", message.message),
             Order::RemoveHttpFront(_) => println!("front removed: {}", message.message),
             _ => {
-              // do nothing for now 
+              // do nothing for now
             }
           }
+          */
         }
       }
     }

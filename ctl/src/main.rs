@@ -55,7 +55,8 @@ fn main() {
                                                     .long("file")
                                                     .value_name("state file")
                                                     .help("Save state to that file")
-                                                    .takes_value(true)))
+                                                    .takes_value(true)
+                                                    .required(true)))
                                     .subcommand(SubCommand::with_name("dump")))
                         .subcommand(SubCommand::with_name("application")
                                                 .about("application management")
@@ -280,14 +281,14 @@ fn main() {
       match sub.subcommand() {
         ("remove", Some(backend_sub)) => {
           let id = backend_sub.value_of("id").expect("missing id");
-          let instance_id = backend_sub.value_of("instance_id").expect("missing instance id");
+          let instance_id = backend_sub.value_of("instance-id").expect("missing instance id");
           let ip = backend_sub.value_of("ip").expect("missing backend ip");
           let port: u16 = backend_sub.value_of("port").expect("mssing backend port").parse().unwrap();
           remove_backend(&mut channel, id, instance_id, ip, port);
         }
         ("add", Some(backend_sub)) => {
           let id = backend_sub.value_of("id").expect("missing id");
-          let instance_id = backend_sub.value_of("instance_id").expect("missing instance id");
+          let instance_id = backend_sub.value_of("instance-id").expect("missing instance id");
           let ip = backend_sub.value_of("ip").expect("missing backend ip");
           let port: u16 = backend_sub.value_of("port").expect("mssing backend port").parse().unwrap();
           add_backend(&mut channel, id, instance_id, ip, port);

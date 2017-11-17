@@ -119,16 +119,18 @@ impl CommandServer {
   }
 
   pub fn dump_state(&mut self, token: FrontToken, message_id: &str) {
-    let conf = ProxyConfiguration {
-      id:    String::from(message_id),
-      state: self.state.clone(),
-    };
-    self.answer_success(token, message_id, serde_json::to_string(&conf).unwrap_or(String::new()), None);
+    let state = self.state.clone();
+    self.answer_success(token, message_id, String::new(), Some(AnswerData::State(state)));
   }
 
   pub fn load_state(&mut self, token_opt: Option<FrontToken>, message_id: &str, path: &str) {
     match fs::File::open(&path) {
-      Err(e)   => error!("cannot open file at path '{}': {:?}", path, e),
+      Err(e)   => {
+        error!("cannot open file at path '{}': {:?}", path, e);
+        if let Some(token) = token_opt {
+          self.answer_error(token, message_id, format!("cannot open file at path '{}': {:?}", path, e), None);
+        }
+      },
       Ok(mut file) => {
         //let mut data = vec!();
         let mut buffer = Buffer::with_capacity(200000);

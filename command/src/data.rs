@@ -4,6 +4,7 @@ use serde_json;
 use std::fmt;
 use std::collections::BTreeMap;
 
+use state::ConfigState;
 use messages::{MetricsData,Order,Query,QueryAnswer};
 
 pub const PROTOCOL_VERSION: u8 = 0;
@@ -54,6 +55,7 @@ pub enum AnswerData {
   Workers(Vec<WorkerInfo>),
   Metrics(BTreeMap<String, MetricsData>),
   Query(BTreeMap<String, QueryAnswer>),
+  State(ConfigState),
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
