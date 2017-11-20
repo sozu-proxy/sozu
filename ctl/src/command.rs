@@ -6,6 +6,10 @@ use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront
 
 use std::collections::{HashMap,HashSet};
 use std::process::exit;
+use std::thread;
+use std::sync::{Arc,Mutex};
+use std::time::Duration;
+use std::sync::mpsc;
 use rand::{thread_rng, Rng};
 use prettytable::Table;
 use prettytable::row::Row;
@@ -336,7 +340,7 @@ pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   }
 }
 
-pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
+pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
@@ -364,7 +368,7 @@ pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
           exit(1);
         },
         ConfigMessageStatus::Ok => {
-          println!("Worker list:\n{:?}", message.data);
+          //println!("Worker list:\n{:?}", message.data);
           if let Some(AnswerData::Workers(ref workers)) = message.data {
             let mut expecting: HashSet<String> = HashSet::new();
 
@@ -382,63 +386,91 @@ pub fn status(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
               h.insert(id, (worker.id, ConfigMessageStatus::Processing));
             }
 
-            loop {
-              //println!("expecting: {:?}", expecting);
-              if expecting.is_empty() {
-                break;
-              }
-              match channel.read_message() {
-                None          => {
-                  println!("the proxy didn't answer");
-                  exit(1);
-                },
-                Some(message) => {
-                  println!("received message: {:?}", message);
-                  match message.status {
-                    ConfigMessageStatus::Processing => {
-                    },
-                    ConfigMessageStatus::Error => {
-                      println!("error for message[{}]: {}", message.id, message.message);
-                      if expecting.contains(&message.id) {
-                        expecting.remove(&message.id);
-                        println!("status message with ID {} done", message.id);
-                        if let Some(data) = h.get_mut(&message.id) {
-                          *data = ((*data).0, ConfigMessageStatus::Error);
+            let state = Arc::new(Mutex::new(h));
+            let st = state.clone();
+            let (send, recv) = mpsc::channel();
+
+            thread::spawn(move || {
+              loop {
+                //println!("expecting: {:?}", expecting);
+                if expecting.is_empty() {
+                  break;
+                }
+                match channel.read_message() {
+                  None          => {
+                    println!("the proxy didn't answer");
+                    exit(1);
+                  },
+                  Some(message) => {
+                    //println!("received message: {:?}", message);
+                    match message.status {
+                      ConfigMessageStatus::Processing => {
+                      },
+                      ConfigMessageStatus::Error => {
+                        println!("error for message[{}]: {}", message.id, message.message);
+                        if expecting.contains(&message.id) {
+                          expecting.remove(&message.id);
+                          //println!("status message with ID {} done", message.id);
+                          if let Ok(mut h) = state.try_lock() {
+                            if let Some(data) = h.get_mut(&message.id) {
+                              *data = ((*data).0, ConfigMessageStatus::Error);
+                            }
+                          }
                         }
-                      }
-                    },
-                    ConfigMessageStatus::Ok => {
-                      if expecting.contains(&message.id) {
-                        expecting.remove(&message.id);
-                        println!("status message with ID {} done", message.id);
-                        if let Some(data) = h.get_mut(&message.id) {
-                          *data = ((*data).0, ConfigMessageStatus::Ok);
+                      },
+                      ConfigMessageStatus::Ok => {
+                        if expecting.contains(&message.id) {
+                          expecting.remove(&message.id);
+                          //println!("status message with ID {} done", message.id);
+                          if let Ok(mut h) = state.try_lock() {
+                            if let Some(data) = h.get_mut(&message.id) {
+                              *data = ((*data).0, ConfigMessageStatus::Ok);
+                            }
+                          }
                         }
                       }
                     }
                   }
                 }
               }
-            }
 
-            let mut h2: HashMap<u32, String> = h.values().map(|&(ref id, ref status)| {
-              (*id, String::from(match *status {
-                ConfigMessageStatus::Processing => "processing",
-                ConfigMessageStatus::Error      => "error",
-                ConfigMessageStatus::Ok         => "ok",
-              }))
-            }).collect();
+              send.send(()).unwrap();
+            });
+
+            let finished = recv.recv_timeout(Duration::from_millis(1000)).is_ok();
+            let placeholder = if finished {
+              String::from("")
+            } else {
+              String::from("timeout")
+            };
+
+            let mut h2: HashMap<u32, String> = if let Ok(mut state) = st.try_lock() {
+              state.values().map(|&(ref id, ref status)| {
+                (*id, String::from(match *status {
+                  ConfigMessageStatus::Processing => if finished {
+                    "processing"
+                  } else {
+                    "timeout"
+                  },
+                  ConfigMessageStatus::Error      => "error",
+                  ConfigMessageStatus::Ok         => "ok",
+                }))
+              }).collect()
+            } else {
+              HashMap::new()
+            };
 
             let mut table = Table::new();
 
             let empty = "";
             table.add_row(row!["Worker", "pid", "run state", "answer"]);
             for ref worker in workers.iter() {
-              let state = format!("{:?}", worker.run_state);
-              table.add_row(row![worker.id, worker.pid, state, h2.get(&worker.id).unwrap_or(&String::from(""))]);
+              let run_state = format!("{:?}", worker.run_state);
+              table.add_row(row![worker.id, worker.pid, run_state, h2.get(&worker.id).unwrap_or(&placeholder)]);
             }
 
             table.printstd();
+
           }
         }
       }

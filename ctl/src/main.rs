@@ -243,7 +243,7 @@ fn main() {
       upgrade(&mut channel);
     },
     ("status", Some(_)) => {
-      status(&mut channel);
+      status(channel);
     },
     ("metrics", Some(_)) => {
       metrics(&mut channel);
