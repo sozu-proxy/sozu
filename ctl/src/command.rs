@@ -480,13 +480,13 @@ pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
 
 pub fn metrics(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   let id = generate_id();
-  println!("will send message for metrics with id {}", id);
+  //println!("will send message for metrics with id {}", id);
   channel.write_message(&ConfigMessage::new(
     id.clone(),
     ConfigCommand::Metrics,
     None,
   ));
-  println!("message sent");
+  //println!("message sent");
 
   loop {
     match channel.read_message() {
@@ -501,8 +501,147 @@ pub fn metrics(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
           },
           ConfigMessageStatus::Ok => {
             if &id == &message.id {
-              println!("Sozu metrics:\n{}\n{:#?}", message.message, message.data);
-              break;
+              //println!("Sozu metrics:\n{}\n{:#?}", message.message, message.data);
+
+              if let Some(AnswerData::Metrics(mut data)) = message.data {
+                if let Some(master) = data.remove("master") {
+                  let mut master_table = Table::new();
+                  master_table.add_row(row![String::from("key"), String::from("value")]);
+
+                  println!("master process metrics:\n");
+                  for (ref key, ref value) in master.proxy.iter() {
+                    master_table.add_row(row![key.to_string(), format!("{:?}", value)]);
+                     //println!("{}:\t{:?}", key, value);
+                  }
+
+                  master_table.printstd();
+                }
+
+                println!("\nworker metrics:\n");
+
+                let mut proxy_table = Table::new();
+                let mut header = Vec::new();
+                header.push(cell!("key"));
+                for ref key in data.keys() {
+                  header.push(cell!(&key));
+                }
+                proxy_table.add_row(Row::new(header));
+
+                let mut application_table = Table::new();
+                let mut header = Vec::new();
+                header.push(cell!("application"));
+                for ref key in data.keys() {
+                  header.push(cell!(&format!("{} samples", key)));
+                  header.push(cell!(&format!("{} p50%", key)));
+                  header.push(cell!(&format!("{} p90%", key)));
+                  header.push(cell!(&format!("{} p99%", key)));
+                  header.push(cell!(&format!("{} p99.9%", key)));
+                  header.push(cell!(&format!("{} p99.99%", key)));
+                  header.push(cell!(&format!("{} p99.999%", key)));
+                  header.push(cell!(&format!("{} p100%", key)));
+                }
+                application_table.add_row(Row::new(header));
+
+                let mut backend_table = Table::new();
+                let mut header = Vec::new();
+                header.push(cell!("backend"));
+                for ref key in data.keys() {
+                  header.push(cell!(&format!("{} bytes out", key)));
+                  header.push(cell!(&format!("{} bytes in", key)));
+                  header.push(cell!(&format!("{} samples", key)));
+                  header.push(cell!(&format!("{} p50%", key)));
+                  header.push(cell!(&format!("{} p90%", key)));
+                  header.push(cell!(&format!("{} p99%", key)));
+                  header.push(cell!(&format!("{} p99.9%", key)));
+                  header.push(cell!(&format!("{} p99.99%", key)));
+                  header.push(cell!(&format!("{} p99.999%", key)));
+                  header.push(cell!(&format!("{} p100%", key)));
+                }
+                backend_table.add_row(Row::new(header));
+
+
+                let mut proxy_data = HashMap::new();
+                let mut application_data = HashMap::new();
+                let mut backend_data = HashMap::new();
+
+                for ref metrics in data.values() {
+                  for (ref key, ref value) in metrics.proxy.iter() {
+                    (*(proxy_data.entry(key.clone()).or_insert(Vec::new()))).push(value.clone());
+                  }
+
+                  for (ref key, ref percentiles) in metrics.applications.iter() {
+                    let mut entry = application_data.entry(key.clone()).or_insert(Vec::new());
+                    (*entry).push(percentiles.samples);
+                    (*entry).push(percentiles.p_50);
+                    (*entry).push(percentiles.p_90);
+                    (*entry).push(percentiles.p_99);
+                    (*entry).push(percentiles.p_99_9);
+                    (*entry).push(percentiles.p_99_99);
+                    (*entry).push(percentiles.p_99_999);
+                    (*entry).push(percentiles.p_100);
+                  }
+
+                  for (ref key, ref back) in metrics.backends.iter() {
+                    let mut entry = backend_data.entry(key.clone()).or_insert(Vec::new());
+                    let bout = back.bytes_out as u64;
+                    let bin  = back.bytes_in as u64;
+                    (*entry).push(bout);
+                    (*entry).push(bin);
+                    (*entry).push(back.percentiles.samples);
+                    (*entry).push(back.percentiles.p_50);
+                    (*entry).push(back.percentiles.p_90);
+                    (*entry).push(back.percentiles.p_99);
+                    (*entry).push(back.percentiles.p_99_9);
+                    (*entry).push(back.percentiles.p_99_99);
+                    (*entry).push(back.percentiles.p_99_999);
+                    (*entry).push(back.percentiles.p_100);
+                  }
+                }
+
+                for (ref key, ref values) in proxy_data.iter() {
+                  let mut row = Vec::new();
+                  row.push(cell!(key));
+
+                  for val in values.iter() {
+                    row.push(cell!(format!("{:?}", val)));
+                  }
+
+                  proxy_table.add_row(Row::new(row));
+                }
+
+                proxy_table.printstd();
+
+                println!("\napplication metrics:\n");
+
+                for (ref key, ref values) in application_data.iter() {
+                  let mut row = Vec::new();
+                  row.push(cell!(key));
+
+                  for val in values.iter() {
+                    row.push(cell!(format!("{:?}", val)));
+                  }
+
+                  application_table.add_row(Row::new(row));
+                }
+
+                application_table.printstd();
+
+                println!("\nbackend metrics:\n");
+
+                for (ref key, ref values) in backend_data.iter() {
+                  let mut row = Vec::new();
+                  row.push(cell!(key));
+
+                  for val in values.iter() {
+                    row.push(cell!(format!("{:?}", val)));
+                  }
+
+                  backend_table.add_row(Row::new(row));
+                }
+
+                backend_table.printstd();
+                break;
+              }
             }
           }
         }
