@@ -128,6 +128,13 @@ impl fmt::Debug for CertFingerprint {
     write!(f, "CertFingerprint({})", self.0.to_hex())
   }
 }
+
+impl fmt::Display for CertFingerprint {
+  fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    write!(f, "{}", self.0.to_hex())
+  }
+}
+
 impl serde::Serialize for CertFingerprint {
   fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
       where S: serde::Serializer,

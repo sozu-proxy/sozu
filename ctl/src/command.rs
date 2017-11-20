@@ -2,7 +2,8 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
-use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront, CertificateAndKey, CertFingerprint, TcpFront, Query};
+use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront,
+  CertificateAndKey, CertFingerprint, TcpFront, Query, QueryAnswer};
 
 use std::collections::{HashMap,HashSet};
 use std::process::exit;
@@ -786,8 +787,8 @@ pub fn remove_tcp_front(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>
   }));
 }
 
-pub fn query_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, id: Option<&str>) {
-  let command = match id {
+pub fn query_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, application_id: Option<&str>) {
+  let command = match application_id {
     Some(app_id) => ConfigCommand::Query(Query::Application(app_id.to_string())),
     None         => ConfigCommand::Query(Query::Applications),
   };
@@ -816,7 +817,204 @@ pub fn query_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer
           println!("could not query proxy state: {}", message.message);
         },
         ConfigMessageStatus::Ok => {
-          println!("Proxy config answer:\n{}\n{:#?}", message.message, message.data);
+          if let Some(app_id) = application_id {
+            println!("Proxy config answer:\n{}\n{:#?}", message.message, message.data);
+            if let Some(AnswerData::Query(data)) = message.data {
+              let mut application_table = Table::new();
+              let mut header = Vec::new();
+              header.push(cell!("key"));
+              for ref key in data.keys() {
+                header.push(cell!(&key));
+              }
+              application_table.add_row(Row::new(header));
+
+              let mut frontend_table = Table::new();
+              let mut header = Vec::new();
+              header.push(cell!("hostname"));
+              header.push(cell!("path begin"));
+              for ref key in data.keys() {
+                header.push(cell!(&key));
+              }
+              frontend_table.add_row(Row::new(header));
+
+              let mut https_frontend_table = Table::new();
+              let mut header = Vec::new();
+              header.push(cell!("hostname"));
+              header.push(cell!("path begin"));
+              header.push(cell!("fingerprint"));
+              for ref key in data.keys() {
+                header.push(cell!(&key));
+              }
+              https_frontend_table.add_row(Row::new(header));
+
+              let mut backend_table = Table::new();
+              let mut header = Vec::new();
+              header.push(cell!("instance id"));
+              header.push(cell!("IP address"));
+              header.push(cell!("port"));
+              for ref key in data.keys() {
+                header.push(cell!(&key));
+              }
+              backend_table.add_row(Row::new(header));
+
+              let keys : HashSet<&String> = data.keys().collect();
+
+              let mut application_data = HashMap::new();
+              let mut frontend_data = HashMap::new();
+              let mut https_frontend_data = HashMap::new();
+              let mut backend_data = HashMap::new();
+
+              for (ref key, ref metrics) in data.iter() {
+                //let m: u8 = metrics;
+                if let &QueryAnswer::Application(ref app) = *metrics {
+                  let mut entry = application_data.entry(String::from("sticky session")).or_insert(Vec::new());
+                  if let Some(ref conf) = app.configuration {
+                    entry.push(format!("{}", conf.sticky_session));
+                  } else {
+                    entry.push(String::from(""));
+                  }
+
+                  for frontend in app.http_frontends.iter() {
+                    let mut entry = frontend_data.entry(frontend).or_insert(Vec::new());
+                    entry.push(key.clone());
+                  }
+
+                  for frontend in app.https_frontends.iter() {
+                    let mut entry = https_frontend_data.entry(frontend).or_insert(Vec::new());
+                    entry.push(key.clone());
+                  }
+
+                  for backend in app.backends.iter() {
+                    let mut entry = backend_data.entry(backend).or_insert(Vec::new());
+                    entry.push(key.clone());
+                  }
+                }
+              }
+
+              println!("Application level configuration for {}:\n", app_id);
+
+              for (ref key, ref values) in application_data.iter() {
+                let mut row = Vec::new();
+                row.push(cell!(key));
+
+                for val in values.iter() {
+                  row.push(cell!(format!("{}", val)));
+                }
+
+                application_table.add_row(Row::new(row));
+              }
+
+              application_table.printstd();
+
+              println!("\nHTTP frontends configuration for {}:\n", app_id);
+
+              for (ref key, ref values) in frontend_data.iter() {
+                let mut row = Vec::new();
+                row.push(cell!(key.hostname));
+                row.push(cell!(key.path_begin));
+
+                for val in values.iter() {
+                  if keys.contains(val) {
+                    row.push(cell!(String::from("X")));
+                  } else {
+                    row.push(cell!(String::from("")));
+                  }
+                }
+
+                frontend_table.add_row(Row::new(row));
+              }
+
+              frontend_table.printstd();
+
+              println!("\nHTTPS frontends configuration for {}:\n", app_id);
+
+              for (ref key, ref values) in https_frontend_data.iter() {
+                let mut row = Vec::new();
+                row.push(cell!(key.hostname));
+                row.push(cell!(key.path_begin));
+                row.push(cell!(format!("{}", key.fingerprint)));
+
+                for val in values.iter() {
+                  if keys.contains(val) {
+                    row.push(cell!(String::from("X")));
+                  } else {
+                    row.push(cell!(String::from("")));
+                  }
+                }
+
+                https_frontend_table.add_row(Row::new(row));
+              }
+
+              https_frontend_table.printstd();
+
+              println!("\nbackends configuration for {}:\n", app_id);
+
+              for (ref key, ref values) in backend_data.iter() {
+                let mut row = Vec::new();
+                row.push(cell!(key.instance_id));
+                row.push(cell!(key.ip_address));
+                row.push(cell!(format!("{}", key.port)));
+
+                for val in values.iter() {
+                  if keys.contains(val) {
+                    row.push(cell!(String::from("X")));
+                  } else {
+                    row.push(cell!(String::from("")));
+                  }
+                }
+
+                backend_table.add_row(Row::new(row));
+              }
+
+              backend_table.printstd();
+            }
+          } else {
+            if let Some(AnswerData::Query(data)) = message.data {
+              let mut table = Table::new();
+              let mut header = Vec::new();
+              header.push(cell!("key"));
+              for ref key in data.keys() {
+                header.push(cell!(&key));
+              }
+              header.push(cell!("desynchronized"));
+              table.add_row(Row::new(header));
+
+              let mut query_data = HashMap::new();
+
+              for ref metrics in data.values() {
+                //let m: u8 = metrics;
+                if let &QueryAnswer::Applications(ref apps) = *metrics {
+                  for (ref key, ref value) in apps.iter() {
+                    (*(query_data.entry(key.clone()).or_insert(Vec::new()))).push(value.clone());
+                  }
+                }
+              }
+
+              for (ref key, ref values) in query_data.iter() {
+                let mut row = Vec::new();
+                row.push(cell!(key));
+
+                for val in values.iter() {
+                  row.push(cell!(format!("{}", val)));
+                }
+
+                let hs: HashSet<&u64> = values.iter().cloned().collect();
+
+                let diff = hs.len() > 1;
+
+                if diff {
+                  row.push(cell!(String::from("X")));
+                } else {
+                  row.push(cell!(String::from("")));
+                }
+
+
+                table.add_row(Row::new(row));
+              }
+
+              table.printstd();
+            }
+          }
         }
       }
     }
