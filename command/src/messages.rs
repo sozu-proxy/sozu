@@ -288,8 +288,8 @@ impl Default for HttpsProxyConfiguration {
       default_name:        Some(String::from("lolcatho.st")),
       default_app_id:      None,
 
-      default_certificate: Some(Vec::from(&include_bytes!("../../lib/assets/certificate.pem")[..])),
-      default_key:         Some(Vec::from(&include_bytes!("../../lib/assets/key.pem")[..])),
+      default_certificate: Some(Vec::from(&include_bytes!("../assets/certificate.pem")[..])),
+      default_key:         Some(Vec::from(&include_bytes!("../assets/key.pem")[..])),
       default_certificate_chain: None,
     }
   }
