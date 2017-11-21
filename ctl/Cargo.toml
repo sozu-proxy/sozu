@@ -10,6 +10,9 @@ license = "AGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
 
+[[bin]]
+name = "sozuctl"
+
 [dependencies]
 clap    = "^2.19.0"
 mio-uds = "^0.6"
