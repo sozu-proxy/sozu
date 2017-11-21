@@ -307,7 +307,7 @@ mod tests {
   use hex::FromHex;
   use certificate::split_certificate_chain;
   use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Instance};
-  use messages::{MetricsData,FilteredData,Percentiles};
+  use messages::{BackendMetricsData,MetricsData,FilteredData,Percentiles};
 
   #[test]
   fn config_message_test() {
@@ -562,6 +562,22 @@ mod tests {
               p_99_99: 20,
               p_99_999: 22,
               p_100: 30,
+            })
+          ].iter().cloned().collect(),
+          backends: [
+            (String::from("app_1-0"), BackendMetricsData {
+              bytes_in:  256,
+              bytes_out: 128,
+              percentiles: Percentiles {
+                samples: 42,
+                p_50: 1,
+                p_90: 2,
+                p_99: 10,
+                p_99_9: 12,
+                p_99_99: 20,
+                p_99_999: 22,
+                p_100: 30,
+              }
             })
           ].iter().cloned().collect()
         })

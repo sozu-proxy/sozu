@@ -490,7 +490,7 @@ mod tests {
       default_name: None,
     };
     println!("https: {:?}", to_string(&https));
-    let config = Config {
+    let config = FileConfig {
       command_socket: String::from("./command_folder/sock"),
       saved_state: None,
       worker_count: Some(2),
