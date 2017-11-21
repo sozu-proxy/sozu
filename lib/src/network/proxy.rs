@@ -6,7 +6,6 @@ use std::net::{SocketAddr,Shutdown};
 use mio::net::*;
 use mio::*;
 use mio::unix::UnixReady;
-use mio::timer::{Timer,Timeout};
 use std::collections::{HashSet,HashMap,VecDeque};
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
@@ -45,7 +44,6 @@ enum ProxyType {
 
 pub struct Server {
   pub poll:        Poll,
-  timer:           Timer<Token>,
   shutting_down:   Option<MessageId>,
   accept_ready:    HashSet<ListenToken>,
   can_accept:      bool,
@@ -78,13 +76,8 @@ impl Server {
       }
     });
 
-    //let timer   = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
-    let timer   = Timer::default();
-    //FIXME: registering the timer makes the timer thread spin too much
-    //poll.register(&timer, Token(1), Ready::readable(), PollOpt::edge()).expect("should register the timer");
     Server {
       poll:            poll,
-      timer:           timer,
       shutting_down:   None,
       accept_ready:    HashSet::new(),
       can_accept:      true,
@@ -232,11 +225,6 @@ impl Server {
         (*metrics.borrow_mut()).send_data();
       });
 
-      //FIXME: manually call the timer instead of relying on a separate thread
-      while let Some(token) = self.timer.poll() {
-        self.timeout(token);
-      }
-
       if self.shutting_down.is_some() {
         info!("last client stopped, shutting down!");
         self.channel.write_message(&OrderMessageAnswer{ id: self.shutting_down.take().expect("should have shut down correctly"), status: OrderMessageStatus::Ok, data: None});
@@ -310,29 +298,6 @@ impl Server {
     }
   }
 
-  fn timeout(&mut self, token: Token) {
-    /*
-    match socket_type(token, self.max_listeners, self.max_connections) {
-      Some(SocketType::Listener) => {
-        error!("PROXY\tthe listener socket should have no timeout set");
-      },
-      Some(SocketType::FrontClient) => {
-        let front_token = self.to_front(token);
-        if self.clients.contains(front_token) {
-          debug!("PROXY\tfrontend [{:?}] got timeout, closing", token);
-          self.close_client(front_token);
-        }
-      },
-      Some(SocketType::BackClient) => {
-        if let Some(tok) = self.get_client_token(token) {
-          debug!("PROXY\tbackend [{:?}] got timeout, closing", token);
-          self.close_client(tok);
-        }
-      }
-      None => {}
-    }
-    */
-  }
 }
 
 fn proxy_type(token: usize) -> ProxyType {

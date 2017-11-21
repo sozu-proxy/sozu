@@ -1,5 +1,4 @@
 use mio::*;
-use mio::timer::Timeout;
 use mio_uds::UnixStream;
 use std::str::from_utf8;
 use std::collections::VecDeque;
@@ -21,7 +20,6 @@ pub struct CommandClient {
   pub channel:       Channel<ConfigMessageAnswer,ConfigMessage>,
   pub token:         Option<Token>,
   message_ids:       Vec<String>,
-  pub write_timeout: Option<Timeout>,
   pub queue:         VecDeque<ConfigMessageAnswer>,
 }
 
@@ -32,7 +30,6 @@ impl CommandClient {
       channel:         channel,
       token:           None,
       message_ids:     Vec::new(),
-      write_timeout:   None,
       queue:           VecDeque::new(),
     }
   }

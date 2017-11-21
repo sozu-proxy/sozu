@@ -6,7 +6,6 @@ use std::net::{SocketAddr,Shutdown};
 use mio::net::*;
 use mio::*;
 use mio::unix::UnixReady;
-use mio::timer::{Timer,Timeout};
 use std::collections::{HashSet,HashMap};
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
@@ -221,10 +220,6 @@ pub trait ProxyClient {
   fn set_back_token(&mut self, token: Token);
   fn back_connected(&self)     -> BackendConnectionStatus;
   fn set_back_connected(&mut self, connected: BackendConnectionStatus);
-  fn front_timeout(&mut self) -> Option<Timeout>;
-  fn back_timeout(&mut self)  -> Option<Timeout>;
-  fn set_front_timeout(&mut self, timeout: Timeout);
-  fn set_back_timeout(&mut self, timeout: Timeout);
   fn front_hup(&mut self)     -> ClientResult;
   fn back_hup(&mut self)      -> ClientResult;
   fn readable(&mut self)      -> ClientResult;
@@ -263,8 +258,6 @@ pub trait ProxyConfiguration<Client> {
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
   fn accept(&mut self, token: ListenToken) -> Result<(Client, bool), AcceptError>;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
-  fn front_timeout(&self) -> u64;
-  fn back_timeout(&self)  -> u64;
 }
 
 pub struct Session<ServerConfiguration,Client> {
@@ -273,7 +266,6 @@ pub struct Session<ServerConfiguration,Client> {
   backend:         Slab<FrontToken,BackToken>,
   max_listeners:   usize,
   max_connections: usize,
-  timer:           Timer<Token>,
   shutting_down:   Option<MessageId>,
   accept_ready:    HashSet<ListenToken>,
   can_accept:      bool,
@@ -284,17 +276,12 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
   pub fn new(max_listeners: usize, max_connections: usize, base_token: usize, configuration: ServerConfiguration, poll: &mut Poll) -> Self {
     let clients = Slab::with_capacity(max_connections);
     let backend = Slab::with_capacity(max_connections);
-    //let timer   = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
-    let timer   = Timer::default();
-    //FIXME: registering the timer makes the timer thread spin too much
-    //poll.register(&timer, Token(1), Ready::readable(), PollOpt::edge()).expect("should register the timer");
     Session {
       configuration:   configuration,
       clients:         clients,
       backend:         backend,
       max_listeners:   max_listeners,
       max_connections: max_connections,
-      timer:           timer,
       shutting_down:   None,
       accept_ready:    HashSet::new(),
       can_accept:      true,
@@ -380,11 +367,6 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
           &self.clients[client_token].set_front_token(front);
 
           let front = self.from_front(client_token);
-          /*
-          if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.front_timeout()), front) {
-          &self.clients[client_token].set_front_timeout(timeout);
-          }
-          */
           incr!("client.connections");
           if should_connect {
             self.connect_to_backend(poll, client_token);
@@ -416,11 +398,6 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
             );
           }
 
-          /*
-          if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.back_timeout()), backend_token) {
-            &self.clients[token].set_back_timeout(timeout);
-          }
-          */
           return;
         }
       },
@@ -441,11 +418,6 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
           }
 
           let back = self.from_back(backend_token);
-          /*
-          if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.back_timeout()), back) {
-            &self.clients[token].set_back_timeout(timeout);
-          }
-          */
           return;
         }
       },
@@ -576,18 +548,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
         let order = self.clients[client_token].readable();
         trace!("front readable\tinterpreting client order {:?}", order);
 
-        // FIXME: should clear the timeout only if data was consumed
-        if let Some(timeout) = self.clients[client_token].front_timeout() {
-          //println!("[{}] clearing timeout", token.as_usize());
-          self.timer.cancel_timeout(&timeout);
-        }
         let front = self.from_front(client_token);
-        /*
-        if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.front_timeout()), front) {
-          //println!("[{}] resetting timeout", front);
-          &self.clients[client_token].set_front_timeout(timeout);
-        }
-        */
 
         self.interpret_client_order(poll, client_token, order);
         //self.clients[client_token].readiness().front_readiness.remove(Ready::readable());
@@ -609,20 +570,6 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
 
       if back_interest.is_readable() {
         let order = self.clients[client_token].back_readable();
-
-        // FIXME: should clear the timeout only if data was consumed
-        if let Some(timeout) = self.clients[client_token].back_timeout() {
-          //println!("[{}] clearing timeout", token.as_usize());
-          self.timer.cancel_timeout(&timeout);
-        }
-        /*
-        if let Some(back) = self.clients[client_token].back_token() {
-          if let Ok(timeout) = self.timer.set_timeout(Duration::from_millis(self.configuration.back_timeout()), back) {
-            //println!("[{}] resetting timeout", back);
-            &self.clients[client_token].set_back_timeout(timeout);
-          }
-        }
-        */
 
         self.interpret_client_order(poll, client_token, order);
         //self.clients[client_token].readiness().back_readiness.remove(Ready::readable());
@@ -691,28 +638,6 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
 
   fn notify(&mut self, poll: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
     self.configuration.notify(poll, message)
-  }
-
-  fn timeout(&mut self, poll: &mut Poll, token: Token) {
-    match socket_type(token, self.base_token, self.max_listeners, self.max_connections) {
-      Some(SocketType::Listener) => {
-        error!("PROXY\tthe listener socket should have no timeout set");
-      },
-      Some(SocketType::FrontClient) => {
-        let front_token = self.to_front(token);
-        if self.clients.contains(front_token) {
-          debug!("PROXY\tfrontend [{:?}] got timeout, closing", token);
-          self.close_client(poll, front_token);
-        }
-      },
-      Some(SocketType::BackClient) => {
-        if let Some(tok) = self.get_client_token(token) {
-          debug!("PROXY\tbackend [{:?}] got timeout, closing", token);
-          self.close_client(poll, tok);
-        }
-      }
-      None => {}
-    }
   }
 
   pub fn handle_remaining_readiness(&mut self, poll: &mut Poll) {

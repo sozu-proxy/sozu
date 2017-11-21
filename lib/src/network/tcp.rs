@@ -5,7 +5,6 @@ use std::sync::mpsc::{self,channel,Receiver};
 use mio::net::*;
 use mio::*;
 use mio_uds::UnixStream;
-use mio::timer::Timeout;
 use mio::unix::UnixReady;
 use std::collections::HashMap;
 use std::io::{self,Read,ErrorKind};
@@ -55,8 +54,6 @@ pub struct Client {
   accept_token:   ListenToken,
   back_interest:  Ready,
   front_interest: Ready,
-  front_timeout:  Option<Timeout>,
-  back_timeout:   Option<Timeout>,
   status:         ConnectionStatus,
   rx_count:       usize,
   tx_count:       usize,
@@ -79,8 +76,6 @@ impl Client {
       accept_token:   accept_token,
       back_interest:  Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
       front_interest: Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-      front_timeout:  None,
-      back_timeout:   None,
       status:         ConnectionStatus::Connected,
       rx_count:       0,
       tx_count:       0,
@@ -139,22 +134,6 @@ impl ProxyClient for Client {
   }
 
   fn set_back_connected(&mut self, _: BackendConnectionStatus) {
-  }
-
-  fn front_timeout(&mut self) -> Option<Timeout> {
-    self.front_timeout.take()
-  }
-
-  fn back_timeout(&mut self) -> Option<Timeout> {
-    self.back_timeout.take()
-  }
-
-  fn set_front_timeout(&mut self, timeout: Timeout) {
-    self.front_timeout = Some(timeout)
-  }
-
-  fn set_back_timeout(&mut self, timeout: Timeout) {
-    self.back_timeout = Some(timeout)
   }
 
   fn metrics(&mut self)        -> &mut SessionMetrics {
@@ -348,8 +327,6 @@ pub struct ServerConfiguration {
   listeners:       Slab<ApplicationListener,ListenToken>,
   pool:            Pool<BufferQueue>,
   base_token:      usize,
-  front_timeout:   u64,
-  back_timeout:    u64,
 }
 
 impl ServerConfiguration {
@@ -360,8 +337,6 @@ impl ServerConfiguration {
       fronts:        HashMap::new(),
       pool:          Pool::with_capacity(2*max_listeners, 0, || BufferQueue::with_capacity(2048)),
       base_token:    base_token,
-      front_timeout: 5000,
-      back_timeout:  5000,
     }
   }
 
@@ -573,14 +548,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         backend.dec_connections();
       }
     }
-  }
-
-  fn front_timeout(&self) -> u64 {
-    self.front_timeout
-  }
-
-  fn back_timeout(&self)  -> u64 {
-    self.back_timeout
   }
 }
 

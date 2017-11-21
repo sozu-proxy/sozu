@@ -1,5 +1,4 @@
 use mio::*;
-use mio::timer::Timer;
 use mio_uds::UnixListener;
 use slab::Slab;
 use std::fs;
@@ -95,7 +94,6 @@ pub struct CommandServer {
   next_id:         u32,
   state:           ConfigState,
   pub poll:        Poll,
-  timer:           Timer<Token>,
   config:          Config,
   token_count:     usize,
   order_state:     state::OrderState,
@@ -159,12 +157,6 @@ impl CommandServer {
       proxies.insert(Token(token_count), proxy);
     }
 
-    //let mut timer = timer::Builder::default().tick_duration(Duration::from_millis(1000)).build();
-    //FIXME: registering the timer makes the timer thread spin too much
-    let mut timer = timer::Timer::default();
-    //poll.register(&timer, Token(1), Ready::readable(), PollOpt::edge()).unwrap();
-    timer.set_timeout(Duration::from_millis(700), Token(0));
-
     CommandServer {
       sock:            srv,
       buffer_size:     config.command_buffer_size,
@@ -174,7 +166,6 @@ impl CommandServer {
       next_id:         next_id as u32,
       state:           state,
       poll:            poll,
-      timer:           timer,
       config:          config,
       token_count:     token_count,
       order_state:     state::OrderState::new(),

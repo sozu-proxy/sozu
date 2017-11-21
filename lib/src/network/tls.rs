@@ -6,7 +6,6 @@ use std::cell::RefCell;
 use std::mem;
 use mio::*;
 use mio::tcp::*;
-use mio::timer::Timeout;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
 use std::io::{self,Read,Write,ErrorKind,BufReader};
@@ -70,8 +69,6 @@ pub enum State {
 pub struct TlsClient {
   front:          Option<TcpStream>,
   front_token:    Option<Token>,
-  front_timeout:  Option<Timeout>,
-  back_timeout:   Option<Timeout>,
   instance:       Option<Rc<RefCell<Backend>>>,
   back_connected: BackendConnectionStatus,
   protocol:       Option<State>,
@@ -91,8 +88,6 @@ impl TlsClient {
     TlsClient {
       front:          Some(sock),
       front_token:    None,
-      front_timeout:  None,
-      back_timeout:   None,
       instance:       None,
       back_connected: BackendConnectionStatus::NotConnected,
       protocol:       Some(State::Handshake(handshake)),
@@ -237,22 +232,6 @@ impl ProxyClient for TlsClient {
     unwrap_msg!(self.http()).set_back_token(token)
   }
 
-  fn front_timeout(&mut self) -> Option<Timeout> {
-    self.front_timeout.clone()
-  }
-
-  fn back_timeout(&mut self)  -> Option<Timeout> {
-    self.back_timeout.clone()
-  }
-
-  fn set_front_timeout(&mut self, timeout: Timeout) {
-    self.front_timeout = Some(timeout)
-  }
-
-  fn set_back_timeout(&mut self, timeout: Timeout) {
-    self.back_timeout = Some(timeout);
-  }
-
   fn metrics(&mut self)        -> &mut SessionMetrics {
     &mut self.metrics
   }
@@ -373,8 +352,6 @@ pub struct ServerConfiguration {
   contexts:        Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
-  front_timeout:   u64,
-  back_timeout:    u64,
   config:          HttpsProxyConfiguration,
   base_token:      usize,
 }
@@ -432,8 +409,6 @@ impl ServerConfiguration {
           pool:            Rc::new(RefCell::new(
                              Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size))
           )),
-          front_timeout:   50000,
-          back_timeout:    50000,
           answers:         default,
           base_token:      base_token,
           config:          config,
@@ -1057,8 +1032,6 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Order::HttpProxy(configuration) => {
         debug!("{} modifying proxy configuration: {:?}", message.id, configuration);
-        self.front_timeout = configuration.front_timeout;
-        self.back_timeout  = configuration.back_timeout;
         self.answers = DefaultAnswers {
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
@@ -1095,14 +1068,6 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
   fn close_backend(&mut self, app_id: AppId, addr: &SocketAddr) {
     self.instances.close_backend_connection(&app_id, &addr);
-  }
-
-  fn front_timeout(&self) -> u64 {
-    self.front_timeout
-  }
-
-  fn back_timeout(&self)  -> u64 {
-    self.back_timeout
   }
 }
 
@@ -1298,8 +1263,6 @@ mod tests {
       default_context: tls_data,
       contexts: rc_ctx,
       pool:      Rc::new(RefCell::new(Pool::with_capacity(1, 0, || BufferQueue::with_capacity(16384)))),
-      front_timeout: 5000,
-      back_timeout:  5000,
       base_token:    6148914691236517205,
       answers:   DefaultAnswers {
         NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),

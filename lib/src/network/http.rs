@@ -8,7 +8,6 @@ use std::net::{SocketAddr,IpAddr,Shutdown};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use mio::*;
 use mio::net::*;
-use mio::timer::Timeout;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
 use pool::{Pool,Checkout,Reset};
@@ -50,8 +49,6 @@ pub struct Client {
   backend:        Option<TcpStream>,
   token:          Option<Token>,
   backend_token:  Option<Token>,
-  front_timeout:  Option<Timeout>,
-  back_timeout:   Option<Timeout>,
   instance:       Option<Rc<RefCell<Backend>>>,
   back_connected: BackendConnectionStatus,
   protocol:       Option<State>,
@@ -77,8 +74,6 @@ impl Client {
         backend:        None,
         token:          None,
         backend_token:  None,
-        front_timeout:  None,
-        back_timeout:   None,
         instance:       None,
         back_connected: BackendConnectionStatus::NotConnected,
         protocol:       Some(State::Http(http)),
@@ -177,22 +172,6 @@ impl ProxyClient for Client {
       },
       _ => "".to_string()
     }
-  }
-
-  fn front_timeout(&mut self) -> Option<Timeout> {
-    self.front_timeout.take()
-  }
-
-  fn back_timeout(&mut self) -> Option<Timeout> {
-    self.back_timeout.take()
-  }
-
-  fn set_front_timeout(&mut self, timeout: Timeout) {
-    self.front_timeout = Some(timeout)
-  }
-
-  fn set_back_timeout(&mut self, timeout: Timeout) {
-    self.back_timeout = Some(timeout)
   }
 
   fn metrics(&mut self)        -> &mut SessionMetrics {
@@ -319,8 +298,6 @@ pub struct ServerConfiguration {
   applications:    HashMap<AppId, Application>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
-  front_timeout:   u64,
-  back_timeout:    u64,
   config:          HttpProxyConfiguration,
 }
 
@@ -353,9 +330,6 @@ impl ServerConfiguration {
           pool:          Rc::new(RefCell::new(
                            Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size))
           )),
-          //FIXME: make the timeout values configurable
-          front_timeout: 5000,
-          back_timeout:  5000,
           answers:       default,
           config:        config,
         })
@@ -677,8 +651,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       },
       Order::HttpProxy(configuration) => {
         debug!("{} modifying proxy configuration: {:?}", message.id, configuration);
-        self.front_timeout = configuration.front_timeout;
-        self.back_timeout  = configuration.back_timeout;
         self.answers = DefaultAnswers {
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
@@ -740,14 +712,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {
     self.instances.close_backend_connection(&app_id, &addr);
-  }
-
-  fn front_timeout(&self) -> u64 {
-    self.front_timeout
-  }
-
-  fn back_timeout(&self)  -> u64 {
-    self.back_timeout
   }
 }
 

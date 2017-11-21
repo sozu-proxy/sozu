@@ -12,7 +12,6 @@ use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 use slab::Slab;
 use serde_json;
 use mio_uds::{UnixListener,UnixStream};
-use mio::timer;
 use mio::{Poll,PollOpt,Ready,Token};
 use nom::{HexDisplay,IResult,Offset};
 
@@ -528,13 +527,9 @@ impl CommandServer {
 
     let config_state = state.clone();
 
-    let mut timer = timer::Timer::default();
-    timer.set_timeout(Duration::from_millis(700), Token(0));
-
     CommandServer {
       sock:            listener,
       poll:            poll,
-      timer:           timer,
       config:          config,
       buffer_size:     buffer_size,
       max_buffer_size: max_buffer_size,
