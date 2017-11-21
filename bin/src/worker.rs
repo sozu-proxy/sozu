@@ -164,6 +164,8 @@ pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Ch
 
 #[cfg(target_os = "linux")]
 pub unsafe fn get_executable_path() -> String {
+  use std::fs;
+
   let path         = fs::read_link("/proc/self/exe").expect("/proc/self/exe doesn't exist");
   let mut path_str = path.into_os_string().into_string().expect("Failed to convert PathBuf to String");
 
