@@ -196,7 +196,7 @@ impl ProxyClient for TlsClient {
 
     if connected == BackendConnectionStatus::Connected {
       self.instance.as_ref().map(|instance| {
-        let ref mut backend = (*instance.borrow_mut());
+        let ref mut backend = *instance.borrow_mut();
         backend.failures = 0;
         backend.retry_policy.succeed();
       });

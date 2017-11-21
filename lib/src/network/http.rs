@@ -149,7 +149,7 @@ impl ProxyClient for Client {
     self.back_connected = connected;
     if connected == BackendConnectionStatus::Connected {
       self.instance.as_ref().map(|instance| {
-        let ref mut backend = (*instance.borrow_mut());
+        let ref mut backend = *instance.borrow_mut();
         //successful connection, rest failure counter
         backend.failures = 0;
         backend.retry_policy.succeed();
