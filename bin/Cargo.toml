@@ -10,14 +10,14 @@ license = "AGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
 
-[[bin]]
-name = "sozu"
-
 include = [
   "README.md",
   "Cargo.toml",
   "src",
 ]
+
+[[bin]]
+name = "sozu"
 
 [dependencies]
 mio = "^0.6"

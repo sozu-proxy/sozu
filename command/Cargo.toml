@@ -10,13 +10,13 @@ license = "AGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
 
-[lib]
-
 include = [
   "README.md",
   "Cargo.toml",
   "/src",
 ]
+
+[lib]
 
 [dependencies]
 hex = "^0.2"

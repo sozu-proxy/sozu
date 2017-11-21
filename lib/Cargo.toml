@@ -10,8 +10,6 @@ license = "AGPL-3.0"
 authors = ["Clément Delafargue <clement@delafargue.name>", "Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
 
-[lib]
-
 include = [
   "README.md",
   "Cargo.toml",
@@ -20,6 +18,8 @@ include = [
   "/examples/minimal.rs",
   "/assets"
 ]
+
+[lib]
 
 [dependencies]
 rand = "^0.3.14"
