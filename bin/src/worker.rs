@@ -3,7 +3,6 @@ use mio::{Poll,Ready};
 use libc::{self,c_char,uint32_t,int32_t,pid_t};
 use std::io;
 use std::ffi::CString;
-use std::fs;
 use std::iter::repeat;
 use std::ptr::null_mut;
 use std::process::Command;

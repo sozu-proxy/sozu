@@ -14,7 +14,6 @@ use std::sync::mpsc;
 use rand::{thread_rng, Rng};
 use prettytable::Table;
 use prettytable::row::Row;
-use prettytable::cell::Cell;
 
 fn generate_id() -> String {
   let s: String = thread_rng().gen_ascii_chars().take(6).collect();
@@ -238,7 +237,7 @@ pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
             let mut launching: HashSet<String> = HashSet::new();
             let mut stopping:  HashSet<String> = HashSet::new();
 
-            for ref worker in workers.iter().filter(|worker| worker.run_state == RunState::Running) {
+            for _ in workers.iter().filter(|worker| worker.run_state == RunState::Running) {
               let id = generate_tagged_id("LAUNCH-WORKER");
               let msg = ConfigMessage::new(
                 id.clone(),
@@ -463,7 +462,6 @@ pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
 
             let mut table = Table::new();
 
-            let empty = "";
             table.add_row(row!["Worker", "pid", "run state", "answer"]);
             for ref worker in workers.iter() {
               let run_state = format!("{:?}", worker.run_state);

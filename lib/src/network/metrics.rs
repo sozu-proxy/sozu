@@ -429,7 +429,7 @@ macro_rules! record_backend_metrics (
       let key: &str = $backend_id;
 
       if m.backend_data.contains_key(key) {
-        let mut bm = m.backend_data.get_mut(key).unwrap();
+        let bm = m.backend_data.get_mut(key).unwrap();
         bm.response_time.record($response_time as u64);
         bm.bin += $bin;
         bm.bout += $bout;

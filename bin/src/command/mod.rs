@@ -53,7 +53,7 @@ pub struct Worker {
 }
 
 impl Worker {
-  pub fn new(id: u32, pid: pid_t, channel: Channel<OrderMessage,OrderMessageAnswer>, config: &Config) -> Worker {
+  pub fn new(id: u32, pid: pid_t, channel: Channel<OrderMessage,OrderMessageAnswer>, _: &Config) -> Worker {
     Worker {
       id:         id,
       channel:    channel,

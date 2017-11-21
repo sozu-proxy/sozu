@@ -9,7 +9,6 @@ extern crate sozu_command_futures as command;
 use futures::future::Future;
 use tokio_uds::UnixStream;
 use tokio_core::reactor::Core;
-use sozu_command::config::Config;
 use command::SozuCommandClient;
 use sozu_command::data::{ConfigCommand,ConfigMessage};
 

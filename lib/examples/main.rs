@@ -8,7 +8,7 @@ extern crate mio;
 extern crate mio_uds;
 extern crate hex;
 
-use std::net::{UdpSocket,ToSocketAddrs};
+use std::net::ToSocketAddrs;
 use std::thread;
 use std::env;
 use std::io::stdout;
@@ -16,7 +16,6 @@ use sozu::network;
 use sozu::logging::{Logger,LoggerBackend};
 use sozu_command::messages;
 use sozu_command::channel::Channel;
-use sozu::network::metrics::{METRICS,ProxyMetrics};
 use openssl::ssl;
 
 fn main() {

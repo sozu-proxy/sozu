@@ -120,7 +120,7 @@ impl Task {
     }
   }
 
-  pub fn generate_data(mut self, master_state: &ConfigState) -> Option<AnswerData> {
+  pub fn generate_data(self, master_state: &ConfigState) -> Option<AnswerData> {
     trace!("state generate data: type={:?}, data = {:#?}", self.message_type, self.data);
     match self.message_type {
       MessageType::Metrics => {

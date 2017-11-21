@@ -131,17 +131,17 @@ impl ConfigState {
       v.push(Order::AddApplication(app.clone()));
     }
 
-    for (app_id, front_list) in self.http_fronts.iter() {
+    for front_list in self.http_fronts.values() {
       for front in front_list {
         v.push(Order::AddHttpFront(front.clone()));
       }
     }
 
-    for certificate_and_key in (&self.certificates).values() {
+    for certificate_and_key in self.certificates.values() {
       v.push(Order::AddCertificate(certificate_and_key.clone()));
     }
 
-    for (app_id, front_list) in &self.https_fronts {
+    for front_list in self.https_fronts.values() {
       for front in front_list {
         v.push(Order::AddHttpsFront(front.clone()));
       }
@@ -247,11 +247,11 @@ impl ConfigState {
       v.push(Order::RemoveInstance(instance.clone()));
     }
 
-    for &(app_id, front) in added_http_fronts {
+    for &(_, front) in added_http_fronts {
       v.push(Order::AddHttpFront(front.clone()));
     }
 
-    for &(app_id, front) in added_https_fronts {
+    for &(_, front) in added_https_fronts {
       v.push(Order::AddHttpsFront(front.clone()));
     }
 

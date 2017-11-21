@@ -21,7 +21,7 @@ use sozu_command::channel::Channel;
 use sozu_command::messages::{Order,OrderMessage,Query};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 
-use super::{CommandServer,FrontToken,ProxyConfiguration,Worker};
+use super::{CommandServer,FrontToken,Worker};
 use super::client::parse;
 use super::state::{MessageType,OrderState};
 use worker::start_worker;
@@ -419,7 +419,7 @@ impl CommandServer {
       if let ConfigCommand::ProxyConfiguration(order) = message.data {
         self.state.handle_order(&order);
 
-        if let &Order::AddCertificate(ref data) = &order {
+        if let &Order::AddCertificate(_) = &order {
           debug!("config generated AddCertificate( ... )");
         } else {
           debug!("config generated {:?}", order);
