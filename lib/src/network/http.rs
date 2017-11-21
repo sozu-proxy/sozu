@@ -807,7 +807,7 @@ mod tests {
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
-    let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
+    let instance = Instance { app_id: String::from("app_1"),instance_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1025 };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
 
     println!("test received: {:?}", command.read_message());
@@ -861,7 +861,7 @@ mod tests {
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
-    let instance = Instance { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1028 };
+    let instance = Instance { app_id: String::from("app_1"), instance_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1028 };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
 
     println!("test received: {:?}", command.read_message());

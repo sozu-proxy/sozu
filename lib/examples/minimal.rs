@@ -40,9 +40,10 @@ fn main() {
     path_begin: String::from("/"),
   };
   let http_instance = messages::Instance {
-    app_id:     String::from("test"),
-    ip_address: String::from("127.0.0.1"),
-    port:       8000
+    app_id:      String::from("test"),
+    instance_id: String::from("test-0"),
+    ip_address:  String::from("127.0.0.1"),
+    port:        8000
   };
 
   command.write_message(&messages::OrderMessage {
