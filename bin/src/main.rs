@@ -203,7 +203,6 @@ fn check_process_limits(config: Config) -> bool {
     return false;
   }
 
-  let total_proxies_connections = http_max_cons + https_max_cons;
   let system_max_fd = procinfo::sys::fs::file_max::file_max()
     .expect("Couldn't read /proc/sys/fs/file-max") as usize;
 
