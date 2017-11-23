@@ -932,8 +932,6 @@ mod tests {
       instances: BackendMap::new(),
       fronts:    fronts,
       pool:      Rc::new(RefCell::new(Pool::with_capacity(1,0, || BufferQueue::with_capacity(16384)))),
-      front_timeout: 50000,
-      back_timeout:  50000,
       answers:   DefaultAnswers {
         NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),

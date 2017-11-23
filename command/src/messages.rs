@@ -214,8 +214,6 @@ pub struct Instance {
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpProxyConfiguration {
     pub front:           SocketAddr,
-    pub front_timeout:   u64,
-    pub back_timeout:    u64,
     pub public_address:  Option<IpAddr>,
     pub answer_404:      String,
     pub answer_503:      String,
@@ -225,8 +223,6 @@ impl Default for HttpProxyConfiguration {
   fn default() -> HttpProxyConfiguration {
     HttpProxyConfiguration {
       front:           "127.0.0.1:8080".parse().expect("could not parse address"),
-      front_timeout:   5000,
-      back_timeout:    5000,
       public_address:  None,
       answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
       answer_503:      String::from("HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
@@ -237,8 +233,6 @@ impl Default for HttpProxyConfiguration {
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpsProxyConfiguration {
     pub front:                     SocketAddr,
-    pub front_timeout:             u64,
-    pub back_timeout:              u64,
     pub public_address:            Option<IpAddr>,
     pub answer_404:                String,
     pub answer_503:                String,
@@ -255,8 +249,6 @@ impl Default for HttpsProxyConfiguration {
   fn default() -> HttpsProxyConfiguration {
     HttpsProxyConfiguration {
       front:           "127.0.0.1:8443".parse().expect("could not parse address"),
-      front_timeout:   5000,
-      back_timeout:    5000,
       public_address:  None,
       answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
       answer_503:      String::from("HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
