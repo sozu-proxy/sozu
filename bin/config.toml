@@ -2,13 +2,16 @@
 
 command_socket = "./command_folder/sock"
 saved_state    = "./state.json"
-log_level      = "debug"
+log_level      = "info"
 log_target     = "stdout"
 #log_target     = "udp://127.0.0.1:9876"
 #log_target     = "tcp://127.0.0.1:9876"
 command_buffer_size = 16384
 worker_count = 2
 handle_process_affinity = false
+max_connections = 500
+max_buffers = 500
+buffer_size = 16384
 
 [metrics]
 address = "127.0.0.1"
@@ -16,17 +19,13 @@ port = 8125
 
 [http]
 address = "127.0.0.1"
-max_connections = 500
 port = 8080
-buffer_size = 16384
 #answer_404 = "./404.html"
 #answer_503 = "./503.html"
 
 [https]
 address = "127.0.0.1"
-max_connections = 500
 port = 8443
-buffer_size = 16384
 default_app_id = "MyApp"
 #tls_versions = ["TLSv1.2"]
 #cipher_list = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256"

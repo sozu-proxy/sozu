@@ -3,6 +3,8 @@
 use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::TryRecvError;
 use std::net::{SocketAddr,Shutdown};
+use std::rc::Rc;
+use std::cell::RefCell;
 use mio::net::*;
 use mio::*;
 use mio::unix::UnixReady;
@@ -11,6 +13,7 @@ use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
 use std::error::Error;
 use slab::Slab;
+use pool::Pool;
 use std::io::Write;
 use std::str::FromStr;
 use std::marker::PhantomData;
@@ -19,10 +22,12 @@ use time::precise_time_ns;
 use std::time::Duration;
 use rand::random;
 
+use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer};
 
+use network::buffer_queue::BufferQueue;
 use network::{ClientResult,ConnectionError,
   SocketType,Protocol,RequiredEvents};
 use network::{http,tls,tcp};
@@ -56,6 +61,31 @@ pub struct Server {
 }
 
 impl Server {
+  pub fn new_from_config(channel: ProxyChannel, config: Config) -> Self {
+    let mut event_loop  = Poll::new().expect("could not create event loop");
+    let pool = Rc::new(RefCell::new(
+      Pool::with_capacity(2*config.max_buffers, 0, || BufferQueue::with_capacity(config.buffer_size))
+    ));
+
+    let max_connections = config.max_connections;
+    let http_session = config.http.and_then(|conf| conf.to_http()).and_then(|http_conf| {
+      let max_listeners = 1;
+      http::ServerConfiguration::new(http_conf, &mut event_loop, 1 + max_listeners, pool.clone()).map(|configuration| {
+        Session::new(1, max_connections, 0, configuration, &mut event_loop)
+      }).ok()
+    });
+
+    let https_session = config.https.and_then(|conf| conf.to_tls()).and_then(|https_conf| {
+      let max_listeners   = 1;
+      tls::ServerConfiguration::new(https_conf, 6148914691236517205, &mut event_loop, 1 + max_listeners + 6148914691236517205, pool.clone()).map(|configuration| {
+        Session::new(max_listeners, max_connections, 6148914691236517205, configuration, &mut event_loop)
+      }).ok()
+    });
+    //TODO: implement for TCP
+
+    Server::new(event_loop, channel, http_session, https_session, None)
+  }
+
   pub fn new(poll: Poll, channel: ProxyChannel,
     http:  Option<Session<http::ServerConfiguration, http::Client>>,
     https: Option<Session<tls::ServerConfiguration, tls::TlsClient>>,

@@ -19,8 +19,6 @@ pub struct ProxyConfig {
   pub address:                   String,
   pub public_address:            Option<String>,
   pub port:                      u16,
-  pub max_connections:           usize,
-  pub buffer_size:               usize,
   pub answer_404:                Option<String>,
   pub answer_503:                Option<String>,
   pub cipher_list:               Option<String>,
@@ -51,8 +49,6 @@ impl ProxyConfig {
       let mut configuration = HttpProxyConfiguration {
         front: addr,
         public_address: public_address,
-        max_connections: self.max_connections,
-        buffer_size: self.buffer_size,
         ..Default::default()
       };
 
@@ -128,8 +124,6 @@ impl ProxyConfig {
       let mut configuration = HttpsProxyConfiguration {
         front:           addr,
         public_address:  public_address,
-        max_connections: self.max_connections,
-        buffer_size:     self.buffer_size,
         cipher_list:     cipher_list,
         options:         default_options.bits(),
         ..Default::default()
@@ -198,6 +192,9 @@ pub struct FileConfig {
   pub command_buffer_size:     Option<usize>,
   pub max_command_buffer_size: Option<usize>,
   pub channel_buffer_size:     Option<usize>,
+  pub max_connections:         usize,
+  pub max_buffers:             usize,
+  pub buffer_size:             usize,
   pub saved_state:             Option<String>,
   pub log_level:               Option<String>,
   pub log_target:              Option<String>,
@@ -234,6 +231,9 @@ impl FileConfig {
       command_buffer_size: self.command_buffer_size.unwrap_or(1_000_000),
       max_command_buffer_size: self.max_command_buffer_size.unwrap_or( self.command_buffer_size.unwrap_or(1_000_000) * 2),
       channel_buffer_size: self.channel_buffer_size.unwrap_or(1_000_000),
+      max_connections: self.max_connections,
+      max_buffers: self.max_buffers,
+      buffer_size: self.buffer_size,
       saved_state: self.saved_state,
       log_level: self.log_level.unwrap_or(String::from("info")),
       log_target: self.log_target.unwrap_or(String::from("stdout")),
@@ -254,6 +254,9 @@ pub struct Config {
   pub command_buffer_size:     usize,
   pub max_command_buffer_size: usize,
   pub channel_buffer_size:     usize,
+  pub max_connections:         usize,
+  pub max_buffers:             usize,
+  pub buffer_size:             usize,
   pub saved_state:             Option<String>,
   pub log_level:               String,
   pub log_target:              String,
@@ -459,8 +462,6 @@ mod tests {
     let http = ProxyConfig {
       address: String::from("127.0.0.1"),
       port: 8080,
-      max_connections: 500,
-      buffer_size: 16384,
       answer_404: Some(String::from("404.html")),
       answer_503: None,
       public_address: None,
@@ -476,8 +477,6 @@ mod tests {
     let https = ProxyConfig {
       address: String::from("127.0.0.1"),
       port: 8080,
-      max_connections: 500,
-      buffer_size: 16384,
       answer_404: Some(String::from("404.html")),
       answer_503: None,
       public_address: None,
@@ -497,6 +496,9 @@ mod tests {
       handle_process_affinity: None,
       channel_buffer_size: Some(10000),
       command_buffer_size: None,
+      max_connections: 500,
+      max_buffers: 500,
+      buffer_size: 16384,
       max_command_buffer_size: None,
       log_level:  None,
       log_target: None,

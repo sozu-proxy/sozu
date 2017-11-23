@@ -1,5 +1,5 @@
 use mio_uds::UnixStream;
-use mio::{Poll,Ready};
+use mio::Ready;
 use libc::{self,c_char,uint32_t,int32_t,pid_t};
 use std::io;
 use std::ffi::CString;
@@ -15,9 +15,7 @@ use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
-use sozu::network::session::Session;
 use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
-use sozu::network::{http,tls};
 use sozu::network::proxy::Server;
 
 use logging;
@@ -72,33 +70,15 @@ pub fn begin_worker_process(fd: i32, id: i32, channel_buffer_size: usize) {
 
   command.set_nonblocking(true);
   let mut command: Channel<OrderMessageAnswer,OrderMessage> = command.into();
+  command.readiness.insert(Ready::readable());
 
   if let Some(ref metrics) = proxy_config.metrics.as_ref() {
     metrics_set_up!(&metrics.address[..], metrics.port);
     gauge!("sozu.worker.TEST", 42);
   }
 
-  let mut event_loop  = Poll::new().expect("could not create event loop");
+  let mut server = Server::new_from_config(command, proxy_config);
 
-  let http_session = proxy_config.http.and_then(|conf| conf.to_http()).and_then(|http_conf| {
-    let max_connections = http_conf.max_connections;
-    let max_listeners = 1;
-    http::ServerConfiguration::new(http_conf, &mut event_loop, 1 + max_listeners).map(|configuration| {
-      Session::new(1, max_connections, 0, configuration, &mut event_loop)
-    }).ok()
-  });
-
-  let https_session = proxy_config.https.and_then(|conf| conf.to_tls()).and_then(|https_conf| {
-    let max_connections = https_conf.max_connections;
-    let max_listeners   = 1;
-    tls::ServerConfiguration::new(https_conf, 6148914691236517205, &mut event_loop, 1 + max_listeners + 6148914691236517205).map(|configuration| {
-      Session::new(max_listeners, max_connections, 6148914691236517205, configuration, &mut event_loop)
-    }).ok()
-  });
-  //TODO: implement for TCP
-
-  command.readiness.insert(Ready::readable());
-  let mut server = Server::new(event_loop, command, http_session, https_session, None);
   info!("{} starting event loop", id);
   server.run();
   info!("{} ending event loop", id);

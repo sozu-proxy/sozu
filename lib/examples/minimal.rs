@@ -30,8 +30,10 @@ fn main() {
 
   let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 
-  let jg            = thread::spawn(move || {
-    network::http::start(config, channel);
+  let jg = thread::spawn(move || {
+    let max_buffers = 500;
+    let buffer_size = 16384;
+    network::http::start(config, channel, max_buffers, buffer_size);
   });
 
   let http_front = messages::HttpFront {

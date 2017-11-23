@@ -601,10 +601,10 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
   command
 }
 
-pub fn start(max_listeners: usize, max_connections: usize, channel: ProxyChannel) {
+pub fn start(max_listeners: usize, max_buffers: usize, channel: ProxyChannel) {
   let mut poll          = Poll::new().expect("could not create event loop");
   let configuration     = ServerConfiguration::new(max_listeners, 12297829382473034410);
-  let session           = Session::new(max_listeners, max_connections, 12297829382473034410, configuration, &mut poll);
+  let session           = Session::new(max_listeners, max_buffers, 12297829382473034410, configuration, &mut poll);
   let mut server        = Server::new(poll, channel, None, None, Some(session));
   let front: SocketAddr = FromStr::from_str("127.0.0.1:8443").expect("could not parse address");
 

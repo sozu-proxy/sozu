@@ -357,7 +357,9 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(config: HttpsProxyConfiguration, base_token: usize, event_loop: &mut Poll, start_at: usize) -> io::Result<ServerConfiguration> {
+  pub fn new(config: HttpsProxyConfiguration, base_token: usize, event_loop: &mut Poll, start_at: usize,
+    pool: Rc<RefCell<Pool<BufferQueue>>>) -> io::Result<ServerConfiguration> {
+
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let     domains  = TrieNode::root();
     let mut fronts   = HashMap::new();
@@ -406,9 +408,7 @@ impl ServerConfiguration {
           domains:         rc_domains,
           default_context: tls_data,
           contexts:        rc_ctx,
-          pool:            Rc::new(RefCell::new(
-                             Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size))
-          )),
+          pool:            pool,
           answers:         default,
           base_token:      base_token,
           config:          config,
@@ -1099,14 +1099,17 @@ fn setup_curves(_: &mut SslContextBuilder) -> Result<(), ErrorStack> {
 
 pub type TlsServer = Session<ServerConfiguration,TlsClient>;
 
-pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel) {
+pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
   let mut event_loop  = Poll::new().expect("could not create event loop");
-  let max_connections = config.max_connections;
   let max_listeners   = 1;
 
+  let pool = Rc::new(RefCell::new(
+    Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
+  ));
+
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok(configuration) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop, 1 + max_listeners) {
-    let session = Session::new(max_listeners, max_connections, 6148914691236517205, configuration, &mut event_loop);
+  if let Ok(configuration) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop, 1 + max_listeners, pool) {
+    let session = Session::new(max_listeners, max_buffers, 6148914691236517205, configuration, &mut event_loop);
     let mut server  = Server::new(event_loop, channel, None, Some(session), None);
 
     info!("starting event loop");

@@ -32,14 +32,14 @@ fn main() {
 
   let config = messages::HttpProxyConfiguration {
     front: "127.0.0.1:8080".parse().expect("could not parse address"),
-    max_connections: 500,
-    buffer_size: 16384,
     ..Default::default()
   };
 
   let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
   let jg = thread::spawn(move || {
-    network::http::start(config, channel);
+    let max_buffers = 500;
+    let buffer_size = 16384;
+    network::http::start(config, channel, max_buffers, buffer_size);
   });
 
   let http_front = messages::HttpFront {
@@ -71,8 +71,6 @@ fn main() {
 
   let config = messages::HttpsProxyConfiguration {
     front: "127.0.0.1:8443".parse().expect("could not parse address"),
-    max_connections: 500,
-    buffer_size: 16384,
     options: (ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |
                ssl::SSL_OP_NO_TICKET | ssl::SSL_OP_NO_SSLV2 |
                ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1).bits(),
@@ -95,7 +93,9 @@ fn main() {
 
   let (mut command2, channel2) = Channel::generate(1000, 10000).expect("should create a channel");
   let jg2 = thread::spawn(move || {
-    network::tls::start(config, channel2);
+    let max_buffers = 500;
+    let buffer_size = 16384;
+    network::tls::start(config, channel2, max_buffers, buffer_size);
   });
 
   let cert1 = include_str!("../assets/certificate.pem");

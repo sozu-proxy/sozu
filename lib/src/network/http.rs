@@ -302,7 +302,9 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(config: HttpProxyConfiguration, event_loop: &mut Poll, start_at:usize) -> io::Result<ServerConfiguration> {
+  pub fn new(config: HttpProxyConfiguration, event_loop: &mut Poll, start_at:usize,
+    pool: Rc<RefCell<Pool<BufferQueue>>>) -> io::Result<ServerConfiguration> {
+
     let front = config.front;
     match server_bind(&config.front) {
       Ok(sock) => {
@@ -327,9 +329,7 @@ impl ServerConfiguration {
           applications:  HashMap::new(),
           instances:     BackendMap::new(),
           fronts:        HashMap::new(),
-          pool:          Rc::new(RefCell::new(
-                           Pool::with_capacity(2*config.max_connections, 0, || BufferQueue::with_capacity(config.buffer_size))
-          )),
+          pool:          pool,
           answers:       default,
           config:        config,
         })
@@ -717,14 +717,16 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
 pub type HttpServer = Session<ServerConfiguration,Client>;
 
-pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel) {
+pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
   let mut event_loop  = Poll::new().expect("could not create event loop");
-  let max_connections = config.max_connections;
   let max_listeners   = 1;
 
+  let pool = Rc::new(RefCell::new(
+    Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
+  ));
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok(configuration) = ServerConfiguration::new(config, &mut event_loop, 1 + max_listeners) {
-    let session    = Session::new(max_listeners, max_connections, 0, configuration, &mut event_loop);
+  if let Ok(configuration) = ServerConfiguration::new(config, &mut event_loop, 1 + max_listeners, pool) {
+    let session    = Session::new(max_listeners, max_buffers, 0, configuration, &mut event_loop);
     let mut server = Server::new(event_loop, channel, Some(session), None, None);
 
     info!("starting event loop");
@@ -759,14 +761,12 @@ mod tests {
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
     let config = HttpProxyConfiguration {
       front: front,
-      max_connections: 10,
-      buffer_size: 16384,
       ..Default::default()
     };
 
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
     let jg = thread::spawn(move || {
-      start(config, channel);
+      start(config, channel, 10, 16384);
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
@@ -812,15 +812,13 @@ mod tests {
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1031").expect("could not parse address");
     let config = HttpProxyConfiguration {
       front: front,
-      max_connections: 10,
-      buffer_size: 16384,
       ..Default::default()
     };
 
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 
     let jg = thread::spawn(move|| {
-      start(config, channel);
+      start(config, channel, 10, 16384);
     });
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };

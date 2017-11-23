@@ -195,11 +195,9 @@ fn check_process_limits(config: Config) -> bool {
   }
 
   let hard_limit = process_limits.max_open_files.hard.unwrap();
-  let http_max_cons = config.http.and_then(|proxy| Some(proxy.max_connections)).unwrap_or(0);
-  let https_max_cons = config.https.and_then(|proxy| Some(proxy.max_connections)).unwrap_or(0);
 
   // check if all proxies are under the hard limit
-  if http_max_cons > hard_limit || https_max_cons > hard_limit {
+  if config.max_connections > hard_limit {
     error!("At least one proxy can't have that much of connections. \
             Current max file descriptor hard limit is: {}", hard_limit);
     return false;
@@ -209,9 +207,9 @@ fn check_process_limits(config: Config) -> bool {
   let system_max_fd = procinfo::sys::fs::file_max::file_max()
     .expect("Couldn't read /proc/sys/fs/file-max") as usize;
 
-  if total_proxies_connections > system_max_fd {
+  if config.max_connections > system_max_fd {
     error!("Proxies total max_connections can't be higher than system's file-max limit. \
-            Current limit: {}, current value: {}", system_max_fd, total_proxies_connections);
+            Current limit: {}, current value: {}", system_max_fd, config.max_connections);
     return false;
   }
 
