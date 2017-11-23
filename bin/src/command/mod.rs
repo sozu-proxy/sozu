@@ -370,35 +370,39 @@ impl CommandServer {
             self.clients[conn_token].queue.len()
           );*/
 
-          if self.clients[conn_token].channel.readiness() == Ready::empty() {
-            break;
-          }
+          {
+            let client = &mut self.clients[conn_token];
 
-          if self.clients[conn_token].channel.readiness().is_writable() {
-            if let Some(msg) = self.clients[conn_token].queue.pop_front() {
-              let write_res = self.clients[conn_token].channel.write_message(&msg);
-              let capacity = self.clients[conn_token].channel.back_buf.capacity();
-              if !write_res {
-                if self.clients[conn_token].channel.back_buf.capacity() == capacity {
-                  //we cannot grow the channel further
-                  error!("cannot write message back to config client: message is larger than max_buffer_size");
-                  self.clients[conn_token].push_message(ConfigMessageAnswer::new(
-                    msg.id,
-                    ConfigMessageStatus::Error,
-                    "cannot write message back to config client because message is larger than max_buffer_size".to_string(),
-                    None
-                  ));
-
-                } else {
-                  incr_resp_client_cmd!();
-                  self.clients[conn_token].queue.push_front(msg);
-                }
-              }
-              self.clients[conn_token].channel.writable();
+            if client.channel.readiness() == Ready::empty() {
+              break;
             }
 
-            if !self.clients[conn_token].queue.is_empty() {
-               self.clients[conn_token].channel.interest.insert(Ready::writable());
+            if client.channel.readiness().is_writable() {
+              if let Some(msg) = client.queue.pop_front() {
+                let write_res = client.channel.write_message(&msg);
+                let capacity  = client.channel.back_buf.capacity();
+                if !write_res {
+                  if client.channel.back_buf.capacity() == capacity {
+                    //we cannot grow the channel further
+                    error!("cannot write message back to config client: message is larger than max_buffer_size");
+                    client.push_message(ConfigMessageAnswer::new(
+                      msg.id,
+                      ConfigMessageStatus::Error,
+                      "cannot write message back to config client because message is larger than max_buffer_size".to_string(),
+                      None
+                    ));
+
+                  } else {
+                    incr_resp_client_cmd!();
+                    client.queue.push_front(msg);
+                  }
+                }
+                client.channel.writable();
+              }
+
+              if !client.queue.is_empty() {
+                 client.channel.interest.insert(Ready::writable());
+              }
             }
           }
 
