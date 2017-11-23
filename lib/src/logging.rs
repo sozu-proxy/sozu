@@ -283,6 +283,7 @@ impl Ord for LogLevelFilter {
 impl FromStr for LogLevelFilter {
     type Err = ();
     fn from_str(level: &str) -> Result<LogLevelFilter, ()> {
+        use std::ascii::AsciiExt;
         ok_or(LOG_LEVEL_NAMES.iter()
                     .position(|&name| name.eq_ignore_ascii_case(level))
                     .map(|p| LogLevelFilter::from_usize(p).unwrap()), ())
