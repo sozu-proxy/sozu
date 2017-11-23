@@ -397,8 +397,8 @@ impl CommandServer {
                     client.queue.push_front(msg);
                   }
                 }
-                client.channel.writable();
               }
+              client.channel.writable();
 
               if !client.queue.is_empty() {
                  client.channel.interest.insert(Ready::writable());
