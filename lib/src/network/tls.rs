@@ -354,6 +354,7 @@ pub struct ServerConfiguration {
   answers:         DefaultAnswers,
   config:          HttpsProxyConfiguration,
   base_token:      usize,
+  ssl_options:     SslOption,
 }
 
 impl ServerConfiguration {
@@ -369,7 +370,8 @@ impl ServerConfiguration {
     let ref_domains  = rc_domains.clone();
     let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
 
-    let (fingerprint, tls_data, names):(CertFingerprint,TlsData, Vec<String>) = Self::create_default_context(&config, ref_ctx, ref_domains, default_name).expect("could not create default context");
+    let (fingerprint, tls_data, names, ssl_options):(CertFingerprint,TlsData, Vec<String>, SslOption) =
+      Self::create_default_context(&config, ref_ctx, ref_domains, default_name).expect("could not create default context");
     let cert = try!(X509::from_pem(&tls_data.certificate));
 
     let common_name: Option<String> = get_cert_common_name(&cert);
@@ -412,6 +414,7 @@ impl ServerConfiguration {
           answers:         default,
           base_token:      base_token,
           config:          config,
+          ssl_options:     ssl_options,
         })
       },
       Err(e) => {
@@ -425,7 +428,7 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn create_default_context(config: &HttpsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>)> {
+  pub fn create_default_context(config: &HttpsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>, SslOption)> {
     let ctx = SslContext::builder(SslMethod::tls());
     if let Err(e) = ctx {
       //return Err(io::Error::new(io::ErrorKind::Other, e.description()));
@@ -439,7 +442,27 @@ impl ServerConfiguration {
     //FIXME: maybe activate ssl::SSL_MODE_RELEASE_BUFFERS to save some memory?
     context.set_mode(mode);
 
-    let opt = context.set_options(unwrap_msg!(SslOption::from_bits(config.options)));
+
+    let mut ssl_options = ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION | ssl::SSL_OP_NO_TICKET;
+    let mut versions = ssl::SSL_OP_NO_SSLV2 |
+      ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1 |
+      ssl::SSL_OP_NO_TLSV1_1 | ssl::SSL_OP_NO_TLSV1_2;
+
+    for version in config.versions.iter() {
+      match version.as_str() {
+        "SSLv2"   => versions.remove(ssl::SSL_OP_NO_SSLV2),
+        "SSLv3"   => versions.remove(ssl::SSL_OP_NO_SSLV3),
+        "TLSv1"   => versions.remove(ssl::SSL_OP_NO_TLSV1),
+        "TLSv1.1" => versions.remove(ssl::SSL_OP_NO_TLSV1_1),
+        "TLSv1.2" => versions.remove(ssl::SSL_OP_NO_TLSV1_2),
+        s         => error!("unrecognized TLS version: {}", s)
+      };
+    }
+
+    ssl_options.insert(versions);
+    trace!("parsed tls options: {:?}", ssl_options);
+
+    let opt = context.set_options(ssl_options);
 
     context.set_cipher_list(&config.cipher_list);
 
@@ -521,7 +544,7 @@ impl ServerConfiguration {
           refcount:    1,
           initialized: true,
         };
-        Some((fingerprint, tls_data, names))
+        Some((fingerprint, tls_data, names, ssl_options))
       } else {
         None
       }
@@ -599,7 +622,7 @@ impl ServerConfiguration {
     let c = SslContext::builder(SslMethod::tls());
     if c.is_err() { return false; }
     let mut ctx = c.expect("should have built a correct SSL context");
-    let opt = ctx.set_options(unwrap_msg!(SslOption::from_bits(self.config.options)));
+    let opt = ctx.set_options(self.ssl_options);
 
     if let Err(e) = setup_curves(&mut ctx) {
       error!("could not setup curves for openssl");
@@ -1272,6 +1295,8 @@ mod tests {
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
       },
       config: Default::default(),
+      ssl_options: ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION | ssl::SSL_OP_NO_TICKET |
+        ssl::SSL_OP_NO_SSLV2 | ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1 | ssl::SSL_OP_NO_TLSV1_1,
     };
 
     println!("TEST {}", line!());

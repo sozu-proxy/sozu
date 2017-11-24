@@ -82,9 +82,9 @@ impl ConfigState {
       },
       &Order::AddCertificate(ref certificate_and_key) => {
         let fingerprint = match calculate_fingerprint(&certificate_and_key.certificate.as_bytes()[..]) {
-          Ok(f)  => CertFingerprint(f),
-          Err(e) => {
-            error!("cannot obtain the certificate's fingerprint: {:?}", e);
+          Some(f)  => CertFingerprint(f),
+          None => {
+            error!("cannot obtain the certificate's fingerprint");
             return;
           }
         };

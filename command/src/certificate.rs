@@ -1,10 +1,12 @@
-use openssl::x509::X509;
-use openssl::error::ErrorStack;
-use openssl::hash::MessageDigest;
+use pem::parse;
+use sha2::{Sha256, Digest};
 
-pub fn calculate_fingerprint(certificate: &[u8]) -> Result<Vec<u8>, ErrorStack> {
-  X509::from_pem(certificate).and_then(|cert| cert.fingerprint(MessageDigest::sha256()))
+pub fn calculate_fingerprint(certificate: &[u8]) -> Option<Vec<u8>> {
+  parse(certificate).map(|data| {
+    Sha256::digest(&data.contents).iter().cloned().collect()
+  }).ok()
 }
+
 
 pub fn split_certificate_chain(mut chain: String) -> Vec<String> {
   let mut v = Vec::new();

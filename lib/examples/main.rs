@@ -71,9 +71,6 @@ fn main() {
 
   let config = messages::HttpsProxyConfiguration {
     front: "127.0.0.1:8443".parse().expect("could not parse address"),
-    options: (ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |
-               ssl::SSL_OP_NO_TICKET | ssl::SSL_OP_NO_SSLV2 |
-               ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1).bits(),
     cipher_list: String::from("ECDHE-ECDSA-CHACHA20-POLY1305:\
     ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:\
     ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:\

@@ -1,7 +1,6 @@
 use serde;
 use serde::de::{self, Visitor};
 use hex::{FromHex,ToHex};
-use openssl::ssl;
 use std::net::{IpAddr,SocketAddr};
 use std::collections::{BTreeMap,HashSet};
 use std::default::Default;
@@ -236,7 +235,7 @@ pub struct HttpsProxyConfiguration {
     pub public_address:            Option<IpAddr>,
     pub answer_404:                String,
     pub answer_503:                String,
-    pub options:                   u64,
+    pub versions:                  Vec<String>,
     pub cipher_list:               String,
     pub default_name:              Option<String>,
     pub default_app_id:            Option<String>,
@@ -266,9 +265,7 @@ impl Default for HttpsProxyConfiguration {
         ECDHE-RSA-DES-CBC3-SHA:EDH-RSA-DES-CBC3-SHA:\
         AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:\
         AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:!DSS"),
-      options:         (ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION |
-                         ssl::SSL_OP_NO_TICKET | ssl::SSL_OP_NO_SSLV2 |
-                         ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1).bits(),
+      versions:            vec!(String::from("TLSv1.2")),
       default_name:        Some(String::from("lolcatho.st")),
       default_app_id:      None,
 

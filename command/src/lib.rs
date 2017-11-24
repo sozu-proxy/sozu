@@ -3,11 +3,12 @@
 
 extern crate hex;
 extern crate mio;
+extern crate pem;
 extern crate toml;
 extern crate pool;
+extern crate sha2;
 extern crate serde;
 extern crate serde_json;
-extern crate openssl;
 extern crate mio_uds;
 
 pub mod certificate;

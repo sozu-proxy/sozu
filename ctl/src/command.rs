@@ -665,8 +665,8 @@ pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, ap
     match Config::load_file_bytes(certificate_path) {
       Ok(data) => {
         match calculate_fingerprint(&data) {
-          Err(e)          => println!("could not calculate fingerprint for certificate: {:?}", e),
-          Ok(fingerprint) => {
+          None              => println!("could not calculate fingerprint for certificate"),
+          Some(fingerprint) => {
             order_command(channel, Order::AddHttpsFront(HttpsFront {
               app_id: String::from(app_id),
               hostname: String::from(hostname),
@@ -692,8 +692,8 @@ pub fn remove_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>,
     match Config::load_file_bytes(certificate_path) {
       Ok(data) => {
         match calculate_fingerprint(&data) {
-          Err(e)          => println!("could not calculate fingerprint for certificate: {:?}", e),
-          Ok(fingerprint) => {
+          None              => println!("could not calculate fingerprint for certificate"),
+          Some(fingerprint) => {
             order_command(channel, Order::RemoveHttpsFront(HttpsFront {
               app_id: String::from(app_id),
               hostname: String::from(hostname),
@@ -761,8 +761,8 @@ pub fn remove_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswe
   match Config::load_file_bytes(certificate_path) {
     Ok(data) => {
       match calculate_fingerprint(&data) {
-        Ok(fingerprint) => order_command(channel, Order::RemoveCertificate(CertFingerprint(fingerprint))),
-        Err(e)          => println!("could not calculate finrprint for certificate: {:?}", e)
+        Some(fingerprint) => order_command(channel, Order::RemoveCertificate(CertFingerprint(fingerprint))),
+        None              => println!("could not calculate finrprint for certificate")
       }
     },
     Err(e) => println!("could not load file: {:?}", e)

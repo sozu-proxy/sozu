@@ -6,7 +6,6 @@ use std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::io::{self,Error,ErrorKind,Read};
 use certificate::{calculate_fingerprint,split_certificate_chain};
-use openssl::ssl;
 use toml;
 
 use messages::Application;
@@ -97,35 +96,26 @@ impl ProxyConfig {
       }
     };
 
-    let mut default_options = ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION | ssl::SSL_OP_NO_TICKET;
-    let mut versions = ssl::SSL_OP_NO_SSLV2 |
-      ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1 |
-      ssl::SSL_OP_NO_TLSV1_1 | ssl::SSL_OP_NO_TLSV1_2;
+    let versions = match self.tls_versions {
+      None    => vec!(String::from("TLSv1.2")),
+      Some(ref v) => {
+        for version in v.iter() {
+          match version.as_str() {
+            "SSLv2" | "SSLv3" | "TLSv1" | "TLSv1.1" | "TLSv1.2" => (),
+            s => error!("unrecognized TLS version: {}", s)
+          };
+        }
 
-    if let Some(ref versions_list) = self.tls_versions {
-      for version in versions_list {
-        match version.as_str() {
-          "SSLv2"   => versions.remove(ssl::SSL_OP_NO_SSLV2),
-          "SSLv3"   => versions.remove(ssl::SSL_OP_NO_SSLV3),
-          "TLSv1"   => versions.remove(ssl::SSL_OP_NO_TLSV1),
-          "TLSv1.1" => versions.remove(ssl::SSL_OP_NO_TLSV1_1),
-          "TLSv1.2" => versions.remove(ssl::SSL_OP_NO_TLSV1_2),
-          s         => error!("unrecognized TLS version: {}", s)
-        };
+        v.clone()
       }
-    } else {
-      versions = ssl::SSL_OP_NO_SSLV2 | ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1;
-    }
-
-    default_options.insert(versions);
-    trace!("parsed tls options: {:?}", default_options);
+    };
 
     tls_proxy_configuration.map(|addr| {
       let mut configuration = HttpsProxyConfiguration {
         front:           addr,
         public_address:  public_address,
         cipher_list:     cipher_list,
-        options:         default_options.bits(),
+        versions:        versions,
         ..Default::default()
       };
 
@@ -330,9 +320,9 @@ impl Config {
         }
         let certificate = certificate_opt.unwrap();
         let fingerprint = match calculate_fingerprint(&certificate.as_bytes()[..]) {
-          Ok(f)  => CertFingerprint(f),
-          Err(e) => {
-            error!("cannot obtain the certificate's fingerprint: {:?}", e);
+          Some(f)  => CertFingerprint(f),
+          None => {
+            error!("cannot obtain the certificate's fingerprint");
             continue;
           }
         };
