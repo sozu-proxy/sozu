@@ -4,8 +4,12 @@ use libc::{self,pid_t};
 use std::process::Command;
 use std::os::unix::process::CommandExt;
 use std::os::unix::io::{AsRawFd,FromRawFd};
+use std::fs::File;
+use std::io::{Seek,SeekFrom};
 use nix::unistd::*;
 use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
+use serde_json;
+use tempfile::tempfile;
 
 use sozu_command::config::Config;
 use sozu_command::data::RunState;
@@ -52,8 +56,18 @@ pub struct UpgradeData {
   //pub order_state: HashMap<String, HashSet<usize>>,
 }
 
-pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<UpgradeData,bool>) {
+pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<(),bool>) {
   trace!("parent({})", unsafe { libc::getpid() });
+
+  let mut upgrade_file = tempfile().expect("could not create temporary file for upgrade");
+
+  let cl_flags = fcntl(upgrade_file.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
+  let mut new_cl_flags = FdFlag::from_bits(cl_flags).unwrap();
+  new_cl_flags.remove(FD_CLOEXEC);
+  fcntl(upgrade_file.as_raw_fd(), FcntlArg::F_SETFD(new_cl_flags));
+
+  serde_json::to_writer(&mut upgrade_file, &upgrade_data).expect("could not write upgrade data to temporary file");
+  upgrade_file.seek(SeekFrom::Start(0));
 
   let (server, client) = UnixStream::pair().unwrap();
 
@@ -65,7 +79,8 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<Up
   new_cl_flags.remove(FD_CLOEXEC);
   fcntl(client.as_raw_fd(), FcntlArg::F_SETFD(new_cl_flags));
 
-  let mut command: Channel<UpgradeData,bool> = Channel::new(
+
+  let mut command: Channel<(),bool> = Channel::new(
     server,
     upgrade_data.config.command_buffer_size,
     upgrade_data.config.max_command_buffer_size
@@ -74,12 +89,11 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<Up
 
   let path = unsafe { get_executable_path() };
 
-  info!("launching worker");
+  info!("launching new master");
   //FIXME: remove the expect, return a result?
   match fork().expect("fork failed") {
     ForkResult::Parent{ child } => {
-      info!("worker launched: {}", child);
-      command.write_message(&upgrade_data);
+      info!("master launched: {}", child);
       command.set_nonblocking(true);
 
       return (child, command);
@@ -90,6 +104,8 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<Up
         .arg("upgrade")
         .arg("--fd")
         .arg(client.as_raw_fd().to_string())
+        .arg("--upgrade-fd")
+        .arg(upgrade_file.as_raw_fd().to_string())
         .arg("--channel-buffer-size")
         .arg(upgrade_data.config.command_buffer_size.to_string())
         .exec();
@@ -100,8 +116,8 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<Up
   }
 }
 
-pub fn begin_new_master_process(fd: i32, channel_buffer_size: usize) {
-  let mut command: Channel<bool,UpgradeData> = Channel::new(
+pub fn begin_new_master_process(fd: i32, upgrade_fd: i32, channel_buffer_size: usize) {
+  let mut command: Channel<bool,()> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
     channel_buffer_size,
     channel_buffer_size *2
@@ -109,10 +125,12 @@ pub fn begin_new_master_process(fd: i32, channel_buffer_size: usize) {
 
   command.set_blocking(true);
 
-  let upgrade_data = command.read_message().expect("new master could not read upgrade_data from socket");
+  let upgrade_file = unsafe { File::from_raw_fd(upgrade_fd) };
+  let upgrade_data: UpgradeData = serde_json::from_reader(upgrade_file).expect("could not parse upgrade data");
+
   //FIXME: should have an id for the master too
   logging::setup("MASTER".to_string(), &upgrade_data.config.log_level, &upgrade_data.config.log_target);
-  trace!("new master got upgrade data: {:?}", upgrade_data);
+  //info!("new master got upgrade data: {:?}", upgrade_data);
 
   let mut server = CommandServer::from_upgrade_data(upgrade_data);
   server.enable_cloexec_after_upgrade();

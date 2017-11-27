@@ -9,6 +9,7 @@ extern crate libc;
 extern crate slab;
 extern crate rand;
 extern crate nix;
+extern crate tempfile;
 #[macro_use] extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
 
@@ -59,6 +60,8 @@ fn main() {
                                     .about("start a new master process (internal command, should not be used directly)")
                                     .arg(Arg::with_name("fd").long("fd")
                                          .takes_value(true).required(true).help("IPC file descriptor"))
+                                    .arg(Arg::with_name("upgrade-fd").long("upgrade-fd")
+                                         .takes_value(true).required(true).help("upgrade data file descriptor"))
                                     .arg(Arg::with_name("channel-buffer-size").long("channel-buffer-size")
                                          .takes_value(true).required(false).help("Worker's channel buffer size")))
                         .get_matches();
@@ -79,11 +82,13 @@ fn main() {
   if let Some(matches) = matches.subcommand_matches("upgrade") {
     let fd  = matches.value_of("fd").expect("needs a file descriptor")
       .parse::<i32>().expect("the file descriptor must be a number");
+    let upgrade_fd  = matches.value_of("upgrade-fd").expect("needs an upgrade file descriptor")
+      .parse::<i32>().expect("the file descriptor must be a number");
     let buffer_size = matches.value_of("channel-buffer-size")
       .and_then(|size| size.parse::<usize>().ok())
       .unwrap_or(1_000_000);
 
-    begin_new_master_process(fd, buffer_size);
+    begin_new_master_process(fd, upgrade_fd, buffer_size);
     return;
   }
 
