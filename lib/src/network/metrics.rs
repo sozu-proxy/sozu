@@ -339,10 +339,15 @@ impl ProxyMetrics {
   }
 }
 
+pub fn udp_bind() -> UdpSocket {
+  UdpSocket::bind(&("0.0.0.0:0".parse().unwrap())).expect("could not parse address")
+}
+
 #[macro_export]
 macro_rules! metrics_set_up (
   ($host:expr, $port: expr) => {
-    let metrics_socket = ::mio::net::UdpSocket::bind(&("0.0.0.0:0".parse().unwrap())).expect("could not parse address");
+    let metrics_socket = $crate::network::metrics::udp_bind();
+
     debug!("setting up metrics: local address = {:#?}", metrics_socket.local_addr());
     let metrics_host   = ($host, $port).to_socket_addrs().expect("could not parse address").next().expect("could not get first address");
     $crate::network::metrics::METRICS.with(|metrics| {

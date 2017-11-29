@@ -34,6 +34,10 @@ pub struct Channel<Tx,Rx> {
 }
 
 impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
+  pub fn from_path(path: &str, buffer_size: usize, max_buffer_size: usize) -> Result<Channel<Tx,Rx>, io::Error> {
+    UnixStream::connect(path).map(|stream| Channel::new(stream, buffer_size, max_buffer_size))
+  }
+
   pub fn new(sock: UnixStream, buffer_size: usize, max_buffer_size: usize) -> Channel<Tx,Rx> {
     Channel {
       sock:            sock,

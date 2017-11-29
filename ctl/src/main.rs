@@ -1,12 +1,10 @@
 #[macro_use] extern crate clap;
 #[macro_use] extern crate prettytable;
-extern crate mio_uds;
 extern crate rand;
 extern crate sozu_command_lib as sozu_command;
 
 mod command;
 
-use mio_uds::UnixStream;
 use clap::{App,Arg,SubCommand};
 
 use sozu_command::config::Config;
@@ -226,8 +224,10 @@ fn main() {
                     };
 
   let config = Config::load_from_path(config_file).expect("could not parse configuration file");
-  let stream = UnixStream::connect(&config.command_socket_path()).expect("could not connect to the command unix socket");
-  let mut channel: Channel<ConfigMessage,ConfigMessageAnswer> = Channel::new(stream, 10_000, 2_000_000);
+  let mut channel: Channel<ConfigMessage,ConfigMessageAnswer> =
+    Channel::from_path(&config.command_socket_path(), 10_000, 2_000_000)
+      .expect("could not connect to the command unix socket");
+
   channel.set_nonblocking(false);
 
   match matches.subcommand() {

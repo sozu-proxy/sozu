@@ -1,9 +1,6 @@
 #![allow(unused_variables,unused_must_use)]
 #[macro_use] extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
-extern crate openssl;
-extern crate mio;
-extern crate mio_uds;
 extern crate time;
 
 use std::env;

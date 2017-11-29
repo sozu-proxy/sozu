@@ -1,11 +1,7 @@
 #![allow(unused_variables,unused_must_use)]
 #[macro_use] extern crate sozu_lib as sozu;
 extern crate sozu_command_lib as sozu_command;
-extern crate openssl;
 extern crate time;
-extern crate libc;
-extern crate mio;
-extern crate mio_uds;
 extern crate hex;
 
 use std::net::ToSocketAddrs;
@@ -16,7 +12,6 @@ use sozu::network;
 use sozu::logging::{Logger,LoggerBackend};
 use sozu_command::messages;
 use sozu_command::channel::Channel;
-use openssl::ssl;
 
 fn main() {
   if env::var("RUST_LOG").is_ok() {
