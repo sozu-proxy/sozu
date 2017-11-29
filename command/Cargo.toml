@@ -11,12 +11,12 @@ authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
 
 include = [
-  "README.md",
+  "./README.md",
   "Cargo.toml",
-  "/src",
+  "src/**/*",
+  "assets/certificate.pem",
+  "assets/key.pem"
 ]
-
-[lib]
 
 [dependencies]
 hex = "^0.2"
