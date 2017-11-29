@@ -1,7 +1,6 @@
 use mio_uds::UnixStream;
 use mio::Ready;
 use libc::{self,c_char,uint32_t,int32_t,pid_t};
-use std::io;
 use std::ffi::CString;
 use std::iter::repeat;
 use std::ptr::null_mut;
@@ -11,13 +10,13 @@ use std::os::unix::process::CommandExt;
 use std::os::unix::io::{AsRawFd,FromRawFd};
 use nix;
 use nix::unistd::*;
-use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
 use sozu::network::proxy::Server;
 
+use util;
 use logging;
 use command::Worker;
 
@@ -81,13 +80,7 @@ pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Ch
 
   let (server, client) = UnixStream::pair().unwrap();
 
-  // FD_CLOEXEC is set by default on every fd in Rust standard lib,
-  // so we need to remove the flag on the client, otherwise
-  // it won't be accessible
-  let cl_flags = fcntl(client.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
-  let mut new_cl_flags = FdFlag::from_bits(cl_flags).unwrap();
-  new_cl_flags.remove(FD_CLOEXEC);
-  fcntl(client.as_raw_fd(), FcntlArg::F_SETFD(new_cl_flags));
+  util::disable_close_on_exec(client.as_raw_fd());
 
   let channel_buffer_size = config.channel_buffer_size;
   //FIXME

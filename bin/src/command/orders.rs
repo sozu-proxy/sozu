@@ -8,7 +8,6 @@ use std::thread::sleep;
 use std::time::Duration;
 use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd,FromRawFd};
-use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 use slab::Slab;
 use serde_json;
 use mio_uds::{UnixListener,UnixStream};
@@ -25,6 +24,7 @@ use super::client::parse;
 use super::state::{MessageType,OrderState};
 use worker::start_worker;
 use upgrade::{start_new_master_process,SerializedWorker,UpgradeData};
+use util;
 
 impl CommandServer {
   pub fn handle_client_message(&mut self, token: FrontToken, message: &ConfigMessage) {
@@ -437,32 +437,20 @@ impl CommandServer {
   pub fn disable_cloexec_before_upgrade(&mut self) {
     for ref mut proxy in self.proxies.values() {
       if proxy.run_state == RunState::Running {
-        let flags = fcntl(proxy.channel.sock.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
-        let mut new_flags = FdFlag::from_bits(flags).unwrap();
-        new_flags.remove(FD_CLOEXEC);
-        fcntl(proxy.channel.sock.as_raw_fd(), FcntlArg::F_SETFD(new_flags));
+        util::disable_close_on_exec(proxy.channel.sock.as_raw_fd());
       }
     }
     trace!("disabling cloexec on listener: {}", self.sock.as_raw_fd());
-    let flags = fcntl(self.sock.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
-    let mut new_flags = FdFlag::from_bits(flags).unwrap();
-    new_flags.remove(FD_CLOEXEC);
-    fcntl(self.sock.as_raw_fd(), FcntlArg::F_SETFD(new_flags));
+    util::disable_close_on_exec(self.sock.as_raw_fd());
   }
 
   pub fn enable_cloexec_after_upgrade(&mut self) {
     for ref mut proxy in self.proxies.values() {
       if proxy.run_state == RunState::Running {
-        let flags = fcntl(proxy.channel.sock.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
-        let mut new_flags = FdFlag::from_bits(flags).unwrap();
-        new_flags.insert(FD_CLOEXEC);
-        fcntl(proxy.channel.sock.as_raw_fd(), FcntlArg::F_SETFD(new_flags));
+        util::enable_close_on_exec(proxy.channel.sock.as_raw_fd());
       }
     }
-    let flags = fcntl(self.sock.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
-    let mut new_flags = FdFlag::from_bits(flags).unwrap();
-    new_flags.insert(FD_CLOEXEC);
-    fcntl(self.sock.as_raw_fd(), FcntlArg::F_SETFD(new_flags));
+        util::enable_close_on_exec(self.sock.as_raw_fd());
   }
 
   pub fn generate_upgrade_data(&self) -> UpgradeData {

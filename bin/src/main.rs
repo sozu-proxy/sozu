@@ -22,6 +22,7 @@ mod command;
 mod worker;
 mod logging;
 mod upgrade;
+mod util;
 
 use std::net::ToSocketAddrs;
 use std::env;

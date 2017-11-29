@@ -7,7 +7,6 @@ use std::os::unix::io::{AsRawFd,FromRawFd};
 use std::fs::File;
 use std::io::{Seek,SeekFrom};
 use nix::unistd::*;
-use nix::fcntl::{fcntl,FcntlArg,FdFlag,FD_CLOEXEC};
 use serde_json;
 use tempfile::tempfile;
 
@@ -17,6 +16,7 @@ use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::messages::OrderMessage;
 
+use util;
 use logging;
 use command::{CommandServer,Worker};
 use worker::get_executable_path;
@@ -61,24 +61,14 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<()
 
   let mut upgrade_file = tempfile().expect("could not create temporary file for upgrade");
 
-  let cl_flags = fcntl(upgrade_file.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
-  let mut new_cl_flags = FdFlag::from_bits(cl_flags).unwrap();
-  new_cl_flags.remove(FD_CLOEXEC);
-  fcntl(upgrade_file.as_raw_fd(), FcntlArg::F_SETFD(new_cl_flags));
+  util::disable_close_on_exec(upgrade_file.as_raw_fd());
 
   serde_json::to_writer(&mut upgrade_file, &upgrade_data).expect("could not write upgrade data to temporary file");
   upgrade_file.seek(SeekFrom::Start(0));
 
   let (server, client) = UnixStream::pair().unwrap();
 
-  // FD_CLOEXEC is set by default on every fd in Rust standard lib,
-  // so we need to remove the flag on the client, otherwise
-  // it won't be accessible
-  let cl_flags = fcntl(client.as_raw_fd(), FcntlArg::F_GETFD).unwrap();
-  let mut new_cl_flags = FdFlag::from_bits(cl_flags).unwrap();
-  new_cl_flags.remove(FD_CLOEXEC);
-  fcntl(client.as_raw_fd(), FcntlArg::F_SETFD(new_cl_flags));
-
+  util::disable_close_on_exec(client.as_raw_fd());
 
   let mut command: Channel<(),bool> = Channel::new(
     server,
