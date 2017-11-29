@@ -236,7 +236,7 @@ mod tests {
   #[test]
   fn delete() {
     let mut b = Buffer::with_capacity(10);
-    let res = b.write(&b"abcdefgh"[..]);
+    let _ = b.write(&b"abcdefgh"[..]).expect("should write");
     assert_eq!(b.available_data(), 8);
     assert_eq!(b.available_space(), 2);
 
@@ -252,7 +252,7 @@ mod tests {
   #[test]
   fn replace() {
     let mut b = Buffer::with_capacity(10);
-    let res = b.write(&b"abcdefgh"[..]);
+    let _ = b.write(&b"abcdefgh"[..]).expect("should write");
     assert_eq!(b.available_data(), 8);
     assert_eq!(b.available_space(), 2);
 

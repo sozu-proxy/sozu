@@ -291,8 +291,16 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
       self.back_buf.grow( new_len );
     }
 
-    self.back_buf.write(message);
-    self.back_buf.write(&b"\0"[..]);
+    if let Err(e) = self.back_buf.write(message) {
+      error!("channel could not write to back buffer: {:?}", e);
+      return false;
+    }
+
+    if let Err(e) = self.back_buf.write(&b"\0"[..]) {
+      error!("channel could not write to back buffer: {:?}", e);
+      return false;
+    }
+
     self.interest.insert(Ready::writable());
 
     true
@@ -316,8 +324,15 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
       self.back_buf.grow( new_len );
     }
 
-    self.back_buf.write(message);
-    self.back_buf.write(&b"\0"[..]);
+    if let Err(e) = self.back_buf.write(message) {
+      error!("channel could not write to back buffer: {:?}", e);
+      return false;
+    }
+
+    if let Err(e) = self.back_buf.write(&b"\0"[..]) {
+      error!("channel could not write to back buffer: {:?}", e);
+      return false;
+    }
 
     loop {
       let size = self.back_buf.available_data();

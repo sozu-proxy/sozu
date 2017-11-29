@@ -275,7 +275,6 @@ impl CommandServer {
 
           let o = order.clone();
           //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
-          self.clients[token].add_message_id(worker_message_id.clone());
           let sending_order = OrderMessage { id: worker_message_id.clone(), order: o };
           worker.channel.write_message(&sending_order);
 
@@ -336,7 +335,6 @@ impl CommandServer {
       self.order_state.insert_worker_message(message_id, message_id, proxy.token.expect("worker should have a valid token"));
       trace!("sending to {:?}, inflight is now {:#?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
 
-      self.clients[token].add_message_id(String::from(message_id));
       proxy.push_message(OrderMessage { id: String::from(message_id), order: Order::Metrics });
     }
   }
@@ -353,7 +351,6 @@ impl CommandServer {
       self.order_state.insert_worker_message(message_id, message_id, proxy.token.expect("worker should have a valid token"));
       trace!("sending to {:?}, inflight is now {:#?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
 
-      self.clients[token].add_message_id(String::from(message_id));
       proxy.push_message(OrderMessage { id: String::from(message_id), order: Order::Query(query.clone()) });
     }
   }
@@ -401,7 +398,6 @@ impl CommandServer {
       trace!("sending to {:?}, inflight is now {:#?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
 
       let o = order.clone();
-      self.clients[token].add_message_id(String::from(message_id));
       proxy.push_message(OrderMessage { id: String::from(message_id), order: o });
       found = true;
     }

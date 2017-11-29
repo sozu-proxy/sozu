@@ -3,7 +3,7 @@ use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront,
-  CertificateAndKey, CertFingerprint, TcpFront, Query, QueryAnswer};
+  CertificateAndKey, CertFingerprint, Query, QueryAnswer};
 
 use std::collections::{HashMap,HashSet};
 use std::process::exit;
@@ -769,6 +769,7 @@ pub fn remove_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswe
   }
 }
 
+/*
 pub fn add_tcp_front(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip_address: &str, port: u16) {
   order_command(channel, Order::AddTcpFront(TcpFront {
     app_id: String::from(app_id),
@@ -784,6 +785,7 @@ pub fn remove_tcp_front(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>
     port: port
   }));
 }
+*/
 
 pub fn query_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, application_id: Option<&str>) {
   let command = match application_id {

@@ -9,17 +9,9 @@ use sozu_command::channel::Channel;
 
 use super::{ConfigMessage,ConfigMessageAnswer};
 
-#[derive(Debug,PartialEq)]
-pub enum ConnReadError {
-  Continue,
-  ParseError,
-  SocketError,
-}
-
 pub struct CommandClient {
   pub channel:       Channel<ConfigMessageAnswer,ConfigMessage>,
   pub token:         Option<Token>,
-  message_ids:       Vec<String>,
   pub queue:         VecDeque<ConfigMessageAnswer>,
 }
 
@@ -29,26 +21,8 @@ impl CommandClient {
     CommandClient {
       channel:         channel,
       token:           None,
-      message_ids:     Vec::new(),
       queue:           VecDeque::new(),
     }
-  }
-
-  pub fn add_message_id(&mut self, id: String) {
-    self.message_ids.push(id);
-    self.message_ids.sort();
-  }
-
-  pub fn has_message_id(&self, id: &String) ->Option<usize> {
-    self.message_ids.binary_search(&id).ok()
-  }
-
-  pub fn remove_message_id(&mut self, index: usize) {
-    self.message_ids.remove(index);
-  }
-
-  pub fn write_message(&mut self, message: &ConfigMessageAnswer) -> bool {
-    self.channel.write_message(message)
   }
 
   pub fn push_message(&mut self, message: ConfigMessageAnswer) {

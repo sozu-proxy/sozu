@@ -1,5 +1,5 @@
 use mio::*;
-use mio::tcp::*;
+use mio::net::*;
 use mio::unix::UnixReady;
 use pool::Checkout;
 use network::buffer_queue::BufferQueue;

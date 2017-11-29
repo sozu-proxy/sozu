@@ -903,7 +903,7 @@ mod tests {
     });
   }
 
-  use mio::tcp;
+  use mio::net;
   #[test]
   fn frontend_from_request_test() {
     let app_id1 = "app_1".to_owned();
@@ -924,7 +924,7 @@ mod tests {
     ]);
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
-    let listener = tcp::TcpListener::bind(&front).expect("should bind TCP socket");
+    let listener = net::TcpListener::bind(&front).expect("should bind TCP socket");
     let server_config = ServerConfiguration {
       listener:  listener,
       address:   front,

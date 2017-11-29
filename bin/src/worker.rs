@@ -45,14 +45,6 @@ pub fn start_worker(id: u32, config: &Config) -> nix::Result<Worker> {
   }
 }
 
-fn generate_channels() -> io::Result<(Channel<OrderMessage,OrderMessageAnswer>, Channel<OrderMessageAnswer,OrderMessage>)> {
-  let (command,proxy) = try!(UnixStream::pair());
-  //FIXME: configurable buffer size
-  let proxy_channel   = Channel::new(proxy, 1_000_000, 2_000_000);
-  let command_channel = Channel::new(command, 1_000_000, 2_000_000);
-  Ok((command_channel, proxy_channel))
-}
-
 pub fn begin_worker_process(fd: i32, id: i32, channel_buffer_size: usize) {
   let mut command: Channel<OrderMessageAnswer,Config> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },

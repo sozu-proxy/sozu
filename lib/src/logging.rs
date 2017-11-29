@@ -55,18 +55,24 @@ impl Logger {
     if self.enabled(meta) {
       match self.backend {
         LoggerBackend::Stdout(ref mut stdout) => {
-          stdout.write_fmt(args);
+          let _ = stdout.write_fmt(args);
         },
         //FIXME: should have a buffer to write to instead of allocating a string
         LoggerBackend::Unix(ref mut socket) => {
-          socket.send(format(args).as_bytes());
+          let _ = socket.send(format(args).as_bytes()).map_err(|e| {
+            println!("cannot write logs to Unix socket: {:?}", e);
+          });
         },
         //FIXME: should have a buffer to write to instead of allocating a string
         LoggerBackend::Udp(ref mut socket, ref address) => {
-          socket.send_to(format(args).as_bytes(), address);
+          let _ = socket.send_to(format(args).as_bytes(), address).map_err(|e| {
+            println!("cannot write logs to UDP socket: {:?}", e);
+          });
         }
         LoggerBackend::Tcp(ref mut socket) => {
-          socket.write_fmt(args);
+          let _ = socket.write_fmt(args).map_err(|e| {
+            println!("cannot write logs to TCP socket: {:?}", e);
+          });
         },
       }
     }
@@ -76,18 +82,24 @@ impl Logger {
     if self.compat_enabled(meta) {
       match self.backend {
         LoggerBackend::Stdout(ref mut stdout) => {
-          stdout.write_fmt(args);
+          let _ = stdout.write_fmt(args);
         },
         //FIXME: should have a buffer to write to instead of allocating a string
         LoggerBackend::Unix(ref mut socket) => {
-          socket.send(format(args).as_bytes());
+          let _= socket.send(format(args).as_bytes()).map_err(|e| {
+            println!("cannot write logs to Unix socket: {:?}", e);
+          });
         },
         //FIXME: should have a buffer to write to instead of allocating a string
         LoggerBackend::Udp(ref mut socket, ref address) => {
-          socket.send_to(format(args).as_bytes(), address);
+          let _ = socket.send_to(format(args).as_bytes(), address).map_err(|e| {
+            println!("cannot write logs to UDP socket: {:?}", e);
+          });
         }
         LoggerBackend::Tcp(ref mut socket) => {
-          socket.write_fmt(args);
+          let _ = socket.write_fmt(args).map_err(|e| {
+            println!("cannot write logs to TCP socket: {:?}", e);
+          });
         },
       }
     }
@@ -283,7 +295,7 @@ impl Ord for LogLevelFilter {
 impl FromStr for LogLevelFilter {
     type Err = ();
     fn from_str(level: &str) -> Result<LogLevelFilter, ()> {
-        use std::ascii::AsciiExt;
+        #[allow(unused_imports)] use std::ascii::AsciiExt;
         ok_or(LOG_LEVEL_NAMES.iter()
                     .position(|&name| name.eq_ignore_ascii_case(level))
                     .map(|p| LogLevelFilter::from_usize(p).unwrap()), ())
