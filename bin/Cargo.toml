@@ -13,7 +13,7 @@ categories = ["network-programming"]
 include = [
   "README.md",
   "Cargo.toml",
-  "src",
+  "src/**/*",
 ]
 
 [[bin]]
