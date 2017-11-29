@@ -13,7 +13,9 @@ fn main() {
         Ok(ref v) if v == "110" => {
             println!("cargo:rustc-cfg=ossl110");
         }
-        _ => panic!("Unable to detect OpenSSL version"),
+        _ => {
+            println!("cargo:rustc-cfg=ossl110");
+        },//panic!("Unable to detect OpenSSL version"),
     }
 
     if let Ok(_) = env::var("DEP_OPENSSL_LIBRESSL") {

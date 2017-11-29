@@ -1120,6 +1120,11 @@ fn setup_curves(_: &mut SslContextBuilder) -> Result<(), ErrorStack> {
   Ok(())
 }
 
+#[cfg(all(not(ossl101), not(ossl102), not(ossl110)))]
+fn setup_curves(_: &mut SslContextBuilder) -> Result<(), ErrorStack> {
+  Ok(())
+}
+
 pub type TlsServer = Session<ServerConfiguration,TlsClient>;
 
 pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
