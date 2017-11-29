@@ -11,12 +11,13 @@ authors = ["Clément Delafargue <clement@delafargue.name>", "Geoffroy Couprie <g
 categories = ["network-programming"]
 
 include = [
-  "README.md",
+  "./README.md",
   "Cargo.toml",
-  "/src",
+  "src/**/*",
   "/examples/main.rs",
   "/examples/minimal.rs",
-  "/assets"
+  "assets/certificate.pem",
+  "assets/key.pem"
 ]
 
 [lib]
