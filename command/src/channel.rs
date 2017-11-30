@@ -70,7 +70,9 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
     unsafe {
       let fd = self.sock.as_raw_fd();
       let stream = net::UnixStream::from_raw_fd(fd);
-      stream.set_nonblocking(nonblocking);
+      let _ = stream.set_nonblocking(nonblocking).map_err(|e| {
+        error!("could not change blocking status for stream: {:?}", e);
+      });
       let _fd = stream.into_raw_fd();
     }
     self.blocking = !nonblocking;
@@ -96,11 +98,15 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
     let interest = self.interest & self.readiness;
 
     if interest.is_readable() {
-      self.readable();
+      let _ = self.readable().map_err(|e| {
+        error!("error reading from channel: {:?}", e);
+      });
     }
 
     if interest.is_writable() {
-      self.writable();
+      let _ = self.writable().map_err(|e| {
+        error!("error writing to channel: {:?}", e);
+      });
     }
   }
 

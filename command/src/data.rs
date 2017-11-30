@@ -171,7 +171,7 @@ impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
       Some(id) => id,
       None => return Err(serde::de::Error::missing_field("id")),
     };
-    let version = match version {
+    let _version = match version {
       Some(version) => version,
       None => return Err(serde::de::Error::missing_field("version")),
     };
