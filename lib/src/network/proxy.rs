@@ -61,7 +61,7 @@ pub struct Server {
 }
 
 impl Server {
-  pub fn new_from_config(channel: ProxyChannel, config: Config) -> Self {
+  pub fn new_from_config(channel: ProxyChannel, config: Config, config_state: ConfigState) -> Self {
     let mut event_loop  = Poll::new().expect("could not create event loop");
     let pool = Rc::new(RefCell::new(
       Pool::with_capacity(2*config.max_buffers, 0, || BufferQueue::with_capacity(config.buffer_size))
@@ -83,13 +83,14 @@ impl Server {
     });
     //TODO: implement for TCP
 
-    Server::new(event_loop, channel, http_session, https_session, None)
+    Server::new(event_loop, channel, http_session, https_session, None, Some(config_state))
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel,
     http:  Option<Session<http::ServerConfiguration, http::Client>>,
     https: Option<Session<tls::ServerConfiguration, tls::TlsClient>>,
-    tcp:  Option<Session<tcp::ServerConfiguration, tcp::Client>>) -> Self {
+    tcp:  Option<Session<tcp::ServerConfiguration, tcp::Client>>,
+    config_state: Option<ConfigState>) -> Self {
 
     poll.register(
       &channel,
@@ -106,7 +107,7 @@ impl Server {
       }
     });
 
-    Server {
+    let mut server = Server {
       poll:            poll,
       shutting_down:   None,
       accept_ready:    HashSet::new(),
@@ -117,7 +118,29 @@ impl Server {
       https:           https,
       tcp:             tcp,
       config_state:    ConfigState::new(),
+    };
+
+    // initialize the worker with the state we got from a file
+    if let Some(state) = config_state {
+      let mut counter = 0usize;
+
+      for order in state.generate_orders() {
+        let id = format!("INIT-{}", counter);
+        let message = OrderMessage {
+          id:    id,
+          order: order,
+        };
+
+        trace!("generating initial config order: {:#?}", message);
+        server.notify_sessions(message);
+
+        counter += 1;
+      }
+      // do not send back answers to the initialization messages
+      server.queue.clear();
     }
+
+    server
   }
 }
 
@@ -304,6 +327,10 @@ impl Server {
       return
     }
 
+    self.notify_sessions(message);
+  }
+
+  pub fn notify_sessions(&mut self, message: OrderMessage) {
     self.config_state.handle_order(&message.order);
 
     let topics = message.order.get_topics();
@@ -327,7 +354,6 @@ impl Server {
       }
     }
   }
-
 }
 
 fn proxy_type(token: usize) -> ProxyType {

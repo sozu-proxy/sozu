@@ -55,6 +55,8 @@ fn main() {
                                          .takes_value(true).required(true).help("worker identifier"))
                                     .arg(Arg::with_name("fd").long("fd")
                                          .takes_value(true).required(true).help("IPC file descriptor"))
+                                    .arg(Arg::with_name("configuration-state-fd").long("configuration-state-fd")
+                                         .takes_value(true).required(true).help("configuration data file descriptor"))
                                     .arg(Arg::with_name("channel-buffer-size").long("channel-buffer-size")
                                          .takes_value(true).required(false).help("Worker's channel buffer size")))
                         .subcommand(SubCommand::with_name("upgrade")
@@ -70,13 +72,16 @@ fn main() {
   if let Some(matches) = matches.subcommand_matches("worker") {
     let fd  = matches.value_of("fd").expect("needs a file descriptor")
       .parse::<i32>().expect("the file descriptor must be a number");
+    let configuration_state_fd  = matches.value_of("configuration-state-fd")
+      .expect("needs a configuration state file descriptor")
+      .parse::<i32>().expect("the file descriptor must be a number");
     let id  = matches.value_of("id").expect("needs a worker id")
-      .parse::<i32>().expect("the worker id must be a number");;
+      .parse::<i32>().expect("the worker id must be a number");
     let buffer_size = matches.value_of("channel-buffer-size")
       .and_then(|size| size.parse::<usize>().ok())
       .unwrap_or(1_000_000);
 
-    begin_worker_process(fd, id, buffer_size);
+    begin_worker_process(fd, configuration_state_fd, id, buffer_size);
     return;
   }
 

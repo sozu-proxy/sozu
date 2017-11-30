@@ -87,7 +87,6 @@ impl OrderState {
 
 #[derive(Clone,Debug,PartialEq)]
 pub enum MessageType {
-  LaunchWorker,
   LoadState,
   WorkerOrder,
   Metrics,

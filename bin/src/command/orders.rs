@@ -261,7 +261,7 @@ impl CommandServer {
 
   pub fn launch_worker(&mut self, token: FrontToken, message: &ConfigMessage, tag: &str) {
     let id = self.next_id;
-    if let Ok(mut worker) = start_worker(id, &self.config) {
+    if let Ok(mut worker) = start_worker(id, &self.config, &self.state) {
       self.clients[token].push_message(ConfigMessageAnswer::new(
           message.id.clone(),
           ConfigMessageStatus::Processing,
@@ -275,30 +275,6 @@ impl CommandServer {
       let worker_token = self.token_count + 1;
       self.token_count = worker_token;
       worker.token     = Some(Token(worker_token));
-
-      if let Some(_) = self.proxies.values().filter(|ref proxy| {
-        proxy.run_state == RunState::Running
-      }).next() {
-        worker.channel.set_blocking(true);
-
-        self.order_state.insert_task(message.id.as_str(), MessageType::LaunchWorker, Some(token));
-        let mut counter = 0u32;
-        for order in self.state.generate_orders() {
-          let worker_message_id = format!("LAUNCH-CONF-{}", counter);
-          self.order_state.insert_worker_message(message.id.as_str(), worker_message_id.as_str(), Token(worker_token));
-
-          let o = order.clone();
-          //info!("sending to new worker({}-{}): {} ->  {:?}", tag, worker.id, message_id, order);
-          let sending_order = OrderMessage { id: worker_message_id.clone(), order: o };
-          worker.channel.write_message(&sending_order);
-
-          let received = worker.channel.read_message();
-          debug!("worker ({}-{}) sent: {:?}", tag, worker.id, received);
-          //worker.channel.run();
-          counter += 1;
-        }
-        worker.channel.set_blocking(false);
-      }
 
       debug!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
       worker_token, tag, worker.id, worker.channel.sock.take_error());

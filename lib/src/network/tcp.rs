@@ -562,7 +562,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
     let mut poll = Poll::new().expect("could not create event loop");
     let configuration = ServerConfiguration::new(10, 12297829382473034410);
     let session = Session::new(10, 500, 12297829382473034410, configuration, &mut poll);
-    let mut s   = Server::new(poll, channel, None, None, Some(session));
+    let mut s   = Server::new(poll, channel, None, None, Some(session), None);
     info!("will run");
     s.run();
     info!("ending event loop");
@@ -605,7 +605,7 @@ pub fn start(max_listeners: usize, max_buffers: usize, channel: ProxyChannel) {
   let mut poll          = Poll::new().expect("could not create event loop");
   let configuration     = ServerConfiguration::new(max_listeners, 12297829382473034410);
   let session           = Session::new(max_listeners, max_buffers, 12297829382473034410, configuration, &mut poll);
-  let mut server        = Server::new(poll, channel, None, None, Some(session));
+  let mut server        = Server::new(poll, channel, None, None, Some(session), None);
   let front: SocketAddr = FromStr::from_str("127.0.0.1:8443").expect("could not parse address");
 
   info!("starting event loop");

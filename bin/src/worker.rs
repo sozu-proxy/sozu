@@ -1,6 +1,8 @@
 use mio_uds::UnixStream;
 use mio::Ready;
 use libc::{self,c_char,uint32_t,int32_t,pid_t};
+use std::io::{Seek,SeekFrom};
+use std::fs::File;
 use std::ffi::CString;
 use std::iter::repeat;
 use std::ptr::null_mut;
@@ -8,11 +10,14 @@ use std::process::Command;
 use std::net::ToSocketAddrs;
 use std::os::unix::process::CommandExt;
 use std::os::unix::io::{AsRawFd,FromRawFd};
+use tempfile::tempfile;
+use serde_json;
 use nix;
 use nix::unistd::*;
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
+use sozu_command::state::ConfigState;
 use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
 use sozu::network::proxy::Server;
 
@@ -21,9 +26,10 @@ use logging;
 use command::Worker;
 
 pub fn start_workers(config: &Config) -> nix::Result<Vec<Worker>> {
+  let state = ConfigState::new();
   let mut workers = Vec::new();
   for index in 0..config.worker_count {
-    match start_worker_process(&index.to_string(), config) {
+    match start_worker_process(&index.to_string(), config, &state) {
       Ok((pid, command)) => {
         let w =  Worker::new(index as u32, pid, command, config);
         workers.push(w);
@@ -34,8 +40,8 @@ pub fn start_workers(config: &Config) -> nix::Result<Vec<Worker>> {
   Ok(workers)
 }
 
-pub fn start_worker(id: u32, config: &Config) -> nix::Result<Worker> {
-  match start_worker_process(&id.to_string(), config) {
+pub fn start_worker(id: u32, config: &Config, state: &ConfigState) -> nix::Result<Worker> {
+  match start_worker_process(&id.to_string(), config, state) {
     Ok((pid, command)) => {
       let w = Worker::new(id, pid, command, config);
       Ok(w)
@@ -44,7 +50,7 @@ pub fn start_worker(id: u32, config: &Config) -> nix::Result<Worker> {
   }
 }
 
-pub fn begin_worker_process(fd: i32, id: i32, channel_buffer_size: usize) {
+pub fn begin_worker_process(fd: i32, configuration_state_fd: i32, id: i32, channel_buffer_size: usize) {
   let mut command: Channel<OrderMessageAnswer,Config> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
     channel_buffer_size,
@@ -52,6 +58,10 @@ pub fn begin_worker_process(fd: i32, id: i32, channel_buffer_size: usize) {
   );
 
   command.set_nonblocking(false);
+
+  let configuration_state_file = unsafe { File::from_raw_fd(configuration_state_fd) };
+  let config_state: ConfigState = serde_json::from_reader(configuration_state_file)
+    .expect("could not parse configuration state data");
 
   let proxy_config = command.read_message().expect("worker could not read configuration from socket");
   //println!("got message: {:?}", proxy_config);
@@ -68,15 +78,21 @@ pub fn begin_worker_process(fd: i32, id: i32, channel_buffer_size: usize) {
     gauge!("sozu.worker.TEST", 42);
   }
 
-  let mut server = Server::new_from_config(command, proxy_config);
+  let mut server = Server::new_from_config(command, proxy_config, config_state);
 
   info!("{} starting event loop", id);
   server.run();
   info!("{} ending event loop", id);
 }
 
-pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Channel<OrderMessage,OrderMessageAnswer>)> {
+pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState) -> nix::Result<(pid_t, Channel<OrderMessage,OrderMessageAnswer>)> {
   trace!("parent({})", unsafe { libc::getpid() });
+
+  let mut state_file = tempfile().expect("could not create temporary file for configuration state");
+  util::disable_close_on_exec(state_file.as_raw_fd());
+
+  serde_json::to_writer(&mut state_file, state).expect("could not write upgrade data to temporary file");
+  state_file.seek(SeekFrom::Start(0)).expect("could not seek to beginning of file");
 
   let (server, client) = UnixStream::pair().unwrap();
 
@@ -112,6 +128,8 @@ pub fn start_worker_process(id: &str, config: &Config) -> nix::Result<(pid_t, Ch
         .arg("worker")
         .arg("--fd")
         .arg(client.as_raw_fd().to_string())
+        .arg("--configuration-state-fd")
+        .arg(state_file.as_raw_fd().to_string())
         .arg("--id")
         .arg(id)
         .arg("--channel-buffer-size")
