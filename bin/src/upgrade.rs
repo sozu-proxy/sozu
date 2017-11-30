@@ -64,7 +64,7 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<()
   util::disable_close_on_exec(upgrade_file.as_raw_fd());
 
   serde_json::to_writer(&mut upgrade_file, &upgrade_data).expect("could not write upgrade data to temporary file");
-  upgrade_file.seek(SeekFrom::Start(0));
+  upgrade_file.seek(SeekFrom::Start(0)).expect("could not seek to beginning of file");
 
   let (server, client) = UnixStream::pair().unwrap();
 

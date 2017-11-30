@@ -304,14 +304,18 @@ impl CommandServer {
         }
 
         if proxy.channel.readiness().is_readable() {
-          proxy.channel.readable();
+          let _ = proxy.channel.readable().map_err(|e| {
+            error!("could not read from worker socket: {:?}", e);
+          });
 
           loop {
             if let Some(msg) = proxy.channel.read_message() {
               messages.push(msg);
             } else {
               if (proxy.channel.interest & proxy.channel.readiness).is_readable() {
-                proxy.channel.readable();
+                let _ = proxy.channel.readable().map_err(|e| {
+                  error!("could not read from worker socket: {:?}", e);
+                });
                 continue;
               } else {
                 break;
@@ -333,7 +337,9 @@ impl CommandServer {
             }
 
             if proxy.channel.back_buf.available_data() > 0 {
-              proxy.channel.writable();
+              let _ = proxy.channel.writable().map_err(|e| {
+                error!("could not write to worker socket: {:?}", e);
+              });
             }
 
             if !proxy.channel.readiness.is_writable() {
@@ -401,7 +407,9 @@ impl CommandServer {
                   }
                 }
               }
-              client.channel.writable();
+              let _ = client.channel.writable().map_err(|e| {
+                error!("could not write to client socket: {:?}", e);
+              });
 
               if !client.queue.is_empty() {
                  client.channel.interest.insert(Ready::writable());
@@ -410,7 +418,10 @@ impl CommandServer {
           }
 
           if self.clients[conn_token].channel.readiness().is_readable() {
-            self.clients[conn_token].channel.readable();
+            let _ = self.clients[conn_token].channel.readable().map_err(|e| {
+              error!("could not read from client socket: {:?}", e);
+            });
+
             loop {
               if let Some(message) = self.clients[conn_token].channel.read_message() {
                 incr_client_cmd!();
@@ -509,7 +520,9 @@ pub fn start(config: Config, command_socket_path: String, proxies: Vec<Worker>) 
     Ok(srv) => {
       if let Err(e) =  fs::set_permissions(&addr, fs::Permissions::from_mode(0o600)) {
         error!("could not set the unix socket permissions: {:?}", e);
-        fs::remove_file(&addr);
+        let _ = fs::remove_file(&addr).map_err(|e2| {
+          error!("could not remove the unix socket: {:?}", e2);
+        });
         return;
       }
 
