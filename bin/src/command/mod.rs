@@ -1,4 +1,5 @@
 use mio::*;
+use mio::unix::UnixReady;
 use mio_uds::UnixListener;
 use slab::Slab;
 use std::fs;
@@ -113,15 +114,13 @@ impl CommandServer {
       // Register the connection
       let token = self.from_front(tok);
       self.clients[tok].token = Some(token);
-      let mut interest = Ready::hup();
-      interest.insert(Ready::readable());
-      interest.insert(Ready::writable());
-      self.poll.register(&self.clients[tok].channel.sock, token, Ready::all(), PollOpt::edge())
+      self.poll.register(&self.clients[tok].channel.sock, token,
+        Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
+        PollOpt::edge())
         .ok().expect("could not register socket with event loop");
 
       let accept_interest = Ready::readable();
-      self.poll.reregister(&self.sock, SERVER, accept_interest, PollOpt::edge());
-      Ok(())
+      self.poll.reregister(&self.sock, SERVER, accept_interest, PollOpt::edge())
     } else {
       //FIXME: what do other cases mean, like Ok(None)?
       acc.map(|_| ())
@@ -152,7 +151,9 @@ impl CommandServer {
 
     for mut proxy in proxy_vec.drain(..) {
       token_count += 1;
-      poll.register(&proxy.channel.sock, Token(token_count), Ready::all(), PollOpt::edge()).unwrap();
+      poll.register(&proxy.channel.sock, Token(token_count),
+        Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
+        PollOpt::edge()).unwrap();
       proxy.token = Some(Token(token_count));
       proxies.insert(Token(token_count), proxy);
     }
@@ -190,7 +191,7 @@ impl CommandServer {
     loop {
       self.poll.poll(&mut events, poll_timeout).unwrap();
       for event in events.iter() {
-        self.ready(event.token(), event.kind());
+        self.ready(event.token(), event.readiness());
       }
 
       loop {
@@ -357,8 +358,10 @@ impl CommandServer {
   pub fn handle_client_events(&mut self, conn_token: FrontToken) {
     if self.clients.contains(conn_token) {
 
-      if self.clients[conn_token].channel.readiness.is_hup() {
-        self.poll.deregister(&self.clients[conn_token].channel.sock);
+      if UnixReady::from(self.clients[conn_token].channel.readiness).is_hup() {
+        let _ = self.poll.deregister(&self.clients[conn_token].channel.sock).map_err(|e| {
+          error!("could not unregister client socket: {:?}", e);
+        });
         self.clients.remove(conn_token);
         trace!("closed client [{}]", conn_token.0);
       } else {

@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::os::unix::io::{AsRawFd,FromRawFd};
 use slab::Slab;
 use serde_json;
+use mio::unix::UnixReady;
 use mio_uds::{UnixListener,UnixStream};
 use mio::{Poll,PollOpt,Ready,Token};
 use nom::{HexDisplay,IResult,Offset};
@@ -288,7 +289,9 @@ impl CommandServer {
 
       debug!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
       worker_token, tag, worker.id, worker.channel.sock.take_error());
-      self.poll.register(&worker.channel.sock, Token(worker_token), Ready::all(), PollOpt::edge()).unwrap();
+      self.poll.register(&worker.channel.sock, Token(worker_token),
+        Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
+        PollOpt::edge()).unwrap();
       worker.token = Some(Token(worker_token));
       self.proxies.insert(Token(worker_token), worker);
 
@@ -492,7 +495,9 @@ impl CommandServer {
     let workers: HashMap<Token, Worker> = workers.iter().filter_map(|serialized| {
       let stream = unsafe { UnixStream::from_raw_fd(serialized.fd) };
       if let Some(token) = serialized.token {
-        debug!("registering: {:?}", poll.register(&stream, Token(token), Ready::all(), PollOpt::edge()));
+        debug!("registering: {:?}", poll.register(&stream, Token(token),
+          Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
+          PollOpt::edge()));
         Some(
           (
             Token(token),
