@@ -1,8 +1,7 @@
 use std::fs;
 use std::str;
 use std::process;
-use std::io::Read;
-use std::io::Write;
+use std::io::{self,Read,Write};
 use std::convert::Into;
 use std::thread::sleep;
 use std::time::Duration;
@@ -92,26 +91,40 @@ impl CommandServer {
     if let Ok(mut f) = fs::File::create(&path) {
 
       let mut counter = 0usize;
-      for command in self.state.generate_orders() {
-        let message = ConfigMessage::new(
-          format!("SAVE-{}", counter),
-          ConfigCommand::ProxyConfiguration(command),
-          None
-        );
+      let orders = self.state.generate_orders();
 
-        f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()));
-        f.write_all(&b"\n\0"[..]);
+      let res: io::Result<usize> = (move || {
+        for command in orders {
+          let message = ConfigMessage::new(
+            format!("SAVE-{}", counter),
+            ConfigCommand::ProxyConfiguration(command),
+            None
+          );
 
-        if counter % 1000 == 0 {
-          info!("writing command {}", counter);
-          f.sync_all();
+          f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()))?;
+          f.write_all(&b"\n\0"[..])?;
+
+          if counter % 1000 == 0 {
+            info!("writing command {}", counter);
+            f.sync_all()?;
+          }
+          counter += 1;
         }
-        counter += 1;
-      }
-      f.sync_all();
+        f.sync_all()?;
 
-      info!("wrote {} commands to {}", counter, path);
-      self.answer_success(token, message_id, format!("saved {} config messages to {}", counter, path), None);
+        Ok(counter)
+      })();
+
+      match res {
+        Ok(counter) => {
+          info!("wrote {} commands to {}", counter, path);
+          self.answer_success(token, message_id, format!("saved {} config messages to {}", counter, path), None);
+        },
+        Err(e) => {
+          error!("failed writing state to file: {:?}", e);
+          self.answer_error(token, message_id, "could not save state to file", None);
+        }
+      }
     } else {
       error!("could not open file: {}", &path);
       self.answer_error(token, message_id, "could not open file", None);
