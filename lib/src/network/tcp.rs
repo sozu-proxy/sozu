@@ -11,6 +11,8 @@ use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
 use std::error::Error;
 use slab::Slab;
+use std::rc::Rc;
+use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::borrow::BorrowMut;
@@ -325,18 +327,18 @@ pub struct ServerConfiguration {
   fronts:          HashMap<String, ListenToken>,
   instances:       HashMap<String, Vec<Backend>>,
   listeners:       Slab<ApplicationListener,ListenToken>,
-  pool:            Pool<BufferQueue>,
+  pool:            Rc<RefCell<Pool<BufferQueue>>>,
   base_token:      usize,
 }
 
 impl ServerConfiguration {
-  pub fn new(max_listeners: usize, base_token: usize) -> ServerConfiguration {
+  pub fn new(max_listeners: usize, start_at: usize, pool: Rc<RefCell<Pool<BufferQueue>>>) -> ServerConfiguration {
     ServerConfiguration {
       instances:     HashMap::new(),
       listeners:     Slab::with_capacity(max_listeners),
       fronts:        HashMap::new(),
-      pool:          Pool::with_capacity(2*max_listeners, 0, || BufferQueue::with_capacity(2048)),
-      base_token:    base_token,
+      pool:          pool,
+      base_token:    start_at,
     }
   }
 
@@ -517,7 +519,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   }
 
   fn accept(&mut self, token: ListenToken) -> Result<(Client, bool), AcceptError> {
-    if let (Some(front_buf), Some(back_buf)) = (self.pool.checkout(), self.pool.checkout()) {
+    let mut p = (*self.pool).borrow_mut();
+
+    if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
       let internal_token = ListenToken(token.0 - 2 - self.base_token);
       if self.listeners.contains(internal_token) {
         self.listeners[internal_token].sock.accept().map(|(frontend_sock, _)| {
@@ -560,7 +564,12 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
   thread::spawn(move|| {
     info!("starting event loop");
     let mut poll = Poll::new().expect("could not create event loop");
-    let configuration = ServerConfiguration::new(10, 12297829382473034410);
+    let max_buffers = 10;
+    let buffer_size = 16384;
+    let pool = Rc::new(RefCell::new(
+      Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
+    ));
+    let configuration = ServerConfiguration::new(10, 12297829382473034410, pool);
     let session = Session::new(10, 500, 12297829382473034410, configuration, &mut poll);
     let mut s   = Server::new(poll, channel, None, None, Some(session), None);
     info!("will run");
@@ -601,12 +610,14 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
   command
 }
 
-pub fn start(max_listeners: usize, max_buffers: usize, channel: ProxyChannel) {
+pub fn start(max_listeners: usize, max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
   let mut poll          = Poll::new().expect("could not create event loop");
-  let configuration     = ServerConfiguration::new(max_listeners, 12297829382473034410);
+  let pool = Rc::new(RefCell::new(
+    Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
+  ));
+  let configuration     = ServerConfiguration::new(max_listeners, 12297829382473034410, pool);
   let session           = Session::new(max_listeners, max_buffers, 12297829382473034410, configuration, &mut poll);
   let mut server        = Server::new(poll, channel, None, None, Some(session), None);
-  let front: SocketAddr = FromStr::from_str("127.0.0.1:8443").expect("could not parse address");
 
   info!("starting event loop");
   server.run();
