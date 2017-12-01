@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use rand::random;
 use mio::net::TcpStream;
 
+use sozu_command::messages::Instance;
+
 use network::{AppId,Backend,ConnectionError};
 
 pub struct BackendMap {
@@ -18,6 +20,12 @@ impl BackendMap {
       instances:    HashMap::new(),
       max_failures: 3,
     }
+  }
+
+  pub fn import_configuration_state(&mut self, instances: &HashMap<AppId, Vec<Instance>>) {
+    self.instances.extend(instances.iter().map(|(ref app_id, ref instance_vec)| {
+      (app_id.to_string(), BackendList::import_configuration_state(instance_vec))
+    }));
   }
 
   pub fn add_instance(&mut self, app_id: &str, instance_id: &str, instance_address: &SocketAddr) {
@@ -117,6 +125,19 @@ impl BackendList {
       instances: Vec::new(),
       next_id:   0,
     }
+  }
+
+  pub fn import_configuration_state(instance_vec: &Vec<Instance>) -> BackendList {
+    let mut list = BackendList::new();
+    for ref instance in instance_vec {
+      let addr_string = instance.ip_address.to_string() + ":" + &instance.port.to_string();
+      let parsed:Option<SocketAddr> = addr_string.parse().ok();
+      if let Some(addr) = parsed {
+        list.add_instance(&instance.instance_id, &addr);
+      }
+    }
+
+    list
   }
 
   pub fn add_instance(&mut self, instance_id: &str, instance_address: &SocketAddr) {

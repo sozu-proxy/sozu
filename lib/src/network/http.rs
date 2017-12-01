@@ -17,6 +17,7 @@ use rand::random;
 use time::{SteadyTime,Duration};
 
 use sozu_command::channel::Channel;
+use sozu_command::state::ConfigState;
 use sozu_command::messages::{self,Application,Order,HttpFront,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol};
@@ -714,6 +715,71 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     self.instances.close_backend_connection(&app_id, &addr);
   }
 }
+
+pub struct InitialServerConfiguration {
+  instances:       BackendMap,
+  fronts:          HashMap<Hostname, Vec<HttpFront>>,
+  applications:    HashMap<AppId, Application>,
+  answers:         DefaultAnswers,
+  config:          HttpProxyConfiguration,
+}
+
+impl InitialServerConfiguration {
+  pub fn new(config: HttpProxyConfiguration, state: &ConfigState) -> InitialServerConfiguration {
+
+    let answers = DefaultAnswers {
+      NotFound: Vec::from(if config.answer_404.len() > 0 {
+                  config.answer_404.as_bytes()
+                } else {
+                  &b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+                }),
+      ServiceUnavailable: Vec::from(if config.answer_503.len() > 0 {
+        config.answer_503.as_bytes()
+      } else {
+        &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+      }),
+    };
+
+    let mut instances = BackendMap::new();
+    instances.import_configuration_state(&state.instances);
+
+    InitialServerConfiguration {
+      instances:    instances,
+      fronts:       state.http_fronts.clone(),
+      applications: state.applications.clone(),
+      answers:      answers,
+      config:       config,
+    }
+  }
+
+  pub fn start_listening(self, event_loop: &mut Poll, start_at:usize, pool: Rc<RefCell<Pool<BufferQueue>>>) -> io::Result<ServerConfiguration> {
+
+    let front = self.config.front;
+    match server_bind(&front) {
+      Ok(sock) => {
+        event_loop.register(&sock, Token(start_at), Ready::readable(), PollOpt::edge());
+
+        Ok(ServerConfiguration {
+          listener:      sock,
+          address:       self.config.front,
+          applications:  self.applications,
+          instances:     self.instances,
+          fronts:        self.fronts,
+          pool:          pool,
+          answers:       self.answers,
+          config:        self.config,
+        })
+      },
+      Err(e) => {
+        let formatted_err = format!("could not create listener {:?}: {:?}", front, e);
+        error!("{}", formatted_err);
+        Err(e)
+      }
+    }
+
+  }
+}
+
 
 pub type HttpServer = Session<ServerConfiguration,Client>;
 
