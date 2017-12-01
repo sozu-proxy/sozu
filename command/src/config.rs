@@ -192,7 +192,7 @@ pub struct FileConfig {
   pub metrics:                 Option<MetricsConfig>,
   pub http:                    Option<ProxyConfig>,
   pub https:                   Option<ProxyConfig>,
-  pub applications:            HashMap<String, AppConfig>,
+  pub applications:            Option<HashMap<String, AppConfig>>,
   pub handle_process_affinity: Option<bool>
 }
 
@@ -231,7 +231,7 @@ impl FileConfig {
       metrics: self.metrics,
       http: self.http,
       https: self.https,
-      applications: self.applications,
+      applications: self.applications.unwrap_or(HashMap::new()),
       handle_process_affinity: self.handle_process_affinity.unwrap_or(false),
     }
   }
@@ -444,7 +444,6 @@ impl Config {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::collections::HashMap;
   use toml::to_string;
 
   #[test]
@@ -498,7 +497,7 @@ mod tests {
       }),
       http:  Some(http),
       https: Some(https),
-      applications: HashMap::new(),
+      applications: None,
     };
 
     println!("config: {:?}", to_string(&config));
