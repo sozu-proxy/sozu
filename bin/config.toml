@@ -36,6 +36,9 @@ default_app_id = "MyApp"
 #answer_404 = "../lib/assets/404.html"
 #answer_503 = "../lib/assets/503.html"
 
+[tcp]
+max_listeners = 1000
+
 [applications]
 
 [applications.MyApp]
@@ -44,7 +47,12 @@ hostname   = "lolcatho.st"
 certificate = "../lib/assets/certificate.pem" # optional
 key = "../lib/assets/key.pem" # optional
 certificate_chain = "../lib/assets/certificate_chain.pem" # optional
-frontends = ["HTTP", "HTTPS"] # list of proxy tags
+#frontends = ["HTTP", "HTTPS"] # list of proxy tags
 backends  = [ "127.0.0.1:1026" ] # list of IP/port
 #sticky_session = true
+
+[applications.TcpTest]
+ip_address = "127.0.0.1"
+port = 8081
+backends  = [ "127.0.0.1:1026" ] # list of IP/port
 

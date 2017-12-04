@@ -9,7 +9,8 @@ use certificate::{calculate_fingerprint,split_certificate_chain};
 use toml;
 
 use messages::Application;
-use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,Instance,HttpProxyConfiguration,HttpsProxyConfiguration};
+use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,TcpFront,Instance,
+  HttpProxyConfiguration,HttpsProxyConfiguration};
 
 use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
 
@@ -159,14 +160,21 @@ impl ProxyConfig {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+pub struct TcpProxyConfig {
+  pub max_listeners : usize,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct MetricsConfig {
   pub address: String,
   pub port:    u16,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
-pub struct AppConfig {
-  pub hostname:          String,
+pub struct FileAppConfig {
+  pub ip_address:        Option<String>,
+  pub port:              Option<u16>,
+  pub hostname:          Option<String>,
   pub path_begin:        Option<String>,
   pub certificate:       Option<String>,
   pub key:               Option<String>,
@@ -175,6 +183,201 @@ pub struct AppConfig {
   pub sticky_session:    Option<bool>,
 }
 
+impl FileAppConfig {
+  pub fn to_app_config(self, app_id: &str) -> Result<AppConfig, String> {
+    if self.hostname.is_none() && self.path_begin.is_none() && self.certificate.is_none() &&
+      self.key.is_none() && self.certificate_chain.is_none() && self.sticky_session.is_none() {
+      match (self.ip_address, self.port) {
+        (Some(ip), Some(port)) => {
+          Ok(AppConfig::Tcp(TcpAppConfig {
+            app_id:     app_id.to_string(),
+            ip_address: ip,
+            port:       port,
+            backends:   self.backends,
+          }))
+        },
+        (None, Some(_)) => Err(String::from("missing IP address for TCP application")),
+        (Some(_), None) => Err(String::from("missing port for TCP application")),
+        (None, None) => Err(String::from("missing IP address port for TCP application")),
+      }
+    } else {
+      if self.hostname.is_none() {
+        return Err(String::from("missing hostname for TCP application"));
+      }
+
+      let path_begin     = self.path_begin.unwrap_or(String::new());
+      let sticky_session = self.sticky_session.unwrap_or(false);
+
+      let key_opt         = self.key.as_ref().and_then(|path| Config::load_file(&path).ok());
+      let certificate_opt = self.certificate.as_ref().and_then(|path| Config::load_file(&path).ok());
+      let chain_opt       = self.certificate_chain.as_ref().and_then(|path| Config::load_file(&path).ok())
+        .map(split_certificate_chain);
+
+      if key_opt.is_some() || certificate_opt.is_some()  || chain_opt.is_some() {
+
+        if key_opt.is_none() {
+          return Err(format!("cannot read the key at {:?}", self.key));
+        }
+        if certificate_opt.is_none() {
+          return Err(format!("cannot read the certificate at {:?}", self.certificate));
+        }
+        if chain_opt.is_none() {
+          return Err(format!("cannot read the certificate chain at {:?}", self.certificate_chain));
+        }
+
+      }
+
+      Ok(AppConfig::Http(HttpAppConfig {
+        app_id:            app_id.to_string(),
+        hostname:          self.hostname.unwrap(),
+        path_begin:        path_begin,
+        certificate:       certificate_opt,
+        key:               key_opt,
+        certificate_chain: chain_opt,
+        backends:          self.backends,
+        sticky_session:    sticky_session,
+
+      }))
+    }
+  }
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+pub struct HttpAppConfig {
+  pub app_id:            String,
+  pub hostname:          String,
+  pub path_begin:        String,
+  pub certificate:       Option<String>,
+  pub key:               Option<String>,
+  pub certificate_chain: Option<Vec<String>>,
+  pub backends:          Vec<String>,
+  pub sticky_session:    bool,
+}
+
+impl HttpAppConfig {
+  pub fn generate_orders(&self) -> Vec<Order> {
+    let mut v = Vec::new();
+
+    v.push(Order::AddApplication(Application {
+      app_id: self.app_id.clone(),
+      sticky_session: false,
+    }));
+
+    //create the front both for HTTP and HTTPS if possible
+    v.push(Order::AddHttpFront(HttpFront {
+      app_id:     self.app_id.clone(),
+      hostname:   self.hostname.clone(),
+      path_begin: self.path_begin.clone(),
+    }));
+
+
+    if self.key.is_some() && self.certificate.is_some() {
+
+      v.push(Order::AddCertificate(CertificateAndKey {
+        key:               self.key.clone().unwrap(),
+        certificate:       self.certificate.clone().unwrap(),
+        certificate_chain: self.certificate_chain.clone().unwrap_or(vec!()),
+      }));
+
+      if let Some(f) = calculate_fingerprint(&self.certificate.as_ref().unwrap().as_bytes()[..]) {
+        v.push(Order::AddHttpsFront(HttpsFront {
+          app_id:         self.app_id.clone(),
+          hostname:       self.hostname.clone(),
+          path_begin:     self.path_begin.clone(),
+          fingerprint:    CertFingerprint(f),
+        }));
+      } else {
+        error!("cannot obtain the certificate's fingerprint");
+      }
+    }
+
+    let mut backend_count = 0usize;
+    for address_str in self.backends.iter() {
+      if let Ok(address_list) = address_str.to_socket_addrs() {
+        for address in address_list {
+          let ip   = format!("{}", address.ip());
+          let port = address.port();
+
+          v.push(Order::AddInstance(Instance {
+            app_id:     self.app_id.clone(),
+            instance_id: format!("{}-{}", self.app_id, backend_count),
+            ip_address: ip,
+            port:       port
+          }));
+
+          backend_count += 1;
+        }
+      } else {
+        error!("could not parse address: {}", address_str);
+      }
+    }
+
+    v
+  }
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+pub struct TcpAppConfig {
+  pub app_id:            String,
+  pub ip_address:        String,
+  pub port:              u16,
+  pub backends:          Vec<String>,
+}
+
+impl TcpAppConfig {
+  pub fn generate_orders(&self) -> Vec<Order> {
+    let mut v = Vec::new();
+
+    v.push(Order::AddApplication(Application {
+      app_id: self.app_id.clone(),
+      sticky_session: false,
+    }));
+
+    v.push(Order::AddTcpFront(TcpFront {
+      app_id:     self.app_id.clone(),
+      ip_address: self.ip_address.clone(),
+      port:       self.port,
+    }));
+
+    let mut backend_count = 0usize;
+    for address_str in self.backends.iter() {
+      if let Ok(address_list) = address_str.to_socket_addrs() {
+        for address in address_list {
+          let ip   = format!("{}", address.ip());
+          let port = address.port();
+
+          v.push(Order::AddInstance(Instance {
+            app_id:     self.app_id.clone(),
+            instance_id: format!("{}-{}", self.app_id, backend_count),
+            ip_address: ip,
+            port:       port
+          }));
+
+          backend_count += 1;
+        }
+      } else {
+        error!("could not parse address: {}", address_str);
+      }
+    }
+
+    v
+  }
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+pub enum AppConfig {
+  Http(HttpAppConfig),
+  Tcp(TcpAppConfig),
+}
+
+impl AppConfig {
+  pub fn generate_orders(&self) -> Vec<Order> {
+    match self {
+      &AppConfig::Http(ref http) => http.generate_orders(),
+      &AppConfig::Tcp(ref tcp)   => tcp.generate_orders(),
+    }
+  }
+}
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct FileConfig {
@@ -192,7 +395,8 @@ pub struct FileConfig {
   pub metrics:                 Option<MetricsConfig>,
   pub http:                    Option<ProxyConfig>,
   pub https:                   Option<ProxyConfig>,
-  pub applications:            Option<HashMap<String, AppConfig>>,
+  pub tcp:                     Option<TcpProxyConfig>,
+  pub applications:            Option<HashMap<String, FileAppConfig>>,
   pub handle_process_affinity: Option<bool>
 }
 
@@ -214,6 +418,16 @@ impl FileConfig {
   }
 
   pub fn into(self, config_path: &str) -> Config {
+    let mut applications = HashMap::new();
+
+    if let Some(mut apps) = self.applications {
+      for (id, app) in apps.drain() {
+        match app.to_app_config(id.as_str()) {
+          Ok(app_config) => { applications.insert(id, app_config); },
+          Err(s)         => { error!("error parsing application configuration for {}: {}", id, s); },
+        }
+      }
+    }
 
     Config {
       config_path:    config_path.to_string(),
@@ -231,7 +445,8 @@ impl FileConfig {
       metrics: self.metrics,
       http: self.http,
       https: self.https,
-      applications: self.applications.unwrap_or(HashMap::new()),
+      tcp: self.tcp,
+      applications: applications,
       handle_process_affinity: self.handle_process_affinity.unwrap_or(false),
     }
   }
@@ -254,6 +469,7 @@ pub struct Config {
   pub metrics:                 Option<MetricsConfig>,
   pub http:                    Option<ProxyConfig>,
   pub https:                   Option<ProxyConfig>,
+  pub tcp:                     Option<TcpProxyConfig>,
   pub applications:            HashMap<String, AppConfig>,
   pub handle_process_affinity: bool,
 }
@@ -266,121 +482,17 @@ impl Config {
   pub fn generate_config_messages(&self) -> Vec<ConfigMessage> {
     let mut v = Vec::new();
     let mut count = 0u8;
-    for (ref id, ref app) in &self.applications {
 
-      let path_begin = app.path_begin.as_ref().unwrap_or(&String::new()).clone();
-
-      //FIXME: TCP should be handled as well
-      let key_opt         = app.key.as_ref().and_then(|path| Config::load_file(&path).ok());
-      let certificate_opt = app.certificate.as_ref().and_then(|path| Config::load_file(&path).ok());
-      let chain_opt       = app.certificate_chain.as_ref().and_then(|path| Config::load_file(&path).ok())
-        .map(split_certificate_chain);
-
-      let order = Order::AddApplication(Application {
-        app_id: id.to_string(),
-        sticky_session: app.sticky_session.unwrap_or(false),
-      });
-
-      v.push(ConfigMessage {
-        id:       format!("CONFIG-{}", count),
-        version:  PROTOCOL_VERSION,
-        proxy_id: None,
-        data:     ConfigCommand::ProxyConfiguration(order),
-      });
-      count += 1;
-
-      //create the front both for HTTP and HTTPS if possible
-      let order = Order::AddHttpFront(HttpFront {
-        app_id:         id.to_string(),
-        hostname:       app.hostname.clone(),
-        path_begin:     path_begin.clone(),
-      });
-
-      v.push(ConfigMessage {
-        id:       format!("CONFIG-{}", count),
-        version:  PROTOCOL_VERSION,
-        proxy_id: None,
-        data:     ConfigCommand::ProxyConfiguration(order),
-      });
-      count += 1;
-
-      if key_opt.is_some() || certificate_opt.is_some()  || chain_opt.is_some() {
-
-        if key_opt.is_none() {
-          error!("cannot read the key at {:?}", app.key);
-          continue;
-        }
-        if certificate_opt.is_none() {
-          error!("cannot read the certificate at {:?}", app.certificate);
-          continue;
-        }
-        if chain_opt.is_none() {
-          error!("cannot read the certificate chain at {:?}", app.certificate_chain);
-          continue;
-        }
-        let certificate = certificate_opt.unwrap();
-        let fingerprint = match calculate_fingerprint(&certificate.as_bytes()[..]) {
-          Some(f)  => CertFingerprint(f),
-          None => {
-            error!("cannot obtain the certificate's fingerprint");
-            continue;
-          }
-        };
-
-        let certificate_order = Order::AddCertificate(CertificateAndKey {
-          key:               key_opt.unwrap(),
-          certificate:       certificate,
-          certificate_chain: chain_opt.unwrap(),
-        });
+    for ref app in self.applications.values() {
+      let mut orders = app.generate_orders();
+      for order in orders.drain(..) {
         v.push(ConfigMessage {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           proxy_id: None,
-          data:     ConfigCommand::ProxyConfiguration(certificate_order),
+          data:     ConfigCommand::ProxyConfiguration(order),
         });
         count += 1;
-        let front_order = Order::AddHttpsFront(HttpsFront {
-          app_id:         id.to_string(),
-          hostname:       app.hostname.clone(),
-          path_begin:     path_begin,
-          fingerprint:    fingerprint,
-        });
-        v.push(ConfigMessage {
-          id:       format!("CONFIG-{}", count),
-          version:  PROTOCOL_VERSION,
-          proxy_id: None,
-          data:     ConfigCommand::ProxyConfiguration(front_order),
-        });
-        count += 1;
-      }
-
-      let mut backend_count = 0usize;
-      for address_str in app.backends.iter() {
-        if let Ok(address_list) = address_str.to_socket_addrs() {
-          for address in address_list {
-            let ip   = format!("{}", address.ip());
-            let port = address.port();
-
-            let backend_order = Order::AddInstance(Instance {
-              app_id:     id.to_string(),
-              instance_id: format!("{}-{}", id, backend_count),
-              ip_address: ip,
-              port:       port
-            });
-
-            v.push(ConfigMessage {
-              id:       format!("CONFIG-{}", count),
-              version:  PROTOCOL_VERSION,
-              proxy_id: None,
-              data:     ConfigCommand::ProxyConfiguration(backend_order),
-            });
-
-            count += 1;
-            backend_count += 1;
-          }
-        } else {
-          error!("could not parse address: {}", address_str);
-        }
       }
     }
 

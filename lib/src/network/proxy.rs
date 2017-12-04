@@ -68,6 +68,7 @@ impl Server {
     ));
 
     let max_connections = config.max_connections;
+    let max_buffers     = config.max_buffers;
     let http_session = config.http.and_then(|conf| conf.to_http()).and_then(|http_conf| {
       let max_listeners = 1;
       http::ServerConfiguration::new(http_conf, &mut event_loop, 1 + max_listeners, pool.clone()).map(|configuration| {
@@ -81,9 +82,13 @@ impl Server {
         Session::new(max_listeners, max_connections, 6148914691236517205, configuration, &mut event_loop)
       }).ok()
     });
-    //TODO: implement for TCP
 
-    Server::new(event_loop, channel, http_session, https_session, None, Some(config_state))
+    let tcp_session = config.tcp.map(|conf| {
+      let configuration = tcp::ServerConfiguration::new(conf.max_listeners, 12297829382473034410, pool.clone());
+      Session::new(conf.max_listeners, max_buffers, 12297829382473034410, configuration, &mut event_loop)
+    });
+
+    Server::new(event_loop, channel, http_session, https_session, tcp_session, Some(config_state))
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel,
