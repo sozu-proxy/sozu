@@ -10,11 +10,11 @@ pub struct App {
 pub enum SubCmd {
   #[structopt(name = "shutdown", about = "shuts down the proxy without waiting for connections to finish")]
   Shutdown {
-    #[structopt(short = "h", long = "hard")]
-    hard: Option<bool>
+    #[structopt(short = "h", long = "hard", default_value="false")]
+    hard: bool
   },
-  #[structopt(name = "upgrade", about = "upgrades the proxy")]
-  Upgrades,
+  #[structopt(name = "upgrade", about = "upgrade the proxy")]
+  Upgrade,
   #[structopt(name = "status", about = "gets information on the running workers")]
   Status,
   #[structopt(name = "metrics", about = "gets statistics on the master and its workers")]
@@ -60,12 +60,12 @@ pub enum SubCmd {
 pub enum StateCmd {
   #[structopt(name = "save", about = "Save state to that file")]
   Save {
-    #[structopt(short = "h", long = "hard")]
+    #[structopt(short = "f", long = "file")]
     file: String,
   },
   #[structopt(name = "load", about = "Load state from that file")]
   Load {
-    #[structopt(short = "h", long = "hard")]
+    #[structopt(short = "f", long = "file")]
     file: String,
   },
   #[structopt(name = "dump")]
@@ -81,10 +81,10 @@ pub enum ApplicationCmd {
   },
   #[structopt(name = "add")]
   Add{
-    #[structopt(short = "h", long = "hard")]
+    #[structopt(short = "i", long = "id")]
     id: String,
-    #[structopt(short = "s", long = "sticky session")]
-    sticky_session: Option<bool>,
+    #[structopt(short = "s", long = "sticky-session", default_value="false")]
+    sticky_session: bool,
   },
 }
 
@@ -98,7 +98,7 @@ pub enum BackendCmd {
     instance_id: String,
     #[structopt(long = "ip")]
     ip: String,
-    #[structopt(short = "p", long = "prot")]
+    #[structopt(short = "p", long = "port")]
     port: u16,
   },
   #[structopt(name = "add")]
@@ -109,7 +109,7 @@ pub enum BackendCmd {
     instance_id: String,
     #[structopt(long = "ip")]
     ip: String,
-    #[structopt(short = "p", long = "prot")]
+    #[structopt(short = "p", long = "port")]
     port: u16,
   },
 }

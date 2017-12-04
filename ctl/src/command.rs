@@ -660,9 +660,9 @@ pub fn remove_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswe
   order_command(channel, Order::RemoveApplication(String::from(app_id)));
 }
 
-pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<&str>) {
+pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
   if let Some(certificate_path) = certificate {
-    match Config::load_file_bytes(certificate_path) {
+    match Config::load_file_bytes(&certificate_path) {
       Ok(data) => {
         match calculate_fingerprint(&data) {
           None              => println!("could not calculate fingerprint for certificate"),
@@ -687,9 +687,9 @@ pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, ap
   }
 }
 
-pub fn remove_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<&str>) {
+pub fn remove_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
   if let Some(certificate_path) = certificate {
-    match Config::load_file_bytes(certificate_path) {
+    match Config::load_file_bytes(&certificate_path) {
       Ok(data) => {
         match calculate_fingerprint(&data) {
           None              => println!("could not calculate fingerprint for certificate"),
@@ -787,9 +787,9 @@ pub fn remove_tcp_front(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>
 }
 */
 
-pub fn query_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, application_id: Option<&str>) {
+pub fn query_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, application_id: Option<String>) {
   let command = match application_id {
-    Some(app_id) => ConfigCommand::Query(Query::Application(app_id.to_string())),
+    Some(ref app_id) => ConfigCommand::Query(Query::Application(app_id.to_string())),
     None         => ConfigCommand::Query(Query::Applications),
   };
 
