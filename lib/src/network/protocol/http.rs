@@ -814,6 +814,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     if r == SocketResult::Error {
       error!("{}\tback socket read error, closing connection", self.log_ctx);
+      metrics.service_stop();
       self.readiness.reset();
       return (ProtocolResult::Continue, ClientResult::CloseBoth);
     }

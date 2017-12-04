@@ -216,6 +216,9 @@ impl ProxyClient for Client {
       self.front_buf.sliced_input(sz);
       self.front_buf.consume_parsed_data(sz);
       self.front_buf.slice_output(sz);
+
+      count!("bytes_in", sz as i64);
+      self.metrics.bin += sz;
     } else {
       self.readiness.front_readiness.remove(Ready::readable());
     }
@@ -223,6 +226,9 @@ impl ProxyClient for Client {
 
     match res {
       SocketResult::Error => {
+        error!("{}\tfront socket error, closing the connection", self.log_context());
+        self.metrics.service_stop();
+        incr_ereq!();
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
@@ -252,10 +258,14 @@ impl ProxyClient for Client {
        sz += current_sz;
      }
      trace!("{}\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0, sz);
+     self.metrics.bout += sz;
 
      match socket_res {
        SocketResult::Error => {
          self.readiness.reset();
+         self.metrics.service_stop();
+         error!("{}\terror writing default answer to front socket, closing", self.log_context());
+         incr_ereq!();
          ClientResult::CloseBoth
        },
        SocketResult::WouldBlock => {
@@ -276,6 +286,9 @@ impl ProxyClient for Client {
       return ClientResult::Continue;
     }
 
+    //FIXME: maybe do not allocate here over and over
+    let log_ctx = self.log_context();
+
     if let Some(ref mut sock) = self.backend {
       let (sz, res) = sock.socket_read(self.back_buf.buffer.space());
       self.back_buf.buffer.fill(sz);
@@ -283,9 +296,12 @@ impl ProxyClient for Client {
       self.back_buf.consume_parsed_data(sz);
       self.back_buf.slice_output(sz);
       trace!("{}\tBACK  [{}<-{}]: read {} bytes", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0, sz);
+      self.metrics.backend_bin += sz;
 
       match res {
         SocketResult::Error => {
+          error!("{}\tback socket read error, closing connection", log_ctx);
+          self.metrics.service_stop();
           self.readiness.reset();
           return ClientResult::CloseClient;
         },
@@ -322,9 +338,12 @@ impl ProxyClient for Client {
        }
      }
     trace!("{}\tBACK [{}->{}]: wrote {} bytes", self.request_id, self.token.unwrap().0, self.backend_token.unwrap().0, sz);
+    self.metrics.backend_bout += sz;
 
      match socket_res {
        SocketResult::Error => {
+         error!("{}\tback socket write error, closing connection", self.log_context());
+         self.metrics.service_stop();
          self.readiness.reset();
          ClientResult::CloseBoth
        },
