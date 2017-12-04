@@ -1,11 +1,13 @@
-#[macro_use] extern crate clap;
 #[macro_use] extern crate prettytable;
 extern crate rand;
 extern crate sozu_command_lib as sozu_command;
+extern crate structopt;
+#[macro_use] extern crate structopt_derive;
 
 mod command;
+mod cli;
 
-use clap::{App,Arg,SubCommand};
+use structopt::StructOpt;
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
@@ -15,336 +17,67 @@ use command::{add_application,remove_application,dump_state,load_state,save_stat
   remove_backend, add_backend, remove_frontend, add_frontend, add_certificate, remove_certificate, query_application,
   logging_filter};
 
-use std::str::FromStr;
+use cli::*;
 
 fn main() {
-  let matches = App::new("sozuctl")
-                        .version(crate_version!())
-                        .about("hot reconfigurable proxy")
-                        .arg(Arg::with_name("config")
-                            .short("c")
-                            .long("config")
-                            .value_name("FILE")
-                            .help("Sets a custom config file")
-                            .takes_value(true)
-                            .required(option_env!("SOZU_CONFIG").is_none()))
-                        .subcommand(SubCommand::with_name("shutdown")
-                                    .about("shuts down the proxy")
-                                    .arg(Arg::with_name("hard").long("hard")
-                                         .help("shuts down the proxy without waiting for connections to finish")))
-                        .subcommand(SubCommand::with_name("upgrade")
-                                    .about("upgrades the proxy"))
-                        .subcommand(SubCommand::with_name("status")
-                                    .about("gets information on the running workers"))
-                        .subcommand(SubCommand::with_name("metrics")
-                                    .about("gets statistics on the master and its workers"))
-                        .subcommand(SubCommand::with_name("state")
-                                    .about("state management")
-                                    .subcommand(SubCommand::with_name("save")
-                                                .arg(Arg::with_name("file")
-                                                    .short("f")
-                                                    .long("file")
-                                                    .value_name("state file")
-                                                    .help("Save state to that file")
-                                                    .takes_value(true)
-                                                    .required(true)))
-                                    .subcommand(SubCommand::with_name("load")
-                                                .arg(Arg::with_name("file")
-                                                    .short("f")
-                                                    .long("file")
-                                                    .value_name("state file")
-                                                    .help("Save state to that file")
-                                                    .takes_value(true)
-                                                    .required(true)))
-                                    .subcommand(SubCommand::with_name("dump")))
-                        .subcommand(SubCommand::with_name("application")
-                                                .about("application management")
-                                                .subcommand(SubCommand::with_name("remove")
-                                                  .arg(Arg::with_name("id")
-                                                      .short("i")
-                                                      .long("id")
-                                                      .value_name("application identifier")
-                                                      .takes_value(true)
-                                                      .required(true)))
-                                                .subcommand(SubCommand::with_name("add")
-                                                  .arg(Arg::with_name("id")
-                                                      .short("i")
-                                                      .long("id")
-                                                      .value_name("application identifier")
-                                                      .takes_value(true)
-                                                      .required(true))
-                                                  .arg(Arg::with_name("sticky_session")
-                                                      .long("sticky session")
-                                                      .value_name("the frontend should do sticky session")
-                                                      .takes_value(true)
-                                                      .required(false))))
-                        .subcommand(SubCommand::with_name("backend")
-                                                .about("backend management")
-                                                .subcommand(SubCommand::with_name("remove")
-                                                  .arg(Arg::with_name("id")
-                                                      .short("i")
-                                                      .long("id")
-                                                      .value_name("app id of the backend")
-                                                      .takes_value(true)
-                                                      .required(true))
-                                                  .arg(Arg::with_name("instance-id")
-                                                      .long("instance-id")
-                                                      .value_name("id of the backend")
-                                                      .takes_value(true)
-                                                      .required(true))
-                                                  .arg(Arg::with_name("ip")
-                                                      .long("ip")
-                                                      .value_name("ip of the backend")
-                                                      .takes_value(true)
-                                                      .required(true))
-                                                  .arg(Arg::with_name("port")
-                                                      .long("port")
-                                                      .short("p")
-                                                      .value_name("port of the backend")
-                                                      .takes_value(true)
-                                                      .required(true)))
-                                                .subcommand(SubCommand::with_name("add")
-                                                  .arg(Arg::with_name("id")
-                                                      .short("i")
-                                                      .long("id")
-                                                      .value_name("app id of the backend")
-                                                      .takes_value(true)
-                                                      .required(true))
-                                                  .arg(Arg::with_name("instance-id")
-                                                      .long("instance-id")
-                                                      .value_name("id of the backend")
-                                                      .takes_value(true)
-                                                      .required(true))
-                                                  .arg(Arg::with_name("ip")
-                                                      .long("ip")
-                                                      .value_name("ip of the backend")
-                                                      .takes_value(true)
-                                                      .required(true))
-                                                  .arg(Arg::with_name("port")
-                                                      .long("port")
-                                                      .short("p")
-                                                      .value_name("port of the backend")
-                                                      .takes_value(true)
-                                                      .required(true))))
-                        .subcommand(SubCommand::with_name("frontend")
-                                                .about("frontend management")
-                                                .subcommand(SubCommand::with_name("add")
-                                                  .arg(Arg::with_name("id")
-                                                      .short("i")
-                                                      .long("id")
-                                                      .value_name("app id of the frontend")
-                                                      .takes_value(true)
-                                                      .required(true))
-                                                  .arg(Arg::with_name("hostname")
-                                                      .short("host")
-                                                      .long("hostname")
-                                                      .value_name("hostname of the frontend")
-                                                      .takes_value(true)
-                                                      .required(true))
-                                                  .arg(Arg::with_name("path_begin")
-                                                      .long("path_begin")
-                                                      .value_name("URL prefix of the frontend")
-                                                      .takes_value(true)
-                                                      .required(false))
-                                                  .arg(Arg::with_name("certificate")
-                                                      .long("certificate")
-                                                      .value_name("path to a certificate file")
-                                                      .takes_value(true)
-                                                      .required(false)))
-                                                .subcommand(SubCommand::with_name("remove")
-                                                  .arg(Arg::with_name("id")
-                                                      .short("i")
-                                                      .long("id")
-                                                      .value_name("app id of the frontend")
-                                                      .takes_value(true)
-                                                      .required(true))
-                                                  .arg(Arg::with_name("hostname")
-                                                      .short("host")
-                                                      .long("hostname")
-                                                      .value_name("hostname of the frontend")
-                                                      .takes_value(true)
-                                                      .required(true))
-                                                  .arg(Arg::with_name("path_begin")
-                                                      .long("path_begin")
-                                                      .value_name("URL prefix of the frontend")
-                                                      .takes_value(true)
-                                                      .required(false))
-                                                  .arg(Arg::with_name("certificate")
-                                                      .long("certificate")
-                                                      .value_name("path to a certificate file")
-                                                      .takes_value(true)
-                                                      .required(false))))
-                        .subcommand(SubCommand::with_name("certificate")
-                                                .about("certificate management")
-                                                .subcommand(SubCommand::with_name("add")
-                                                  .arg(Arg::with_name("certificate")
-                                                      .long("certificate")
-                                                      .value_name("path to the certificate")
-                                                      .takes_value(true)
-                                                      .required(true))
-                                                  .arg(Arg::with_name("certificate chain")
-                                                      .short("chain")
-                                                      .long("certificate-chain")
-                                                      .value_name("path to the certificate chain")
-                                                      .takes_value(true)
-                                                      .required(true))
-                                                  .arg(Arg::with_name("key")
-                                                      .long("key")
-                                                      .value_name("path to the key")
-                                                      .takes_value(true)
-                                                      .required(false)))
-                                                .subcommand(SubCommand::with_name("remove")
-                                                  .arg(Arg::with_name("certificate")
-                                                      .long("certificate")
-                                                      .value_name("path to the certificate")
-                                                      .takes_value(true)
-                                                      .required(true))))
-                        .subcommand(SubCommand::with_name("query")
-                                                .about("configuration state verification")
-                                                .subcommand(SubCommand::with_name("applications")
-                                                  .arg(Arg::with_name("id")
-                                                      .short("i")
-                                                      .long("id")
-                                                      .value_name("application identifier")
-                                                      .takes_value(true)
-                                                      .required(false))))
-                        .subcommand(SubCommand::with_name("logging")
-                                                .about("change logging level")
-                                                .arg(Arg::with_name("level")
-                                                  .short("l")
-                                                  .long("level")
-                                                  .value_name("logging level")
-                                                  .takes_value(true)
-                                                  .required(true)))
-                        .get_matches();
- 
-  let config_file = match matches.value_of("config"){
-                      Some(config_file) => config_file,
-                      None => option_env!("SOZU_CONFIG").expect("could not find `SOZU_CONFIG` env var at build"),
-                    };
+  let matches = App::from_args();
 
-  let config = Config::load_from_path(config_file).expect("could not parse configuration file");
+  let config_file = matches.config;
+
+  let config = Config::load_from_path(config_file.as_str()).expect("could not parse configuration file");
   let mut channel: Channel<ConfigMessage,ConfigMessageAnswer> =
     Channel::from_path(&config.command_socket_path(), 10_000, 2_000_000)
       .expect("could not connect to the command unix socket");
 
   channel.set_nonblocking(false);
 
-  match matches.subcommand() {
-    ("shutdown", Some(sub)) => {
-      let hard_shutdown = sub.is_present("hard");
-      if hard_shutdown {
+  match matches.cmd {
+    SubCmd::Shutdown{ hard } => {
+      if hard {
         hard_stop(&mut channel);
       } else {
         soft_stop(&mut channel);
       }
     },
-    ("upgrade", Some(_)) => {
-      upgrade(&mut channel);
-    },
-    ("status", Some(_)) => {
-      status(channel);
-    },
-    ("metrics", Some(_)) => {
-      metrics(&mut channel);
-    },
-    ("state", Some(sub))    => {
-      match sub.subcommand() {
-        ("save", Some(state_sub)) => {
-          let file = state_sub.value_of("file").expect("missing target file");
-          save_state(&mut channel, file);
-        },
-        ("load", Some(state_sub)) => {
-          let file = state_sub.value_of("file").expect("missing target file");
-          load_state(&mut channel, file);
-        },
-        ("dump", _) => {
-          dump_state(&mut channel);
-        },
-        _                   => println!("unknown state management command")
+    SubCmd::Upgrade => upgrade(&mut channel),
+    SubCmd::Status => status(channel),
+    SubCmd::Metrics => metrics(&mut channel),
+    SubCmd::Logging{ level } => logging_filter(&mut channel, &level),
+    SubCmd::State{ cmd } => {
+      match cmd {
+        StateCmd::Save{ file } => save_state(&mut channel, &file),
+        StateCmd::Load{ file } => load_state(&mut channel, &file),
+        StateCmd::Dump => dump_state(&mut channel),
       }
     },
-    ("application", Some(sub)) => {
-      match sub.subcommand() {
-        ("remove", Some(app_sub)) => {
-          let id = app_sub.value_of("id").expect("missing id");
-          remove_application(&mut channel, id);
-        }
-        ("add", Some(app_sub)) => {
-          let id = app_sub.value_of("id").expect("missing id");
-          let sticky_session  = app_sub.value_of("sticky_session").and_then(|b| bool::from_str(b).ok()).unwrap_or(false);
-          add_application(&mut channel, id, sticky_session);
-        }
-        _ => println!("unknown backend management command")
+    SubCmd::Application{ cmd } => {
+      match cmd {
+        ApplicationCmd::Add{ id, sticky_session } => add_application(&mut channel, &id, sticky_session),
+        ApplicationCmd::Remove{ id } => remove_application(&mut channel, &id),
       }
     },
-    ("backend", Some(sub)) => {
-      match sub.subcommand() {
-        ("remove", Some(backend_sub)) => {
-          let id = backend_sub.value_of("id").expect("missing id");
-          let instance_id = backend_sub.value_of("instance-id").expect("missing instance id");
-          let ip = backend_sub.value_of("ip").expect("missing backend ip");
-          let port: u16 = backend_sub.value_of("port").expect("mssing backend port").parse().unwrap();
-          remove_backend(&mut channel, id, instance_id, ip, port);
-        }
-        ("add", Some(backend_sub)) => {
-          let id = backend_sub.value_of("id").expect("missing id");
-          let instance_id = backend_sub.value_of("instance-id").expect("missing instance id");
-          let ip = backend_sub.value_of("ip").expect("missing backend ip");
-          let port: u16 = backend_sub.value_of("port").expect("mssing backend port").parse().unwrap();
-          add_backend(&mut channel, id, instance_id, ip, port);
-        }
-        _ => println!("unknown backend management command")
+    SubCmd::Backend{ cmd } => {
+      match cmd {
+        BackendCmd::Add{ id, instance_id, ip, port } => add_backend(&mut channel, &id, &instance_id, &ip, port),
+        BackendCmd::Remove{ id, instance_id, ip, port } => remove_backend(&mut channel, &id, &instance_id, &ip, port),
       }
     },
-    ("frontend", Some(sub)) => {
-      match sub.subcommand() {
-        ("remove", Some(frontend_sub)) => {
-          let id              = frontend_sub.value_of("id").expect("missing id");
-          let hostname        = frontend_sub.value_of("hostname").expect("missing frontend hostname");
-          let path_begin      = frontend_sub.value_of("path_begin").unwrap_or("");
-          let certificate     = frontend_sub.value_of("certificate");
-          remove_frontend(&mut channel, id, hostname, path_begin, certificate);
-        },
-        ("add", Some(frontend_sub)) => {
-          let id              = frontend_sub.value_of("id").expect("missing id");
-          let hostname        = frontend_sub.value_of("hostname").expect("missing frontend hostname");
-          let path_begin      = frontend_sub.value_of("path_begin").unwrap_or("");
-          let certificate     = frontend_sub.value_of("certificate");
-          add_frontend(&mut channel, id, hostname, path_begin, certificate);
-        }
-        _ => println!("unknown backend management command")
+    SubCmd::Frontend{ cmd } => {
+      match cmd {
+        FrontendCmd::Add{ id, hostname, path_begin, path_to_certificate } => add_frontend(&mut channel, &id, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate),
+        FrontendCmd::Remove{ id, hostname, path_begin, path_to_certificate } => remove_frontend(&mut channel, &id, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate),
       }
     },
-    ("certificate", Some(sub)) => {
-      match sub.subcommand() {
-        ("add", Some(cert_sub)) => {
-          let certificate = cert_sub.value_of("certificate").expect("missing certificate path");
-          let chain       = cert_sub.value_of("certificate-chain").expect("missing certificate chain path");
-          let key         = cert_sub.value_of("key").unwrap_or("missing key path");
-          add_certificate(&mut channel, certificate, chain, key);
-        }
-        ("remove", Some(cert_sub)) => {
-          let certificate = cert_sub.value_of("certificate").expect("missing certificate path");
-          remove_certificate(&mut channel, certificate);
-        },
-        _ => println!("unknown backend management command")
+    SubCmd::Certificate{ cmd } => {
+      match cmd {
+        CertificateCmd::Add{ certificate, chain, key } => add_certificate(&mut channel, &certificate, &chain, key.unwrap_or("missing key path".to_string()).as_str()),
+        CertificateCmd::Remove{ certificate } => remove_certificate(&mut channel, &certificate),
       }
     },
-    ("query", Some(sub)) => {
-      match sub.subcommand() {
-        ("applications", Some(frontend_sub)) => {
-          let id              = frontend_sub.value_of("id");
-          query_application(&mut channel, id);
-        },
-        _ => println!("unknown query command")
+    SubCmd::Query{ cmd } => {
+      match cmd {
+        QueryCmd::Applications{ id } => query_application(&mut channel, id),
       }
     },
-    ("logging", Some(sub)) => {
-      let level = sub.value_of("level").expect("missing logging level");
-      logging_filter(&mut channel, level);
-    },
-    _                => println!("unknown subcommand")
   }
-
 }
