@@ -86,6 +86,36 @@ impl Client {
       metrics:        SessionMetrics::new(),
     }
   }
+
+  fn log_request(&self) {
+    let client = match self.sock.peer_addr().ok() {
+      None => String::from("-"),
+      Some(SocketAddr::V4(addr)) => format!("{}", addr),
+      Some(SocketAddr::V6(addr)) => format!("{}", addr),
+    };
+
+    let backend = match self.backend.as_ref().and_then(|backend| backend.peer_addr().ok()) {
+      None => String::from("-"),
+      Some(SocketAddr::V4(addr)) => format!("{}", addr),
+      Some(SocketAddr::V6(addr)) => format!("{}", addr),
+    };
+
+    let response_time = self.metrics.response_time().num_milliseconds();
+    let service_time  = self.metrics.service_time().num_milliseconds();
+    let app_id = self.app_id.clone().unwrap_or(String::from("-"));
+    record_request_time!(&app_id, response_time);
+
+    if let Some(backend_id) = self.metrics.backend_id.as_ref() {
+      if let Some(backend_response_time) = self.metrics.backend_response_time() {
+        record_backend_metrics!(backend_id, backend_response_time.num_milliseconds(),
+          self.metrics.backend_bin, self.metrics.backend_bout);
+      }
+    }
+
+    info!("{}{} -> {}\t{} {} {} {}",
+      self.log_context(), client, backend,
+      response_time, service_time, self.metrics.bin, self.metrics.bout);
+  }
 }
 
 impl ProxyClient for Client {
@@ -106,7 +136,6 @@ impl ProxyClient for Client {
   }
 
   fn close(&mut self) {
-    //println!("TCP closing[{:?}] front: {:?}, back: {:?}", self.token, *self.front_buf, *self.back_buf);
   }
 
   fn log_context(&self) -> String {
@@ -146,7 +175,7 @@ impl ProxyClient for Client {
   }
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0);
+
     let addr = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
     self.backend       = None;
     self.backend_token = None;
@@ -154,6 +183,7 @@ impl ProxyClient for Client {
   }
 
   fn front_hup(&mut self) -> ClientResult {
+    self.log_request();
     self.readiness.front_interest = UnixReady::from(Ready::empty());
     if  self.status == ConnectionStatus::ServerClosed ||
         self.status == ConnectionStatus::ClientConnected { // the server never answered, the client closed
@@ -168,6 +198,7 @@ impl ProxyClient for Client {
   }
 
   fn back_hup(&mut self) -> ClientResult {
+    self.log_request();
     self.readiness.back_interest = UnixReady::from(Ready::empty());
     self.status = ConnectionStatus::Closed;
     ClientResult::CloseBoth
