@@ -300,6 +300,7 @@ pub struct QueryAnswerApplication {
   pub configuration:   Option<Application>,
   pub http_frontends:  Vec<HttpFront>,
   pub https_frontends: Vec<HttpsFront>,
+  pub tcp_frontends:   Vec<TcpFront>,
   pub backends:        Vec<Instance>,
 }
 

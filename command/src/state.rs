@@ -5,7 +5,8 @@ use std::hash::{Hash, Hasher};
 use std::iter::FromIterator;
 use certificate::calculate_fingerprint;
 
-use messages::{Application,CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,Instance,QueryAnswerApplication};
+use messages::{Application,CertFingerprint,CertificateAndKey,Order,
+  HttpFront,HttpsFront,TcpFront,Instance,QueryAnswerApplication};
 
 pub type AppId = String;
 
@@ -32,6 +33,7 @@ pub struct ConfigState {
   pub instances:       HashMap<AppId, Vec<Instance>>,
   pub http_fronts:     HashMap<AppId, Vec<HttpFront>>,
   pub https_fronts:    HashMap<AppId, Vec<HttpsFront>>,
+  pub tcp_fronts:      HashMap<AppId, Vec<TcpFront>>,
   pub certificates:    HashMap<CertFingerprint, CertificateAndKey>,
   //ip, port
   pub http_addresses:  Vec<(String, u16)>,
@@ -46,6 +48,7 @@ impl ConfigState {
       instances:       HashMap::new(),
       http_fronts:     HashMap::new(),
       https_fronts:    HashMap::new(),
+      tcp_fronts:      HashMap::new(),
       certificates:    HashMap::new(),
       http_addresses:  Vec::new(),
       https_addresses: Vec::new(),
@@ -103,7 +106,20 @@ impl ConfigState {
         }
       },
       &Order::RemoveHttpsFront(ref front) => {
-        self.https_fronts.remove(&front.app_id);
+        if let Some(front_list) = self.https_fronts.get_mut(&front.app_id) {
+          front_list.retain(|el| el.hostname != front.hostname || el.path_begin != front.path_begin);
+        }
+      },
+      &Order::AddTcpFront(ref front) => {
+        let front_vec = self.tcp_fronts.entry(front.app_id.clone()).or_insert(vec!());
+        if !front_vec.contains(front) {
+          front_vec.push(front.clone());
+        }
+      },
+      &Order::RemoveTcpFront(ref front) => {
+        if let Some(front_list) = self.tcp_fronts.get_mut(&front.app_id) {
+          front_list.retain(|el| el.ip_address != front.ip_address || el.port != front.port);
+        }
       },
       &Order::AddInstance(ref instance)  => {
         let instance_vec = self.instances.entry(instance.app_id.clone()).or_insert(vec!());
@@ -144,6 +160,12 @@ impl ConfigState {
     for front_list in self.https_fronts.values() {
       for front in front_list {
         v.push(Order::AddHttpsFront(front.clone()));
+      }
+    }
+
+    for front_list in self.tcp_fronts.values() {
+      for front in front_list {
+        v.push(Order::AddTcpFront(front.clone()));
       }
     }
 
@@ -195,6 +217,22 @@ impl ConfigState {
     let removed_https_fronts = my_fronts.difference(&their_fronts);
     let added_https_fronts   = their_fronts.difference(&my_fronts);
 
+    let mut my_fronts: HashSet<(&AppId, &TcpFront)> = HashSet::new();
+    for (ref app_id, ref front_list) in self.tcp_fronts.iter() {
+      for ref front in front_list.iter() {
+        my_fronts.insert((&app_id, &front));
+      }
+    }
+    let mut their_fronts: HashSet<(&AppId, &TcpFront)> = HashSet::new();
+    for (ref app_id, ref front_list) in other.tcp_fronts.iter() {
+      for ref front in front_list.iter() {
+        their_fronts.insert((&app_id, &front));
+      }
+    }
+
+    let removed_tcp_fronts = my_fronts.difference(&their_fronts);
+    let added_tcp_fronts   = their_fronts.difference(&my_fronts);
+
     let mut my_instances: HashSet<(&AppId, &Instance)> = HashSet::new();
     for (ref app_id, ref instance_list) in self.instances.iter() {
       for ref instance in instance_list.iter() {
@@ -239,6 +277,10 @@ impl ConfigState {
      v.push(Order::RemoveHttpsFront(front.clone()));
     }
 
+    for &(_, front) in removed_tcp_fronts {
+     v.push(Order::RemoveTcpFront(front.clone()));
+    }
+
     for &(_, instance) in added_instances {
       v.push(Order::AddInstance(instance.clone()));
     }
@@ -255,6 +297,10 @@ impl ConfigState {
       v.push(Order::AddHttpsFront(front.clone()));
     }
 
+    for &(_, front) in added_tcp_fronts {
+      v.push(Order::AddTcpFront(front.clone()));
+    }
+
     for  &(fingerprint, _) in removed_certificates {
       v.push(Order::RemoveCertificate(fingerprint.clone()));
     }
@@ -268,6 +314,7 @@ impl ConfigState {
       self.instances.get(app_id).hash(&mut s);
       self.http_fronts.get(app_id).hash(&mut s);
       self.https_fronts.get(app_id).hash(&mut s);
+      self.tcp_fronts.get(app_id).hash(&mut s);
 
       (app_id.to_string(), s.finish())
 
@@ -279,6 +326,7 @@ impl ConfigState {
       configuration:   self.applications.get(app_id).cloned(),
       http_frontends:  self.http_fronts.get(app_id).cloned().unwrap_or(vec!()),
       https_frontends: self.https_fronts.get(app_id).cloned().unwrap_or(vec!()),
+      tcp_frontends:   self.tcp_fronts.get(app_id).cloned().unwrap_or(vec!()),
       backends:        self.instances.get(app_id).cloned().unwrap_or(vec!()),
     }
   }
