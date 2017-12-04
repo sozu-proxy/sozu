@@ -1,5 +1,3 @@
-#![allow(dead_code, unused_must_use, unused_variables, unused_imports)]
-
 use std::thread::{self,Thread,Builder};
 use std::sync::mpsc::{self,channel,Receiver};
 use mio::net::*;
@@ -54,8 +52,6 @@ pub struct Client {
   token:          Option<Token>,
   backend_token:  Option<Token>,
   accept_token:   ListenToken,
-  back_interest:  Ready,
-  front_interest: Ready,
   status:         ConnectionStatus,
   rx_count:       usize,
   tx_count:       usize,
@@ -68,6 +64,11 @@ pub struct Client {
 impl Client {
   fn new(sock: TcpStream, accept_token: ListenToken, front_buf: Checkout<BufferQueue>,
     back_buf: Checkout<BufferQueue>) -> Client {
+
+    let mut readiness = Readiness::new();
+    readiness.front_interest = UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error();
+    readiness.back_interest  = UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error();
+
     Client {
       sock:           sock,
       backend:        None,
@@ -76,14 +77,12 @@ impl Client {
       token:          None,
       backend_token:  None,
       accept_token:   accept_token,
-      back_interest:  Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-      front_interest: Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
       status:         ConnectionStatus::Connected,
       rx_count:       0,
       tx_count:       0,
       app_id:         None,
       request_id:     Uuid::new_v4().hyphenated().to_string(),
-      readiness:      Readiness::new(),
+      readiness:      readiness,
       metrics:        SessionMetrics::new(),
     }
   }
@@ -155,8 +154,10 @@ impl ProxyClient for Client {
   }
 
   fn front_hup(&mut self) -> ClientResult {
+    self.readiness.front_interest = UnixReady::from(Ready::empty());
     if  self.status == ConnectionStatus::ServerClosed ||
         self.status == ConnectionStatus::ClientConnected { // the server never answered, the client closed
+
       self.status = ConnectionStatus::Closed;
       ClientResult::CloseClient
     } else {
@@ -167,6 +168,7 @@ impl ProxyClient for Client {
   }
 
   fn back_hup(&mut self) -> ClientResult {
+    self.readiness.back_interest = UnixReady::from(Ready::empty());
     self.status = ConnectionStatus::Closed;
     ClientResult::CloseBoth
   }
