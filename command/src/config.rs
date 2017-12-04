@@ -609,6 +609,7 @@ mod tests {
       }),
       http:  Some(http),
       https: Some(https),
+      tcp:   None,
       applications: None,
     };
 
