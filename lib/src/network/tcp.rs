@@ -563,8 +563,12 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         });
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
-      _ => {
-        error!("unsupported message, ignoring");
+      // these messages are useless for now
+      Order::AddApplication(_) | Order::RemoveApplication(_) => {
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+      }
+      command => {
+        error!("{} unsupported message, ignoring {:?}", message.id, command);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message")), data: None}
       }
     }
