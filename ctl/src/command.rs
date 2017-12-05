@@ -62,39 +62,48 @@ pub fn save_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path
   }
 }
 
-pub fn load_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path: &str) {
+pub fn load_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, path: String) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
-    ConfigCommand::LoadState(path.to_string()),
+    ConfigCommand::LoadState(path.clone()),
     None,
   ));
 
-  match channel.read_message() {
-    None          => {
-      println!("the proxy didn't answer");
-      exit(1);
-    },
-    Some(message) => {
-      if id != message.id {
-        println!("received message with invalid id: {:?}", message);
+  let (send, recv) = mpsc::channel();
+
+  thread::spawn(move || {
+    match channel.read_message() {
+      None          => {
+        println!("the proxy didn't answer");
         exit(1);
-      }
-      match message.status {
-        ConfigMessageStatus::Processing => {
-          // do nothing here
-          // for other messages, we would loop over read_message
-          // until an error or ok message was sent
-        },
-        ConfigMessageStatus::Error => {
-          println!("could not load proxy state: {}", message.message);
+      },
+      Some(message) => {
+        if id != message.id {
+          println!("received message with invalid id: {:?}", message);
           exit(1);
-        },
-        ConfigMessageStatus::Ok => {
-          println!("Proxy state loaded successfully from {}", path);
+        }
+        match message.status {
+          ConfigMessageStatus::Processing => {
+            // do nothing here
+            // for other messages, we would loop over read_message
+            // until an error or ok message was sent
+          },
+          ConfigMessageStatus::Error => {
+            println!("could not load proxy state: {}", message.message);
+            exit(1);
+          },
+          ConfigMessageStatus::Ok => {
+            println!("Proxy state loaded successfully from {}", path);
+          }
         }
       }
-    }
+    };
+    send.send(()).unwrap();
+  });
+
+  if recv.recv_timeout(Duration::from_millis(1000)).is_err() {
+    eprintln!("Command timeout");
   }
 }
 
