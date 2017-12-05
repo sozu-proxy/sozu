@@ -256,7 +256,7 @@ impl ProxyClient for TlsClient {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Handshake(ref mut handshake) => handshake.readable(),
       State::Http(ref mut http)           => (ProtocolResult::Continue, http.readable(&mut self.metrics)),
-      State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.readable()),
+      State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.readable(&mut self.metrics)),
     };
 
     if upgrade == ProtocolResult::Continue {
@@ -277,7 +277,7 @@ impl ProxyClient for TlsClient {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Handshake(ref mut handshake) => ClientResult::CloseClient,
       State::Http(ref mut http)           => http.writable(&mut self.metrics),
-      State::WebSocket(ref mut pipe)      => pipe.writable(),
+      State::WebSocket(ref mut pipe)      => pipe.writable(&mut self.metrics),
     }
   }
 
@@ -285,17 +285,17 @@ impl ProxyClient for TlsClient {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)           => http.back_readable(&mut self.metrics),
       State::Handshake(ref mut handshake) => (ProtocolResult::Continue, ClientResult::CloseClient),
-      State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.back_readable()),
+      State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.back_readable(&mut self.metrics)),
     };
 
     if upgrade == ProtocolResult::Continue {
       result
     } else {
       if self.upgrade() {
-      match *unwrap_msg!(self.protocol.as_mut()) {
-        State::WebSocket(ref mut pipe) => pipe.back_readable(),
-        _ => result
-      }
+        match *unwrap_msg!(self.protocol.as_mut()) {
+          State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
+          _ => result
+        }
       } else {
         ClientResult::CloseBoth
       }
@@ -306,7 +306,7 @@ impl ProxyClient for TlsClient {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Handshake(ref mut handshake) => ClientResult::CloseClient,
       State::Http(ref mut http)           => http.back_writable(&mut self.metrics),
-      State::WebSocket(ref mut pipe)      => pipe.back_writable(),
+      State::WebSocket(ref mut pipe)      => pipe.back_writable(&mut self.metrics),
     }
   }
 

@@ -242,7 +242,7 @@ impl ProxyClient for Client {
   fn readable(&mut self) -> ClientResult {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.readable(&mut self.metrics),
-      State::WebSocket(ref mut pipe) => pipe.readable()
+      State::WebSocket(ref mut pipe) => pipe.readable(&mut self.metrics)
     }
   }
 
@@ -250,7 +250,7 @@ impl ProxyClient for Client {
   fn writable(&mut self) -> ClientResult {
     match  *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.writable(&mut self.metrics),
-      State::WebSocket(ref mut pipe) => pipe.writable()
+      State::WebSocket(ref mut pipe) => pipe.writable(&mut self.metrics)
     }
   }
 
@@ -258,7 +258,7 @@ impl ProxyClient for Client {
   fn back_writable(&mut self) -> ClientResult {
     match *unwrap_msg!(self.protocol.as_mut())  {
       State::Http(ref mut http)      => http.back_writable(&mut self.metrics),
-      State::WebSocket(ref mut pipe) => pipe.back_writable()
+      State::WebSocket(ref mut pipe) => pipe.back_writable(&mut self.metrics)
     }
   }
 
@@ -266,7 +266,7 @@ impl ProxyClient for Client {
   fn back_readable(&mut self) -> ClientResult {
     let (upgrade, result) = match  *unwrap_msg!(self.protocol.as_mut())  {
       State::Http(ref mut http)      => http.back_readable(&mut self.metrics),
-      State::WebSocket(ref mut pipe) => (ProtocolResult::Continue, pipe.back_readable())
+      State::WebSocket(ref mut pipe) => (ProtocolResult::Continue, pipe.back_readable(&mut self.metrics))
     };
 
     if upgrade == ProtocolResult::Continue {
@@ -274,7 +274,7 @@ impl ProxyClient for Client {
     } else {
       self.upgrade();
       match *unwrap_msg!(self.protocol.as_mut()) {
-        State::WebSocket(ref mut pipe) => pipe.back_readable(),
+        State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
         _ => result
       }
     }

@@ -728,6 +728,8 @@ impl<Front:SocketHandler> Http<Front> {
       SocketResult::Error => {
         error!("{}\tback socket write error, closing connection", self.log_ctx);
         self.readiness.reset();
+        metrics.service_stop();
+        incr_ereq!();
         return ClientResult::CloseBoth;
       },
       SocketResult::WouldBlock => {

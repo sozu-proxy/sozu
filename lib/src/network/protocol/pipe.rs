@@ -9,7 +9,7 @@ use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
 use network::{ClientResult,Protocol};
 use network::buffer_queue::BufferQueue;
-use network::session::Readiness;
+use network::session::{Readiness,SessionMetrics};
 use network::socket::{SocketHandler,SocketResult};
 use nom::HexDisplay;
 
@@ -127,7 +127,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   }
 
   // Read content from the client
-  pub fn readable(&mut self) -> ClientResult {
+  pub fn readable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
     trace!("pipe readable");
     if self.front_buf.buffer.available_space() == 0 {
       self.readiness.front_interest.remove(Ready::readable());
@@ -145,6 +145,9 @@ impl<Front:SocketHandler> Pipe<Front> {
       self.front_buf.consume_parsed_data(sz);
       self.front_buf.slice_output(sz);
 
+      count!("bytes_in", sz as i64);
+      metrics.bin += sz;
+
       if self.front_buf.buffer.available_space() == 0 {
         self.readiness.front_interest.remove(Ready::readable());
       }
@@ -156,6 +159,8 @@ impl<Front:SocketHandler> Pipe<Front> {
     match res {
       SocketResult::Error => {
         error!("{}\t[{:?}] front socket error, closing the connection", self.log_ctx, self.token);
+        metrics.service_stop();
+        incr_ereq!();
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
@@ -170,7 +175,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   }
 
   // Forward content to client
-  pub fn writable(&mut self) -> ClientResult {
+  pub fn writable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
     trace!("pipe writable");
     if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
       self.readiness.back_interest.insert(Ready::readable());
@@ -196,6 +201,7 @@ impl<Front:SocketHandler> Pipe<Front> {
 
     if sz > 0 {
       self.readiness.back_interest.insert(Ready::readable());
+      metrics.bout += sz;
     }
 
     if let Some((front,back)) = self.tokens() {
@@ -207,6 +213,8 @@ impl<Front:SocketHandler> Pipe<Front> {
     match res {
       SocketResult::Error => {
         error!("{}\t[{:?}] error writing to front socket, closing", self.log_ctx, self.token);
+        incr_ereq!();
+        metrics.service_stop();
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
@@ -220,7 +228,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   }
 
   // Forward content to application
-  pub fn back_writable(&mut self) -> ClientResult {
+  pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
     trace!("pipe back_writable");
     if self.front_buf.output_data_size() == 0 || self.front_buf.next_output_data().len() == 0 {
       self.readiness.front_interest.insert(Ready::readable());
@@ -248,12 +256,16 @@ impl<Front:SocketHandler> Pipe<Front> {
       sz += current_sz;
     }
 
+    metrics.backend_bout += sz;
+
     if let Some((front,back)) = tokens {
       debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", self.log_ctx, front.0, back.0, sz, output_size);
     }
     match socket_res {
       SocketResult::Error => {
         error!("{}\tback socket write error, closing connection", self.log_ctx);
+        metrics.service_stop();
+        incr_ereq!();
         self.readiness.reset();
         return ClientResult::CloseBoth;
       },
@@ -267,7 +279,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   }
 
   // Read content from application
-  pub fn back_readable(&mut self) -> ClientResult {
+  pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
     trace!("pipe back_readable");
     if self.back_buf.buffer.available_space() == 0 {
       self.readiness.back_interest.remove(Ready::readable());
@@ -290,10 +302,13 @@ impl<Front:SocketHandler> Pipe<Front> {
     }
     if sz > 0 {
       self.readiness.front_interest.insert(Ready::writable());
+      metrics.backend_bin += sz;
     }
 
     if r == SocketResult::Error {
       error!("{}\tback socket read error, closing connection", self.log_ctx);
+      metrics.service_stop();
+      incr_ereq!();
       self.readiness.reset();
       return ClientResult::CloseBoth;
     }
