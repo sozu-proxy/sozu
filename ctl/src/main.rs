@@ -13,9 +13,11 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 
-use command::{add_application,remove_application,dump_state,load_state,save_state,soft_stop,hard_stop,upgrade,status,metrics,
-  remove_backend, add_backend, remove_frontend, add_frontend, add_certificate, remove_certificate, query_application,
-  logging_filter};
+use command::{add_application,remove_application,dump_state,load_state,
+  save_state,soft_stop,hard_stop,upgrade,status,metrics,
+  remove_backend, add_backend, remove_http_frontend, add_http_frontend,
+  remove_tcp_frontend, add_tcp_frontend, add_certificate, remove_certificate,
+  query_application, logging_filter};
 
 use cli::*;
 
@@ -64,8 +66,18 @@ fn main() {
     },
     SubCmd::Frontend{ cmd } => {
       match cmd {
-        FrontendCmd::Add{ id, hostname, path_begin, path_to_certificate } => add_frontend(&mut channel, &id, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate),
-        FrontendCmd::Remove{ id, hostname, path_begin, path_to_certificate } => remove_frontend(&mut channel, &id, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate),
+        FrontendCmd::Http{ cmd } => match cmd {
+          HttpFrontendCmd::Add{ id, hostname, path_begin, path_to_certificate } =>
+            add_http_frontend(&mut channel, &id, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate),
+          HttpFrontendCmd::Remove{ id, hostname, path_begin, path_to_certificate } =>
+            remove_http_frontend(&mut channel, &id, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate),
+        },
+        FrontendCmd::Tcp { cmd } => match cmd {
+          TcpFrontendCmd::Add{ id, ip_address, port } =>
+            add_tcp_frontend(&mut channel, &id, &ip_address, port),
+          TcpFrontendCmd::Remove{ id, ip_address, port } =>
+            remove_tcp_frontend(&mut channel, &id, &ip_address, port),
+        }
       }
     },
     SubCmd::Certificate{ cmd } => {

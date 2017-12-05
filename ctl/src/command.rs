@@ -2,7 +2,7 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
-use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront,
+use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer};
 
 use std::collections::{HashMap,HashSet};
@@ -660,7 +660,7 @@ pub fn remove_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswe
   order_command(channel, Order::RemoveApplication(String::from(app_id)));
 }
 
-pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
+pub fn add_http_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
   if let Some(certificate_path) = certificate {
     match Config::load_file_bytes(&certificate_path) {
       Ok(data) => {
@@ -687,7 +687,7 @@ pub fn add_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, ap
   }
 }
 
-pub fn remove_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
+pub fn remove_http_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
   if let Some(certificate_path) = certificate {
     match Config::load_file_bytes(&certificate_path) {
       Ok(data) => {
@@ -769,8 +769,7 @@ pub fn remove_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswe
   }
 }
 
-/*
-pub fn add_tcp_front(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip_address: &str, port: u16) {
+pub fn add_tcp_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip_address: &str, port: u16) {
   order_command(channel, Order::AddTcpFront(TcpFront {
     app_id: String::from(app_id),
     ip_address: String::from(ip_address),
@@ -778,14 +777,13 @@ pub fn add_tcp_front(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, a
   }));
 }
 
-pub fn remove_tcp_front(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip_address: &str, port: u16) {
+pub fn remove_tcp_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip_address: &str, port: u16) {
   order_command(channel, Order::RemoveTcpFront(TcpFront {
     app_id: String::from(app_id),
     ip_address: String::from(ip_address),
     port: port
   }));
 }
-*/
 
 pub fn query_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, application_id: Option<String>) {
   let command = match application_id {

@@ -116,6 +116,20 @@ pub enum BackendCmd {
 
 #[derive(StructOpt, PartialEq, Debug)]
 pub enum FrontendCmd {
+  #[structopt(name = "http", about = "HTTP/HTTPS frontend management")]
+  Http {
+    #[structopt(subcommand)]
+    cmd: HttpFrontendCmd,
+  },
+  #[structopt(name = "tcp", about = "TCP frontend management")]
+  Tcp {
+    #[structopt(subcommand)]
+    cmd: TcpFrontendCmd,
+  },
+}
+
+#[derive(StructOpt, PartialEq, Debug)]
+pub enum HttpFrontendCmd {
   #[structopt(name = "add")]
   Add {
     #[structopt(short = "i", long = "id", help = "app id of the frontend")]
@@ -137,6 +151,28 @@ pub enum FrontendCmd {
     path_begin: Option<String>,
     #[structopt(long = "certificate", help="path to a certificate file")]
     path_to_certificate: Option<String>,
+  },
+}
+
+#[derive(StructOpt, PartialEq, Debug)]
+pub enum TcpFrontendCmd {
+  #[structopt(name = "add")]
+  Add {
+    #[structopt(short = "i", long = "id", help = "app id of the frontend")]
+    id: String,
+    #[structopt(long = "ip", help = "IP address of the frontend")]
+    ip_address: String,
+    #[structopt(short = "p", long = "port", help="TCP port of the frontend")]
+    port: u16,
+  },
+  #[structopt(name = "remove")]
+  Remove {
+    #[structopt(short = "i", long = "id", help = "app id of the frontend")]
+    id: String,
+    #[structopt(long = "ip", help = "IP address of the frontend")]
+    ip_address: String,
+    #[structopt(short = "p", long = "port", help="TCP port of the frontend")]
+    port: u16,
   },
 }
 
