@@ -10,7 +10,7 @@ pub struct App {
 pub enum SubCmd {
   #[structopt(name = "shutdown", about = "shuts down the proxy without waiting for connections to finish")]
   Shutdown {
-    #[structopt(short = "h", long = "hard", default_value="false")]
+    #[structopt(short = "h", long = "hard")]
     hard: bool
   },
   #[structopt(name = "upgrade", about = "upgrade the proxy")]
@@ -83,7 +83,7 @@ pub enum ApplicationCmd {
   Add{
     #[structopt(short = "i", long = "id")]
     id: String,
-    #[structopt(short = "s", long = "sticky-session", default_value="false")]
+    #[structopt(short = "s", long = "sticky-session")]
     sticky_session: bool,
   },
 }
