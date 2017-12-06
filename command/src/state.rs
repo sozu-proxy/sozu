@@ -133,7 +133,7 @@ impl ConfigState {
         }
       },
       // This is to avoid the error message
-      &Order::Logging(_) => {},
+      &Order::Logging(_) | &Order::Status => {},
       o => {
         error!("state cannot handle order message: {:#?}", o);
       }
