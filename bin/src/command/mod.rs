@@ -9,7 +9,9 @@ use std::io::{self,ErrorKind};
 use std::os::unix::fs::PermissionsExt;
 use std::collections::{HashMap,VecDeque};
 use std::time::Duration;
-use libc::{pid_t,kill};
+use libc::pid_t;
+use nix::sys::signal::{kill,Signal};
+use nix::sys::wait::{waitpid,WaitStatus,WNOHANG};
 
 use sozu::network::metrics::METRICS;
 use sozu_command::config::Config;
@@ -22,6 +24,7 @@ pub mod orders;
 pub mod client;
 pub mod state;
 
+use worker::start_worker;
 use self::client::CommandClient;
 use self::state::MessageType;
 
@@ -270,6 +273,11 @@ impl CommandServer {
       Token(i) if i < HALF_USIZE + 1 => {
         if let Some(ref mut proxy) =self.proxies.get_mut(&Token(i)) {
           proxy.channel.handle_events(events);
+          let uevent = UnixReady::from(events);
+          if uevent.is_hup() {
+            proxy.run_state = RunState::NotAnswering;
+          }
+
         }
 
         self.handle_worker_events(Token(i));
@@ -337,9 +345,11 @@ impl CommandServer {
             }
 
             if proxy.channel.back_buf.available_data() > 0 {
-              let _ = proxy.channel.writable().map_err(|e| {
+              let res = proxy.channel.writable();
+              if let Err(e) = res {
                 error!("could not write to worker socket: {:?}", e);
-              });
+                proxy.run_state = RunState::NotAnswering;
+              }
             }
 
             if !proxy.channel.readiness.is_writable() {
@@ -358,6 +368,10 @@ impl CommandServer {
 
     for msg in messages.drain(..) {
       self.handle_worker_message(token, msg);
+    }
+
+    if self.proxies.get(&token).as_ref().map(|proxy| proxy.run_state) == Some(RunState::NotAnswering) {
+      self.check_worker_status(token);
     }
   }
 
@@ -500,6 +514,57 @@ impl CommandServer {
       }
     }
   }
+
+  pub fn check_worker_status(&mut self, token: Token) {
+    {
+      let ref mut proxy = self.proxies.get_mut(&token).expect("there should be a worker at that token");
+      let res = waitpid(proxy.pid, Some(WNOHANG));
+
+      if let Ok(WaitStatus::StillAlive) = res {
+        if proxy.run_state == RunState::NotAnswering {
+          error!("worker process {} (PID = {}) not answering, killing and replacing", proxy.id, proxy.pid);
+          if let Err(e) = kill(proxy.pid, Signal::SIGKILL) {
+            error!("failed to kill the worker process: {:?}", e);
+          } else {
+            proxy.run_state == RunState::Stopped;
+          }
+        } else {
+          return;
+        }
+
+      } else {
+        if proxy.run_state == RunState::NotAnswering {
+          error!("worker process {} (PID = {}) stopped running, replacing", proxy.id, proxy.pid);
+        } else {
+          error!("failed to check process status: {:?}", res);
+          return;
+        }
+      }
+
+      let _ = self.poll.deregister(&proxy.channel.sock);
+    }
+
+    self.proxies.remove(&token);
+
+    let id = self.next_id;
+    if let Ok(mut worker) = start_worker(id, &self.config, &self.state) {
+      info!("created new worker: {}", id);
+      self.next_id += 1;
+      let worker_token = self.token_count + 1;
+      self.token_count = worker_token;
+      worker.token     = Some(Token(worker_token));
+
+      debug!("registering new sock {:?} at token {:?} for id {} (sock error: {:?})",
+        worker.channel.sock, worker_token, worker.id, worker.channel.sock.take_error());
+
+      self.poll.register(&worker.channel.sock, Token(worker_token),
+        Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
+        PollOpt::edge()).unwrap();
+      worker.token = Some(Token(worker_token));
+      self.proxies.insert(Token(worker_token), worker);
+
+    }
+  }
 }
 
 pub fn start(config: Config, command_socket_path: String, proxies: Vec<Worker>) {
@@ -543,7 +608,9 @@ pub fn start(config: Config, command_socket_path: String, proxies: Vec<Worker>) 
       // the workers did not even get the configuration, we can kill them right away
       for proxy in proxies {
         error!("killing worker n°{} (PID {})", proxy.id, proxy.pid);
-        unsafe { kill(proxy.pid, 9); }
+        let _ = kill(proxy.pid, Signal::SIGKILL).map_err(|e| {
+          error!("could not kill worker: {:?}", e);
+        });
       }
     }
   }
