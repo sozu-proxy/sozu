@@ -15,6 +15,8 @@ use rand::{thread_rng, Rng};
 use prettytable::Table;
 use prettytable::row::Row;
 
+const DEFAULT_TIMEOUT: u64 = 1000;
+
 fn generate_id() -> String {
   let s: String = thread_rng().gen_ascii_chars().take(6).collect();
   format!("ID-{}", s)
@@ -25,41 +27,61 @@ fn generate_tagged_id(tag: &str) -> String {
   format!("{}-{}", tag, s)
 }
 
+// Run the code waiting for messages in a separate thread. Just before finishing the thread sends a message.
+// The calling code waits for this message with a timeout.
+// Note: This macro is used only for simple command which has any/simple computing
+// to do with the message received.
+macro_rules! command_timeout {
+  (dur => $duration: expr, b => $block: expr) => (
+    let (send, recv) = mpsc::channel();
 
-pub fn save_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, path: &str) {
+    thread::spawn(move || {
+      $block
+      send.send(()).unwrap();
+    });
+
+    if recv.recv_timeout(Duration::from_millis($duration)).is_err() {
+      eprintln!("Command timeout. The proxy didn't send answer");
+    }
+  )
+}
+
+pub fn save_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, path: String) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
-    ConfigCommand::SaveState(path.to_string()),
+    ConfigCommand::SaveState(path),
     None,
   ));
 
-  match channel.read_message() {
-    None          => {
-      println!("the proxy didn't answer");
-      exit(1);
-    },
-    Some(message) => {
-      if id != message.id {
-        println!("received message with invalid id: {:?}", message);
+  command_timeout!(dur => DEFAULT_TIMEOUT, b => {
+    match channel.read_message() {
+      None          => {
+        println!("the proxy didn't answer");
         exit(1);
-      }
-      match message.status {
-        ConfigMessageStatus::Processing => {
-          // do nothing here
-          // for other messages, we would loop over read_message
-          // until an error or ok message was sent
-        },
-        ConfigMessageStatus::Error => {
-          println!("could not save proxy state: {}", message.message);
+      },
+      Some(message) => {
+        if id != message.id {
+          println!("received message with invalid id: {:?}", message);
           exit(1);
-        },
-        ConfigMessageStatus::Ok => {
-          println!("{}", message.message);
+        }
+        match message.status {
+          ConfigMessageStatus::Processing => {
+            // do nothing here
+            // for other messages, we would loop over read_message
+            // until an error or ok message was sent
+          },
+          ConfigMessageStatus::Error => {
+            println!("could not save proxy state: {}", message.message);
+            exit(1);
+          },
+          ConfigMessageStatus::Ok => {
+            println!("{}", message.message);
+          }
         }
       }
     }
-  }
+  });
 }
 
 pub fn load_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, path: String) {
@@ -70,9 +92,7 @@ pub fn load_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, path:
     None,
   ));
 
-  let (send, recv) = mpsc::channel();
-
-  thread::spawn(move || {
+  command_timeout!(dur => DEFAULT_TIMEOUT, b => {
     match channel.read_message() {
       None          => {
         println!("the proxy didn't answer");
@@ -99,15 +119,10 @@ pub fn load_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, path:
         }
       }
     };
-    send.send(()).unwrap();
   });
-
-  if recv.recv_timeout(Duration::from_millis(1000)).is_err() {
-    eprintln!("Command timeout");
-  }
 }
 
-pub fn dump_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
+pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
@@ -115,40 +130,42 @@ pub fn dump_state(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
     None,
   ));
 
-  match channel.read_message() {
-    None          => {
-      println!("the proxy didn't answer");
-      exit(1);
-    },
-    Some(message) => {
-      if id != message.id {
-        println!("received message with invalid id: {:?}", message);
+  command_timeout!(dur => DEFAULT_TIMEOUT, b => {
+    match channel.read_message() {
+      None          => {
+        println!("the proxy didn't answer");
         exit(1);
-      }
-      match message.status {
-        ConfigMessageStatus::Processing => {
-          // do nothing here
-          // for other messages, we would loop over read_message
-          // until an error or ok message was sent
-        },
-        ConfigMessageStatus::Error => {
-          println!("could not dump proxy state: {}", message.message);
+      },
+      Some(message) => {
+        if id != message.id {
+          println!("received message with invalid id: {:?}", message);
           exit(1);
-        },
-        ConfigMessageStatus::Ok => {
-          if let Some(AnswerData::State(state)) = message.data {
-            println!("{:#?}", state);
-          } else {
-            println!("state dump was empty");
+        }
+        match message.status {
+          ConfigMessageStatus::Processing => {
+            // do nothing here
+            // for other messages, we would loop over read_message
+            // until an error or ok message was sent
+          },
+          ConfigMessageStatus::Error => {
+            println!("could not dump proxy state: {}", message.message);
             exit(1);
+          },
+          ConfigMessageStatus::Ok => {
+            if let Some(AnswerData::State(state)) = message.data {
+              println!("{:#?}", state);
+            } else {
+              println!("state dump was empty");
+              exit(1);
+            }
           }
         }
       }
     }
-  }
+  });
 }
 
-pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
+pub fn soft_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
   println!("shutting down proxy");
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
@@ -183,7 +200,7 @@ pub fn soft_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   }
 }
 
-pub fn hard_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
+pub fn hard_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
   println!("shutting down proxy");
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
@@ -193,27 +210,29 @@ pub fn hard_stop(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
     None,
   ));
 
-  loop {
-    match channel.read_message() {
-      None          => println!("the proxy didn't answer"),
-      Some(message) => {
-        match message.status {
-          ConfigMessageStatus::Processing => {
-            println!("Proxy is processing: {}", message.message);
-          },
-          ConfigMessageStatus::Error => {
-            println!("could not stop the proxy: {}", message.message);
-          },
-          ConfigMessageStatus::Ok => {
-            if &id == &message.id {
-              println!("Proxy shut down: {}", message.message);
-              break;
+  command_timeout!(dur => DEFAULT_TIMEOUT, b =>
+    loop {
+      match channel.read_message() {
+        None          => println!("the proxy didn't answer"),
+        Some(message) => {
+          match message.status {
+            ConfigMessageStatus::Processing => {
+              println!("Proxy is processing: {}", message.message);
+            },
+            ConfigMessageStatus::Error => {
+              println!("could not stop the proxy: {}", message.message);
+            },
+            ConfigMessageStatus::Ok => {
+              if &id == &message.id {
+                println!("Proxy shut down: {}", message.message);
+                break;
+              }
             }
           }
         }
       }
     }
-  }
+  );
 }
 
 pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
@@ -658,18 +677,18 @@ pub fn metrics(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
   }
 }
 
-pub fn add_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, sticky_session: bool) {
+pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, sticky_session: bool) {
   order_command(channel, Order::AddApplication(Application {
     app_id:         String::from(app_id),
     sticky_session: sticky_session,
   }));
 }
 
-pub fn remove_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str) {
+pub fn remove_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str) {
   order_command(channel, Order::RemoveApplication(String::from(app_id)));
 }
 
-pub fn add_http_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
+pub fn add_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
   if let Some(certificate_path) = certificate {
     match Config::load_file_bytes(&certificate_path) {
       Ok(data) => {
@@ -696,7 +715,7 @@ pub fn add_http_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer
   }
 }
 
-pub fn remove_http_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
+pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
   if let Some(certificate_path) = certificate {
     match Config::load_file_bytes(&certificate_path) {
       Ok(data) => {
@@ -724,7 +743,7 @@ pub fn remove_http_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAns
 }
 
 
-pub fn add_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, instance_id: &str, ip: &str, port: u16) {
+pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, instance_id: &str, ip: &str, port: u16) {
   order_command(channel, Order::AddInstance(Instance {
       app_id: String::from(app_id),
       instance_id: String::from(instance_id),
@@ -733,7 +752,7 @@ pub fn add_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app
     }));
 }
 
-pub fn remove_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, instance_id: &str, ip: &str, port: u16) {
+pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, instance_id: &str, ip: &str, port: u16) {
     order_command(channel, Order::RemoveInstance(Instance {
       app_id: String::from(app_id),
       instance_id: String::from(instance_id),
@@ -742,7 +761,7 @@ pub fn remove_backend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, 
     }));
 }
 
-pub fn add_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, certificate_path: &str, certificate_chain_path: &str, key_path: &str) {
+pub fn add_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, certificate_path: &str, certificate_chain_path: &str, key_path: &str) {
   match Config::load_file(certificate_path) {
     Err(e) => println!("could not load certificate: {:?}", e),
     Ok(certificate) => {
@@ -766,7 +785,7 @@ pub fn add_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>,
   }
 }
 
-pub fn remove_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, certificate_path: &str) {
+pub fn remove_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, certificate_path: &str) {
   match Config::load_file_bytes(certificate_path) {
     Ok(data) => {
       match calculate_fingerprint(&data) {
@@ -778,7 +797,7 @@ pub fn remove_certificate(channel: &mut Channel<ConfigMessage,ConfigMessageAnswe
   }
 }
 
-pub fn add_tcp_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip_address: &str, port: u16) {
+pub fn add_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip_address: &str, port: u16) {
   order_command(channel, Order::AddTcpFront(TcpFront {
     app_id: String::from(app_id),
     ip_address: String::from(ip_address),
@@ -786,7 +805,7 @@ pub fn add_tcp_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>
   }));
 }
 
-pub fn remove_tcp_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip_address: &str, port: u16) {
+pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip_address: &str, port: u16) {
   order_command(channel, Order::RemoveTcpFront(TcpFront {
     app_id: String::from(app_id),
     ip_address: String::from(ip_address),
@@ -794,7 +813,7 @@ pub fn remove_tcp_frontend(channel: &mut Channel<ConfigMessage,ConfigMessageAnsw
   }));
 }
 
-pub fn query_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, application_id: Option<String>) {
+pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, application_id: Option<String>) {
   let command = match application_id {
     Some(ref app_id) => ConfigCommand::Query(Query::Application(app_id.to_string())),
     None         => ConfigCommand::Query(Query::Applications),
@@ -1028,11 +1047,11 @@ pub fn query_application(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer
   }
 }
 
-pub fn logging_filter(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, filter: &str) {
+pub fn logging_filter(channel: Channel<ConfigMessage,ConfigMessageAnswer>, filter: &str) {
   order_command(channel, Order::Logging(String::from(filter)));
 }
 
-fn order_command(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, order: Order) {
+fn order_command(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, order: Order) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
@@ -1040,42 +1059,44 @@ fn order_command(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>, order
     None,
   ));
 
-  match channel.read_message() {
-    None          => println!("the proxy didn't answer"),
-    Some(message) => {
-      if id != message.id {
-        println!("received message with invalid id: {:?}", message);
-        return;
-      }
-      match message.status {
-        ConfigMessageStatus::Processing => {
-          // do nothing here
-          // for other messages, we would loop over read_message
-          // until an error or ok message was sent
-        },
-        ConfigMessageStatus::Error => {
-          println!("could not execute order: {}", message.message);
-          exit(1);
-        },
-        ConfigMessageStatus::Ok => {
-          //deactivate success messages for now
-          /*
-          match order {
-            Order::AddApplication(_) => println!("application added : {}", message.message),
-            Order::RemoveApplication(_) => println!("application removed : {} ", message.message),
-            Order::AddInstance(_) => println!("backend added : {}", message.message),
-            Order::RemoveInstance(_) => println!("backend removed : {} ", message.message),
-            Order::AddCertificate(_) => println!("certificate added: {}", message.message),
-            Order::RemoveCertificate(_) => println!("certificate removed: {}", message.message),
-            Order::AddHttpFront(_) => println!("front added: {}", message.message),
-            Order::RemoveHttpFront(_) => println!("front removed: {}", message.message),
-            _ => {
-              // do nothing for now
+  command_timeout!(dur => DEFAULT_TIMEOUT, b => {
+    match channel.read_message() {
+      None          => println!("the proxy didn't answer"),
+      Some(message) => {
+        if id != message.id {
+          println!("received message with invalid id: {:?}", message);
+          return;
+        }
+        match message.status {
+          ConfigMessageStatus::Processing => {
+            // do nothing here
+            // for other messages, we would loop over read_message
+            // until an error or ok message was sent
+          },
+          ConfigMessageStatus::Error => {
+            println!("could not execute order: {}", message.message);
+            exit(1);
+          },
+          ConfigMessageStatus::Ok => {
+            //deactivate success messages for now
+            /*
+            match order {
+              Order::AddApplication(_) => println!("application added : {}", message.message),
+              Order::RemoveApplication(_) => println!("application removed : {} ", message.message),
+              Order::AddInstance(_) => println!("backend added : {}", message.message),
+              Order::RemoveInstance(_) => println!("backend removed : {} ", message.message),
+              Order::AddCertificate(_) => println!("certificate added: {}", message.message),
+              Order::RemoveCertificate(_) => println!("certificate removed: {}", message.message),
+              Order::AddHttpFront(_) => println!("front added: {}", message.message),
+              Order::RemoveHttpFront(_) => println!("front removed: {}", message.message),
+              _ => {
+                // do nothing for now
+              }
             }
+            */
           }
-          */
         }
       }
     }
-  }
+  });
 }

@@ -36,59 +36,59 @@ fn main() {
   match matches.cmd {
     SubCmd::Shutdown{ hard } => {
       if hard {
-        hard_stop(&mut channel);
+        hard_stop(channel);
       } else {
-        soft_stop(&mut channel);
+        soft_stop(channel);
       }
     },
     SubCmd::Upgrade => upgrade(&mut channel),
     SubCmd::Status => status(channel),
     SubCmd::Metrics => metrics(&mut channel),
-    SubCmd::Logging{ level } => logging_filter(&mut channel, &level),
+    SubCmd::Logging{ level } => logging_filter(channel, &level),
     SubCmd::State{ cmd } => {
       match cmd {
-        StateCmd::Save{ file } => save_state(&mut channel, &file),
+        StateCmd::Save{ file } => save_state(channel, file),
         StateCmd::Load{ file } => load_state(channel, file),
-        StateCmd::Dump => dump_state(&mut channel),
+        StateCmd::Dump => dump_state(channel),
       }
     },
     SubCmd::Application{ cmd } => {
       match cmd {
-        ApplicationCmd::Add{ id, sticky_session } => add_application(&mut channel, &id, sticky_session),
-        ApplicationCmd::Remove{ id } => remove_application(&mut channel, &id),
+        ApplicationCmd::Add{ id, sticky_session } => add_application(channel, &id, sticky_session),
+        ApplicationCmd::Remove{ id } => remove_application(channel, &id),
       }
     },
     SubCmd::Backend{ cmd } => {
       match cmd {
-        BackendCmd::Add{ id, instance_id, ip, port } => add_backend(&mut channel, &id, &instance_id, &ip, port),
-        BackendCmd::Remove{ id, instance_id, ip, port } => remove_backend(&mut channel, &id, &instance_id, &ip, port),
+        BackendCmd::Add{ id, instance_id, ip, port } => add_backend(channel, &id, &instance_id, &ip, port),
+        BackendCmd::Remove{ id, instance_id, ip, port } => remove_backend(channel, &id, &instance_id, &ip, port),
       }
     },
     SubCmd::Frontend{ cmd } => {
       match cmd {
         FrontendCmd::Http{ cmd } => match cmd {
           HttpFrontendCmd::Add{ id, hostname, path_begin, path_to_certificate } =>
-            add_http_frontend(&mut channel, &id, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate),
+            add_http_frontend(channel, &id, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate),
           HttpFrontendCmd::Remove{ id, hostname, path_begin, path_to_certificate } =>
-            remove_http_frontend(&mut channel, &id, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate),
+            remove_http_frontend(channel, &id, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate),
         },
         FrontendCmd::Tcp { cmd } => match cmd {
           TcpFrontendCmd::Add{ id, ip_address, port } =>
-            add_tcp_frontend(&mut channel, &id, &ip_address, port),
+            add_tcp_frontend(channel, &id, &ip_address, port),
           TcpFrontendCmd::Remove{ id, ip_address, port } =>
-            remove_tcp_frontend(&mut channel, &id, &ip_address, port),
+            remove_tcp_frontend(channel, &id, &ip_address, port),
         }
       }
     },
     SubCmd::Certificate{ cmd } => {
       match cmd {
-        CertificateCmd::Add{ certificate, chain, key } => add_certificate(&mut channel, &certificate, &chain, key.unwrap_or("missing key path".to_string()).as_str()),
-        CertificateCmd::Remove{ certificate } => remove_certificate(&mut channel, &certificate),
+        CertificateCmd::Add{ certificate, chain, key } => add_certificate(channel, &certificate, &chain, key.unwrap_or("missing key path".to_string()).as_str()),
+        CertificateCmd::Remove{ certificate } => remove_certificate(channel, &certificate),
       }
     },
     SubCmd::Query{ cmd } => {
       match cmd {
-        QueryCmd::Applications{ id } => query_application(&mut channel, id),
+        QueryCmd::Applications{ id } => query_application(channel, id),
       }
     },
   }
