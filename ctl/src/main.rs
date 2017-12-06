@@ -48,7 +48,7 @@ fn main() {
     SubCmd::State{ cmd } => {
       match cmd {
         StateCmd::Save{ file } => save_state(&mut channel, &file),
-        StateCmd::Load{ file } => load_state(&mut channel, &file),
+        StateCmd::Load{ file } => load_state(channel, file),
         StateCmd::Dump => dump_state(&mut channel),
       }
     },
