@@ -32,7 +32,7 @@ fn generate_tagged_id(tag: &str) -> String {
 // Note: This macro is used only for simple command which has any/simple computing
 // to do with the message received.
 macro_rules! command_timeout {
-  (dur => $duration: expr, b => $block: expr) => (
+  ($duration: expr, $block: expr) => (
     let (send, recv) = mpsc::channel();
 
     thread::spawn(move || {
@@ -54,7 +54,7 @@ pub fn save_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, path:
     None,
   ));
 
-  command_timeout!(dur => DEFAULT_TIMEOUT, b => {
+  command_timeout!(DEFAULT_TIMEOUT, {
     match channel.read_message() {
       None          => {
         println!("the proxy didn't answer");
@@ -92,7 +92,7 @@ pub fn load_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, path:
     None,
   ));
 
-  command_timeout!(dur => DEFAULT_TIMEOUT, b => {
+  command_timeout!(DEFAULT_TIMEOUT, {
     match channel.read_message() {
       None          => {
         println!("the proxy didn't answer");
@@ -130,7 +130,7 @@ pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
     None,
   ));
 
-  command_timeout!(dur => DEFAULT_TIMEOUT, b => {
+  command_timeout!(DEFAULT_TIMEOUT, {
     match channel.read_message() {
       None          => {
         println!("the proxy didn't answer");
@@ -210,7 +210,7 @@ pub fn hard_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
     None,
   ));
 
-  command_timeout!(dur => DEFAULT_TIMEOUT, b =>
+  command_timeout!(DEFAULT_TIMEOUT,
     loop {
       match channel.read_message() {
         None          => println!("the proxy didn't answer"),
@@ -1059,7 +1059,7 @@ fn order_command(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, order:
     None,
   ));
 
-  command_timeout!(dur => DEFAULT_TIMEOUT, b => {
+  command_timeout!(DEFAULT_TIMEOUT, {
     match channel.read_message() {
       None          => println!("the proxy didn't answer"),
       Some(message) => {
