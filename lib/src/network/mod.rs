@@ -11,6 +11,7 @@ pub mod trie;
 pub mod protocol;
 pub mod http;
 pub mod https_openssl;
+pub mod https_rustls;
 pub mod backends;
 pub mod retry;
 

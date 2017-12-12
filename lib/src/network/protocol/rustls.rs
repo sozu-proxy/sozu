@@ -17,16 +17,23 @@ pub enum TlsState {
 }
 
 pub struct RustlsHandshake {
-  pub socket:  TcpStream,
-  pub session: ServerSession,
-
+  pub stream:    TcpStream,
+  pub session:   ServerSession,
+  pub readiness: Readiness,
 }
 
 impl RustlsHandshake {
-  pub fn new(session: ServerSession, socket: TcpStream) -> RustlsHandshake {
+  pub fn new(session: ServerSession, stream: TcpStream) -> RustlsHandshake {
     RustlsHandshake {
-      socket,
-      session,
+      stream:   stream,
+      session:   session,
+      readiness: Readiness {
+        front_interest:  UnixReady::from(Ready::readable()) | UnixReady::from(Ready::writable())
+                           | UnixReady::hup() | UnixReady::error(),
+        back_interest:   UnixReady::from(Ready::empty()),
+        front_readiness: UnixReady::from(Ready::empty()),
+        back_readiness:  UnixReady::from(Ready::empty()),
+      },
     }
   }
 
@@ -40,7 +47,7 @@ impl RustlsHandshake {
       if self.session.wants_read() && can_read {
         can_work = true;
 
-        match self.session.read_tls(&mut self.socket) {
+        match self.session.read_tls(&mut self.stream) {
           Ok(_) => {},
           Err(e) => match e.kind() {
             ErrorKind::WouldBlock => can_read = false,
@@ -60,7 +67,7 @@ impl RustlsHandshake {
       if self.session.wants_write() && can_write {
         can_work = true;
 
-        match self.session.write_tls(&mut self.socket) {
+        match self.session.write_tls(&mut self.stream) {
           Ok(_) => {},
           Err(e) => match e.kind() {
             ErrorKind::WouldBlock => can_write = false,
