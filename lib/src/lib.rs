@@ -161,6 +161,7 @@ extern crate log;
 extern crate time;
 extern crate rand;
 extern crate openssl;
+extern crate rustls;
 extern crate pool;
 extern crate uuid;
 extern crate net2;

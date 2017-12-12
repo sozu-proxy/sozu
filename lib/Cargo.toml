@@ -35,6 +35,7 @@ libc = "^0.2"
 slab = "^0.3.0"
 pool = "^0.1"
 openssl = {version="^0.9.5", features= ["v102"]}
+rustls = "^0.12"
 hdrsample = "^6.0"
 sozu-command-lib = { version = "^0.5", path = "../command" }
 idna = "^0.1"

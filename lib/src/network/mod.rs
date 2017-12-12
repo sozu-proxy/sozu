@@ -10,7 +10,7 @@ pub mod socket;
 pub mod trie;
 pub mod protocol;
 pub mod http;
-pub mod tls;
+pub mod https_openssl;
 pub mod backends;
 pub mod retry;
 
