@@ -40,19 +40,12 @@ use network::protocol::{ProtocolResult,RustlsHandshake,Http,Pipe,StickySession};
 use network::protocol::http::DefaultAnswerStatus;
 use network::retry::RetryPolicy;
 use util::UnwrapLog;
+use super::configuration::TlsApp;
 
 
 type BackendToken = Token;
 
 type ClientToken = Token;
-
-#[derive(Debug,Clone,PartialEq,Eq)]
-pub struct TlsApp {
-  pub app_id:           String,
-  pub hostname:         String,
-  pub path_begin:       String,
-  pub cert_fingerprint: CertFingerprint,
-}
 
 pub enum State {
   Handshake(RustlsHandshake),
@@ -61,15 +54,15 @@ pub enum State {
 }
 
 pub struct TlsClient {
-  front:          Option<TcpStream>,
-  front_token:    Option<Token>,
-  instance:       Option<Rc<RefCell<Backend>>>,
-  back_connected: BackendConnectionStatus,
+  pub front:          Option<TcpStream>,
+  pub front_token:    Option<Token>,
+  pub instance:       Option<Rc<RefCell<Backend>>>,
+  pub back_connected: BackendConnectionStatus,
   protocol:       Option<State>,
-  public_address: Option<IpAddr>,
+  pub public_address: Option<IpAddr>,
   pool:           Weak<RefCell<Pool<BufferQueue>>>,
-  sticky_session: bool,
-  metrics:        SessionMetrics,
+  pub sticky_session: bool,
+  pub metrics:        SessionMetrics,
 }
 
 impl TlsClient {
@@ -323,4 +316,3 @@ impl ProxyClient for TlsClient {
     Protocol::HTTPS
   }
 }
-
