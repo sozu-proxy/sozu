@@ -246,15 +246,15 @@ impl<Front:SocketHandler> Pipe<Front> {
     let mut sz = 0usize;
     let mut socket_res = SocketResult::Continue;
 
-    while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
-      // no more data in buffer, stop here
-      if self.front_buf.next_output_data().len() == 0 {
-        self.readiness.front_interest.insert(Ready::readable());
-        self.readiness.back_interest.remove(Ready::writable());
-        return ClientResult::Continue;
-      }
+    if let Some(ref mut backend) = self.backend {
+      while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
+        // no more data in buffer, stop here
+        if self.front_buf.next_output_data().len() == 0 {
+          self.readiness.front_interest.insert(Ready::readable());
+          self.readiness.back_interest.remove(Ready::writable());
+          return ClientResult::Continue;
+        }
 
-      if let Some(ref mut backend) = self.backend {
         let (current_sz, current_res) = backend.socket_write(self.front_buf.next_output_data());
         socket_res = current_res;
         self.front_buf.consume_output_data(current_sz);
