@@ -41,7 +41,7 @@ use network::protocol::http::DefaultAnswerStatus;
 use network::retry::RetryPolicy;
 use util::UnwrapLog;
 
-use super::resolver::CertificateResolver;
+use super::resolver::{CertificateResolver,CertificateResolverWrapper};
 use super::client::TlsClient;
 
 type BackendToken = Token;
@@ -70,7 +70,7 @@ pub struct ServerConfiguration {
   config:          HttpsProxyConfiguration,
   base_token:      usize,
   ssl_config:      Arc<ServerConfig>,
-  resolver:        Arc<CertificateResolver>,
+  resolver:        Arc<CertificateResolverWrapper>,
 }
 
 impl ServerConfiguration {
@@ -104,7 +104,7 @@ impl ServerConfiguration {
     };
 
     let mut server_config = ServerConfig::new(NoClientAuth::new());
-    let resolver = Arc::new(CertificateResolver::new());
+    let resolver = Arc::new(CertificateResolverWrapper::new());
     server_config.cert_resolver = resolver.clone();
 
     Ok((ServerConfiguration {
