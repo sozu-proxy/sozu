@@ -7,6 +7,10 @@ pub fn calculate_fingerprint(certificate: &[u8]) -> Option<Vec<u8>> {
   }).ok()
 }
 
+pub fn calculate_fingerprint_from_der(certificate: &[u8]) -> Vec<u8> {
+  Sha256::digest(&certificate).iter().cloned().collect()
+}
+
 
 pub fn split_certificate_chain(mut chain: String) -> Vec<String> {
   let mut v = Vec::new();

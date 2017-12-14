@@ -7,6 +7,8 @@ use rustls::internal::pemfile;
 use webpki::DNSNameRef;
 
 use sozu_command::messages::{CertificateAndKey, CertFingerprint};
+use sozu_command::certificate::calculate_fingerprint_from_der;
+
 use network::trie::TrieNode;
 
 pub struct CertificateResolver {
@@ -29,7 +31,13 @@ impl CertificateResolver {
     let mut cert_reader = BufReader::new(certificate_and_key.certificate.as_bytes());
     let parsed_certs = pemfile::certs(&mut cert_reader);
     //info!("parsed: {:?}", parsed_cert);
-    if let Ok(certs) = parsed_certs {
+
+    if let Ok(mut certs) = parsed_certs {
+      if !certs.is_empty() {
+        let fingerprint: Vec<u8> = calculate_fingerprint_from_der(&certs[0].0);
+        info!("cert fingerprint: {:?}", fingerprint);
+        chain.push(certs.remove(0));
+      }
       for cert in certs {
         chain.push(cert);
       }
