@@ -1,10 +1,11 @@
 use std::io::{self,ErrorKind,Read,Write};
 use std::net::{SocketAddr,SocketAddrV4,SocketAddrV6};
 use mio::tcp::{TcpListener,TcpStream};
-use openssl::ssl::{Error, SslStream};
 use rustls::{ServerSession, Session};
 use net2::TcpBuilder;
 use net2::unix::UnixTcpBuilderExt;
+#[cfg(feature = "use_openssl")]
+use openssl::ssl::{Error, SslStream};
 
 #[derive(Debug,PartialEq,Copy,Clone)]
 pub enum SocketResult {
@@ -72,6 +73,7 @@ impl SocketHandler for TcpStream {
   fn socket_ref(&self) -> &TcpStream { self }
 }
 
+#[cfg(feature = "use_openssl")]
 impl SocketHandler for SslStream<TcpStream> {
   fn socket_read(&mut self,  buf: &mut[u8]) -> (usize, SocketResult) {
     let mut size = 0usize;

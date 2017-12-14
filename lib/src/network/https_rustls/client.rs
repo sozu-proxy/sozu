@@ -36,7 +36,7 @@ use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
 use network::trie::*;
-use network::protocol::{ProtocolResult,RustlsHandshake,Http,Pipe,StickySession};
+use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
 use network::protocol::http::DefaultAnswerStatus;
 use network::retry::RetryPolicy;
 use util::UnwrapLog;
@@ -48,7 +48,7 @@ type BackendToken = Token;
 type ClientToken = Token;
 
 pub enum State {
-  Handshake(RustlsHandshake),
+  Handshake(TlsHandshake),
   Http(Http<FrontRustls>),
   WebSocket(Pipe<FrontRustls>)
 }
@@ -70,7 +70,7 @@ impl TlsClient {
     //FIXME: we should not need to clone the socket. Maybe do the accept here instead of
     // in TlsHandshake?
     let s = sock.try_clone().expect("could not clone the socket");
-    let handshake = RustlsHandshake::new(ssl, s);
+    let handshake = TlsHandshake::new(ssl, s);
     TlsClient {
       front:          Some(sock),
       front_token:    None,
@@ -134,8 +134,8 @@ impl TlsClient {
       let front_token = unwrap_msg!(http.front_token());
       let back_token  = unwrap_msg!(http.back_token());
 
-      let mut pipe = Pipe::new(http.frontend, unwrap_msg!(http.backend),
-        http.front_buf, http.back_buf, http.public_address).expect("could not create Pipe instance");
+      let mut pipe = Pipe::new(http.frontend, http.backend,
+        http.front_buf, http.back_buf, http.public_address);
 
       pipe.readiness.front_readiness = http.readiness.front_readiness;
       pipe.readiness.back_readiness  = http.readiness.back_readiness;

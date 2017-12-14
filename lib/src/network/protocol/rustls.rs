@@ -16,15 +16,15 @@ pub enum TlsState {
   Error,
 }
 
-pub struct RustlsHandshake {
+pub struct TlsHandshake {
   pub stream:    TcpStream,
   pub session:   ServerSession,
   pub readiness: Readiness,
 }
 
-impl RustlsHandshake {
-  pub fn new(session: ServerSession, stream: TcpStream) -> RustlsHandshake {
-    RustlsHandshake {
+impl TlsHandshake {
+  pub fn new(session: ServerSession, stream: TcpStream) -> TlsHandshake {
+    TlsHandshake {
       stream:   stream,
       session:   session,
       readiness: Readiness {

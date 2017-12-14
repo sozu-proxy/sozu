@@ -10,7 +10,7 @@ use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
 use std::io::{self,Read,Write,ErrorKind,BufReader};
-use std::collections::HashMap;
+use std::collections::{HashMap,HashSet};
 use std::error::Error;
 use slab::Slab;
 use pool::{Pool,Checkout};
@@ -18,7 +18,7 @@ use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{precise_time_s, precise_time_ns};
 use rand::random;
-use rustls::{ServerConfig, ServerSession};
+use rustls::{ServerConfig, ServerSession, NoClientAuth};
 use nom::IResult;
 
 use sozu_command::buffer::Buffer;
@@ -36,7 +36,7 @@ use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
 use network::trie::*;
-use network::protocol::{ProtocolResult,RustlsHandshake,Http,Pipe,StickySession};
+use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
 use network::protocol::http::DefaultAnswerStatus;
 use network::retry::RetryPolicy;
 use util::UnwrapLog;
@@ -60,7 +60,7 @@ pub type HostName  = String;
 pub type PathBegin = String;
 
 pub struct ServerConfiguration {
-  listener:        TcpListener,
+  listener:        Option<TcpListener>,
   address:         SocketAddr,
   applications:    HashMap<AppId, Application>,
   instances:       BackendMap,
@@ -75,51 +75,55 @@ pub struct ServerConfiguration {
 
 impl ServerConfiguration {
   pub fn new(config: HttpsProxyConfiguration, base_token: usize, event_loop: &mut Poll, start_at: usize,
-    pool: Rc<RefCell<Pool<BufferQueue>>>) -> io::Result<ServerConfiguration> {
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>) -> io::Result<(ServerConfiguration, HashSet<ListenToken>)> {
 
     let mut fronts   = HashMap::new();
     let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
 
-    match server_bind(&config.front) {
-      Ok(listener) => {
-        event_loop.register(&listener, Token(base_token), Ready::readable(), PollOpt::edge());
-        let default = DefaultAnswers {
-          NotFound: Vec::from(if config.answer_404.len() > 0 {
-              config.answer_404.as_bytes()
-            } else {
-              &b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-            }),
-          ServiceUnavailable: Vec::from(if config.answer_503.len() > 0 {
-              config.answer_503.as_bytes()
-            } else {
-              &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-            }),
-        };
+    let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
+      error!("could not create listener {:?}: {:?}", fronts, e);
+    }).ok());
 
-        let mut server_config = ServerConfig::new();
-        let resolver = Arc::new(CertificateResolver::new());
-        server_config.cert_resolver = resolver.clone();
-
-        Ok(ServerConfiguration {
-          listener:        listener,
-          address:         config.front.clone(),
-          applications:    HashMap::new(),
-          instances:       BackendMap::new(),
-          fronts:          fronts,
-          pool:            pool,
-          answers:         default,
-          base_token:      base_token,
-          config:          config,
-          ssl_config:      Arc::new(server_config),
-          resolver:        resolver,
-        })
-      },
-      Err(e) => {
-        let formatted_err = format!("could not create listener {:?}: {:?}", fronts, e);
-        error!("{}", formatted_err);
-        Err(e)
-      }
+    let mut listeners = HashSet::new();
+    if let Some(ref sock) = listener {
+      event_loop.register(sock, Token(base_token), Ready::readable(), PollOpt::edge());
+      listeners.insert(ListenToken(0));
     }
+
+    let default = DefaultAnswers {
+      NotFound: Vec::from(if config.answer_404.len() > 0 {
+          config.answer_404.as_bytes()
+        } else {
+          &b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+        }),
+      ServiceUnavailable: Vec::from(if config.answer_503.len() > 0 {
+          config.answer_503.as_bytes()
+        } else {
+          &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+        }),
+    };
+
+    let mut server_config = ServerConfig::new(NoClientAuth::new());
+    let resolver = Arc::new(CertificateResolver::new());
+    server_config.cert_resolver = resolver.clone();
+
+    Ok((ServerConfiguration {
+      listener:        listener,
+      address:         config.front.clone(),
+      applications:    HashMap::new(),
+      instances:       BackendMap::new(),
+      fronts:          fronts,
+      pool:            pool,
+      answers:         default,
+      base_token:      base_token,
+      config:          config,
+      ssl_config:      Arc::new(server_config),
+      resolver:        resolver,
+    }, listeners))
+  }
+
+  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
+    self.listener.take()
   }
 
   pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
@@ -282,20 +286,24 @@ impl ServerConfiguration {
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   fn accept(&mut self, token: ListenToken) -> Result<(TlsClient,bool), AcceptError> {
-    self.listener.accept().map_err(|e| {
-      match e.kind() {
-        ErrorKind::WouldBlock => AcceptError::WouldBlock,
-        other => {
-          error!("accept() IO error: {:?}", e);
-          AcceptError::IoError
+    if let Some(ref listener) = self.listener.as_ref() {
+      listener.accept().map_err(|e| {
+        match e.kind() {
+          ErrorKind::WouldBlock => AcceptError::WouldBlock,
+          other => {
+            error!("accept() IO error: {:?}", e);
+            AcceptError::IoError
+          }
         }
-      }
-    }).map(|(frontend_sock, _)| {
-      frontend_sock.set_nodelay(true);
-      let session = ServerSession::new(&self.ssl_config);
-      let c = TlsClient::new(session, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address);
-      (c, false)
-    })
+      }).map(|(frontend_sock, _)| {
+        frontend_sock.set_nodelay(true);
+        let session = ServerSession::new(&self.ssl_config);
+        let c = TlsClient::new(session, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address);
+        (c, false)
+      })
+    } else {
+      Err(AcceptError::IoError)
+    }
   }
 
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut TlsClient) -> Result<BackendConnectAction,ConnectionError> {
@@ -471,14 +479,14 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         self.remove_https_front(front, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
-      Order::AddCertificate(certificate_and_key) => {
+      Order::AddCertificate(add_certificate) => {
         //info!("HTTPS\t{} add certificate: {:?}", id, certificate_and_key);
-          self.add_certificate(certificate_and_key, event_loop);
+          self.add_certificate(add_certificate.certificate, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
-      Order::RemoveCertificate(fingerprint) => {
+      Order::RemoveCertificate(remove_certificate) => {
         //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
-        self.remove_certificate(fingerprint, event_loop);
+        self.remove_certificate(remove_certificate.fingerprint, event_loop);
         //FIXME: should return an error if certificate still has fronts referencing it
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
@@ -515,11 +523,16 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
-        event_loop.deregister(&self.listener);
+        self.listener.as_ref().map(|sock| {
+          event_loop.deregister(sock);
+        });
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None }
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
+        self.listener.as_ref().map(|sock| {
+          event_loop.deregister(sock);
+        });
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::Status => {

@@ -32,7 +32,7 @@ use sozu_command::messages::{self,TcpFront,Order,Instance,MessageId,OrderMessage
 use network::buffer_queue::BufferQueue;
 use network::{ClientResult,ConnectionError,
   SocketType,Protocol,RequiredEvents};
-use network::{http,https_openssl,tcp};
+use network::{http,https,tcp};
 use network::metrics::METRICS;
 use network::session::{BackToken,FrontToken,ListenToken,ProxyClient,ProxyConfiguration,Readiness,Session};
 
@@ -57,7 +57,7 @@ pub struct Server {
   channel:         ProxyChannel,
   queue:           VecDeque<OrderMessageAnswer>,
   http:            Option<Session<http::ServerConfiguration, http::Client>>,
-  https:           Option<Session<https_openssl::ServerConfiguration, https_openssl::TlsClient>>,
+  https:           Option<Session<https::ServerConfiguration, https::TlsClient>>,
   tcp:             Option<Session<tcp::ServerConfiguration, tcp::Client>>,
   config_state:    ConfigState,
   scm:             ScmSocket,
@@ -93,7 +93,7 @@ impl Server {
 
     let https_session = config.https.and_then(|conf| conf.to_tls()).and_then(|https_conf| {
       let max_listeners   = 1;
-      https_openssl::ServerConfiguration::new(https_conf, 6148914691236517205, &mut event_loop,
+      https::ServerConfiguration::new(https_conf, 6148914691236517205, &mut event_loop,
         1 + max_listeners + 6148914691236517205, pool.clone(),
         listeners.tls.map(|fd| unsafe { TcpListener::from_raw_fd(fd) })
       ).map(|(configuration, listener_tokens)| {
@@ -116,7 +116,7 @@ impl Server {
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
     http:  Option<Session<http::ServerConfiguration, http::Client>>,
-    https: Option<Session<https_openssl::ServerConfiguration, https_openssl::TlsClient>>,
+    https: Option<Session<https::ServerConfiguration, https::TlsClient>>,
     tcp:  Option<Session<tcp::ServerConfiguration, tcp::Client>>,
     config_state: Option<ConfigState>) -> Self {
 

@@ -2,6 +2,7 @@ use std::sync::Mutex;
 use std::collections::HashMap;
 use rustls::{ResolvesServerCert, SignatureScheme};
 use rustls::sign::CertifiedKey;
+use webpki::DNSNameRef;
 
 use sozu_command::messages::{CertificateAndKey, CertFingerprint};
 
@@ -44,7 +45,7 @@ impl CertificateResolver {
 impl ResolvesServerCert for CertificateResolver {
   fn resolve(
         &self,
-        server_name: Option<&str>,
+        server_name: Option<DNSNameRef>,
         sigschemes: &[SignatureScheme]
     ) -> Option<CertifiedKey> {
 

@@ -914,6 +914,7 @@ dependencies = [
  "tiny_http 0.4.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "url 1.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "uuid 0.2.3 (registry+https://github.com/rust-lang/crates.io-index)",
+ "webpki 0.18.0-alpha (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
