@@ -7,6 +7,7 @@ RUN apk add --no-cache --virtual .build-dependencies \
   cargo \
   g++ \
   gcc \
+  libgcc \
   musl-dev \
   rust
 RUN apk add --no-cache openssl-dev llvm-libunwind pkgconfig
