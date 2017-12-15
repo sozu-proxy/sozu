@@ -518,6 +518,8 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn writable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
 
     assert!(self.front_buf.empty(), "investigating single buffer usage: the front->back buffer should not be used while parsing and forwarding the response");
+
+    //handle default answers
     let output_size = self.back_buf.output_data_size();
     if let ClientStatus::DefaultAnswer(answer) = self.status {
       if self.back_buf.output_data_size() == 0 {
@@ -534,6 +536,7 @@ impl<Front:SocketHandler> Http<Front> {
         sz += current_sz;
       }
 
+      count!("bytes_out", sz as i64);
       metrics.bout += sz;
 
       if res != SocketResult::Continue {
@@ -572,6 +575,8 @@ impl<Front:SocketHandler> Http<Front> {
       if self.back_buf.next_output_data().len() == 0 {
         self.readiness.back_interest.insert(Ready::readable());
         self.readiness.front_interest.remove(Ready::writable());
+        count!("bytes_out", sz as i64);
+        metrics.bout += sz;
         return ClientResult::Continue;
       }
       let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
@@ -710,6 +715,7 @@ impl<Front:SocketHandler> Http<Front> {
       if self.front_buf.next_output_data().len() == 0 {
         self.readiness.front_interest.insert(Ready::readable());
         self.readiness.back_interest.remove(Ready::writable());
+        metrics.backend_bout += sz;
         return ClientResult::Continue;
       }
       let (current_sz, current_res) = sock.socket_write(self.front_buf.next_output_data());
