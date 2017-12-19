@@ -235,7 +235,7 @@ pub fn hard_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
   );
 }
 
-pub fn upgrade(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
+pub fn upgrade(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
   let id = generate_tagged_id("LIST-WORKERS");
   channel.write_message(&ConfigMessage::new(
     id.clone(),
@@ -505,7 +505,7 @@ pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
   }
 }
 
-pub fn metrics(channel: &mut Channel<ConfigMessage,ConfigMessageAnswer>) {
+pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
   let id = generate_id();
   //println!("will send message for metrics with id {}", id);
   channel.write_message(&ConfigMessage::new(
