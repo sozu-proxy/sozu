@@ -239,6 +239,8 @@ pub fn hard_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
 pub fn upgrade<C>(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
                   connector: C)
   where C: Fn() -> Result<Channel<ConfigMessage,ConfigMessageAnswer>,io::Error> {
+  println!("Preparing to upgrade proxy...");
+
   let id = generate_tagged_id("LIST-WORKERS");
   channel.write_message(&ConfigMessage::new(
     id.clone(),
@@ -247,92 +249,99 @@ pub fn upgrade<C>(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
   ));
 
   match channel.read_message() {
-    None          => println!("the proxy didn't answer"),
+    None          => println!("Error: the proxy didn't list workers"),
     Some(message) => {
       if id != message.id {
-        println!("received message with invalid id: {:?}", message);
+        println!("Error: received unexpected message: {:?}", message);
         return;
       }
       match message.status {
         ConfigMessageStatus::Processing => {
-          println!("should have obtained an answer immediately");
+          println!("Error: the proxy didn't return list of workers immediately");
           return;
         },
         ConfigMessageStatus::Error => {
-          println!("could not get the worker list: {}", message.message);
+          println!("Error: failed to get the list of worker: {}", message.message);
           return
         },
         ConfigMessageStatus::Ok => {
-          println!("Worker list:\n{:?}", message.data);
           if let Some(AnswerData::Workers(ref workers)) = message.data {
+            let mut table = Table::new();
+            table.add_row(row!["Worker", "pid", "run state"]);
+            for ref worker in workers.iter() {
+              let run_state = format!("{:?}", worker.run_state);
+              table.add_row(row![worker.id, worker.pid, run_state]);
+            }
+            println!("");
+            table.printstd();
+            println!("");
+
             let id = generate_tagged_id("UPGRADE-MASTER");
             channel.write_message(&ConfigMessage::new(
               id.clone(),
               ConfigCommand::UpgradeMaster,
               None,
             ));
-            println!("master upgrade message sent: {}", id);
+            println!("Upgrading master process");
 
             loop {
               match channel.read_message() {
-                None          => println!("the proxy didn't answer"),
+                None          => println!("Error: the proxy didn't start master upgrade"),
                 Some(message) => {
                   if &id != &message.id {
-                    println!("received message with invalid id: {:?}", message);
+                    println!("Error: received unexpected message: {:?}", message);
                     return;
                   }
                   match message.status {
-                    ConfigMessageStatus::Processing => {
-                      println!("master is processing: {}", message.message);
-                    },
+                    ConfigMessageStatus::Processing => {},
                     ConfigMessageStatus::Error => {
-                      println!("could not upgrade the master: {}", message.message);
+                      println!("Error: failed to upgrade the master: {}", message.message);
                       return;
                     },
                     ConfigMessageStatus::Ok => {
-                      println!("successfully upgraded the master: {}", message.message);
+                      println!("Master process upgrade succeeded: {}", message.message);
                       break;
-                    }
+                    },
                   }
                 }
               }
             }
 
             // Reconnect to the new master
-            println!("reconnecting to upgraded master");
+            println!("Reconnecting to new master process...");
             let mut channel = connector().expect("could not reconnect to the command unix socket");
 
             // Do a rolling restart of the workers
-            for ref worker in workers.iter().filter(|worker| worker.run_state == RunState::Running) {
+            let running_workers = workers.iter()
+              .filter(|worker| worker.run_state == RunState::Running)
+              .collect::<Vec<_>>();
+            let running_count = running_workers.len();
+            for (i, ref worker) in running_workers.iter().enumerate() {
+              println!("Upgrading worker {} (of {})", i+1, running_count);
+
               let id = generate_tagged_id("LAUNCH-WORKER");
               let msg = ConfigMessage::new(
                 id.clone(),
                 ConfigCommand::LaunchWorker("BLAH".to_string()),
                 None,
               );
-              println!("launching new worker: {:?}", msg);
               channel.write_message(&msg);
 
               loop {
                 match channel.read_message() {
-                  None          => println!("the proxy didn't answer"),
+                  None          => println!("Error: the proxy didn't launch a new worker"),
                   Some(message) => {
                     if &id != &message.id {
-                      println!("received message with invalid id: {:?}", message);
+                      println!("Error: received unexpected message: {:?}", message);
                       return;
                     }
                     match message.status {
-                      ConfigMessageStatus::Processing => {
-                        println!("new worker is launching: {}", message.message);
-                      },
+                      ConfigMessageStatus::Processing => {},
                       ConfigMessageStatus::Error => {
-                        println!("could not launch new worker: {}", message.message);
+                        println!("Error: failed to launch a new worker: {}", message.message);
                         return;
                       },
-                      ConfigMessageStatus::Ok => {
-                        println!("successfully launched new worker: {}", message.message);
-                        break;
-                      }
+                      ConfigMessageStatus::Ok => break,
                     }
                   }
                 }
@@ -345,36 +354,30 @@ pub fn upgrade<C>(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
                 ConfigCommand::ProxyConfiguration(Order::SoftStop),
                 Some(worker.id),
               );
-              println!("stopping old worker: {:?}", msg);
               channel.write_message(&msg);
 
               loop {
                 match channel.read_message() {
-                  None          => println!("the proxy didn't answer"),
+                  None          => println!("Error: the proxy didn't stop the old worker"),
                   Some(message) => {
                     if &id != &message.id {
-                      println!("received message with invalid id: {:?}", message);
+                      println!("Error: received unexpected message: {:?}", message);
                       return;
                     }
                     match message.status {
-                      ConfigMessageStatus::Processing => {
-                        println!("old worker is stopping: {}", message.message);
-                      },
+                      ConfigMessageStatus::Processing => {},
                       ConfigMessageStatus::Error => {
-                        println!("could not stop old worker: {}", message.message);
+                        println!("Error: failed to stop old worker: {}", message.message);
                         return;
                       },
-                      ConfigMessageStatus::Ok => {
-                        println!("successfully stopped old worker: {}", message.message);
-                        break;
-                      }
+                      ConfigMessageStatus::Ok => break,
                     }
                   }
                 }
               }
             }
 
-            println!("proxy upgrade finished");
+            println!("Proxy successfully upgraded!");
           }
         }
       }
