@@ -286,7 +286,10 @@ pub fn upgrade<C>(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
 
             loop {
               match channel.read_message() {
-                None          => println!("Error: the proxy didn't start master upgrade"),
+                None          => {
+                  println!("Error: the proxy didn't start master upgrade");
+                  return;
+                },
                 Some(message) => {
                   if &id != &message.id {
                     println!("Error: received unexpected message: {:?}", message);
@@ -329,7 +332,10 @@ pub fn upgrade<C>(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
 
               loop {
                 match channel.read_message() {
-                  None          => println!("Error: the proxy didn't launch a new worker"),
+                  None          => {
+                    println!("Error: the proxy didn't launch a new worker");
+                    return;
+                  },
                   Some(message) => {
                     if &id != &message.id {
                       println!("Error: received unexpected message: {:?}", message);
@@ -358,7 +364,10 @@ pub fn upgrade<C>(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
 
               loop {
                 match channel.read_message() {
-                  None          => println!("Error: the proxy didn't stop the old worker"),
+                  None          => {
+                    println!("Error: the proxy didn't stop the old worker");
+                    return;
+                  }
                   Some(message) => {
                     if &id != &message.id {
                       println!("Error: received unexpected message: {:?}", message);
