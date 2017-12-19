@@ -41,9 +41,9 @@ fn main() {
         soft_stop(channel);
       }
     },
-    SubCmd::Upgrade => upgrade(&mut channel),
+    SubCmd::Upgrade => upgrade(channel),
     SubCmd::Status => status(channel),
-    SubCmd::Metrics => metrics(&mut channel),
+    SubCmd::Metrics => metrics(channel),
     SubCmd::Logging{ level } => logging_filter(channel, &level),
     SubCmd::State{ cmd } => {
       match cmd {
