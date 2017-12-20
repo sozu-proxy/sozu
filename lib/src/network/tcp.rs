@@ -28,6 +28,7 @@ use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
+use network::protocol::Pipe;
 
 use util::UnwrapLog;
 
@@ -47,8 +48,6 @@ pub enum ConnectionStatus {
 pub struct Client {
   sock:           TcpStream,
   backend:        Option<TcpStream>,
-  front_buf:      Checkout<BufferQueue>,
-  back_buf:       Checkout<BufferQueue>,
   token:          Option<Token>,
   backend_token:  Option<Token>,
   accept_token:   ListenToken,
@@ -57,23 +56,19 @@ pub struct Client {
   tx_count:       usize,
   app_id:         Option<String>,
   request_id:     String,
-  readiness:      Readiness,
   metrics:        SessionMetrics,
+  protocol:       Pipe<TcpStream>,
 }
 
 impl Client {
   fn new(sock: TcpStream, accept_token: ListenToken, front_buf: Checkout<BufferQueue>,
     back_buf: Checkout<BufferQueue>) -> Client {
-
-    let mut readiness = Readiness::new();
-    readiness.front_interest = UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error();
-    readiness.back_interest  = UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error();
+    let s = sock.try_clone().expect("could not clone the socket");
+    let addr = sock.peer_addr().map(|s| s.ip()).ok();
 
     Client {
       sock:           sock,
       backend:        None,
-      front_buf:      front_buf,
-      back_buf:       back_buf,
       token:          None,
       backend_token:  None,
       accept_token:   accept_token,
@@ -82,8 +77,8 @@ impl Client {
       tx_count:       0,
       app_id:         None,
       request_id:     Uuid::new_v4().hyphenated().to_string(),
-      readiness:      readiness,
       metrics:        SessionMetrics::new(),
+      protocol:       Pipe::new(s, None, front_buf, back_buf, addr),
     }
   }
 
@@ -120,19 +115,19 @@ impl Client {
 
 impl ProxyClient for Client {
   fn front_socket(&self) -> &TcpStream {
-    &self.sock
+    self.protocol.front_socket()
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
-    self.backend.as_ref()
+    self.protocol.back_socket()
   }
 
   fn front_token(&self)  -> Option<Token> {
-    self.token
+    self.protocol.front_token()
   }
 
   fn back_token(&self)   -> Option<Token> {
-    self.backend_token
+    self.protocol.back_token()
   }
 
   fn close(&mut self) {
@@ -147,15 +142,17 @@ impl ProxyClient for Client {
   }
 
   fn set_back_socket(&mut self, socket: TcpStream) {
-    self.backend       = Some(socket);
+    self.protocol.set_back_socket(socket);
   }
 
   fn set_front_token(&mut self, token: Token) {
     self.token         = Some(token);
+    self.protocol.set_front_token(token);
   }
 
   fn set_back_token(&mut self, token: Token) {
     self.backend_token = Some(token);
+    self.protocol.set_back_token(token);
   }
 
   fn back_connected(&self)     -> BackendConnectionStatus {
@@ -184,183 +181,32 @@ impl ProxyClient for Client {
 
   fn front_hup(&mut self) -> ClientResult {
     self.log_request();
-    self.readiness.front_interest = UnixReady::from(Ready::empty());
-    if  self.status == ConnectionStatus::ServerClosed ||
-        self.status == ConnectionStatus::ClientConnected { // the server never answered, the client closed
-
-      self.status = ConnectionStatus::Closed;
-      ClientResult::CloseClient
-    } else {
-      self.status = ConnectionStatus::ClientClosed;
-      ClientResult::CloseBoth
-    }
-
+    self.protocol.front_hup()
   }
 
   fn back_hup(&mut self) -> ClientResult {
     self.log_request();
-    self.readiness.back_interest = UnixReady::from(Ready::empty());
-    self.status = ConnectionStatus::Closed;
-    ClientResult::CloseBoth
+    self.protocol.back_hup()
   }
 
   fn readable(&mut self) -> ClientResult {
-    if self.front_buf.buffer.available_space() == 0 {
-      self.readiness.front_interest.remove(Ready::readable());
-      return ClientResult::Continue;
-    }
-
-    let (sz, res) = self.sock.socket_read(self.front_buf.buffer.space());
-    if sz > 0 {
-      self.front_buf.buffer.fill(sz);
-      self.front_buf.sliced_input(sz);
-      self.front_buf.consume_parsed_data(sz);
-      self.front_buf.slice_output(sz);
-
-      count!("bytes_in", sz as i64);
-      self.metrics.bin += sz;
-    } else {
-      self.readiness.front_readiness.remove(Ready::readable());
-    }
-    trace!("{}\tFRONT [{}->{}]: read {} bytes", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0, sz);
-
-    match res {
-      SocketResult::Error => {
-        error!("{}\tfront socket error, closing the connection", self.log_context());
-        self.metrics.service_stop();
-        incr_ereq!();
-        self.readiness.reset();
-        return ClientResult::CloseClient;
-      },
-      _                   => {
-        if res == SocketResult::WouldBlock {
-          self.readiness.front_readiness.remove(Ready::readable());
-        }
-        self.readiness.back_interest.insert(Ready::writable());
-        return ClientResult::Continue;
-      }
-    }
+    self.protocol.readable(&mut self.metrics)
   }
 
   fn writable(&mut self) -> ClientResult {
-    if self.back_buf.buffer.available_data() == 0 {
-      self.readiness.front_interest.remove(Ready::writable());
-      return ClientResult::Continue;
-    }
-
-     let mut sz = 0usize;
-     let mut socket_res = SocketResult::Continue;
-
-     while socket_res == SocketResult::Continue && self.back_buf.output_data_size() > 0 {
-       let (current_sz, current_res) = self.sock.socket_write(self.back_buf.next_output_data());
-       socket_res = current_res;
-       self.back_buf.consume_output_data(current_sz);
-       sz += current_sz;
-     }
-     trace!("{}\tFRONT [{}<-{}]: wrote {} bytes", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0, sz);
-     self.metrics.bout += sz;
-
-     match socket_res {
-       SocketResult::Error => {
-         self.readiness.reset();
-         self.metrics.service_stop();
-         error!("{}\terror writing default answer to front socket, closing", self.log_context());
-         incr_ereq!();
-         ClientResult::CloseBoth
-       },
-       SocketResult::WouldBlock => {
-         self.readiness.front_readiness.remove(Ready::writable());
-         self.readiness.back_interest.insert(Ready::readable());
-         ClientResult::Continue
-       },
-       SocketResult::Continue => {
-         self.readiness.back_interest.insert(Ready::readable());
-         ClientResult::Continue
-       }
-     }
+    self.protocol.writable(&mut self.metrics)
   }
 
   fn back_readable(&mut self) -> ClientResult {
-    if self.back_buf.buffer.available_space() == 0 {
-      self.readiness.back_interest.remove(Ready::readable());
-      return ClientResult::Continue;
-    }
-
-    //FIXME: maybe do not allocate here over and over
-    let log_ctx = self.log_context();
-
-    if let Some(ref mut sock) = self.backend {
-      let (sz, res) = sock.socket_read(self.back_buf.buffer.space());
-      self.back_buf.buffer.fill(sz);
-      self.back_buf.sliced_input(sz);
-      self.back_buf.consume_parsed_data(sz);
-      self.back_buf.slice_output(sz);
-      trace!("{}\tBACK  [{}<-{}]: read {} bytes", self.request_id, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0, sz);
-      self.metrics.backend_bin += sz;
-
-      match res {
-        SocketResult::Error => {
-          error!("{}\tback socket read error, closing connection", log_ctx);
-          self.metrics.service_stop();
-          self.readiness.reset();
-          return ClientResult::CloseClient;
-        },
-        _                   => {
-          if res == SocketResult::WouldBlock {
-            self.readiness.back_readiness.remove(Ready::readable());
-          }
-          self.readiness.front_interest.insert(Ready::writable());
-          return ClientResult::Continue;
-        }
-      }
-    } else {
-      self.readiness.reset();
-      ClientResult::CloseBoth
-    }
+    self.protocol.back_readable(&mut self.metrics)
   }
 
   fn back_writable(&mut self) -> ClientResult {
-     if self.front_buf.buffer.available_data() == 0 {
-        self.readiness.back_interest.remove(Ready::writable());
-        self.readiness.front_interest.insert(Ready::readable());
-        return ClientResult::Continue;
-     }
-
-     let mut sz = 0usize;
-     let mut socket_res = SocketResult::Continue;
-
-     if let Some(ref mut sock) = self.backend {
-       while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
-         let (current_sz, current_res) = sock.socket_write(self.front_buf.next_output_data());
-         socket_res = current_res;
-         self.front_buf.consume_output_data(current_sz);
-         sz += current_sz;
-       }
-     }
-    trace!("{}\tBACK [{}->{}]: wrote {} bytes", self.request_id, self.token.unwrap().0, self.backend_token.unwrap().0, sz);
-    self.metrics.backend_bout += sz;
-
-     match socket_res {
-       SocketResult::Error => {
-         error!("{}\tback socket write error, closing connection", self.log_context());
-         self.metrics.service_stop();
-         self.readiness.reset();
-         ClientResult::CloseBoth
-       },
-       SocketResult::WouldBlock => {
-         self.readiness.back_readiness.remove(Ready::writable());
-         self.readiness.front_interest.insert(Ready::readable());
-         ClientResult::Continue
-       },
-       SocketResult::Continue => {
-         self.readiness.front_interest.insert(Ready::readable());
-         ClientResult::Continue
-       }
-     }
+    self.protocol.back_writable(&mut self.metrics)
   }
 
   fn readiness(&mut self) -> &mut Readiness {
-    &mut self.readiness
+    self.protocol.readiness()
   }
 
 }

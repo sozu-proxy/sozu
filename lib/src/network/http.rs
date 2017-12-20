@@ -96,8 +96,8 @@ impl Client {
       let front_token = unwrap_msg!(http.front_token());
       let back_token  = unwrap_msg!(http.back_token());
 
-      let mut pipe = Pipe::new(http.frontend, unwrap_msg!(http.backend),
-        http.front_buf, http.back_buf, http.public_address).expect("could not create a Pipe instance");
+      let mut pipe = Pipe::new(http.frontend, Some(unwrap_msg!(http.backend)),
+        http.front_buf, http.back_buf, http.public_address);
 
       pipe.readiness.front_readiness = http.readiness.front_readiness;
       pipe.readiness.back_readiness  = http.readiness.back_readiness;

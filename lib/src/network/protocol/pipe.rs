@@ -23,7 +23,7 @@ pub enum ClientStatus {
 
 pub struct Pipe<Front:SocketHandler> {
   pub frontend:       Front,
-  backend:            TcpStream,
+  backend:            Option<TcpStream>,
   token:              Option<Token>,
   backend_token:      Option<Token>,
   pub front_buf:      Checkout<BufferQueue>,
@@ -38,7 +38,7 @@ pub struct Pipe<Front:SocketHandler> {
 }
 
 impl<Front:SocketHandler> Pipe<Front> {
-  pub fn new(frontend: Front, backend: TcpStream, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Option<Pipe<Front>> {
+  pub fn new(frontend: Front, backend: Option<TcpStream>, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Pipe<Front> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{}\tunknown\t", &request_id);
     let client = Pipe {
@@ -63,7 +63,7 @@ impl<Front:SocketHandler> Pipe<Front> {
     };
 
     trace!("created pipe");
-    Some(client)
+    client
   }
 
   fn tokens(&self) -> Option<(Token,Token)> {
@@ -80,7 +80,11 @@ impl<Front:SocketHandler> Pipe<Front> {
   }
 
   pub fn back_socket(&self)  -> Option<&TcpStream> {
-    Some(&self.backend)
+    self.backend.as_ref()
+  }
+
+  pub fn set_back_socket(&mut self, socket: TcpStream) {
+    self.backend = Some(socket);
   }
 
   pub fn front_token(&self)  -> Option<Token> {
@@ -242,18 +246,21 @@ impl<Front:SocketHandler> Pipe<Front> {
     let mut sz = 0usize;
     let mut socket_res = SocketResult::Continue;
 
-    while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
-      // no more data in buffer, stop here
-      if self.front_buf.next_output_data().len() == 0 {
-        self.readiness.front_interest.insert(Ready::readable());
-        self.readiness.back_interest.remove(Ready::writable());
-        return ClientResult::Continue;
+    if let Some(ref mut backend) = self.backend {
+      while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
+        // no more data in buffer, stop here
+        if self.front_buf.next_output_data().len() == 0 {
+          self.readiness.front_interest.insert(Ready::readable());
+          self.readiness.back_interest.remove(Ready::writable());
+          return ClientResult::Continue;
+        }
+
+        let (current_sz, current_res) = backend.socket_write(self.front_buf.next_output_data());
+        socket_res = current_res;
+        self.front_buf.consume_output_data(current_sz);
+        self.front_buf_position += current_sz;
+        sz += current_sz;
       }
-      let (current_sz, current_res) = self.backend.socket_write(self.front_buf.next_output_data());
-      socket_res = current_res;
-      self.front_buf.consume_output_data(current_sz);
-      self.front_buf_position += current_sz;
-      sz += current_sz;
     }
 
     metrics.backend_bout += sz;
@@ -287,30 +294,33 @@ impl<Front:SocketHandler> Pipe<Front> {
     }
 
     let tokens     = self.tokens().clone();
-    let (sz, r) = self.backend.socket_read(&mut self.back_buf.buffer.space());
-    self.back_buf.buffer.fill(sz);
-    self.back_buf.sliced_input(sz);
-    self.back_buf.consume_parsed_data(sz);
-    self.back_buf.slice_output(sz);
 
-    if let Some((front,back)) = tokens {
-      debug!("{}\tBACK  [{}<-{}]: read {} bytes", self.log_ctx, front.0, back.0, sz);
-    }
+    if let Some(ref mut backend) = self.backend {
+      let (sz, r) = backend.socket_read(&mut self.back_buf.buffer.space());
+      self.back_buf.buffer.fill(sz);
+      self.back_buf.sliced_input(sz);
+      self.back_buf.consume_parsed_data(sz);
+      self.back_buf.slice_output(sz);
 
-    if r != SocketResult::Continue || sz == 0 {
-      self.readiness.back_readiness.remove(Ready::readable());
-    }
-    if sz > 0 {
-      self.readiness.front_interest.insert(Ready::writable());
-      metrics.backend_bin += sz;
-    }
+      if let Some((front,back)) = tokens {
+        debug!("{}\tBACK  [{}<-{}]: read {} bytes", self.log_ctx, front.0, back.0, sz);
+      }
 
-    if r == SocketResult::Error {
-      error!("{}\tback socket read error, closing connection", self.log_ctx);
-      metrics.service_stop();
-      incr_ereq!();
-      self.readiness.reset();
-      return ClientResult::CloseBoth;
+      if r != SocketResult::Continue || sz == 0 {
+        self.readiness.back_readiness.remove(Ready::readable());
+      }
+      if sz > 0 {
+        self.readiness.front_interest.insert(Ready::writable());
+        metrics.backend_bin += sz;
+      }
+
+      if r == SocketResult::Error {
+        error!("{}\tback socket read error, closing connection", self.log_ctx);
+        metrics.service_stop();
+        incr_ereq!();
+        self.readiness.reset();
+        return ClientResult::CloseBoth;
+      }
     }
 
     ClientResult::Continue
