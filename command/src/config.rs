@@ -57,11 +57,15 @@ impl ProxyConfig {
       if self.answer_404.as_ref().and_then(|path| File::open(path).ok())
         .and_then(|mut file| file.read_to_string(&mut answer_404).ok()).is_some() {
         configuration.answer_404 = answer_404;
+      } else {
+        configuration.answer_404 = String::from(include_str!("../assets/404.html"));
       }
       let mut answer_503 = String::new();
       if self.answer_503.as_ref().and_then(|path| File::open(path).ok())
         .and_then(|mut file| file.read_to_string(&mut answer_503).ok()).is_some() {
         configuration.answer_503 = answer_503;
+      } else {
+        configuration.answer_503 = String::from(include_str!("../assets/503.html"));
       }
       configuration
     })
@@ -120,20 +124,19 @@ impl ProxyConfig {
         ..Default::default()
       };
 
-      //FIXME: error messages if file not found?
       let mut answer_404 = String::new();
       if self.answer_404.as_ref().and_then(|path| File::open(path).ok())
         .and_then(|mut file| file.read_to_string(&mut answer_404).ok()).is_some() {
         configuration.answer_404 = answer_404;
       } else {
-        error!("error loading default 404 answer file: {:?}", self.answer_404);
+        configuration.answer_404 = String::from(include_str!("../assets/404.html"));
       }
       let mut answer_503 = String::new();
       if self.answer_503.as_ref().and_then(|path| File::open(path).ok())
         .and_then(|mut file| file.read_to_string(&mut answer_503).ok()).is_some() {
         configuration.answer_503 = answer_503;
       } else {
-        error!("error loading default 503 answer file: {:?}", self.answer_503);
+        configuration.answer_503 = String::from(include_str!("../assets/503.html"));
       }
       if let Some(cipher_list) = self.cipher_list.as_ref() {
         configuration.cipher_list = cipher_list.clone();
