@@ -202,8 +202,10 @@ impl Server {
 
                 let msg = msg.expect("the message should be valid");
                 if let Order::HardStop = msg.order {
+                  let id_msg = msg.id.clone();
                   self.notify(msg);
-                  //FIXME: it's a bit brutal
+                  self.channel.write_message(&OrderMessageAnswer{ id: id_msg, status: OrderMessageStatus::Ok, data: None});
+                  self.channel.run();
                   return;
                 } else if let Order::SoftStop = msg.order {
                   self.shutting_down = Some(msg.id.clone());
