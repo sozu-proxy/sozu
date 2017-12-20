@@ -247,7 +247,11 @@ impl CommandServer {
         (*metrics.borrow_mut()).send_data();
       });
 
-      if self.must_stop {
+      let clients_not_served = self.clients.iter()
+                                            .filter(|c| !c.queue.is_empty())
+                                            .count();
+
+      if self.must_stop && clients_not_served == 0 {
         info!("stopping...");
         break;
       }
@@ -489,9 +493,7 @@ impl CommandServer {
             let id        = task.id.clone();
             let answer = if task.error.is_empty() {
               if task.message_type == MessageType::Stop {
-                if let Some(ref mut proxy) = self.proxies.get_mut(&token) {
-                  proxy.run_state = RunState::Stopped;
-                }
+                self.must_stop = true;
               }
               ConfigMessageAnswer::new(
                 id,

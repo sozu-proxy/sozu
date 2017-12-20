@@ -367,7 +367,7 @@ impl CommandServer {
 
     self.state.handle_order(&order);
 
-    if order == Order::SoftStop {
+    if order == Order::SoftStop || order == Order::HardStop {
       self.order_state.insert_task(message_id, MessageType::Stop, Some(token));
     } else {
       self.order_state.insert_task(message_id, MessageType::WorkerOrder, Some(token));
