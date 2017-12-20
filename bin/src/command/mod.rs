@@ -275,7 +275,9 @@ impl CommandServer {
           proxy.channel.handle_events(events);
           let uevent = UnixReady::from(events);
           if uevent.is_hup() {
-            proxy.run_state = RunState::NotAnswering;
+            if proxy.run_state != RunState::Stopped && proxy.run_state != RunState::Stopping {
+              proxy.run_state = RunState::NotAnswering;
+            }
           }
 
         }
@@ -348,7 +350,9 @@ impl CommandServer {
               let res = proxy.channel.writable();
               if let Err(e) = res {
                 error!("could not write to worker socket: {:?}", e);
-                proxy.run_state = RunState::NotAnswering;
+                if proxy.run_state != RunState::Stopped && proxy.run_state != RunState::Stopping {
+                  proxy.run_state = RunState::NotAnswering;
+                }
               }
             }
 
