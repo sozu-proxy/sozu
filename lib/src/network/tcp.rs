@@ -549,6 +549,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
+        for listener in self.listeners.iter() {
+          event_loop.deregister(&listener.sock);
+        }
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
       },
       Order::Status => {

@@ -669,6 +669,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         info!("{} hard shutdown", message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
+        event_loop.deregister(&self.listener);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::Status => {

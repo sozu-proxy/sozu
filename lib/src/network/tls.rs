@@ -1069,6 +1069,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
+        event_loop.deregister(&self.listener);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::Status => {
