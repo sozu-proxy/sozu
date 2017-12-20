@@ -262,7 +262,7 @@ impl ServerConfiguration {
         self.listeners[tok].token = Some(Token(self.base_token+2+tok.0));
         self.fronts.insert(String::from(app_id), tok);
         event_loop.register(&self.listeners[tok].sock, Token(self.base_token+2+tok.0), Ready::readable(), PollOpt::edge());
-        info!("registered listener for app {} on port {} at token {:?}", app_id, front.port(), Token(self.base_token+2+tok.0));
+        info!("started TCP listener for app {} on port {}", app_id, front.port());
         Some(tok)
       } else {
         error!("could not register listener for app {} on port {}", app_id, front.port());
@@ -315,7 +315,7 @@ impl ServerConfiguration {
       application_listener.back_addresses.push(*instance_address);
       Some(tok)
     } else {
-      error!("No front for this instance");
+      error!("No front for instance {} in app {}", instance_id, app_id);
       None
     }
   }
@@ -371,7 +371,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         if let Some(token) = self.add_instance(&instance.app_id, &instance.instance_id, addr, event_loop) {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
         } else {
-          error!("Couldn't add tcp instance");
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot add tcp instance")), data: None}
         }
       },
