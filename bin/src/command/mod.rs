@@ -487,7 +487,7 @@ impl CommandServer {
             error!("{}: {} successful messages, failures: {:?}, reason: {}", msg.id, ok, &failures, s.clone());
 
             if let Some(client_token) = opt_token {
-              self.clients[client_token].push_message(answer);
+              self.clients.get_mut(client_token).map(|cl| cl.push_message(answer));
             }
           }
         },
@@ -517,7 +517,7 @@ impl CommandServer {
             };
 
             if let Some(client_token) = opt_token {
-              self.clients[client_token].push_message(answer);
+              self.clients.get_mut(client_token).map(|cl| cl.push_message(answer));
             }
           }
         }
