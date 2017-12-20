@@ -302,6 +302,10 @@ impl CommandServer {
   }
 
   pub fn handle_worker_events(&mut self, token: Token) {
+    if !self.proxies.contains_key(&token) {
+      return;
+    }
+
     let mut messages = {
       let mut messages = Vec::new();
       let ref mut proxy = self.proxies.get_mut(&token).unwrap();
