@@ -599,6 +599,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
           },
           _ => {
             self.clients[client_token].readiness().front_readiness.remove(UnixReady::hup());
+            break;
           }
         }
       }
@@ -610,9 +611,15 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
             self.close_client(poll, client_token);
             break;
           },
-          ClientResult::Continue => {},
+          ClientResult::Continue => {
+            self.clients[client_token].readiness().front_interest.insert(Ready::writable());
+            if ! self.clients[client_token].readiness().front_readiness.is_writable() {
+              break;
+            }
+          },
           _ => {
             self.clients[client_token].readiness().back_readiness.remove(UnixReady::hup());
+            break;
           }
         };
       }
