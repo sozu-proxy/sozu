@@ -865,7 +865,7 @@ mod tests {
 
         //thread::sleep(Duration::from_millis(300));
         //assert_eq!(&body, &"Hello World!"[..]);
-        assert_eq!(sz, 204);
+        assert_eq!(sz, 201);
         //assert!(false);
       }
     }
@@ -917,7 +917,7 @@ mod tests {
 
         //thread::sleep(Duration::from_millis(300));
         //assert_eq!(&body, &"Hello World!"[..]);
-        assert_eq!(sz, 204);
+        assert_eq!(sz, 201);
         //assert!(false);
       }
     }
@@ -939,7 +939,7 @@ mod tests {
 
         //thread::sleep(Duration::from_millis(300));
         //assert_eq!(&body, &"Hello World!"[..]);
-        assert_eq!(sz, 204);
+        assert_eq!(sz, 201);
         //assert!(false);
       }
     }
