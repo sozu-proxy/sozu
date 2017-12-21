@@ -173,7 +173,14 @@ impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
       None => return Err(serde::de::Error::missing_field("id")),
     };
     let _version = match version {
-      Some(version) => version,
+      Some(version) => {
+        if version > PROTOCOL_VERSION {
+          let msg = format!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", PROTOCOL_VERSION, version);
+          return Err(serde::de::Error::custom(msg));
+        } else {
+          version
+        }
+      },
       None => return Err(serde::de::Error::missing_field("version")),
     };
 
@@ -305,6 +312,7 @@ impl serde::Serialize for ConfigMessage {
 mod tests {
   use super::*;
   use serde_json;
+  use std::error::Error;
   use hex::FromHex;
   use certificate::split_certificate_chain;
   use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Instance};
@@ -320,6 +328,16 @@ mod tests {
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
     })));
+  }
+
+  #[test]
+  fn protocol_version_mismatch_test() {
+    let data = include_str!("../assets/protocol_mismatch.json");
+    let msg = format!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {} at line 14 column 1", PROTOCOL_VERSION, 1);
+    let res: Result<ConfigMessage, serde_json::Error> = serde_json::from_str(data);
+
+    let err = format!("{}", res.unwrap_err());
+    assert_eq!(err, msg);
   }
 
   macro_rules! test_message (

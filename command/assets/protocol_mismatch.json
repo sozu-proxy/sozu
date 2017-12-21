@@ -1,6 +1,6 @@
 {
   "id": "ID_TEST",
-  "version": 0,
+  "version": 1,
   "type": "PROXY",
   "data": {
     "type": "ADD_INSTANCE",
