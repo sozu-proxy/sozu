@@ -527,8 +527,13 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
     };
 
 
+    let mut counter = 0;
+    let max_loop_iterations = 100000;
+
     self.clients[client_token].metrics().service_start();
-    loop {
+
+    while counter < max_loop_iterations {
+
       let front_interest = self.clients[client_token].readiness().front_interest &
         self.clients[client_token].readiness().front_readiness;
       let back_interest = self.clients[client_token].readiness().back_interest &
@@ -636,10 +641,23 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
         self.close_client(poll, client_token);
         break;
       }
+
+      counter += 1;
     }
 
     if self.clients.contains(client_token) {
       self.clients[client_token].metrics().service_stop();
+    }
+
+    if counter == max_loop_iterations {
+      error!("PROXY\thandling client {:?} went through 10000 iterations, there's a probable infinite loop bug, closing the connection", client_token);
+      let front_interest = self.clients[client_token].readiness().front_interest &
+        self.clients[client_token].readiness().front_readiness;
+      let back_interest = self.clients[client_token].readiness().back_interest &
+        self.clients[client_token].readiness().back_readiness;
+      error!("PROXY\t{:?} events {:?} | readiness: {:?} | front: {:?} | back: {:?} ", client_token, events, self.clients[client_token].readiness(), front_interest, back_interest);
+
+      self.close_client(poll, client_token);
     }
   }
 
