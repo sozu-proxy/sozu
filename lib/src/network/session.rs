@@ -650,7 +650,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
     }
 
     if counter == max_loop_iterations {
-      error!("PROXY\thandling client {:?} went through 10000 iterations, there's a probable infinite loop bug, closing the connection", client_token);
+      error!("PROXY\thandling client {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", client_token, max_loop_iterations);
       let front_interest = self.clients[client_token].readiness().front_interest &
         self.clients[client_token].readiness().front_readiness;
       let back_interest = self.clients[client_token].readiness().back_interest &
