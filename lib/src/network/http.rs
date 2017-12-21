@@ -354,27 +354,41 @@ impl ServerConfiguration {
     self.applications.remove(app_id);
   }
 
-  pub fn add_http_front(&mut self, http_front: HttpFront, event_loop: &mut Poll) {
-    let front2 = http_front.clone();
-    let front3 = http_front.clone();
-    if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
-        if !fronts.contains(&front2) {
-          fronts.push(front2);
+  pub fn add_http_front(&mut self, mut http_front: HttpFront, event_loop: &mut Poll) -> Result<(), String> {
+    match ::idna::domain_to_ascii(&http_front.hostname) {
+      Ok(hostname) => {
+        http_front.hostname = hostname;
+        let front2 = http_front.clone();
+        let front3 = http_front.clone();
+        if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
+            if !fronts.contains(&front2) {
+              fronts.push(front2);
+            }
         }
-    }
 
-    // FIXME: check that http front port matches the listener's port
-    // FIXME: separate the port and hostname, match the hostname separately
+        // FIXME: check that http front port matches the listener's port
+        // FIXME: separate the port and hostname, match the hostname separately
 
-    if self.fronts.get(&http_front.hostname).is_none() {
-      self.fronts.insert(http_front.hostname, vec![front3]);
+        if self.fronts.get(&http_front.hostname).is_none() {
+          self.fronts.insert(http_front.hostname, vec![front3]);
+        }
+        Ok(())
+      },
+      Err(_) => Err(format!("Couldn't parse hostname {} to ascii", http_front.hostname))
     }
   }
 
-  pub fn remove_http_front(&mut self, front: HttpFront, event_loop: &mut Poll) {
+  pub fn remove_http_front(&mut self, mut front: HttpFront, event_loop: &mut Poll) -> Result<(), String> {
     debug!("removing http_front {:?}", front);
-    if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
-      fronts.retain(|f| f != &front);
+    match ::idna::domain_to_ascii(&front.hostname) {
+      Ok(hostname) => {
+        front.hostname = hostname;
+        if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
+          fronts.retain(|f| f != &front);
+        }
+        Ok(())
+      },
+      Err(_) => Err(format!("Couldn't parse hostname {} to ascii", front.hostname))
     }
   }
 
@@ -619,13 +633,17 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       },
       Order::AddHttpFront(front) => {
         debug!("{} add front {:?}", message.id, front);
-        self.add_http_front(front, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        match self.add_http_front(front, event_loop) {
+          Ok(_) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None },
+          Err(err) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(err), data: None }
+        }
       },
       Order::RemoveHttpFront(front) => {
         debug!("{} front {:?}", message.id, front);
-        self.remove_http_front(front, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        match self.remove_http_front(front, event_loop) {
+          Ok(_) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None },
+          Err(err) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(err), data: None }
+        }
       },
       Order::AddInstance(instance) => {
         debug!("{} add instance {:?}", message.id, instance);
