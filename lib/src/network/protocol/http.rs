@@ -164,29 +164,29 @@ impl<Front:SocketHandler> Http<Front> {
       //FIXME: in the "for", we don't put the other values we could get from a preexisting forward header
       match (peer, front) {
         (IpAddr::V4(p), IpAddr::V4(f)) => {
-          format!("Forwarded: proto={};for={};by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nRequest-id: {}\r\n",
+          format!("Forwarded: proto={};for={};by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nSozu-Id: {}\r\n",
             proto, peer, front, proto, peer, self.request_id)
         },
         (IpAddr::V4(p), IpAddr::V6(f)) => {
-          format!("Forwarded: proto={};for={};by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nRequest-id: {}\r\n",
+          format!("Forwarded: proto={};for={};by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nSozu-Id: {}\r\n",
             proto, peer, front, proto, peer, self.request_id)
         },
         (IpAddr::V6(p), IpAddr::V4(f)) => {
-          format!("Forwarded: proto={};for=\"{}\";by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nRequest-id: {}\r\n",
+          format!("Forwarded: proto={};for=\"{}\";by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nSozu-Id: {}\r\n",
             proto, peer, front, proto, peer, self.request_id)
         },
         (IpAddr::V6(p), IpAddr::V6(f)) => {
-          format!("Forwarded: proto={};for=\"{}\";by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nRequest-id: {}\r\n",
+          format!("Forwarded: proto={};for=\"{}\";by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nSozu-Id: {}\r\n",
             proto, peer, front, proto, peer, self.request_id)
         },
       }
     } else {
-      format!("Request-id: {}\r\n", self.request_id)
+      format!("Sozu-Id: {}\r\n", self.request_id)
     }
   }
 
   pub fn added_response_header(&self) -> String {
-    format!("Request-id: {}\r\n", self.request_id)
+    format!("Sozu-Id: {}\r\n", self.request_id)
   }
 
   pub fn front_socket(&self) -> &TcpStream {

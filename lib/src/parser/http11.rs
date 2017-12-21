@@ -582,7 +582,7 @@ impl<'a> Header<'a> {
       &lowercase[..] == b"x-forwarded-for"   ||
       &lowercase[..] == b"x-forwarded-proto" ||
       &lowercase[..] == b"x-forwarded-port"  ||
-      &lowercase[..] == b"request-id"        ||
+      &lowercase[..] == b"sozu-id"           ||
       conn.to_delete.contains(unsafe {str::from_utf8_unchecked(&self.value.to_ascii_lowercase()[..])})
     }
   }
@@ -2398,8 +2398,8 @@ mod tests {
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]);
 
-      let new_header = b"Request-Id: 123456789\r\n";
-      initial.added_req_header = String::from("Request-Id: 123456789\r\n");
+      let new_header = b"Sozu-Id: 123456789\r\n";
+      initial.added_req_header = String::from("Sozu-Id: 123456789\r\n");
       let result = parse_request_until_stop(initial, "", &mut buf);
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
@@ -2422,7 +2422,7 @@ mod tests {
             200
           )),
           response: Some(ResponseState::Initial),
-          added_req_header: String::from("Request-Id: 123456789\r\n"),
+          added_req_header: String::from("Sozu-Id: 123456789\r\n"),
           added_res_header: String::from(""),
         }
       );
@@ -2860,8 +2860,8 @@ mod tests {
     let mut buf = BufferQueue::with_capacity(2048);
     buf.write(&input[..]);
 
-    let new_header = b"Request-Id: 123456789\r\n";
-    initial.added_res_header = String::from("Request-Id: 123456789\r\n");
+    let new_header = b"Sozu-Id: 123456789\r\n";
+    initial.added_res_header = String::from("Sozu-Id: 123456789\r\n");
     let result = parse_response_until_stop(initial, "", &mut buf, None);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
@@ -2889,7 +2889,7 @@ mod tests {
           0
         )),
         added_req_header: String::from(""),
-        added_res_header: String::from("Request-Id: 123456789\r\n"),
+        added_res_header: String::from("Sozu-Id: 123456789\r\n"),
       }
     );
   }
@@ -2907,8 +2907,8 @@ mod tests {
     let mut buf = BufferQueue::with_capacity(2048);
     buf.write(&input[..]);
 
-    let new_header = b"Request-Id: 123456789\r\n";
-    initial.added_res_header = String::from("Request-Id: 123456789\r\n");
+    let new_header = b"Sozu-Id: 123456789\r\n";
+    initial.added_res_header = String::from("Sozu-Id: 123456789\r\n");
     let result = parse_response_until_stop(initial, "", &mut buf, None);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
@@ -2932,7 +2932,7 @@ mod tests {
           0
         )),
         added_req_header: String::from(""),
-        added_res_header: String::from("Request-Id: 123456789\r\n"),
+        added_res_header: String::from("Sozu-Id: 123456789\r\n"),
       }
     );
   }
