@@ -252,6 +252,13 @@ impl ProxyMetrics {
   pub fn fill_buffer(&mut self) {
     let now  = Instant::now();
     let secs = Duration::new(2, 0);
+
+    if now.duration_since(self.request_counter.sent_at) > secs {
+      if self.buffer.write_fmt(format_args!("{}.{}:{}|g\n", self.prefix, "requests", self.request_counter.last_sent)).is_ok() {
+        self.request_counter.update_sent_at(now);
+      }
+    }
+
     for (ref key, ref mut stored_metric) in self.data.iter_mut().filter(|&(_, ref value)| now.duration_since(value.last_sent) > secs) {
       //info!("will write {} -> {:#?}", key, stored_metric);
       match stored_metric.data {
@@ -282,6 +289,7 @@ impl ProxyMetrics {
         _ => {}
       }
     }
+
   }
 
   pub fn send_data(&mut self) {
@@ -515,8 +523,10 @@ macro_rules! incr_req (
 
 #[derive(Debug,Clone)]
 pub struct TimeSerie {
+  sent_at:           Instant,
   updated_second_at: Instant,
   updated_minute_at: Instant,
+  last_sent:         u32,
   last_second:       u32,
   last_minute:       VecDeque<u32>,
   last_hour:         VecDeque<u32>,
@@ -525,8 +535,10 @@ pub struct TimeSerie {
 impl TimeSerie {
   pub fn new() -> TimeSerie {
     TimeSerie {
+      sent_at:           Instant::now(),
       updated_second_at: Instant::now(),
       updated_minute_at: Instant::now(),
+      last_sent:         0,
       last_second:       0,
       last_minute:       repeat(0).take(60).collect(),
       last_hour:         repeat(0).take(60).collect(),
@@ -553,6 +565,8 @@ impl TimeSerie {
     } else {
       self.last_second += 1;
     }
+
+    self.last_sent += 1;
   }
 
   pub fn filtered(&mut self) -> FilteredTimeSerie {
@@ -579,5 +593,10 @@ impl TimeSerie {
       last_minute: self.last_minute.iter().cloned().collect(),
       last_hour:   self.last_hour.iter().cloned().collect(),
     }
+  }
+
+  pub fn update_sent_at(&mut self, now: Instant) {
+    self.sent_at   = now;
+    self.last_sent = 0;
   }
 }
