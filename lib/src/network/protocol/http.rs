@@ -432,6 +432,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     if unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial) {
       incr!("http.requests");
+      incr_req!();
     }
 
     // if there's no host, continue parsing until we find it

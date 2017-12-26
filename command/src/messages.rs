@@ -50,6 +50,23 @@ pub enum FilteredData {
   Gauge(usize),
   Count(i64),
   Time(usize),
+  TimeSerie(FilteredTimeSerie),
+}
+
+#[derive(Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct FilteredTimeSerie {
+  pub last_second: u32,
+  pub last_minute: Vec<u32>,
+  pub last_hour:   Vec<u32>,
+}
+
+impl fmt::Debug for FilteredTimeSerie {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    write!(f, "FilteredTimeSerie {{\nlast_second: {},\n last_minute:\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n last_hour:\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n{:?}\n}}",
+      self.last_second,
+    &self.last_minute[0..10], &self.last_minute[10..20], &self.last_minute[20..30], &self.last_minute[30..40], &self.last_minute[40..50], &self.last_minute[50..60],
+    &self.last_hour[0..10], &self.last_hour[10..20], &self.last_hour[20..30], &self.last_hour[30..40], &self.last_hour[40..50], &self.last_hour[50..60])
+  }
 }
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]

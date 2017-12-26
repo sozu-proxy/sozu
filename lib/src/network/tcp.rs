@@ -431,6 +431,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         self.listeners[internal_token].sock.accept().map(|(frontend_sock, _)| {
           frontend_sock.set_nodelay(true);
           let c = Client::new(frontend_sock, internal_token, front_buf, back_buf);
+          incr_req!();
           (c, true)
         }).map_err(|e| {
           match e.kind() {

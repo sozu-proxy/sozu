@@ -3,7 +3,9 @@ use std::thread;
 use std::sync::Mutex;
 use std::cell::RefCell;
 use std::time::{Duration,Instant};
+use std::iter::repeat;
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::fmt::Arguments;
 use std::net::SocketAddr;
 use mio::net::UdpSocket;
@@ -11,7 +13,7 @@ use std::io::{self,Write,Error,ErrorKind};
 use nom::HexDisplay;
 use hdrsample::Histogram;
 use sozu_command::buffer::Buffer;
-use sozu_command::messages::{FilteredData,MetricsData,Percentiles,BackendMetricsData};
+use sozu_command::messages::{FilteredData,MetricsData,Percentiles,BackendMetricsData,FilteredTimeSerie};
 
 thread_local! {
   pub static METRICS: RefCell<ProxyMetrics> = RefCell::new(ProxyMetrics::new(String::from("sozu")))
@@ -57,6 +59,7 @@ pub struct ProxyMetrics {
   pub app_data:    BTreeMap<String,Histogram<u32>>,
   /// app_id -> response time histogram (in ms)
   pub backend_data: BTreeMap<String,BackendMetrics>,
+  pub request_counter: TimeSerie,
   pub is_writable: bool,
   remote:          Option<(SocketAddr, UdpSocket)>,
 }
@@ -70,6 +73,7 @@ impl ProxyMetrics {
       data:        BTreeMap::new(),
       app_data:    BTreeMap::new(),
       backend_data: BTreeMap::new(),
+      request_counter: TimeSerie::new(),
       remote:      None,
       is_writable: false,
     }
@@ -89,8 +93,8 @@ impl ProxyMetrics {
     self.send();
   }
 
-  pub fn dump_data(&self) -> BTreeMap<String, FilteredData> {
-    self.data.iter().filter(|&(_, ref value)| {
+  pub fn dump_data(&mut self) -> BTreeMap<String, FilteredData> {
+    let mut data: BTreeMap<String, FilteredData> = self.data.iter().filter(|&(_, ref value)| {
       if let MetricData::Time(_,None) = value.data {
         false
       } else {
@@ -108,7 +112,11 @@ impl ProxyMetrics {
         _ => unreachable!()
       };
       (key.to_string(), val)
-    }).collect()
+    }).collect();
+
+    data.insert(String::from("requests"), FilteredData::TimeSerie(self.request_counter.filtered()));
+
+    data
   }
 
   pub fn dump_percentiles(&self) -> BTreeMap<String, Percentiles> {
@@ -151,7 +159,7 @@ impl ProxyMetrics {
     }).collect()
   }
 
-  pub fn dump_metrics_data(&self) -> MetricsData {
+  pub fn dump_metrics_data(&mut self) -> MetricsData {
     MetricsData {
       proxy:        self.dump_data(),
       applications: self.dump_percentiles(),
@@ -493,3 +501,83 @@ macro_rules! incr_client_cmd (
 macro_rules! incr_resp_client_cmd (
   () => (incr!("incr_resp_client_cmd");)
 );
+
+/// count another accepted request
+#[macro_export]
+macro_rules! incr_req (
+  () => {
+    $crate::network::metrics::METRICS.with(|metrics| {
+      let ref mut m = *metrics.borrow_mut();
+      m.request_counter.increment();
+    });
+  }
+);
+
+#[derive(Debug,Clone)]
+pub struct TimeSerie {
+  updated_second_at: Instant,
+  updated_minute_at: Instant,
+  last_second:       u32,
+  last_minute:       VecDeque<u32>,
+  last_hour:         VecDeque<u32>,
+}
+
+impl TimeSerie {
+  pub fn new() -> TimeSerie {
+    TimeSerie {
+      updated_second_at: Instant::now(),
+      updated_minute_at: Instant::now(),
+      last_second:       0,
+      last_minute:       repeat(0).take(60).collect(),
+      last_hour:         repeat(0).take(60).collect(),
+    }
+  }
+
+  pub fn increment(&mut self) {
+    let now = Instant::now();
+
+    if now - self.updated_minute_at > Duration::from_secs(60) {
+      self.updated_minute_at = now;
+      let _ = self.last_hour.pop_front();
+
+      self.last_hour.push_back( self.last_minute.iter().sum() );
+    }
+
+    if now - self.updated_second_at > Duration::from_secs(1) {
+      self.updated_second_at = now;
+      let _ = self.last_minute.pop_front();
+
+      self.last_minute.push_back( self.last_second );
+
+      self.last_second = 1;
+    } else {
+      self.last_second += 1;
+    }
+  }
+
+  pub fn filtered(&mut self) -> FilteredTimeSerie {
+    let now = Instant::now();
+
+    if now - self.updated_minute_at > Duration::from_secs(60) {
+      self.updated_minute_at = now;
+      let _ = self.last_hour.pop_front();
+
+      self.last_hour.push_back( self.last_minute.iter().sum() );
+    }
+
+    if now - self.updated_second_at > Duration::from_secs(1) {
+      self.updated_second_at = now;
+      let _ = self.last_minute.pop_front();
+
+      self.last_minute.push_back( self.last_second );
+
+      self.last_second = 0;
+    }
+
+    FilteredTimeSerie {
+      last_second: self.last_second,
+      last_minute: self.last_minute.iter().cloned().collect(),
+      last_hour:   self.last_hour.iter().cloned().collect(),
+    }
+  }
+}

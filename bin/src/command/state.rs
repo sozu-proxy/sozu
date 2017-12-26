@@ -131,7 +131,7 @@ impl Task {
            }
         }).collect();
         let master_metrics = METRICS.with(|metrics| {
-          (*metrics.borrow()).dump_metrics_data()
+          (*metrics.borrow_mut()).dump_metrics_data()
         });
         data.insert(String::from("master"), master_metrics);
         Some(AnswerData::Metrics(data))
