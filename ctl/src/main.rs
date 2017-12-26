@@ -51,7 +51,7 @@ fn main() {
     },
     SubCmd::Application{ cmd } => {
       match cmd {
-        ApplicationCmd::Add{ id, sticky_session } => add_application(channel, &id, sticky_session),
+        ApplicationCmd::Add{ id, sticky_session, https_redirect } => add_application(channel, &id, sticky_session, https_redirect),
         ApplicationCmd::Remove{ id } => remove_application(channel, &id),
       }
     },

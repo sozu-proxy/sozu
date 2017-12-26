@@ -184,6 +184,7 @@ pub struct FileAppConfig {
   pub certificate_chain: Option<String>,
   pub backends:          Vec<String>,
   pub sticky_session:    Option<bool>,
+  pub https_redirect:    Option<bool>,
 }
 
 impl FileAppConfig {
@@ -210,6 +211,7 @@ impl FileAppConfig {
 
       let path_begin     = self.path_begin.unwrap_or(String::new());
       let sticky_session = self.sticky_session.unwrap_or(false);
+      let https_redirect = self.https_redirect.unwrap_or(false);
 
       let key_opt         = self.key.as_ref().and_then(|path| Config::load_file(&path).ok());
       let certificate_opt = self.certificate.as_ref().and_then(|path| Config::load_file(&path).ok());
@@ -239,7 +241,7 @@ impl FileAppConfig {
         certificate_chain: chain_opt,
         backends:          self.backends,
         sticky_session:    sticky_session,
-
+        https_redirect:    https_redirect,
       }))
     }
   }
@@ -255,6 +257,7 @@ pub struct HttpAppConfig {
   pub certificate_chain: Option<Vec<String>>,
   pub backends:          Vec<String>,
   pub sticky_session:    bool,
+  pub https_redirect:    bool,
 }
 
 impl HttpAppConfig {
@@ -264,6 +267,7 @@ impl HttpAppConfig {
     v.push(Order::AddApplication(Application {
       app_id: self.app_id.clone(),
       sticky_session: self.sticky_session.clone(),
+      https_redirect: self.https_redirect.clone(),
     }));
 
     //create the front both for HTTP and HTTPS if possible
@@ -334,6 +338,7 @@ impl TcpAppConfig {
     v.push(Order::AddApplication(Application {
       app_id: self.app_id.clone(),
       sticky_session: false,
+      https_redirect: false,
     }));
 
     v.push(Order::AddTcpFront(TcpFront {

@@ -128,7 +128,8 @@ pub enum ConnectionError {
   NoRequestLineGiven,
   HostNotFound,
   NoBackendAvailable,
-  ToBeDefined
+  ToBeDefined,
+  HttpsRedirect
 }
 
 #[derive(Debug,PartialEq,Eq)]

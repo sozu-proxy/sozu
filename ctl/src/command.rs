@@ -702,10 +702,11 @@ pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
   }
 }
 
-pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, sticky_session: bool) {
+pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, sticky_session: bool, https_redirect: bool) {
   order_command(channel, Order::AddApplication(Application {
     app_id:         String::from(app_id),
     sticky_session: sticky_session,
+    https_redirect: https_redirect
   }));
 }
 

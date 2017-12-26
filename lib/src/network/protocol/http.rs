@@ -39,6 +39,7 @@ pub enum ClientStatus {
 
 #[derive(Debug,Clone,Copy,PartialEq)]
 pub enum DefaultAnswerStatus {
+  Answer301,
   Answer404,
   Answer503,
 }
@@ -348,6 +349,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     let status_line = match self.status {
       ClientStatus::Normal => "-",
+      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer301) => "301 Moved Permanently",
       ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer404) => "404 Not Found",
       ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer503) => "503 Service Unavailable",
     };
