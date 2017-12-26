@@ -385,19 +385,16 @@ impl<Front:SocketHandler> Http<Front> {
       if self.backend_token == None {
         // We don't have a backend to empty the buffer into, close the connection
         error!("{}\tfront buffer full, no backend, closing the connection", self.log_ctx);
-        self.readiness.front_interest = UnixReady::from(Ready::empty());
-        self.readiness.back_interest  = UnixReady::from(Ready::empty());
         incr_ereq!();
         let answer_413 = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
         self.set_answer(DefaultAnswerStatus::Answer413, answer_413.as_bytes());
         self.readiness.front_interest.remove(Ready::readable());
         self.readiness.front_interest.insert(Ready::writable());
-        return ClientResult::Continue;
       } else {
         self.readiness.front_interest.remove(Ready::readable());
         self.readiness.back_interest.insert(Ready::writable());
-        return ClientResult::Continue;
       }
+      return ClientResult::Continue;
     }
 
     let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
