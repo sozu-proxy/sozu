@@ -7,6 +7,7 @@ extern crate structopt;
 mod command;
 mod cli;
 
+use std::io;
 use structopt::StructOpt;
 
 use sozu_command::config::Config;
@@ -26,12 +27,8 @@ fn main() {
 
   let config_file = matches.config;
 
-  let config = Config::load_from_path(config_file.as_str()).expect("could not parse configuration file");
-  let mut channel: Channel<ConfigMessage,ConfigMessageAnswer> =
-    Channel::from_path(&config.command_socket_path(), 10_000, 2_000_000)
-      .expect("could not connect to the command unix socket");
-
-  channel.set_nonblocking(false);
+  let config  = Config::load_from_path(config_file.as_str()).expect("could not parse configuration file");
+  let channel = create_channel(&config.command_socket_path()).expect("could not connect to the command unix socket");
 
   match matches.cmd {
     SubCmd::Shutdown{ hard } => {
@@ -41,7 +38,7 @@ fn main() {
         soft_stop(channel);
       }
     },
-    SubCmd::Upgrade => upgrade(channel),
+    SubCmd::Upgrade => upgrade(channel, &config.command_socket_path()),
     SubCmd::Status => status(channel),
     SubCmd::Metrics => metrics(channel),
     SubCmd::Logging{ level } => logging_filter(channel, &level),
@@ -92,4 +89,12 @@ fn main() {
       }
     },
   }
+}
+
+pub fn create_channel(path: &str) -> Result<Channel<ConfigMessage,ConfigMessageAnswer>,io::Error> {
+  Channel::from_path(path, 10_000, 2_000_000)
+    .and_then(|mut channel| {
+      channel.set_nonblocking(false);
+      Ok(channel)
+    })
 }
