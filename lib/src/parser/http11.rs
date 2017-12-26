@@ -243,13 +243,13 @@ pub struct CookieValue<'a> {
   name: &'a [u8],
   value: &'a [u8],
   semicolon: Option<&'a [u8]>,
-  spaces: Option<&'a [u8]>
+  spaces: &'a [u8]
 }
 
 impl<'a> CookieValue<'a> {
   pub fn get_full_length(&self) -> usize {
     let semicolon = if self.semicolon.is_some() { 1 } else { 0 };
-    let space = self.spaces.map(|sp| sp.len()).unwrap_or(0);
+    let space = self.spaces.len();
 
     self.name.len() + self.value.len() + semicolon + space + 1 // +1 is for =
   }
@@ -265,7 +265,7 @@ named!(pub single_request_cookie<CookieValue>,
     name: take_until_and_consume!("=") >>
     value: take_while!(is_cookie_value_char) >>
     semicolon: opt!(complete!(tag!(";"))) >>
-    spaces: opt!(complete!(take_while!(is_space))) >>
+    spaces: complete!(take_while!(is_space)) >>
     (CookieValue {
       name: name,
       value: value,
@@ -627,7 +627,7 @@ impl<'a> Header<'a> {
         // Our return value
         let mut moves = Vec::new();
         // The current number of cookie parsed
-        let mut current_cookie = 1;
+        let mut current_cookie = 0;
         // If the cookie SOZUBALANCEID is the last of the cookie chain
         let sozu_balance_is_last = if (sozu_balance_position + 1) == cookies.len() { true } else { false };
 
@@ -636,29 +636,36 @@ impl<'a> Header<'a> {
         loop {
           match iter.next() {
             Some(cookie) => {
-              if &cookie.name[..] == b"SOZUBALANCEID" {
-                moves.push(BufferMove::Delete(cookie.get_full_length()));
+              let cookie_length = cookie.get_full_length();
+              // We already know the position of the cookie in the chain, so we avoid
+              // a string comparision and directly check against where we are in the cookies
+              if current_cookie == sozu_balance_position {
+                moves.push(BufferMove::Delete(cookie_length));
               } else if sozu_balance_is_last {
                 // if sozublanceid is the last element, we want to delete the "; " chars from
                 // the before last cookie
-                let next = current_cookie + 1;
-                let cookie_length = cookie.get_full_length();
-                if next == sozu_balance_position {
-                  moves.push(BufferMove::Advance(cookie_length - 2));
+                if (current_cookie + 1) == sozu_balance_position {
+                  let spaces = cookie.spaces.len();
+                  // This one is obvious but I prefer to name the value
+                  let semicolon = 1;
+                  moves.push(BufferMove::Advance(cookie_length - spaces - semicolon));
+                  // We directly do the Delete here to avoid keeping context of 'did the cookie
+                  // before had spaces ?'
+                  moves.push(BufferMove::Delete(semicolon + spaces));
                 } else {
                   moves.push(BufferMove::Advance(cookie_length));
                 }
               } else {
-                moves.push(BufferMove::Advance(cookie.get_full_length()));
+                moves.push(BufferMove::Advance(cookie_length));
               }
+
+              current_cookie += 1;
             },
             None => {
               moves.push(BufferMove::Advance(2)); // advance of 2 for the header's \r\n
               return moves;
             }
           }
-
-          current_cookie += 1;
         }
       }
     }
@@ -3045,6 +3052,210 @@ mod tests {
           added_res_header: String::from(""),
         }
       );
+  }
+
+  #[test]
+  fn header_cookies_must_mutate() {
+    let header = Header {
+      name: b"Cookie",
+      value: b"FOO=BAR"
+    };
+
+    assert!(header.must_mutate());
+  }
+
+  #[test]
+  fn header_cookies_request_cookies() {
+    let none_cookies = request_cookies(b"FOOBAR").unwrap();
+    let some_cookies = request_cookies(b"FOO=BAR;BAR=FOO; SOZUBALANCEID=0;   SOZU=SOZU").unwrap();
+
+    assert_eq!(none_cookies.len(), 0);
+    assert_eq!(some_cookies.len(), 4);
+
+    assert_eq!(some_cookies[0].name, b"FOO");
+    assert_eq!(some_cookies[0].value, b"BAR");
+    assert_eq!(some_cookies[0].semicolon.is_some(), true);
+    assert_eq!(some_cookies[0].spaces.len(), 0);
+
+    assert_eq!(some_cookies[1].name, b"BAR");
+    assert_eq!(some_cookies[1].value, b"FOO");
+    assert_eq!(some_cookies[1].semicolon.is_some(), true);
+    assert_eq!(some_cookies[1].spaces.len(), 1);
+
+    assert_eq!(some_cookies[2].name, b"SOZUBALANCEID");
+    assert_eq!(some_cookies[2].value, b"0");
+    assert_eq!(some_cookies[2].semicolon.is_some(), true);
+    assert_eq!(some_cookies[2].spaces.len(), 3);
+
+    assert_eq!(some_cookies[3].name, b"SOZU");
+    assert_eq!(some_cookies[3].value, b"SOZU");
+    assert_eq!(some_cookies[3].semicolon.is_some(), false);
+    assert_eq!(some_cookies[3].spaces.len(), 0);
+  }
+
+  #[test]
+  fn header_cookies_no_sticky() {
+    let header_line1 = b"Cookie: FOO=BAR\r\n";
+    let header_line2 = b"Cookie:FOO=BAR; BAR=FOO;SOZU=SOZU\r\n";
+    let header_line3 = b"Cookie: FOO=BAR; BAR=FOO\r\n";
+
+    let header1 = match message_header(header_line1) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let header2 = match message_header(header_line2) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let header3 = match message_header(header_line3) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len());
+    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len());
+    let moves3 = header3.remove_sticky_cookie_in_request(header_line3, header_line3.len());
+    let expected1 = vec![BufferMove::Advance(header_line1.len())];
+    let expected2 = vec![BufferMove::Advance(header_line2.len())];
+    let expected3 = vec![BufferMove::Advance(header_line3.len())];
+
+    assert_eq!(moves1, expected1);
+    assert_eq!(moves2, expected2);
+    assert_eq!(moves3, expected3);
+  }
+
+  #[test]
+  fn header_cookies_sticky_only_cookie() {
+    let header_line1 = b"Cookie: SOZUBALANCEID=0\r\n";
+    let header_line2 = b"Cookie: SOZUBALANCEID=0;  \r\n";
+
+    let header1 = match message_header(header_line1) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let header2 = match message_header(header_line2) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len());
+    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len());
+    let expected1 = vec![BufferMove::Delete(header_line1.len())];
+    let expected2 = vec![BufferMove::Delete(header_line2.len())];
+
+    assert_eq!(moves1, expected1);
+    assert_eq!(moves2, expected2);
+  }
+
+  #[test]
+  fn header_cookies_sticky_start() {
+    let header_line1 = b"Cookie:SOZUBALANCEID=0;FOO=BAR\r\n";
+    let header_line2 = b"Cookie: SOZUBALANCEID=0;  FOO=BAR\r\n";
+    let header_line3 = b"Cookie: SOZUBALANCEID=0; FOO=BAR\r\n";
+
+    let header1 = match message_header(header_line1) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let header2 = match message_header(header_line2) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let header3 = match message_header(header_line3) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len());
+    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len());
+    let moves3 = header3.remove_sticky_cookie_in_request(header_line3, header_line3.len());
+    let expected1 = vec![BufferMove::Advance(7), BufferMove::Delete(16), BufferMove::Advance(7), BufferMove::Advance(2)];
+    let expected2 = vec![BufferMove::Advance(8), BufferMove::Delete(18), BufferMove::Advance(7), BufferMove::Advance(2)];
+    let expected3 = vec![BufferMove::Advance(8), BufferMove::Delete(17), BufferMove::Advance(7), BufferMove::Advance(2)];
+
+    assert_eq!(moves1, expected1);
+    assert_eq!(moves2, expected2);
+    assert_eq!(moves3, expected3);
+  }
+
+  #[test]
+  fn header_cookies_sticky_middle() {
+    let header_line1 = b"Cookie: BAR=FOO; SOZUBALANCEID=0;FOO=BAR\r\n";
+    let header_line2 = b"Cookie:BAR=FOO;SOZUBALANCEID=0;  FOO=BAR\r\n";
+    let header_line3 = b"Cookie: BAR=FOO; SOZUBALANCEID=0; FOO=BAR\r\n";
+
+    let header1 = match message_header(header_line1) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let header2 = match message_header(header_line2) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let header3 = match message_header(header_line3) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len());
+    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len());
+    let moves3 = header3.remove_sticky_cookie_in_request(header_line3, header_line3.len());
+    let expected1 = vec![BufferMove::Advance(8), BufferMove::Advance(9), BufferMove::Delete(16), BufferMove::Advance(7), BufferMove::Advance(2)];
+    let expected2 = vec![BufferMove::Advance(7), BufferMove::Advance(8), BufferMove::Delete(18), BufferMove::Advance(7), BufferMove::Advance(2)];
+    let expected3 = vec![BufferMove::Advance(8), BufferMove::Advance(9), BufferMove::Delete(17), BufferMove::Advance(7), BufferMove::Advance(2)];
+
+    assert_eq!(moves1, expected1);
+    assert_eq!(moves2, expected2);
+    assert_eq!(moves3, expected3);
+  }
+
+  #[test]
+  fn header_cookies_sticky_end() {
+    let header_line1 = b"Cookie: BAR=FOO;  SOZUBALANCEID=0\r\n";
+    let header_line2 = b"Cookie:BAR=FOO;SOZUBALANCEID=0;  \r\n";
+    let header_line3 = b"Cookie: BAR=FOO; SOZUBALANCEID=0  \r\n";
+    let header_line4 = b"Cookie: BAR=FOO; SOZUBALANCEID=0\r\n";
+
+    let header1 = match message_header(header_line1) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let header2 = match message_header(header_line2) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let header3 = match message_header(header_line3) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let header4 = match message_header(header_line4) {
+      IResult::Done(_, header) => header,
+      _ => panic!()
+    };
+
+    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len());
+    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len());
+    let moves3 = header3.remove_sticky_cookie_in_request(header_line3, header_line3.len());
+    let moves4 = header4.remove_sticky_cookie_in_request(header_line4, header_line4.len());
+    let expected1 = vec![BufferMove::Advance(8), BufferMove::Advance(7), BufferMove::Delete(3), BufferMove::Delete(15), BufferMove::Advance(2)];
+    let expected2 = vec![BufferMove::Advance(7), BufferMove::Advance(7), BufferMove::Delete(1), BufferMove::Delete(18), BufferMove::Advance(2)];
+    let expected3 = vec![BufferMove::Advance(8), BufferMove::Advance(7), BufferMove::Delete(2), BufferMove::Delete(17), BufferMove::Advance(2)];
+    let expected4 = vec![BufferMove::Advance(8), BufferMove::Advance(7), BufferMove::Delete(2), BufferMove::Delete(15), BufferMove::Advance(2)];
+
+    assert_eq!(moves1, expected1);
+    assert_eq!(moves2, expected2);
+    assert_eq!(moves3, expected3);
+    assert_eq!(moves4, expected4);
   }
 }
 
