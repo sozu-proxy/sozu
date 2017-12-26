@@ -940,10 +940,3 @@ fn save_http_status_metric(rs_status_line : Option<RStatusLine>) {
     }
   }
 }
-
-
-#[allow(non_snake_case)]
-pub struct DefaultAnswers {
-  pub NotFound:           Vec<u8>,
-  pub ServiceUnavailable: Vec<u8>
-}
