@@ -451,6 +451,7 @@ impl<Front:SocketHandler> Http<Front> {
         self.readiness.back_interest.insert(Ready::writable());
         return ClientResult::ConnectBackend;
       } else {
+        self.readiness.front_interest.insert(Ready::readable());
         return ClientResult::Continue;
       }
     }
