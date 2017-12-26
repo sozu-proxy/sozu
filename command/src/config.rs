@@ -263,7 +263,7 @@ impl HttpAppConfig {
 
     v.push(Order::AddApplication(Application {
       app_id: self.app_id.clone(),
-      sticky_session: false,
+      sticky_session: self.sticky_session.clone(),
     }));
 
     //create the front both for HTTP and HTTPS if possible
