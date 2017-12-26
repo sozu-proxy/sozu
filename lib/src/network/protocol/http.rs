@@ -41,6 +41,7 @@ pub enum ClientStatus {
 pub enum DefaultAnswerStatus {
   Answer404,
   Answer503,
+  Answer413,
 }
 
 pub struct Http<Front:SocketHandler> {
@@ -350,6 +351,7 @@ impl<Front:SocketHandler> Http<Front> {
       ClientStatus::Normal => "-",
       ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer404) => "404 Not Found",
       ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer503) => "503 Service Unavailable",
+      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer413) => "413 Payload Too Large",
     };
 
     let host         = self.get_host().unwrap_or(String::from("-"));
@@ -386,6 +388,9 @@ impl<Front:SocketHandler> Http<Front> {
         self.readiness.front_interest = UnixReady::from(Ready::empty());
         self.readiness.back_interest  = UnixReady::from(Ready::empty());
         incr_ereq!();
+        let answer_413 = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
+        self.set_answer(DefaultAnswerStatus::Answer413, answer_413.as_bytes());
+        self.readiness.back_interest.insert(Ready::writable());
         return ClientResult::CloseClient;
       } else {
         self.readiness.front_interest.remove(Ready::readable());
