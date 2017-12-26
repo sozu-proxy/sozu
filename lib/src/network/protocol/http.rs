@@ -390,8 +390,9 @@ impl<Front:SocketHandler> Http<Front> {
         incr_ereq!();
         let answer_413 = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
         self.set_answer(DefaultAnswerStatus::Answer413, answer_413.as_bytes());
-        self.readiness.back_interest.insert(Ready::writable());
-        return ClientResult::CloseClient;
+        self.readiness.front_interest.remove(Ready::readable());
+        self.readiness.front_interest.insert(Ready::writable());
+        return ClientResult::Continue;
       } else {
         self.readiness.front_interest.remove(Ready::readable());
         self.readiness.back_interest.insert(Ready::writable());
