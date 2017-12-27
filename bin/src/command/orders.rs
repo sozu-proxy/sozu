@@ -487,12 +487,14 @@ impl CommandServer {
         debug!("registering: {:?}", poll.register(&stream, Token(token),
           Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
           PollOpt::edge()));
+        let mut channel = Channel::new(stream, buffer_size, buffer_size * 2);
+        channel.readiness.insert(Ready::writable());
         Some(
           (
             Token(token),
             Worker {
               id:         serialized.id,
-              channel:    Channel::new(stream, buffer_size, buffer_size * 2),
+              channel:    channel,
               token:      Some(Token(token)),
               pid:        serialized.pid,
               run_state:  serialized.run_state.clone(),
