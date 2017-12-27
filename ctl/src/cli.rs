@@ -85,6 +85,8 @@ pub enum ApplicationCmd {
     id: String,
     #[structopt(short = "s", long = "sticky-session")]
     sticky_session: bool,
+    #[structopt(short = "h", long = "https-redirect")]
+    https_redirect: bool
   },
 }
 

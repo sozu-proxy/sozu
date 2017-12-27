@@ -518,6 +518,15 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     let rl     = try!(client.http().unwrap().state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
     if let Some(app_id) = self.frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
 
+      let front_should_redirect_https = self.applications.get(&app_id).map(|ref app| app.https_redirect).unwrap_or(false);
+      if front_should_redirect_https {
+        let answer = format!("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://{}{}\r\n\r\n", host, rl.uri);
+        //FIXME: the buffer is copied but it's not needed
+        client.set_answer(DefaultAnswerStatus::Answer301, answer.as_bytes());
+        client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+        return Err(ConnectionError::HttpsRedirect);
+      }
+
       let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
 
       if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
@@ -959,6 +968,57 @@ mod tests {
         //assert_eq!(&body, &"Hello World!"[..]);
         assert_eq!(sz, 201);
         //assert!(false);
+      }
+    }
+  }
+
+  #[allow(unused_mut, unused_must_use, unused_variables)]
+  #[test]
+  fn https_redirect() {
+    setup_test_logger!();
+    start_server(1040);
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1041").expect("could not parse address");
+    let config = HttpProxyConfiguration {
+      front: front,
+      ..Default::default()
+    };
+
+    let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
+    let jg = thread::spawn(move || {
+      start(config, channel, 10, 16384);
+    });
+
+    let application = Application { app_id: String::from("app_1"), sticky_session: false, https_redirect: true };
+    command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddApplication(application) });
+    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
+    command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddHttpFront(front) });
+    let instance = Instance { app_id: String::from("app_1"),instance_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1040 };
+    command.write_message(&OrderMessage { id: String::from("ID_IJKL"), order: Order::AddInstance(instance) });
+
+    println!("test received: {:?}", command.read_message());
+    println!("test received: {:?}", command.read_message());
+    println!("test received: {:?}", command.read_message());
+    thread::sleep(Duration::from_millis(300));
+
+    let mut client = TcpStream::connect(("127.0.0.1", 1041)).expect("could not parse address");
+    // 5 seconds of timeout
+    client.set_read_timeout(Some(Duration::new(5,0)));
+    thread::sleep(Duration::from_millis(100));
+    let mut w  = client.write(&b"GET /redirected?true HTTP/1.1\r\nHost: localhost\r\nConnection: Close\r\n\r\n"[..]);
+    println!("http client write: {:?}", w);
+    let mut buffer = [0;4096];
+    thread::sleep(Duration::from_millis(500));
+    let mut r = client.read(&mut buffer[..]);
+    println!("http client read: {:?}", r);
+    match r {
+      Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
+      Ok(sz) => {
+        let answer = str::from_utf8(&buffer[0..sz]).expect("could not make string from buffer");
+        // Read the Response.
+        println!("read response");
+        println!("Response: {}", answer);
+        let expected_answer = "HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://localhost/redirected?true\r\n\r\n";
+        assert_eq!(answer, expected_answer);
       }
     }
   }

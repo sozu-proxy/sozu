@@ -6,7 +6,8 @@
     "type": "ADD_APPLICATION",
     "data": {
       "app_id": "xxx",
-      "sticky_session": true
+      "sticky_session": true,
+      "https_redirect": true
     }
   }
 }

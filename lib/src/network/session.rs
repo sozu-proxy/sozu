@@ -421,7 +421,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
           return;
         }
       },
-      Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) => {
+      Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) | Err(ConnectionError::HttpsRedirect) => {
         self.clients[token].readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
         self.clients[token].readiness().back_interest  = UnixReady::hup() | UnixReady::error();
       },
