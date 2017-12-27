@@ -41,6 +41,7 @@ pub enum ClientStatus {
 pub enum DefaultAnswerStatus {
   Answer404,
   Answer503,
+  Answer413,
 }
 
 pub struct Http<Front:SocketHandler> {
@@ -350,6 +351,7 @@ impl<Front:SocketHandler> Http<Front> {
       ClientStatus::Normal => "-",
       ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer404) => "404 Not Found",
       ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer503) => "503 Service Unavailable",
+      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer413) => "413 Payload Too Large",
     };
 
     let host         = self.get_host().unwrap_or(String::from("-"));
@@ -383,15 +385,16 @@ impl<Front:SocketHandler> Http<Front> {
       if self.backend_token == None {
         // We don't have a backend to empty the buffer into, close the connection
         error!("{}\tfront buffer full, no backend, closing the connection", self.log_ctx);
-        self.readiness.front_interest = UnixReady::from(Ready::empty());
-        self.readiness.back_interest  = UnixReady::from(Ready::empty());
         incr_ereq!();
-        return ClientResult::CloseClient;
+        let answer_413 = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
+        self.set_answer(DefaultAnswerStatus::Answer413, answer_413.as_bytes());
+        self.readiness.front_interest.remove(Ready::readable());
+        self.readiness.front_interest.insert(Ready::writable());
       } else {
         self.readiness.front_interest.remove(Ready::readable());
         self.readiness.back_interest.insert(Ready::writable());
-        return ClientResult::Continue;
       }
+      return ClientResult::Continue;
     }
 
     let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
@@ -937,11 +940,4 @@ fn save_http_status_metric(rs_status_line : Option<RStatusLine>) {
       _ => { incr!("hrsp_other"); }, // http responses with other codes (protocol error)
     }
   }
-}
-
-
-#[allow(non_snake_case)]
-pub struct DefaultAnswers {
-  pub NotFound:           Vec<u8>,
-  pub ServiceUnavailable: Vec<u8>
 }
