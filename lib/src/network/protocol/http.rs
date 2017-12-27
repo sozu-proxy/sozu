@@ -146,9 +146,18 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: &[u8])  {
     self.front_buf.reset();
     self.back_buf.reset();
-    self.back_buf.write(buf);
-    self.back_buf.consume_parsed_data(buf.len());
-    self.back_buf.slice_output(buf.len());
+    match self.back_buf.write(buf) {
+      Ok(sz) => {
+        self.back_buf.consume_parsed_data(sz);
+        self.back_buf.slice_output(sz);
+
+        if sz < buf.len() {
+          error!("The backend buffer is too small, we couldn't write the entire answer");
+        }
+      }
+      Err(e) => error!("The backend buffer is too small: {}", e),
+    }
+
     self.status = ClientStatus::DefaultAnswer(answer);
   }
 
