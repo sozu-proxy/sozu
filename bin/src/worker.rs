@@ -126,12 +126,12 @@ pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState) -> n
       trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
       Command::new(path)
         .arg("worker")
+        .arg("--id")
+        .arg(id)
         .arg("--fd")
         .arg(client.as_raw_fd().to_string())
         .arg("--configuration-state-fd")
         .arg(state_file.as_raw_fd().to_string())
-        .arg("--id")
-        .arg(id)
         .arg("--channel-buffer-size")
         .arg(channel_buffer_size.to_string())
         .exec();
