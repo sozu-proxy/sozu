@@ -150,6 +150,10 @@ impl<Front:SocketHandler> Http<Front> {
       Ok(sz) => {
         self.back_buf.consume_parsed_data(sz);
         self.back_buf.slice_output(sz);
+
+        if sz < buf.len() {
+          error!("The backend buffer is too small, we couldn't write the entire answer");
+        }
       }
       Err(e) => error!("The backend buffer is too small: {}", e),
     }
