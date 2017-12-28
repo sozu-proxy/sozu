@@ -191,8 +191,22 @@ impl CommandServer {
   pub fn run(&mut self) {
     let mut events = Events::with_capacity(1024);
     let poll_timeout = Some(Duration::from_millis(1000));
+    let max_poll_errors = 10000;
+    let mut current_poll_errors = 0;
     loop {
-      self.poll.poll(&mut events, poll_timeout).unwrap();
+      if current_poll_errors == max_poll_errors {
+        error!("Something is going very wrong. Last {} poll() calls failed, crashing..", current_poll_errors);
+        panic!(format!("poll() calls failed {} times in a row", current_poll_errors));
+      }
+
+      if let Err(error) = self.poll.poll(&mut events, poll_timeout) {
+        error!("Error while polling events: {:?}", error);
+        current_poll_errors += 1;
+        continue;
+      } else {
+        current_poll_errors = 0;
+      }
+
       for event in events.iter() {
         self.ready(event.token(), event.readiness());
       }
