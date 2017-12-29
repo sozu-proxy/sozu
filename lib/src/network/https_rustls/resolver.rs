@@ -11,9 +11,14 @@ use sozu_command::certificate::calculate_fingerprint_from_der;
 
 use network::trie::TrieNode;
 
+struct TlsData {
+  pub cert:     CertifiedKey,
+  pub refcount: usize,
+}
+
 pub struct CertificateResolver {
   domains:      TrieNode<CertFingerprint>,
-  certificates: HashMap<CertFingerprint, CertifiedKey>,
+  certificates: HashMap<CertFingerprint, TlsData>,
 }
 
 impl CertificateResolver {
@@ -24,7 +29,7 @@ impl CertificateResolver {
     }
   }
 
-  pub fn add_certificate(&self, certificate_and_key: CertificateAndKey) -> bool {
+  pub fn add_certificate(&mut self, certificate_and_key: CertificateAndKey) -> bool {
 
     let mut chain = Vec::new();
 
@@ -32,11 +37,21 @@ impl CertificateResolver {
     let parsed_certs = pemfile::certs(&mut cert_reader);
     //info!("parsed: {:?}", parsed_cert);
 
-    if let Ok(mut certs) = parsed_certs {
+    let mut names = vec!(String::from("https://lolcatho.st"));
+    let mut fingerprint:Vec<u8> = Vec::new();
+    if let Ok(certs) = parsed_certs {
       if !certs.is_empty() {
-        let fingerprint: Vec<u8> = calculate_fingerprint_from_der(&certs[0].0);
+        fingerprint = calculate_fingerprint_from_der(&certs[0].0);
         info!("cert fingerprint: {:?}", fingerprint);
-        chain.push(certs.remove(0));
+
+        // create a untrusted::Input
+        // let input = untrusted::Input::from(&certs[0].0);
+        // create an EndEntityCert
+        // let ee = webpki::EndEntityCert::from(input).unwrap()
+        // get names
+        // let dns_names = ee.list_dns_names()
+        // names.extend(dns_names.drain(..).map(|name| name.to_String()));
+
       }
       for cert in certs {
         chain.push(cert);
@@ -62,7 +77,16 @@ impl CertificateResolver {
         if let Ok(signing_key) = RSASigningKey::new(&keys[0]) {
           let certified = CertifiedKey::new(chain, Arc::new(Box::new(signing_key)));
 
-          // add to certificate list here
+          let data = TlsData {
+            cert:     certified,
+            refcount: 0,
+          };
+
+          let fingerprint = CertFingerprint(fingerprint);
+          self.certificates.insert(fingerprint.clone(), data);
+          for name in names.drain(..) {
+            self.domains.domain_insert(name.into_bytes(), fingerprint.clone());
+          }
 
           return true;
         }
@@ -72,20 +96,47 @@ impl CertificateResolver {
     false
   }
 
-  pub fn remove_certificate(&self, fingerprint: &CertFingerprint) {
+  pub fn remove_certificate(&mut self, fingerprint: &CertFingerprint) {
+    let must_delete = self.certificates.get(fingerprint).map(|data| data.refcount == 0).unwrap_or(false);
 
+    if let Some(data) = self.certificates.get(fingerprint) {
+      let cert = &data.cert.cert[0];
+      let names = vec!(String::from("https://lolcatho.st"));
+
+      // create a untrusted::Input
+      // let input = untrusted::Input::from(&certs[0].0);
+      // create an EndEntityCert
+      // let ee = webpki::EndEntityCert::from(input).unwrap()
+      // get names
+      // let dns_names = ee.list_dns_names()
+      // names.extend(dns_names.drain(..).map(|name| name.to_String()));
+
+      for name in names {
+        self.domains.domain_remove(&name.into_bytes());
+      }
+    }
+
+    if must_delete {
+      self.certificates.remove(fingerprint);
+    }
   }
 
-  pub fn add_front(&self, fingerprint: &CertFingerprint) -> bool {
-    // increase refcount here
-    // mark certificate as initialized
-
-    //return false if we did not find a certificate
-    false
+  pub fn add_front(&mut self, fingerprint: &CertFingerprint) -> bool {
+    if self.certificates.contains_key(fingerprint) {
+      self.certificates.get_mut(fingerprint).map(|data| data.refcount += 1);
+      true
+    } else {
+      false
+    }
   }
 
-  pub fn remove_front(&self, fingerprint: &CertFingerprint) {
-    // decrease refcount here
+  pub fn remove_front(&mut self, fingerprint: &CertFingerprint) {
+    self.certificates.get_mut(fingerprint).map(|data| data.refcount -= 1);
+
+    let must_delete = self.certificates.get(fingerprint).map(|data| data.refcount == 0).unwrap_or(false);
+    if must_delete {
+      self.certificates.remove(fingerprint);
+    }
   }
 }
 
@@ -143,8 +194,3 @@ impl ResolvesServerCert for CertificateResolverWrapper {
   }
 }
 
-pub struct TlsData {
-  certificate: Vec<u8>,
-  refcount:    usize,
-  initialized: bool,
-}

@@ -78,6 +78,7 @@ impl ServerConfiguration {
     pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>) -> io::Result<(ServerConfiguration, HashSet<ListenToken>)> {
 
     let mut fronts   = HashMap::new();
+    //FIXME: register default certificate and default app
     let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
 
     let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
@@ -135,9 +136,6 @@ impl ServerConfiguration {
   }
 
   pub fn add_https_front(&mut self, tls_front: HttpsFront, event_loop: &mut Poll) -> bool {
-    if !(*self.resolver).add_front(&tls_front.fingerprint) {
-      return false;
-    }
 
     //FIXME: should clone he hostname then do a into() here
     let app = TlsApp {
@@ -150,10 +148,17 @@ impl ServerConfiguration {
     if let Some(fronts) = self.fronts.get_mut(&tls_front.hostname) {
         if ! fronts.contains(&app) {
           fronts.push(app.clone());
+
+          if !(*self.resolver).add_front(&tls_front.fingerprint) {
+            return false;
+          }
         }
     }
     if self.fronts.get(&tls_front.hostname).is_none() {
       self.fronts.insert(tls_front.hostname, vec![app]);
+      if !(*self.resolver).add_front(&tls_front.fingerprint) {
+        return false;
+      }
     }
 
     true
@@ -167,7 +172,7 @@ impl ServerConfiguration {
         .position(|f| &f.app_id == &front.app_id && &f.cert_fingerprint == &front.fingerprint) {
 
         let front = fronts.remove(pos);
-        (*self.resolver).remove_front(&front.cert_fingerprint) 
+        (*self.resolver).remove_front(&front.cert_fingerprint)
       }
     }
   }
