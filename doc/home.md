@@ -5,13 +5,13 @@
 
 # What is Sōzu?
 
-Sōzu is a reverse proxy for load balancing written in Rust. His main job is to balances inbound requests across two or more backends applications to spread the load.
+Sōzu is a reverse proxy for load balancing written in Rust. It's main job is to balance inbound requests across two or more applications backends to spread the load.
 
-* He serve as a termination point for SSL sessions. So the workload of dealing with the encryption is offloaded from the backend.
+* It serves as a termination point for SSL sessions. So the workload of dealing with the encryption is offloaded from the backend.
 
-* He can protect the backends by preventing direct access from the network.
+* It can protect the backends by preventing direct access from the network.
 
-* Return some statics contents related on the traffics between the clients and the backends applications behind him.
+* Return some metrics related on the traffics between the clients and the backends applications behind it.
 
 # Introduction
 
