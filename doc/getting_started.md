@@ -17,7 +17,7 @@ After you did that, `Rust` should be fully installed.
 
 ### Install
 
-`sozu` and `sozuctl` are published on [crates.io][cr]. To install them, you only have to do `cargo install sozu sozuctl`. They will be build and available in the `~/.cargo/bin` folder.
+`sozu` and `sozuctl` are published on [crates.io][cr]. To install them, you only have to do `cargo install sozu sozuctl`. They will be built and available in the `~/.cargo/bin` folder.
 
 ### Build from source
 
