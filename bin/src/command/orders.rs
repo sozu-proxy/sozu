@@ -333,8 +333,8 @@ impl CommandServer {
 
   pub fn query(&mut self, token: FrontToken, message_id: &str, query: Query) {
     let message_type = match &query {
-      &Query::Applications            => MessageType::QueryApplications,
       &Query::Application(ref app_id) => MessageType::QueryApplication(app_id.clone()),
+      &Query::ApplicationsHashes      => MessageType::QueryApplicationsHashes,
     };
 
     self.order_state.insert_task(message_id, message_type, Some(token));

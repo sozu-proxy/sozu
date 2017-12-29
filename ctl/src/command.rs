@@ -842,7 +842,7 @@ pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, 
 pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, application_id: Option<String>) {
   let command = match application_id {
     Some(ref app_id) => ConfigCommand::Query(Query::Application(app_id.to_string())),
-    None         => ConfigCommand::Query(Query::Applications),
+    None         => ConfigCommand::Query(Query::ApplicationsHashes),
   };
 
   let id = generate_id();
@@ -1035,7 +1035,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
 
               for ref metrics in data.values() {
                 //let m: u8 = metrics;
-                if let &QueryAnswer::Applications(ref apps) = *metrics {
+                if let &QueryAnswer::ApplicationsHashes(ref apps) = *metrics {
                   for (ref key, ref value) in apps.iter() {
                     (*(query_data.entry(key.clone()).or_insert(Vec::new()))).push(value.clone());
                   }

@@ -304,7 +304,7 @@ pub enum Query {
   Application(String),
   //Certificate(CertFingerprint),
   //Certificates,
-  Applications,
+  ApplicationsHashes,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -314,7 +314,7 @@ pub enum QueryAnswer {
   //Certificate(QueryAnswerCertificate),
   //Certificates(Vec<CertFingerprint>),
   /// application id, hash of application information
-  Applications(BTreeMap<String, u64>),
+  ApplicationsHashes(BTreeMap<String, u64>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

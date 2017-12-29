@@ -90,7 +90,7 @@ pub enum MessageType {
   LoadState,
   WorkerOrder,
   Metrics,
-  QueryApplications,
+  QueryApplicationsHashes,
   QueryApplication(String),
   Stop,
 }
@@ -136,7 +136,7 @@ impl Task {
         data.insert(String::from("master"), master_metrics);
         Some(AnswerData::Metrics(data))
       },
-      MessageType::QueryApplications => {
+      MessageType::QueryApplicationsHashes => {
         let mut data: BTreeMap<String, QueryAnswer> = self.data.into_iter().filter_map(|(tag, query)| {
           if let OrderMessageAnswerData::Query(data) = query {
             Some((tag, data))
@@ -145,7 +145,7 @@ impl Task {
           }
         }).collect();
 
-        data.insert(String::from("master"), QueryAnswer::Applications(master_state.hash_state()));
+        data.insert(String::from("master"), QueryAnswer::ApplicationsHashes(master_state.hash_state()));
 
         Some(AnswerData::Query(data))
       },

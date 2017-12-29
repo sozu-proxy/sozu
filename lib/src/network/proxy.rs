@@ -326,12 +326,12 @@ impl Server {
 
     if let Order::Query(ref query) = message.order {
       match query {
-        &Query::Applications => {
+        &Query::ApplicationsHashes => {
           self.queue.push_back(OrderMessageAnswer {
             id:     message.id.clone(),
             status: OrderMessageStatus::Ok,
             data:   Some(OrderMessageAnswerData::Query(
-              QueryAnswer::Applications(self.config_state.hash_state())
+              QueryAnswer::ApplicationsHashes(self.config_state.hash_state())
             ))
           });
         },
