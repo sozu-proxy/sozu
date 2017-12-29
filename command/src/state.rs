@@ -332,6 +332,40 @@ impl ConfigState {
   }
 }
 
+pub fn get_application_ids_by_domain(state: &ConfigState, hostname: String, path_begin: Option<String>) -> HashSet<AppId> {
+  let domain_check = |front_hostname: &str, front_path_begin: &str, hostname: &str, path_begin: &Option<String>| -> bool {
+    let domain_matches = if hostname == front_hostname { true } else { false };
+    if !domain_matches {
+      return false;
+    }
+
+    match path_begin {
+      &Some(ref path_begin) => if path_begin == front_path_begin { true } else { false }
+      &None => true
+    }
+  };
+
+  let mut app_ids: HashSet<AppId> = HashSet::new();
+
+  state.http_fronts.values()
+    .for_each(|fronts| {
+      fronts
+        .iter()
+        .filter(|front| domain_check(&front.hostname, &front.path_begin, &hostname, &path_begin))
+        .for_each(|front| { app_ids.insert(front.app_id.clone()); });
+    });
+
+  state.https_fronts.values()
+    .for_each(|fronts| {
+      fronts
+        .iter()
+        .filter(|front| domain_check(&front.hostname, &front.path_begin, &hostname, &path_begin))
+        .for_each(|front| { app_ids.insert(front.app_id.clone()); });
+    });
+
+  app_ids
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -400,5 +434,57 @@ mod tests {
    println!("state 3 hashes: {:#?}", hash3);
 
    assert_eq!(diff, expected_diff);
+  }
+
+  #[test]
+  fn application_ids_by_domain() {
+    let mut config = ConfigState::new();
+    let http_front_app1 = HttpFront {
+      app_id: String::from("MyApp_1"),
+      hostname: String::from("lolcatho.st"),
+      path_begin: String::from("")
+    };
+
+    let https_front_app1 = HttpsFront {
+      app_id: String::from("MyApp_1"),
+      hostname: String::from("lolcatho.st"),
+      path_begin: String::from(""),
+      fingerprint: CertFingerprint(vec!(0x00))
+    };
+
+    let http_front_app2 = HttpFront {
+      app_id: String::from("MyApp_2"),
+      hostname: String::from("lolcatho.st"),
+      path_begin: String::from("/api")
+    };
+
+    let https_front_app2 = HttpsFront {
+      app_id: String::from("MyApp_2"),
+      hostname: String::from("lolcatho.st"),
+      path_begin: String::from("/api"),
+      fingerprint: CertFingerprint(vec!(0x00))
+    };
+
+    let add_http_front_order_app1 = Order::AddHttpFront(http_front_app1);
+    let add_http_front_order_app2 = Order::AddHttpFront(http_front_app2);
+    let add_https_front_order_app1 = Order::AddHttpsFront(https_front_app1);
+    let add_https_front_order_app2 = Order::AddHttpsFront(https_front_app2);
+    config.handle_order(&add_http_front_order_app1);
+    config.handle_order(&add_http_front_order_app2);
+    config.handle_order(&add_https_front_order_app1);
+    config.handle_order(&add_https_front_order_app2);
+
+    let mut app1_app2: HashSet<AppId> = HashSet::new();
+    app1_app2.insert(String::from("MyApp_1"));
+    app1_app2.insert( String::from("MyApp_2"));
+
+    let mut app2: HashSet<AppId> = HashSet::new();
+    app2.insert(String::from("MyApp_2"));
+
+    let empty: HashSet<AppId> = HashSet::new();
+    assert_eq!(get_application_ids_by_domain(&config, String::from("lolcatho.st"), None), app1_app2);
+    assert_eq!(get_application_ids_by_domain(&config, String::from("lolcatho.st"), Some(String::from("/api"))), app2);
+    assert_eq!(get_application_ids_by_domain(&config, String::from("lolcathost"), None), empty);
+    assert_eq!(get_application_ids_by_domain(&config, String::from("lolcathost"), Some(String::from("/sozu"))), empty);
   }
 }

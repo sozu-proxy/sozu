@@ -24,8 +24,8 @@ use rand::random;
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
-use sozu_command::state::ConfigState;
-use sozu_command::messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer};
+use sozu_command::state::{ConfigState,get_application_ids_by_domain};
+use sozu_command::messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer,QueryApplicationType};
 
 use network::buffer_queue::BufferQueue;
 use network::{ClientResult,ConnectionError,
@@ -335,13 +335,23 @@ impl Server {
             ))
           });
         },
-        &Query::Application(ref app_id) => {
+        &Query::Applications(ref query_type) => {
+          let answer = match query_type {
+            &QueryApplicationType::AppId(ref app_id) => {
+              QueryAnswer::Applications(vec!(self.config_state.application_state(app_id)))
+            },
+            &QueryApplicationType::Domain(ref domain) => {
+              let app_ids = get_application_ids_by_domain(&self.config_state, domain.hostname.clone(), domain.path_begin.clone());
+              let answer = app_ids.iter().map(|ref app_id| self.config_state.application_state(app_id)).collect();
+
+              QueryAnswer::Applications(answer)
+            }
+          };
+
           self.queue.push_back(OrderMessageAnswer {
             id:     message.id.clone(),
             status: OrderMessageStatus::Ok,
-            data:   Some(OrderMessageAnswerData::Query(
-              QueryAnswer::Application(self.config_state.application_state(app_id))
-            ))
+            data:   Some(OrderMessageAnswerData::Query(answer))
           });
         }
       }
