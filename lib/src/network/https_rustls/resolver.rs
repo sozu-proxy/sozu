@@ -31,69 +31,33 @@ impl CertificateResolver {
 
   pub fn add_certificate(&mut self, certificate_and_key: CertificateAndKey) -> bool {
 
-    let mut chain = Vec::new();
+    if let Some(certified_key) = generate_certified_key(certificate_and_key) {
+      let mut names = vec!(String::from("https://lolcatho.st"));
+      let fingerprint = calculate_fingerprint_from_der(&certified_key.cert[0].0);
+      info!("cert fingerprint: {:?}", fingerprint);
+      // create a untrusted::Input
+      // let input = untrusted::Input::from(&certs[0].0);
+      // create an EndEntityCert
+      // let ee = webpki::EndEntityCert::from(input).unwrap()
+      // get names
+      // let dns_names = ee.list_dns_names()
+      // names.extend(dns_names.drain(..).map(|name| name.to_String()));
 
-    let mut cert_reader = BufReader::new(certificate_and_key.certificate.as_bytes());
-    let parsed_certs = pemfile::certs(&mut cert_reader);
-    //info!("parsed: {:?}", parsed_cert);
+      let data = TlsData {
+        cert:     certified_key,
+        refcount: 0,
+      };
 
-    let mut names = vec!(String::from("https://lolcatho.st"));
-    let mut fingerprint:Vec<u8> = Vec::new();
-    if let Ok(certs) = parsed_certs {
-      if !certs.is_empty() {
-        fingerprint = calculate_fingerprint_from_der(&certs[0].0);
-        info!("cert fingerprint: {:?}", fingerprint);
-
-        // create a untrusted::Input
-        // let input = untrusted::Input::from(&certs[0].0);
-        // create an EndEntityCert
-        // let ee = webpki::EndEntityCert::from(input).unwrap()
-        // get names
-        // let dns_names = ee.list_dns_names()
-        // names.extend(dns_names.drain(..).map(|name| name.to_String()));
-
+      let fingerprint = CertFingerprint(fingerprint);
+      self.certificates.insert(fingerprint.clone(), data);
+      for name in names.drain(..) {
+        self.domains.domain_insert(name.into_bytes(), fingerprint.clone());
       }
-      for cert in certs {
-        chain.push(cert);
-      }
+
+      true
     } else {
-      return false;
+      false
     }
-
-    for ref cert in certificate_and_key.certificate_chain.iter() {
-      let mut chain_cert_reader = BufReader::new(cert.as_bytes());
-      if let Ok(parsed_chain_certs) = pemfile::certs(&mut chain_cert_reader) {
-        for cert in parsed_chain_certs {
-          chain.push(cert);
-        }
-      }
-    }
-
-    let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
-    let parsed_key = pemfile::pkcs8_private_keys(&mut key_reader);
-
-    if let Ok(keys) = parsed_key {
-      if !keys.is_empty() {
-        if let Ok(signing_key) = RSASigningKey::new(&keys[0]) {
-          let certified = CertifiedKey::new(chain, Arc::new(Box::new(signing_key)));
-
-          let data = TlsData {
-            cert:     certified,
-            refcount: 0,
-          };
-
-          let fingerprint = CertFingerprint(fingerprint);
-          self.certificates.insert(fingerprint.clone(), data);
-          for name in names.drain(..) {
-            self.domains.domain_insert(name.into_bytes(), fingerprint.clone());
-          }
-
-          return true;
-        }
-      }
-    }
-
-    false
   }
 
   pub fn remove_certificate(&mut self, fingerprint: &CertFingerprint) {
@@ -194,3 +158,41 @@ impl ResolvesServerCert for CertificateResolverWrapper {
   }
 }
 
+pub fn generate_certified_key(certificate_and_key: CertificateAndKey) -> Option<CertifiedKey> {
+  let mut chain = Vec::new();
+
+  let mut cert_reader = BufReader::new(certificate_and_key.certificate.as_bytes());
+  let parsed_certs = pemfile::certs(&mut cert_reader);
+
+  let mut fingerprint:Vec<u8> = Vec::new();
+  if let Ok(certs) = parsed_certs {
+    for cert in certs {
+      chain.push(cert);
+    }
+  } else {
+    return None;
+  }
+
+  for ref cert in certificate_and_key.certificate_chain.iter() {
+    let mut chain_cert_reader = BufReader::new(cert.as_bytes());
+    if let Ok(parsed_chain_certs) = pemfile::certs(&mut chain_cert_reader) {
+      for cert in parsed_chain_certs {
+        chain.push(cert);
+      }
+    }
+  }
+
+  let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
+  let parsed_key = pemfile::pkcs8_private_keys(&mut key_reader);
+
+  if let Ok(keys) = parsed_key {
+    if !keys.is_empty() {
+      if let Ok(signing_key) = RSASigningKey::new(&keys[0]) {
+        let certified = CertifiedKey::new(chain, Arc::new(Box::new(signing_key)));
+        return Some(certified);
+      }
+    }
+  }
+
+  None
+}
