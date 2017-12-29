@@ -29,7 +29,7 @@ impl CertificateResolver {
     }
   }
 
-  pub fn add_certificate(&mut self, certificate_and_key: CertificateAndKey) -> bool {
+  pub fn add_certificate(&mut self, certificate_and_key: CertificateAndKey) -> Option<CertFingerprint> {
 
     if let Some(certified_key) = generate_certified_key(certificate_and_key) {
       let mut names = vec!(String::from("https://lolcatho.st"));
@@ -54,9 +54,9 @@ impl CertificateResolver {
         self.domains.domain_insert(name.into_bytes(), fingerprint.clone());
       }
 
-      true
+      Some(fingerprint)
     } else {
-      false
+      None
     }
   }
 
@@ -111,11 +111,11 @@ impl CertificateResolverWrapper {
     CertificateResolverWrapper(Mutex::new(CertificateResolver::new()))
   }
 
-  pub fn add_certificate(&self, certificate_and_key: CertificateAndKey) -> bool {
+  pub fn add_certificate(&self, certificate_and_key: CertificateAndKey) -> Option<CertFingerprint> {
     if let Ok(ref mut resolver) = self.0.try_lock() {
       resolver.add_certificate(certificate_and_key)
     } else {
-      false
+      None
     }
   }
 

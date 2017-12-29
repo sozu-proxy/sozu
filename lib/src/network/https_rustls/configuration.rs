@@ -23,8 +23,9 @@ use nom::IResult;
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
-use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,Order,HttpsFront,HttpsProxyConfiguration,OrderMessage,
-  OrderMessageAnswer,OrderMessageStatus};
+use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,
+  Order,HttpsFront,HttpsProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
+use sozu_command::certificate::split_certificate_chain;
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::buffer_queue::BufferQueue;
@@ -41,7 +42,7 @@ use network::protocol::http::DefaultAnswerStatus;
 use network::retry::RetryPolicy;
 use util::UnwrapLog;
 
-use super::resolver::{CertificateResolver,CertificateResolverWrapper};
+use super::resolver::{CertificateResolver,CertificateResolverWrapper,generate_certified_key};
 use super::client::TlsClient;
 
 type BackendToken = Token;
@@ -107,6 +108,27 @@ impl ServerConfiguration {
     let mut server_config = ServerConfig::new(NoClientAuth::new());
     let resolver = Arc::new(CertificateResolverWrapper::new());
     server_config.cert_resolver = resolver.clone();
+
+    let cert = CertificateAndKey {
+      certificate: config.default_certificate.as_ref().and_then(|v| from_utf8(v).ok())
+                     .unwrap_or(&include_str!("../../../assets/certificate.pem")[..]).to_string(),
+      key: config.default_key.as_ref().and_then(|v| from_utf8(v).ok())
+        .unwrap_or(&include_str!("../../../assets/key.pem")[..]).to_string(),
+      certificate_chain: config.default_certificate_chain.clone().map(split_certificate_chain).unwrap_or(vec!()),
+    };
+
+    if let Some(fingerprint) = resolver.add_certificate(cert) {
+      resolver.add_front(&fingerprint);
+
+      let app = TlsApp {
+        app_id:           config.default_app_id.clone().unwrap_or(String::new()),
+        hostname:         config.default_name.clone().unwrap_or(String::new()),
+        path_begin:       String::new(),
+        cert_fingerprint: fingerprint,
+      };
+
+      fronts.insert(config.default_name.clone().unwrap_or(String::from("")), vec![app]);
+    }
 
     Ok((ServerConfiguration {
       listener:        listener,
@@ -178,7 +200,7 @@ impl ServerConfiguration {
   }
 
   pub fn add_certificate(&mut self, certificate_and_key: CertificateAndKey, event_loop: &mut Poll) -> bool {
-    (*self.resolver).add_certificate(certificate_and_key)
+    (*self.resolver).add_certificate(certificate_and_key).is_some()
   }
 
   // FIXME: return an error if the cert is still in use
