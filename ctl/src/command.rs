@@ -903,6 +903,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
 
               let mut frontend_table = Table::new();
               let mut header = Vec::new();
+              header.push(cell!("id"));
               header.push(cell!("hostname"));
               header.push(cell!("path begin"));
               for ref key in data.keys() {
@@ -912,6 +913,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
 
               let mut https_frontend_table = Table::new();
               let mut header = Vec::new();
+              header.push(cell!("id"));
               header.push(cell!("hostname"));
               header.push(cell!("path begin"));
               header.push(cell!("fingerprint"));
@@ -986,6 +988,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
 
               for (ref key, ref values) in frontend_data.iter() {
                 let mut row = Vec::new();
+                row.push(cell!(key.app_id));
                 row.push(cell!(key.hostname));
                 row.push(cell!(key.path_begin));
 
@@ -1006,6 +1009,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
 
               for (ref key, ref values) in https_frontend_data.iter() {
                 let mut row = Vec::new();
+                row.push(cell!(key.app_id));
                 row.push(cell!(key.hostname));
                 row.push(cell!(key.path_begin));
                 row.push(cell!(format!("{}", key.fingerprint)));
