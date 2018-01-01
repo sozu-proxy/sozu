@@ -16,7 +16,6 @@ use prettytable::Table;
 use prettytable::row::Row;
 use super::create_channel;
 
-const DEFAULT_TIMEOUT: u64 = 1000;
 
 fn generate_id() -> String {
   let s: String = thread_rng().gen_ascii_chars().take(6).collect();
@@ -47,7 +46,7 @@ macro_rules! command_timeout {
   )
 }
 
-pub fn save_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, path: String) {
+pub fn save_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, path: String) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
@@ -55,7 +54,7 @@ pub fn save_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, path:
     None,
   ));
 
-  command_timeout!(DEFAULT_TIMEOUT, {
+  command_timeout!(timeout, {
     match channel.read_message() {
       None          => {
         println!("the proxy didn't answer");
@@ -85,7 +84,7 @@ pub fn save_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, path:
   });
 }
 
-pub fn load_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, path: String) {
+pub fn load_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, path: String) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
@@ -93,7 +92,7 @@ pub fn load_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, path:
     None,
   ));
 
-  command_timeout!(DEFAULT_TIMEOUT, {
+  command_timeout!(timeout, {
     match channel.read_message() {
       None          => {
         println!("the proxy didn't answer");
@@ -123,7 +122,7 @@ pub fn load_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, path:
   });
 }
 
-pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
+pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
@@ -131,7 +130,7 @@ pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
     None,
   ));
 
-  command_timeout!(DEFAULT_TIMEOUT, {
+  command_timeout!(timeout, {
     match channel.read_message() {
       None          => {
         println!("the proxy didn't answer");
@@ -201,7 +200,7 @@ pub fn soft_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
   }
 }
 
-pub fn hard_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
+pub fn hard_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64) {
   println!("shutting down proxy");
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
@@ -211,7 +210,7 @@ pub fn hard_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
     None,
   ));
 
-  command_timeout!(DEFAULT_TIMEOUT,
+  command_timeout!(timeout,
     loop {
       match channel.read_message() {
         None          => println!("the proxy didn't answer"),
@@ -702,26 +701,26 @@ pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
   }
 }
 
-pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, sticky_session: bool, https_redirect: bool) {
-  order_command(channel, Order::AddApplication(Application {
+pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool) {
+  order_command(channel, timeout, Order::AddApplication(Application {
     app_id:         String::from(app_id),
     sticky_session: sticky_session,
     https_redirect: https_redirect
   }));
 }
 
-pub fn remove_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str) {
-  order_command(channel, Order::RemoveApplication(String::from(app_id)));
+pub fn remove_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str) {
+  order_command(channel, timeout, Order::RemoveApplication(String::from(app_id)));
 }
 
-pub fn add_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
+pub fn add_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
   if let Some(certificate_path) = certificate {
     match Config::load_file_bytes(&certificate_path) {
       Ok(data) => {
         match calculate_fingerprint(&data) {
           None              => println!("could not calculate fingerprint for certificate"),
           Some(fingerprint) => {
-            order_command(channel, Order::AddHttpsFront(HttpsFront {
+            order_command(channel, timeout, Order::AddHttpsFront(HttpsFront {
               app_id: String::from(app_id),
               hostname: String::from(hostname),
               path_begin: String::from(path_begin),
@@ -733,7 +732,7 @@ pub fn add_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, ap
       Err(e) => println!("could not load file: {:?}", e)
     }
   } else {
-    order_command(channel, Order::AddHttpFront(HttpFront {
+    order_command(channel, timeout, Order::AddHttpFront(HttpFront {
       app_id: String::from(app_id),
       hostname: String::from(hostname),
       path_begin: String::from(path_begin),
@@ -741,14 +740,14 @@ pub fn add_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, ap
   }
 }
 
-pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
+pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
   if let Some(certificate_path) = certificate {
     match Config::load_file_bytes(&certificate_path) {
       Ok(data) => {
         match calculate_fingerprint(&data) {
           None              => println!("could not calculate fingerprint for certificate"),
           Some(fingerprint) => {
-            order_command(channel, Order::RemoveHttpsFront(HttpsFront {
+            order_command(channel, timeout, Order::RemoveHttpsFront(HttpsFront {
               app_id: String::from(app_id),
               hostname: String::from(hostname),
               path_begin: String::from(path_begin),
@@ -760,7 +759,7 @@ pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>,
       Err(e) => println!("could not load file: {:?}", e)
     }
   } else {
-    order_command(channel, Order::RemoveHttpFront(HttpFront {
+    order_command(channel, timeout, Order::RemoveHttpFront(HttpFront {
       app_id: String::from(app_id),
       hostname: String::from(hostname),
       path_begin: String::from(path_begin),
@@ -769,8 +768,8 @@ pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>,
 }
 
 
-pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, instance_id: &str, ip: &str, port: u16) {
-  order_command(channel, Order::AddInstance(Instance {
+pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, instance_id: &str, ip: &str, port: u16) {
+  order_command(channel, timeout, Order::AddInstance(Instance {
       app_id: String::from(app_id),
       instance_id: String::from(instance_id),
       ip_address: String::from(ip),
@@ -778,8 +777,8 @@ pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: 
     }));
 }
 
-pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, instance_id: &str, ip: &str, port: u16) {
-    order_command(channel, Order::RemoveInstance(Instance {
+pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, instance_id: &str, ip: &str, port: u16) {
+    order_command(channel, timeout, Order::RemoveInstance(Instance {
       app_id: String::from(app_id),
       instance_id: String::from(instance_id),
       ip_address: String::from(ip),
@@ -787,7 +786,7 @@ pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_i
     }));
 }
 
-pub fn add_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, certificate_path: &str, certificate_chain_path: &str, key_path: &str) {
+pub fn add_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, certificate_path: &str, certificate_chain_path: &str, key_path: &str) {
   match Config::load_file(certificate_path) {
     Err(e) => println!("could not load certificate: {:?}", e),
     Ok(certificate) => {
@@ -797,7 +796,7 @@ pub fn add_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, cert
           match Config::load_file(key_path) {
             Err(e) => println!("could not load key: {:?}", e),
             Ok(key) => {
-              order_command(channel, Order::AddCertificate(CertificateAndKey {
+              order_command(channel, timeout, Order::AddCertificate(CertificateAndKey {
                 certificate: certificate,
                 certificate_chain: certificate_chain,
                 key: key
@@ -811,11 +810,11 @@ pub fn add_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, cert
   }
 }
 
-pub fn remove_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, certificate_path: &str) {
+pub fn remove_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, certificate_path: &str) {
   match Config::load_file_bytes(certificate_path) {
     Ok(data) => {
       match calculate_fingerprint(&data) {
-        Some(fingerprint) => order_command(channel, Order::RemoveCertificate(CertFingerprint(fingerprint))),
+        Some(fingerprint) => order_command(channel, timeout, Order::RemoveCertificate(CertFingerprint(fingerprint))),
         None              => println!("could not calculate finrprint for certificate")
       }
     },
@@ -823,16 +822,16 @@ pub fn remove_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, c
   }
 }
 
-pub fn add_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip_address: &str, port: u16) {
-  order_command(channel, Order::AddTcpFront(TcpFront {
+pub fn add_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, ip_address: &str, port: u16) {
+  order_command(channel, timeout, Order::AddTcpFront(TcpFront {
     app_id: String::from(app_id),
     ip_address: String::from(ip_address),
     port: port
   }));
 }
 
-pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, app_id: &str, ip_address: &str, port: u16) {
-  order_command(channel, Order::RemoveTcpFront(TcpFront {
+pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, ip_address: &str, port: u16) {
+  order_command(channel, timeout, Order::RemoveTcpFront(TcpFront {
     app_id: String::from(app_id),
     ip_address: String::from(ip_address),
     port: port
@@ -1073,11 +1072,11 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
   }
 }
 
-pub fn logging_filter(channel: Channel<ConfigMessage,ConfigMessageAnswer>, filter: &str) {
-  order_command(channel, Order::Logging(String::from(filter)));
+pub fn logging_filter(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, filter: &str) {
+  order_command(channel, timeout, Order::Logging(String::from(filter)));
 }
 
-fn order_command(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, order: Order) {
+fn order_command(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, order: Order) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
@@ -1085,7 +1084,7 @@ fn order_command(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, order:
     None,
   ));
 
-  command_timeout!(DEFAULT_TIMEOUT, {
+  command_timeout!(timeout, {
     match channel.read_message() {
       None          => println!("the proxy didn't answer"),
       Some(message) => {
