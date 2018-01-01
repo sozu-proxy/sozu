@@ -5,8 +5,8 @@ COPY bin/config.toml /etc/sozu/sozu.toml
 
 RUN apk add --no-cache --virtual .build-dependencies \
   cargo \
-  g++ \
-  gcc \
+  build-base \
+  file \
   libgcc \
   musl-dev \
   rust
