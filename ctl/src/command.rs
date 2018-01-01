@@ -33,15 +33,19 @@ fn generate_tagged_id(tag: &str) -> String {
 // to do with the message received.
 macro_rules! command_timeout {
   ($duration: expr, $block: expr) => (
-    let (send, recv) = mpsc::channel();
-
-    thread::spawn(move || {
+    if $duration == 0 {
       $block
-      send.send(()).unwrap();
-    });
+    } else {
+      let (send, recv) = mpsc::channel();
 
-    if recv.recv_timeout(Duration::from_millis($duration)).is_err() {
-      eprintln!("Command timeout. The proxy didn't send answer");
+      thread::spawn(move || {
+        $block
+        send.send(()).unwrap();
+      });
+
+      if recv.recv_timeout(Duration::from_millis($duration)).is_err() {
+        eprintln!("Command timeout. The proxy didn't send answer");
+      }
     }
   )
 }
