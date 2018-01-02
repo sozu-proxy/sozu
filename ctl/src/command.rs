@@ -542,7 +542,7 @@ pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
   }
 }
 
-pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
+pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bool) {
   let id = generate_id();
   //println!("will send message for metrics with id {}", id);
   channel.write_message(&ConfigMessage::new(
@@ -561,13 +561,22 @@ pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
             println!("Proxy is processing: {}", message.message);
           },
           ConfigMessageStatus::Error => {
-            println!("could not stop the proxy: {}", message.message);
+            if json {
+              print_json_response(&message.message);
+            } else {
+              println!("could not stop the proxy: {}", message.message);
+            }
           },
           ConfigMessageStatus::Ok => {
             if &id == &message.id {
               //println!("Sozu metrics:\n{}\n{:#?}", message.message, message.data);
 
               if let Some(AnswerData::Metrics(mut data)) = message.data {
+                if json {
+                  print_json_response(&data);
+                  return;
+                }
+
                 if let Some(master) = data.remove("master") {
                   let mut master_table = Table::new();
                   master_table.add_row(row![String::from("key"), String::from("value")]);

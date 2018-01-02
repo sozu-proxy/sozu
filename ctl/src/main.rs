@@ -43,7 +43,7 @@ fn main() {
     },
     SubCmd::Upgrade => upgrade(channel, &config.command_socket_path()),
     SubCmd::Status => status(channel),
-    SubCmd::Metrics => metrics(channel),
+    SubCmd::Metrics{ json } => metrics(channel, json),
     SubCmd::Logging{ level } => logging_filter(channel, timeout, &level),
     SubCmd::State{ cmd } => {
       match cmd {

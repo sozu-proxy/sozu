@@ -20,7 +20,10 @@ pub enum SubCmd {
   #[structopt(name = "status", about = "gets information on the running workers")]
   Status,
   #[structopt(name = "metrics", about = "gets statistics on the master and its workers")]
-  Metrics,
+  Metrics {
+    #[structopt(short = "j", long = "json", help = "Print the command result in JSON format")]
+    json: bool
+  },
   #[structopt(name = "logging", about = "change logging level")]
   Logging {
     #[structopt(short = "l", long = "level", help = "change logging level")]
