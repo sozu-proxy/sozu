@@ -906,7 +906,6 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
         },
         ConfigMessageStatus::Ok => {
           if let Some(needle) = application_id.or(domain) {
-            println!("Proxy config answer:\n{}\n{:#?}", message.message, message.data);
             if let Some(AnswerData::Query(data)) = message.data {
               if json {
                 print_json_response(&data);
