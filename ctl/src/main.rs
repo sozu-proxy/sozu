@@ -3,6 +3,8 @@ extern crate rand;
 extern crate sozu_command_lib as sozu_command;
 extern crate structopt;
 #[macro_use] extern crate structopt_derive;
+extern crate serde;
+extern crate serde_json;
 
 mod command;
 mod cli;
@@ -47,7 +49,7 @@ fn main() {
       match cmd {
         StateCmd::Save{ file } => save_state(channel, timeout, file),
         StateCmd::Load{ file } => load_state(channel, timeout, file),
-        StateCmd::Dump => dump_state(channel, timeout),
+        StateCmd::Dump{ json } => dump_state(channel, timeout, json),
       }
     },
     SubCmd::Application{ cmd } => {

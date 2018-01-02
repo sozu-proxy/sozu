@@ -5,6 +5,7 @@ use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAns
 use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain};
 
+use serde_json;
 use std::collections::{HashMap,HashSet};
 use std::process::exit;
 use std::thread;
@@ -126,7 +127,7 @@ pub fn load_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
   });
 }
 
-pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64) {
+pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, json: bool) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
@@ -152,12 +153,20 @@ pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
             // until an error or ok message was sent
           },
           ConfigMessageStatus::Error => {
-            println!("could not dump proxy state: {}", message.message);
+            if json {
+              print_json_response(&message.message);
+            } else {
+              println!("could not dump proxy state: {}", message.message);
+            }
             exit(1);
           },
           ConfigMessageStatus::Ok => {
             if let Some(AnswerData::State(state)) = message.data {
-              println!("{:#?}", state);
+              if json {
+                print_json_response(&state);
+              } else {
+                println!("{:#?}", state);
+              }
             } else {
               println!("state dump was empty");
               exit(1);
@@ -1156,4 +1165,14 @@ fn order_command(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeou
       }
     }
   });
+}
+
+fn print_json_response<T: ::serde::Serialize>(input: &T) {
+  match serde_json::to_string(&input) {
+    Ok(to_print) => println!("{}", to_print),
+    Err(e) => {
+      eprintln!("Error while parsing response to JSON: {:?}", e);
+      exit(1);
+    }
+  };
 }

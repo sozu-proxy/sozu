@@ -71,7 +71,10 @@ pub enum StateCmd {
     file: String,
   },
   #[structopt(name = "dump")]
-  Dump,
+  Dump {
+    #[structopt(short = "j", long = "json", help = "Print the command result in JSON format")]
+    json: bool
+  },
 }
 
 #[derive(StructOpt, PartialEq, Debug)]
