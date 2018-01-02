@@ -53,6 +53,8 @@ pub enum SubCmd {
   },
   #[structopt(name = "query", about = "configuration state verification")]
   Query {
+    #[structopt(short = "j", long = "json", help = "Print the command result in JSON format")]
+    json: bool,
     #[structopt(subcommand)]
     cmd: QueryCmd,
   }

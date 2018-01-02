@@ -851,7 +851,7 @@ pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, 
   }));
 }
 
-pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, application_id: Option<String>, domain: Option<String>) {
+pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bool, application_id: Option<String>, domain: Option<String>) {
   if application_id.is_some() && domain.is_some() {
     println!("Error: Either request an application ID or a domain name");
     return;
@@ -898,12 +898,21 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
           // until an error or ok message was sent
         },
         ConfigMessageStatus::Error => {
-          println!("could not query proxy state: {}", message.message);
+          if json {
+            print_json_response(&message.message);
+          } else {
+            println!("could not query proxy state: {}", message.message);
+          }
         },
         ConfigMessageStatus::Ok => {
           if let Some(needle) = application_id.or(domain) {
             println!("Proxy config answer:\n{}\n{:#?}", message.message, message.data);
             if let Some(AnswerData::Query(data)) = message.data {
+              if json {
+                print_json_response(&data);
+                return;
+              }
+
               let mut application_table = Table::new();
               let mut header = Vec::new();
               header.push(cell!("id"));

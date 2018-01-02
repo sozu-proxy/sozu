@@ -86,9 +86,9 @@ fn main() {
         CertificateCmd::Remove{ certificate } => remove_certificate(channel, timeout, &certificate),
       }
     },
-    SubCmd::Query{ cmd } => {
+    SubCmd::Query{ cmd, json } => {
       match cmd {
-        QueryCmd::Applications{ id, domain } => query_application(channel, id, domain),
+        QueryCmd::Applications{ id, domain } => query_application(channel, json, id, domain),
       }
     },
   }
