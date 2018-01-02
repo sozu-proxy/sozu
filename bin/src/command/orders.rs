@@ -484,9 +484,11 @@ impl CommandServer {
     let workers: HashMap<Token, Worker> = workers.iter().filter_map(|serialized| {
       let stream = unsafe { UnixStream::from_raw_fd(serialized.fd) };
       if let Some(token) = serialized.token {
-        debug!("registering: {:?}", poll.register(&stream, Token(token),
+        let _register = poll.register(&stream, Token(token),
           Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
-          PollOpt::edge()));
+          PollOpt::edge());
+        debug!("registering: {:?}", _register);
+
         let mut channel = Channel::new(stream, buffer_size, buffer_size * 2);
         channel.readiness.insert(Ready::writable());
         Some(
