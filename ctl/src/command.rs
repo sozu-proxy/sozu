@@ -1,7 +1,7 @@
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
-use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
+use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain};
 
@@ -17,6 +17,13 @@ use prettytable::Table;
 use prettytable::row::Row;
 use super::create_channel;
 
+
+// Used to display the JSON response of the status command
+#[derive(Serialize, Debug)]
+struct WorkerStatus<'a> {
+  pub worker: &'a WorkerInfo,
+  pub status: &'a String
+}
 
 fn generate_id() -> String {
   let s: String = thread_rng().gen_ascii_chars().take(6).collect();
@@ -405,7 +412,7 @@ pub fn upgrade(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
   }
 }
 
-pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
+pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bool) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
@@ -429,7 +436,11 @@ pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
           exit(1);
         },
         ConfigMessageStatus::Error => {
-          println!("could not get the worker list: {}", message.message);
+          if json {
+            print_json_response(&message.message);
+          } else {
+            println!("could not get the worker list: {}", message.message);
+          }
           exit(1);
         },
         ConfigMessageStatus::Ok => {
@@ -525,16 +536,25 @@ pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
               HashMap::new()
             };
 
-            let mut table = Table::new();
+            if json {
+              let workers_status: Vec<WorkerStatus> = workers.iter().map(|ref worker| {
+                WorkerStatus {
+                  worker: worker,
+                  status: h2.get(&worker.id).unwrap_or(&placeholder)
+                }
+              }).collect();
+              print_json_response(&workers_status);
+            } else {
+              let mut table = Table::new();
 
-            table.add_row(row!["Worker", "pid", "run state", "answer"]);
-            for ref worker in workers.iter() {
-              let run_state = format!("{:?}", worker.run_state);
-              table.add_row(row![worker.id, worker.pid, run_state, h2.get(&worker.id).unwrap_or(&placeholder)]);
+              table.add_row(row!["Worker", "pid", "run state", "answer"]);
+              for ref worker in workers.iter() {
+                let run_state = format!("{:?}", worker.run_state);
+                table.add_row(row![worker.id, worker.pid, run_state, h2.get(&worker.id).unwrap_or(&placeholder)]);
+              }
+
+              table.printstd();
             }
-
-            table.printstd();
-
           }
         }
       }

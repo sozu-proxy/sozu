@@ -18,7 +18,10 @@ pub enum SubCmd {
   #[structopt(name = "upgrade", about = "upgrade the proxy")]
   Upgrade,
   #[structopt(name = "status", about = "gets information on the running workers")]
-  Status,
+  Status {
+    #[structopt(short = "j", long = "json", help = "Print the command result in JSON format")]
+    json: bool
+  },
   #[structopt(name = "metrics", about = "gets statistics on the master and its workers")]
   Metrics {
     #[structopt(short = "j", long = "json", help = "Print the command result in JSON format")]

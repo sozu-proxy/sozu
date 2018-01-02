@@ -5,6 +5,7 @@ extern crate structopt;
 #[macro_use] extern crate structopt_derive;
 extern crate serde;
 extern crate serde_json;
+#[macro_use] extern crate serde_derive;
 
 mod command;
 mod cli;
@@ -42,7 +43,7 @@ fn main() {
       }
     },
     SubCmd::Upgrade => upgrade(channel, &config.command_socket_path()),
-    SubCmd::Status => status(channel),
+    SubCmd::Status{ json } => status(channel, json),
     SubCmd::Metrics{ json } => metrics(channel, json),
     SubCmd::Logging{ level } => logging_filter(channel, timeout, &level),
     SubCmd::State{ cmd } => {
