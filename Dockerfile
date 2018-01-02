@@ -5,8 +5,8 @@ COPY bin/config.toml /etc/sozu/sozu.toml
 
 RUN apk add --no-cache --virtual .build-dependencies \
   cargo \
-  g++ \
-  gcc \
+  build-base \
+  file \
   libgcc \
   musl-dev \
   rust
@@ -20,7 +20,7 @@ RUN cargo build --release
 
 FROM alpine:edge
 COPY bin/config.toml /etc/sozu/sozu.toml
-RUN apk add --no-cache openssl llvm-libunwind
+RUN apk add --no-cache openssl llvm-libunwind libgcc
 COPY --from=builder /source/target/release/sozu /sozu
 COPY --from=builder /source/target/release/sozuctl /sozuctl
 
