@@ -428,7 +428,9 @@ impl FileConfig {
       for (id, app) in apps.drain() {
         match app.to_app_config(id.as_str()) {
           Ok(app_config) => { applications.insert(id, app_config); },
-          Err(s)         => { error!("error parsing application configuration for {}: {}", id, s); },
+          Err(s)         => {
+            println!("error parsing application configuration for {}: {}", id, s);
+          },
         }
       }
     }
