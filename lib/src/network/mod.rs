@@ -27,6 +27,8 @@ pub mod https_openssl;
 pub mod https {
   pub type ServerConfiguration = https_openssl::ServerConfiguration;
   pub type TlsClient           = https_openssl::TlsClient;
+
+  pub use super::https_openssl::configuration::start;
 }
 
 #[cfg(not(feature = "use_openssl"))]
@@ -36,6 +38,8 @@ pub mod https_rustls;
 pub mod https {
   pub type ServerConfiguration = super::https_rustls::configuration::ServerConfiguration;
   pub type TlsClient           = super::https_rustls::client::TlsClient;
+
+  pub use super::https_rustls::configuration::start;
 }
 
 use mio::Token;
