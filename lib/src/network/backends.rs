@@ -9,6 +9,7 @@ use sozu_command::messages::Instance;
 
 use network::{AppId,Backend,ConnectionError};
 
+#[derive(Debug)]
 pub struct BackendMap {
   pub instances:    HashMap<AppId, BackendList>,
   pub max_failures: usize,
@@ -114,6 +115,7 @@ impl BackendMap {
 
 const MAX_FAILURES_PER_BACKEND: usize = 10;
 
+#[derive(Debug)]
 pub struct BackendList {
   pub instances: Vec<Rc<RefCell<Backend>>>,
   pub next_id:   u32,
