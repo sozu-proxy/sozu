@@ -1,10 +1,10 @@
 use std::sync::{Arc,Mutex};
 use std::collections::HashMap;
 use std::io::BufReader;
+use webpki;
 use rustls::{ResolvesServerCert, SignatureScheme, PrivateKey};
 use rustls::sign::{CertifiedKey, RSASigningKey};
 use rustls::internal::pemfile;
-use webpki::DNSNameRef;
 
 use sozu_command::messages::{CertificateAndKey, CertFingerprint};
 use sozu_command::certificate::calculate_fingerprint_from_der;
@@ -30,9 +30,9 @@ impl CertificateResolver {
   }
 
   pub fn add_certificate(&mut self, certificate_and_key: CertificateAndKey) -> Option<CertFingerprint> {
-
     if let Some(certified_key) = generate_certified_key(certificate_and_key) {
-      let mut names = vec!(String::from("https://lolcatho.st"));
+      //FIXME: waiting for https://github.com/briansmith/webpki/pull/65 to merge to get the DNS names
+      let mut names = vec!(String::from("lolcatho.st"));
       let fingerprint = calculate_fingerprint_from_der(&certified_key.cert[0].0);
       info!("cert fingerprint: {:?}", fingerprint);
       // create a untrusted::Input
@@ -144,13 +144,21 @@ impl CertificateResolverWrapper {
 impl ResolvesServerCert for CertificateResolverWrapper {
   fn resolve(
         &self,
-        server_name: Option<DNSNameRef>,
+        server_name: Option<webpki::DNSNameRef>,
         sigschemes: &[SignatureScheme]
     ) -> Option<CertifiedKey> {
 
     info!("trying to resolve name: {:?} for signature scheme: {:?}", server_name, sigschemes);
     if let Ok(ref mut resolver) = self.0.try_lock() {
-
+      info!("got the resolver");
+      if let Some(name) = server_name {
+        resolver.domains.print();
+        let s: &str = name.into();
+        if let Some(kv) = resolver.domains.domain_lookup(s.as_bytes()) {
+           info!("looking for certificate for {:?} with fingerprint {:?}", s, kv.1);
+           return resolver.certificates.get(&kv.1).as_ref().map(|data| data.cert.clone());
+        }
+      }
     }
 
 
@@ -164,7 +172,7 @@ pub fn generate_certified_key(certificate_and_key: CertificateAndKey) -> Option<
   let mut cert_reader = BufReader::new(certificate_and_key.certificate.as_bytes());
   let parsed_certs = pemfile::certs(&mut cert_reader);
 
-  let mut fingerprint:Vec<u8> = Vec::new();
+  let fingerprint:Vec<u8> = Vec::new();
   if let Ok(certs) = parsed_certs {
     for cert in certs {
       chain.push(cert);
@@ -183,7 +191,7 @@ pub fn generate_certified_key(certificate_and_key: CertificateAndKey) -> Option<
   }
 
   let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
-  let parsed_key = pemfile::pkcs8_private_keys(&mut key_reader);
+  let parsed_key = pemfile::rsa_private_keys(&mut key_reader);
 
   if let Ok(keys) = parsed_key {
     if !keys.is_empty() {
@@ -191,7 +199,20 @@ pub fn generate_certified_key(certificate_and_key: CertificateAndKey) -> Option<
         let certified = CertifiedKey::new(chain, Arc::new(Box::new(signing_key)));
         return Some(certified);
       }
+    } else {
+      let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
+      let parsed_key = pemfile::pkcs8_private_keys(&mut key_reader);
+      if let Ok(keys) = parsed_key {
+        if !keys.is_empty() {
+          if let Ok(signing_key) = RSASigningKey::new(&keys[0]) {
+            let certified = CertifiedKey::new(chain, Arc::new(Box::new(signing_key)));
+            return Some(certified);
+          }
+        }
+      }
     }
+  } else {
+    error!("could not parse private key: {:?}", parsed_key);
   }
 
   None

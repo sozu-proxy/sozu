@@ -78,6 +78,7 @@ impl ServerConfiguration {
   pub fn new(config: HttpsProxyConfiguration, base_token: usize, event_loop: &mut Poll, start_at: usize,
     pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>) -> io::Result<(ServerConfiguration, HashSet<ListenToken>)> {
 
+    info!("creating Rustls enabled HTTPS proxy");
     let mut fronts   = HashMap::new();
     //FIXME: register default certificate and default app
     let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
@@ -483,7 +484,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   }
 
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
-    //trace!("{} notified", message);
+    //trace!("rustls: {} notified", message);
     match message.order {
       Order::AddApplication(application) => {
         debug!("{} add application {:?}", message.id, application);
