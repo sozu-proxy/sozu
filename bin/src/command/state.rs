@@ -2,8 +2,8 @@ use mio::Token;
 use std::collections::{BTreeMap,HashMap,HashSet};
 
 use sozu::network::metrics::METRICS;
-use sozu_command::messages::{MetricsData,OrderMessageAnswerData,QueryAnswer};
-use sozu_command::state::ConfigState;
+use sozu_command::messages::{MetricsData,OrderMessageAnswerData,QueryAnswer,QueryApplicationType};
+use sozu_command::state::{ConfigState,get_application_ids_by_domain};
 use sozu_command::data::AnswerData;
 use command::FrontToken;
 
@@ -90,8 +90,8 @@ pub enum MessageType {
   LoadState,
   WorkerOrder,
   Metrics,
-  QueryApplications,
-  QueryApplication(String),
+  QueryApplicationsHashes,
+  QueryApplications(QueryApplicationType),
   Stop,
 }
 
@@ -136,7 +136,7 @@ impl Task {
         data.insert(String::from("master"), master_metrics);
         Some(AnswerData::Metrics(data))
       },
-      MessageType::QueryApplications => {
+      MessageType::QueryApplicationsHashes => {
         let mut data: BTreeMap<String, QueryAnswer> = self.data.into_iter().filter_map(|(tag, query)| {
           if let OrderMessageAnswerData::Query(data) = query {
             Some((tag, data))
@@ -145,11 +145,11 @@ impl Task {
           }
         }).collect();
 
-        data.insert(String::from("master"), QueryAnswer::Applications(master_state.hash_state()));
+        data.insert(String::from("master"), QueryAnswer::ApplicationsHashes(master_state.hash_state()));
 
         Some(AnswerData::Query(data))
       },
-      MessageType::QueryApplication(app_id) => {
+      MessageType::QueryApplications(query_type) => {
         let mut data: BTreeMap<String, QueryAnswer> = self.data.into_iter().filter_map(|(tag, query)| {
           if let OrderMessageAnswerData::Query(data) = query {
             Some((tag, data))
@@ -158,7 +158,15 @@ impl Task {
           }
         }).collect();
 
-        data.insert(String::from("master"), QueryAnswer::Application(master_state.application_state(&app_id)));
+        let answer = match query_type {
+          QueryApplicationType::AppId(ref app_id) => vec!(master_state.application_state(app_id)),
+          QueryApplicationType::Domain(ref domain) => {
+            let app_ids = get_application_ids_by_domain(&master_state, domain.hostname.clone(), domain.path_begin.clone());
+            app_ids.iter().map(|ref app_id| master_state.application_state(app_id)).collect()
+          }
+        };
+
+        data.insert(String::from("master"), QueryAnswer::Applications(answer));
 
         Some(AnswerData::Query(data))
       },

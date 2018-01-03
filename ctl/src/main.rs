@@ -85,7 +85,7 @@ fn main() {
     },
     SubCmd::Query{ cmd } => {
       match cmd {
-        QueryCmd::Applications{ id } => query_application(channel, id),
+        QueryCmd::Applications{ id, domain } => query_application(channel, id, domain),
       }
     },
   }

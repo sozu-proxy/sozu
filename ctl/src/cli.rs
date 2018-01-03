@@ -201,6 +201,8 @@ pub enum QueryCmd {
   #[structopt(name = "applications")]
   Applications {
     #[structopt(short = "i", long="id", help="application identifier")]
-    id: Option<String>
+    id: Option<String>,
+    #[structopt(short = "d", long="domain", help="application domain name")]
+    domain: Option<String>
   }
 }

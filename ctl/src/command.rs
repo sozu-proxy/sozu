@@ -3,7 +3,7 @@ use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront, TcpFront,
-  CertificateAndKey, CertFingerprint, Query, QueryAnswer};
+  CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain};
 
 use std::collections::{HashMap,HashSet};
 use std::process::exit;
@@ -839,10 +839,30 @@ pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, 
   }));
 }
 
-pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, application_id: Option<String>) {
-  let command = match application_id {
-    Some(ref app_id) => ConfigCommand::Query(Query::Application(app_id.to_string())),
-    None         => ConfigCommand::Query(Query::Applications),
+pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, application_id: Option<String>, domain: Option<String>) {
+  if application_id.is_some() && domain.is_some() {
+    println!("Error: Either request an application ID or a domain name");
+    return;
+  }
+
+  let command = if let Some(ref app_id) = application_id {
+    ConfigCommand::Query(Query::Applications(QueryApplicationType::AppId(app_id.to_string())))
+  } else if let Some(ref domain) = domain {
+    let splitted: Vec<String> = domain.splitn(2, "/").map(|elem| elem.to_string()).collect();
+
+    if splitted.len() == 0 {
+      println!("Domain can't be empty");
+      return;
+    }
+
+    let query_domain = QueryApplicationDomain {
+      hostname: splitted.get(0).expect("Domain can't be empty").clone(),
+      path_begin: splitted.get(1).cloned().map(|path| format!("/{}", path)) // We add the / again because of the splitn removing it
+    };
+
+    ConfigCommand::Query(Query::Applications(QueryApplicationType::Domain(query_domain)))
+  } else {
+    ConfigCommand::Query(Query::ApplicationsHashes)
   };
 
   let id = generate_id();
@@ -869,12 +889,13 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
           println!("could not query proxy state: {}", message.message);
         },
         ConfigMessageStatus::Ok => {
-          if let Some(app_id) = application_id {
+          if let Some(needle) = application_id.or(domain) {
             println!("Proxy config answer:\n{}\n{:#?}", message.message, message.data);
             if let Some(AnswerData::Query(data)) = message.data {
               let mut application_table = Table::new();
               let mut header = Vec::new();
-              header.push(cell!("key"));
+              header.push(cell!("id"));
+              header.push(cell!("sticky_session"));
               for ref key in data.keys() {
                 header.push(cell!(&key));
               }
@@ -882,6 +903,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
 
               let mut frontend_table = Table::new();
               let mut header = Vec::new();
+              header.push(cell!("id"));
               header.push(cell!("hostname"));
               header.push(cell!("path begin"));
               for ref key in data.keys() {
@@ -891,6 +913,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
 
               let mut https_frontend_table = Table::new();
               let mut header = Vec::new();
+              header.push(cell!("id"));
               header.push(cell!("hostname"));
               header.push(cell!("path begin"));
               header.push(cell!("fingerprint"));
@@ -918,39 +941,42 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
 
               for (ref key, ref metrics) in data.iter() {
                 //let m: u8 = metrics;
-                if let &QueryAnswer::Application(ref app) = *metrics {
-                  let mut entry = application_data.entry(String::from("sticky session")).or_insert(Vec::new());
-                  if let Some(ref conf) = app.configuration {
-                    entry.push(format!("{}", conf.sticky_session));
-                  } else {
-                    entry.push(String::from(""));
-                  }
-
-                  for frontend in app.http_frontends.iter() {
-                    let mut entry = frontend_data.entry(frontend).or_insert(Vec::new());
+                if let &QueryAnswer::Applications(ref apps) = *metrics {
+                  for app in apps.iter() {
+                    let mut entry = application_data.entry(app).or_insert(Vec::new());
                     entry.push(key.clone());
-                  }
 
-                  for frontend in app.https_frontends.iter() {
-                    let mut entry = https_frontend_data.entry(frontend).or_insert(Vec::new());
-                    entry.push(key.clone());
-                  }
+                    for frontend in app.http_frontends.iter() {
+                      let mut entry = frontend_data.entry(frontend).or_insert(Vec::new());
+                      entry.push(key.clone());
+                    }
 
-                  for backend in app.backends.iter() {
-                    let mut entry = backend_data.entry(backend).or_insert(Vec::new());
-                    entry.push(key.clone());
+                    for frontend in app.https_frontends.iter() {
+                      let mut entry = https_frontend_data.entry(frontend).or_insert(Vec::new());
+                      entry.push(key.clone());
+                    }
+
+                    for backend in app.backends.iter() {
+                      let mut entry = backend_data.entry(backend).or_insert(Vec::new());
+                      entry.push(key.clone());
+                    }
                   }
                 }
               }
 
-              println!("Application level configuration for {}:\n", app_id);
+              println!("Application level configuration for {}:\n", needle);
 
               for (ref key, ref values) in application_data.iter() {
                 let mut row = Vec::new();
-                row.push(cell!(key));
+                row.push(cell!(key.configuration.clone().map(|conf| conf.app_id).unwrap_or(String::from(""))));
+                row.push(cell!(key.configuration.clone().map(|conf| conf.sticky_session).unwrap_or(false)));
 
                 for val in values.iter() {
-                  row.push(cell!(format!("{}", val)));
+                  if keys.contains(val) {
+                    row.push(cell!(String::from("X")));
+                  } else {
+                    row.push(cell!(String::from("")));
+                  }
                 }
 
                 application_table.add_row(Row::new(row));
@@ -958,10 +984,11 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
 
               application_table.printstd();
 
-              println!("\nHTTP frontends configuration for {}:\n", app_id);
+              println!("\nHTTP frontends configuration for {}:\n", needle);
 
               for (ref key, ref values) in frontend_data.iter() {
                 let mut row = Vec::new();
+                row.push(cell!(key.app_id));
                 row.push(cell!(key.hostname));
                 row.push(cell!(key.path_begin));
 
@@ -978,10 +1005,11 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
 
               frontend_table.printstd();
 
-              println!("\nHTTPS frontends configuration for {}:\n", app_id);
+              println!("\nHTTPS frontends configuration for {}:\n", needle);
 
               for (ref key, ref values) in https_frontend_data.iter() {
                 let mut row = Vec::new();
+                row.push(cell!(key.app_id));
                 row.push(cell!(key.hostname));
                 row.push(cell!(key.path_begin));
                 row.push(cell!(format!("{}", key.fingerprint)));
@@ -999,7 +1027,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
 
               https_frontend_table.printstd();
 
-              println!("\nbackends configuration for {}:\n", app_id);
+              println!("\nbackends configuration for {}:\n", needle);
 
               for (ref key, ref values) in backend_data.iter() {
                 let mut row = Vec::new();
@@ -1035,7 +1063,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
 
               for ref metrics in data.values() {
                 //let m: u8 = metrics;
-                if let &QueryAnswer::Applications(ref apps) = *metrics {
+                if let &QueryAnswer::ApplicationsHashes(ref apps) = *metrics {
                   for (ref key, ref value) in apps.iter() {
                     (*(query_data.entry(key.clone()).or_insert(Vec::new()))).push(value.clone());
                   }

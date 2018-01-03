@@ -299,22 +299,35 @@ impl Default for HttpsProxyConfiguration {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct QueryApplicationDomain {
+  pub hostname: String,
+  pub path_begin: Option<String>
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum QueryApplicationType {
+  AppId(String),
+  Domain(QueryApplicationDomain)
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Query {
-  Application(String),
+  Applications(QueryApplicationType),
   //Certificate(CertFingerprint),
   //Certificates,
-  Applications,
+  ApplicationsHashes,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryAnswer {
-  Application(QueryAnswerApplication),
+  Applications(Vec<QueryAnswerApplication>),
   //Certificate(QueryAnswerCertificate),
   //Certificates(Vec<CertFingerprint>),
   /// application id, hash of application information
-  Applications(BTreeMap<String, u64>),
+  ApplicationsHashes(BTreeMap<String, u64>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -324,6 +337,18 @@ pub struct QueryAnswerApplication {
   pub https_frontends: Vec<HttpsFront>,
   pub tcp_frontends:   Vec<TcpFront>,
   pub backends:        Vec<Instance>,
+}
+
+impl Default for QueryAnswerApplication {
+  fn default() -> QueryAnswerApplication {
+    QueryAnswerApplication {
+      configuration: None,
+      http_frontends: vec!(),
+      https_frontends: vec!(),
+      tcp_frontends: vec!(),
+      backends: vec!()
+    }
+  }
 }
 
 impl Order {
