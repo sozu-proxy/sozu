@@ -226,10 +226,6 @@ impl FileAppConfig {
         if certificate_opt.is_none() {
           return Err(format!("cannot read the certificate at {:?}", self.certificate));
         }
-        if chain_opt.is_none() {
-          return Err(format!("cannot read the certificate chain at {:?}", self.certificate_chain));
-        }
-
       }
 
       Ok(AppConfig::Http(HttpAppConfig {
