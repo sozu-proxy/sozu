@@ -2,6 +2,8 @@
 pub struct App {
   #[structopt(short="c", long = "config", help = "Sets a custom config file")]
   pub config: String,
+  #[structopt(short="t", long = "timeout", help = "Sets a custom timeout for commands (in milliseconds). 0 disables the timeout")]
+  pub timeout: Option<u64>,
   #[structopt(subcommand)]
   pub cmd: SubCmd,
 }

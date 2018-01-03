@@ -12,6 +12,7 @@ handle_process_affinity = false
 max_connections = 500
 max_buffers = 500
 buffer_size = 16384
+#ctl_commands_timeout = 1000
 
 [metrics]
 address = "127.0.0.1"
