@@ -140,9 +140,12 @@ impl SocketHandler for FrontRustls {
         Ok(0)  => can_read = false,
         Ok(sz) => {},
         Err(e) => match e.kind() {
-          ErrorKind::WouldBlock => can_read = false,
-           _ => {
-             error!("could not read TLS stream from socket: {:?}", e);
+          ErrorKind::WouldBlock => {
+            error!("rustls socket_read wouldblock");
+            can_read = false;
+          },
+          _ => {
+            error!("could not read TLS stream from socket: {:?}", e);
             return (size, SocketResult::Error)
            }
         }
@@ -153,11 +156,13 @@ impl SocketHandler for FrontRustls {
         return (size, SocketResult::Error);
       }
 
-      match self.session.read(buf) {
+      match self.session.read(&mut buf[size..]) {
         Ok(0)  => return (size, SocketResult::Continue),
         Ok(sz) => size += sz,
         Err(e) => match e.kind() {
-          ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
+          ErrorKind::WouldBlock => {
+            return (size, SocketResult::WouldBlock);
+          },
            _ => {
              error!("could not read data from TLS stream: {:?}", e);
             return (size, SocketResult::Error)
@@ -175,46 +180,77 @@ impl SocketHandler for FrontRustls {
   }
 
   fn socket_write(&mut self,  buf: &[u8]) -> (usize, SocketResult) {
-    let mut size = 0usize;
+    let mut sent_size = 0usize;
+    let mut buffered_size = 0usize;
     let mut can_write = true;
 
-    while self.session.wants_write() && can_write {
-      if size == buf.len() {
-        return (size, SocketResult::Continue);
-      }
-
-      match self.session.write(buf) {
-        Ok(0)  => { },
-        Ok(sz) => size += sz,
-        Err(e) => match e.kind() {
-          ErrorKind::WouldBlock => {
-            // we don't need to do anything, the session will return false in wants_write?
-          },
-           _ => {
-             error!("could not write data to TLS stream: {:?}", e);
-            return (size, SocketResult::Error)
-           }
+    match self.session.write(buf) {
+      Ok(0)  => {
+      },
+      Ok(sz) => {
+        buffered_size += sz;
+      },
+      Err(e) => match e.kind() {
+        ErrorKind::WouldBlock => {
+          // we don't need to do anything, the session will return false in wants_write?
+          error!("rustls socket_write wouldblock");
+        },
+        _ => {
+          error!("could not write data to TLS stream: {:?}", e);
+          return (buffered_size, SocketResult::Error)
         }
       }
+    }
+
+    while self.session.wants_write() && can_write {
+      if sent_size == buf.len() {
+        return (buffered_size, SocketResult::Continue);
+      }
+
+      if sent_size == buffered_size && buffered_size < buf.len() {
+        match self.session.write(&buf[buffered_size..]) {
+          Ok(0)  => {
+          },
+          Ok(sz) => {
+            buffered_size += sz;
+          },
+          Err(e) => match e.kind() {
+            ErrorKind::WouldBlock => {
+              // we don't need to do anything, the session will return false in wants_write?
+              error!("rustls socket_write wouldblock");
+            },
+             _ => {
+               error!("could not write data to TLS stream: {:?}", e);
+              return (buffered_size, SocketResult::Error)
+             }
+          }
+        }
+
+      }
+
 
       match self.session.write_tls(&mut self.stream) {
-        Ok(0)  => can_write = false,
-        Ok(sz) => {},
+        Ok(0)  => {
+          can_write = false;
+        },
+        Ok(sz) => {
+          sent_size += sz;
+        },
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => can_write = false,
-           _ => {
-             error!("could not write TLS stream to socket: {:?}", e);
-            return (size, SocketResult::Error)
-           }
+          _ => {
+            error!("could not write TLS stream to socket: {:?}", e);
+            return (buffered_size, SocketResult::Error)
+          }
         }
       }
 
     }
 
     if can_write {
-    (size, SocketResult::Continue)
+      (buffered_size, SocketResult::Continue)
     } else {
-    (size, SocketResult::WouldBlock)
+      (buffered_size, SocketResult::WouldBlock)
     }
   }
 
