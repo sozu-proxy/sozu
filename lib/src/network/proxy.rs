@@ -10,6 +10,7 @@ use mio::*;
 use mio::unix::UnixReady;
 use std::collections::{HashSet,HashMap,VecDeque};
 use std::io::{self,Read,ErrorKind};
+use std::os::unix::io::FromRawFd;
 use nom::HexDisplay;
 use std::error::Error;
 use slab::Slab;
@@ -24,6 +25,7 @@ use rand::random;
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
+use sozu_command::scm_socket::ScmSocket;
 use sozu_command::state::{ConfigState,get_application_ids_by_domain};
 use sozu_command::messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer,QueryApplicationType};
 
@@ -58,43 +60,49 @@ pub struct Server {
   https:           Option<Session<tls::ServerConfiguration, tls::TlsClient>>,
   tcp:             Option<Session<tcp::ServerConfiguration, tcp::Client>>,
   config_state:    ConfigState,
+  scm:             ScmSocket,
 }
 
 impl Server {
-  pub fn new_from_config(channel: ProxyChannel, config: Config, config_state: ConfigState) -> Self {
+  pub fn new_from_config(channel: ProxyChannel, scm: ScmSocket, config: Config, config_state: ConfigState) -> Self {
     let mut event_loop  = Poll::new().expect("could not create event loop");
     let pool = Rc::new(RefCell::new(
       Pool::with_capacity(2*config.max_buffers, 0, || BufferQueue::with_capacity(config.buffer_size))
     ));
 
+    let mut listeners = scm.receive_listeners();
+    info!("received listeners: {:#?}", listeners);
+
     let max_connections = config.max_connections;
     let max_buffers     = config.max_buffers;
     let http_session = config.http.and_then(|conf| conf.to_http()).and_then(|http_conf| {
       let max_listeners = 1;
-      http::ServerConfiguration::new(http_conf, &mut event_loop, 1 + max_listeners, pool.clone()).map(|configuration| {
+      http::ServerConfiguration::new(http_conf, &mut event_loop, 1 + max_listeners, pool.clone(),
+        listeners.http.map(|fd| unsafe { TcpListener::from_raw_fd(fd) })).map(|configuration| {
         Session::new(1, max_connections, 0, configuration, &mut event_loop)
       }).ok()
     });
 
     let https_session = config.https.and_then(|conf| conf.to_tls()).and_then(|https_conf| {
       let max_listeners   = 1;
-      tls::ServerConfiguration::new(https_conf, 6148914691236517205, &mut event_loop, 1 + max_listeners + 6148914691236517205, pool.clone()).map(|configuration| {
+      tls::ServerConfiguration::new(https_conf, 6148914691236517205, &mut event_loop, 1 + max_listeners + 6148914691236517205, pool.clone(), listeners.tls.map(|fd| unsafe { TcpListener::from_raw_fd(fd) })).map(|configuration| {
         Session::new(max_listeners, max_connections, 6148914691236517205, configuration, &mut event_loop)
       }).ok()
     });
 
     let tcp_session = config.tcp.map(|conf| {
-      let configuration = tcp::ServerConfiguration::new(conf.max_listeners, 12297829382473034410, pool.clone());
+      let configuration = tcp::ServerConfiguration::new(conf.max_listeners, 12297829382473034410, pool.clone(),
+        listeners.tcp.drain(..).map(|fd| unsafe { TcpListener::from_raw_fd(fd) }).collect());
       Session::new(conf.max_listeners, max_buffers, 12297829382473034410, configuration, &mut event_loop)
     });
 
-    Server::new(event_loop, channel, http_session, https_session, tcp_session, Some(config_state))
+    Server::new(event_loop, channel, scm, http_session, https_session, tcp_session, Some(config_state))
   }
 
-  pub fn new(poll: Poll, channel: ProxyChannel,
+  pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
     http:  Option<Session<http::ServerConfiguration, http::Client>>,
     https: Option<Session<tls::ServerConfiguration, tls::TlsClient>>,
-    tcp:  Option<Session<tcp::ServerConfiguration, tcp::Client>>,
+    tcp:   Option<Session<tcp::ServerConfiguration, tcp::Client>>,
     config_state: Option<ConfigState>) -> Self {
 
     poll.register(
@@ -123,6 +131,7 @@ impl Server {
       https:           https,
       tcp:             tcp,
       config_state:    ConfigState::new(),
+      scm:             scm,
     };
 
     // initialize the worker with the state we got from a file

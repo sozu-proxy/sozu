@@ -9,7 +9,7 @@ use std::ptr::null_mut;
 use std::process::Command;
 use std::net::ToSocketAddrs;
 use std::os::unix::process::CommandExt;
-use std::os::unix::io::{AsRawFd,FromRawFd};
+use std::os::unix::io::{AsRawFd,FromRawFd,RawFd};
 use tempfile::tempfile;
 use serde_json;
 use nix;
@@ -18,6 +18,7 @@ use nix::unistd::*;
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
+use sozu_command::scm_socket::ScmSocket;
 use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
 use sozu::network::proxy::Server;
 
@@ -30,8 +31,8 @@ pub fn start_workers(config: &Config) -> nix::Result<Vec<Worker>> {
   let mut workers = Vec::new();
   for index in 0..config.worker_count {
     match start_worker_process(&index.to_string(), config, &state) {
-      Ok((pid, command)) => {
-        let w =  Worker::new(index as u32, pid, command, config);
+      Ok((pid, command, scm)) => {
+        let w =  Worker::new(index as u32, pid, command, ScmSocket::new(scm), config);
         workers.push(w);
       },
       Err(e) => return Err(e)
@@ -42,15 +43,15 @@ pub fn start_workers(config: &Config) -> nix::Result<Vec<Worker>> {
 
 pub fn start_worker(id: u32, config: &Config, state: &ConfigState) -> nix::Result<Worker> {
   match start_worker_process(&id.to_string(), config, state) {
-    Ok((pid, command)) => {
-      let w = Worker::new(id, pid, command, config);
+    Ok((pid, command, scm)) => {
+      let w = Worker::new(id, pid, command,  ScmSocket::new(scm), config);
       Ok(w)
     },
     Err(e) => Err(e)
   }
 }
 
-pub fn begin_worker_process(fd: i32, configuration_state_fd: i32, id: i32, channel_buffer_size: usize) {
+pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: i32, channel_buffer_size: usize) {
   let mut command: Channel<OrderMessageAnswer,Config> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
     channel_buffer_size,
@@ -78,14 +79,14 @@ pub fn begin_worker_process(fd: i32, configuration_state_fd: i32, id: i32, chann
     gauge!("sozu.worker.TEST", 42);
   }
 
-  let mut server = Server::new_from_config(command, proxy_config, config_state);
+  let mut server = Server::new_from_config(command, ScmSocket::new(scm), proxy_config, config_state);
 
   info!("{} starting event loop", id);
   server.run();
   info!("{} ending event loop", id);
 }
 
-pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState) -> nix::Result<(pid_t, Channel<OrderMessage,OrderMessageAnswer>)> {
+pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState) -> nix::Result<(pid_t, Channel<OrderMessage,OrderMessageAnswer>, RawFd)> {
   trace!("parent({})", unsafe { libc::getpid() });
 
   let mut state_file = tempfile().expect("could not create temporary file for configuration state");
@@ -95,6 +96,7 @@ pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState) -> n
   state_file.seek(SeekFrom::Start(0)).expect("could not seek to beginning of file");
 
   let (server, client) = UnixStream::pair().unwrap();
+  let (scm_server, scm_client) = UnixStream::pair().unwrap();
 
   util::disable_close_on_exec(client.as_raw_fd());
 
@@ -120,7 +122,7 @@ pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState) -> n
       command.set_nonblocking(true);
 
       let command: Channel<OrderMessage,OrderMessageAnswer> = command.into();
-      Ok((child, command))
+      Ok((child, command, scm_server.as_raw_fd()))
     },
     Ok(ForkResult::Child) => {
       trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
@@ -130,6 +132,8 @@ pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState) -> n
         .arg(id)
         .arg("--fd")
         .arg(client.as_raw_fd().to_string())
+        .arg("--scm")
+        .arg(scm_client.as_raw_fd().to_string())
         .arg("--configuration-state-fd")
         .arg(state_file.as_raw_fd().to_string())
         .arg("--channel-buffer-size")

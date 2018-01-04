@@ -5,6 +5,8 @@ use mio::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
 use std::collections::HashMap;
+use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd,AsRawFd};
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
 use std::error::Error;
@@ -19,8 +21,9 @@ use rand::random;
 use uuid::Uuid;
 use pool::{Pool,Checkout,Reset};
 
-use sozu_command::channel::Channel;
 use sozu_command::buffer::Buffer;
+use sozu_command::channel::Channel;
+use sozu_command::scm_socket::ScmSocket;
 use sozu_command::messages::{self,TcpFront,Order,Instance,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 
 use network::{Backend,ClientResult,ConnectionError,RequiredEvents,Protocol};
@@ -230,7 +233,8 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(max_listeners: usize, start_at: usize, pool: Rc<RefCell<Pool<BufferQueue>>>) -> ServerConfiguration {
+  pub fn new(max_listeners: usize, start_at: usize, pool: Rc<RefCell<Pool<BufferQueue>>>,
+    tcp_listener: Vec<TcpListener>) -> ServerConfiguration {
     ServerConfiguration {
       instances:     HashMap::new(),
       listeners:     Slab::with_capacity(max_listeners),
@@ -474,9 +478,11 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
     let pool = Rc::new(RefCell::new(
       Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
     ));
-    let configuration = ServerConfiguration::new(10, 12297829382473034410, pool);
+    let configuration = ServerConfiguration::new(10, 12297829382473034410, pool, Vec::new());
     let session = Session::new(10, 500, 12297829382473034410, configuration, &mut poll);
-    let mut s   = Server::new(poll, channel, None, None, Some(session), None);
+    let (scm_server, scm_client) = UnixStream::pair().unwrap();
+    let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()),
+      None, None, Some(session), None);
     info!("will run");
     s.run();
     info!("ending event loop");
@@ -520,9 +526,10 @@ pub fn start(max_listeners: usize, max_buffers: usize, buffer_size:usize, channe
   let pool = Rc::new(RefCell::new(
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
-  let configuration     = ServerConfiguration::new(max_listeners, 12297829382473034410, pool);
+  let configuration     = ServerConfiguration::new(max_listeners, 12297829382473034410, pool, Vec::new());
   let session           = Session::new(max_listeners, max_buffers, 12297829382473034410, configuration, &mut poll);
-  let mut server        = Server::new(poll, channel, None, None, Some(session), None);
+  let (scm_server, scm_client) = UnixStream::pair().unwrap();
+  let mut server        = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), None, None, Some(session), None);
 
   info!("starting event loop");
   server.run();

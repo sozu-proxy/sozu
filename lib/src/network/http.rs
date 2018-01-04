@@ -3,6 +3,8 @@ use std::io::{self,Read,Write,ErrorKind};
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
 use std::thread::{self,Thread,Builder};
+use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd,AsRawFd};
 use std::sync::mpsc::{self,channel,Receiver};
 use std::net::{SocketAddr,IpAddr,Shutdown};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
@@ -18,6 +20,7 @@ use time::{SteadyTime,Duration};
 
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
+use sozu_command::scm_socket::ScmSocket;
 use sozu_command::messages::{self,Application,Order,HttpFront,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol};
@@ -304,10 +307,17 @@ pub struct ServerConfiguration {
 
 impl ServerConfiguration {
   pub fn new(config: HttpProxyConfiguration, event_loop: &mut Poll, start_at:usize,
-    pool: Rc<RefCell<Pool<BufferQueue>>>) -> io::Result<ServerConfiguration> {
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>) -> io::Result<ServerConfiguration> {
 
     let front = config.front;
-    match server_bind(&config.front) {
+
+    let listener = if let Some(listener) = tcp_listener {
+      Ok(listener)
+    } else {
+      server_bind(&config.front)
+    };
+
+    match listener {
       Ok(sock) => {
         event_loop.register(&sock, Token(start_at), Ready::readable(), PollOpt::edge());
 
@@ -819,9 +829,11 @@ pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel, max_buffers:
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok(configuration) = ServerConfiguration::new(config, &mut event_loop, 1 + max_listeners, pool) {
+  if let Ok(configuration) = ServerConfiguration::new(config, &mut event_loop, 1 + max_listeners, pool, None) {
     let session    = Session::new(max_listeners, max_buffers, 0, configuration, &mut event_loop);
-    let mut server = Server::new(event_loop, channel, Some(session), None, None, None);
+    let (scm_server, scm_client) = UnixStream::pair().unwrap();
+    let mut server = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
+      Some(session), None, None, None);
 
     info!("starting event loop");
     server.run();

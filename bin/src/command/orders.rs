@@ -16,6 +16,7 @@ use nom::{HexDisplay,IResult,Offset};
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
+use sozu_command::scm_socket::ScmSocket;
 use sozu_command::messages::{Order,OrderMessage,Query};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 
@@ -501,6 +502,7 @@ impl CommandServer {
               pid:        serialized.pid,
               run_state:  serialized.run_state.clone(),
               queue:      serialized.queue.clone().into(),
+              scm:        ScmSocket::new(serialized.scm),
             }
           )
         )

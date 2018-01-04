@@ -29,6 +29,7 @@ pub struct SerializedWorker {
   pub run_state:  RunState,
   pub token:      Option<usize>,
   pub queue:      Vec<OrderMessage>,
+  pub scm:        i32,
 }
 
 impl SerializedWorker {
@@ -40,6 +41,7 @@ impl SerializedWorker {
       run_state:  proxy.run_state.clone(),
       token:      proxy.token.clone().map(|Token(t)| t),
       queue:      proxy.queue.clone().into(),
+      scm:        proxy.scm.raw_fd(),
     }
   }
 }

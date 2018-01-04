@@ -5,6 +5,8 @@ use std::rc::{Rc,Weak};
 use std::cell::RefCell;
 use std::mem;
 use std::net::Shutdown;
+use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd,AsRawFd};
 use mio::*;
 use mio::net::*;
 use mio_uds::UnixStream;
@@ -30,6 +32,7 @@ use nom::IResult;
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
+use sozu_command::scm_socket::ScmSocket;
 use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,Order,HttpsFront,HttpsProxyConfiguration,OrderMessage,
   OrderMessageAnswer,OrderMessageStatus};
 
@@ -360,7 +363,7 @@ pub struct ServerConfiguration {
 
 impl ServerConfiguration {
   pub fn new(config: HttpsProxyConfiguration, base_token: usize, event_loop: &mut Poll, start_at: usize,
-    pool: Rc<RefCell<Pool<BufferQueue>>>) -> io::Result<ServerConfiguration> {
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>) -> io::Result<ServerConfiguration> {
 
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let     domains  = TrieNode::root();
@@ -386,7 +389,13 @@ impl ServerConfiguration {
     };
     fronts.insert(config.default_name.clone().unwrap_or(String::from("")), vec![app]);
 
-    match server_bind(&config.front) {
+    let tcp_listener = if let Some(listener) = tcp_listener {
+      Ok(listener)
+    } else {
+      server_bind(&config.front)
+    };
+
+    match tcp_listener {
       Ok(listener) => {
         event_loop.register(&listener, Token(base_token), Ready::readable(), PollOpt::edge());
         let default = DefaultAnswers {
@@ -1146,9 +1155,13 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
   ));
 
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok(configuration) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop, 1 + max_listeners, pool) {
+  if let Ok(configuration) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop,
+    1 + max_listeners, pool, None) {
+
     let session = Session::new(max_listeners, max_buffers, 6148914691236517205, configuration, &mut event_loop);
-    let mut server  = Server::new(event_loop, channel, None, Some(session), None, None);
+    let (scm_server, scm_client) = UnixStream::pair().unwrap();
+    let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
+      None, Some(session), None, None);
 
     info!("starting event loop");
     server.run();
