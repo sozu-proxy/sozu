@@ -174,24 +174,24 @@ impl<Front:SocketHandler> Http<Front> {
       //FIXME: in the "for", we don't put the other values we could get from a preexisting forward header
       match (peer_ip, peer_port, front) {
         (IpAddr::V4(p), peer_port, IpAddr::V4(f)) => {
-          format!("Forwarded: proto={};for={};by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
+          format!("Forwarded: proto={};for={}:{};by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
                   X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
-            proto, peer_ip, front, proto, peer_ip, peer_port, self.request_id)
+            proto, peer_ip, peer_port, front, proto, peer_ip, peer_port, self.request_id)
         },
         (IpAddr::V4(p), peer_port, IpAddr::V6(f)) => {
-          format!("Forwarded: proto={};for={};by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
+          format!("Forwarded: proto={};for={}:{};by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
                   X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
-            proto, peer_ip, front, proto, peer_ip, peer_port, self.request_id)
+            proto, peer_ip, peer_port, front, proto, peer_ip, peer_port, self.request_id)
         },
         (IpAddr::V6(p), peer_port, IpAddr::V4(f)) => {
-          format!("Forwarded: proto={};for=\"{}\";by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
+          format!("Forwarded: proto={};for=\"{}:{}\";by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
                   X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
-            proto, peer_ip, front, proto, peer_ip, peer_port, self.request_id)
+            proto, peer_ip, peer_port, front, proto, peer_ip, peer_port, self.request_id)
         },
         (IpAddr::V6(p), peer_port, IpAddr::V6(f)) => {
-          format!("Forwarded: proto={};for=\"{}\";by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
+          format!("Forwarded: proto={};for=\"{}:{}\";by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
                   X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
-            proto, peer_ip, front, proto, peer_ip, peer_port, self.request_id)
+            proto, peer_ip, peer_port, front, proto, peer_ip, peer_port, self.request_id)
         },
       }
     } else {
