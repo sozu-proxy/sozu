@@ -162,10 +162,9 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn added_request_header(&self, public_address: Option<IpAddr>) -> String {
-    if let (Some(peer), Some(front)) = (
-      self.front_socket().peer_addr().map(|addr| addr.ip()).ok(),
-      public_address.or(self.front_socket().local_addr().map(|addr| addr.ip()).ok())
-    ) {
+    let peer = self.front_socket().peer_addr().map(|addr| (addr.ip(), addr.port())).ok();
+    let front = public_address.or(self.front_socket().local_addr().map(|addr| addr.ip()).ok());
+    if let (Some((peer_ip, peer_port)), Some(front)) = (peer, front) {
       let proto = match self.protocol() {
         Protocol::HTTP  => "http",
         Protocol::HTTPS => "https",
@@ -173,22 +172,26 @@ impl<Front:SocketHandler> Http<Front> {
       };
 
       //FIXME: in the "for", we don't put the other values we could get from a preexisting forward header
-      match (peer, front) {
-        (IpAddr::V4(p), IpAddr::V4(f)) => {
-          format!("Forwarded: proto={};for={};by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nSozu-Id: {}\r\n",
-            proto, peer, front, proto, peer, self.request_id)
+      match (peer_ip, peer_port, front) {
+        (IpAddr::V4(p), peer_port, IpAddr::V4(f)) => {
+          format!("Forwarded: proto={};for={};by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
+                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
+            proto, peer_ip, front, proto, peer_ip, peer_port, self.request_id)
         },
-        (IpAddr::V4(p), IpAddr::V6(f)) => {
-          format!("Forwarded: proto={};for={};by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nSozu-Id: {}\r\n",
-            proto, peer, front, proto, peer, self.request_id)
+        (IpAddr::V4(p), peer_port, IpAddr::V6(f)) => {
+          format!("Forwarded: proto={};for={};by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
+                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
+            proto, peer_ip, front, proto, peer_ip, peer_port, self.request_id)
         },
-        (IpAddr::V6(p), IpAddr::V4(f)) => {
-          format!("Forwarded: proto={};for=\"{}\";by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nSozu-Id: {}\r\n",
-            proto, peer, front, proto, peer, self.request_id)
+        (IpAddr::V6(p), peer_port, IpAddr::V4(f)) => {
+          format!("Forwarded: proto={};for=\"{}\";by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
+                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
+            proto, peer_ip, front, proto, peer_ip, peer_port, self.request_id)
         },
-        (IpAddr::V6(p), IpAddr::V6(f)) => {
-          format!("Forwarded: proto={};for=\"{}\";by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\nSozu-Id: {}\r\n",
-            proto, peer, front, proto, peer, self.request_id)
+        (IpAddr::V6(p), peer_port, IpAddr::V6(f)) => {
+          format!("Forwarded: proto={};for=\"{}\";by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
+                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
+            proto, peer_ip, front, proto, peer_ip, peer_port, self.request_id)
         },
       }
     } else {
