@@ -33,6 +33,8 @@ serde_derive = "^1.0.2"
 
 [features]
 unstable = []
+logs-debug = []
+logs-trace = []
 
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }

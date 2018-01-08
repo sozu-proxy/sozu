@@ -470,12 +470,12 @@ macro_rules! info {
 #[macro_export]
 macro_rules! debug {
     ($format:expr, $($arg:tt)*) => {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "logs-debug", feature = "logs-trace"))]
         log!($crate::logging::LogLevel::Debug, concat!("{}\t", $format),
           "DEBUG", {module_path!()}, $($arg)*);
     };
     ($format:expr) => {
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "logs-debug", feature = "logs-trace"))]
         log!($crate::logging::LogLevel::Debug, concat!("{}\t", $format),
           "DEBUG", {module_path!()});
     }
@@ -484,12 +484,12 @@ macro_rules! debug {
 #[macro_export]
 macro_rules! trace {
     ($format:expr, $($arg:tt)*) => (
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "logs-trace"))]
         log!($crate::logging::LogLevel::Trace, concat!("{}\t", $format),
           "TRACE", module_path!(), $($arg)*);
     );
     ($format:expr) => (
-        #[cfg(debug_assertions)]
+        #[cfg(any(debug_assertions, feature = "logs-trace"))]
         log!($crate::logging::LogLevel::Trace, concat!("{}\t", $format),
           "TRACE", module_path!());
     )
