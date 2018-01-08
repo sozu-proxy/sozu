@@ -58,7 +58,7 @@ impl<V:Debug> TrieNode<V> {
   }
 
   pub fn insert(&mut self, key: Key, value: V) -> InsertResult {
-    println!("adding {}", str::from_utf8(&key).unwrap());
+    info!("adding {}", str::from_utf8(&key).unwrap());
     let res = self.insert_recursive(&key, &key, value);
     assert_ne!(res, InsertResult::Failed);
     res
@@ -385,5 +385,104 @@ mod tests {
     assert_eq!(root.domain_lookup(&b"test.alldomains.org"[..]), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
     assert_eq!(root.domain_lookup(&b"hello.alldomains.org"[..]), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
     assert_eq!(root.domain_lookup(&b"blah.test.alldomains.org"[..]), None);
+  }
+}
+
+#[cfg(all(feature = "unstable", test))]
+mod bench {
+  use super::*;
+  use test::Bencher;
+
+  // Generate a simple branch with three subdomain doc, blog, site to the domain in parameters
+  // This function help to product samples for benchmark
+  // tld_ _ _ _ _ _ _ _
+  //   \doc    \blog    \site
+  //    \domain \domain  \domain
+  fn create_bench_node(root: &mut TrieNode<u8>, domain_name: &[u8], tld: &[u8]) {
+    root.domain_insert([&domain_name[..], &tld[..]].concat(), 1);
+    root.domain_insert([&domain_name[..], &b".doc"[..],&tld[..]].concat(), 2);
+    root.domain_insert([&domain_name[..], &b".blog"[..],&tld[..]].concat(), 3);
+    root.domain_insert([&domain_name[..], &b".site"[..],&tld[..]].concat(), 4);
+  }
+
+  macro_rules! gen_basic_sample {
+    ($r: expr) => {
+      create_bench_node($r, b"sozu", b".io");
+      create_bench_node($r, b"rust", b".rs");
+      create_bench_node($r, b"cargo", b".com");
+    }
+  }
+
+  #[bench]
+  fn bench_lookup_first_elem(b: &mut Bencher) {
+    let mut root: TrieNode<u8> = TrieNode::root();
+    gen_basic_sample!(&mut root);
+
+    b.iter(|| {
+      root.domain_lookup(b"sozu.io");
+    });
+  }
+
+  #[bench]
+  fn bench_lookup_in_depth(b: &mut Bencher) {
+    let mut root: TrieNode<u8> = TrieNode::root();
+    gen_basic_sample!(&mut root);
+
+    b.iter(|| {
+      root.domain_lookup(b"cargo.site.blog");
+    });
+  }
+
+  #[bench]
+  fn bench_remove_tld_domain(b: &mut Bencher) {
+    let mut root: TrieNode<u8> = TrieNode::root();
+    gen_basic_sample!(&mut root);
+
+    b.iter(|| {
+      root.domain_remove(&Vec::from(&b".com"[..]));
+    });
+  }
+
+  #[bench]
+  fn remove_depth_leaf(b: &mut Bencher) {
+    let mut root: TrieNode<u8> = TrieNode::root();
+    gen_basic_sample!(&mut root);
+
+    b.iter(|| {
+      root.domain_remove(&Vec::from(&b"cargo.site.com"[..]));
+    });
+  }
+
+  #[bench]
+  fn bench_insert_with_split(b: &mut Bencher) {
+    let mut root: TrieNode<u8> = TrieNode::root();
+    gen_basic_sample!(&mut root);
+
+    b.iter(|| {
+      root.domain_insert(Vec::from(&b"cergo.site.com"[..]), 9);
+    });
+  }
+
+  #[bench]
+  fn bench_creation_of_1_3_9_levels_trie(b: &mut Bencher) {
+    let mut root: TrieNode<u8> = TrieNode::root();
+
+    b.iter(|| {
+      root.domain_insert(Vec::from(&b"rustfest.io"[..]), 1);
+      root.domain_insert(Vec::from(&b"rustrs.io"[..]), 1);
+      root.domain_insert(Vec::from(&b"sozu.io"[..]), 1);
+
+      root.domain_insert(Vec::from(&b"rustfest.site.io"[..]), 1);
+      root.domain_insert(Vec::from(&b"rustrs.site.io"[..]), 1);
+      root.domain_insert(Vec::from(&b"sozu.site.io"[..]), 1);
+
+      root.domain_insert(Vec::from(&b"rustfest.doc.io"[..]), 1);
+      root.domain_insert(Vec::from(&b"rustrs.doc.io"[..]), 1);
+      root.domain_insert(Vec::from(&b"sozu.doc.io"[..]), 1);
+
+      root.domain_insert(Vec::from(&b"rustfest.blog.io"[..]), 1);
+      root.domain_insert(Vec::from(&b"rustrs.blog.io"[..]), 1);
+      root.domain_insert(Vec::from(&b"sozu.blog.io"[..]), 1);
+    })
   }
 }
