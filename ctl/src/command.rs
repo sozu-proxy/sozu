@@ -945,6 +945,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
               let mut header = Vec::new();
               header.push(cell!("id"));
               header.push(cell!("sticky_session"));
+              header.push(cell!("https_redirect"));
               for ref key in data.keys() {
                 header.push(cell!(&key));
               }
@@ -1019,6 +1020,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
                 let mut row = Vec::new();
                 row.push(cell!(key.configuration.clone().map(|conf| conf.app_id).unwrap_or(String::from(""))));
                 row.push(cell!(key.configuration.clone().map(|conf| conf.sticky_session).unwrap_or(false)));
+                row.push(cell!(key.configuration.clone().map(|conf| conf.https_redirect).unwrap_or(false)));
 
                 for val in values.iter() {
                   if keys.contains(val) {
