@@ -3188,7 +3188,6 @@ mod tests {
 mod bench {
   use super::*;
   use test::Bencher;
-  use network::buffer::Buffer;
   use network::buffer_queue::BufferQueue;
   use std::io::Write;
   use nom::HexDisplay;
