@@ -3,6 +3,9 @@ extern crate rand;
 extern crate sozu_command_lib as sozu_command;
 extern crate structopt;
 #[macro_use] extern crate structopt_derive;
+extern crate serde;
+extern crate serde_json;
+#[macro_use] extern crate serde_derive;
 
 mod command;
 mod cli;
@@ -40,14 +43,14 @@ fn main() {
       }
     },
     SubCmd::Upgrade => upgrade(channel, &config.command_socket_path()),
-    SubCmd::Status => status(channel),
-    SubCmd::Metrics => metrics(channel),
+    SubCmd::Status{ json } => status(channel, json),
+    SubCmd::Metrics{ json } => metrics(channel, json),
     SubCmd::Logging{ level } => logging_filter(channel, timeout, &level),
     SubCmd::State{ cmd } => {
       match cmd {
         StateCmd::Save{ file } => save_state(channel, timeout, file),
         StateCmd::Load{ file } => load_state(channel, timeout, file),
-        StateCmd::Dump => dump_state(channel, timeout),
+        StateCmd::Dump{ json } => dump_state(channel, timeout, json),
       }
     },
     SubCmd::Application{ cmd } => {
@@ -84,9 +87,9 @@ fn main() {
         CertificateCmd::Remove{ certificate } => remove_certificate(channel, timeout, &certificate),
       }
     },
-    SubCmd::Query{ cmd } => {
+    SubCmd::Query{ cmd, json } => {
       match cmd {
-        QueryCmd::Applications{ id, domain } => query_application(channel, id, domain),
+        QueryCmd::Applications{ id, domain } => query_application(channel, json, id, domain),
       }
     },
   }

@@ -18,9 +18,15 @@ pub enum SubCmd {
   #[structopt(name = "upgrade", about = "upgrade the proxy")]
   Upgrade,
   #[structopt(name = "status", about = "gets information on the running workers")]
-  Status,
+  Status {
+    #[structopt(short = "j", long = "json", help = "Print the command result in JSON format")]
+    json: bool
+  },
   #[structopt(name = "metrics", about = "gets statistics on the master and its workers")]
-  Metrics,
+  Metrics {
+    #[structopt(short = "j", long = "json", help = "Print the command result in JSON format")]
+    json: bool
+  },
   #[structopt(name = "logging", about = "change logging level")]
   Logging {
     #[structopt(short = "l", long = "level", help = "change logging level")]
@@ -53,6 +59,8 @@ pub enum SubCmd {
   },
   #[structopt(name = "query", about = "configuration state verification")]
   Query {
+    #[structopt(short = "j", long = "json", help = "Print the command result in JSON format")]
+    json: bool,
     #[structopt(subcommand)]
     cmd: QueryCmd,
   }
@@ -71,7 +79,10 @@ pub enum StateCmd {
     file: String,
   },
   #[structopt(name = "dump")]
-  Dump,
+  Dump {
+    #[structopt(short = "j", long = "json", help = "Print the command result in JSON format")]
+    json: bool
+  },
 }
 
 #[derive(StructOpt, PartialEq, Debug)]

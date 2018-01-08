@@ -1,10 +1,11 @@
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
-use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
+use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain};
 
+use serde_json;
 use std::collections::{HashMap,HashSet};
 use std::process::exit;
 use std::thread;
@@ -16,6 +17,13 @@ use prettytable::Table;
 use prettytable::row::Row;
 use super::create_channel;
 
+
+// Used to display the JSON response of the status command
+#[derive(Serialize, Debug)]
+struct WorkerStatus<'a> {
+  pub worker: &'a WorkerInfo,
+  pub status: &'a String
+}
 
 fn generate_id() -> String {
   let s: String = thread_rng().gen_ascii_chars().take(6).collect();
@@ -126,7 +134,7 @@ pub fn load_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
   });
 }
 
-pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64) {
+pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, json: bool) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
@@ -152,12 +160,20 @@ pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
             // until an error or ok message was sent
           },
           ConfigMessageStatus::Error => {
-            println!("could not dump proxy state: {}", message.message);
+            if json {
+              print_json_response(&message.message);
+            } else {
+              println!("could not dump proxy state: {}", message.message);
+            }
             exit(1);
           },
           ConfigMessageStatus::Ok => {
             if let Some(AnswerData::State(state)) = message.data {
-              println!("{:#?}", state);
+              if json {
+                print_json_response(&state);
+              } else {
+                println!("{:#?}", state);
+              }
             } else {
               println!("state dump was empty");
               exit(1);
@@ -396,7 +412,7 @@ pub fn upgrade(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
   }
 }
 
-pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
+pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bool) {
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
@@ -420,7 +436,11 @@ pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
           exit(1);
         },
         ConfigMessageStatus::Error => {
-          println!("could not get the worker list: {}", message.message);
+          if json {
+            print_json_response(&message.message);
+          } else {
+            println!("could not get the worker list: {}", message.message);
+          }
           exit(1);
         },
         ConfigMessageStatus::Ok => {
@@ -516,16 +536,25 @@ pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
               HashMap::new()
             };
 
-            let mut table = Table::new();
+            if json {
+              let workers_status: Vec<WorkerStatus> = workers.iter().map(|ref worker| {
+                WorkerStatus {
+                  worker: worker,
+                  status: h2.get(&worker.id).unwrap_or(&placeholder)
+                }
+              }).collect();
+              print_json_response(&workers_status);
+            } else {
+              let mut table = Table::new();
 
-            table.add_row(row!["Worker", "pid", "run state", "answer"]);
-            for ref worker in workers.iter() {
-              let run_state = format!("{:?}", worker.run_state);
-              table.add_row(row![worker.id, worker.pid, run_state, h2.get(&worker.id).unwrap_or(&placeholder)]);
+              table.add_row(row!["Worker", "pid", "run state", "answer"]);
+              for ref worker in workers.iter() {
+                let run_state = format!("{:?}", worker.run_state);
+                table.add_row(row![worker.id, worker.pid, run_state, h2.get(&worker.id).unwrap_or(&placeholder)]);
+              }
+
+              table.printstd();
             }
-
-            table.printstd();
-
           }
         }
       }
@@ -533,7 +562,7 @@ pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
   }
 }
 
-pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
+pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bool) {
   let id = generate_id();
   //println!("will send message for metrics with id {}", id);
   channel.write_message(&ConfigMessage::new(
@@ -552,13 +581,22 @@ pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
             println!("Proxy is processing: {}", message.message);
           },
           ConfigMessageStatus::Error => {
-            println!("could not stop the proxy: {}", message.message);
+            if json {
+              print_json_response(&message.message);
+            } else {
+              println!("could not stop the proxy: {}", message.message);
+            }
           },
           ConfigMessageStatus::Ok => {
             if &id == &message.id {
               //println!("Sozu metrics:\n{}\n{:#?}", message.message, message.data);
 
               if let Some(AnswerData::Metrics(mut data)) = message.data {
+                if json {
+                  print_json_response(&data);
+                  return;
+                }
+
                 if let Some(master) = data.remove("master") {
                   let mut master_table = Table::new();
                   master_table.add_row(row![String::from("key"), String::from("value")]);
@@ -842,7 +880,7 @@ pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, 
   }));
 }
 
-pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, application_id: Option<String>, domain: Option<String>) {
+pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bool, application_id: Option<String>, domain: Option<String>) {
   if application_id.is_some() && domain.is_some() {
     println!("Error: Either request an application ID or a domain name");
     return;
@@ -889,12 +927,20 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
           // until an error or ok message was sent
         },
         ConfigMessageStatus::Error => {
-          println!("could not query proxy state: {}", message.message);
+          if json {
+            print_json_response(&message.message);
+          } else {
+            println!("could not query proxy state: {}", message.message);
+          }
         },
         ConfigMessageStatus::Ok => {
           if let Some(needle) = application_id.or(domain) {
-            println!("Proxy config answer:\n{}\n{:#?}", message.message, message.data);
             if let Some(AnswerData::Query(data)) = message.data {
+              if json {
+                print_json_response(&data);
+                return;
+              }
+
               let mut application_table = Table::new();
               let mut header = Vec::new();
               header.push(cell!("id"));
@@ -1156,4 +1202,14 @@ fn order_command(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeou
       }
     }
   });
+}
+
+fn print_json_response<T: ::serde::Serialize>(input: &T) {
+  match serde_json::to_string(&input) {
+    Ok(to_print) => println!("{}", to_print),
+    Err(e) => {
+      eprintln!("Error while parsing response to JSON: {:?}", e);
+      exit(1);
+    }
+  };
 }
