@@ -403,7 +403,7 @@ impl ServerConfiguration {
   pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&HttpFront> {
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
-        error!("invalid remaining chars after hostname");
+        error!("frontend_from_request: invalid remaining chars after hostname. Host: {}", host);
         return None;
       }
 
@@ -493,7 +493,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
-        error!("invalid remaining chars after hostname");
+        error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
         return Err(ConnectionError::ToBeDefined);
       }
 
