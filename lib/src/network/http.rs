@@ -1081,7 +1081,7 @@ mod tests {
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
     let listener = net::TcpListener::bind(&front).expect("should bind TCP socket");
     let server_config = ServerConfiguration {
-      listener:  listener,
+      listener:  Some(listener),
       address:   front,
       applications: HashMap::new(),
       instances: BackendMap::new(),
