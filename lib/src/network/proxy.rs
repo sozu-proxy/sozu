@@ -91,8 +91,8 @@ impl Server {
     });
 
     let tcp_session = config.tcp.map(|conf| {
-      let configuration = tcp::ServerConfiguration::new(conf.max_listeners, 12297829382473034410, pool.clone(),
-        listeners.tcp.drain(..).map(|fd| unsafe { TcpListener::from_raw_fd(fd) }).collect());
+      let configuration = tcp::ServerConfiguration::new(conf.max_listeners, 12297829382473034410,  &mut event_loop, pool.clone(),
+        listeners.tcp.drain(..).map(|(app_id, fd)| (app_id, unsafe { TcpListener::from_raw_fd(fd) })).collect());
       Session::new(conf.max_listeners, max_buffers, 12297829382473034410, configuration, &mut event_loop)
     });
 

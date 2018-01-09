@@ -1,6 +1,5 @@
 use nix::sys::socket;
 use nix::sys::uio;
-use nix::Error;
 use nix::Result as NixResult;
 use std::iter::repeat;
 use std::str::from_utf8;
@@ -30,7 +29,7 @@ impl ScmSocket {
     let listeners_count = ListenersCount {
       http: listeners.http.is_some(),
       tls:  listeners.tls.is_some(),
-      tcp:  listeners.tcp.len() as u32,
+      tcp:  listeners.tcp.iter().map(|t| t.0.clone()).collect(),
     };
 
     let message = serde_json::to_string(&listeners_count).map(|s| s.into_bytes()).unwrap_or(vec!());
@@ -43,7 +42,7 @@ impl ScmSocket {
       v.push(fd);
     }
 
-    v.extend_from_slice(&listeners.tcp);
+    v.extend(listeners.tcp.iter().map(|t| t.1));
 
     self.send_msg(&message, &v)
   }
@@ -71,7 +70,7 @@ impl ScmSocket {
               error!("could not parse listeners list: {:?}", e);
               default
             },
-            Ok(listeners_count) => {
+            Ok(mut listeners_count) => {
               let mut index = 0;
               let http = if listeners_count.http {
                 index = 1;
@@ -89,7 +88,8 @@ impl ScmSocket {
               };
 
               let mut tcp = Vec::new();
-              tcp.extend_from_slice(&received_fds[index..fds_len]);
+              tcp.extend(listeners_count.tcp.drain(..)
+                         .zip((&received_fds[index..fds_len]).iter().cloned()));
 
               Listeners { http, tls, tcp }
             }
@@ -114,7 +114,7 @@ impl ScmSocket {
     Ok(())
   }
 
-  pub fn rcv_msg(&self, buffer: &mut [u8], mut fds: &mut [RawFd]) -> NixResult<(usize, usize)> {
+  pub fn rcv_msg(&self, buffer: &mut [u8], fds: &mut [RawFd]) -> NixResult<(usize, usize)> {
     let mut cmsg = socket::CmsgSpace::<[RawFd; MAX_FDS_OUT]>::new();
     let iov = [uio::IoVec::from_mut_slice(buffer)];
 
@@ -140,12 +140,13 @@ impl ScmSocket {
 pub struct Listeners {
   pub http: Option<RawFd>,
   pub tls:  Option<RawFd>,
-  pub tcp:  Vec<RawFd>,
+  //app_id, fd
+  pub tcp:  Vec<(String, RawFd)>,
 }
 
 #[derive(Clone,Debug,Serialize,Deserialize)]
 pub struct ListenersCount {
   pub http: bool,
   pub tls:  bool,
-  pub tcp:  u32,
+  pub tcp:  Vec<String>,
 }
