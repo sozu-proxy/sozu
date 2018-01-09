@@ -1,5 +1,6 @@
 use std::{iter,str};
 use std::fmt::Debug;
+use uuid::Uuid;
 
 pub type Key = Vec<u8>;
 pub type KeyValue<K,V> = (K,V);
@@ -393,96 +394,98 @@ mod bench {
   use super::*;
   use test::Bencher;
 
-  // Generate a simple branch with three subdomain doc, blog, site to the domain in parameters
-  // This function help to product samples for benchmark
-  // tld_ _ _ _ _ _ _ _
-  //   \doc    \blog    \site
-  //    \domain \domain  \domain
-  fn create_bench_node(root: &mut TrieNode<u8>, domain_name: &[u8], tld: &[u8]) {
-    root.domain_insert([&domain_name[..], &tld[..]].concat(), 1);
-    root.domain_insert([&domain_name[..], &b".doc"[..],&tld[..]].concat(), 2);
-    root.domain_insert([&domain_name[..], &b".blog"[..],&tld[..]].concat(), 3);
-    root.domain_insert([&domain_name[..], &b".site"[..],&tld[..]].concat(), 4);
+  // Generate half domain with the format: simple_uri.simple_uri.tld
+  // and half with *.simple_uri.tld
+  fn seed_trie_with_top_level_domain(root: &mut TrieNode<u8>, top_level_domain: &str, count: i32) {
+    for i in 0..count / 2 {
+      root.domain_insert(gen_seed_domain(top_level_domain), 1);
+      root.domain_insert(gen_seed_wilcard_domain(top_level_domain), 2);
+    }
   }
 
-  macro_rules! gen_basic_sample {
-    ($r: expr) => {
-      create_bench_node($r, b"sozu", b".io");
-      create_bench_node($r, b"rust", b".rs");
-      create_bench_node($r, b"cargo", b".com");
+  fn gen_seed_domain(top_level_domain: &str) -> Vec<u8> {
+    let sub_domain_uuid = Uuid::new_v4().simple().to_string();
+    let domain_uuid = Uuid::new_v4().simple().to_string();
+    format!("{}.{}.{}", sub_domain_uuid, domain_uuid, top_level_domain).into_bytes()
+  }
+
+  fn gen_seed_wilcard_domain(top_level_domain: &str) -> Vec<u8> {
+    let domain_uuid = Uuid::new_v4().simple().to_string();
+    format!("*.{}.{}", domain_uuid, top_level_domain).into_bytes()
+  }
+
+  macro_rules! gen_common_seed_trie {
+    ($root: expr) => {
+      seed_trie_with_top_level_domain($root, "rs", 200);
+      seed_trie_with_top_level_domain($root, "io", 200);
+      seed_trie_with_top_level_domain($root, "com", 200);
+      seed_trie_with_top_level_domain($root, "org", 200);
+      seed_trie_with_top_level_domain($root, "net", 200);
     }
   }
 
   #[bench]
-  fn bench_lookup_first_elem(b: &mut Bencher) {
+  fn bench_lookup_domain(b: &mut Bencher) {
     let mut root: TrieNode<u8> = TrieNode::root();
-    gen_basic_sample!(&mut root);
+    gen_common_seed_trie!(&mut root);
+
+    let domain_to_search = gen_seed_domain("com");
+    root.domain_insert(domain_to_search.clone(), 1);
 
     b.iter(|| {
-      root.domain_lookup(b"sozu.io");
+      root.domain_lookup(&domain_to_search)
     });
   }
 
   #[bench]
-  fn bench_lookup_in_depth(b: &mut Bencher) {
+  fn bench_lookup_unknow_domain(b: &mut Bencher) {
     let mut root: TrieNode<u8> = TrieNode::root();
-    gen_basic_sample!(&mut root);
+    gen_common_seed_trie!(&mut root);
 
     b.iter(|| {
-      root.domain_lookup(b"cargo.site.blog");
+      let unknow_domain_to_search = gen_seed_domain("com");
+      root.domain_lookup(&unknow_domain_to_search)
     });
   }
 
   #[bench]
-  fn bench_remove_tld_domain(b: &mut Bencher) {
+  fn bench_inserts_domain(b: &mut Bencher) {
     let mut root: TrieNode<u8> = TrieNode::root();
-    gen_basic_sample!(&mut root);
+    gen_common_seed_trie!(&mut root);
+    let tlds = vec!["com", "fr", "org", "net"];
 
     b.iter(|| {
-      root.domain_remove(&Vec::from(&b".com"[..]));
+      for _ in 0..100 {
+        tlds.iter().for_each(|tld| {
+          let domain_to_search = gen_seed_domain("com");
+          root.domain_insert(domain_to_search, 10);
+        });
+      }
     });
   }
 
   #[bench]
-  fn remove_depth_leaf(b: &mut Bencher) {
+  fn bench_remove_domain(b: &mut Bencher) {
     let mut root: TrieNode<u8> = TrieNode::root();
-    gen_basic_sample!(&mut root);
+    gen_common_seed_trie!(&mut root);
+    let domain_to_remove = gen_seed_domain("com");
+    root.domain_insert(domain_to_remove.clone(), 1);
 
     b.iter(|| {
-      root.domain_remove(&Vec::from(&b"cargo.site.com"[..]));
+      root.domain_remove(&domain_to_remove)
     });
   }
 
   #[bench]
-  fn bench_insert_with_split(b: &mut Bencher) {
-    let mut root: TrieNode<u8> = TrieNode::root();
-    gen_basic_sample!(&mut root);
-
-    b.iter(|| {
-      root.domain_insert(Vec::from(&b"cergo.site.com"[..]), 9);
-    });
-  }
-
-  #[bench]
-  fn bench_creation_of_1_3_9_levels_trie(b: &mut Bencher) {
+  fn bench_creation_of_large_trie(b: &mut Bencher) {
     let mut root: TrieNode<u8> = TrieNode::root();
 
     b.iter(|| {
-      root.domain_insert(Vec::from(&b"rustfest.io"[..]), 1);
-      root.domain_insert(Vec::from(&b"rustrs.io"[..]), 1);
-      root.domain_insert(Vec::from(&b"sozu.io"[..]), 1);
-
-      root.domain_insert(Vec::from(&b"rustfest.site.io"[..]), 1);
-      root.domain_insert(Vec::from(&b"rustrs.site.io"[..]), 1);
-      root.domain_insert(Vec::from(&b"sozu.site.io"[..]), 1);
-
-      root.domain_insert(Vec::from(&b"rustfest.doc.io"[..]), 1);
-      root.domain_insert(Vec::from(&b"rustrs.doc.io"[..]), 1);
-      root.domain_insert(Vec::from(&b"sozu.doc.io"[..]), 1);
-
-      root.domain_insert(Vec::from(&b"rustfest.blog.io"[..]), 1);
-      root.domain_insert(Vec::from(&b"rustrs.blog.io"[..]), 1);
-      root.domain_insert(Vec::from(&b"sozu.blog.io"[..]), 1);
+      seed_trie_with_top_level_domain(&mut root, "rs", 1000);
+      seed_trie_with_top_level_domain(&mut root, "io", 1000);
+      seed_trie_with_top_level_domain(&mut root, "com", 1000);
+      seed_trie_with_top_level_domain(&mut root, "org", 1000);
+      seed_trie_with_top_level_domain(&mut root, "net", 1000);
     })
   }
 }
