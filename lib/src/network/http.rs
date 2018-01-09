@@ -312,8 +312,7 @@ impl ServerConfiguration {
     let front = config.front;
 
     let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
-      let formatted_err = format!("could not create listener {:?}: {:?}", front, e);
-      error!("{}", formatted_err);
+      error!("could not create listener {:?}: {:?}", front, e);
     }).ok());
 
     if let Some(ref sock) = listener {

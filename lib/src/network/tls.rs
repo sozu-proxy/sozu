@@ -346,7 +346,7 @@ pub struct TlsData {
 }
 
 pub struct ServerConfiguration {
-  listener:        TcpListener,
+  listener:        Option<TcpListener>,
   address:         SocketAddr,
   applications:    HashMap<AppId, Application>,
   instances:       BackendMap,
@@ -389,53 +389,43 @@ impl ServerConfiguration {
     };
     fronts.insert(config.default_name.clone().unwrap_or(String::from("")), vec![app]);
 
-    let tcp_listener = if let Some(listener) = tcp_listener {
-      Ok(listener)
-    } else {
-      server_bind(&config.front)
+    let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
+       error!("could not create listener {:?}: {:?}", fronts, e);
+    }).ok());
+
+
+    if let Some(ref sock) = listener {
+      event_loop.register(sock, Token(base_token), Ready::readable(), PollOpt::edge());
+    }
+
+    let default = DefaultAnswers {
+      NotFound: Vec::from(if config.answer_404.len() > 0 {
+          config.answer_404.as_bytes()
+        } else {
+          &b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+        }),
+      ServiceUnavailable: Vec::from(if config.answer_503.len() > 0 {
+          config.answer_503.as_bytes()
+        } else {
+          &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+        }),
     };
 
-    match tcp_listener {
-      Ok(listener) => {
-        event_loop.register(&listener, Token(base_token), Ready::readable(), PollOpt::edge());
-        let default = DefaultAnswers {
-          NotFound: Vec::from(if config.answer_404.len() > 0 {
-              config.answer_404.as_bytes()
-            } else {
-              &b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-            }),
-          ServiceUnavailable: Vec::from(if config.answer_503.len() > 0 {
-              config.answer_503.as_bytes()
-            } else {
-              &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-            }),
-        };
-
-        Ok(ServerConfiguration {
-          listener:        listener,
-          address:         config.front.clone(),
-          applications:    HashMap::new(),
-          instances:       BackendMap::new(),
-          fronts:          fronts,
-          domains:         rc_domains,
-          default_context: tls_data,
-          contexts:        rc_ctx,
-          pool:            pool,
-          answers:         default,
-          base_token:      base_token,
-          config:          config,
-          ssl_options:     ssl_options,
-        })
-      },
-      Err(e) => {
-        let formatted_err = format!("could not create listener {:?}: {:?}", fronts, e);
-        error!("{}", formatted_err);
-        //FIXME: send message if we could not create the listener
-        //channel.write_message(&OrderMessageAnswer{id: String::from("listener_failed"), status: OrderMessageStatus::Error(formatted_err)});
-        //channel.run();
-        Err(e)
-      }
-    }
+    Ok(ServerConfiguration {
+      listener:        listener,
+      address:         config.front.clone(),
+      applications:    HashMap::new(),
+      instances:       BackendMap::new(),
+      fronts:          fronts,
+      domains:         rc_domains,
+      default_context: tls_data,
+      contexts:        rc_ctx,
+      pool:            pool,
+      answers:         default,
+      base_token:      base_token,
+      config:          config,
+      ssl_options:     ssl_options,
+    })
   }
 
   pub fn create_default_context(config: &HttpsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>, SslOption)> {
@@ -836,24 +826,29 @@ impl ServerConfiguration {
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   fn accept(&mut self, token: ListenToken) -> Result<(TlsClient,bool), AcceptError> {
-    self.listener.accept().map_err(|e| {
-      match e.kind() {
-        ErrorKind::WouldBlock => AcceptError::WouldBlock,
-        other => {
-          error!("accept() IO error: {:?}", e);
-          AcceptError::IoError
+    if let Some(ref sock) = self.listener {
+      sock.accept().map_err(|e| {
+        match e.kind() {
+          ErrorKind::WouldBlock => AcceptError::WouldBlock,
+          other => {
+            error!("accept() IO error: {:?}", e);
+            AcceptError::IoError
+          }
         }
-      }
-    }).and_then(|(frontend_sock, _)| {
-      frontend_sock.set_nodelay(true);
-      if let Ok(ssl) = Ssl::new(&self.default_context.context) {
-        let c = TlsClient::new(ssl, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address);
-        return Ok((c, false))
-      } else {
-        error!("could not create ssl context");
-        Err(AcceptError::IoError)
-      }
-    })
+      }).and_then(|(frontend_sock, _)| {
+        frontend_sock.set_nodelay(true);
+        if let Ok(ssl) = Ssl::new(&self.default_context.context) {
+          let c = TlsClient::new(ssl, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address);
+          return Ok((c, false))
+        } else {
+          error!("could not create ssl context");
+          Err(AcceptError::IoError)
+        }
+      })
+    } else {
+      error!("cannot accept connections, no listening socket available");
+      Err(AcceptError::IoError)
+    }
   }
 
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut TlsClient) -> Result<BackendConnectAction,ConnectionError> {
@@ -1081,12 +1076,16 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
-        event_loop.deregister(&self.listener);
+        if let Some(ref sock) = self.listener {
+          event_loop.deregister(sock);
+        }
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None }
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
-        event_loop.deregister(&self.listener);
+        if let Some(ref sock) = self.listener {
+          event_loop.deregister(sock);
+        }
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::Status => {
@@ -1308,7 +1307,7 @@ mod tests {
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1032").expect("test address 127.0.0.1:1032 should be parsed");
     let listener = net::TcpListener::bind(&front).expect("test address 127.0.0.1:1032 should be available");
     let server_config = ServerConfiguration {
-      listener:  listener,
+      listener:  Some(listener),
       address:   front,
       applications: HashMap::new(),
       instances: BackendMap::new(),
