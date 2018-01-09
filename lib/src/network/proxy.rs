@@ -75,12 +75,12 @@ impl Server {
 
     let max_connections = config.max_connections;
     let max_buffers     = config.max_buffers;
-    let http_session = config.http.and_then(|conf| conf.to_http()).and_then(|http_conf| {
+    let http_session = config.http.and_then(|conf| conf.to_http()).map(|http_conf| {
       let max_listeners = 1;
-      http::ServerConfiguration::new(http_conf, &mut event_loop, 1 + max_listeners, pool.clone(),
-        listeners.http.map(|fd| unsafe { TcpListener::from_raw_fd(fd) })).map(|configuration| {
-        Session::new(1, max_connections, 0, configuration, &mut event_loop)
-      }).ok()
+      let configuration = http::ServerConfiguration::new(http_conf, &mut event_loop, 1 + max_listeners, pool.clone(),
+        listeners.http.map(|fd| unsafe { TcpListener::from_raw_fd(fd) }));
+
+      Session::new(1, max_connections, 0, configuration, &mut event_loop)
     });
 
     let https_session = config.https.and_then(|conf| conf.to_tls()).and_then(|https_conf| {

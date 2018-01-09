@@ -295,7 +295,7 @@ pub struct DefaultAnswers {
 pub type Hostname = String;
 
 pub struct ServerConfiguration {
-  listener:        TcpListener,
+  listener:        Option<TcpListener>,
   address:         SocketAddr,
   instances:       BackendMap,
   fronts:          HashMap<Hostname, Vec<HttpFront>>,
@@ -307,53 +307,43 @@ pub struct ServerConfiguration {
 
 impl ServerConfiguration {
   pub fn new(config: HttpProxyConfiguration, event_loop: &mut Poll, start_at:usize,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>) -> io::Result<ServerConfiguration> {
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>) -> ServerConfiguration {
 
     let front = config.front;
 
-    let listener = if let Some(listener) = tcp_listener {
-      Ok(listener)
-    } else {
-      server_bind(&config.front)
+    let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
+      let formatted_err = format!("could not create listener {:?}: {:?}", front, e);
+      error!("{}", formatted_err);
+    }).ok());
+
+    if let Some(ref sock) = listener {
+      event_loop.register(sock, Token(start_at), Ready::readable(), PollOpt::edge());
+    }
+
+    let default = DefaultAnswers {
+      NotFound: Vec::from(if config.answer_404.len() > 0 {
+                  config.answer_404.as_bytes()
+                } else {
+                  &b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+                }),
+      ServiceUnavailable: Vec::from(if config.answer_503.len() > 0 {
+                  config.answer_503.as_bytes()
+                } else {
+                  &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+                }),
     };
 
-    match listener {
-      Ok(sock) => {
-        event_loop.register(&sock, Token(start_at), Ready::readable(), PollOpt::edge());
-
-        let default = DefaultAnswers {
-          NotFound: Vec::from(if config.answer_404.len() > 0 {
-              config.answer_404.as_bytes()
-            } else {
-              &b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-            }),
-          ServiceUnavailable: Vec::from(if config.answer_503.len() > 0 {
-              config.answer_503.as_bytes()
-            } else {
-              &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-            }),
-        };
-
-        Ok(ServerConfiguration {
-          listener:      sock,
-          address:       config.front,
-          applications:  HashMap::new(),
-          instances:     BackendMap::new(),
-          fronts:        HashMap::new(),
-          pool:          pool,
-          answers:       default,
-          config:        config,
-        })
-      },
-      Err(e) => {
-        let formatted_err = format!("could not create listener {:?}: {:?}", front, e);
-        error!("{}", formatted_err);
-        //FIXME: return an error if listener creation failed
-        //channel.write_message(&OrderMessageAnswer{id: String::from("listener_failed"), status: OrderMessageStatus::Error(formatted_err)});
-        //channel.run();
-        Err(e)
-      }
+    ServerConfiguration {
+      listener:      listener,
+      address:       config.front,
+      applications:  HashMap::new(),
+      instances:     BackendMap::new(),
+      fronts:        HashMap::new(),
+      pool:          pool,
+      answers:       default,
+      config:        config,
     }
+
   }
 
   pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
@@ -699,14 +689,18 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         info!("{} processing soft shutdown", message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        event_loop.deregister(&self.listener);
+        if let Some(ref sock) = self.listener {
+          event_loop.deregister(sock);
+        }
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None }
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        event_loop.deregister(&self.listener);
+        if let Some(ref sock) = self.listener {
+          event_loop.deregister(sock);
+        }
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::Status => {
@@ -729,24 +723,29 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   }
 
   fn accept(&mut self, token: ListenToken) -> Result<(Client, bool), AcceptError> {
-    self.listener.accept().map_err(|e| {
-      match e.kind() {
-        ErrorKind::WouldBlock => AcceptError::WouldBlock,
-        other => {
-          error!("accept() IO error: {:?}", e);
-          AcceptError::IoError
+    if let Some(ref sock) = self.listener {
+      sock.accept().map_err(|e| {
+        match e.kind() {
+          ErrorKind::WouldBlock => AcceptError::WouldBlock,
+          other => {
+            error!("accept() IO error: {:?}", e);
+            AcceptError::IoError
+          }
         }
-      }
-    }).and_then(|(frontend_sock, _)| {
-      frontend_sock.set_nodelay(true);
-      if let Some(mut c) = Client::new(frontend_sock, Rc::downgrade(&self.pool), self.config.public_address) {
-        c.readiness().front_interest.insert(Ready::readable());
-        c.readiness().back_interest.remove(Ready::readable() | Ready::writable());
-        Ok((c, false))
-      } else {
-        Err(AcceptError::TooManyClients)
-      }
-    })
+      }).and_then(|(frontend_sock, _)| {
+        frontend_sock.set_nodelay(true);
+        if let Some(mut c) = Client::new(frontend_sock, Rc::downgrade(&self.pool), self.config.public_address) {
+          c.readiness().front_interest.insert(Ready::readable());
+          c.readiness().back_interest.remove(Ready::readable() | Ready::writable());
+          Ok((c, false))
+        } else {
+          Err(AcceptError::TooManyClients)
+        }
+      })
+    } else {
+      error!("cannot accept connections, no listening socket available");
+      Err(AcceptError::IoError)
+    }
   }
 
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {
@@ -798,7 +797,7 @@ impl InitialServerConfiguration {
         event_loop.register(&sock, Token(start_at), Ready::readable(), PollOpt::edge());
 
         Ok(ServerConfiguration {
-          listener:      sock,
+          listener:      Some(sock),
           address:       self.config.front,
           applications:  self.applications,
           instances:     self.instances,
@@ -829,16 +828,15 @@ pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel, max_buffers:
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok(configuration) = ServerConfiguration::new(config, &mut event_loop, 1 + max_listeners, pool, None) {
-    let session    = Session::new(max_listeners, max_buffers, 0, configuration, &mut event_loop);
-    let (scm_server, scm_client) = UnixStream::pair().unwrap();
-    let mut server = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      Some(session), None, None, None);
+  let configuration = ServerConfiguration::new(config, &mut event_loop, 1 + max_listeners, pool, None);
+  let session       = Session::new(max_listeners, max_buffers, 0, configuration, &mut event_loop);
+  let (scm_server, scm_client) = UnixStream::pair().unwrap();
+  let mut server    = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
+    Some(session), None, None, None);
 
-    info!("starting event loop");
-    server.run();
-    info!("ending event loop");
-  }
+  info!("starting event loop");
+  server.run();
+  info!("ending event loop");
 }
 
 #[cfg(test)]
