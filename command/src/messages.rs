@@ -113,6 +113,7 @@ pub enum Order {
     RemoveHttpsFront(HttpsFront),
 
     AddCertificate(CertificateAndKey),
+    ReplaceCertificate(ReplaceCertificate),
     RemoveCertificate(CertFingerprint),
 
     AddTcpFront(TcpFront),
@@ -203,6 +204,12 @@ pub struct CertificateAndKey {
     pub certificate:       String,
     pub certificate_chain: Vec<String>,
     pub key:               String,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct ReplaceCertificate {
+    pub new_certificate: CertificateAndKey,
+    pub old_fingerprint: CertFingerprint,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -361,6 +368,7 @@ impl Order {
       Order::AddHttpsFront(_)     => [Topic::HttpsProxyConfig].iter().cloned().collect(),
       Order::RemoveHttpsFront(_)  => [Topic::HttpsProxyConfig].iter().cloned().collect(),
       Order::AddCertificate(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::ReplaceCertificate(_)=> [Topic::HttpsProxyConfig].iter().cloned().collect(),
       Order::RemoveCertificate(_) => [Topic::HttpsProxyConfig].iter().cloned().collect(),
       Order::AddTcpFront(_)       => [Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::RemoveTcpFront(_)    => [Topic::TcpProxyConfig].iter().cloned().collect(),

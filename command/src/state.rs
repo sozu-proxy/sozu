@@ -99,6 +99,21 @@ impl ConfigState {
       &Order::RemoveCertificate(ref fingerprint) => {
         self.certificates.remove(fingerprint);
       },
+      &Order::ReplaceCertificate(ref replace) => {
+        self.certificates.remove(&replace.old_fingerprint);
+
+        let fingerprint = match calculate_fingerprint(&replace.new_certificate.certificate.as_bytes()[..]) {
+          Some(f)  => CertFingerprint(f),
+          None => {
+            error!("cannot obtain the certificate's fingerprint");
+            return;
+          }
+        };
+
+        if !self.certificates.contains_key(&fingerprint) {
+          self.certificates.insert(fingerprint.clone(), replace.new_certificate.clone());
+        }
+      },
       &Order::AddHttpsFront(ref front) => {
         let front_vec = self.https_fronts.entry(front.app_id.clone()).or_insert(vec!());
         if !front_vec.contains(front) {

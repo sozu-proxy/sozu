@@ -1031,6 +1031,14 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         //FIXME: should return an error if certificate still has fronts referencing it
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
+      Order::ReplaceCertificate(replace) => {
+        //info!("TLS\t{} replace certificate of fingerprint {:?} with {:?}", id,
+        //  replace.old_fingerprint, replace.new_certificate);
+        self.remove_certificate(replace.old_fingerprint, event_loop);
+        self.add_certificate(replace.new_certificate, event_loop);
+        //FIXME: should return an error if certificate still has fronts referencing it
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+      },
       Order::AddInstance(instance) => {
         debug!("{} add instance {:?}", message.id, instance);
         let addr_string = instance.ip_address + ":" + &instance.port.to_string();
