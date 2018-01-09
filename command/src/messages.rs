@@ -133,6 +133,8 @@ pub enum Order {
     Status,
     Metrics,
     Logging(String),
+
+    ReturnListenSockets,
 }
 
 
@@ -404,6 +406,7 @@ impl Order {
       Order::Status               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::Metrics              => HashSet::new(),
       Order::Logging(_)           => [Topic::HttpsProxyConfig, Topic::HttpProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::ReturnListenSockets  => HashSet::new(),
     }
   }
 }

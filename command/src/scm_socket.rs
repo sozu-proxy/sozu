@@ -3,7 +3,8 @@ use nix::sys::uio;
 use nix::Result as NixResult;
 use std::iter::repeat;
 use std::str::from_utf8;
-use std::os::unix::io::RawFd;
+use std::os::unix::net;
+use std::os::unix::io::{RawFd, FromRawFd, IntoRawFd};
 use serde_json;
 
 pub const MAX_FDS_OUT: usize = 200;
@@ -12,17 +13,38 @@ pub const MAX_BYTES_OUT: usize = 4096;
 #[derive(Clone,Debug,Serialize,Deserialize)]
 pub struct ScmSocket {
   pub fd: RawFd,
+  pub blocking: bool,
 }
 
 impl ScmSocket {
   pub fn new(fd: RawFd) -> ScmSocket {
+    unsafe {
+      let stream = net::UnixStream::from_raw_fd(fd);
+      let _ = stream.set_nonblocking(false).map_err(|e| {
+        error!("could not change blocking status for stream: {:?}", e);
+      });
+      let _fd = stream.into_raw_fd();
+    }
+
+    println!("creating scm socket from fd {}", fd);
     ScmSocket {
-      fd
+      fd,
+      blocking: true,
     }
   }
 
   pub fn raw_fd(&self) -> i32 {
     self.fd
+  }
+
+  pub fn set_blocking(&self, blocking: bool) {
+    unsafe {
+      let stream = net::UnixStream::from_raw_fd(self.fd);
+      let _ = stream.set_nonblocking(!blocking).map_err(|e| {
+        error!("could not change blocking status for stream: {:?}", e);
+      });
+      let _fd = stream.into_raw_fd();
+    }
   }
 
   pub fn send_listeners(&self, listeners: Listeners) -> NixResult<()> {
@@ -47,7 +69,7 @@ impl ScmSocket {
     self.send_msg(&message, &v)
   }
 
-  pub fn receive_listeners(&self) -> Listeners {
+  pub fn receive_listeners(&self) -> Option<Listeners> {
     let mut buf = Vec::with_capacity(MAX_BYTES_OUT);
     buf.extend(repeat(0).take(MAX_BYTES_OUT));
 
@@ -60,17 +82,19 @@ impl ScmSocket {
 
     match self.rcv_msg(&mut buf, &mut received_fds) {
       Err(e) => {
-        error!("could not receive listeners: {:?}", e);
-        default
+        println!("{} could not receive listeners: {:?}", self.fd, e);
+        None
       },
       Ok((sz, fds_len)) => {
+        println!("{} received :{:?}", self.fd, (sz, fds_len));
         match from_utf8(&buf[..sz]) {
           Ok(s) => match serde_json::from_str::<ListenersCount>(s) {
             Err(e) => {
-              error!("could not parse listeners list: {:?}", e);
-              default
+              println!("{} could not parse listeners list: {:?}", self.fd, e);
+              None
             },
             Ok(mut listeners_count) => {
+              println!("got listeners_count: {:?}", listeners_count);
               let mut index = 0;
               let http = if listeners_count.http {
                 index = 1;
@@ -91,12 +115,12 @@ impl ScmSocket {
               tcp.extend(listeners_count.tcp.drain(..)
                          .zip((&received_fds[index..fds_len]).iter().cloned()));
 
-              Listeners { http, tls, tcp }
+              Some(Listeners { http, tls, tcp })
             }
           }
           Err(e) => {
-            error!("could not parse listeners list: {:?}", e);
-            default
+            println!("{} could not parse listeners list: {:?}", self.fd, e);
+            None
           }
         }
       }
@@ -105,11 +129,21 @@ impl ScmSocket {
 
   pub fn send_msg(&self, bytes: &[u8], fds: &[RawFd]) -> NixResult<()> {
     let iov = [uio::IoVec::from_slice(bytes)];
+    let flags = if self.blocking {
+      socket::MsgFlags::empty()
+    } else {
+      socket::MSG_DONTWAIT
+    };
+
     if fds.len() > 0 {
       let cmsgs = [socket::ControlMessage::ScmRights(fds)];
-      socket::sendmsg(self.fd, &iov, &cmsgs, socket::MSG_DONTWAIT, None)?;
+      //socket::sendmsg(self.fd, &iov, &cmsgs, socket::MSG_DONTWAIT, None)?;
+      println!("{} send with data", self.fd);
+      socket::sendmsg(self.fd, &iov, &cmsgs, flags, None)?;
     } else {
-      socket::sendmsg(self.fd, &iov, &[], socket::MSG_DONTWAIT, None)?;
+      println!("{} send empty", self.fd);
+      //socket::sendmsg(self.fd, &iov, &[], socket::MSG_DONTWAIT, None)?;
+      socket::sendmsg(self.fd, &iov, &[], flags, None)?;
     };
     Ok(())
   }
@@ -118,7 +152,14 @@ impl ScmSocket {
     let mut cmsg = socket::CmsgSpace::<[RawFd; MAX_FDS_OUT]>::new();
     let iov = [uio::IoVec::from_mut_slice(buffer)];
 
-    let msg = socket::recvmsg(self.fd, &iov[..], Some(&mut cmsg), socket::MSG_DONTWAIT)?;
+    let flags = if self.blocking {
+      socket::MsgFlags::empty()
+    } else {
+      socket::MSG_DONTWAIT
+    };
+
+    //let msg = socket::recvmsg(self.fd, &iov[..], Some(&mut cmsg), socket::MSG_DONTWAIT)?;
+    let msg = socket::recvmsg(self.fd, &iov[..], Some(&mut cmsg), flags)?;
 
     let mut fd_count = 0;
     let received_fds = msg.cmsgs()

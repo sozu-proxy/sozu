@@ -20,6 +20,7 @@ pub enum ConfigCommand {
   UpgradeMaster,
   Metrics,
   Query(Query),
+  UpgradeWorker(u32),
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
@@ -217,6 +218,12 @@ impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
       ConfigCommand::LaunchWorker(try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("launch worker")))))
     } else if &config_type == &"UPGRADE_MASTER" {
       ConfigCommand::UpgradeMaster
+    } else if &config_type == &"UPGRADE_WORKER" {
+      let data = match data {
+        Some(data) => data,
+        None => return Err(serde::de::Error::missing_field("data")),
+      };
+      ConfigCommand::UpgradeWorker(try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("upgrade worker")))))
     } else if &config_type == &"METRICS" {
       ConfigCommand::Metrics
     } else if &config_type == &"QUERY" {
@@ -300,6 +307,10 @@ impl serde::Serialize for ConfigMessage {
       ConfigCommand::Query(ref query) => {
         try!(map.serialize_entry("type", "QUERY"));
         try!(map.serialize_entry("data", query));
+      },
+      ConfigCommand::UpgradeWorker(ref id) => {
+        try!(map.serialize_entry("type", "UPGRADE_WORKER"));
+        try!(map.serialize_entry("data", id));
       },
     };
 
@@ -543,6 +554,13 @@ mod tests {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     ConfigCommand::UpgradeMaster,
+      proxy_id: None
+    });
+
+  test_message!(upgrade_worker, "../assets/upgrade_worker.json", ConfigMessage {
+      id:       "ID_TEST".to_string(),
+      version:  0,
+      data:     ConfigCommand::UpgradeWorker(0),
       proxy_id: None
     });
 

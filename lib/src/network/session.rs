@@ -261,7 +261,7 @@ pub trait ProxyConfiguration<Client> {
 }
 
 pub struct Session<ServerConfiguration,Client> {
-  configuration:   ServerConfiguration,
+  pub configuration:   ServerConfiguration,
   clients:         Slab<Client,FrontToken>,
   backend:         Slab<FrontToken,BackToken>,
   max_listeners:   usize,

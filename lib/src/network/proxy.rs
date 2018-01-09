@@ -10,7 +10,7 @@ use mio::*;
 use mio::unix::UnixReady;
 use std::collections::{HashSet,HashMap,VecDeque};
 use std::io::{self,Read,ErrorKind};
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd,FromRawFd};
 use nom::HexDisplay;
 use std::error::Error;
 use slab::Slab;
@@ -25,7 +25,7 @@ use rand::random;
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
-use sozu_command::scm_socket::ScmSocket;
+use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::state::{ConfigState,get_application_ids_by_domain};
 use sozu_command::messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer,QueryApplicationType};
 
@@ -70,8 +70,16 @@ impl Server {
       Pool::with_capacity(2*config.max_buffers, 0, || BufferQueue::with_capacity(config.buffer_size))
     ));
 
+    info!("will try to receive listeners");
+    scm.set_blocking(false);
     let mut listeners = scm.receive_listeners();
+    scm.set_blocking(true);
     info!("received listeners: {:#?}", listeners);
+    let mut listeners = listeners.unwrap_or(Listeners {
+      http: None,
+      tls:  None,
+      tcp:  Vec::new(),
+    });
 
     let max_connections = config.max_connections;
     let max_buffers     = config.max_buffers;
@@ -232,6 +240,16 @@ impl Server {
                 } else if let Order::SoftStop = msg.order {
                   self.shutting_down = Some(msg.id.clone());
                   self.notify(msg);
+                } else if let Order::ReturnListenSockets = msg.order {
+                  info!("received ReturnListenSockets order");
+                  self.scm.set_blocking(false);
+                  let res = self.scm.send_listeners(Listeners {
+                    http: self.http.as_ref().and_then(|http| http.configuration.listener.as_ref()).map(|listener| listener.as_raw_fd()),
+                    tls:  None,
+                    tcp:  Vec::new(),
+                  });
+                  self.scm.set_blocking(true);
+                  info!("sent default listeners: {:?}", res);
                 } else {
                   self.notify(msg);
                 }

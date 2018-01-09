@@ -256,7 +256,7 @@ pub fn hard_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeou
   );
 }
 
-pub fn upgrade(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
+pub fn upgrade_master(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
                   socket_path: &str) {
   println!("Preparing to upgrade proxy...");
 
@@ -411,6 +411,41 @@ pub fn upgrade(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
       }
     }
   }
+}
+
+pub fn upgrade_worker(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, worker_id: u32) {
+  println!("upgrading worker {}", worker_id);
+  let id = generate_id();
+  channel.write_message(&ConfigMessage::new(
+    id.clone(),
+    ConfigCommand::UpgradeWorker(worker_id),
+    //FIXME: we should be able to soft stop one specific worker
+    None,
+  ));
+
+  command_timeout!(timeout,
+    loop {
+      match channel.read_message() {
+        None          => println!("the proxy didn't answer"),
+        Some(message) => {
+          match message.status {
+            ConfigMessageStatus::Processing => {
+              println!("Proxy is processing: {}", message.message);
+            },
+            ConfigMessageStatus::Error => {
+              println!("could not stop the proxy: {}", message.message);
+            },
+            ConfigMessageStatus::Ok => {
+              if &id == &message.id {
+                println!("Proxy shut down: {}", message.message);
+                break;
+              }
+            }
+          }
+        }
+      }
+    }
+  );
 }
 
 pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bool) {

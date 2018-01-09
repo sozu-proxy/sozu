@@ -59,7 +59,10 @@ impl CommandServer {
       },
       ConfigCommand::ProxyConfiguration(order) => {
         self.worker_order(token, &message.id, order, message.proxy_id);
-      }
+      },
+      ConfigCommand::UpgradeWorker(id) => {
+        self.upgrade_worker(token, &message.id, id);
+      },
     }
   }
 
@@ -262,7 +265,7 @@ impl CommandServer {
 
   pub fn launch_worker(&mut self, token: FrontToken, message: &ConfigMessage, tag: &str) {
     let id = self.next_id;
-    if let Ok(mut worker) = start_worker(id, &self.config, &self.state) {
+    if let Ok(mut worker) = start_worker(id, &self.config, &self.state, None) {
       self.clients[token].push_message(ConfigMessageAnswer::new(
           message.id.clone(),
           ConfigMessageStatus::Processing,
@@ -288,6 +291,86 @@ impl CommandServer {
       self.answer_success(token, message.id.as_str(), "", None);
     } else {
       self.answer_error(token, message.id.as_str(), "failed creating worker", None);
+    }
+  }
+
+  pub fn upgrade_worker(&mut self, token: FrontToken, message_id: &str, id: u32) {
+    info!("client[{}] msg {} wants to upgrade worker {}", token.0, message_id, id);
+    if self.proxies.values().find(|worker| {
+      worker.id == id && worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
+    }).is_none() {
+      self.answer_error(token, message_id, "worker not found", None);
+      return;
+    }
+
+    let mut listeners = None;
+    let old_worker_token = {
+      let worker = self.proxies.values_mut().filter(|worker| worker.id == id).next().unwrap();
+
+      worker.channel.set_blocking(true);
+      worker.channel.write_message(&OrderMessage { id: String::from(message_id), order: Order::ReturnListenSockets });
+      info!("sent returnlistensockets message to worker");
+      worker.channel.set_blocking(false);
+
+      let mut counter   = 0;
+
+      loop {
+        worker.scm.set_blocking(false);
+        if let Some(l) = worker.scm.receive_listeners() {
+          listeners = Some(l);
+          break;
+        } else {
+          counter += 1;
+          if counter == 50 {
+            break;
+          }
+          sleep(Duration::from_millis(100));
+        }
+      }
+      worker.run_state = RunState::Stopping;
+      worker.push_message(OrderMessage { id: String::from(message_id), order: Order::SoftStop });
+
+      worker.token.expect("worker should have a valid token")
+    };
+
+    if listeners.is_none() {
+      error!("could not get the list of listeners from the previous worker");
+    }
+
+    //FIXME: soft stop the old worker correctly
+    //self.order_state.insert_task(message_id, MessageType::Stop, Some(token));
+    //self.order_state.insert_worker_message(message_id, message_id, old_worker_token);
+    trace!("sending to {:?}, inflight is now {:#?}", old_worker_token.0, self.order_state);
+
+
+    // same as launch_worker
+    let id = self.next_id;
+    if let Ok(mut worker) = start_worker(id, &self.config, &self.state, listeners) {
+      self.clients[token].push_message(ConfigMessageAnswer::new(
+          String::from(message_id),
+          ConfigMessageStatus::Processing,
+          "sending configuration orders".to_string(),
+          None
+          ));
+      info!("created new worker: {}", id);
+
+      self.next_id += 1;
+
+      let worker_token = self.token_count + 1;
+      self.token_count = worker_token;
+      worker.token     = Some(Token(worker_token));
+
+      debug!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
+      worker_token, "upgrade", worker.id, worker.channel.sock.take_error());
+      self.poll.register(&worker.channel.sock, Token(worker_token),
+        Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
+        PollOpt::edge()).unwrap();
+      worker.token = Some(Token(worker_token));
+      self.proxies.insert(Token(worker_token), worker);
+
+      self.answer_success(token, message_id, "", None);
+    } else {
+      self.answer_error(token, message_id, "failed creating worker", None);
     }
   }
 

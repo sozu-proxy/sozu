@@ -9,7 +9,7 @@ use std::ptr::null_mut;
 use std::process::Command;
 use std::net::ToSocketAddrs;
 use std::os::unix::process::CommandExt;
-use std::os::unix::io::{AsRawFd,FromRawFd,RawFd};
+use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd, RawFd};
 use tempfile::tempfile;
 use serde_json;
 use nix;
@@ -18,7 +18,7 @@ use nix::unistd::*;
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
-use sozu_command::scm_socket::ScmSocket;
+use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
 use sozu::network::proxy::Server;
 
@@ -30,9 +30,9 @@ pub fn start_workers(config: &Config) -> nix::Result<Vec<Worker>> {
   let state = ConfigState::new();
   let mut workers = Vec::new();
   for index in 0..config.worker_count {
-    match start_worker_process(&index.to_string(), config, &state) {
+    match start_worker_process(&index.to_string(), config, &state, None) {
       Ok((pid, command, scm)) => {
-        let w =  Worker::new(index as u32, pid, command, ScmSocket::new(scm), config);
+        let w =  Worker::new(index as u32, pid, command, scm, config);
         workers.push(w);
       },
       Err(e) => return Err(e)
@@ -41,10 +41,10 @@ pub fn start_workers(config: &Config) -> nix::Result<Vec<Worker>> {
   Ok(workers)
 }
 
-pub fn start_worker(id: u32, config: &Config, state: &ConfigState) -> nix::Result<Worker> {
-  match start_worker_process(&id.to_string(), config, state) {
+pub fn start_worker(id: u32, config: &Config, state: &ConfigState, listeners: Option<Listeners>) -> nix::Result<Worker> {
+  match start_worker_process(&id.to_string(), config, state, listeners) {
     Ok((pid, command, scm)) => {
-      let w = Worker::new(id, pid, command,  ScmSocket::new(scm), config);
+      let w = Worker::new(id, pid, command,  scm, config);
       Ok(w)
     },
     Err(e) => Err(e)
@@ -86,7 +86,7 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
   info!("{} ending event loop", id);
 }
 
-pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState) -> nix::Result<(pid_t, Channel<OrderMessage,OrderMessageAnswer>, RawFd)> {
+pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState, listeners: Option<Listeners>) -> nix::Result<(pid_t, Channel<OrderMessage,OrderMessageAnswer>, ScmSocket)> {
   trace!("parent({})", unsafe { libc::getpid() });
 
   let mut state_file = tempfile().expect("could not create temporary file for configuration state");
@@ -96,9 +96,12 @@ pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState) -> n
   state_file.seek(SeekFrom::Start(0)).expect("could not seek to beginning of file");
 
   let (server, client) = UnixStream::pair().unwrap();
-  let (scm_server, scm_client) = UnixStream::pair().unwrap();
+  let (scm_server_fd, scm_client) = UnixStream::pair().unwrap();
+
+  let scm_server = ScmSocket::new(scm_server_fd.into_raw_fd());
 
   util::disable_close_on_exec(client.as_raw_fd());
+  util::disable_close_on_exec(scm_client.as_raw_fd());
 
   let channel_buffer_size = config.channel_buffer_size;
   //FIXME
@@ -121,8 +124,21 @@ pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState) -> n
       command.write_message(config);
       command.set_nonblocking(true);
 
+      let res = if let Some(l) = listeners {
+        info!("sending listeners to new worker: {:#?}", l);
+        scm_server.send_listeners(l)
+      } else {
+        scm_server.send_listeners(Listeners {
+          http: None,
+          tls:  None,
+          tcp:  Vec::new(),
+
+        })
+      };
+      info!("sent listeners from master: {:?}", res);
+
       let command: Channel<OrderMessage,OrderMessageAnswer> = command.into();
-      Ok((child, command, scm_server.as_raw_fd()))
+      Ok((child, command, scm_server))
     },
     Ok(ForkResult::Child) => {
       trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });

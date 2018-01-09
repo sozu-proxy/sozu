@@ -295,7 +295,7 @@ pub struct DefaultAnswers {
 pub type Hostname = String;
 
 pub struct ServerConfiguration {
-  listener:        Option<TcpListener>,
+  pub listener:        Option<TcpListener>,
   address:         SocketAddr,
   instances:       BackendMap,
   fronts:          HashMap<Hostname, Vec<HttpFront>>,

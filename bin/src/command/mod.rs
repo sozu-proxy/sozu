@@ -575,7 +575,7 @@ impl CommandServer {
     self.proxies.remove(&token);
 
     let id = self.next_id;
-    if let Ok(mut worker) = start_worker(id, &self.config, &self.state) {
+    if let Ok(mut worker) = start_worker(id, &self.config, &self.state, None) {
       info!("created new worker: {}", id);
       self.next_id += 1;
       let worker_token = self.token_count + 1;
