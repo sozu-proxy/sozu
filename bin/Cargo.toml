@@ -5,7 +5,7 @@ repository = "https://github.com/sozu-proxy/sozu"
 readme = "README.md"
 documentation = "https://docs.rs/sozu"
 homepage = "http://sozu.io"
-version = "0.4.0"
+version = "0.5.0"
 license = "AGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
@@ -33,8 +33,8 @@ slab = "^0.3.0"
 libc = "^0.2"
 rand = "^0.3.14"
 tempfile = "^2.2"
-sozu-lib = { version = "^0.4", path = "../lib" }
-sozu-command-lib = { version = "^0.4", path = "../command" }
+sozu-lib = { version = "^0.5", path = "../lib" }
+sozu-command-lib = { version = "^0.5", path = "../command" }
 
 [target.'cfg(target_os="linux")'.dependencies]
 num_cpus = "^1.3.0"
