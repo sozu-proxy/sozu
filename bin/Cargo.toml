@@ -42,6 +42,8 @@ procinfo = "^0.4.1"
 
 [features]
 unstable = []
+logs-debug = ["sozu-lib/logs-debug", "sozu-command-lib/logs-debug"]
+logs-trace = ["sozu-lib/logs-trace", "sozu-command-lib/logs-trace"]
 
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }

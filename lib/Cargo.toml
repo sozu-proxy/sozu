@@ -51,6 +51,8 @@ features = ["v4"]
 default  = []
 splice   = []
 unstable = []
+logs-debug = []
+logs-trace = []
 
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }
