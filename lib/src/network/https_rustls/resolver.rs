@@ -6,7 +6,7 @@ use rustls::{ResolvesServerCert, SignatureScheme, PrivateKey};
 use rustls::sign::{CertifiedKey, RSASigningKey};
 use rustls::internal::pemfile;
 
-use sozu_command::messages::{CertificateAndKey, CertFingerprint};
+use sozu_command::messages::{CertificateAndKey, CertFingerprint, AddCertificate, RemoveCertificate};
 use sozu_command::certificate::calculate_fingerprint_from_der;
 
 use network::trie::TrieNode;
@@ -29,8 +29,8 @@ impl CertificateResolver {
     }
   }
 
-  pub fn add_certificate(&mut self, certificate_and_key: CertificateAndKey) -> Option<CertFingerprint> {
-    if let Some(certified_key) = generate_certified_key(certificate_and_key) {
+  pub fn add_certificate(&mut self, add_certificate: AddCertificate) -> Option<CertFingerprint> {
+    if let Some(certified_key) = generate_certified_key(add_certificate.certificate) {
       //FIXME: waiting for https://github.com/briansmith/webpki/pull/65 to merge to get the DNS names
       let mut names = vec!(String::from("lolcatho.st"));
       let fingerprint = calculate_fingerprint_from_der(&certified_key.cert[0].0);
@@ -60,10 +60,10 @@ impl CertificateResolver {
     }
   }
 
-  pub fn remove_certificate(&mut self, fingerprint: &CertFingerprint) {
-    let must_delete = self.certificates.get(fingerprint).map(|data| data.refcount == 0).unwrap_or(false);
+  pub fn remove_certificate(&mut self, remove_certificate: RemoveCertificate) {
+    let must_delete = self.certificates.get(&remove_certificate.fingerprint).map(|data| data.refcount == 0).unwrap_or(false);
 
-    if let Some(data) = self.certificates.get(fingerprint) {
+    if let Some(data) = self.certificates.get(&remove_certificate.fingerprint) {
       let cert = &data.cert.cert[0];
       let names = vec!(String::from("https://lolcatho.st"));
 
@@ -81,7 +81,7 @@ impl CertificateResolver {
     }
 
     if must_delete {
-      self.certificates.remove(fingerprint);
+      self.certificates.remove(&remove_certificate.fingerprint);
     }
   }
 
@@ -111,17 +111,17 @@ impl CertificateResolverWrapper {
     CertificateResolverWrapper(Mutex::new(CertificateResolver::new()))
   }
 
-  pub fn add_certificate(&self, certificate_and_key: CertificateAndKey) -> Option<CertFingerprint> {
+  pub fn add_certificate(&self, add_certificate: AddCertificate) -> Option<CertFingerprint> {
     if let Ok(ref mut resolver) = self.0.try_lock() {
-      resolver.add_certificate(certificate_and_key)
+      resolver.add_certificate(add_certificate)
     } else {
       None
     }
   }
 
-  pub fn remove_certificate(&self, fingerprint: &CertFingerprint) {
+  pub fn remove_certificate(&self, remove_certificate: RemoveCertificate) {
     if let Ok(ref mut resolver) = self.0.try_lock() {
-      resolver.remove_certificate(fingerprint)
+      resolver.remove_certificate(remove_certificate)
     }
 
   }

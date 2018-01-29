@@ -24,7 +24,8 @@ use nom::IResult;
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,
-  Order,HttpsFront,HttpsProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
+  Order,HttpsFront,HttpsProxyConfiguration,OrderMessage, OrderMessageAnswer,
+  OrderMessageStatus,AddCertificate,RemoveCertificate};
 use sozu_command::certificate::split_certificate_chain;
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
@@ -42,7 +43,7 @@ use network::protocol::http::DefaultAnswerStatus;
 use network::retry::RetryPolicy;
 use util::UnwrapLog;
 
-use super::resolver::{CertificateResolver,CertificateResolverWrapper,generate_certified_key};
+use super::resolver::{CertificateResolver,CertificateResolverWrapper};
 use super::client::TlsClient;
 
 type BackendToken = Token;
@@ -78,9 +79,7 @@ impl ServerConfiguration {
   pub fn new(config: HttpsProxyConfiguration, base_token: usize, event_loop: &mut Poll, start_at: usize,
     pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>) -> io::Result<(ServerConfiguration, HashSet<ListenToken>)> {
 
-    info!("creating Rustls enabled HTTPS proxy");
     let mut fronts   = HashMap::new();
-    //FIXME: register default certificate and default app
     let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
 
     let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
@@ -118,7 +117,10 @@ impl ServerConfiguration {
       certificate_chain: config.default_certificate_chain.clone().map(split_certificate_chain).unwrap_or(vec!()),
     };
 
-    if let Some(fingerprint) = resolver.add_certificate(cert) {
+    if let Some(fingerprint) = resolver.add_certificate(AddCertificate{
+      certificate: cert,
+      names: Vec::new()
+    }) {
       resolver.add_front(&fingerprint);
 
       let app = TlsApp {
@@ -159,6 +161,9 @@ impl ServerConfiguration {
   }
 
   pub fn add_https_front(&mut self, tls_front: HttpsFront, event_loop: &mut Poll) -> bool {
+    if !(*self.resolver).add_front(&tls_front.fingerprint) {
+      return false;
+    }
 
     //FIXME: should clone he hostname then do a into() here
     let app = TlsApp {
@@ -171,17 +176,10 @@ impl ServerConfiguration {
     if let Some(fronts) = self.fronts.get_mut(&tls_front.hostname) {
         if ! fronts.contains(&app) {
           fronts.push(app.clone());
-
-          if !(*self.resolver).add_front(&tls_front.fingerprint) {
-            return false;
-          }
         }
     }
     if self.fronts.get(&tls_front.hostname).is_none() {
       self.fronts.insert(tls_front.hostname, vec![app]);
-      if !(*self.resolver).add_front(&tls_front.fingerprint) {
-        return false;
-      }
     }
 
     true
@@ -195,19 +193,19 @@ impl ServerConfiguration {
         .position(|f| &f.app_id == &front.app_id && &f.cert_fingerprint == &front.fingerprint) {
 
         let front = fronts.remove(pos);
-        (*self.resolver).remove_front(&front.cert_fingerprint)
+        (*self.resolver).remove_front(&front.cert_fingerprint) 
       }
     }
   }
 
-  pub fn add_certificate(&mut self, certificate_and_key: CertificateAndKey, event_loop: &mut Poll) -> bool {
-    (*self.resolver).add_certificate(certificate_and_key).is_some()
+  pub fn add_certificate(&mut self, add_certificate: AddCertificate, event_loop: &mut Poll) -> bool {
+    (*self.resolver).add_certificate(add_certificate).is_some()
   }
 
   // FIXME: return an error if the cert is still in use
-  pub fn remove_certificate(&mut self, fingerprint: CertFingerprint, event_loop: &mut Poll) {
-    debug!("removing certificate {:?}", fingerprint);
-    (*self.resolver).remove_certificate(&fingerprint)
+  pub fn remove_certificate(&mut self, remove_certificate: RemoveCertificate, event_loop: &mut Poll) {
+    debug!("removing certificate {:?}", remove_certificate);
+    (*self.resolver).remove_certificate(remove_certificate)
   }
 
   pub fn add_instance(&mut self, app_id: &str, instance_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
@@ -484,7 +482,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   }
 
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
-    //trace!("rustls: {} notified", message);
+    info!("{} notified", message);
     match message.order {
       Order::AddApplication(application) => {
         debug!("{} add application {:?}", message.id, application);
@@ -509,12 +507,12 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Order::AddCertificate(add_certificate) => {
         //info!("HTTPS\t{} add certificate: {:?}", id, certificate_and_key);
-          self.add_certificate(add_certificate.certificate, event_loop);
+          self.add_certificate(add_certificate, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::RemoveCertificate(remove_certificate) => {
         //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
-        self.remove_certificate(remove_certificate.fingerprint, event_loop);
+        self.remove_certificate(remove_certificate, event_loop);
         //FIXME: should return an error if certificate still has fronts referencing it
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
@@ -590,6 +588,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 pub type RustlsServer = Session<ServerConfiguration,TlsClient>;
 
 pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
+}
+
+/*
+pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_listeners   = 1;
 
@@ -597,6 +599,7 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
 
+  // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
   if let Ok(configuration) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop, 1 + max_listeners, pool) {
     let session = Session::new(max_listeners, max_buffers, 6148914691236517205, configuration, &mut event_loop);
     let mut server  = Server::new(event_loop, channel, None, Some(session), None, None);
@@ -607,3 +610,115 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
   }
 }
 
+#[cfg(test)]
+mod tests {
+  extern crate tiny_http;
+  use super::*;
+  use std::collections::HashMap;
+  use std::net::{TcpListener, TcpStream, Shutdown};
+  use std::io::{Read,Write};
+  use std::{thread,str};
+  use std::sync::mpsc::channel;
+  use std::net::SocketAddr;
+  use std::str::FromStr;
+  use std::time::Duration;
+  use std::rc::{Rc,Weak};
+  use std::sync::{Arc,Mutex};
+  use std::cell::RefCell;
+  use slab::Slab;
+  use pool::Pool;
+  use sozu_command::buffer::Buffer;
+  use network::buffer_queue::BufferQueue;
+  use network::http::DefaultAnswers;
+  use network::trie::TrieNode;
+  use sozu_command::messages::{Order,HttpsFront,Instance,OrderMessage,OrderMessageAnswer};
+  use openssl::ssl::{SslContext, SslMethod, Ssl, SslStream};
+  use openssl::x509::X509;
+
+  use mio::net;
+  #[test]
+  fn frontend_from_request_test() {
+    let app_id1 = "app_1".to_owned();
+    let app_id2 = "app_2".to_owned();
+    let app_id3 = "app_3".to_owned();
+    let uri1 = "/".to_owned();
+    let uri2 = "/yolo".to_owned();
+    let uri3 = "/yolo/swag".to_owned();
+
+    let mut fronts = HashMap::new();
+    fronts.insert("lolcatho.st".to_owned(), vec![
+      TlsApp {
+        app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1,
+        cert_fingerprint: CertFingerprint(vec!()),
+      },
+      TlsApp {
+        app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2,
+        cert_fingerprint: CertFingerprint(vec!()),
+      },
+      TlsApp {
+        app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3,
+        cert_fingerprint: CertFingerprint(vec!()),
+      }
+    ]);
+    fronts.insert("other.domain".to_owned(), vec![
+      TlsApp {
+        app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(),
+        cert_fingerprint: CertFingerprint(vec!()),
+      },
+    ]);
+
+    let contexts   = HashMap::new();
+    let rc_ctx     = Arc::new(Mutex::new(contexts));
+    let domains    = TrieNode::root();
+    let rc_domains = Arc::new(Mutex::new(domains));
+
+    let context    = SslContext::builder(SslMethod::tls()).expect("could not create a SslContextBuilder");
+
+    let tls_data = TlsData {
+      context:     context.build(),
+      certificate: vec!(),
+      refcount:    0,
+      initialized: false,
+    };
+
+    let front: SocketAddr = FromStr::from_str("127.0.0.1:1032").expect("test address 127.0.0.1:1032 should be parsed");
+    let listener = net::TcpListener::bind(&front).expect("test address 127.0.0.1:1032 should be available");
+    let server_config = ServerConfiguration {
+      listener:  listener,
+      address:   front,
+      applications: HashMap::new(),
+      instances: BackendMap::new(),
+      fronts:    fronts,
+      domains:   rc_domains,
+      default_context: tls_data,
+      contexts: rc_ctx,
+      pool:      Rc::new(RefCell::new(Pool::with_capacity(1, 0, || BufferQueue::with_capacity(16384)))),
+      base_token:    6148914691236517205,
+      answers:   DefaultAnswers {
+        NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
+        ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
+      },
+      config: Default::default(),
+      ssl_options: ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION | ssl::SSL_OP_NO_TICKET |
+        ssl::SSL_OP_NO_SSLV2 | ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1 | ssl::SSL_OP_NO_TLSV1_1,
+    };
+
+    println!("TEST {}", line!());
+    let frontend1 = server_config.frontend_from_request("lolcatho.st", "/");
+    assert_eq!(frontend1.expect("should find a frontend").app_id, "app_1");
+    println!("TEST {}", line!());
+    let frontend2 = server_config.frontend_from_request("lolcatho.st", "/test");
+    assert_eq!(frontend2.expect("should find a frontend").app_id, "app_1");
+    println!("TEST {}", line!());
+    let frontend3 = server_config.frontend_from_request("lolcatho.st", "/yolo/test");
+    assert_eq!(frontend3.expect("should find a frontend").app_id, "app_2");
+    println!("TEST {}", line!());
+    let frontend4 = server_config.frontend_from_request("lolcatho.st", "/yolo/swag");
+    assert_eq!(frontend4.expect("should find a frontend").app_id, "app_3");
+    println!("TEST {}", line!());
+    let frontend5 = server_config.frontend_from_request("domain", "/");
+    assert_eq!(frontend5, None);
+   // assert!(false);
+  }
+}
+*/
