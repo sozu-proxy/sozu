@@ -1020,14 +1020,14 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         self.remove_https_front(front, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
-      Order::AddCertificate(certificate_and_key) => {
+      Order::AddCertificate(add_certificate) => {
         //info!("HTTPS\t{} add certificate: {:?}", id, certificate_and_key);
-          self.add_certificate(certificate_and_key, event_loop);
+          self.add_certificate(add_certificate.certificate, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
-      Order::RemoveCertificate(fingerprint) => {
+      Order::RemoveCertificate(remove_certificate) => {
         //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
-        self.remove_certificate(fingerprint, event_loop);
+        self.remove_certificate(remove_certificate.fingerprint, event_loop);
         //FIXME: should return an error if certificate still has fronts referencing it
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },

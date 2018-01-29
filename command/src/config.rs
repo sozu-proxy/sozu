@@ -10,7 +10,7 @@ use toml;
 
 use messages::Application;
 use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,TcpFront,Instance,
-  HttpProxyConfiguration,HttpsProxyConfiguration};
+  HttpProxyConfiguration,HttpsProxyConfiguration,AddCertificate};
 
 use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
 
@@ -276,10 +276,13 @@ impl HttpAppConfig {
 
     if self.key.is_some() && self.certificate.is_some() {
 
-      v.push(Order::AddCertificate(CertificateAndKey {
-        key:               self.key.clone().unwrap(),
-        certificate:       self.certificate.clone().unwrap(),
-        certificate_chain: self.certificate_chain.clone().unwrap_or(vec!()),
+      v.push(Order::AddCertificate(AddCertificate{
+        certificate: CertificateAndKey {
+          key:               self.key.clone().unwrap(),
+          certificate:       self.certificate.clone().unwrap(),
+          certificate_chain: self.certificate_chain.clone().unwrap_or(vec!()),
+        },
+        names: Vec::new(),
       }));
 
       if let Some(f) = calculate_fingerprint(&self.certificate.as_ref().unwrap().as_bytes()[..]) {

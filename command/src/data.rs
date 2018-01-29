@@ -312,11 +312,11 @@ impl serde::Serialize for ConfigMessage {
 mod tests {
   use super::*;
   use serde_json;
-  use std::error::Error;
   use hex::FromHex;
   use certificate::split_certificate_chain;
   use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Instance};
   use messages::{BackendMetricsData,MetricsData,FilteredData,Percentiles};
+  use messages::{AddCertificate,RemoveCertificate};
 
   #[test]
   fn config_message_test() {
@@ -445,10 +445,13 @@ mod tests {
   test_message!(add_certificate, "../assets/add_certificate.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::AddCertificate(CertificateAndKey {
+      data:     ConfigCommand::ProxyConfiguration(Order::AddCertificate( AddCertificate{
+        certificate: CertificateAndKey {
                   certificate: String::from(CERTIFICATE),
                   certificate_chain: split_certificate_chain(String::from(CHAIN)),
                   key: String::from(KEY),
+        },
+        names: Vec::new()
       })),
       proxy_id: None
     });
@@ -456,8 +459,10 @@ mod tests {
   test_message!(remove_certificate, "../assets/remove_certificate.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::RemoveCertificate(
-          CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()))),
+      data:     ConfigCommand::ProxyConfiguration(Order::RemoveCertificate(RemoveCertificate {
+          fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
+          names: Vec::new(),
+      })),
       proxy_id: None
     });
 

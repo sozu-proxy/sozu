@@ -6,7 +6,8 @@ use std::iter::FromIterator;
 use certificate::calculate_fingerprint;
 
 use messages::{Application,CertFingerprint,CertificateAndKey,Order,
-  HttpFront,HttpsFront,TcpFront,Instance,QueryAnswerApplication};
+  HttpFront,HttpsFront,TcpFront,Instance,QueryAnswerApplication,
+  AddCertificate, RemoveCertificate};
 
 pub type AppId = String;
 
@@ -83,8 +84,8 @@ impl ConfigState {
           front_list.retain(|el| el.hostname != front.hostname || el.path_begin != front.path_begin);
         }
       },
-      &Order::AddCertificate(ref certificate_and_key) => {
-        let fingerprint = match calculate_fingerprint(&certificate_and_key.certificate.as_bytes()[..]) {
+      &Order::AddCertificate(ref add) => {
+        let fingerprint = match calculate_fingerprint(&add.certificate.certificate.as_bytes()[..]) {
           Some(f)  => CertFingerprint(f),
           None => {
             error!("cannot obtain the certificate's fingerprint");
@@ -93,11 +94,11 @@ impl ConfigState {
         };
 
         if !self.certificates.contains_key(&fingerprint) {
-          self.certificates.insert(fingerprint.clone(), certificate_and_key.clone());
+          self.certificates.insert(fingerprint.clone(), add.certificate.clone());
         }
       },
-      &Order::RemoveCertificate(ref fingerprint) => {
-        self.certificates.remove(fingerprint);
+      &Order::RemoveCertificate(ref remove) => {
+        self.certificates.remove(&remove.fingerprint);
       },
       &Order::ReplaceCertificate(ref replace) => {
         self.certificates.remove(&replace.old_fingerprint);
@@ -169,7 +170,10 @@ impl ConfigState {
     }
 
     for certificate_and_key in self.certificates.values() {
-      v.push(Order::AddCertificate(certificate_and_key.clone()));
+      v.push(Order::AddCertificate(AddCertificate{
+        certificate: certificate_and_key.clone(),
+        names: Vec::new(),
+      }));
     }
 
     for front_list in self.https_fronts.values() {
@@ -281,7 +285,10 @@ impl ConfigState {
     }
 
     for &(_, certificate_and_key) in added_certificates {
-      v.push(Order::AddCertificate(certificate_and_key.clone()));
+      v.push(Order::AddCertificate(AddCertificate{
+        certificate: certificate_and_key.clone(),
+        names: Vec::new(),
+      }));
     }
 
     for &(_, front) in removed_http_fronts {
@@ -317,7 +324,10 @@ impl ConfigState {
     }
 
     for  &(fingerprint, _) in removed_certificates {
-      v.push(Order::RemoveCertificate(fingerprint.clone()));
+      v.push(Order::RemoveCertificate(RemoveCertificate {
+        fingerprint: fingerprint.clone(),
+        names: Vec::new(),
+      }));
     }
     v
   }

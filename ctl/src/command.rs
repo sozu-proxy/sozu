@@ -3,7 +3,8 @@ use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront, TcpFront,
-  CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain};
+  CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
+  AddCertificate, RemoveCertificate};
 
 use serde_json;
 use std::collections::{HashMap,HashSet};
@@ -838,10 +839,13 @@ pub fn add_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, time
           match Config::load_file(key_path) {
             Err(e) => println!("could not load key: {:?}", e),
             Ok(key) => {
-              order_command(channel, timeout, Order::AddCertificate(CertificateAndKey {
-                certificate: certificate,
-                certificate_chain: certificate_chain,
-                key: key
+              order_command(channel, timeout, Order::AddCertificate(AddCertificate {
+                certificate: CertificateAndKey {
+                  certificate: certificate,
+                  certificate_chain: certificate_chain,
+                  key: key
+                },
+                names: Vec::new(),
               }));
 
             }
@@ -856,7 +860,10 @@ pub fn remove_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, t
   match Config::load_file_bytes(certificate_path) {
     Ok(data) => {
       match calculate_fingerprint(&data) {
-        Some(fingerprint) => order_command(channel, timeout, Order::RemoveCertificate(CertFingerprint(fingerprint))),
+        Some(fingerprint) => order_command(channel, timeout, Order::RemoveCertificate(RemoveCertificate {
+          fingerprint: CertFingerprint(fingerprint),
+          names: Vec::new(),
+        })),
         None              => println!("could not calculate finrprint for certificate")
       }
     },

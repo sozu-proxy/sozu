@@ -100,7 +100,10 @@ fn main() {
   };
   command2.write_message(&messages::OrderMessage {
     id:    String::from("ID_IJKL1"),
-    order: messages::Order::AddCertificate(certificate_and_key)
+    order: messages::Order::AddCertificate(messages::AddCertificate{
+      certificate: certificate_and_key,
+      names: Vec::new(),
+    })
   });
 
   let tls_front = messages::HttpsFront {
@@ -137,7 +140,10 @@ fn main() {
 
   command2.write_message(&messages::OrderMessage {
     id:    String::from("ID_QRST1"),
-    order: messages::Order::AddCertificate(certificate_and_key2)
+    order: messages::Order::AddCertificate(messages::AddCertificate {
+      certificate: certificate_and_key2,
+      names: Vec::new(),
+    })
   });
 
   let tls_front2 = messages::HttpsFront {

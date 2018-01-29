@@ -112,9 +112,9 @@ pub enum Order {
     AddHttpsFront(HttpsFront),
     RemoveHttpsFront(HttpsFront),
 
-    AddCertificate(CertificateAndKey),
+    AddCertificate(AddCertificate),
     ReplaceCertificate(ReplaceCertificate),
-    RemoveCertificate(CertFingerprint),
+    RemoveCertificate(RemoveCertificate),
 
     AddTcpFront(TcpFront),
     RemoveTcpFront(TcpFront),
@@ -207,9 +207,31 @@ pub struct CertificateAndKey {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct AddCertificate {
+    pub certificate: CertificateAndKey,
+    #[serde(default)]
+    #[serde(skip_serializing_if="Vec::is_empty")]
+    pub names: Vec<String>,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct RemoveCertificate {
+    pub fingerprint: CertFingerprint,
+    #[serde(default)]
+    #[serde(skip_serializing_if="Vec::is_empty")]
+    pub names: Vec<String>,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct ReplaceCertificate {
     pub new_certificate: CertificateAndKey,
     pub old_fingerprint: CertFingerprint,
+    #[serde(default)]
+    #[serde(skip_serializing_if="Vec::is_empty")]
+    pub old_names: Vec<String>,
+    #[serde(default)]
+    #[serde(skip_serializing_if="Vec::is_empty")]
+    pub new_names: Vec<String>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
