@@ -553,6 +553,10 @@ impl ServerConfiguration {
     }
   }
 
+  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
+    self.listener.take()
+  }
+
   pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
     self.applications.insert(application.app_id.clone(), application);
   }

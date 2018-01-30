@@ -295,7 +295,7 @@ pub struct DefaultAnswers {
 pub type Hostname = String;
 
 pub struct ServerConfiguration {
-  pub listener:        Option<TcpListener>,
+  listener:        Option<TcpListener>,
   address:         SocketAddr,
   instances:       BackendMap,
   fronts:          HashMap<Hostname, Vec<HttpFront>>,
@@ -333,16 +333,20 @@ impl ServerConfiguration {
     };
 
     ServerConfiguration {
-      listener:      listener,
-      address:       config.front,
-      applications:  HashMap::new(),
-      instances:     BackendMap::new(),
-      fronts:        HashMap::new(),
-      pool:          pool,
-      answers:       default,
-      config:        config,
+      listener:       listener,
+      address:        config.front,
+      applications:   HashMap::new(),
+      instances:      BackendMap::new(),
+      fronts:         HashMap::new(),
+      pool:           pool,
+      answers:        default,
+      config:         config,
     }
 
+  }
+
+  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
+    self.listener.take()
   }
 
   pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {

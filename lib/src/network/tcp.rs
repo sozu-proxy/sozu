@@ -216,7 +216,7 @@ impl ProxyClient for Client {
 
 pub struct ApplicationListener {
   app_id:         String,
-  sock:           TcpListener,
+  sock:           Option<TcpListener>,
   token:          Option<Token>,
   front_address:  SocketAddr,
   back_addresses: Vec<SocketAddr>
@@ -248,7 +248,7 @@ impl ServerConfiguration {
       if let Ok(front) = listener.local_addr() {
         let al = ApplicationListener {
           app_id:         app_id.clone(),
-          sock:           listener,
+          sock:           Some(listener),
           token:          None,
           front_address:  front,
           back_addresses: Vec::new()
@@ -260,13 +260,24 @@ impl ServerConfiguration {
     configuration
   }
 
+  pub fn give_back_listeners(&mut self) -> Vec<(String, TcpListener)> {
+    let res = self.listeners.iter_mut()
+      .filter(|app_listener| app_listener.sock.is_some())
+      .map(|app_listener| (app_listener.app_id.clone(), app_listener.sock.take().unwrap()))
+      .collect();
+    self.listeners.clear();
+    res
+  }
+
   fn add_application_listener(&mut self, app_id: &str, al: ApplicationListener, event_loop: &mut Poll) -> Option<ListenToken> {
     let front = al.front_address.clone();
     if let Ok(tok) = self.listeners.insert(al) {
       //FIXME: the +2 is probably not necessary here
       self.listeners[tok].token = Some(Token(self.base_token+2+tok.0));
       self.fronts.insert(String::from(app_id), tok);
-      event_loop.register(&self.listeners[tok].sock, Token(self.base_token+2+tok.0), Ready::readable(), PollOpt::edge());
+      if let Some(ref sock) = self.listeners[tok].sock {
+        event_loop.register(sock, Token(self.base_token+2+tok.0), Ready::readable(), PollOpt::edge());
+      }
       info!("started TCP listener for app {} on port {}", app_id, front.port());
       Some(tok)
     } else {
@@ -291,7 +302,7 @@ impl ServerConfiguration {
 
       let al = ApplicationListener {
         app_id:         String::from(app_id),
-        sock:           listener,
+        sock:           Some(listener),
         token:          None,
         front_address:  *front,
         back_addresses: addresses
@@ -311,7 +322,7 @@ impl ServerConfiguration {
     // an app can't have two listeners. Is this a problem?
     if let Some(&tok) = self.fronts.get(&app_id) {
       if self.listeners.contains(tok) {
-        event_loop.deregister(&self.listeners[tok].sock);
+        self.listeners[tok].sock.as_ref().map(|sock| event_loop.deregister(sock));
         self.listeners.remove(tok);
         warn!("removed server {:?}", tok);
         //self.listeners[tok].sock.shutdown(Shutdown::Both);
@@ -417,14 +428,14 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
         for listener in self.listeners.iter() {
-          event_loop.deregister(&listener.sock);
+          listener.sock.as_ref().map(|sock| event_loop.deregister(sock));
         }
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None}
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
         for listener in self.listeners.iter() {
-          event_loop.deregister(&listener.sock);
+          listener.sock.as_ref().map(|sock| event_loop.deregister(sock));
         }
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
       },
@@ -457,20 +468,24 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
       let internal_token = ListenToken(token.0 - 2 - self.base_token);
       if self.listeners.contains(internal_token) {
-        self.listeners[internal_token].sock.accept().map(|(frontend_sock, _)| {
-          frontend_sock.set_nodelay(true);
-          let c = Client::new(frontend_sock, internal_token, front_buf, back_buf);
-          incr_req!();
-          (c, true)
-        }).map_err(|e| {
-          match e.kind() {
-            ErrorKind::WouldBlock => AcceptError::WouldBlock,
-            other => {
-              error!("accept() IO error: {:?}", e);
-              AcceptError::IoError
+        if let Some(ref listener) = self.listeners[internal_token].sock.as_ref() {
+          listener.accept().map(|(frontend_sock, _)| {
+            frontend_sock.set_nodelay(true);
+            let c = Client::new(frontend_sock, internal_token, front_buf, back_buf);
+            incr_req!();
+            (c, true)
+          }).map_err(|e| {
+            match e.kind() {
+              ErrorKind::WouldBlock => AcceptError::WouldBlock,
+              other => {
+                error!("accept() IO error: {:?}", e);
+                AcceptError::IoError
+              }
             }
-          }
-        })
+          })
+        } else {
+          Err(AcceptError::IoError)
+        }
       } else {
         Err(AcceptError::IoError)
       }

@@ -72,7 +72,7 @@ impl Server {
 
     info!("will try to receive listeners");
     scm.set_blocking(false);
-    let mut listeners = scm.receive_listeners();
+    let listeners = scm.receive_listeners();
     scm.set_blocking(true);
     info!("received listeners: {:#?}", listeners);
     let mut listeners = listeners.unwrap_or(Listeners {
@@ -242,14 +242,7 @@ impl Server {
                   self.notify(msg);
                 } else if let Order::ReturnListenSockets = msg.order {
                   info!("received ReturnListenSockets order");
-                  self.scm.set_blocking(false);
-                  let res = self.scm.send_listeners(Listeners {
-                    http: self.http.as_ref().and_then(|http| http.configuration.listener.as_ref()).map(|listener| listener.as_raw_fd()),
-                    tls:  None,
-                    tcp:  Vec::new(),
-                  });
-                  self.scm.set_blocking(true);
-                  info!("sent default listeners: {:?}", res);
+                  self.return_listen_sockets();
                 } else {
                   self.notify(msg);
                 }
@@ -411,6 +404,40 @@ impl Server {
         self.tcp = Some(tcp);
       }
     }
+  }
+
+  pub fn return_listen_sockets(&mut self) {
+    self.scm.set_blocking(false);
+
+    let http_listener = self.http.as_mut()
+      .and_then(|http| http.configuration.give_back_listener());
+    if let Some(ref sock) = http_listener {
+      self.poll.deregister(sock);
+    }
+
+    let https_listener = self.https.as_mut()
+      .and_then(|https| https.configuration.give_back_listener());
+    if let Some(ref sock) = https_listener {
+      self.poll.deregister(sock);
+    }
+
+    let tcp_listeners = self.tcp.as_mut()
+      .map(|tcp| tcp.configuration.give_back_listeners()).unwrap_or(Vec::new());
+
+    for &(_, ref sock) in tcp_listeners.iter() {
+      self.poll.deregister(sock);
+    }
+
+    let res = self.scm.send_listeners(Listeners {
+      http: http_listener.map(|listener| listener.as_raw_fd()),
+      tls:  https_listener.map(|listener| listener.as_raw_fd()),
+      tcp:  tcp_listeners.into_iter().map(|(app_id, listener)| (app_id, listener.as_raw_fd())).collect(),
+    });
+
+    self.scm.set_blocking(true);
+
+    info!("sent default listeners: {:?}", res);
+
   }
 }
 
