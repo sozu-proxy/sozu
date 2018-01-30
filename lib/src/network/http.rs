@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap,HashSet};
 use std::io::{self,Read,Write,ErrorKind};
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
@@ -307,17 +307,20 @@ pub struct ServerConfiguration {
 
 impl ServerConfiguration {
   pub fn new(config: HttpProxyConfiguration, event_loop: &mut Poll, start_at:usize,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>) -> ServerConfiguration {
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>) -> (ServerConfiguration,HashSet<ListenToken>) {
 
     let front = config.front;
 
     let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
       error!("could not create listener {:?}: {:?}", front, e);
-    }).ok());
+   }).ok());
 
+    let mut listeners = HashSet::new();
     if let Some(ref sock) = listener {
       event_loop.register(sock, Token(start_at), Ready::readable(), PollOpt::edge());
+      listeners.insert(ListenToken(0));
     }
+
 
     let default = DefaultAnswers {
       NotFound: Vec::from(if config.answer_404.len() > 0 {
@@ -332,7 +335,7 @@ impl ServerConfiguration {
                 }),
     };
 
-    ServerConfiguration {
+    (ServerConfiguration {
       listener:       listener,
       address:        config.front,
       applications:   HashMap::new(),
@@ -341,8 +344,7 @@ impl ServerConfiguration {
       pool:           pool,
       answers:        default,
       config:         config,
-    }
-
+    }, listeners)
   }
 
   pub fn give_back_listener(&mut self) -> Option<TcpListener> {
@@ -831,8 +833,8 @@ pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel, max_buffers:
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  let configuration = ServerConfiguration::new(config, &mut event_loop, 1 + max_listeners, pool, None);
-  let session       = Session::new(max_listeners, max_buffers, 0, configuration, &mut event_loop);
+  let (configuration, listeners) = ServerConfiguration::new(config, &mut event_loop, 1 + max_listeners, pool, None);
+  let session       = Session::new(max_listeners, max_buffers, 0, configuration, listeners, &mut event_loop);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
   let mut server    = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
     Some(session), None, None, None);

@@ -12,7 +12,7 @@ use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
 use std::io::{self,Read,Write,ErrorKind,BufReader};
-use std::collections::HashMap;
+use std::collections::{HashMap,HashSet};
 use std::error::Error;
 use slab::Slab;
 use pool::{Pool,Checkout};
@@ -363,7 +363,8 @@ pub struct ServerConfiguration {
 
 impl ServerConfiguration {
   pub fn new(config: HttpsProxyConfiguration, base_token: usize, event_loop: &mut Poll, start_at: usize,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>) -> io::Result<ServerConfiguration> {
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>)
+      -> io::Result<(ServerConfiguration, HashSet<ListenToken>)> {
 
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let     domains  = TrieNode::root();
@@ -393,9 +394,10 @@ impl ServerConfiguration {
        error!("could not create listener {:?}: {:?}", fronts, e);
     }).ok());
 
-
+    let mut listeners = HashSet::new();
     if let Some(ref sock) = listener {
       event_loop.register(sock, Token(base_token), Ready::readable(), PollOpt::edge());
+      listeners.insert(ListenToken(0));
     }
 
     let default = DefaultAnswers {
@@ -411,7 +413,7 @@ impl ServerConfiguration {
         }),
     };
 
-    Ok(ServerConfiguration {
+    Ok((ServerConfiguration {
       listener:        listener,
       address:         config.front.clone(),
       applications:    HashMap::new(),
@@ -425,7 +427,7 @@ impl ServerConfiguration {
       base_token:      base_token,
       config:          config,
       ssl_options:     ssl_options,
-    })
+    }, listeners))
   }
 
   pub fn create_default_context(config: &HttpsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>, SslOption)> {
@@ -1158,10 +1160,10 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
   ));
 
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok(configuration) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop,
+  if let Ok((configuration, listeners)) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop,
     1 + max_listeners, pool, None) {
 
-    let session = Session::new(max_listeners, max_buffers, 6148914691236517205, configuration, &mut event_loop);
+    let session = Session::new(max_listeners, max_buffers, 6148914691236517205, configuration, listeners, &mut event_loop);
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
     let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
       None, Some(session), None, None);

@@ -85,23 +85,30 @@ impl Server {
     let max_buffers     = config.max_buffers;
     let http_session = config.http.and_then(|conf| conf.to_http()).map(|http_conf| {
       let max_listeners = 1;
-      let configuration = http::ServerConfiguration::new(http_conf, &mut event_loop, 1 + max_listeners, pool.clone(),
-        listeners.http.map(|fd| unsafe { TcpListener::from_raw_fd(fd) }));
+      let (configuration, listener_tokens) = http::ServerConfiguration::new(http_conf, &mut event_loop,
+        1 + max_listeners, pool.clone(), listeners.http.map(|fd| unsafe { TcpListener::from_raw_fd(fd) }));
 
-      Session::new(1, max_connections, 0, configuration, &mut event_loop)
+      Session::new(1, max_connections, 0, configuration, listener_tokens, &mut event_loop)
     });
 
     let https_session = config.https.and_then(|conf| conf.to_tls()).and_then(|https_conf| {
       let max_listeners   = 1;
-      tls::ServerConfiguration::new(https_conf, 6148914691236517205, &mut event_loop, 1 + max_listeners + 6148914691236517205, pool.clone(), listeners.tls.map(|fd| unsafe { TcpListener::from_raw_fd(fd) })).map(|configuration| {
-        Session::new(max_listeners, max_connections, 6148914691236517205, configuration, &mut event_loop)
+      tls::ServerConfiguration::new(https_conf, 6148914691236517205, &mut event_loop,
+        1 + max_listeners + 6148914691236517205, pool.clone(),
+        listeners.tls.map(|fd| unsafe { TcpListener::from_raw_fd(fd) })
+      ).map(|(configuration, listener_tokens)| {
+        Session::new(max_listeners, max_connections, 6148914691236517205, configuration,
+          listener_tokens, &mut event_loop)
       }).ok()
     });
 
     let tcp_session = config.tcp.map(|conf| {
-      let configuration = tcp::ServerConfiguration::new(conf.max_listeners, 12297829382473034410,  &mut event_loop, pool.clone(),
+      let (configuration, listener_tokens) = tcp::ServerConfiguration::new(conf.max_listeners,
+        12297829382473034410,  &mut event_loop, pool.clone(),
         listeners.tcp.drain(..).map(|(app_id, fd)| (app_id, unsafe { TcpListener::from_raw_fd(fd) })).collect());
-      Session::new(conf.max_listeners, max_buffers, 12297829382473034410, configuration, &mut event_loop)
+
+      Session::new(conf.max_listeners, max_buffers, 12297829382473034410, configuration, listener_tokens,
+        &mut event_loop)
     });
 
     Server::new(event_loop, channel, scm, http_session, https_session, tcp_session, Some(config_state))

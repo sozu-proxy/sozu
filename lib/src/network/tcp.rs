@@ -4,7 +4,7 @@ use mio::net::*;
 use mio::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
-use std::collections::HashMap;
+use std::collections::{HashMap,HashSet};
 use std::os::unix::io::RawFd;
 use std::os::unix::io::{FromRawFd,AsRawFd};
 use std::io::{self,Read,ErrorKind};
@@ -234,7 +234,7 @@ pub struct ServerConfiguration {
 
 impl ServerConfiguration {
   pub fn new(max_listeners: usize, start_at: usize, event_loop: &mut Poll, pool: Rc<RefCell<Pool<BufferQueue>>>,
-    mut tcp_listener: Vec<(AppId, TcpListener)>) -> ServerConfiguration {
+    mut tcp_listener: Vec<(AppId, TcpListener)>) -> (ServerConfiguration, HashSet<ListenToken>) {
 
     let mut configuration = ServerConfiguration {
       instances:     HashMap::new(),
@@ -243,6 +243,8 @@ impl ServerConfiguration {
       pool:          pool,
       base_token:    start_at,
     };
+
+    let mut listener_tokens = HashSet::new();
 
     for (app_id, listener) in tcp_listener.drain(..) {
       if let Ok(front) = listener.local_addr() {
@@ -253,11 +255,13 @@ impl ServerConfiguration {
           front_address:  front,
           back_addresses: Vec::new()
         };
-        configuration.add_application_listener(&app_id, al, event_loop);
+        if let Some(token) = configuration.add_application_listener(&app_id, al, event_loop) {
+          listener_tokens.insert(token);
+        }
       }
     }
 
-    configuration
+    (configuration, listener_tokens)
   }
 
   pub fn give_back_listeners(&mut self) -> Vec<(String, TcpListener)> {
@@ -518,8 +522,8 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
     let pool = Rc::new(RefCell::new(
       Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
     ));
-    let configuration = ServerConfiguration::new(10, 12297829382473034410, &mut poll, pool, Vec::new());
-    let session = Session::new(10, 500, 12297829382473034410, configuration, &mut poll);
+    let (configuration, tokens) = ServerConfiguration::new(10, 12297829382473034410, &mut poll, pool, Vec::new());
+    let session = Session::new(10, 500, 12297829382473034410, configuration, tokens, &mut poll);
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
     let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()),
       None, None, Some(session), None);
@@ -566,8 +570,8 @@ pub fn start(max_listeners: usize, max_buffers: usize, buffer_size:usize, channe
   let pool = Rc::new(RefCell::new(
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
-  let configuration     = ServerConfiguration::new(max_listeners, 12297829382473034410, &mut poll, pool, Vec::new());
-  let session           = Session::new(max_listeners, max_buffers, 12297829382473034410, configuration, &mut poll);
+  let (configuration, tokens) = ServerConfiguration::new(max_listeners, 12297829382473034410, &mut poll, pool, Vec::new());
+  let session           = Session::new(max_listeners, max_buffers, 12297829382473034410, configuration, tokens, &mut poll);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
   let mut server        = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), None, None, Some(session), None);
 

@@ -273,7 +273,9 @@ pub struct Session<ServerConfiguration,Client> {
 }
 
 impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<ServerConfiguration,Client> {
-  pub fn new(max_listeners: usize, max_connections: usize, base_token: usize, configuration: ServerConfiguration, poll: &mut Poll) -> Self {
+  pub fn new(max_listeners: usize, max_connections: usize, base_token: usize, configuration: ServerConfiguration,
+    accept_ready: HashSet<ListenToken>, poll: &mut Poll) -> Self {
+
     let clients = Slab::with_capacity(max_connections);
     let backend = Slab::with_capacity(max_connections);
     Session {
@@ -283,7 +285,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
       max_listeners:   max_listeners,
       max_connections: max_connections,
       shutting_down:   None,
-      accept_ready:    HashSet::new(),
+      accept_ready:    accept_ready,
       can_accept:      true,
       base_token:      base_token,
     }
