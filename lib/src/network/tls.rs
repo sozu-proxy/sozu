@@ -5,12 +5,14 @@ use std::rc::{Rc,Weak};
 use std::cell::RefCell;
 use std::mem;
 use std::net::Shutdown;
+use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd,AsRawFd};
 use mio::*;
 use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
 use std::io::{self,Read,Write,ErrorKind,BufReader};
-use std::collections::HashMap;
+use std::collections::{HashMap,HashSet};
 use std::error::Error;
 use slab::Slab;
 use pool::{Pool,Checkout};
@@ -30,6 +32,7 @@ use nom::IResult;
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
+use sozu_command::scm_socket::ScmSocket;
 use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,Order,HttpsFront,HttpsProxyConfiguration,OrderMessage,
   OrderMessageAnswer,OrderMessageStatus};
 
@@ -343,7 +346,7 @@ pub struct TlsData {
 }
 
 pub struct ServerConfiguration {
-  listener:        TcpListener,
+  listener:        Option<TcpListener>,
   address:         SocketAddr,
   applications:    HashMap<AppId, Application>,
   instances:       BackendMap,
@@ -360,7 +363,8 @@ pub struct ServerConfiguration {
 
 impl ServerConfiguration {
   pub fn new(config: HttpsProxyConfiguration, base_token: usize, event_loop: &mut Poll, start_at: usize,
-    pool: Rc<RefCell<Pool<BufferQueue>>>) -> io::Result<ServerConfiguration> {
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>)
+      -> io::Result<(ServerConfiguration, HashSet<ListenToken>)> {
 
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let     domains  = TrieNode::root();
@@ -386,47 +390,44 @@ impl ServerConfiguration {
     };
     fronts.insert(config.default_name.clone().unwrap_or(String::from("")), vec![app]);
 
-    match server_bind(&config.front) {
-      Ok(listener) => {
-        event_loop.register(&listener, Token(base_token), Ready::readable(), PollOpt::edge());
-        let default = DefaultAnswers {
-          NotFound: Vec::from(if config.answer_404.len() > 0 {
-              config.answer_404.as_bytes()
-            } else {
-              &b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-            }),
-          ServiceUnavailable: Vec::from(if config.answer_503.len() > 0 {
-              config.answer_503.as_bytes()
-            } else {
-              &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-            }),
-        };
+    let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
+       error!("could not create listener {:?}: {:?}", fronts, e);
+    }).ok());
 
-        Ok(ServerConfiguration {
-          listener:        listener,
-          address:         config.front.clone(),
-          applications:    HashMap::new(),
-          instances:       BackendMap::new(),
-          fronts:          fronts,
-          domains:         rc_domains,
-          default_context: tls_data,
-          contexts:        rc_ctx,
-          pool:            pool,
-          answers:         default,
-          base_token:      base_token,
-          config:          config,
-          ssl_options:     ssl_options,
-        })
-      },
-      Err(e) => {
-        let formatted_err = format!("could not create listener {:?}: {:?}", fronts, e);
-        error!("{}", formatted_err);
-        //FIXME: send message if we could not create the listener
-        //channel.write_message(&OrderMessageAnswer{id: String::from("listener_failed"), status: OrderMessageStatus::Error(formatted_err)});
-        //channel.run();
-        Err(e)
-      }
+    let mut listeners = HashSet::new();
+    if let Some(ref sock) = listener {
+      event_loop.register(sock, Token(base_token), Ready::readable(), PollOpt::edge());
+      listeners.insert(ListenToken(0));
     }
+
+    let default = DefaultAnswers {
+      NotFound: Vec::from(if config.answer_404.len() > 0 {
+          config.answer_404.as_bytes()
+        } else {
+          &b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+        }),
+      ServiceUnavailable: Vec::from(if config.answer_503.len() > 0 {
+          config.answer_503.as_bytes()
+        } else {
+          &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+        }),
+    };
+
+    Ok((ServerConfiguration {
+      listener:        listener,
+      address:         config.front.clone(),
+      applications:    HashMap::new(),
+      instances:       BackendMap::new(),
+      fronts:          fronts,
+      domains:         rc_domains,
+      default_context: tls_data,
+      contexts:        rc_ctx,
+      pool:            pool,
+      answers:         default,
+      base_token:      base_token,
+      config:          config,
+      ssl_options:     ssl_options,
+    }, listeners))
   }
 
   pub fn create_default_context(config: &HttpsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>, SslOption)> {
@@ -552,6 +553,10 @@ impl ServerConfiguration {
     } else {
       None
     }
+  }
+
+  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
+    self.listener.take()
   }
 
   pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
@@ -827,24 +832,29 @@ impl ServerConfiguration {
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   fn accept(&mut self, token: ListenToken) -> Result<(TlsClient,bool), AcceptError> {
-    self.listener.accept().map_err(|e| {
-      match e.kind() {
-        ErrorKind::WouldBlock => AcceptError::WouldBlock,
-        other => {
-          error!("accept() IO error: {:?}", e);
-          AcceptError::IoError
+    if let Some(ref sock) = self.listener {
+      sock.accept().map_err(|e| {
+        match e.kind() {
+          ErrorKind::WouldBlock => AcceptError::WouldBlock,
+          other => {
+            error!("accept() IO error: {:?}", e);
+            AcceptError::IoError
+          }
         }
-      }
-    }).and_then(|(frontend_sock, _)| {
-      frontend_sock.set_nodelay(true);
-      if let Ok(ssl) = Ssl::new(&self.default_context.context) {
-        let c = TlsClient::new(ssl, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address);
-        return Ok((c, false))
-      } else {
-        error!("could not create ssl context");
-        Err(AcceptError::IoError)
-      }
-    })
+      }).and_then(|(frontend_sock, _)| {
+        frontend_sock.set_nodelay(true);
+        if let Ok(ssl) = Ssl::new(&self.default_context.context) {
+          let c = TlsClient::new(ssl, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address);
+          return Ok((c, false))
+        } else {
+          error!("could not create ssl context");
+          Err(AcceptError::IoError)
+        }
+      })
+    } else {
+      error!("cannot accept connections, no listening socket available");
+      Err(AcceptError::IoError)
+    }
   }
 
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut TlsClient) -> Result<BackendConnectAction,ConnectionError> {
@@ -1072,12 +1082,16 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
-        event_loop.deregister(&self.listener);
+        if let Some(ref sock) = self.listener {
+          event_loop.deregister(sock);
+        }
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None }
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
-        event_loop.deregister(&self.listener);
+        if let Some(ref sock) = self.listener {
+          event_loop.deregister(sock);
+        }
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::Status => {
@@ -1146,9 +1160,13 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
   ));
 
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok(configuration) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop, 1 + max_listeners, pool) {
-    let session = Session::new(max_listeners, max_buffers, 6148914691236517205, configuration, &mut event_loop);
-    let mut server  = Server::new(event_loop, channel, None, Some(session), None, None);
+  if let Ok((configuration, listeners)) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop,
+    1 + max_listeners, pool, None) {
+
+    let session = Session::new(max_listeners, max_buffers, 6148914691236517205, configuration, listeners, &mut event_loop);
+    let (scm_server, scm_client) = UnixStream::pair().unwrap();
+    let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
+      None, Some(session), None, None);
 
     info!("starting event loop");
     server.run();
@@ -1295,7 +1313,7 @@ mod tests {
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1032").expect("test address 127.0.0.1:1032 should be parsed");
     let listener = net::TcpListener::bind(&front).expect("test address 127.0.0.1:1032 should be available");
     let server_config = ServerConfiguration {
-      listener:  listener,
+      listener:  Some(listener),
       address:   front,
       applications: HashMap::new(),
       instances: BackendMap::new(),

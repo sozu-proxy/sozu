@@ -18,10 +18,10 @@ use sozu_command::channel::Channel;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
 
 use command::{add_application,remove_application,dump_state,load_state,
-  save_state,soft_stop,hard_stop,upgrade,status,metrics,
+  save_state, soft_stop, hard_stop, upgrade_master, status,metrics,
   remove_backend, add_backend, remove_http_frontend, add_http_frontend,
   remove_tcp_frontend, add_tcp_frontend, add_certificate, remove_certificate,
-  query_application, logging_filter};
+  query_application, logging_filter, upgrade_worker};
 
 use cli::*;
 
@@ -42,7 +42,8 @@ fn main() {
         soft_stop(channel);
       }
     },
-    SubCmd::Upgrade => upgrade(channel, &config.command_socket_path()),
+    SubCmd::Upgrade { worker: None } => upgrade_master(channel, &config.command_socket_path()),
+    SubCmd::Upgrade { worker: Some(id) } => upgrade_worker(channel, timeout, id),
     SubCmd::Status{ json } => status(channel, json),
     SubCmd::Metrics{ json } => metrics(channel, json),
     SubCmd::Logging{ level } => logging_filter(channel, timeout, &level),

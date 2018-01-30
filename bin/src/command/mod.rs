@@ -19,6 +19,7 @@ use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 use sozu_command::messages::{OrderMessage,OrderMessageAnswer,OrderMessageStatus};
+use sozu_command::scm_socket::ScmSocket;
 
 pub mod orders;
 pub mod client;
@@ -53,10 +54,12 @@ pub struct Worker {
   pub pid:           pid_t,
   pub run_state:     RunState,
   pub queue:         VecDeque<OrderMessage>,
+  pub scm:           ScmSocket,
 }
 
 impl Worker {
-  pub fn new(id: u32, pid: pid_t, channel: Channel<OrderMessage,OrderMessageAnswer>, _: &Config) -> Worker {
+  pub fn new(id: u32, pid: pid_t, channel: Channel<OrderMessage,OrderMessageAnswer>, scm: ScmSocket, _: &Config)
+    -> Worker {
     Worker {
       id:         id,
       channel:    channel,
@@ -64,6 +67,7 @@ impl Worker {
       pid:        pid,
       run_state:  RunState::Running,
       queue:      VecDeque::new(),
+      scm:        scm,
     }
   }
 
@@ -571,7 +575,7 @@ impl CommandServer {
     self.proxies.remove(&token);
 
     let id = self.next_id;
-    if let Ok(mut worker) = start_worker(id, &self.config, &self.state) {
+    if let Ok(mut worker) = start_worker(id, &self.config, &self.state, None) {
       info!("created new worker: {}", id);
       self.next_id += 1;
       let worker_token = self.token_count + 1;

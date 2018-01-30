@@ -4,6 +4,7 @@
 extern crate hex;
 extern crate mio;
 extern crate pem;
+extern crate nix;
 extern crate toml;
 extern crate pool;
 extern crate sha2;
@@ -18,3 +19,4 @@ pub mod state;
 pub mod messages;
 pub mod channel;
 pub mod buffer;
+pub mod scm_socket;

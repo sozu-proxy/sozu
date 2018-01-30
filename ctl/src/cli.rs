@@ -16,7 +16,10 @@ pub enum SubCmd {
     hard: bool
   },
   #[structopt(name = "upgrade", about = "upgrade the proxy")]
-  Upgrade,
+  Upgrade {
+    #[structopt(short = "w", long = "worker", help = "Upgrade the worker with this id")]
+    worker: Option<u32>,
+  },
   #[structopt(name = "status", about = "gets information on the running workers")]
   Status {
     #[structopt(short = "j", long = "json", help = "Print the command result in JSON format")]
