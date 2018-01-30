@@ -26,7 +26,6 @@ impl ScmSocket {
       let _fd = stream.into_raw_fd();
     }
 
-    println!("creating scm socket from fd {}", fd);
     ScmSocket {
       fd,
       blocking: true,
@@ -82,7 +81,7 @@ impl ScmSocket {
 
     match self.rcv_msg(&mut buf, &mut received_fds) {
       Err(e) => {
-        println!("{} could not receive listeners: {:?}", self.fd, e);
+        error!("{} could not receive listeners: {:?}", self.fd, e);
         None
       },
       Ok((sz, fds_len)) => {
@@ -90,11 +89,10 @@ impl ScmSocket {
         match from_utf8(&buf[..sz]) {
           Ok(s) => match serde_json::from_str::<ListenersCount>(s) {
             Err(e) => {
-              println!("{} could not parse listeners list: {:?}", self.fd, e);
+              error!("{} could not parse listeners list: {:?}", self.fd, e);
               None
             },
             Ok(mut listeners_count) => {
-              println!("got listeners_count: {:?}", listeners_count);
               let mut index = 0;
               let http = if listeners_count.http {
                 index = 1;
@@ -119,7 +117,7 @@ impl ScmSocket {
             }
           }
           Err(e) => {
-            println!("{} could not parse listeners list: {:?}", self.fd, e);
+            error!("{} could not parse listeners list: {:?}", self.fd, e);
             None
           }
         }
@@ -137,12 +135,10 @@ impl ScmSocket {
 
     if fds.len() > 0 {
       let cmsgs = [socket::ControlMessage::ScmRights(fds)];
-      //socket::sendmsg(self.fd, &iov, &cmsgs, socket::MSG_DONTWAIT, None)?;
-      println!("{} send with data", self.fd);
+      //println!("{} send with data", self.fd);
       socket::sendmsg(self.fd, &iov, &cmsgs, flags, None)?;
     } else {
       println!("{} send empty", self.fd);
-      //socket::sendmsg(self.fd, &iov, &[], socket::MSG_DONTWAIT, None)?;
       socket::sendmsg(self.fd, &iov, &[], flags, None)?;
     };
     Ok(())
