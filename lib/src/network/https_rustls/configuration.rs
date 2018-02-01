@@ -9,6 +9,7 @@ use mio::*;
 use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
+use std::os::unix::io::{AsRawFd};
 use std::io::{self,Read,Write,ErrorKind,BufReader};
 use std::collections::{HashMap,HashSet};
 use std::error::Error;
@@ -23,6 +24,7 @@ use nom::IResult;
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
+use sozu_command::scm_socket::ScmSocket;
 use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,
   Order,HttpsFront,HttpsProxyConfiguration,OrderMessage, OrderMessageAnswer,
   OrderMessageStatus,AddCertificate,RemoveCertificate};
@@ -588,10 +590,6 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 pub type RustlsServer = Session<ServerConfiguration,TlsClient>;
 
 pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
-}
-
-/*
-pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_listeners   = 1;
 
@@ -600,9 +598,11 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
   ));
 
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok(configuration) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop, 1 + max_listeners, pool) {
-    let session = Session::new(max_listeners, max_buffers, 6148914691236517205, configuration, &mut event_loop);
-    let mut server  = Server::new(event_loop, channel, None, Some(session), None, None);
+  if let Ok((configuration, listeners)) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop, 1 + max_listeners, pool, None) {
+    let session = Session::new(max_listeners, max_buffers, 6148914691236517205, configuration, listeners, &mut event_loop);
+    let (scm_server, scm_client) = UnixStream::pair().unwrap();
+    let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
+      None, Some(session), None, None);
 
     info!("starting event loop");
     server.run();
@@ -610,115 +610,3 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
   }
 }
 
-#[cfg(test)]
-mod tests {
-  extern crate tiny_http;
-  use super::*;
-  use std::collections::HashMap;
-  use std::net::{TcpListener, TcpStream, Shutdown};
-  use std::io::{Read,Write};
-  use std::{thread,str};
-  use std::sync::mpsc::channel;
-  use std::net::SocketAddr;
-  use std::str::FromStr;
-  use std::time::Duration;
-  use std::rc::{Rc,Weak};
-  use std::sync::{Arc,Mutex};
-  use std::cell::RefCell;
-  use slab::Slab;
-  use pool::Pool;
-  use sozu_command::buffer::Buffer;
-  use network::buffer_queue::BufferQueue;
-  use network::http::DefaultAnswers;
-  use network::trie::TrieNode;
-  use sozu_command::messages::{Order,HttpsFront,Instance,OrderMessage,OrderMessageAnswer};
-  use openssl::ssl::{SslContext, SslMethod, Ssl, SslStream};
-  use openssl::x509::X509;
-
-  use mio::net;
-  #[test]
-  fn frontend_from_request_test() {
-    let app_id1 = "app_1".to_owned();
-    let app_id2 = "app_2".to_owned();
-    let app_id3 = "app_3".to_owned();
-    let uri1 = "/".to_owned();
-    let uri2 = "/yolo".to_owned();
-    let uri3 = "/yolo/swag".to_owned();
-
-    let mut fronts = HashMap::new();
-    fronts.insert("lolcatho.st".to_owned(), vec![
-      TlsApp {
-        app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1,
-        cert_fingerprint: CertFingerprint(vec!()),
-      },
-      TlsApp {
-        app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2,
-        cert_fingerprint: CertFingerprint(vec!()),
-      },
-      TlsApp {
-        app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3,
-        cert_fingerprint: CertFingerprint(vec!()),
-      }
-    ]);
-    fronts.insert("other.domain".to_owned(), vec![
-      TlsApp {
-        app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(),
-        cert_fingerprint: CertFingerprint(vec!()),
-      },
-    ]);
-
-    let contexts   = HashMap::new();
-    let rc_ctx     = Arc::new(Mutex::new(contexts));
-    let domains    = TrieNode::root();
-    let rc_domains = Arc::new(Mutex::new(domains));
-
-    let context    = SslContext::builder(SslMethod::tls()).expect("could not create a SslContextBuilder");
-
-    let tls_data = TlsData {
-      context:     context.build(),
-      certificate: vec!(),
-      refcount:    0,
-      initialized: false,
-    };
-
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1032").expect("test address 127.0.0.1:1032 should be parsed");
-    let listener = net::TcpListener::bind(&front).expect("test address 127.0.0.1:1032 should be available");
-    let server_config = ServerConfiguration {
-      listener:  listener,
-      address:   front,
-      applications: HashMap::new(),
-      instances: BackendMap::new(),
-      fronts:    fronts,
-      domains:   rc_domains,
-      default_context: tls_data,
-      contexts: rc_ctx,
-      pool:      Rc::new(RefCell::new(Pool::with_capacity(1, 0, || BufferQueue::with_capacity(16384)))),
-      base_token:    6148914691236517205,
-      answers:   DefaultAnswers {
-        NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
-        ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
-      },
-      config: Default::default(),
-      ssl_options: ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION | ssl::SSL_OP_NO_TICKET |
-        ssl::SSL_OP_NO_SSLV2 | ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1 | ssl::SSL_OP_NO_TLSV1_1,
-    };
-
-    println!("TEST {}", line!());
-    let frontend1 = server_config.frontend_from_request("lolcatho.st", "/");
-    assert_eq!(frontend1.expect("should find a frontend").app_id, "app_1");
-    println!("TEST {}", line!());
-    let frontend2 = server_config.frontend_from_request("lolcatho.st", "/test");
-    assert_eq!(frontend2.expect("should find a frontend").app_id, "app_1");
-    println!("TEST {}", line!());
-    let frontend3 = server_config.frontend_from_request("lolcatho.st", "/yolo/test");
-    assert_eq!(frontend3.expect("should find a frontend").app_id, "app_2");
-    println!("TEST {}", line!());
-    let frontend4 = server_config.frontend_from_request("lolcatho.st", "/yolo/swag");
-    assert_eq!(frontend4.expect("should find a frontend").app_id, "app_3");
-    println!("TEST {}", line!());
-    let frontend5 = server_config.frontend_from_request("domain", "/");
-    assert_eq!(frontend5, None);
-   // assert!(false);
-  }
-}
-*/
