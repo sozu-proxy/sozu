@@ -111,30 +111,6 @@ impl ServerConfiguration {
     let resolver = Arc::new(CertificateResolverWrapper::new());
     server_config.cert_resolver = resolver.clone();
 
-    let cert = CertificateAndKey {
-      certificate: config.default_certificate.as_ref().and_then(|v| from_utf8(v).ok())
-                     .unwrap_or(&include_str!("../../../assets/certificate.pem")[..]).to_string(),
-      key: config.default_key.as_ref().and_then(|v| from_utf8(v).ok())
-        .unwrap_or(&include_str!("../../../assets/key.pem")[..]).to_string(),
-      certificate_chain: config.default_certificate_chain.clone().map(split_certificate_chain).unwrap_or(vec!()),
-    };
-
-    if let Some(fingerprint) = resolver.add_certificate(AddCertificate{
-      certificate: cert,
-      names: Vec::new()
-    }) {
-      resolver.add_front(&fingerprint);
-
-      let app = TlsApp {
-        app_id:           config.default_app_id.clone().unwrap_or(String::new()),
-        hostname:         config.default_name.clone().unwrap_or(String::new()),
-        path_begin:       String::new(),
-        cert_fingerprint: fingerprint,
-      };
-
-      fronts.insert(config.default_name.clone().unwrap_or(String::from("")), vec![app]);
-    }
-
     Ok((ServerConfiguration {
       listener:        listener,
       address:         config.front.clone(),
@@ -525,9 +501,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::AddCertificate(add_certificate) => {
-        //info!("HTTPS\t{} add certificate: {:?}", id, certificate_and_key);
-          self.add_certificate(add_certificate, event_loop);
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        self.add_certificate(add_certificate, event_loop);
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::RemoveCertificate(remove_certificate) => {
         //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);

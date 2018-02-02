@@ -31,17 +31,21 @@ impl CertificateResolver {
 
   pub fn add_certificate(&mut self, add_certificate: AddCertificate) -> Option<CertFingerprint> {
     if let Some(certified_key) = generate_certified_key(add_certificate.certificate) {
-      //FIXME: waiting for https://github.com/briansmith/webpki/pull/65 to merge to get the DNS names
-      let mut names = vec!(String::from("lolcatho.st"));
+      if add_certificate.names.is_empty() {
+        //FIXME: waiting for https://github.com/briansmith/webpki/pull/65 to merge to get the DNS names
+        // create a untrusted::Input
+        // let input = untrusted::Input::from(&certs[0].0);
+        // create an EndEntityCert
+        // let ee = webpki::EndEntityCert::from(input).unwrap()
+        // get names
+        // let dns_names = ee.list_dns_names()
+        // names.extend(dns_names.drain(..).map(|name| name.to_String()));
+        unimplemented!("the rustls proxy cannot extract the names from the certificate");
+      }
+
+      let mut names = add_certificate.names;
       let fingerprint = calculate_fingerprint_from_der(&certified_key.cert[0].0);
       info!("cert fingerprint: {:?}", fingerprint);
-      // create a untrusted::Input
-      // let input = untrusted::Input::from(&certs[0].0);
-      // create an EndEntityCert
-      // let ee = webpki::EndEntityCert::from(input).unwrap()
-      // get names
-      // let dns_names = ee.list_dns_names()
-      // names.extend(dns_names.drain(..).map(|name| name.to_String()));
 
       let data = TlsData {
         cert:     certified_key,
@@ -65,15 +69,19 @@ impl CertificateResolver {
 
     if let Some(data) = self.certificates.get(&remove_certificate.fingerprint) {
       let cert = &data.cert.cert[0];
-      let names = vec!(String::from("https://lolcatho.st"));
+      if remove_certificate.names.is_empty() {
+        //FIXME: waiting for https://github.com/briansmith/webpki/pull/65 to merge to get the DNS names
+        // create a untrusted::Input
+        // let input = untrusted::Input::from(&certs[0].0);
+        // create an EndEntityCert
+        // let ee = webpki::EndEntityCert::from(input).unwrap()
+        // get names
+        // let dns_names = ee.list_dns_names()
+        // names.extend(dns_names.drain(..).map(|name| name.to_String()));
+        unimplemented!("the rustls proxy cannot extract the names from the certificate");
+      }
 
-      // create a untrusted::Input
-      // let input = untrusted::Input::from(&certs[0].0);
-      // create an EndEntityCert
-      // let ee = webpki::EndEntityCert::from(input).unwrap()
-      // get names
-      // let dns_names = ee.list_dns_names()
-      // names.extend(dns_names.drain(..).map(|name| name.to_String()));
+      let mut names = remove_certificate.names;
 
       for name in names {
         self.domains.domain_remove(&name.into_bytes());

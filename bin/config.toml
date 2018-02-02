@@ -50,6 +50,7 @@ key = "../lib/assets/key.pem" # optional
 certificate_chain = "../lib/assets/certificate_chain.pem" # optional
 #frontends = ["HTTP", "HTTPS"] # list of proxy tags
 backends  = [ "127.0.0.1:1026" ] # list of IP/port
+#tls_names = [ "lolcatho.st" ]
 #sticky_session = true
 
 [applications.TcpTest]
