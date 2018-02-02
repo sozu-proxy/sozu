@@ -10,7 +10,6 @@ pub mod socket;
 pub mod trie;
 pub mod protocol;
 pub mod http;
-pub mod tls;
 pub mod backends;
 pub mod retry;
 
@@ -20,6 +19,28 @@ mod splice;
 pub mod tcp;
 pub mod proxy;
 pub mod session;
+
+#[cfg(feature = "use_openssl")]
+pub mod https_openssl;
+
+#[cfg(feature = "use_openssl")]
+pub mod https {
+  pub type ServerConfiguration = https_openssl::ServerConfiguration;
+  pub type TlsClient           = https_openssl::TlsClient;
+
+  pub use super::https_openssl::configuration::start;
+}
+
+#[cfg(not(feature = "use_openssl"))]
+pub mod https_rustls;
+
+#[cfg(not(feature = "use_openssl"))]
+pub mod https {
+  pub type ServerConfiguration = super::https_rustls::configuration::ServerConfiguration;
+  pub type TlsClient           = super::https_rustls::client::TlsClient;
+
+  pub use super::https_rustls::configuration::start;
+}
 
 use mio::Token;
 

@@ -1,9 +1,11 @@
 use std::io::{self,ErrorKind,Read,Write};
 use std::net::{SocketAddr,SocketAddrV4,SocketAddrV6};
 use mio::tcp::{TcpListener,TcpStream};
-use openssl::ssl::{Error, SslStream};
+use rustls::{ServerSession, Session};
 use net2::TcpBuilder;
 use net2::unix::UnixTcpBuilderExt;
+#[cfg(feature = "use_openssl")]
+use openssl::ssl::{Error, SslStream};
 
 #[derive(Debug,PartialEq,Copy,Clone)]
 pub enum SocketResult {
@@ -71,6 +73,7 @@ impl SocketHandler for TcpStream {
   fn socket_ref(&self) -> &TcpStream { self }
 }
 
+#[cfg(feature = "use_openssl")]
 impl SocketHandler for SslStream<TcpStream> {
   fn socket_read(&mut self,  buf: &mut[u8]) -> (usize, SocketResult) {
     let mut size = 0usize;
@@ -116,6 +119,142 @@ impl SocketHandler for SslStream<TcpStream> {
   }
 
   fn socket_ref(&self) -> &TcpStream { self.get_ref() }
+}
+
+pub struct FrontRustls {
+  pub stream:  TcpStream,
+  pub session: ServerSession,
+}
+
+impl SocketHandler for FrontRustls {
+  fn socket_read(&mut self,  buf: &mut[u8]) -> (usize, SocketResult) {
+    let mut size = 0usize;
+    let mut can_read = true;
+
+    while self.session.wants_read() && can_read {
+      if size == buf.len() {
+        return (size, SocketResult::Continue);
+      }
+
+      match self.session.read_tls(&mut self.stream) {
+        Ok(0)  => can_read = false,
+        Ok(sz) => {},
+        Err(e) => match e.kind() {
+          ErrorKind::WouldBlock => {
+            error!("rustls socket_read wouldblock");
+            can_read = false;
+          },
+          _ => {
+            error!("could not read TLS stream from socket: {:?}", e);
+            return (size, SocketResult::Error)
+           }
+        }
+      }
+
+      if let Err(e) = self.session.process_new_packets() {
+        error!("could not process read TLS packets: {:?}", e);
+        return (size, SocketResult::Error);
+      }
+
+      match self.session.read(&mut buf[size..]) {
+        Ok(0)  => return (size, SocketResult::Continue),
+        Ok(sz) => size += sz,
+        Err(e) => match e.kind() {
+          ErrorKind::WouldBlock => {
+            return (size, SocketResult::WouldBlock);
+          },
+           _ => {
+             error!("could not read data from TLS stream: {:?}", e);
+            return (size, SocketResult::Error)
+           }
+        }
+
+      }
+    }
+
+    if can_read {
+    (size, SocketResult::Continue)
+    } else {
+    (size, SocketResult::WouldBlock)
+    }
+  }
+
+  fn socket_write(&mut self,  buf: &[u8]) -> (usize, SocketResult) {
+    let mut sent_size = 0usize;
+    let mut buffered_size = 0usize;
+    let mut can_write = true;
+
+    match self.session.write(buf) {
+      Ok(0)  => {
+      },
+      Ok(sz) => {
+        buffered_size += sz;
+      },
+      Err(e) => match e.kind() {
+        ErrorKind::WouldBlock => {
+          // we don't need to do anything, the session will return false in wants_write?
+          error!("rustls socket_write wouldblock");
+        },
+        _ => {
+          error!("could not write data to TLS stream: {:?}", e);
+          return (buffered_size, SocketResult::Error)
+        }
+      }
+    }
+
+    while self.session.wants_write() && can_write {
+      if sent_size == buf.len() {
+        return (buffered_size, SocketResult::Continue);
+      }
+
+      if sent_size == buffered_size && buffered_size < buf.len() {
+        match self.session.write(&buf[buffered_size..]) {
+          Ok(0)  => {
+          },
+          Ok(sz) => {
+            buffered_size += sz;
+          },
+          Err(e) => match e.kind() {
+            ErrorKind::WouldBlock => {
+              // we don't need to do anything, the session will return false in wants_write?
+              error!("rustls socket_write wouldblock");
+            },
+             _ => {
+               error!("could not write data to TLS stream: {:?}", e);
+              return (buffered_size, SocketResult::Error)
+             }
+          }
+        }
+
+      }
+
+
+      match self.session.write_tls(&mut self.stream) {
+        Ok(0)  => {
+          can_write = false;
+        },
+        Ok(sz) => {
+          sent_size += sz;
+        },
+        Err(e) => match e.kind() {
+          ErrorKind::WouldBlock => can_write = false,
+          _ => {
+            error!("could not write TLS stream to socket: {:?}", e);
+            return (buffered_size, SocketResult::Error)
+          }
+        }
+      }
+
+    }
+
+    if can_write {
+      (buffered_size, SocketResult::Continue)
+    } else {
+      (buffered_size, SocketResult::WouldBlock)
+    }
+  }
+
+  fn socket_ref(&self) -> &TcpStream { &self.stream }
 }
 
 pub fn server_bind(addr: &SocketAddr) -> io::Result<TcpListener> {

@@ -160,7 +160,9 @@ extern crate url;
 extern crate log;
 extern crate time;
 extern crate rand;
+#[cfg(feature = "use_openssl")]
 extern crate openssl;
+extern crate rustls;
 extern crate pool;
 extern crate uuid;
 extern crate net2;
@@ -170,6 +172,7 @@ extern crate mio_uds;
 extern crate hdrsample;
 extern crate sozu_command_lib as sozu_command;
 extern crate idna;
+extern crate webpki;
 
 #[macro_use] pub mod util;
 #[macro_use] pub mod logging;

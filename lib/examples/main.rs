@@ -87,7 +87,7 @@ fn main() {
   let jg2 = thread::spawn(move || {
     let max_buffers = 500;
     let buffer_size = 16384;
-    network::tls::start(config, channel2, max_buffers, buffer_size);
+    network::https::start(config, channel2, max_buffers, buffer_size);
   });
 
   let cert1 = include_str!("../assets/certificate.pem");
