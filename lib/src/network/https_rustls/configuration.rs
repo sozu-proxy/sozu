@@ -27,7 +27,7 @@ use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,
   Order,HttpsFront,HttpsProxyConfiguration,OrderMessage, OrderMessageAnswer,
-  OrderMessageStatus,AddCertificate,RemoveCertificate};
+  OrderMessageStatus,AddCertificate,RemoveCertificate,ReplaceCertificate};
 use sozu_command::certificate::split_certificate_chain;
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
@@ -208,6 +208,23 @@ impl ServerConfiguration {
   pub fn remove_certificate(&mut self, remove_certificate: RemoveCertificate, event_loop: &mut Poll) {
     debug!("removing certificate {:?}", remove_certificate);
     (*self.resolver).remove_certificate(remove_certificate)
+  }
+
+  pub fn replace_certificate(&mut self, replace_certificate: ReplaceCertificate, event_loop: &mut Poll) {
+    debug!("replacing certificate {:?}", replace_certificate);
+    let ReplaceCertificate { new_certificate, old_fingerprint, old_names, new_names } = replace_certificate;
+    let remove = RemoveCertificate {
+      fingerprint: old_fingerprint,
+      names: old_names,
+    };
+    let add = AddCertificate {
+      certificate: new_certificate,
+      names: new_names,
+    };
+
+    //FIXME: handle results
+    (*self.resolver).remove_certificate(remove);
+    (*self.resolver).add_certificate(add);
   }
 
   pub fn add_instance(&mut self, app_id: &str, instance_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
@@ -515,6 +532,12 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       Order::RemoveCertificate(remove_certificate) => {
         //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
         self.remove_certificate(remove_certificate, event_loop);
+        //FIXME: should return an error if certificate still has fronts referencing it
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+      },
+      Order::ReplaceCertificate(replace_certificate) => {
+        //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
+        self.replace_certificate(replace_certificate, event_loop);
         //FIXME: should return an error if certificate still has fronts referencing it
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
