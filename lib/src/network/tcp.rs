@@ -212,6 +212,116 @@ impl ProxyClient for Client {
     self.protocol.readiness()
   }
 
+  fn ready(&mut self) -> ClientResult {
+        let mut counter = 0;
+    let max_loop_iterations = 100000;
+
+    self.metrics().service_start();
+
+    let token = self.token.clone();
+    while counter < max_loop_iterations {
+      let front_interest = self.readiness().front_interest & self.readiness().front_readiness;
+      let back_interest  = self.readiness().back_interest & self.readiness().back_readiness;
+
+      //info!("PROXY\t{:?} {:?} | front: {:?} | back: {:?} ", token, self.readiness(), front_interest, back_interest);
+
+      if front_interest == UnixReady::from(Ready::empty()) && back_interest == UnixReady::from(Ready::empty()) {
+        break;
+      }
+
+      if front_interest.is_readable() {
+        let order = self.readable();
+        trace!("front readable\tinterpreting client order {:?}", order);
+
+        if order != ClientResult::Continue {
+          return order;
+        }
+      }
+
+      if back_interest.is_writable() {
+        let order = self.back_writable();
+        if order != ClientResult::Continue {
+          return order;
+        }
+      }
+
+      if back_interest.is_readable() {
+        let order = self.back_readable();
+        if order != ClientResult::Continue {
+          return order;
+        }
+      }
+
+      if front_interest.is_writable() {
+        let order = self.writable();
+        trace!("front writable\tinterpreting client order {:?}", order);
+        if order != ClientResult::Continue {
+          return order;
+        }
+      }
+
+      if front_interest.is_hup() {
+        let order = self.front_hup();
+        match order {
+          ClientResult::CloseClient |  ClientResult::CloseBoth => {
+            return order;
+          },
+          _ => {
+            self.readiness().front_readiness.remove(UnixReady::hup());
+            return order;
+          }
+        }
+      }
+
+      if back_interest.is_hup() {
+        let order = self.back_hup();
+        match order {
+          ClientResult::CloseClient |  ClientResult::CloseBoth => {
+            return order;
+          },
+          ClientResult::Continue => {
+            self.readiness().front_interest.insert(Ready::writable());
+            if ! self.readiness().front_readiness.is_writable() {
+              break;
+            }
+          },
+          _ => {
+            self.readiness().back_readiness.remove(UnixReady::hup());
+            return order;
+          }
+        };
+      }
+
+      if front_interest.is_error() || back_interest.is_error() {
+        if front_interest.is_error() {
+          error!("PROXY client {:?} front error, disconnecting", self.token);
+        } else {
+          error!("PROXY client {:?} back error, disconnecting", self.token);
+        }
+
+        self.readiness().front_interest = UnixReady::from(Ready::empty());
+        self.readiness().back_interest  = UnixReady::from(Ready::empty());
+        return ClientResult::CloseClient;
+      }
+
+      counter += 1;
+    }
+
+    if counter == max_loop_iterations {
+      error!("PROXY\thandling client {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.token, max_loop_iterations);
+
+      let front_interest = self.readiness().front_interest & self.readiness().front_readiness;
+      let back_interest  = self.readiness().back_interest & self.readiness().back_readiness;
+
+      let token = self.token.clone();
+      error!("PROXY\t{:?} readiness: {:?} | front: {:?} | back: {:?} ", token,
+        self.readiness(), front_interest, back_interest);
+
+      return ClientResult::CloseClient;
+    }
+
+    ClientResult::Continue
+  }
 }
 
 pub struct ApplicationListener {

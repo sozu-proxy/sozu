@@ -230,6 +230,7 @@ pub trait ProxyClient {
   fn readiness(&mut self)      -> &mut Readiness;
   fn protocol(&self)           -> Protocol;
   fn metrics(&mut self)        -> &mut SessionMetrics;
+  fn ready(&mut self)          -> ClientResult;
 }
 
 #[derive(Clone,Copy,Debug,PartialEq)]
@@ -528,138 +529,20 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
       }
     };
 
+    loop {
+    //self.client_ready(poll, client_token, events);
+      let order = self.clients[client_token].ready();
+      info!("client[{:?}] got events {:?} and returned order {:?}", client_token, events, order);
+      let is_connect = order == ClientResult::ConnectBackend;
+      self.interpret_client_order(poll, client_token, order);
 
-    let mut counter = 0;
-    let max_loop_iterations = 100000;
-
-    self.clients[client_token].metrics().service_start();
-
-    while counter < max_loop_iterations {
-
-      let front_interest = self.clients[client_token].readiness().front_interest &
-        self.clients[client_token].readiness().front_readiness;
-      let back_interest = self.clients[client_token].readiness().back_interest &
-        self.clients[client_token].readiness().back_readiness;
-
-      //info!("PROXY\t{:?} {:?} | {:?} front: {:?} | back: {:?} ", client_token, events, self.clients[client_token].readiness(), front_interest, back_interest);
-
-      if front_interest == UnixReady::from(Ready::empty()) && back_interest == UnixReady::from(Ready::empty()) {
+      // if we had to connect to a backend server, go back to the loop
+      // I'm not sure we would have anything to do right away, though,
+      // so maybe we can just stop there for that client?
+      // also the events would change?
+      if !is_connect {
         break;
       }
-
-      if !self.clients.contains(client_token) {
-        break;
-      }
-
-      if front_interest.is_readable() {
-        let order = self.clients[client_token].readable();
-        trace!("front readable\tinterpreting client order {:?}", order);
-
-        let front = self.from_front(client_token);
-
-        self.interpret_client_order(poll, client_token, order);
-        //self.clients[client_token].readiness().front_readiness.remove(Ready::readable());
-        if !self.clients.contains(client_token) {
-          break;
-        }
-
-      }
-
-      if back_interest.is_writable() {
-        let order = self.clients[client_token].back_writable();
-        self.interpret_client_order(poll, client_token, order);
-        //self.clients[client_token].readiness().back_readiness.remove(Ready::writable());
-        if !self.clients.contains(client_token) {
-          break;
-        }
-
-      }
-
-      if back_interest.is_readable() {
-        let order = self.clients[client_token].back_readable();
-
-        self.interpret_client_order(poll, client_token, order);
-        //self.clients[client_token].readiness().back_readiness.remove(Ready::readable());
-        if !self.clients.contains(client_token) {
-          break;
-        }
-
-      }
-
-      if front_interest.is_writable() {
-        let order = self.clients[client_token].writable();
-        trace!("front writable\tinterpreting client order {:?}", order);
-        self.interpret_client_order(poll, client_token, order);
-        //self.clients[client_token].readiness().front_readiness.remove(Ready::writable());
-      }
-
-      if !self.clients.contains(client_token) {
-        break;
-      }
-
-      if front_interest.is_hup() {
-        let order = self.clients[client_token].front_hup();
-        match order {
-          ClientResult::CloseClient |  ClientResult::CloseBoth => {
-            self.close_client(poll, client_token);
-            break;
-          },
-          _ => {
-            self.clients[client_token].readiness().front_readiness.remove(UnixReady::hup());
-            break;
-          }
-        }
-      }
-
-      if back_interest.is_hup() {
-        let order = self.clients[client_token].back_hup();
-        match order {
-          ClientResult::CloseClient |  ClientResult::CloseBoth => {
-            self.close_client(poll, client_token);
-            break;
-          },
-          ClientResult::Continue => {
-            self.clients[client_token].readiness().front_interest.insert(Ready::writable());
-            if ! self.clients[client_token].readiness().front_readiness.is_writable() {
-              break;
-            }
-          },
-          _ => {
-            self.clients[client_token].readiness().back_readiness.remove(UnixReady::hup());
-            break;
-          }
-        };
-      }
-
-      if front_interest.is_error() || back_interest.is_error() {
-        if front_interest.is_error() {
-          error!("PROXY client {:?} front error, disconnecting", client_token);
-        } else {
-          error!("PROXY client {:?} back error, disconnecting", client_token);
-        }
-
-        self.clients[client_token].readiness().front_interest = UnixReady::from(Ready::empty());
-        self.clients[client_token].readiness().back_interest  = UnixReady::from(Ready::empty());
-        self.close_client(poll, client_token);
-        break;
-      }
-
-      counter += 1;
-    }
-
-    if self.clients.contains(client_token) {
-      self.clients[client_token].metrics().service_stop();
-    }
-
-    if counter == max_loop_iterations {
-      error!("PROXY\thandling client {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", client_token, max_loop_iterations);
-      let front_interest = self.clients[client_token].readiness().front_interest &
-        self.clients[client_token].readiness().front_readiness;
-      let back_interest = self.clients[client_token].readiness().back_interest &
-        self.clients[client_token].readiness().back_readiness;
-      error!("PROXY\t{:?} events {:?} | readiness: {:?} | front: {:?} | back: {:?} ", client_token, events, self.clients[client_token].readiness(), front_interest, back_interest);
-
-      self.close_client(poll, client_token);
     }
   }
 
