@@ -182,6 +182,7 @@ pub struct FileAppConfig {
   pub certificate:       Option<String>,
   pub key:               Option<String>,
   pub certificate_chain: Option<String>,
+  pub tls_names:         Option<Vec<String>>,
   pub backends:          Vec<String>,
   pub sticky_session:    Option<bool>,
   pub https_redirect:    Option<bool>,
@@ -235,6 +236,7 @@ impl FileAppConfig {
         certificate:       certificate_opt,
         key:               key_opt,
         certificate_chain: chain_opt,
+        tls_names:         self.tls_names,
         backends:          self.backends,
         sticky_session:    sticky_session,
         https_redirect:    https_redirect,
@@ -251,6 +253,7 @@ pub struct HttpAppConfig {
   pub certificate:       Option<String>,
   pub key:               Option<String>,
   pub certificate_chain: Option<Vec<String>>,
+  pub tls_names:         Option<Vec<String>>,
   pub backends:          Vec<String>,
   pub sticky_session:    bool,
   pub https_redirect:    bool,
@@ -282,7 +285,7 @@ impl HttpAppConfig {
           certificate:       self.certificate.clone().unwrap(),
           certificate_chain: self.certificate_chain.clone().unwrap_or(vec!()),
         },
-        names: Vec::new(),
+        names: self.tls_names.clone().unwrap_or(vec!()),
       }));
 
       if let Some(f) = calculate_fingerprint(&self.certificate.as_ref().unwrap().as_bytes()[..]) {
