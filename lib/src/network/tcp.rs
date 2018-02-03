@@ -114,6 +114,40 @@ impl Client {
       self.log_context(), client, backend,
       response_time, service_time, self.metrics.bin, self.metrics.bout);
   }
+
+  fn front_hup(&mut self) -> ClientResult {
+    self.log_request();
+    self.protocol.front_hup()
+  }
+
+  fn back_hup(&mut self) -> ClientResult {
+    self.log_request();
+    self.protocol.back_hup()
+  }
+
+  fn log_context(&self) -> String {
+    if let Some(ref app_id) = self.app_id {
+      format!("{}\t{}\t", self.request_id, app_id)
+    } else {
+      format!("{}\tunknown\t", self.request_id)
+    }
+  }
+
+  fn readable(&mut self) -> ClientResult {
+    self.protocol.readable(&mut self.metrics)
+  }
+
+  fn writable(&mut self) -> ClientResult {
+    self.protocol.writable(&mut self.metrics)
+  }
+
+  fn back_readable(&mut self) -> ClientResult {
+    self.protocol.back_readable(&mut self.metrics)
+  }
+
+  fn back_writable(&mut self) -> ClientResult {
+    self.protocol.back_writable(&mut self.metrics)
+  }
 }
 
 impl ProxyClient for Client {
@@ -134,14 +168,6 @@ impl ProxyClient for Client {
   }
 
   fn close(&mut self) {
-  }
-
-  fn log_context(&self) -> String {
-    if let Some(ref app_id) = self.app_id {
-      format!("{}\t{}\t", self.request_id, app_id)
-    } else {
-      format!("{}\tunknown\t", self.request_id)
-    }
   }
 
   fn set_back_socket(&mut self, socket: TcpStream) {
@@ -180,32 +206,6 @@ impl ProxyClient for Client {
     self.backend       = None;
     self.backend_token = None;
     (self.app_id.clone(), addr)
-  }
-
-  fn front_hup(&mut self) -> ClientResult {
-    self.log_request();
-    self.protocol.front_hup()
-  }
-
-  fn back_hup(&mut self) -> ClientResult {
-    self.log_request();
-    self.protocol.back_hup()
-  }
-
-  fn readable(&mut self) -> ClientResult {
-    self.protocol.readable(&mut self.metrics)
-  }
-
-  fn writable(&mut self) -> ClientResult {
-    self.protocol.writable(&mut self.metrics)
-  }
-
-  fn back_readable(&mut self) -> ClientResult {
-    self.protocol.back_readable(&mut self.metrics)
-  }
-
-  fn back_writable(&mut self) -> ClientResult {
-    self.protocol.back_writable(&mut self.metrics)
   }
 
   fn readiness(&mut self) -> &mut Readiness {

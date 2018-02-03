@@ -126,6 +126,77 @@ impl Client {
       _ => None
     }
   }
+
+  fn front_hup(&mut self) -> ClientResult {
+    if self.backend_token == None {
+      ClientResult::CloseClient
+    } else {
+      ClientResult::CloseBoth
+    }
+  }
+
+  fn back_hup(&mut self) -> ClientResult {
+    match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Http(ref mut http)      => http.back_hup(),
+      State::WebSocket(ref mut pipe) => pipe.back_hup()
+    }
+  }
+
+  fn log_context(&self) -> String {
+    match *unwrap_msg!(self.protocol.as_ref()) {
+      State::Http(ref http) => {
+        if let Some(ref app_id) = http.app_id {
+          format!("{}\t{}\t", http.request_id, app_id)
+        } else {
+          format!("{}\tunknown\t", http.request_id)
+        }
+
+      },
+      _ => "".to_string()
+    }
+  }
+
+  // Read content from the client
+  fn readable(&mut self) -> ClientResult {
+    match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Http(ref mut http)      => http.readable(&mut self.metrics),
+      State::WebSocket(ref mut pipe) => pipe.readable(&mut self.metrics)
+    }
+  }
+
+  // Forward content to client
+  fn writable(&mut self) -> ClientResult {
+    match  *unwrap_msg!(self.protocol.as_mut()) {
+      State::Http(ref mut http)      => http.writable(&mut self.metrics),
+      State::WebSocket(ref mut pipe) => pipe.writable(&mut self.metrics)
+    }
+  }
+
+  // Forward content to application
+  fn back_writable(&mut self) -> ClientResult {
+    match *unwrap_msg!(self.protocol.as_mut())  {
+      State::Http(ref mut http)      => http.back_writable(&mut self.metrics),
+      State::WebSocket(ref mut pipe) => pipe.back_writable(&mut self.metrics)
+    }
+  }
+
+  // Read content from application
+  fn back_readable(&mut self) -> ClientResult {
+    let (upgrade, result) = match  *unwrap_msg!(self.protocol.as_mut())  {
+      State::Http(ref mut http)      => http.back_readable(&mut self.metrics),
+      State::WebSocket(ref mut pipe) => (ProtocolResult::Continue, pipe.back_readable(&mut self.metrics))
+    };
+
+    if upgrade == ProtocolResult::Continue {
+      result
+    } else {
+      self.upgrade();
+      match *unwrap_msg!(self.protocol.as_mut()) {
+        State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
+        _ => result
+      }
+    }
+  }
 }
 
 impl ProxyClient for Client {
@@ -162,20 +233,6 @@ impl ProxyClient for Client {
   }
 
   fn close(&mut self) {
-  }
-
-  fn log_context(&self) -> String {
-    match *unwrap_msg!(self.protocol.as_ref()) {
-      State::Http(ref http) => {
-        if let Some(ref app_id) = http.app_id {
-          format!("{}\t{}\t", http.request_id, app_id)
-        } else {
-          format!("{}\tunknown\t", http.request_id)
-        }
-
-      },
-      _ => "".to_string()
-    }
   }
 
   fn metrics(&mut self)        -> &mut SessionMetrics {
@@ -224,63 +281,6 @@ impl ProxyClient for Client {
     self.backend       = None;
     self.backend_token = None;
     (unwrap_msg!(self.http()).app_id.clone(), addr)
-  }
-
-  fn front_hup(&mut self) -> ClientResult {
-    if self.backend_token == None {
-      ClientResult::CloseClient
-    } else {
-      ClientResult::CloseBoth
-    }
-  }
-
-  fn back_hup(&mut self) -> ClientResult {
-    match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http)      => http.back_hup(),
-      State::WebSocket(ref mut pipe) => pipe.back_hup()
-    }
-  }
-
-  // Read content from the client
-  fn readable(&mut self) -> ClientResult {
-    match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http)      => http.readable(&mut self.metrics),
-      State::WebSocket(ref mut pipe) => pipe.readable(&mut self.metrics)
-    }
-  }
-
-  // Forward content to client
-  fn writable(&mut self) -> ClientResult {
-    match  *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http)      => http.writable(&mut self.metrics),
-      State::WebSocket(ref mut pipe) => pipe.writable(&mut self.metrics)
-    }
-  }
-
-  // Forward content to application
-  fn back_writable(&mut self) -> ClientResult {
-    match *unwrap_msg!(self.protocol.as_mut())  {
-      State::Http(ref mut http)      => http.back_writable(&mut self.metrics),
-      State::WebSocket(ref mut pipe) => pipe.back_writable(&mut self.metrics)
-    }
-  }
-
-  // Read content from application
-  fn back_readable(&mut self) -> ClientResult {
-    let (upgrade, result) = match  *unwrap_msg!(self.protocol.as_mut())  {
-      State::Http(ref mut http)      => http.back_readable(&mut self.metrics),
-      State::WebSocket(ref mut pipe) => (ProtocolResult::Continue, pipe.back_readable(&mut self.metrics))
-    };
-
-    if upgrade == ProtocolResult::Continue {
-      result
-    } else {
-      self.upgrade();
-      match *unwrap_msg!(self.protocol.as_mut()) {
-        State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
-        _ => result
-      }
-    }
   }
 
   fn ready(&mut self) -> ClientResult {

@@ -149,81 +149,6 @@ impl TlsClient {
       true
     }
   }
-}
-
-impl ProxyClient for TlsClient {
-  fn front_socket(&self) -> &TcpStream {
-    unwrap_msg!(self.front.as_ref())
-  }
-
-  fn back_socket(&self)  -> Option<&TcpStream> {
-    match unwrap_msg!(self.protocol.as_ref()) {
-      &State::Handshake(ref handshake) => None,
-      &State::Http(ref http)           => http.back_socket(),
-      &State::WebSocket(ref pipe)      => pipe.back_socket(),
-    }
-  }
-
-  fn front_token(&self)  -> Option<Token> {
-    self.front_token
-  }
-
-  fn back_token(&self)   -> Option<Token> {
-    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
-      http.back_token()
-    } else {
-      None
-    }
-  }
-
-  fn back_connected(&self)     -> BackendConnectionStatus {
-    self.back_connected
-  }
-
-  fn set_back_connected(&mut self, connected: BackendConnectionStatus) {
-    self.back_connected = connected;
-
-    if connected == BackendConnectionStatus::Connected {
-      self.instance.as_ref().map(|instance| {
-        let ref mut backend = *instance.borrow_mut();
-        backend.failures = 0;
-        backend.retry_policy.succeed();
-      });
-    }
-  }
-
-  fn close(&mut self) {
-    //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
-    self.http().map(|http| http.close());
-  }
-
-  fn log_context(&self)  -> String {
-    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
-      http.log_context()
-    } else {
-      "".to_string()
-    }
-  }
-
-  fn set_back_socket(&mut self, sock:TcpStream) {
-    unwrap_msg!(self.http()).set_back_socket(sock)
-  }
-
-  fn set_front_token(&mut self, token: Token) {
-    self.front_token = Some(token);
-    self.protocol.as_mut().map(|p| match *p {
-      State::Http(ref mut http) => http.set_front_token(token),
-      _                         => {}
-    });
-  }
-
-  fn set_back_token(&mut self, token: Token) {
-    unwrap_msg!(self.http()).set_back_token(token)
-  }
-
-  fn metrics(&mut self)        -> &mut SessionMetrics {
-    &mut self.metrics
-  }
 
   fn front_hup(&mut self)     -> ClientResult {
     self.http().map(|h| h.front_hup()).unwrap_or(ClientResult::CloseClient)
@@ -237,6 +162,14 @@ impl ProxyClient for TlsClient {
         error!("why a backend HUP event while still in frontend handshake?");
         ClientResult::CloseClient
       }
+    }
+  }
+
+  fn log_context(&self)  -> String {
+    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
+      http.log_context()
+    } else {
+      "".to_string()
     }
   }
 
@@ -296,6 +229,74 @@ impl ProxyClient for TlsClient {
       State::Http(ref mut http)           => http.back_writable(&mut self.metrics),
       State::WebSocket(ref mut pipe)      => pipe.back_writable(&mut self.metrics),
     }
+  }
+
+}
+
+impl ProxyClient for TlsClient {
+  fn front_socket(&self) -> &TcpStream {
+    unwrap_msg!(self.front.as_ref())
+  }
+
+  fn back_socket(&self)  -> Option<&TcpStream> {
+    match unwrap_msg!(self.protocol.as_ref()) {
+      &State::Handshake(ref handshake) => None,
+      &State::Http(ref http)           => http.back_socket(),
+      &State::WebSocket(ref pipe)      => pipe.back_socket(),
+    }
+  }
+
+  fn front_token(&self)  -> Option<Token> {
+    self.front_token
+  }
+
+  fn back_token(&self)   -> Option<Token> {
+    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
+      http.back_token()
+    } else {
+      None
+    }
+  }
+
+  fn back_connected(&self)     -> BackendConnectionStatus {
+    self.back_connected
+  }
+
+  fn set_back_connected(&mut self, connected: BackendConnectionStatus) {
+    self.back_connected = connected;
+
+    if connected == BackendConnectionStatus::Connected {
+      self.instance.as_ref().map(|instance| {
+        let ref mut backend = *instance.borrow_mut();
+        backend.failures = 0;
+        backend.retry_policy.succeed();
+      });
+    }
+  }
+
+  fn close(&mut self) {
+    //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
+    self.http().map(|http| http.close());
+  }
+
+  fn set_back_socket(&mut self, sock:TcpStream) {
+    unwrap_msg!(self.http()).set_back_socket(sock)
+  }
+
+  fn set_front_token(&mut self, token: Token) {
+    self.front_token = Some(token);
+    self.protocol.as_mut().map(|p| match *p {
+      State::Http(ref mut http) => http.set_front_token(token),
+      _                         => {}
+    });
+  }
+
+  fn set_back_token(&mut self, token: Token) {
+    unwrap_msg!(self.http()).set_back_token(token)
+  }
+
+  fn metrics(&mut self)        -> &mut SessionMetrics {
+    &mut self.metrics
   }
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {

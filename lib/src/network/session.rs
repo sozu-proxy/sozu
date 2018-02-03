@@ -214,18 +214,11 @@ pub trait ProxyClient {
   fn front_token(&self)  -> Option<Token>;
   fn back_token(&self)   -> Option<Token>;
   fn close(&mut self);
-  fn log_context(&self)  -> String;
   fn set_back_socket(&mut self, TcpStream);
   fn set_front_token(&mut self, token: Token);
   fn set_back_token(&mut self, token: Token);
   fn back_connected(&self)     -> BackendConnectionStatus;
   fn set_back_connected(&mut self, connected: BackendConnectionStatus);
-  fn front_hup(&mut self)     -> ClientResult;
-  fn back_hup(&mut self)      -> ClientResult;
-  fn readable(&mut self)      -> ClientResult;
-  fn writable(&mut self)      -> ClientResult;
-  fn back_readable(&mut self) -> ClientResult;
-  fn back_writable(&mut self) -> ClientResult;
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>);
   fn readiness(&mut self)      -> &mut Readiness;
   fn protocol(&self)           -> Protocol;
