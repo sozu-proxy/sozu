@@ -25,10 +25,10 @@ pub mod https_openssl;
 
 #[cfg(feature = "use_openssl")]
 pub mod https {
-  pub type ServerConfiguration = https_openssl::ServerConfiguration;
-  pub type TlsClient           = https_openssl::TlsClient;
+  pub type ServerConfiguration = super::https_openssl::ServerConfiguration;
+  pub type TlsClient           = super::https_openssl::TlsClient;
 
-  pub use super::https_openssl::configuration::start;
+  pub use super::https_openssl::start;
 }
 
 #[cfg(not(feature = "use_openssl"))]
