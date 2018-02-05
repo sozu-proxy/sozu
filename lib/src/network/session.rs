@@ -455,23 +455,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
       },
       Some(SocketType::BackClient) => {
         if let Some(tok) = self.get_client_token(token) {
-          self.clients[tok].metrics().service_start();
-
           self.clients[tok].readiness().back_readiness = self.clients[tok].readiness().back_readiness | UnixReady::from(events);
-
-          if self.clients[tok].back_connected() == BackendConnectionStatus::Connecting {
-            if self.clients[tok].readiness().back_readiness.is_hup() {
-              //retry connecting the backend
-              //FIXME: there should probably be a circuit breaker per client too
-              error!("error connecting to backend, trying again");
-              self.connect_to_backend(poll, tok);
-            } else {
-              self.clients[tok].set_back_connected(BackendConnectionStatus::Connected);
-            }
-          }
-
-          self.clients[tok].metrics().service_stop();
-
           tok
         } else {
           return;

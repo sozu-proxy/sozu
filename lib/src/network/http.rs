@@ -297,6 +297,18 @@ impl ProxyClient for Client {
 
     self.metrics().service_start();
 
+    if self.back_connected() == BackendConnectionStatus::Connecting {
+      if self.readiness().back_readiness.is_hup() {
+        //retry connecting the backend
+        //FIXME: there should probably be a circuit breaker per client too
+        error!("error connecting to backend, trying again");
+        self.metrics().service_stop();
+        return ClientResult::ConnectBackend;
+      } else {
+        self.set_back_connected(BackendConnectionStatus::Connected);
+      }
+    }
+
     let token = self.token.clone();
     while counter < max_loop_iterations {
       let front_interest = self.readiness().front_interest & self.readiness().front_readiness;

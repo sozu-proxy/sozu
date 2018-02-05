@@ -340,10 +340,22 @@ impl ProxyClient for TlsClient {
   }
 
   fn ready(&mut self) -> ClientResult {
-        let mut counter = 0;
+    let mut counter = 0;
     let max_loop_iterations = 100000;
 
     self.metrics().service_start();
+
+    if self.back_connected() == BackendConnectionStatus::Connecting {
+      if self.readiness().back_readiness.is_hup() {
+        //retry connecting the backend
+        //FIXME: there should probably be a circuit breaker per client too
+        error!("error connecting to backend, trying again");
+        self.metrics().service_stop();
+        return ClientResult::ConnectBackend;
+      } else {
+        self.set_back_connected(BackendConnectionStatus::Connected);
+      }
+    }
 
     let token = self.token.clone();
     while counter < max_loop_iterations {
