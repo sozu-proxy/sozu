@@ -211,12 +211,9 @@ impl SessionMetrics {
 pub trait ProxyClient {
   fn back_token(&self)   -> Option<Token>;
   fn close(&mut self, poll: &mut Poll);
-  fn back_connected(&self)     -> BackendConnectionStatus;
-  fn set_back_connected(&mut self, connected: BackendConnectionStatus);
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>);
   fn readiness(&mut self)      -> &mut Readiness;
   fn protocol(&self)           -> Protocol;
-  fn metrics(&mut self)        -> &mut SessionMetrics;
   fn ready(&mut self)          -> ClientResult;
 }
 

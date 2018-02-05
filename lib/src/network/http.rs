@@ -234,12 +234,6 @@ impl Client {
       State::WebSocket(ref mut pipe) => pipe.set_back_token(token)
     }
   }
-}
-
-impl ProxyClient for Client {
-  fn back_token(&self)   -> Option<Token> {
-    self.backend_token
-  }
 
   fn back_connected(&self)     -> BackendConnectionStatus {
     self.back_connected
@@ -257,6 +251,16 @@ impl ProxyClient for Client {
     }
   }
 
+  fn metrics(&mut self)        -> &mut SessionMetrics {
+    &mut self.metrics
+  }
+}
+
+impl ProxyClient for Client {
+  fn back_token(&self)   -> Option<Token> {
+    self.backend_token
+  }
+
   fn close(&mut self, poll: &mut Poll) {
     self.metrics.service_stop();
     self.front_socket().shutdown(Shutdown::Both);
@@ -265,10 +269,6 @@ impl ProxyClient for Client {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
     }
-  }
-
-  fn metrics(&mut self)        -> &mut SessionMetrics {
-    &mut self.metrics
   }
 
   fn readiness(&mut self) -> &mut Readiness {

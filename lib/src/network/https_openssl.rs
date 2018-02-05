@@ -277,17 +277,6 @@ impl TlsClient {
   fn set_back_token(&mut self, token: Token) {
     unwrap_msg!(self.http()).set_back_token(token)
   }
-}
-
-impl ProxyClient for TlsClient {
-
-  fn back_token(&self)   -> Option<Token> {
-    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
-      http.back_token()
-    } else {
-      None
-    }
-  }
 
   fn back_connected(&self)     -> BackendConnectionStatus {
     self.back_connected
@@ -305,6 +294,21 @@ impl ProxyClient for TlsClient {
     }
   }
 
+  fn metrics(&mut self)        -> &mut SessionMetrics {
+    &mut self.metrics
+  }
+}
+
+impl ProxyClient for TlsClient {
+
+  fn back_token(&self)   -> Option<Token> {
+    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
+      http.back_token()
+    } else {
+      None
+    }
+  }
+
   fn close(&mut self, poll: &mut Poll) {
     //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
     self.http().map(|http| http.close());
@@ -315,10 +319,6 @@ impl ProxyClient for TlsClient {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
     }
-  }
-
-  fn metrics(&mut self)        -> &mut SessionMetrics {
-    &mut self.metrics
   }
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {

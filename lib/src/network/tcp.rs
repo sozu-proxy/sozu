@@ -174,6 +174,19 @@ impl Client {
     self.backend_token = Some(token);
     self.protocol.set_back_token(token);
   }
+
+  fn back_connected(&self)     -> BackendConnectionStatus {
+    //FIXME: handle backends correctly when refactoring the TCP proxy
+    BackendConnectionStatus::Connected
+  }
+
+  fn set_back_connected(&mut self, _: BackendConnectionStatus) {
+  }
+
+  fn metrics(&mut self)        -> &mut SessionMetrics {
+    &mut self.metrics
+  }
+
 }
 
 impl ProxyClient for Client {
@@ -189,18 +202,6 @@ impl ProxyClient for Client {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
     }
-  }
-
-  fn back_connected(&self)     -> BackendConnectionStatus {
-    //FIXME: handle backends correctly when refactoring the TCP proxy
-    BackendConnectionStatus::Connected
-  }
-
-  fn set_back_connected(&mut self, _: BackendConnectionStatus) {
-  }
-
-  fn metrics(&mut self)        -> &mut SessionMetrics {
-    &mut self.metrics
   }
 
   fn protocol(&self)           -> Protocol {
