@@ -148,33 +148,17 @@ impl Client {
   fn back_writable(&mut self) -> ClientResult {
     self.protocol.back_writable(&mut self.metrics)
   }
-}
 
-impl ProxyClient for Client {
   fn front_socket(&self) -> &TcpStream {
     self.protocol.front_socket()
-  }
-
-  fn back_socket(&self)  -> Option<&TcpStream> {
-    self.protocol.back_socket()
   }
 
   fn front_token(&self)  -> Option<Token> {
     self.protocol.front_token()
   }
 
-  fn back_token(&self)   -> Option<Token> {
-    self.protocol.back_token()
-  }
-
-  fn close(&mut self, poll: &mut Poll) {
-    self.metrics.service_stop();
-    self.front_socket().shutdown(Shutdown::Both);
-    poll.deregister(self.front_socket());
-    if let Some(sock) = self.back_socket() {
-      sock.shutdown(Shutdown::Both);
-      poll.deregister(sock);
-    }
+  fn back_socket(&self)  -> Option<&TcpStream> {
+    self.protocol.back_socket()
   }
 
   fn set_back_socket(&mut self, socket: TcpStream) {
@@ -189,6 +173,22 @@ impl ProxyClient for Client {
   fn set_back_token(&mut self, token: Token) {
     self.backend_token = Some(token);
     self.protocol.set_back_token(token);
+  }
+}
+
+impl ProxyClient for Client {
+  fn back_token(&self)   -> Option<Token> {
+    self.protocol.back_token()
+  }
+
+  fn close(&mut self, poll: &mut Poll) {
+    self.metrics.service_stop();
+    self.front_socket().shutdown(Shutdown::Both);
+    poll.deregister(self.front_socket());
+    if let Some(sock) = self.back_socket() {
+      sock.shutdown(Shutdown::Both);
+      poll.deregister(sock);
+    }
   }
 
   fn back_connected(&self)     -> BackendConnectionStatus {

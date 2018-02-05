@@ -245,9 +245,7 @@ impl TlsClient {
       State::WebSocket(ref mut pipe)      => pipe.back_writable(&mut self.metrics),
     }
   }
-}
 
-impl ProxyClient for TlsClient {
   fn front_socket(&self) -> &TcpStream {
     unwrap_msg!(self.front.as_ref())
   }
@@ -263,6 +261,25 @@ impl ProxyClient for TlsClient {
   fn front_token(&self)  -> Option<Token> {
     self.front_token
   }
+
+  fn set_back_socket(&mut self, sock:TcpStream) {
+    unwrap_msg!(self.http()).set_back_socket(sock)
+  }
+
+  fn set_front_token(&mut self, token: Token) {
+    self.front_token = Some(token);
+    self.protocol.as_mut().map(|p| match *p {
+      State::Http(ref mut http) => http.set_front_token(token),
+      _                         => {}
+    });
+  }
+
+  fn set_back_token(&mut self, token: Token) {
+    unwrap_msg!(self.http()).set_back_token(token)
+  }
+}
+
+impl ProxyClient for TlsClient {
 
   fn back_token(&self)   -> Option<Token> {
     if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
@@ -298,22 +315,6 @@ impl ProxyClient for TlsClient {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
     }
-  }
-
-  fn set_back_socket(&mut self, sock:TcpStream) {
-    unwrap_msg!(self.http()).set_back_socket(sock)
-  }
-
-  fn set_front_token(&mut self, token: Token) {
-    self.front_token = Some(token);
-    self.protocol.as_mut().map(|p| match *p {
-      State::Http(ref mut http) => http.set_front_token(token),
-      _                         => {}
-    });
-  }
-
-  fn set_back_token(&mut self, token: Token) {
-    unwrap_msg!(self.http()).set_back_token(token)
   }
 
   fn metrics(&mut self)        -> &mut SessionMetrics {

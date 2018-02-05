@@ -209,14 +209,8 @@ impl SessionMetrics {
 }
 
 pub trait ProxyClient {
-  fn front_socket(&self) -> &TcpStream;
-  fn back_socket(&self)  -> Option<&TcpStream>;
-  fn front_token(&self)  -> Option<Token>;
   fn back_token(&self)   -> Option<Token>;
   fn close(&mut self, poll: &mut Poll);
-  fn set_back_socket(&mut self, TcpStream);
-  fn set_front_token(&mut self, token: Token);
-  fn set_back_token(&mut self, token: Token);
   fn back_connected(&self)     -> BackendConnectionStatus;
   fn set_back_connected(&mut self, connected: BackendConnectionStatus);
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>);

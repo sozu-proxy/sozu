@@ -198,9 +198,7 @@ impl Client {
       }
     }
   }
-}
 
-impl ProxyClient for Client {
   fn front_socket(&self) -> &TcpStream {
     self.frontend.socket_ref()
   }
@@ -213,6 +211,32 @@ impl ProxyClient for Client {
     self.token
   }
 
+  fn set_back_socket(&mut self, socket: TcpStream) {
+    match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Http(ref mut http)      => http.set_back_socket(unwrap_msg!(socket.try_clone())),
+      State::WebSocket(ref mut pipe) => {} /*pipe.set_back_socket(unwrap_msg!(socket.try_clone()))*/
+    }
+    self.backend         = Some(socket);
+  }
+
+  fn set_front_token(&mut self, token: Token) {
+    self.token         = Some(token);
+    match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Http(ref mut http)      => http.set_front_token(token),
+      State::WebSocket(ref mut pipe) => pipe.set_front_token(token)
+    }
+  }
+
+  fn set_back_token(&mut self, token: Token) {
+    self.backend_token = Some(token);
+    match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Http(ref mut http)      => http.set_back_token(token),
+      State::WebSocket(ref mut pipe) => pipe.set_back_token(token)
+    }
+  }
+}
+
+impl ProxyClient for Client {
   fn back_token(&self)   -> Option<Token> {
     self.backend_token
   }
@@ -245,30 +269,6 @@ impl ProxyClient for Client {
 
   fn metrics(&mut self)        -> &mut SessionMetrics {
     &mut self.metrics
-  }
-
-  fn set_back_socket(&mut self, socket: TcpStream) {
-    match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http)      => http.set_back_socket(unwrap_msg!(socket.try_clone())),
-      State::WebSocket(ref mut pipe) => {} /*pipe.set_back_socket(unwrap_msg!(socket.try_clone()))*/
-    }
-    self.backend         = Some(socket);
-  }
-
-  fn set_front_token(&mut self, token: Token) {
-    self.token         = Some(token);
-    match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http)      => http.set_front_token(token),
-      State::WebSocket(ref mut pipe) => pipe.set_front_token(token)
-    }
-  }
-
-  fn set_back_token(&mut self, token: Token) {
-    self.backend_token = Some(token);
-    match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http)      => http.set_back_token(token),
-      State::WebSocket(ref mut pipe) => pipe.set_back_token(token)
-    }
   }
 
   fn readiness(&mut self) -> &mut Readiness {
