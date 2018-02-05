@@ -12,6 +12,7 @@ pub mod protocol;
 pub mod http;
 pub mod backends;
 pub mod retry;
+pub mod proxy_protocol;
 
 #[cfg(feature = "splice")]
 mod splice;
