@@ -14,7 +14,7 @@ use mio::unix::UnixReady;
 use std::io::{self,Read,Write,ErrorKind,BufReader};
 use std::collections::{HashMap,HashSet};
 use std::error::Error;
-use slab::Slab;
+use slab::{Slab,VacantEntry};
 use pool::{Pool,Checkout};
 use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
@@ -942,7 +942,8 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
-  fn accept(&mut self, token: ListenToken) -> Result<(TlsClient,bool), AcceptError> {
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<Client, FrontToken>,
+           client_token: Token) -> Result<(FrontToken,bool), AcceptError> {
     if let Some(ref sock) = self.listener {
       sock.accept().map_err(|e| {
         match e.kind() {
@@ -955,8 +956,21 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       }).and_then(|(frontend_sock, _)| {
         frontend_sock.set_nodelay(true);
         if let Ok(ssl) = Ssl::new(&self.default_context.context) {
-          let c = TlsClient::new(ssl, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address);
-          return Ok((c, false))
+          let mut c = TlsClient::new(ssl, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address);
+          c.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+
+          c.set_front_token(client_token);
+          poll.register(
+            c.front_socket(),
+            client_token,
+            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+            PollOpt::edge()
+          );
+
+          let index = entry.index();
+          entry.insert(c);
+
+          return Ok((index, false))
         } else {
           error!("could not create ssl context");
           Err(AcceptError::IoError)

@@ -10,7 +10,7 @@ use std::os::unix::io::{FromRawFd,AsRawFd};
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
 use std::error::Error;
-use slab::Slab;
+use slab::{Slab,VacantEntry};
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::net::SocketAddr;
@@ -576,7 +576,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: ListenToken) -> Result<(Client, bool), AcceptError> {
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<Client, FrontToken>,
+           client_token: Token) -> Result<(FrontToken, bool), AcceptError> {
     let mut p = (*self.pool).borrow_mut();
 
     if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
@@ -585,9 +586,22 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         if let Some(ref listener) = self.listeners[internal_token].sock.as_ref() {
           listener.accept().map(|(frontend_sock, _)| {
             frontend_sock.set_nodelay(true);
-            let c = Client::new(frontend_sock, internal_token, front_buf, back_buf);
+            let mut c = Client::new(frontend_sock, internal_token, front_buf, back_buf);
             incr_req!();
-            (c, true)
+
+            c.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+            c.set_front_token(client_token);
+            poll.register(
+              c.front_socket(),
+              client_token,
+              Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+              PollOpt::edge()
+            );
+
+            let index = entry.index();
+            entry.insert(c);
+
+            (index, true)
           }).map_err(|e| {
             match e.kind() {
               ErrorKind::WouldBlock => AcceptError::WouldBlock,

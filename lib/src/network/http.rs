@@ -17,6 +17,7 @@ use uuid::Uuid;
 use nom::{HexDisplay,IResult};
 use rand::random;
 use time::{SteadyTime,Duration};
+use slab::VacantEntry;
 
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
@@ -838,7 +839,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: ListenToken) -> Result<(Client, bool), AcceptError> {
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<Client, FrontToken>,
+           client_token: Token) -> Result<(FrontToken, bool), AcceptError> {
     if let Some(ref sock) = self.listener {
       sock.accept().map_err(|e| {
         match e.kind() {
@@ -851,9 +853,19 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       }).and_then(|(frontend_sock, _)| {
         frontend_sock.set_nodelay(true);
         if let Some(mut c) = Client::new(frontend_sock, Rc::downgrade(&self.pool), self.config.public_address) {
-          c.readiness().front_interest.insert(Ready::readable());
-          c.readiness().back_interest.remove(Ready::readable() | Ready::writable());
-          Ok((c, false))
+          c.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+          c.set_front_token(client_token);
+          poll.register(
+            c.front_socket(),
+            client_token,
+            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+            PollOpt::edge()
+          );
+
+          let index = entry.index();
+          entry.insert(c);
+
+          Ok((index, false))
         } else {
           Err(AcceptError::TooManyClients)
         }

@@ -10,7 +10,7 @@ use std::collections::{HashSet,HashMap};
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
 use std::error::Error;
-use slab::Slab;
+use slab::{Slab,VacantEntry};
 use std::io::Write;
 use std::str::FromStr;
 use std::marker::PhantomData;
@@ -250,7 +250,8 @@ pub enum AcceptError {
 pub trait ProxyConfiguration<Client> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client:&mut Client) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
-  fn accept(&mut self, token: ListenToken) -> Result<(Client, bool), AcceptError>;
+  fn accept(&mut self, token: ListenToken, event_loop: &mut Poll, entry: VacantEntry<Client, FrontToken>,
+           client_token: Token) -> Result<(FrontToken, bool), AcceptError>;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
 }
 
@@ -297,6 +298,10 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
     Token(token.0 + 2 + self.max_listeners + self.base_token)
   }
 
+  pub fn from_front_add(&self) -> usize {
+    2 + self.max_listeners + self.base_token
+  }
+
   pub fn from_back(&self, token: BackToken) -> Token {
     Token(token.0 + 2 + self.max_listeners + self.max_connections + self.base_token)
   }
@@ -337,7 +342,14 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
   }
 
   pub fn accept(&mut self, poll: &mut Poll, token: ListenToken) -> bool {
-    match self.configuration.accept(token) {
+    let add = self.from_front_add();
+    let res = {
+      let entry = self.clients.vacant_entry().expect("FIXME");
+      let client_token = Token(entry.index().0 + add);
+      self.configuration.accept(token, poll, entry, client_token)
+    };
+
+    match res {
       Err(AcceptError::IoError) => {
         //FIXME: do we stop accepting?
         false
@@ -350,30 +362,12 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
         self.accept_ready.remove(&token);
         false
       },
-      Ok((client, should_connect)) => {
-        if let Ok(client_token) = self.clients.insert(client) {
-          self.clients[client_token].readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-          poll.register(
-            self.clients[client_token].front_socket(),
-            self.from_front(client_token),
-            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-            PollOpt::edge()
-          );
-          let front = self.from_front(client_token);
-          &self.clients[client_token].set_front_token(front);
-
-          let front = self.from_front(client_token);
-          incr!("client.connections");
-          if should_connect {
-            self.connect_to_backend(poll, client_token);
-          }
-
-          // should continue accepting
-          true
-        } else {
-          error!("PROXY\tcould not add client to slab");
-          false
+      Ok((client_token, should_connect)) => {
+        if should_connect {
+           self.connect_to_backend(poll, client_token);
         }
+
+        true
       }
     }
   }
