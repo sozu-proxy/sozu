@@ -213,7 +213,7 @@ pub trait ProxyClient {
   fn back_socket(&self)  -> Option<&TcpStream>;
   fn front_token(&self)  -> Option<Token>;
   fn back_token(&self)   -> Option<Token>;
-  fn close(&mut self);
+  fn close(&mut self, poll: &mut Poll);
   fn set_back_socket(&mut self, TcpStream);
   fn set_front_token(&mut self, token: Token);
   fn set_back_token(&mut self, token: Token);
@@ -317,16 +317,8 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
   }
 
   pub fn close_client(&mut self, poll: &mut Poll, token: FrontToken) {
-    self.clients[token].metrics().service_stop();
-    self.clients[token].front_socket().shutdown(Shutdown::Both);
-    poll.deregister(self.clients[token].front_socket());
-    if let Some(sock) = self.clients[token].back_socket() {
-      sock.shutdown(Shutdown::Both);
-      poll.deregister(sock);
-    }
-
     self.close_backend(token);
-    self.clients[token].close();
+    self.clients[token].close(poll);
     self.clients.remove(token);
     decr!("client.connections");
 
@@ -336,8 +328,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
   pub fn close_backend(&mut self, token: FrontToken) {
     if let Some(backend_tk) = self.clients[token].back_token() {
       let backend_token = self.to_back(backend_tk);
-      if self.backend.contains(backend_token) {
-        self.backend.remove(backend_token);
+      if let Some(_) = self.backend.remove(backend_token) {
         if let (Some(app_id), Some(addr)) = self.clients[token].remove_backend() {
           self.configuration.close_backend(app_id, &addr);
           decr!("backend.connections");

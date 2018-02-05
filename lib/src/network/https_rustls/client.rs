@@ -274,9 +274,16 @@ impl ProxyClient for TlsClient {
     }
   }
 
-  fn close(&mut self) {
+  fn close(&mut self, poll: &mut Poll) {
     //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
     self.http().map(|http| http.close());
+    self.metrics.service_stop();
+    self.front_socket().shutdown(Shutdown::Both);
+    poll.deregister(self.front_socket());
+    if let Some(sock) = self.back_socket() {
+      sock.shutdown(Shutdown::Both);
+      poll.deregister(sock);
+    }
   }
 
   fn set_back_socket(&mut self, sock:TcpStream) {

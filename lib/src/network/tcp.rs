@@ -13,7 +13,7 @@ use std::error::Error;
 use slab::{Slab,Entry,VacantEntry};
 use std::rc::Rc;
 use std::cell::RefCell;
-use std::net::SocketAddr;
+use std::net::{SocketAddr,Shutdown};
 use std::str::FromStr;
 use std::borrow::BorrowMut;
 use time::{Duration,precise_time_s};
@@ -167,7 +167,14 @@ impl ProxyClient for Client {
     self.protocol.back_token()
   }
 
-  fn close(&mut self) {
+  fn close(&mut self, poll: &mut Poll) {
+    self.metrics.service_stop();
+    self.front_socket().shutdown(Shutdown::Both);
+    poll.deregister(self.front_socket());
+    if let Some(sock) = self.back_socket() {
+      sock.shutdown(Shutdown::Both);
+      poll.deregister(sock);
+    }
   }
 
   fn set_back_socket(&mut self, socket: TcpStream) {

@@ -233,7 +233,14 @@ impl ProxyClient for Client {
     }
   }
 
-  fn close(&mut self) {
+  fn close(&mut self, poll: &mut Poll) {
+    self.metrics.service_stop();
+    self.front_socket().shutdown(Shutdown::Both);
+    poll.deregister(self.front_socket());
+    if let Some(sock) = self.back_socket() {
+      sock.shutdown(Shutdown::Both);
+      poll.deregister(sock);
+    }
   }
 
   fn metrics(&mut self)        -> &mut SessionMetrics {
