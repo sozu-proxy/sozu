@@ -31,8 +31,9 @@ use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol
 use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken,ListenClient};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
-use network::protocol::Pipe;
 use network::{http,https};
+use network::protocol::{Pipe, ProtocolResult};
+use network::protocol::proxy_protocol::ProxyProtocol;
 
 use util::UnwrapLog;
 
@@ -49,6 +50,11 @@ pub enum ConnectionStatus {
   Closed
 }
 
+pub enum State {
+  Pipe(Pipe<TcpStream>),
+  ProxyProtocol(ProxyProtocol<TcpStream>),
+}
+
 pub struct Client {
   sock:           TcpStream,
   backend:        Option<TcpStream>,
@@ -61,14 +67,26 @@ pub struct Client {
   app_id:         Option<String>,
   request_id:     String,
   metrics:        SessionMetrics,
-  protocol:       Pipe<TcpStream>,
+  protocol:       Option<State>,
+  front_buf:      Option<Checkout<BufferQueue>>,
+  back_buf:       Option<Checkout<BufferQueue>>,
 }
 
 impl Client {
   fn new(sock: TcpStream, accept_token: Token, front_buf: Checkout<BufferQueue>,
-    back_buf: Checkout<BufferQueue>) -> Client {
+    back_buf: Checkout<BufferQueue>, proxy_protocol: bool) -> Client {
     let s = sock.try_clone().expect("could not clone the socket");
     let addr = sock.peer_addr().map(|s| s.ip()).ok();
+    let mut frontend_buffer = None;
+    let mut backend_buffer = None;
+
+    let protocol = if proxy_protocol {
+      frontend_buffer = Some(front_buf);
+      backend_buffer = Some(back_buf);
+      Some(State::ProxyProtocol(ProxyProtocol::new(s, None)))
+    } else {
+      Some(State::Pipe(Pipe::new(s, None, front_buf, back_buf, addr)))
+    };
 
     Client {
       sock:           sock,
@@ -82,7 +100,9 @@ impl Client {
       app_id:         None,
       request_id:     Uuid::new_v4().hyphenated().to_string(),
       metrics:        SessionMetrics::new(),
-      protocol:       Pipe::new(s, None, front_buf, back_buf, addr),
+      protocol,
+      front_buf: frontend_buffer,
+      back_buf: backend_buffer,
     }
   }
 
@@ -118,13 +138,25 @@ impl Client {
 
   fn front_hup(&mut self) -> ClientResult {
     self.log_request();
-    self.protocol.front_hup()
+
+    match self.protocol {
+      Some(State::Pipe(ref mut pipe)) => pipe.front_hup(),
+      Some(State::ProxyProtocol(_)) => {
+        ClientResult::CloseClient
+      },
+      _ => unreachable!(),
+    }
   }
 
   fn back_hup(&mut self) -> ClientResult {
     self.log_request();
-    self.protocol.back_hup()
+
+    match self.protocol {
+      Some(State::Pipe(ref mut pipe)) => pipe.back_hup(),
+      _ => ClientResult::CloseClient,
+    }
   }
+
 
   fn log_context(&self) -> String {
     if let Some(ref app_id) = self.app_id {
@@ -135,49 +167,147 @@ impl Client {
   }
 
   fn readable(&mut self) -> ClientResult {
-    self.protocol.readable(&mut self.metrics)
+    match self.protocol {
+      Some(State::Pipe(ref mut pipe)) => pipe.readable(&mut self.metrics),
+      _ => ClientResult::Continue,
+    }
   }
 
   fn writable(&mut self) -> ClientResult {
-    self.protocol.writable(&mut self.metrics)
+    match self.protocol {
+      Some(State::Pipe(ref mut pipe)) => pipe.writable(&mut self.metrics),
+      _ => ClientResult::Continue,
+    }
   }
 
   fn back_readable(&mut self) -> ClientResult {
-    self.protocol.back_readable(&mut self.metrics)
+    match self.protocol {
+      Some(State::Pipe(ref mut pipe)) => pipe.back_readable(&mut self.metrics),
+      _ => ClientResult::Continue,
+    }
   }
 
   fn back_writable(&mut self) -> ClientResult {
-    self.protocol.back_writable(&mut self.metrics)
+    let mut res = (ProtocolResult::Continue, ClientResult::Continue);
+
+    match self.protocol {
+      Some(State::Pipe(ref mut pipe)) => res.1 = pipe.back_writable(&mut self.metrics),
+      Some(State::ProxyProtocol(ref mut pp)) => {
+        res.0 = pp.back_writable().0;
+        res.1 = pp.back_writable().1;
+      }
+      _ => unreachable!(),
+    };
+
+    if let ProtocolResult::Upgrade = res.0 {
+      self.upgrade();
+    }
+
+    res.1
   }
 
   fn front_socket(&self) -> &TcpStream {
-    self.protocol.front_socket()
-  }
-
-  fn front_token(&self)  -> Option<Token> {
-    self.protocol.front_token()
-  }
-
-  fn back_token(&self)   -> Option<Token> {
-    self.protocol.back_token()
+    match self.protocol {
+      Some(State::Pipe(ref pipe)) => pipe.front_socket(),
+      Some(State::ProxyProtocol(ref pp)) => pp.front_socket(),
+      _ => unreachable!(),
+    }
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
-    self.protocol.back_socket()
+    match self.protocol {
+      Some(State::Pipe(ref pipe)) => pipe.back_socket(),
+      Some(State::ProxyProtocol(ref pp)) => pp.back_socket(),
+      _ => unreachable!(),
+    }
+  }
+
+  pub fn upgrade(&mut self) {
+    let protocol = self.protocol.take();
+
+    if let Some(State::ProxyProtocol(mut pp)) = protocol {
+      if self.back_buf.is_some() && self.front_buf.is_some() {
+        let mut backend_socket = pp.backend.take().unwrap();
+        let addr = backend_socket.peer_addr().map(|s| s.ip()).ok();
+
+        let front_token = pp.front_token();
+        let back_token = pp.back_token();
+
+        let mut pipe = Pipe::new(
+          pp.frontend.take(0).into_inner(),
+          Some(backend_socket),
+          self.front_buf.take().unwrap(),
+          self.back_buf.take().unwrap(),
+          addr,
+        );
+
+        pipe.readiness.front_readiness = pp.readiness.front_readiness;
+        pipe.readiness.back_readiness  = pp.readiness.back_readiness;
+
+        if let Some(front_token) = front_token {
+          pipe.set_front_token(front_token);
+        }
+        if let Some(back_token) = back_token {
+          pipe.set_back_token(back_token);
+        }
+
+        self.protocol = Some(State::Pipe(pipe));
+      } else {
+        error!("Missing the frontend or backend buffer queue, we can't switch to a pipe");
+      }
+    }
+  }
+
+  fn readiness(&mut self) -> &mut Readiness {
+    match self.protocol {
+      Some(State::Pipe(ref mut pipe)) => pipe.readiness(),
+      Some(State::ProxyProtocol(ref mut pp)) => pp.readiness(),
+      _ => unreachable!(),
+    }
+  }
+
+  fn front_token(&self)  -> Option<Token> {
+    match self.protocol {
+      Some(State::Pipe(ref pipe)) => pipe.front_token(),
+      Some(State::ProxyProtocol(ref pp)) => pp.front_token(),
+      _ => unreachable!()
+    }
+  }
+
+  fn back_token(&self)   -> Option<Token> {
+    match self.protocol {
+      Some(State::Pipe(ref pipe)) => pipe.back_token(),
+      Some(State::ProxyProtocol(ref pp)) => pp.back_token(),
+      _ => unreachable!()
+    }
   }
 
   fn set_back_socket(&mut self, socket: TcpStream) {
-    self.protocol.set_back_socket(socket);
+    match self.protocol {
+      Some(State::Pipe(ref mut pipe)) => pipe.set_back_socket(socket),
+      Some(State::ProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
+      _ => unreachable!()
+    }
   }
 
   fn set_front_token(&mut self, token: Token) {
-    self.token         = Some(token);
-    self.protocol.set_front_token(token);
+    self.token = Some(token);
+
+    match self.protocol {
+      Some(State::Pipe(ref mut pipe)) => pipe.set_front_token(token),
+      Some(State::ProxyProtocol(ref mut pp)) => pp.set_front_token(token),
+      _ => unreachable!()
+    }
   }
 
   fn set_back_token(&mut self, token: Token) {
     self.backend_token = Some(token);
-    self.protocol.set_back_token(token);
+
+    match self.protocol {
+      Some(State::Pipe(ref mut pipe)) => pipe.set_back_token(token),
+      Some(State::ProxyProtocol(ref mut pp)) => pp.set_back_token(token),
+      _ => unreachable!()
+    }
   }
 
   fn back_connected(&self)     -> BackendConnectionStatus {
@@ -198,10 +328,6 @@ impl Client {
     self.backend       = None;
     self.backend_token = None;
     (self.app_id.clone(), addr)
-  }
-
-  fn readiness(&mut self) -> &mut Readiness {
-    self.protocol.readiness()
   }
 
 }
@@ -402,13 +528,19 @@ pub struct ApplicationListener {
   sock:           Option<TcpListener>,
   token:          Option<Token>,
   front_address:  SocketAddr,
-  back_addresses: Vec<SocketAddr>
+  back_addresses: Vec<SocketAddr>,
+}
+
+#[derive(Debug)]
+pub struct ApplicationConfiguration {
+  proxy_protocol: bool,
 }
 
 pub struct ServerConfiguration {
   fronts:          HashMap<String, Token>,
   instances:       HashMap<String, Vec<Backend>>,
   listeners:       HashMap<Token, ApplicationListener>,
+  configs:         HashMap<AppId, ApplicationConfiguration>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
 }
 
@@ -419,6 +551,7 @@ impl ServerConfiguration {
     let mut configuration = ServerConfiguration {
       instances:     HashMap::new(),
       listeners:     HashMap::new(),
+      configs:       HashMap::new(),
       fronts:        HashMap::new(),
       pool:          pool,
     };
@@ -432,7 +565,7 @@ impl ServerConfiguration {
           sock:           Some(listener),
           token:          None,
           front_address:  front,
-          back_addresses: Vec::new()
+          back_addresses: Vec::new(),
         };
         if let Some(_) = configuration.add_application_listener(&app_id, al, event_loop, token) {
           listener_tokens.insert(token);
@@ -482,7 +615,7 @@ impl ServerConfiguration {
         sock:           Some(listener),
         token:          Some(token),
         front_address:  *front,
-        back_addresses: addresses
+        back_addresses: addresses,
       };
 
       self.add_application_listener(app_id, al, event_loop, token)
@@ -576,8 +709,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
     client.set_back_token(back_token);
     client.set_back_socket(stream);
-    client.readiness().front_interest.insert(Ready::readable() | Ready::writable());
-    client.readiness().back_interest.insert(Ready::readable() | Ready::writable());
     incr!("backend.connections");
     Ok(BackendConnectAction::New)
   }
@@ -651,10 +782,16 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         });
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
-      // these messages are useless for now
-      Order::AddApplication(_) | Order::RemoveApplication(_) => {
+      Order::AddApplication(application) => {
+        let config = ApplicationConfiguration {
+          proxy_protocol: application.proxy_protocol,
+        };
+        self.configs.insert(application.app_id, config);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
-      }
+      },
+      Order::RemoveApplication(_) => {
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+      },
       command => {
         error!("{} unsupported message, ignoring {:?}", message.id, command);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message")), data: None}
@@ -670,10 +807,15 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
       let internal_token = Token(token.0);//FIXME: ListenToken(token.0 - 2 - self.base_token);
       if self.listeners.contains_key(&internal_token) {
+        let mut proxy_protocol = false;
+        if let Some(config) = self.configs.get(&self.listeners[&internal_token].app_id) {
+          proxy_protocol = config.proxy_protocol;
+        }
+
         if let Some(ref listener) = self.listeners[&internal_token].sock.as_ref() {
           listener.accept().map(|(frontend_sock, _)| {
             frontend_sock.set_nodelay(true);
-            let mut c = Client::new(frontend_sock, internal_token, front_buf, back_buf);
+            let mut c = Client::new(frontend_sock, internal_token, front_buf, back_buf, proxy_protocol);
             incr_req!();
 
             c.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();

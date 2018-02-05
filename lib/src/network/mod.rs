@@ -63,6 +63,7 @@ pub enum Protocol {
   HTTPListen,
   HTTPSListen,
   TCPListen,
+  ProxyProtocol,
 }
 
 #[derive(Debug,Clone,Default)]
