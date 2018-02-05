@@ -393,11 +393,8 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
       Ok(BackendConnectAction::Replace) => {
       },
       Ok(BackendConnectAction::New) => {
-        incr!("backend.connections");
       },
       Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) | Err(ConnectionError::HttpsRedirect) => {
-        self.clients[token].readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
-        self.clients[token].readiness().back_interest  = UnixReady::hup() | UnixReady::error();
       },
       _ => self.close_client(poll, token),
     }

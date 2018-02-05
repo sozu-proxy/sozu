@@ -1002,6 +1002,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         error!("TLS SNI hostname '{:?}' and Host header '{}' don't match", servername, hostname_str);
         unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
         client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+        client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
         return Err(ConnectionError::HostNotFound);
       }
 
@@ -1127,17 +1128,20 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
             client.set_back_socket(socket);
             client.set_back_token(back_token);
+            incr!("backend.connections");
             Ok(BackendConnectAction::New)
           }
         },
         Err(ConnectionError::NoBackendAvailable) => {
           unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
           client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+          client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::NoBackendAvailable)
         },
         Err(ConnectionError::HostNotFound) => {
           unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
           client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+          client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::HostNotFound)
         },
         e => panic!(e)
@@ -1145,6 +1149,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     } else {
       unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
       client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+      client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
       Err(ConnectionError::HostNotFound)
     }
   }

@@ -503,6 +503,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     client.set_back_socket(stream);
     client.readiness().front_interest.insert(Ready::readable() | Ready::writable());
     client.readiness().back_interest.insert(Ready::readable() | Ready::writable());
+    incr!("backend.connections");
     Ok(BackendConnectAction::New)
   }
 

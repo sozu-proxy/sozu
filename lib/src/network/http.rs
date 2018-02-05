@@ -641,6 +641,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         //FIXME: the buffer is copied but it's not needed
         client.set_answer(DefaultAnswerStatus::Answer301, answer.as_bytes());
         client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+        client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
         return Err(ConnectionError::HttpsRedirect);
       }
 
@@ -737,6 +738,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
             client.set_back_socket(socket);
             client.set_back_token(back_token);
+            incr!("backend.connections");
             Ok(BackendConnectAction::New)
           }
           //Ok(())
@@ -744,11 +746,13 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         Err(ConnectionError::NoBackendAvailable) => {
           client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
           client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+          client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::NoBackendAvailable)
         }
         Err(ConnectionError::HostNotFound) => {
           client.set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
           client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+          client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::HostNotFound)
         }
         e => panic!(e)
