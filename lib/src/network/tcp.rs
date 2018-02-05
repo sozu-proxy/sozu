@@ -10,7 +10,7 @@ use std::os::unix::io::{FromRawFd,AsRawFd};
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
 use std::error::Error;
-use slab::{Slab,VacantEntry};
+use slab::{Slab,Entry,VacantEntry};
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::net::SocketAddr;
@@ -483,7 +483,7 @@ impl ServerConfiguration {
 
 impl ProxyConfiguration<Client> for ServerConfiguration {
 
-  fn connect_to_backend(&mut self, event_loop: &mut Poll, client:&mut Client) ->Result<BackendConnectAction,ConnectionError> {
+  fn connect_to_backend(&mut self, poll: &mut Poll, client:&mut Client, entry: Entry<FrontToken, BackToken>, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
     let rnd = random::<usize>();
     let idx = rnd % self.listeners[client.accept_token].back_addresses.len();
 
@@ -492,6 +492,14 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     let stream = try!(TcpStream::connect(backend_addr).map_err(|_| ConnectionError::ToBeDefined));
     stream.set_nodelay(true);
 
+    poll.register(
+      &stream,
+      back_token,
+      Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+      PollOpt::edge()
+    );
+
+    client.set_back_token(back_token);
     client.set_back_socket(stream);
     client.readiness().front_interest.insert(Ready::readable() | Ready::writable());
     client.readiness().back_interest.insert(Ready::readable() | Ready::writable());

@@ -10,7 +10,7 @@ use std::collections::{HashSet,HashMap};
 use std::io::{self,Read,ErrorKind};
 use nom::HexDisplay;
 use std::error::Error;
-use slab::{Slab,VacantEntry};
+use slab::{Slab,Entry,VacantEntry};
 use std::io::Write;
 use std::str::FromStr;
 use std::marker::PhantomData;
@@ -248,7 +248,8 @@ pub enum AcceptError {
 }
 
 pub trait ProxyConfiguration<Client> {
-  fn connect_to_backend(&mut self, event_loop: &mut Poll, client:&mut Client) ->Result<BackendConnectAction,ConnectionError>;
+  fn connect_to_backend(&mut self, event_loop: &mut Poll, client:&mut Client,
+    entry: Entry<FrontToken, BackToken>, back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
   fn accept(&mut self, token: ListenToken, event_loop: &mut Poll, entry: VacantEntry<Client, FrontToken>,
            client_token: Token) -> Result<(FrontToken, bool), AcceptError>;
@@ -304,6 +305,10 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
 
   pub fn from_back(&self, token: BackToken) -> Token {
     Token(token.0 + 2 + self.max_listeners + self.max_connections + self.base_token)
+  }
+
+  pub fn from_back_add(&self) -> usize {
+    2 + self.max_listeners + self.max_connections + self.base_token
   }
 
 
@@ -373,43 +378,22 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
   }
 
   pub fn connect_to_backend(&mut self, poll: &mut Poll, token: FrontToken) {
-    match self.configuration.connect_to_backend(poll, &mut self.clients[token]) {
+    let add = self.from_back_add();
+    let res = {
+      let entry = self.backend.vacant_entry().expect("FIXME");
+      let entry = entry.insert(token);
+      let back_token = Token(entry.index().0 + add);
+      self.configuration.connect_to_backend(poll, &mut self.clients[token], entry, back_token)
+    };
+
+    match res {
       Ok(BackendConnectAction::Reuse) => {
         debug!("keepalive, reusing backend connection");
       }
       Ok(BackendConnectAction::Replace) => {
-        if let Some(backend_token) = self.clients[token].back_token() {
-          if let Some(sock) = self.clients[token].back_socket() {
-            poll.register(
-              sock,
-              backend_token,
-              Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-              PollOpt::edge()
-            );
-          }
-
-          return;
-        }
       },
       Ok(BackendConnectAction::New) => {
         incr!("backend.connections");
-        if let Ok(backend_token) = self.backend.insert(token) {
-          let back = self.from_back(backend_token);
-          self.clients[token].set_back_token(back);
-
-          //self.clients[token].readiness().back_interest = Ready::writable() | UnixReady::hup() | UnixReady::error();
-          if let Some(sock) = self.clients[token].back_socket() {
-            poll.register(
-              sock,
-              back,
-              Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-              PollOpt::edge()
-            );
-          }
-
-          let back = self.from_back(backend_token);
-          return;
-        }
       },
       Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) | Err(ConnectionError::HttpsRedirect) => {
         self.clients[token].readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();

@@ -14,7 +14,7 @@ use mio::unix::UnixReady;
 use std::io::{self,Read,Write,ErrorKind,BufReader};
 use std::collections::{HashMap,HashSet};
 use std::error::Error;
-use slab::{Slab,VacantEntry};
+use slab::{Slab,Entry,VacantEntry};
 use pool::{Pool,Checkout};
 use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
@@ -982,7 +982,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     }
   }
 
-  fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut TlsClient) -> Result<BackendConnectAction,ConnectionError> {
+  fn connect_to_backend(&mut self, poll: &mut Poll, client: &mut TlsClient, entry: Entry<FrontToken, BackToken>, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let h = try!(unwrap_msg!(client.http()).state().get_host().ok_or(ConnectionError::NoHostGiven));
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
@@ -1037,7 +1037,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           //client.readiness().back_interest  = UnixReady::from(Ready::empty());
           client.readiness().back_readiness = UnixReady::from(Ready::empty());
           client.back_socket().as_ref().map(|sock| {
-            event_loop.deregister(*sock);
+            poll.deregister(*sock);
             sock.shutdown(Shutdown::Both);
           });
         }
@@ -1057,7 +1057,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         client.readiness().back_interest  = UnixReady::from(Ready::empty());
         client.readiness().back_readiness = UnixReady::from(Ready::empty());
         client.back_socket().as_ref().map(|sock| {
-          event_loop.deregister(*sock);
+          poll.deregister(*sock);
           sock.shutdown(Shutdown::Both);
         });
       }
@@ -1081,7 +1081,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
             client.back_connected = BackendConnectionStatus::NotConnected;
             client.readiness().back_readiness = UnixReady::from(Ready::empty());
             client.back_socket().as_ref().map(|sock| {
-              event_loop.deregister(*sock);
+              poll.deregister(*sock);
               sock.shutdown(Shutdown::Both);
             });
             // we still want to use the new socket
@@ -1104,11 +1104,29 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           });
 
           socket.set_nodelay(true);
-          client.set_back_socket(socket);
 
           if old_app_id == new_app_id {
+            entry.remove();
+
+            poll.register(
+              &socket,
+              client.back_token().expect("FIXME"),
+              Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+              PollOpt::edge()
+            );
+
+            client.set_back_socket(socket);
             Ok(BackendConnectAction::Replace)
           } else {
+            poll.register(
+              &socket,
+              back_token,
+              Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+              PollOpt::edge()
+            );
+
+            client.set_back_socket(socket);
+            client.set_back_token(back_token);
             Ok(BackendConnectAction::New)
           }
         },

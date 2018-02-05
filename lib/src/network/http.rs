@@ -17,7 +17,7 @@ use uuid::Uuid;
 use nom::{HexDisplay,IResult};
 use rand::random;
 use time::{SteadyTime,Duration};
-use slab::VacantEntry;
+use slab::{Entry,VacantEntry};
 
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
@@ -605,7 +605,7 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<Client> for ServerConfiguration {
-  fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut Client) -> Result<BackendConnectAction,ConnectionError> {
+  fn connect_to_backend(&mut self, poll: &mut Poll, client: &mut Client, entry: Entry<FrontToken, BackToken>, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let h = try!(client.http().unwrap().state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
@@ -662,7 +662,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           //client.readiness().back_interest  = UnixReady::from(Ready::empty());
           client.readiness().back_readiness = UnixReady::from(Ready::empty());
           client.back_socket().as_ref().map(|sock| {
-            event_loop.deregister(*sock);
+            poll.deregister(*sock);
             sock.shutdown(Shutdown::Both);
           });
         }
@@ -683,7 +683,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         client.readiness().back_interest  = UnixReady::from(Ready::empty());
         client.readiness().back_readiness = UnixReady::from(Ready::empty());
         client.back_socket().as_ref().map(|sock| {
-          event_loop.deregister(*sock);
+          poll.deregister(*sock);
           sock.shutdown(Shutdown::Both);
         });
       }
@@ -704,21 +704,39 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
             client.back_connected = BackendConnectionStatus::NotConnected;
             client.readiness().back_readiness = UnixReady::from(Ready::empty());
             client.back_socket().as_ref().map(|sock| {
-              event_loop.deregister(*sock);
+              poll.deregister(*sock);
               sock.shutdown(Shutdown::Both);
             });
             // we still want to use the new socket
             client.readiness().back_interest  = UnixReady::from(Ready::writable());
           }
 
+
           socket.set_nodelay(true);
-          client.set_back_socket(socket);
           client.readiness().back_interest.insert(Ready::writable());
           client.readiness().back_interest.insert(UnixReady::hup());
           client.readiness().back_interest.insert(UnixReady::error());
           if old_app_id == new_app_id {
+            entry.remove();
+
+            poll.register(
+              &socket,
+              client.back_token().expect("FIXME"),
+              Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+              PollOpt::edge()
+            );
+            client.set_back_socket(socket);
             Ok(BackendConnectAction::Replace)
           } else {
+            poll.register(
+              &socket,
+              back_token,
+              Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+              PollOpt::edge()
+            );
+
+            client.set_back_socket(socket);
+            client.set_back_token(back_token);
             Ok(BackendConnectAction::New)
           }
           //Ok(())
