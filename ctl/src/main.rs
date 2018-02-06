@@ -21,7 +21,7 @@ use command::{add_application,remove_application,dump_state,load_state,
   save_state, soft_stop, hard_stop, upgrade_master, status,metrics,
   remove_backend, add_backend, remove_http_frontend, add_http_frontend,
   remove_tcp_frontend, add_tcp_frontend, add_certificate, remove_certificate,
-  query_application, logging_filter, upgrade_worker};
+  replace_certificate, query_application, logging_filter, upgrade_worker};
 
 use cli::*;
 
@@ -86,6 +86,7 @@ fn main() {
       match cmd {
         CertificateCmd::Add{ certificate, chain, key } => add_certificate(channel, timeout, &certificate, &chain, key.unwrap_or("missing key path".to_string()).as_str()),
         CertificateCmd::Remove{ certificate } => remove_certificate(channel, timeout, &certificate),
+        CertificateCmd::Replace{ certificate, chain, key, old_certificate } => replace_certificate(channel, timeout, &certificate, &chain, &key.unwrap_or("missing key path".to_string()).as_str(), &old_certificate)
       }
     },
     SubCmd::Query{ cmd, json } => {

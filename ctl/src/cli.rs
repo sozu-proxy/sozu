@@ -212,6 +212,17 @@ pub enum CertificateCmd {
     #[structopt(short = "cert", long = "certificate", help = "path to the certificate")]
     certificate: String,
   },
+  #[structopt(name = "replace")]
+  Replace {
+    #[structopt(long = "new-certificate", help = "path to the new certificate")]
+    certificate: String,
+    #[structopt(long = "new-certificate-chain", help = "path to the new certificate chain")]
+    chain: String,
+    #[structopt(long = "new-key", help = "path to the new key")]
+    key: Option<String>,
+    #[structopt(short = "old-cert", long = "old-certificate", help = "path to the old certificate")]
+    old_certificate: String,
+  }
 }
 
 #[derive(StructOpt, PartialEq, Debug)]

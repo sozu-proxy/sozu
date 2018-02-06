@@ -4,7 +4,7 @@ use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
-  AddCertificate, RemoveCertificate};
+  AddCertificate, RemoveCertificate, ReplaceCertificate};
 
 use serde_json;
 use std::collections::{HashMap,HashSet};
@@ -866,44 +866,35 @@ pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
 }
 
 pub fn add_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, certificate_path: &str, certificate_chain_path: &str, key_path: &str) {
-  match Config::load_file(certificate_path) {
-    Err(e) => println!("could not load certificate: {:?}", e),
-    Ok(certificate) => {
-      match Config::load_file(certificate_chain_path).map(split_certificate_chain) {
-        Err(e) => println!("could not load certificate chain: {:?}", e),
-        Ok(certificate_chain) => {
-          match Config::load_file(key_path) {
-            Err(e) => println!("could not load key: {:?}", e),
-            Ok(key) => {
-              order_command(channel, timeout, Order::AddCertificate(AddCertificate {
-                certificate: CertificateAndKey {
-                  certificate: certificate,
-                  certificate_chain: certificate_chain,
-                  key: key
-                },
-                names: Vec::new(),
-              }));
-
-            }
-          }
-        }
-      }
-    }
+  if let Some(new_certificate) = load_full_certificate(certificate_path, certificate_chain_path, key_path) {
+    order_command(channel, timeout, Order::AddCertificate(AddCertificate {
+      certificate: new_certificate,
+      names: Vec::new(),
+    }));
   }
 }
 
 pub fn remove_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, certificate_path: &str) {
-  match Config::load_file_bytes(certificate_path) {
-    Ok(data) => {
-      match calculate_fingerprint(&data) {
-        Some(fingerprint) => order_command(channel, timeout, Order::RemoveCertificate(RemoveCertificate {
-          fingerprint: CertFingerprint(fingerprint),
-          names: Vec::new(),
-        })),
-        None              => println!("could not calculate finrprint for certificate")
-      }
-    },
-    Err(e) => println!("could not load file: {:?}", e)
+  if let Some(fingerprint) = get_certificate_fingerprint(certificate_path) {
+    order_command(channel, timeout, Order::RemoveCertificate(RemoveCertificate {
+      fingerprint: fingerprint,
+      names: Vec::new(),
+    }));
+  }
+}
+
+pub fn replace_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, new_certificate_path: &str,
+                           new_certificate_chain_path: &str, new_key_path: &str, old_certificate_path: &str)
+{
+  if let Some(new_certificate) = load_full_certificate(new_certificate_path, new_certificate_chain_path, new_key_path) {
+    if let Some(old_fingerprint) = get_certificate_fingerprint(old_certificate_path) {
+      order_command(channel, timeout, Order::ReplaceCertificate(ReplaceCertificate {
+        new_certificate,
+        old_fingerprint,
+        new_names: Vec::new(),
+        old_names: Vec::new()
+      }));
+    }
   }
 }
 
@@ -1257,4 +1248,54 @@ fn print_json_response<T: ::serde::Serialize>(input: &T) {
       exit(1);
     }
   };
+}
+
+fn load_full_certificate(certificate_path: &str, certificate_chain_path: &str, key_path: &str) -> Option<CertificateAndKey> {
+  match Config::load_file(certificate_path) {
+    Err(e) => {
+      println!("could not load certificate: {:?}", e);
+      None
+    },
+    Ok(certificate) => {
+      match Config::load_file(certificate_chain_path).map(split_certificate_chain) {
+        Err(e) => {
+          println!("could not load certificate chain: {:?}", e);
+          None
+        },
+        Ok(certificate_chain) => {
+          match Config::load_file(key_path) {
+            Err(e) => {
+              println!("could not load key: {:?}", e);
+              None
+            },
+            Ok(key) => {
+              Some(CertificateAndKey {
+                certificate: certificate,
+                certificate_chain: certificate_chain,
+                key: key
+              })
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn get_certificate_fingerprint(certificate_path: &str) -> Option<CertFingerprint> {
+  match Config::load_file_bytes(certificate_path) {
+    Ok(data) => {
+      match calculate_fingerprint(&data) {
+        Some(fingerprint) => Some(CertFingerprint(fingerprint)),
+        None              => {
+          println!("could not calculate finrprint for certificate");
+          None
+        }
+      }
+    },
+    Err(e) => {
+      println!("could not load file: {:?}", e);
+      None
+    }
+  }
 }
