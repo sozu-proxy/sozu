@@ -307,7 +307,7 @@ impl ProxyClient for Client {
       if front_interest.is_hup() {
         let order = self.front_hup();
         match order {
-          ClientResult::CloseClient |  ClientResult::CloseBoth => {
+          ClientResult::CloseClient => {
             return order;
           },
           _ => {
@@ -320,7 +320,7 @@ impl ProxyClient for Client {
       if back_interest.is_hup() {
         let order = self.back_hup();
         match order {
-          ClientResult::CloseClient |  ClientResult::CloseBoth => {
+          ClientResult::CloseClient => {
             return order;
           },
           ClientResult::Continue => {

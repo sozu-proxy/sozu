@@ -218,7 +218,7 @@ impl TlsClient {
           _ => result
         }
       } else {
-        ClientResult::CloseBoth
+        ClientResult::CloseClient
       }
     }
   }
@@ -411,7 +411,7 @@ impl ProxyClient for TlsClient {
       if front_interest.is_hup() {
         let order = self.front_hup();
         match order {
-          ClientResult::CloseClient |  ClientResult::CloseBoth => {
+          ClientResult::CloseClient => {
             return order;
           },
           _ => {
@@ -424,7 +424,7 @@ impl ProxyClient for TlsClient {
       if back_interest.is_hup() {
         let order = self.back_hup();
         match order {
-          ClientResult::CloseClient |  ClientResult::CloseBoth => {
+          ClientResult::CloseClient => {
             return order;
           },
           ClientResult::Continue => {
