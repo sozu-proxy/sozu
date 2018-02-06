@@ -156,6 +156,10 @@ impl Client {
     self.protocol.front_token()
   }
 
+  fn back_token(&self)   -> Option<Token> {
+    self.protocol.back_token()
+  }
+
   fn back_socket(&self)  -> Option<&TcpStream> {
     self.protocol.back_socket()
   }
@@ -186,13 +190,21 @@ impl Client {
     &mut self.metrics
   }
 
+  fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
+
+    let addr = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
+    self.backend       = None;
+    self.backend_token = None;
+    (self.app_id.clone(), addr)
+  }
+
+  fn readiness(&mut self) -> &mut Readiness {
+    self.protocol.readiness()
+  }
+
 }
 
 impl ProxyClient for Client {
-  fn back_token(&self)   -> Option<Token> {
-    self.protocol.back_token()
-  }
-
   fn close(&mut self, poll: &mut Poll, configuration: &mut ProxyConfiguration<Client>) -> Vec<Token> {
     self.metrics.service_stop();
     self.front_socket().shutdown(Shutdown::Both);
@@ -221,18 +233,6 @@ impl ProxyClient for Client {
 
   fn protocol(&self)           -> Protocol {
     Protocol::TCP
-  }
-
-  fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-
-    let addr = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
-    self.backend       = None;
-    self.backend_token = None;
-    (self.app_id.clone(), addr)
-  }
-
-  fn readiness(&mut self) -> &mut Readiness {
-    self.protocol.readiness()
   }
 
   fn process_events(&mut self, token: Token, events: Ready) {

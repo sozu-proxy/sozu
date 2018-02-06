@@ -247,6 +247,14 @@ impl TlsClient {
     self.front_token
   }
 
+  pub fn back_token(&self)   -> Option<Token> {
+    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
+      http.back_token()
+    } else {
+      None
+    }
+  }
+
   pub fn set_back_socket(&mut self, sock:TcpStream) {
     unwrap_msg!(self.http()).set_back_socket(sock)
   }
@@ -282,17 +290,23 @@ impl TlsClient {
   fn metrics(&mut self)        -> &mut SessionMetrics {
     &mut self.metrics
   }
+
+  fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
+    unwrap_msg!(self.http()).remove_backend()
+  }
+
+  pub fn readiness(&mut self)      -> &mut Readiness {
+    let r = match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Handshake(ref mut handshake) => &mut handshake.readiness,
+      State::Http(ref mut http)           => http.readiness(),
+      State::WebSocket(ref mut pipe)      => &mut pipe.readiness,
+    };
+    //info!("current readiness: {:?}", r);
+    r
+  }
 }
 
 impl ProxyClient for TlsClient {
-
-  fn back_token(&self)   -> Option<Token> {
-    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
-      http.back_token()
-    } else {
-      None
-    }
-  }
 
   fn close(&mut self, poll: &mut Poll, configuration: &mut ProxyConfiguration<TlsClient>) -> Vec<Token> {
     //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
@@ -320,20 +334,6 @@ impl ProxyClient for TlsClient {
     }
 
     res
-  }
-
-  fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    unwrap_msg!(self.http()).remove_backend()
-  }
-
-  fn readiness(&mut self)      -> &mut Readiness {
-    let r = match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Handshake(ref mut handshake) => &mut handshake.readiness,
-      State::Http(ref mut http)           => http.readiness(),
-      State::WebSocket(ref mut pipe)      => &mut pipe.readiness,
-    };
-    //info!("current readiness: {:?}", r);
-    r
   }
 
   fn protocol(&self)           -> Protocol {

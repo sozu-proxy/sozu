@@ -197,13 +197,10 @@ impl SessionMetrics {
 }
 
 pub trait ProxyClient {
-  fn back_token(&self)   -> Option<Token>;
-  fn close(&mut self, poll: &mut Poll, configuration: &mut ProxyConfiguration<Self>) -> Vec<Token>;
-  fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>);
-  fn readiness(&mut self)      -> &mut Readiness;
-  fn protocol(&self)           -> Protocol;
+  fn protocol(&self)  -> Protocol;
+  fn ready(&mut self) -> ClientResult;
   fn process_events(&mut self, token: Token, events: Ready);
-  fn ready(&mut self)          -> ClientResult;
+  fn close(&mut self, poll: &mut Poll, configuration: &mut ProxyConfiguration<Self>) -> Vec<Token>;
 }
 
 #[derive(Clone,Copy,Debug,PartialEq)]
@@ -283,8 +280,6 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
   }
 
   pub fn close_client(&mut self, poll: &mut Poll, token: ClientToken) {
-    info!("CLOSE_CLIENT {:?}", token);
-    //self.close_backend(token);
     if self.clients.contains(token) {
       let client = self.clients.remove(token).expect("client shoud be there");
       let tokens = client.borrow_mut().close(poll, &mut self.configuration);

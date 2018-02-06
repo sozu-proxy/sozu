@@ -211,6 +211,10 @@ impl Client {
     self.token
   }
 
+  fn back_token(&self)   -> Option<Token> {
+    self.backend_token
+  }
+
   fn set_back_socket(&mut self, socket: TcpStream) {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.set_back_socket(unwrap_msg!(socket.try_clone())),
@@ -254,13 +258,25 @@ impl Client {
   fn metrics(&mut self)        -> &mut SessionMetrics {
     &mut self.metrics
   }
+
+  fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
+    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), unwrap_msg!(self.token).0,
+      unwrap_msg!(self.backend_token).0);
+    let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
+    self.backend       = None;
+    self.backend_token = None;
+    (unwrap_msg!(self.http()).app_id.clone(), addr)
+  }
+
+  fn readiness(&mut self) -> &mut Readiness {
+    match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Http(ref mut http)      => &mut http.readiness,
+      State::WebSocket(ref mut pipe) => &mut pipe.readiness
+    }
+  }
 }
 
 impl ProxyClient for Client {
-  fn back_token(&self)   -> Option<Token> {
-    self.backend_token
-  }
-
   fn close(&mut self, poll: &mut Poll, configuration: &mut ProxyConfiguration<Client>) -> Vec<Token> {
     self.metrics.service_stop();
     self.front_socket().shutdown(Shutdown::Both);
@@ -287,24 +303,8 @@ impl ProxyClient for Client {
     res
   }
 
-  fn readiness(&mut self) -> &mut Readiness {
-    match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http)      => &mut http.readiness,
-      State::WebSocket(ref mut pipe) => &mut pipe.readiness
-    }
-  }
-
   fn protocol(&self)           -> Protocol {
     Protocol::HTTP
-  }
-
-  fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), unwrap_msg!(self.token).0,
-      unwrap_msg!(self.backend_token).0);
-    let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
-    self.backend       = None;
-    self.backend_token = None;
-    (unwrap_msg!(self.http()).app_id.clone(), addr)
   }
 
   fn process_events(&mut self, token: Token, events: Ready) {
