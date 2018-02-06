@@ -12,10 +12,9 @@ use nom::HexDisplay;
 use std::error::Error;
 use slab::{Slab,Entry,VacantEntry};
 use std::rc::Rc;
-use std::cell::RefCell;
+use std::cell::{RefCell,RefMut};
 use std::net::{SocketAddr,Shutdown};
 use std::str::FromStr;
-use std::borrow::BorrowMut;
 use time::{Duration,precise_time_s};
 use rand::random;
 use uuid::Uuid;
@@ -28,7 +27,7 @@ use sozu_command::messages::{self,TcpFront,Order,Instance,OrderMessage,OrderMess
 
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol};
 use network::proxy::{Server,ProxyChannel};
-use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
+use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,ClientToken,AcceptError,Session,SessionMetrics};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::protocol::Pipe;
@@ -194,13 +193,25 @@ impl ProxyClient for Client {
     self.protocol.back_token()
   }
 
-  fn close(&mut self, poll: &mut Poll) {
+  fn close(&mut self, poll: &mut Poll, configuration: &mut ProxyConfiguration<Client>) -> Vec<Token> {
     self.metrics.service_stop();
     self.front_socket().shutdown(Shutdown::Both);
     poll.deregister(self.front_socket());
+
+    if let (Some(app_id), Some(addr)) = self.remove_backend() {
+      configuration.close_backend(app_id, &addr);
+      decr!("backend.connections");
+    }
+
     if let Some(sock) = self.back_socket() {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
+    }
+
+    if let Some(tk) = self.backend_token {
+      vec!(tk)
+    } else {
+      vec!()
     }
   }
 
@@ -218,6 +229,14 @@ impl ProxyClient for Client {
 
   fn readiness(&mut self) -> &mut Readiness {
     self.protocol.readiness()
+  }
+
+  fn process_events(&mut self, token: Token, events: Ready) {
+    if self.token == Some(token) {
+      self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
+    } else if self.backend_token == Some(token) {
+      self.readiness().back_readiness = self.readiness().back_readiness | UnixReady::from(events);
+    }
   }
 
   fn ready(&mut self) -> ClientResult {
@@ -352,8 +371,6 @@ pub struct ApplicationListener {
   back_addresses: Vec<SocketAddr>
 }
 
-type ClientToken = Token;
-
 pub struct ServerConfiguration {
   fronts:          HashMap<String, ListenToken>,
   instances:       HashMap<String, Vec<Backend>>,
@@ -470,6 +487,7 @@ impl ServerConfiguration {
   }
 
   pub fn add_instance(&mut self, app_id: &str, instance_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken> {
+    use std::borrow::BorrowMut;
     if let Some(addrs) = self.instances.get_mut(app_id) {
       let id = addrs.last().map(|mut b| (*b.borrow_mut()).id ).unwrap_or(0) + 1;
       let backend = Backend::new(instance_id, *instance_address, id);
@@ -503,7 +521,9 @@ impl ServerConfiguration {
 
 impl ProxyConfiguration<Client> for ServerConfiguration {
 
-  fn connect_to_backend(&mut self, poll: &mut Poll, client:&mut Client, entry: Entry<FrontToken, BackToken>, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
+  fn connect_to_backend(&mut self, poll: &mut Poll, clref: Rc<RefCell<Client>>, entry: Entry<Rc<RefCell<Client>>, ClientToken>, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
+    let mut client = clref.borrow_mut();// (*(*entry.get_mut()).borrow_mut());
+
     let rnd = random::<usize>();
     let idx = rnd % self.listeners[client.accept_token].back_addresses.len();
 
@@ -605,8 +625,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<Client, FrontToken>,
-           client_token: Token) -> Result<(FrontToken, bool), AcceptError> {
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<Rc<RefCell<Client>>, ClientToken>,
+           client_token: Token) -> Result<(ClientToken, bool), AcceptError> {
     let mut p = (*self.pool).borrow_mut();
 
     if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
@@ -628,7 +648,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
             );
 
             let index = entry.index();
-            entry.insert(c);
+            entry.insert(Rc::new(RefCell::new(c)));
 
             (index, true)
           }).map_err(|e| {

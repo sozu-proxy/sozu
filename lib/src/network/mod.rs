@@ -157,7 +157,6 @@ pub enum ConnectionError {
 pub enum SocketType {
   Listener,
   FrontClient,
-  BackClient,
 }
 
 #[derive(Debug,PartialEq,Eq)]

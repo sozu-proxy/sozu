@@ -42,7 +42,7 @@ use network::{AppId,Backend,ClientResult,ConnectionError,Protocol};
 use network::backends::BackendMap;
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,
-  Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
+  Readiness,ListenToken,ClientToken,AcceptError,Session,SessionMetrics};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
@@ -50,11 +50,6 @@ use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
 use network::protocol::http::DefaultAnswerStatus;
 use network::retry::RetryPolicy;
 use util::UnwrapLog;
-
-
-type BackendToken = Token;
-
-type ClientToken = Token;
 
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct TlsApp {
@@ -309,15 +304,27 @@ impl ProxyClient for TlsClient {
     }
   }
 
-  fn close(&mut self, poll: &mut Poll) {
+  fn close(&mut self, poll: &mut Poll, configuration: &ProxyConfiguration<TlsClient>) -> Vec<Token> {
     //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
     self.http().map(|http| http.close());
     self.metrics.service_stop();
     self.front_socket().shutdown(Shutdown::Both);
     poll.deregister(self.front_socket());
+
+    if let (Some(app_id), Some(addr)) = self.remove_backend() {
+      configuration.close_backend(app_id, &addr);
+      decr!("backend.connections");
+    }
+
     if let Some(sock) = self.back_socket() {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
+    }
+
+    if let Some(tk) = self.backend_token {
+      vec!(tk)
+    } else {
+      vec!()
     }
   }
 
@@ -337,6 +344,14 @@ impl ProxyClient for TlsClient {
 
   fn protocol(&self)           -> Protocol {
     Protocol::HTTPS
+  }
+
+  fn process_events(&mut self, token: Token, events: Ready) {
+    if self.front_token == Some(token) {
+      self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
+    } else if self.back_token() == Some(token) {
+      self.readiness().back_readiness = self.readiness().back_readiness | UnixReady::from(events);
+    }
   }
 
   fn ready(&mut self) -> ClientResult {
@@ -962,8 +977,8 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<Client, FrontToken>,
-           client_token: Token) -> Result<(FrontToken,bool), AcceptError> {
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<Rc<RefCell<Client>>, ClientToken>,
+           client_token: Token) -> Result<(ClientToken,bool), AcceptError> {
     if let Some(ref sock) = self.listener {
       sock.accept().map_err(|e| {
         match e.kind() {
@@ -988,7 +1003,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           );
 
           let index = entry.index();
-          entry.insert(c);
+          entry.insert(Rc::new(RefCell::new(c)));
 
           return Ok((index, false))
         } else {
@@ -1002,7 +1017,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     }
   }
 
-  fn connect_to_backend(&mut self, poll: &mut Poll, client: &mut TlsClient, entry: Entry<FrontToken, BackToken>, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
+  fn connect_to_backend(&mut self, poll: &mut Poll,  clref: Rc<RefCell<TlsClient>>, entry: Entry<Rc<RefCell<TlsClient>>, ClientToken>, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
+    let mut client = clref.borrow_mut();
     let h = try!(unwrap_msg!(client.http()).state().get_host().ok_or(ConnectionError::NoHostGiven));
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {

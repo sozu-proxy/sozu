@@ -30,7 +30,7 @@ use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
 use network::protocol::http::DefaultAnswerStatus;
 use network::proxy::{Server,ProxyChannel};
-use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
+use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,ClientToken,AcceptError,Session,SessionMetrics};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::retry::RetryPolicy;
 use parser::http11::hostname_and_port;
@@ -261,13 +261,25 @@ impl ProxyClient for Client {
     self.backend_token
   }
 
-  fn close(&mut self, poll: &mut Poll) {
+  fn close(&mut self, poll: &mut Poll, configuration: &mut ProxyConfiguration<Client>) -> Vec<Token> {
     self.metrics.service_stop();
     self.front_socket().shutdown(Shutdown::Both);
     poll.deregister(self.front_socket());
+
+    if let (Some(app_id), Some(addr)) = self.remove_backend() {
+      configuration.close_backend(app_id, &addr);
+      decr!("backend.connections");
+    }
+
     if let Some(sock) = self.back_socket() {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
+    }
+
+    if let Some(tk) = self.backend_token {
+      vec!(tk)
+    } else {
+      vec!()
     }
   }
 
@@ -289,6 +301,16 @@ impl ProxyClient for Client {
     self.backend       = None;
     self.backend_token = None;
     (unwrap_msg!(self.http()).app_id.clone(), addr)
+  }
+
+  fn process_events(&mut self, token: Token, events: Ready) {
+    if self.token == Some(token) {
+      info!("processing events for front token");
+      self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
+    } else if self.backend_token ==Some(token) {
+      info!("processing events for back token");
+      self.readiness().back_readiness = self.readiness().back_readiness | UnixReady::from(events);
+    }
   }
 
   fn ready(&mut self) -> ClientResult {
@@ -414,8 +436,6 @@ impl ProxyClient for Client {
     ClientResult::Continue
   }
 }
-
-type ClientToken = Token;
 
 #[allow(non_snake_case)]
 pub struct DefaultAnswers {
@@ -624,7 +644,8 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<Client> for ServerConfiguration {
-  fn connect_to_backend(&mut self, poll: &mut Poll, client: &mut Client, entry: Entry<FrontToken, BackToken>, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
+  fn connect_to_backend(&mut self, poll: &mut Poll, clref: Rc<RefCell<Client>>, entry: Entry<Rc<RefCell<Client>>, ClientToken>, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
+    let mut client = clref.borrow_mut();// (*(*entry.get_mut()).borrow_mut());
     let h = try!(client.http().unwrap().state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
@@ -711,8 +732,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
 
       let conn = match (front_should_stick, sticky_session) {
-        (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session),
-        _ => self.backend_from_app_id(client, &app_id, front_should_stick),
+        (true, Some(session)) => self.backend_from_sticky_session(&mut client, &app_id, session),
+        _ => self.backend_from_app_id(&mut client, &app_id, front_should_stick),
       };
 
       match conn {
@@ -880,8 +901,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<Client, FrontToken>,
-           client_token: Token) -> Result<(FrontToken, bool), AcceptError> {
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<Rc<RefCell<Client>>, ClientToken>,
+           client_token: Token) -> Result<(ClientToken, bool), AcceptError> {
     if let Some(ref sock) = self.listener {
       sock.accept().map_err(|e| {
         match e.kind() {
@@ -904,7 +925,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           );
 
           let index = entry.index();
-          entry.insert(c);
+          entry.insert(Rc::new(RefCell::new(c)));
 
           Ok((index, false))
         } else {

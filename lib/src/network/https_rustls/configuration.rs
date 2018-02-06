@@ -36,7 +36,7 @@ use network::{AppId,Backend,ClientResult,ConnectionError,Protocol};
 use network::backends::BackendMap;
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,
-  Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
+  Readiness,ListenToken,ClientToken,AcceptError,Session,SessionMetrics};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
 use network::trie::*;
@@ -47,10 +47,6 @@ use util::UnwrapLog;
 
 use super::resolver::{CertificateResolver,CertificateResolverWrapper};
 use super::client::TlsClient;
-
-type BackendToken = Token;
-
-type ClientToken = Token;
 
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct TlsApp {
@@ -306,8 +302,8 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<TlsClient, FrontToken>,
-           client_token: Token) -> Result<(FrontToken,bool), AcceptError> {
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<Rc<RefCell<TlsClient>>, ClientToken>,
+           client_token: Token) -> Result<(ClientToken,bool), AcceptError> {
     if let Some(ref listener) = self.listener.as_ref() {
       listener.accept().map_err(|e| {
         match e.kind() {
@@ -332,7 +328,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         );
 
         let index = entry.index();
-        entry.insert(c);
+        entry.insert(Rc::new(RefCell::new(c)));
 
         (index, false)
       })
@@ -341,7 +337,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     }
   }
 
-  fn connect_to_backend(&mut self, poll: &mut Poll, client: &mut TlsClient, entry: Entry<FrontToken, BackToken>, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
+  fn connect_to_backend(&mut self, poll: &mut Poll,  clref: Rc<RefCell<TlsClient>>, entry: Entry<Rc<RefCell<TlsClient>>, ClientToken>, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
+    let mut client = clref.borrow_mut();// (*(*entry.get_mut()).borrow_mut());
     let h = try!(unwrap_msg!(client.http()).state().get_host().ok_or(ConnectionError::NoHostGiven));
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
@@ -427,8 +424,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       let conn   = try!(unwrap_msg!(client.http()).state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
       let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();
       let conn = match (front_should_stick, sticky_session) {
-        (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session),
-        _ => self.backend_from_request(client, &host, &rl.uri, front_should_stick),
+        (true, Some(session)) => self.backend_from_sticky_session(&mut client, &app_id, session),
+        _ => self.backend_from_request(&mut client, &host, &rl.uri, front_should_stick),
       };
 
       match conn {

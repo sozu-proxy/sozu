@@ -15,6 +15,8 @@ use std::io::Write;
 use std::str::FromStr;
 use std::marker::PhantomData;
 use std::fmt::Debug;
+use std::rc::Rc;
+use std::cell::RefCell;
 use time::{precise_time_ns,SteadyTime,Duration};
 use rand::random;
 
@@ -34,9 +36,7 @@ pub type ProxyChannel = Channel<OrderMessageAnswer,OrderMessage>;
 #[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
 pub struct ListenToken(pub usize);
 #[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
-pub struct FrontToken(pub usize);
-#[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
-pub struct BackToken(pub usize);
+pub struct ClientToken(pub usize);
 
 impl From<usize> for ListenToken {
     fn from(val: usize) -> ListenToken {
@@ -50,26 +50,14 @@ impl From<ListenToken> for usize {
     }
 }
 
-impl From<usize> for FrontToken {
-    fn from(val: usize) -> FrontToken {
-        FrontToken(val)
+impl From<usize> for ClientToken {
+    fn from(val: usize) -> ClientToken {
+        ClientToken(val)
     }
 }
 
-impl From<FrontToken> for usize {
-    fn from(val: FrontToken) -> usize {
-        val.0
-    }
-}
-
-impl From<usize> for BackToken {
-    fn from(val: usize) -> BackToken {
-        BackToken(val)
-    }
-}
-
-impl From<BackToken> for usize {
-    fn from(val: BackToken) -> usize {
+impl From<ClientToken> for usize {
+    fn from(val: ClientToken) -> usize {
         val.0
     }
 }
@@ -210,10 +198,11 @@ impl SessionMetrics {
 
 pub trait ProxyClient {
   fn back_token(&self)   -> Option<Token>;
-  fn close(&mut self, poll: &mut Poll);
+  fn close(&mut self, poll: &mut Poll, configuration: &mut ProxyConfiguration<Self>) -> Vec<Token>;
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>);
   fn readiness(&mut self)      -> &mut Readiness;
   fn protocol(&self)           -> Protocol;
+  fn process_events(&mut self, token: Token, events: Ready);
   fn ready(&mut self)          -> ClientResult;
 }
 
@@ -239,24 +228,24 @@ pub enum AcceptError {
 }
 
 pub trait ProxyConfiguration<Client> {
-  fn connect_to_backend(&mut self, event_loop: &mut Poll, client:&mut Client,
-    entry: Entry<FrontToken, BackToken>, back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
+  fn connect_to_backend(&mut self, event_loop: &mut Poll, client: Rc<RefCell<Client>>,
+    entry: Entry<Rc<RefCell<Client>>, ClientToken>, back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
-  fn accept(&mut self, token: ListenToken, event_loop: &mut Poll, entry: VacantEntry<Client, FrontToken>,
-           client_token: Token) -> Result<(FrontToken, bool), AcceptError>;
+  fn accept(&mut self, token: ListenToken, event_loop: &mut Poll, entry: VacantEntry<Rc<RefCell<Client>>, ClientToken>,
+           client_token: Token) -> Result<(ClientToken, bool), AcceptError>;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
 }
 
 pub struct Session<ServerConfiguration,Client> {
   pub configuration:   ServerConfiguration,
-  clients:         Slab<Client,FrontToken>,
-  backend:         Slab<FrontToken,BackToken>,
+  clients:         Slab<Rc<RefCell<Client>>,ClientToken>,
   max_listeners:   usize,
   max_connections: usize,
   shutting_down:   Option<MessageId>,
   accept_ready:    HashSet<ListenToken>,
   can_accept:      bool,
   base_token:      usize,
+  phantom:         PhantomData<Client>,
 }
 
 impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<ServerConfiguration,Client> {
@@ -264,72 +253,56 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
     accept_ready: HashSet<ListenToken>, poll: &mut Poll) -> Self {
 
     let clients = Slab::with_capacity(max_connections);
-    let backend = Slab::with_capacity(max_connections);
     Session {
       configuration:   configuration,
       clients:         clients,
-      backend:         backend,
       max_listeners:   max_listeners,
       max_connections: max_connections,
       shutting_down:   None,
       accept_ready:    accept_ready,
       can_accept:      true,
       base_token:      base_token,
+      phantom:         PhantomData,
     }
   }
 
-  pub fn to_front(&self, token: Token) -> FrontToken {
-    FrontToken(token.0 - 2 - self.max_listeners - self.base_token)
+  pub fn to_client(&self, token: Token) -> ClientToken {
+    ClientToken(token.0 - 2 - self.max_listeners - self.base_token)
   }
 
-  pub fn to_back(&self, token: Token) -> BackToken {
-    BackToken(token.0 - 2 - self.max_listeners - self.max_connections - self.base_token)
-  }
-
-  pub fn from_front(&self, token: FrontToken) -> Token {
+  pub fn from_client(&self, token: ClientToken) -> Token {
     Token(token.0 + 2 + self.max_listeners + self.base_token)
   }
 
-  pub fn from_front_add(&self) -> usize {
+  pub fn from_client_add(&self) -> usize {
     2 + self.max_listeners + self.base_token
   }
-
-  pub fn from_back(&self, token: BackToken) -> Token {
-    Token(token.0 + 2 + self.max_listeners + self.max_connections + self.base_token)
-  }
-
-  pub fn from_back_add(&self) -> usize {
-    2 + self.max_listeners + self.max_connections + self.base_token
-  }
-
 
   pub fn configuration(&mut self) -> &mut ServerConfiguration {
     &mut self.configuration
   }
 
-  pub fn close_client(&mut self, poll: &mut Poll, token: FrontToken) {
-    self.close_backend(token);
-    self.clients[token].close(poll);
-    self.clients.remove(token);
-    decr!("client.connections");
+  pub fn close_client(&mut self, poll: &mut Poll, token: ClientToken) {
+    info!("CLOSE_CLIENT {:?}", token);
+    //self.close_backend(token);
+    if self.clients.contains(token) {
+      let client = self.clients.remove(token).expect("client shoud be there");
+      let tokens = client.borrow_mut().close(poll, &mut self.configuration);
+      for tk in tokens.into_iter() {
+        let cl = self.to_client(tk);
+        self.clients.remove(cl);
+      }
+      decr!("client.connections");
+    }
 
     self.can_accept = true;
   }
 
-  pub fn close_backend(&mut self, token: FrontToken) {
-    if let Some(backend_tk) = self.clients[token].back_token() {
-      let backend_token = self.to_back(backend_tk);
-      if let Some(_) = self.backend.remove(backend_token) {
-        if let (Some(app_id), Some(addr)) = self.clients[token].remove_backend() {
-          self.configuration.close_backend(app_id, &addr);
-          decr!("backend.connections");
-        }
-      }
-    }
+  pub fn close_backend(&mut self, token: ClientToken) {
   }
 
   pub fn accept(&mut self, poll: &mut Poll, token: ListenToken) -> bool {
-    let add = self.from_front_add();
+    let add = self.from_client_add();
     let res = {
       let entry = self.clients.vacant_entry().expect("FIXME");
       let client_token = Token(entry.index().0 + add);
@@ -359,13 +332,15 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
     }
   }
 
-  pub fn connect_to_backend(&mut self, poll: &mut Poll, token: FrontToken) {
-    let add = self.from_back_add();
+  pub fn connect_to_backend(&mut self, poll: &mut Poll, token: ClientToken) {
+    let add = self.from_client_add();
     let res = {
-      let entry = self.backend.vacant_entry().expect("FIXME");
-      let entry = entry.insert(token);
+      let cl = self.clients[token].clone();
+      let cl2 = self.clients[token].clone();
+      let entry = self.clients.vacant_entry().expect("FIXME");
+      let entry = entry.insert(cl);
       let back_token = Token(entry.index().0 + add);
-      self.configuration.connect_to_backend(poll, &mut self.clients[token], entry, back_token)
+      self.configuration.connect_to_backend(poll, cl2, entry, back_token)
     };
 
     match res {
@@ -382,23 +357,17 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
     }
   }
 
-  pub fn get_client_token(&self, token: Token) -> Option<FrontToken> {
+  pub fn get_client_token(&self, token: Token) -> Option<ClientToken> {
     if token.0 < 2 + self.max_listeners + self.base_token {
       None
-    } else if token.0 < 2 + self.max_listeners + self.max_connections + self.base_token && self.clients.contains(self.to_front(token)) {
-      Some(self.to_front(token))
-    } else if token.0 < 2 + self.max_listeners + 2 * self.max_connections + self.base_token && self.backend.contains(self.to_back(token)) {
-      if self.clients.contains(self.backend[self.to_back(token)]) {
-        Some(self.backend[self.to_back(token)])
-      } else {
-        None
-      }
+    } else if self.clients.contains(self.to_client(token)) {
+      Some(self.to_client(token))
     } else {
       None
     }
   }
 
-  pub fn interpret_client_order(&mut self, poll: &mut Poll, token: FrontToken, order: ClientResult) {
+  pub fn interpret_client_order(&mut self, poll: &mut Poll, token: ClientToken, order: ClientResult) {
     //println!("INTERPRET ORDER: {:?}", order);
     match order {
       ClientResult::CloseClient     => self.close_client(poll, token),
@@ -418,7 +387,7 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
   pub fn ready(&mut self, poll: &mut Poll, token: Token, events: Ready) {
     //info!("PROXY\t{:?} got events: {:?}", token, events);
 
-    let client_token:FrontToken = match socket_type(token, self.base_token, self.max_listeners, self.max_connections) {
+    let client_token:ClientToken = match socket_type(token, self.base_token, self.max_listeners, self.max_connections) {
       Some(SocketType::Listener) => {
         if events.is_readable() {
           self.accept_ready.insert(ListenToken(token.0));
@@ -442,17 +411,9 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
         unreachable!();
       },
       Some(SocketType::FrontClient) => {
-        let front_token = self.to_front(token);
-        if self.clients.contains(front_token) {
-          self.clients[front_token].readiness().front_readiness = self.clients[front_token].readiness().front_readiness | UnixReady::from(events);
-          front_token
-        } else {
-          return;
-        }
-      },
-      Some(SocketType::BackClient) => {
-        if let Some(tok) = self.get_client_token(token) {
-          self.clients[tok].readiness().back_readiness = self.clients[tok].readiness().back_readiness | UnixReady::from(events);
+        let tok = self.to_client(token);
+        if self.clients.contains(tok) {
+          self.clients[tok].borrow_mut().process_events(token, events);
           tok
         } else {
           return;
@@ -465,8 +426,8 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
 
     loop {
     //self.client_ready(poll, client_token, events);
-      let order = self.clients[client_token].ready();
-      info!("client[{:?}] got events {:?} and returned order {:?}", client_token, events, order);
+      let order = self.clients[client_token].borrow_mut().ready();
+      //info!("client[{:?} -> {:?}] got events {:?} and returned order {:?}", client_token, self.from_client(client_token), events, order);
       let is_connect = order == ClientResult::ConnectBackend;
       self.interpret_client_order(poll, client_token, order);
 
@@ -507,10 +468,8 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
 pub fn socket_type(token: Token, base_token: usize, max_listeners: usize, max_connections: usize) -> Option<SocketType> {
   if token.0 < 2 + max_listeners + base_token {
     Some(SocketType::Listener)
-  } else if token.0 < 2 + max_listeners + max_connections + base_token {
-    Some(SocketType::FrontClient)
   } else if token.0 < 2 + max_listeners + 2 * max_connections + base_token {
-    Some(SocketType::BackClient)
+    Some(SocketType::FrontClient)
   } else {
     None
   }

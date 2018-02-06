@@ -32,7 +32,7 @@ use network::{AppId,Backend,ClientResult,ConnectionError,Protocol};
 use network::backends::BackendMap;
 use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,
-  Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
+  Readiness,ListenToken,AcceptError,Session,SessionMetrics};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
 use network::trie::*;
@@ -40,7 +40,7 @@ use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
 use network::protocol::http::DefaultAnswerStatus;
 use network::retry::RetryPolicy;
 use util::UnwrapLog;
-use super::configuration::TlsApp;
+use super::configuration::{ServerConfiguration,TlsApp};
 
 
 type BackendToken = Token;
@@ -294,15 +294,27 @@ impl ProxyClient for TlsClient {
     }
   }
 
-  fn close(&mut self, poll: &mut Poll) {
+  fn close(&mut self, poll: &mut Poll, configuration: &mut ProxyConfiguration<TlsClient>) -> Vec<Token> {
     //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
     self.http().map(|http| http.close());
     self.metrics.service_stop();
     self.front_socket().shutdown(Shutdown::Both);
     poll.deregister(self.front_socket());
+
+    if let (Some(app_id), Some(addr)) = self.remove_backend() {
+      configuration.close_backend(app_id, &addr);
+      decr!("backend.connections");
+    }
+
     if let Some(sock) = self.back_socket() {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
+    }
+
+    if let Some(tk) = self.back_token() {
+      vec!(tk)
+    } else {
+      vec!()
     }
   }
 
@@ -322,6 +334,14 @@ impl ProxyClient for TlsClient {
 
   fn protocol(&self)           -> Protocol {
     Protocol::HTTPS
+  }
+
+  fn process_events(&mut self, token: Token, events: Ready) {
+    if self.front_token == Some(token) {
+      self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
+    } else if self.back_token() == Some(token) {
+      self.readiness().back_readiness = self.readiness().back_readiness | UnixReady::from(events);
+    }
   }
 
   fn ready(&mut self) -> ClientResult {

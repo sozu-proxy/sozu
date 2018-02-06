@@ -34,7 +34,7 @@ use network::{ClientResult,ConnectionError,
   SocketType,Protocol,RequiredEvents};
 use network::{http,https,tcp};
 use network::metrics::METRICS;
-use network::session::{BackToken,FrontToken,ListenToken,ProxyClient,ProxyConfiguration,Readiness,Session};
+use network::session::{ListenToken,ProxyClient,ProxyConfiguration,Readiness,Session};
 
 const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
