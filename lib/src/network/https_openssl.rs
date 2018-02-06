@@ -346,6 +346,19 @@ impl ProxyClient for TlsClient {
     res
   }
 
+  fn close_backend(&mut self, _: Token, poll: &mut Poll, configuration: &mut ProxyConfiguration<Self>) {
+    if let (Some(app_id), Some(addr)) = self.remove_backend() {
+      configuration.close_backend(app_id, &addr);
+      decr!("backend.connections");
+    }
+
+    if let Some(sock) = self.back_socket() {
+      sock.shutdown(Shutdown::Both);
+      poll.deregister(sock);
+    }
+
+  }
+
   fn protocol(&self)           -> Protocol {
     Protocol::HTTPS
   }

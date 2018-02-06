@@ -140,7 +140,7 @@ impl RequiredEvents {
 #[derive(Debug,PartialEq,Eq)]
 pub enum ClientResult {
   CloseClient,
-  CloseBackend,
+  CloseBackend(Option<Token>),
   Continue,
   ConnectBackend
 }

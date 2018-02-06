@@ -67,6 +67,7 @@ pub trait ProxyClient {
   fn ready(&mut self) -> ClientResult;
   fn process_events(&mut self, token: Token, events: Ready);
   fn close(&mut self, poll: &mut Poll, configuration: &mut ProxyConfiguration<Self>) -> Vec<Token>;
+  fn close_backend(&mut self, token: Token, poll: &mut Poll, configuration: &mut ProxyConfiguration<Self>);
 }
 
 #[derive(Clone,Copy,Debug,PartialEq)]
@@ -233,7 +234,14 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
     match order {
       ClientResult::CloseClient     => self.close_client(poll, token),
       //FIXME: we do not deregister in close_backend
-      ClientResult::CloseBackend    => self.close_backend(token),
+      ClientResult::CloseBackend(opt) => {
+        if let Some(token) = opt {
+          let cl = self.to_client(token);
+          if let Some(client) = self.clients.remove(cl) {
+            client.borrow_mut().close_backend(token, poll, &mut self.configuration);
+          }
+        }
+      },
       ClientResult::ConnectBackend  => self.connect_to_backend(poll, token),
       ClientResult::Continue        => {}
     }
@@ -288,6 +296,8 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
     //self.client_ready(poll, client_token, events);
       let order = self.clients[client_token].borrow_mut().ready();
       //info!("client[{:?} -> {:?}] got events {:?} and returned order {:?}", client_token, self.from_client(client_token), events, order);
+      //FIXME: the CloseBackend message might not mean we have nothing else to do
+      //with that client
       let is_connect = order == ClientResult::ConnectBackend;
       self.interpret_client_order(poll, client_token, order);
 
