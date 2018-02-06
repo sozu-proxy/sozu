@@ -4,8 +4,7 @@ use mio::unix::UnixReady;
 use pool::Checkout;
 use std::io::ErrorKind;
 use network::buffer_queue::BufferQueue;
-use network::{ClientResult,Protocol};
-use network::session::Readiness;
+use network::{ClientResult,Protocol,Readiness};
 use network::protocol::ProtocolResult;
 use rustls::{ServerSession, Session};
 

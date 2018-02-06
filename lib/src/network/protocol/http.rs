@@ -9,9 +9,8 @@ use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
 use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop,
   BufferMove, RequestState, ResponseState, Chunk, Continue, RRequestLine, RStatusLine};
-use network::{ClientResult,Protocol};
+use network::{ClientResult,Protocol,Readiness,SessionMetrics};
 use network::buffer_queue::BufferQueue;
-use network::session::{Readiness,SessionMetrics};
 use network::socket::{SocketHandler,SocketResult};
 use network::protocol::ProtocolResult;
 use util::UnwrapLog;

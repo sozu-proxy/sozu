@@ -24,13 +24,14 @@ use sozu_command::state::ConfigState;
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::messages::{self,Application,Order,HttpFront,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 
-use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol};
+use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics};
 use network::backends::BackendMap;
 use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
 use network::protocol::http::DefaultAnswerStatus;
 use network::proxy::{Server,ProxyChannel};
-use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,ClientToken,AcceptError,Session,SessionMetrics};
+use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,
+  ListenToken,ClientToken,AcceptError,Session};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::retry::RetryPolicy;
 use parser::http11::hostname_and_port;
