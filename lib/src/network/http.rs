@@ -276,11 +276,15 @@ impl ProxyClient for Client {
       poll.deregister(sock);
     }
 
-    if let Some(tk) = self.backend_token {
-      vec!(tk)
-    } else {
-      vec!()
+    let mut res = vec!();
+    if let Some(tk) = self.token {
+      res.push(tk)
     }
+    if let Some(tk) = self.backend_token {
+      res.push(tk)
+    }
+
+    res
   }
 
   fn readiness(&mut self) -> &mut Readiness {

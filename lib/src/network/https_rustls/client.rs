@@ -311,11 +311,15 @@ impl ProxyClient for TlsClient {
       poll.deregister(sock);
     }
 
-    if let Some(tk) = self.back_token() {
-      vec!(tk)
-    } else {
-      vec!()
+    let mut res = vec!();
+    if let Some(tk) = self.front_token {
+      res.push(tk)
     }
+    if let Some(tk) = self.back_token() {
+      res.push(tk)
+    }
+
+    res
   }
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
