@@ -30,11 +30,10 @@ use sozu_command::state::{ConfigState,get_application_ids_by_domain};
 use sozu_command::messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer,QueryApplicationType};
 
 use network::buffer_queue::BufferQueue;
-use network::{ClientResult,ConnectionError,
-  SocketType,Protocol,RequiredEvents};
+use network::{ClientResult,ConnectionError,Protocol,RequiredEvents,ProxyClient,ProxyConfiguration};
 use network::{http,https,tcp};
 use network::metrics::METRICS;
-use network::session::{ListenToken,ProxyClient,ProxyConfiguration,Session};
+use network::session::{ListenToken,Session};
 
 const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;

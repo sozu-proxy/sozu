@@ -38,11 +38,11 @@ use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::buffer_queue::BufferQueue;
-use network::{AppId,Backend,ClientResult,ConnectionError,Protocol,Readiness,SessionMetrics};
+use network::{AppId,Backend,ClientResult,ConnectionError,Protocol,Readiness,SessionMetrics,
+  ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus};
 use network::backends::BackendMap;
 use network::proxy::{Server,ProxyChannel};
-use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,
-  ListenToken,ClientToken,AcceptError,Session};
+use network::session::{ListenToken,ClientToken,Session};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;

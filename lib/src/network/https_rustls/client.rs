@@ -28,11 +28,11 @@ use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::buffer_queue::BufferQueue;
-use network::{AppId,Backend,ClientResult,ConnectionError,Protocol,Readiness,SessionMetrics};
+use network::{AppId,Backend,ClientResult,ConnectionError,Protocol,Readiness,SessionMetrics,ClientToken,
+  ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus};
 use network::backends::BackendMap;
 use network::proxy::{Server,ProxyChannel};
-use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,
-  ListenToken,AcceptError,Session};
+use network::session::{ListenToken,Session};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
 use network::trie::*;
@@ -42,10 +42,6 @@ use network::retry::RetryPolicy;
 use util::UnwrapLog;
 use super::configuration::{ServerConfiguration,TlsApp};
 
-
-type BackendToken = Token;
-
-type ClientToken = Token;
 
 pub enum State {
   Handshake(TlsHandshake),
