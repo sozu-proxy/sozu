@@ -31,7 +31,7 @@ use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
-use network::protocol::Pipe;
+use network::protocol::{Pipe, ProxyProtocol};
 
 use util::UnwrapLog;
 
@@ -48,6 +48,11 @@ pub enum ConnectionStatus {
   Closed
 }
 
+pub enum State {
+  Pipe(Pipe<TcpStream>),
+  ProxyProtocol(ProxyProtocol),
+}
+
 pub struct Client {
   sock:           TcpStream,
   backend:        Option<TcpStream>,
@@ -60,7 +65,7 @@ pub struct Client {
   app_id:         Option<String>,
   request_id:     String,
   metrics:        SessionMetrics,
-  protocol:       Pipe<TcpStream>,
+  protocol:       State,
 }
 
 impl Client {
@@ -81,7 +86,7 @@ impl Client {
       app_id:         None,
       request_id:     Uuid::new_v4().hyphenated().to_string(),
       metrics:        SessionMetrics::new(),
-      protocol:       Pipe::new(s, None, front_buf, back_buf, addr),
+      protocol:       State::Pipe(Pipe::new(s, None, front_buf, back_buf, addr)),
     }
   }
 
@@ -118,19 +123,31 @@ impl Client {
 
 impl ProxyClient for Client {
   fn front_socket(&self) -> &TcpStream {
-    self.protocol.front_socket()
+    match self.protocol {
+      State::Pipe(ref pipe) => pipe.front_socket(),
+      _ => &self.sock,
+    }
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
-    self.protocol.back_socket()
+    match self.protocol {
+      State::Pipe(ref pipe) => pipe.back_socket(),
+      _ => self.backend.as_ref(),
+    }
   }
 
   fn front_token(&self)  -> Option<Token> {
-    self.protocol.front_token()
+    match self.protocol {
+      State::Pipe(ref pipe) => pipe.front_token(),
+      _ => self.token,
+    }
   }
 
   fn back_token(&self)   -> Option<Token> {
-    self.protocol.back_token()
+    match self.protocol {
+      State::Pipe(ref pipe) => pipe.back_token(),
+      _ => self.backend_token,
+    }
   }
 
   fn close(&mut self) {
@@ -145,17 +162,28 @@ impl ProxyClient for Client {
   }
 
   fn set_back_socket(&mut self, socket: TcpStream) {
-    self.protocol.set_back_socket(socket);
+    match self.protocol {
+      State::Pipe(ref mut pipe) => pipe.set_back_socket(socket),
+      State::ProxyProtocol(ref mut pp) => pp.set_back_socket(socket),
+    }
   }
 
   fn set_front_token(&mut self, token: Token) {
-    self.token         = Some(token);
-    self.protocol.set_front_token(token);
+    self.token = Some(token);
+
+    match self.protocol {
+      State::Pipe(ref mut pipe) => pipe.set_front_token(token),
+      _ => {},
+    }
   }
 
   fn set_back_token(&mut self, token: Token) {
     self.backend_token = Some(token);
-    self.protocol.set_back_token(token);
+
+    match self.protocol {
+      State::Pipe(ref mut pipe) => pipe.set_back_token(token),
+      _ => {}, // We don't care about the token.
+    }
   }
 
   fn back_connected(&self)     -> BackendConnectionStatus {
@@ -184,32 +212,61 @@ impl ProxyClient for Client {
 
   fn front_hup(&mut self) -> ClientResult {
     self.log_request();
-    self.protocol.front_hup()
+
+    match self.protocol {
+      State::Pipe(ref mut pipe) => pipe.front_hup(),
+      State::ProxyProtocol(_) => {
+        if self.backend_token == None {
+          ClientResult::CloseClient
+        } else {
+          ClientResult::CloseBoth
+        }
+      },
+    }
   }
 
   fn back_hup(&mut self) -> ClientResult {
     self.log_request();
-    self.protocol.back_hup()
+
+    match self.protocol {
+      State::Pipe(ref mut pipe) => pipe.back_hup(),
+      _ => ClientResult::CloseBoth,
+    }
   }
 
   fn readable(&mut self) -> ClientResult {
-    self.protocol.readable(&mut self.metrics)
+    match self.protocol {
+      State::Pipe(ref mut pipe) => pipe.readable(&mut self.metrics),
+      _ => ClientResult::Continue,
+    }
   }
 
   fn writable(&mut self) -> ClientResult {
-    self.protocol.writable(&mut self.metrics)
+    match self.protocol {
+      State::Pipe(ref mut pipe) => pipe.writable(&mut self.metrics),
+      _ => ClientResult::Continue,
+    }
   }
 
   fn back_readable(&mut self) -> ClientResult {
-    self.protocol.back_readable(&mut self.metrics)
+    match self.protocol {
+      State::Pipe(ref mut pipe) => pipe.back_readable(&mut self.metrics),
+      _ => ClientResult::Continue,
+    }
   }
 
   fn back_writable(&mut self) -> ClientResult {
-    self.protocol.back_writable(&mut self.metrics)
+    match self.protocol {
+      State::Pipe(ref mut pipe) => pipe.back_writable(&mut self.metrics),
+      State::ProxyProtocol(ref mut pp) => pp.back_writable().1,
+    }
   }
 
   fn readiness(&mut self) -> &mut Readiness {
-    self.protocol.readiness()
+    match self.protocol {
+      State::Pipe(ref mut pipe) => pipe.readiness(),
+      State::ProxyProtocol(ref mut pp) => pp.readiness(),
+    }
   }
 
 }
