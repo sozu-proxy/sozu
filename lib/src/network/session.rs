@@ -25,7 +25,8 @@ use sozu_command::messages::{self,TcpFront,Order,Instance,MessageId,OrderMessage
   OrderMessageAnswer,OrderMessageStatus};
 
 use network::{ClientResult,ConnectionError,SocketType,Protocol,RequiredEvents,
-  ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction};
+  ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,
+  CloseResult};
 
 const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
@@ -111,18 +112,21 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
   pub fn close_client(&mut self, poll: &mut Poll, token: ClientToken) {
     if self.clients.contains(token) {
       let client = self.clients.remove(token).expect("client shoud be there");
-      let tokens = client.borrow_mut().close(poll, &mut self.configuration);
+      let CloseResult { tokens, backends } = client.borrow_mut().close(poll);
+
       for tk in tokens.into_iter() {
         let cl = self.to_client(tk);
         self.clients.remove(cl);
       }
+
+      for (app_id, address) in backends.into_iter() {
+        self.configuration.close_backend(app_id, &address);
+      }
+
       decr!("client.connections");
     }
 
     self.can_accept = true;
-  }
-
-  pub fn close_backend(&mut self, token: ClientToken) {
   }
 
   pub fn accept(&mut self, poll: &mut Poll, token: ListenToken) -> bool {
@@ -200,7 +204,10 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
         if let Some(token) = opt {
           let cl = self.to_client(token);
           if let Some(client) = self.clients.remove(cl) {
-            client.borrow_mut().close_backend(token, poll, &mut self.configuration);
+            let res = client.borrow_mut().close_backend(token, poll);
+            if let Some((app_id, address)) = res {
+              self.configuration.close_backend(app_id, &address);
+            }
           }
         }
       },

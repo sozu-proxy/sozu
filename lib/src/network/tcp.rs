@@ -26,7 +26,8 @@ use sozu_command::scm_socket::ScmSocket;
 use sozu_command::messages::{self,TcpFront,Order,Instance,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
-  ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus};
+  ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
+  CloseResult};
 use network::proxy::{Server,ProxyChannel};
 use network::session::{ListenToken,ClientToken,Session};
 use network::buffer_queue::BufferQueue;
@@ -206,42 +207,46 @@ impl Client {
 }
 
 impl ProxyClient for Client {
-  fn close(&mut self, poll: &mut Poll, configuration: &mut ProxyConfiguration<Client>) -> Vec<Token> {
+  fn close(&mut self, poll: &mut Poll) -> CloseResult {
     self.metrics.service_stop();
     self.front_socket().shutdown(Shutdown::Both);
     poll.deregister(self.front_socket());
 
+    let mut result = CloseResult::default();
+
     if let (Some(app_id), Some(addr)) = self.remove_backend() {
-      configuration.close_backend(app_id, &addr);
-      decr!("backend.connections");
+      result.backends.push((app_id, addr.clone()));
     }
 
     if let Some(sock) = self.back_socket() {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
+      decr!("backend.connections");
     }
 
-    let mut res = vec!();
     if let Some(tk) = self.token {
-      res.push(tk)
+      result.tokens.push(tk)
     }
     if let Some(tk) = self.backend_token {
-      res.push(tk)
+      result.tokens.push(tk)
+    }
+
+    result
+  }
+
+  fn close_backend(&mut self, _: Token, poll: &mut Poll) -> Option<(String,SocketAddr)> {
+    let mut res = None;
+    if let (Some(app_id), Some(addr)) = self.remove_backend() {
+      res = Some((app_id, addr.clone()));
+    }
+
+    if let Some(sock) = self.back_socket() {
+      sock.shutdown(Shutdown::Both);
+      poll.deregister(sock);
+      decr!("backend.connections");
     }
 
     res
-  }
-
-  fn close_backend(&mut self, _: Token, poll: &mut Poll, configuration: &mut ProxyConfiguration<Self>) {
-    if let (Some(app_id), Some(addr)) = self.remove_backend() {
-      configuration.close_backend(app_id, &addr);
-      decr!("backend.connections");
-    }
-
-    if let Some(sock) = self.back_socket() {
-      sock.shutdown(Shutdown::Both);
-      poll.deregister(sock);
-    }
   }
 
   fn protocol(&self)           -> Protocol {

@@ -63,12 +63,18 @@ pub enum Protocol {
   TCP
 }
 
+#[derive(Debug,Clone,Default)]
+pub struct CloseResult {
+  pub tokens:   Vec<Token>,
+  pub backends: Vec<(String, SocketAddr)>,
+}
+
 pub trait ProxyClient {
   fn protocol(&self)  -> Protocol;
   fn ready(&mut self) -> ClientResult;
   fn process_events(&mut self, token: Token, events: Ready);
-  fn close(&mut self, poll: &mut Poll, configuration: &mut ProxyConfiguration<Self>) -> Vec<Token>;
-  fn close_backend(&mut self, token: Token, poll: &mut Poll, configuration: &mut ProxyConfiguration<Self>);
+  fn close(&mut self, poll: &mut Poll) -> CloseResult;
+  fn close_backend(&mut self, token: Token, poll: &mut Poll) -> Option<(String, SocketAddr)>;
 }
 
 #[derive(Clone,Copy,Debug,PartialEq)]
@@ -97,8 +103,9 @@ pub trait ProxyConfiguration<Client> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: Rc<RefCell<Client>>,
     entry: Entry<Rc<RefCell<Client>>, ClientToken>, back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
-  fn accept(&mut self, token: ListenToken, event_loop: &mut Poll, entry: VacantEntry<Rc<RefCell<Client>>, ClientToken>,
-           client_token: Token) -> Result<(ClientToken, bool), AcceptError>;
+  fn accept(&mut self, token: ListenToken, event_loop: &mut Poll,
+    entry: VacantEntry<Rc<RefCell<Client>>, ClientToken>,
+    client_token: Token) -> Result<(ClientToken, bool), AcceptError>;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
 }
 
