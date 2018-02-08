@@ -663,8 +663,8 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<Client> for ServerConfiguration {
-  fn connect_to_backend(&mut self, poll: &mut Poll, clref: Rc<RefCell<Client>>, entry: Entry<Rc<RefCell<Client>>, ClientToken>, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
-    let mut client = clref.borrow_mut();// (*(*entry.get_mut()).borrow_mut());
+  fn connect_to_backend(&mut self, poll: &mut Poll, clref: Rc<RefCell<Client>>, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
+    let mut client = clref.borrow_mut();
     let h = try!(client.http().unwrap().state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
@@ -777,8 +777,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           client.readiness().back_interest.insert(UnixReady::hup());
           client.readiness().back_interest.insert(UnixReady::error());
           if old_app_id == new_app_id {
-            entry.remove();
-
             poll.register(
               &socket,
               client.back_token().expect("FIXME"),

@@ -172,7 +172,12 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
       let entry = self.clients.vacant_entry().expect("FIXME");
       let entry = entry.insert(cl);
       let back_token = Token(entry.index().0 + add);
-      self.configuration.connect_to_backend(poll, cl2, entry, back_token)
+      self.configuration.connect_to_backend(poll, cl2, back_token).map(|action| {
+        if action == BackendConnectAction::Replace {
+          entry.remove();
+        }
+        action
+      })
     };
 
     match res {

@@ -101,7 +101,7 @@ pub enum AcceptError {
 use self::session::{ClientToken,ListenToken};
 pub trait ProxyConfiguration<Client> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: Rc<RefCell<Client>>,
-    entry: Entry<Rc<RefCell<Client>>, ClientToken>, back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
+    back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
   fn accept(&mut self, token: ListenToken, event_loop: &mut Poll, client_token: Token)
     -> Result<(Rc<RefCell<Client>>, bool), AcceptError>;

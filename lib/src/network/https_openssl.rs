@@ -1035,7 +1035,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     }
   }
 
-  fn connect_to_backend(&mut self, poll: &mut Poll,  clref: Rc<RefCell<TlsClient>>, entry: Entry<Rc<RefCell<TlsClient>>, ClientToken>, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
+  fn connect_to_backend(&mut self, poll: &mut Poll,  clref: Rc<RefCell<TlsClient>>, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let mut client = clref.borrow_mut();
     let h = try!(unwrap_msg!(client.http()).state().get_host().ok_or(ConnectionError::NoHostGiven));
 
@@ -1161,8 +1161,6 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           socket.set_nodelay(true);
 
           if old_app_id == new_app_id {
-            entry.remove();
-
             poll.register(
               &socket,
               client.back_token().expect("FIXME"),

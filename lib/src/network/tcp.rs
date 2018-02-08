@@ -543,8 +543,8 @@ impl ServerConfiguration {
 
 impl ProxyConfiguration<Client> for ServerConfiguration {
 
-  fn connect_to_backend(&mut self, poll: &mut Poll, clref: Rc<RefCell<Client>>, entry: Entry<Rc<RefCell<Client>>, ClientToken>, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
-    let mut client = clref.borrow_mut();// (*(*entry.get_mut()).borrow_mut());
+  fn connect_to_backend(&mut self, poll: &mut Poll, clref: Rc<RefCell<Client>>, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
+    let mut client = clref.borrow_mut();
 
     let rnd = random::<usize>();
     let idx = rnd % self.listeners[client.accept_token].back_addresses.len();
