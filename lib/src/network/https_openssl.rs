@@ -998,8 +998,8 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<Rc<RefCell<Client>>, ClientToken>,
-           client_token: Token) -> Result<(ClientToken,bool), AcceptError> {
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token)
+    -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
     if let Some(ref sock) = self.listener {
       sock.accept().map_err(|e| {
         match e.kind() {
@@ -1023,10 +1023,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
             PollOpt::edge()
           );
 
-          let index = entry.index();
-          entry.insert(Rc::new(RefCell::new(c)));
-
-          return Ok((index, false))
+          Ok((Rc::new(RefCell::new(c)), false))
         } else {
           error!("could not create ssl context");
           Err(AcceptError::IoError)

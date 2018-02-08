@@ -647,8 +647,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<Rc<RefCell<Client>>, ClientToken>,
-           client_token: Token) -> Result<(ClientToken, bool), AcceptError> {
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token)
+    -> Result<(Rc<RefCell<Client>>, bool), AcceptError> {
+
     let mut p = (*self.pool).borrow_mut();
 
     if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
@@ -669,10 +670,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
               PollOpt::edge()
             );
 
-            let index = entry.index();
-            entry.insert(Rc::new(RefCell::new(c)));
-
-            (index, true)
+            (Rc::new(RefCell::new(c)), true)
           }).map_err(|e| {
             match e.kind() {
               ErrorKind::WouldBlock => AcceptError::WouldBlock,

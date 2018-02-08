@@ -920,8 +920,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<Rc<RefCell<Client>>, ClientToken>,
-           client_token: Token) -> Result<(ClientToken, bool), AcceptError> {
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token)
+    -> Result<(Rc<RefCell<Client>>, bool), AcceptError> {
+
     if let Some(ref sock) = self.listener {
       sock.accept().map_err(|e| {
         match e.kind() {
@@ -943,10 +944,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
             PollOpt::edge()
           );
 
-          let index = entry.index();
-          entry.insert(Rc::new(RefCell::new(c)));
-
-          Ok((index, false))
+          Ok((Rc::new(RefCell::new(c)), false))
         } else {
           Err(AcceptError::TooManyClients)
         }

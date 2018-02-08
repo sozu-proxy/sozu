@@ -134,7 +134,11 @@ impl<ServerConfiguration:ProxyConfiguration<Client>,Client:ProxyClient> Session<
     let res = {
       let entry = self.clients.vacant_entry().expect("FIXME");
       let client_token = Token(entry.index().0 + add);
-      self.configuration.accept(token, poll, entry, client_token)
+      self.configuration.accept(token, poll, client_token).map(|(client, should_connect)| {
+        let index = entry.index();
+        entry.insert(client);
+        (index, should_connect)
+      })
     };
 
     match res {

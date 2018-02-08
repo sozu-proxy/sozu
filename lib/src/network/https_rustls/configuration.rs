@@ -302,8 +302,9 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, entry: VacantEntry<Rc<RefCell<TlsClient>>, ClientToken>,
-           client_token: Token) -> Result<(ClientToken,bool), AcceptError> {
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token)
+    -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
+
     if let Some(ref listener) = self.listener.as_ref() {
       listener.accept().map_err(|e| {
         match e.kind() {
@@ -327,10 +328,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           PollOpt::edge()
         );
 
-        let index = entry.index();
-        entry.insert(Rc::new(RefCell::new(c)));
-
-        (index, false)
+        (Rc::new(RefCell::new(c)), false)
       })
     } else {
       Err(AcceptError::IoError)

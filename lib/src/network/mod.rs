@@ -103,9 +103,8 @@ pub trait ProxyConfiguration<Client> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: Rc<RefCell<Client>>,
     entry: Entry<Rc<RefCell<Client>>, ClientToken>, back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
-  fn accept(&mut self, token: ListenToken, event_loop: &mut Poll,
-    entry: VacantEntry<Rc<RefCell<Client>>, ClientToken>,
-    client_token: Token) -> Result<(ClientToken, bool), AcceptError>;
+  fn accept(&mut self, token: ListenToken, event_loop: &mut Poll, client_token: Token)
+    -> Result<(Rc<RefCell<Client>>, bool), AcceptError>;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
 }
 
