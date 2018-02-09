@@ -35,8 +35,7 @@ use network::buffer_queue::BufferQueue;
 use network::{AppId,Backend,ClientResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus};
 use network::backends::BackendMap;
-use network::proxy::{Server,ProxyChannel};
-use network::session::{ListenToken,ClientToken,Session};
+use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
 use network::trie::*;
@@ -68,14 +67,13 @@ pub struct ServerConfiguration {
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
   config:          HttpsProxyConfiguration,
-  base_token:      usize,
   ssl_config:      Arc<ServerConfig>,
   resolver:        Arc<CertificateResolverWrapper>,
 }
 
 impl ServerConfiguration {
-  pub fn new(config: HttpsProxyConfiguration, base_token: usize, event_loop: &mut Poll, start_at: usize,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>) -> io::Result<(ServerConfiguration, HashSet<ListenToken>)> {
+  pub fn new(config: HttpsProxyConfiguration, event_loop: &mut Poll,
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> io::Result<(ServerConfiguration, HashSet<Token>)> {
 
     let mut fronts   = HashMap::new();
     let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
@@ -86,8 +84,8 @@ impl ServerConfiguration {
 
     let mut listeners = HashSet::new();
     if let Some(ref sock) = listener {
-      event_loop.register(sock, Token(base_token), Ready::readable(), PollOpt::edge());
-      listeners.insert(ListenToken(0));
+      event_loop.register(sock, token, Ready::readable(), PollOpt::edge());
+      listeners.insert(token);
     }
 
     let default = DefaultAnswers {
@@ -115,7 +113,6 @@ impl ServerConfiguration {
       fronts:          fronts,
       pool:            pool,
       answers:         default,
-      base_token:      base_token,
       config:          config,
       ssl_config:      Arc::new(server_config),
       resolver:        resolver,
@@ -335,8 +332,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     }
   }
 
-  fn connect_to_backend(&mut self, poll: &mut Poll,  clref: Rc<RefCell<TlsClient>>, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
-    let mut client = clref.borrow_mut();
+  fn connect_to_backend(&mut self, poll: &mut Poll,  client: &mut TlsClient, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let h = try!(unwrap_msg!(client.http()).state().get_host().ok_or(ConnectionError::NoHostGiven));
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
@@ -422,8 +418,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       let conn   = try!(unwrap_msg!(client.http()).state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
       let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();
       let conn = match (front_should_stick, sticky_session) {
-        (true, Some(session)) => self.backend_from_sticky_session(&mut client, &app_id, session),
-        _ => self.backend_from_request(&mut client, &host, &rl.uri, front_should_stick),
+        (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session),
+        _ => self.backend_from_request(client, &host, &rl.uri, front_should_stick),
       };
 
       match conn {
@@ -615,8 +611,6 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   }
 }
 
-pub type RustlsServer = Session<ServerConfiguration,TlsClient>;
-
 pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_listeners   = 1;
@@ -625,12 +619,11 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
 
-  // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok((configuration, listeners)) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop, 1 + max_listeners, pool, None) {
-    let session = Session::new(max_listeners, max_buffers, 6148914691236517205, configuration, listeners, &mut event_loop);
+  if let Ok((configuration, listeners)) = ServerConfiguration::new(config, &mut event_loop, pool, None, Token(0)) {
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
+    let clients = Slab::with_capacity(max_buffers);
     let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      None, Some(session), None, None);
+      clients, None, Some(configuration), None, None);
 
     info!("starting event loop");
     server.run();

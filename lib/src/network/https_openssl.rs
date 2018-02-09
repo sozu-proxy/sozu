@@ -42,8 +42,7 @@ use network::{AppId,Backend,ClientResult,ConnectionError,Protocol,Readiness,Sess
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use network::backends::BackendMap;
-use network::proxy::{Server,ProxyChannel};
-use network::session::{ListenToken,ClientToken,Session};
+use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
@@ -1363,10 +1362,10 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
   if let Ok((configuration, listeners)) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop,
     1 + max_listeners, pool, None) {
 
-    let session = Session::new(max_listeners, max_buffers, 6148914691236517205, configuration, listeners, &mut event_loop);
+    //let session = Session::new(max_listeners, max_buffers, 6148914691236517205, configuration, listeners, &mut event_loop);
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
     let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      None, Some(session), None, None);
+      None, Some(configuration), None, None);
 
     info!("starting event loop");
     server.run();

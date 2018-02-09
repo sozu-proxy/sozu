@@ -26,7 +26,6 @@ mod splice;
 
 pub mod tcp;
 pub mod proxy;
-pub mod session;
 
 #[cfg(feature = "use_openssl")]
 pub mod https_openssl;
@@ -60,7 +59,10 @@ pub type AppId = String;
 pub enum Protocol {
   HTTP,
   HTTPS,
-  TCP
+  TCP,
+  HTTPListen,
+  HTTPSListen,
+  TCPListen,
 }
 
 #[derive(Debug,Clone,Default)]
@@ -71,6 +73,9 @@ pub struct CloseResult {
 
 pub trait ProxyClient {
   fn protocol(&self)  -> Protocol;
+  fn as_tcp(&mut self) -> &mut tcp::Client;
+  fn as_http(&mut self) -> &mut http::Client;
+  fn as_https(&mut self) -> &mut https::TlsClient;
   fn ready(&mut self) -> ClientResult;
   fn process_events(&mut self, token: Token, events: Ready);
   fn close(&mut self, poll: &mut Poll) -> CloseResult;
@@ -98,9 +103,9 @@ pub enum AcceptError {
   WouldBlock,
 }
 
-use self::session::{ClientToken,ListenToken};
+use self::proxy::{ClientToken,ListenToken};
 pub trait ProxyConfiguration<Client> {
-  fn connect_to_backend(&mut self, event_loop: &mut Poll, client: Rc<RefCell<Client>>,
+  fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut Client,
     back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
   fn accept(&mut self, token: ListenToken, event_loop: &mut Poll, client_token: Token)

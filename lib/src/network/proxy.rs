@@ -30,10 +30,10 @@ use sozu_command::state::{ConfigState,get_application_ids_by_domain};
 use sozu_command::messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer,QueryApplicationType};
 
 use network::buffer_queue::BufferQueue;
-use network::{ClientResult,ConnectionError,Protocol,RequiredEvents,ProxyClient,ProxyConfiguration};
+use network::{ClientResult,ConnectionError,Protocol,RequiredEvents,ProxyClient,ProxyConfiguration,
+  CloseResult,AcceptError,BackendConnectAction};
 use network::{http,https,tcp};
 use network::metrics::METRICS;
-use network::session::{ListenToken,Session};
 
 const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
@@ -48,6 +48,35 @@ enum ProxyType {
   TCP,
 }
 
+#[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
+pub struct ListenToken(pub usize);
+#[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
+pub struct ClientToken(pub usize);
+
+impl From<usize> for ListenToken {
+    fn from(val: usize) -> ListenToken {
+        ListenToken(val)
+    }
+}
+
+impl From<ListenToken> for usize {
+    fn from(val: ListenToken) -> usize {
+        val.0
+    }
+}
+
+impl From<usize> for ClientToken {
+    fn from(val: usize) -> ClientToken {
+        ClientToken(val)
+    }
+}
+
+impl From<ClientToken> for usize {
+    fn from(val: ClientToken) -> usize {
+        val.0
+    }
+}
+
 pub struct Server {
   pub poll:        Poll,
   shutting_down:   Option<MessageId>,
@@ -55,11 +84,12 @@ pub struct Server {
   can_accept:      bool,
   channel:         ProxyChannel,
   queue:           VecDeque<OrderMessageAnswer>,
-  http:            Option<Session<http::ServerConfiguration, http::Client>>,
-  https:           Option<Session<https::ServerConfiguration, https::TlsClient>>,
-  tcp:             Option<Session<tcp::ServerConfiguration, tcp::Client>>,
+  http:            Option<http::ServerConfiguration>,
+  https:           Option<https::ServerConfiguration>,
+  tcp:             Option<tcp::ServerConfiguration>,
   config_state:    ConfigState,
   scm:             ScmSocket,
+  clients:         Slab<Rc<RefCell<ProxyClient>>,ClientToken>,
 }
 
 impl Server {
@@ -80,43 +110,82 @@ impl Server {
       tcp:  Vec::new(),
     });
 
+    let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(10000);
+    {
+      let entry = clients.vacant_entry().expect("FIXME");
+      info!("taking token {:?} for channel", entry.index());
+      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+    }
+    {
+      let entry = clients.vacant_entry().expect("FIXME");
+      info!("taking token {:?} for metrics", entry.index());
+      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+    }
+
     let max_connections = config.max_connections;
     let max_buffers     = config.max_buffers;
     let http_session = config.http.and_then(|conf| conf.to_http()).map(|http_conf| {
-      let max_listeners = 1;
+      let entry = clients.vacant_entry().expect("FIXME");
+      let token = Token(entry.index().0);
       let (configuration, listener_tokens) = http::ServerConfiguration::new(http_conf, &mut event_loop,
-        1 + max_listeners, pool.clone(), listeners.http.map(|fd| unsafe { TcpListener::from_raw_fd(fd) }));
+        pool.clone(), listeners.http.map(|fd| unsafe { TcpListener::from_raw_fd(fd) }), token);
 
-      Session::new(1, max_connections, 0, configuration, listener_tokens, &mut event_loop)
+      if listener_tokens.len() == 1 {
+        let e = entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+        info!("inserting http listener at token: {:?}", e.index());
+      }
+      configuration
     });
 
     let https_session = config.https.and_then(|conf| conf.to_tls()).and_then(|https_conf| {
-      let max_listeners   = 1;
-      https::ServerConfiguration::new(https_conf, 6148914691236517205, &mut event_loop,
-        1 + max_listeners + 6148914691236517205, pool.clone(),
-        listeners.tls.map(|fd| unsafe { TcpListener::from_raw_fd(fd) })
+      let entry = clients.vacant_entry().expect("FIXME");
+      let token = Token(entry.index().0);
+      https::ServerConfiguration::new(https_conf, &mut event_loop, pool.clone(),
+      listeners.tls.map(|fd| unsafe { TcpListener::from_raw_fd(fd) }), token
       ).map(|(configuration, listener_tokens)| {
-        Session::new(max_listeners, max_connections, 6148914691236517205, configuration,
-          listener_tokens, &mut event_loop)
+        //FIXME
+        //Session::new(max_listeners, max_connections, 6148914691236517205, configuration,
+        //  listener_tokens, &mut event_loop)
+        if listener_tokens.len() == 1 {
+          entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPSListen })));
+        }
+        configuration
       }).ok()
     });
 
+    let tcp_listeners: Vec<(String, TcpListener)> = listeners.tcp.drain(..).map(|(app_id, fd)| {
+      (app_id, unsafe { TcpListener::from_raw_fd(fd) })
+    }).collect();
+
+    let mut tokens = Vec::new();
+    for _ in 0..tcp_listeners.len() {
+      let entry = clients.vacant_entry().expect("FIXME");
+      let token = Token(entry.index().0);
+      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::TCPListen })));
+      tokens.push(token);
+    }
+
+    let tcp_tokens: HashSet<Token> = tokens.iter().cloned().collect();
+
     let tcp_session = config.tcp.map(|conf| {
       let (configuration, listener_tokens) = tcp::ServerConfiguration::new(conf.max_listeners,
-        12297829382473034410,  &mut event_loop, pool.clone(),
-        listeners.tcp.drain(..).map(|(app_id, fd)| (app_id, unsafe { TcpListener::from_raw_fd(fd) })).collect());
+      &mut event_loop, pool.clone(), tcp_listeners, tokens);
 
-      Session::new(conf.max_listeners, max_buffers, 12297829382473034410, configuration, listener_tokens,
-        &mut event_loop)
+      let to_remove:Vec<Token> = tcp_tokens.difference(&listener_tokens).cloned().collect();
+      for token in to_remove.into_iter() {
+        clients.remove(ClientToken(token.0));
+      }
+      configuration
     });
 
-    Server::new(event_loop, channel, scm, http_session, https_session, tcp_session, Some(config_state))
+    Server::new(event_loop, channel, scm, clients, http_session, https_session, tcp_session, Some(config_state))
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
-    http:  Option<Session<http::ServerConfiguration, http::Client>>,
-    https: Option<Session<https::ServerConfiguration, https::TlsClient>>,
-    tcp:  Option<Session<tcp::ServerConfiguration, tcp::Client>>,
+    clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken>,
+    http:  Option<http::ServerConfiguration>,
+    https: Option<https::ServerConfiguration>,
+    tcp:  Option<tcp::ServerConfiguration>,
     config_state: Option<ConfigState>) -> Self {
 
     poll.register(
@@ -146,6 +215,7 @@ impl Server {
       tcp:             tcp,
       config_state:    ConfigState::new(),
       scm:             scm,
+      clients:         clients,
     };
 
     // initialize the worker with the state we got from a file
@@ -289,36 +359,11 @@ impl Server {
             (*metrics.borrow_mut()).writable();
           });
         } else {
-          //self.ready(event.token(), event.readiness());
-          match proxy_type(event.token().0) {
-            ProxyType::HTTP  => if let Some(mut http) = self.http.take() {
-              http.ready(&mut self.poll, event.token(), event.readiness());
-              self.http = Some(http);
-            },
-            ProxyType::HTTPS => if let Some(mut https) = self.https.take() {
-              https.ready(&mut self.poll, event.token(), event.readiness());
-              self.https = Some(https);
-            },
-            ProxyType::TCP   => if let Some(mut tcp) = self.tcp.take() {
-              tcp.ready(&mut self.poll, event.token(), event.readiness());
-              self.tcp = Some(tcp);
-            },
-          };
+          self.ready(event.token(), event.readiness());
         }
       }
 
-      if let Some(mut http) = self.http.take() {
-        http.handle_remaining_readiness(&mut self.poll);
-        self.http = Some(http);
-      }
-      if let Some(mut https) = self.https.take() {
-        https.handle_remaining_readiness(&mut self.poll);
-        self.https = Some(https);
-      }
-      if let Some(mut tcp) = self.tcp.take() {
-        tcp.handle_remaining_readiness(&mut self.poll);
-        self.tcp = Some(tcp);
-      }
+      self.handle_remaining_readiness();
 
       METRICS.with(|metrics| {
         (*metrics.borrow_mut()).send_data();
@@ -394,19 +439,19 @@ impl Server {
 
     if topics.contains(&Topic::HttpProxyConfig) {
       if let Some(mut http) = self.http.take() {
-        self.queue.push_back(http.configuration().notify(&mut self.poll, message.clone()));
+        self.queue.push_back(http.notify(&mut self.poll, message.clone()));
         self.http = Some(http);
       }
     }
     if topics.contains(&Topic::HttpsProxyConfig) {
       if let Some(mut https) = self.https.take() {
-        self.queue.push_back(https.configuration().notify(&mut self.poll, message.clone()));
+        self.queue.push_back(https.notify(&mut self.poll, message.clone()));
         self.https = Some(https);
       }
     }
     if topics.contains(&Topic::TcpProxyConfig) {
       if let Some(mut tcp) = self.tcp.take() {
-        self.queue.push_back(tcp.configuration().notify(&mut self.poll, message));
+        self.queue.push_back(tcp.notify(&mut self.poll, message));
         self.tcp = Some(tcp);
       }
     }
@@ -416,19 +461,19 @@ impl Server {
     self.scm.set_blocking(false);
 
     let http_listener = self.http.as_mut()
-      .and_then(|http| http.configuration.give_back_listener());
+      .and_then(|http| http.give_back_listener());
     if let Some(ref sock) = http_listener {
       self.poll.deregister(sock);
     }
 
     let https_listener = self.https.as_mut()
-      .and_then(|https| https.configuration.give_back_listener());
+      .and_then(|https| https.give_back_listener());
     if let Some(ref sock) = https_listener {
       self.poll.deregister(sock);
     }
 
     let tcp_listeners = self.tcp.as_mut()
-      .map(|tcp| tcp.configuration.give_back_listeners()).unwrap_or(Vec::new());
+      .map(|tcp| tcp.give_back_listeners()).unwrap_or(Vec::new());
 
     for &(_, ref sock) in tcp_listeners.iter() {
       self.poll.deregister(sock);
@@ -445,14 +490,338 @@ impl Server {
     info!("sent default listeners: {:?}", res);
 
   }
+
+  pub fn to_client(&self, token: Token) -> ClientToken {
+    ClientToken(token.0)
+  }
+
+  pub fn from_client(&self, token: ClientToken) -> Token {
+    Token(token.0)
+  }
+
+  pub fn from_client_add(&self) -> usize {
+    0
+  }
+
+  pub fn close_client(&mut self, token: ClientToken) {
+    if self.clients.contains(token) {
+      let client = self.clients.remove(token).expect("client shoud be there");
+      let CloseResult { tokens, backends } = client.borrow_mut().close(&mut self.poll);
+
+      for tk in tokens.into_iter() {
+        let cl = self.to_client(tk);
+        self.clients.remove(cl);
+      }
+
+      for (app_id, address) in backends.into_iter() {
+        //FIXME
+        //self.configuration.close_backend(app_id, &address);
+      }
+
+      decr!("client.connections");
+    }
+
+    self.can_accept = true;
+  }
+
+  pub fn accept(&mut self, token: ListenToken, protocol: Protocol) -> bool {
+    let add = self.from_client_add();
+    let res = {
+      let entry = self.clients.vacant_entry().expect("FIXME");
+      let client_token = Token(entry.index().0 + add);
+      let index = entry.index();
+      let res = match protocol {
+        Protocol::TCPListen   => {
+          let mut tcp = self.tcp.take();
+          if let Some(mut configuration) = tcp {
+            let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+              entry.insert(client);
+              (index, should_connect)
+            });
+            self.tcp = Some(configuration);
+            Some(res1)
+          } else {
+            None
+          }
+        },
+        Protocol::HTTPListen  => {
+          let mut http = self.http.take();
+          if let Some(mut configuration) = http {
+            let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+              entry.insert(client);
+              (index, should_connect)
+            });
+            self.http = Some(configuration);
+            Some(res1)
+          } else {
+            None
+          }
+        },
+        Protocol::HTTPSListen => {
+          let mut https = self.https.take();
+          if let Some(mut configuration) = https {
+            let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+              entry.insert(client);
+              (index, should_connect)
+            });
+            self.https = Some(configuration);
+            Some(res1)
+          } else {
+            None
+          }
+        },
+        _ => panic!("should not call accept() on a HTTP, HTTPS or TCP client"),
+      };
+      res.expect("FIXME")
+    };
+
+    match res {
+      Err(AcceptError::IoError) => {
+        //FIXME: do we stop accepting?
+        false
+      },
+      Err(AcceptError::TooManyClients) => {
+        self.can_accept = false;
+        false
+      },
+      Err(AcceptError::WouldBlock) => {
+        self.accept_ready.remove(&token);
+        false
+      },
+      Ok((client_token, should_connect)) => {
+        if should_connect {
+           self.connect_to_backend(client_token);
+        }
+
+        true
+      }
+    }
+  }
+
+  pub fn connect_to_backend(&mut self, token: ClientToken) {
+    let add = self.from_client_add();
+    let res = {
+      let cl = self.clients[token].clone();
+      let cl2: Rc<RefCell<ProxyClient>> = self.clients[token].clone();
+      let protocol = { cl.borrow().protocol() };
+      let entry = self.clients.vacant_entry().expect("FIXME");
+      let entry = entry.insert(cl);
+      let back_token = Token(entry.index().0 + add);
+
+      let res = match protocol {
+        Protocol::TCP   => {
+          if let Some(mut tcp) = self.tcp.take() {
+            let mut b = cl2.borrow_mut();
+            let client: &mut tcp::Client = b.as_tcp() ;
+            let r = tcp.connect_to_backend(&mut self.poll, client, back_token);
+            self.tcp = Some(tcp);
+            r
+          } else {
+            //FIXME
+            Err(ConnectionError::HostNotFound)
+          }
+        },
+        Protocol::HTTP  => {
+          if let Some(mut http) = self.http.take() {
+            let mut b = cl2.borrow_mut();
+            let client: &mut http::Client = b.as_http() ;
+            let r = http.connect_to_backend(&mut self.poll, client, back_token);
+            self.http = Some(http);
+            r
+          } else {
+            //FIXME
+            Err(ConnectionError::HostNotFound)
+          }
+        },
+        Protocol::HTTPS => {
+          if let Some(mut https) = self.https.take() {
+            let mut b = cl2.borrow_mut();
+            let client: &mut https::TlsClient = b.as_https() ;
+            let r = https.connect_to_backend(&mut self.poll, client, back_token);
+            self.https = Some(https);
+            r
+          } else {
+            //FIXME
+            Err(ConnectionError::HostNotFound)
+          }
+        },
+        _ => {
+          panic!("should not call connect_to_backend on listeners");
+          Err(ConnectionError::HostNotFound)
+        },
+      };
+ 
+      res.map(|action| {
+        if action == BackendConnectAction::Replace {
+          entry.remove();
+        }
+        action
+      })
+    };
+    let res = Err(ConnectionError::HostNotFound);
+
+    match res {
+      Ok(BackendConnectAction::Reuse) => {
+        debug!("keepalive, reusing backend connection");
+      }
+      Ok(BackendConnectAction::Replace) => {
+      },
+      Ok(BackendConnectAction::New) => {
+      },
+      Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) | Err(ConnectionError::HttpsRedirect) => {
+      },
+      _ => self.close_client(token),
+    }
+  }
+
+  pub fn interpret_client_order(&mut self, token: ClientToken, order: ClientResult) {
+    //println!("INTERPRET ORDER: {:?}", order);
+    match order {
+      ClientResult::CloseClient     => self.close_client(token),
+      //FIXME: we do not deregister in close_backend
+      ClientResult::CloseBackend(opt) => {
+        if let Some(token) = opt {
+          let cl = self.to_client(token);
+          if let Some(client) = self.clients.remove(cl) {
+            let protocol = client.borrow().protocol();
+            let res = client.borrow_mut().close_backend(token, &mut self.poll);
+            if let Some((app_id, address)) = res {
+              match protocol {
+                Protocol::TCP   => self.tcp.as_mut().map(|c| {
+                  c.close_backend(app_id, &address);
+                }),
+                Protocol::HTTP  => self.http.as_mut().map(|c| {
+                  c.close_backend(app_id, &address);
+                }),
+                Protocol::HTTPS => self.https.as_mut().map(|c| {
+                  c.close_backend(app_id, &address);
+                }),
+                _ => {
+                  panic!("should not call interpret_client_order on a listen socket");
+                }
+              };
+            }
+          }
+        }
+      },
+      ClientResult::ConnectBackend  => self.connect_to_backend(token),
+      ClientResult::Continue        => {}
+    }
+  }
+
+  pub fn ready(&mut self, token: Token, events: Ready) {
+    //info!("PROXY\t{:?} got events: {:?}", token, events);
+
+    let client_token = ClientToken(token.0);
+    if self.clients.contains(client_token) {
+      info!("clients contains {:?}", client_token);
+      let protocol = self.clients[client_token].borrow().protocol();
+      info!("protocol: {:?}", protocol);
+      match protocol {
+        Protocol::HTTPListen | Protocol::HTTPSListen | Protocol::TCPListen => {
+          info!("PROTOCOL IS LISTEN");
+          if events.is_readable() {
+            self.accept_ready.insert(ListenToken(token.0));
+            loop {
+              info!("will accept");
+              if !self.accept(ListenToken(token.0), protocol) {
+                break;
+              }
+            }
+            return;
+          }
+
+          if events.is_writable() {
+            error!("received writable for listener {:?}, this should not happen", token);
+            return;
+          }
+
+          if UnixReady::from(events).is_hup() {
+            error!("should not happen: server {:?} closed", token);
+            return;
+          }
+
+          unreachable!();
+
+        },
+        _ => {}
+      }
+
+      self.clients[client_token].borrow_mut().process_events(token, events);
+    }
+
+    loop {
+    //self.client_ready(poll, client_token, events);
+      let order = self.clients[client_token].borrow_mut().ready();
+      //info!("client[{:?} -> {:?}] got events {:?} and returned order {:?}", client_token, self.from_client(client_token), events, order);
+      //FIXME: the CloseBackend message might not mean we have nothing else to do
+      //with that client
+      let is_connect = order == ClientResult::ConnectBackend;
+      self.interpret_client_order(client_token, order);
+
+      // if we had to connect to a backend server, go back to the loop
+      // I'm not sure we would have anything to do right away, though,
+      // so maybe we can just stop there for that client?
+      // also the events would change?
+      if !is_connect {
+        break;
+      }
+    }
+  }
+
+  pub fn handle_remaining_readiness(&mut self) {
+    // try to accept again after handling all client events,
+    // since we might have released a few client slots
+    if !self.accept_ready.is_empty() && self.can_accept {
+      loop {
+        if let Some(token) = self.accept_ready.iter().next().map(|token| ListenToken(token.0)) {
+          let protocol = self.clients[ClientToken(token.0)].borrow().protocol();
+          if !self.accept(token, protocol) {
+            if !self.accept_ready.is_empty() && self.can_accept {
+              break;
+            }
+          }
+        } else {
+          // we don't have any more elements to loop over
+          break;
+        }
+      }
+    }
+  }
 }
 
-fn proxy_type(token: usize) -> ProxyType {
-  if token < 6148914691236517205 {
-    ProxyType::HTTP
-  } else if token < 12297829382473034410 {
-    ProxyType::HTTPS
-  } else {
-    ProxyType::TCP
+pub struct ListenClient {
+  pub protocol: Protocol,
+}
+
+impl ProxyClient for ListenClient {
+  fn protocol(&self) -> Protocol {
+    self.protocol
+  }
+
+  fn as_http(&mut self) ->  &mut http::Client {
+    panic!();
+  }
+
+  fn as_tcp(&mut self) -> &mut tcp::Client {
+    panic!();
+  }
+
+  fn as_https(&mut self) -> &mut https::TlsClient {
+    panic!();
+  }
+
+  fn ready(&mut self) -> ClientResult {
+    ClientResult::Continue
+  }
+
+  fn process_events(&mut self, token: Token, events: Ready) {}
+
+  fn close(&mut self, poll: &mut Poll) -> CloseResult {
+    CloseResult::default()
+  }
+
+  fn close_backend(&mut self, token: Token, poll: &mut Poll) -> Option<(String, SocketAddr)> {
+    None
   }
 }

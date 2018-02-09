@@ -28,11 +28,11 @@ use sozu_command::messages::{self,TcpFront,Order,Instance,OrderMessage,OrderMess
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
-use network::proxy::{Server,ProxyChannel};
-use network::session::{ListenToken,ClientToken,Session};
+use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::protocol::Pipe;
+use network::{http,https};
 
 use util::UnwrapLog;
 
@@ -253,6 +253,18 @@ impl ProxyClient for Client {
     Protocol::TCP
   }
 
+  fn as_http(&mut self) -> &mut http::Client {
+    panic!();
+  }
+
+  fn as_tcp(&mut self) -> &mut Client {
+    self
+  }
+
+  fn as_https(&mut self) -> &mut https::TlsClient {
+    panic!();
+  }
+
   fn process_events(&mut self, token: Token, events: Ready) {
     if self.token == Some(token) {
       self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
@@ -398,24 +410,22 @@ pub struct ServerConfiguration {
   instances:       HashMap<String, Vec<Backend>>,
   listeners:       Slab<ApplicationListener,ListenToken>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
-  base_token:      usize,
 }
 
 impl ServerConfiguration {
-  pub fn new(max_listeners: usize, start_at: usize, event_loop: &mut Poll, pool: Rc<RefCell<Pool<BufferQueue>>>,
-    mut tcp_listener: Vec<(AppId, TcpListener)>) -> (ServerConfiguration, HashSet<ListenToken>) {
+  pub fn new(max_listeners: usize, event_loop: &mut Poll, pool: Rc<RefCell<Pool<BufferQueue>>>,
+    mut tcp_listener: Vec<(AppId, TcpListener)>, mut tokens: Vec<Token>) -> (ServerConfiguration, HashSet<Token>) {
 
     let mut configuration = ServerConfiguration {
       instances:     HashMap::new(),
       listeners:     Slab::with_capacity(max_listeners),
       fronts:        HashMap::new(),
       pool:          pool,
-      base_token:    start_at,
     };
 
     let mut listener_tokens = HashSet::new();
 
-    for (app_id, listener) in tcp_listener.drain(..) {
+    for ((app_id, listener), token) in tcp_listener.drain(..).zip(tokens.drain(..)) {
       if let Ok(front) = listener.local_addr() {
         let al = ApplicationListener {
           app_id:         app_id.clone(),
@@ -424,7 +434,7 @@ impl ServerConfiguration {
           front_address:  front,
           back_addresses: Vec::new()
         };
-        if let Some(token) = configuration.add_application_listener(&app_id, al, event_loop) {
+        if let Some(_) = configuration.add_application_listener(&app_id, al, event_loop, token) {
           listener_tokens.insert(token);
         }
       }
@@ -442,14 +452,14 @@ impl ServerConfiguration {
     res
   }
 
-  fn add_application_listener(&mut self, app_id: &str, al: ApplicationListener, event_loop: &mut Poll) -> Option<ListenToken> {
+  fn add_application_listener(&mut self, app_id: &str, al: ApplicationListener, event_loop: &mut Poll, token: Token) -> Option<ListenToken> {
     let front = al.front_address.clone();
     if let Ok(tok) = self.listeners.insert(al) {
       //FIXME: the +2 is probably not necessary here
-      self.listeners[tok].token = Some(Token(self.base_token+2+tok.0));
+      self.listeners[tok].token = Some(token);
       self.fronts.insert(String::from(app_id), tok);
       if let Some(ref sock) = self.listeners[tok].sock {
-        event_loop.register(sock, Token(self.base_token+2+tok.0), Ready::readable(), PollOpt::edge());
+        event_loop.register(sock, token, Ready::readable(), PollOpt::edge());
       }
       info!("started TCP listener for app {} on port {}", app_id, front.port());
       Some(tok)
@@ -459,7 +469,7 @@ impl ServerConfiguration {
     }
   }
 
-  fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken> {
+  fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, event_loop: &mut Poll, token: Token) -> Option<ListenToken> {
     if self.fronts.contains_key(app_id) {
       error!("TCP front already exists for app_id {}", app_id);
       return None;
@@ -476,12 +486,12 @@ impl ServerConfiguration {
       let al = ApplicationListener {
         app_id:         String::from(app_id),
         sock:           Some(listener),
-        token:          None,
+        token:          Some(token),
         front_address:  *front,
         back_addresses: addresses
       };
 
-      self.add_application_listener(app_id, al, event_loop)
+      self.add_application_listener(app_id, al, event_loop, token)
     } else {
       error!("could not declare listener for app {} on port {}", app_id, front.port());
       None
@@ -543,9 +553,7 @@ impl ServerConfiguration {
 
 impl ProxyConfiguration<Client> for ServerConfiguration {
 
-  fn connect_to_backend(&mut self, poll: &mut Poll, clref: Rc<RefCell<Client>>, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
-    let mut client = clref.borrow_mut();
-
+  fn connect_to_backend(&mut self, poll: &mut Poll, client: &mut Client, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
     let rnd = random::<usize>();
     let idx = rnd % self.listeners[client.accept_token].back_addresses.len();
 
@@ -571,6 +579,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
     match message.order {
+      /*FIXME
       Order::AddTcpFront(tcp_front) => {
         let addr_string = tcp_front.ip_address + ":" + &tcp_front.port.to_string();
         if let Ok(front) = addr_string.parse() {
@@ -585,6 +594,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None}
         }
       },
+      */
       Order::RemoveTcpFront(front) => {
         trace!("{:?}", front);
         let _ = self.remove_tcp_front(front.app_id, event_loop);
@@ -653,7 +663,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     let mut p = (*self.pool).borrow_mut();
 
     if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-      let internal_token = ListenToken(token.0 - 2 - self.base_token);
+      let internal_token = ListenToken(token.0);//FIXME: ListenToken(token.0 - 2 - self.base_token);
       if self.listeners.contains(internal_token) {
         if let Some(ref listener) = self.listeners[internal_token].sock.as_ref() {
           listener.accept().map(|(frontend_sock, _)| {
@@ -701,8 +711,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   }
 }
 
-pub type TcpServer = Session<ServerConfiguration,Client>;
-
 pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
 
   info!("listen for connections");
@@ -715,11 +723,11 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
     let pool = Rc::new(RefCell::new(
       Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
     ));
-    let (configuration, tokens) = ServerConfiguration::new(10, 12297829382473034410, &mut poll, pool, Vec::new());
-    let session = Session::new(10, 500, 12297829382473034410, configuration, tokens, &mut poll);
+    let (configuration, tokens) = ServerConfiguration::new(10, &mut poll, pool, Vec::new(), Vec::new());
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
+    let clients = Slab::with_capacity(max_buffers);
     let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      None, None, Some(session), None);
+      clients, None, None, Some(configuration), None);
     info!("will run");
     s.run();
     info!("ending event loop");
@@ -763,10 +771,10 @@ pub fn start(max_listeners: usize, max_buffers: usize, buffer_size:usize, channe
   let pool = Rc::new(RefCell::new(
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
-  let (configuration, tokens) = ServerConfiguration::new(max_listeners, 12297829382473034410, &mut poll, pool, Vec::new());
-  let session           = Session::new(max_listeners, max_buffers, 12297829382473034410, configuration, tokens, &mut poll);
+  let (configuration, tokens) = ServerConfiguration::new(max_listeners, &mut poll, pool, Vec::new(), Vec::new());
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
-  let mut server        = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), None, None, Some(session), None);
+  let clients = Slab::with_capacity(max_buffers);
+  let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), clients, None, None, Some(configuration), None);
 
   info!("starting event loop");
   server.run();
