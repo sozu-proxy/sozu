@@ -33,15 +33,23 @@ impl fmt::Display for ProtocolSupportedV1 {
 #[derive(Debug)]
 pub struct HeaderV1 {
   protocol: ProtocolSupportedV1,
-  addr_src: Option<SocketAddr>,
-  addr_dst: Option<SocketAddr>,
+  addr_src: SocketAddr,
+  addr_dst: SocketAddr,
 }
 
 const PROXY_PROTO_IDENTIFIER: &'static str = "PROXY";
 
 impl HeaderV1 {
 
-  pub fn new (protocol: ProtocolSupportedV1, addr_src: Option<SocketAddr>, addr_dst: Option<SocketAddr>) -> Self {
+  pub fn new (addr_src: SocketAddr, addr_dst: SocketAddr) -> Self {
+    let protocol = if addr_dst.is_ipv6() {
+      ProtocolSupportedV1::TCP6
+    } else if addr_dst.is_ipv4() {
+      ProtocolSupportedV1::TCP4
+    } else {
+      ProtocolSupportedV1::UNKNOWN
+    };
+
     HeaderV1 {
       protocol,
       addr_src,
@@ -60,10 +68,10 @@ impl HeaderV1 {
       format!("{} {} {} {} {} {}\r\n",
         PROXY_PROTO_IDENTIFIER,
         self.protocol,
-        self.addr_src.unwrap().ip(),
-        self.addr_dst.unwrap().ip(),
-        self.addr_src.unwrap().port(),
-        self.addr_dst.unwrap().port(),
+        self.addr_src.ip(),
+        self.addr_dst.ip(),
+        self.addr_src.port(),
+        self.addr_dst.port(),
       ).into_bytes()
     }
   }
@@ -77,9 +85,10 @@ mod test {
 
   #[test]
   fn it_should_return_a_correct_header_with_ipv4() {
-    let addr_src = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 80));
-    let addr_dst = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 80));
-    let header = HeaderV1::new(ProtocolSupportedV1::TCP4, addr_src, addr_dst);
+    let header = HeaderV1::new(
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 80),
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 80)
+    );
 
     let header_to_cmp = "PROXY TCP4 127.0.0.1 127.0.0.1 80 80\r\n".as_bytes();
 
@@ -88,23 +97,24 @@ mod test {
 
   #[test]
   fn it_should_return_a_correct_header_with_ipv6() {
-    let addr_src = Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0xffff)), 80));
-    let addr_dst = Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0xffff)), 80));
-    let header = HeaderV1::new(ProtocolSupportedV1::TCP6, addr_src, addr_dst);
+    let header = HeaderV1::new(
+      SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0xffff)), 80),
+      SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0xffff)), 80)
+    );
 
     let header_to_cmp = "PROXY TCP6 ::0.0.255.255 ::0.0.255.255 80 80\r\n".as_bytes();
 
     assert_eq!(header_to_cmp, &header.into_bytes()[..]);
   }
 
-  #[test]
-  fn it_should_return_the_an_unknown_header() {
-    let header = HeaderV1::new(ProtocolSupportedV1::UNKNOWN, None, None);
+  // #[test]
+  // fn it_should_return_the_an_unknown_header() {
+  //   let header = HeaderV1::new(ProtocolSupportedV1::UNKNOWN, None, None);
 
-    let header_to_cmp = "PROXY UNKNOWN\r\n".as_bytes();
+  //   let header_to_cmp = "PROXY UNKNOWN\r\n".as_bytes();
 
-    assert_eq!(header_to_cmp, &header.into_bytes()[..]);
-  }
+  //   assert_eq!(header_to_cmp, &header.into_bytes()[..]);
+  // }
 }
 
 
