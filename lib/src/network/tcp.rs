@@ -439,10 +439,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     let backend_addr = try!(self.listeners[client.accept_token].back_addresses.get(idx).ok_or(ConnectionError::ToBeDefined));
     let stream = try!(TcpStream::connect(backend_addr).map_err(|_| ConnectionError::ToBeDefined));
     stream.set_nodelay(true);
-
     client.set_back_socket(stream);
-    client.readiness().front_interest.insert(Ready::readable() | Ready::writable());
-    client.readiness().back_interest.insert(Ready::readable() | Ready::writable());
+
     Ok(BackendConnectAction::New)
   }
 
