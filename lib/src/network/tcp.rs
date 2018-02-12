@@ -50,7 +50,7 @@ pub enum ConnectionStatus {
 
 pub enum State {
   Pipe(Pipe<TcpStream>),
-  ProxyProtocol(ProxyProtocol),
+  ProxyProtocol(ProxyProtocol<TcpStream>),
 }
 
 pub struct Client {
@@ -86,7 +86,8 @@ impl Client {
       app_id:         None,
       request_id:     Uuid::new_v4().hyphenated().to_string(),
       metrics:        SessionMetrics::new(),
-      protocol:       State::Pipe(Pipe::new(s, None, front_buf, back_buf, addr)),
+      //protocol:       State::Pipe(Pipe::new(s, None, front_buf, back_buf, addr)),
+      protocol:       State::ProxyProtocol(ProxyProtocol::new(s, None)),
     }
   }
 
@@ -125,28 +126,28 @@ impl ProxyClient for Client {
   fn front_socket(&self) -> &TcpStream {
     match self.protocol {
       State::Pipe(ref pipe) => pipe.front_socket(),
-      _ => &self.sock,
+      State::ProxyProtocol(ref pp) => pp.front_socket(),
     }
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
     match self.protocol {
       State::Pipe(ref pipe) => pipe.back_socket(),
-      _ => self.backend.as_ref(),
+      State::ProxyProtocol(ref pp) => pp.back_socket(),
     }
   }
 
   fn front_token(&self)  -> Option<Token> {
     match self.protocol {
       State::Pipe(ref pipe) => pipe.front_token(),
-      _ => self.token,
+      State::ProxyProtocol(ref pp) => pp.front_token(),
     }
   }
 
   fn back_token(&self)   -> Option<Token> {
     match self.protocol {
       State::Pipe(ref pipe) => pipe.back_token(),
-      _ => self.backend_token,
+      State::ProxyProtocol(ref pp) => pp.back_token(),
     }
   }
 
@@ -173,7 +174,7 @@ impl ProxyClient for Client {
 
     match self.protocol {
       State::Pipe(ref mut pipe) => pipe.set_front_token(token),
-      _ => {},
+      State::ProxyProtocol(ref mut pp) => pp.set_front_token(token),
     }
   }
 
@@ -182,7 +183,7 @@ impl ProxyClient for Client {
 
     match self.protocol {
       State::Pipe(ref mut pipe) => pipe.set_back_token(token),
-      _ => {}, // We don't care about the token.
+      State::ProxyProtocol(ref mut pp) => pp.set_back_token(token),
     }
   }
 
