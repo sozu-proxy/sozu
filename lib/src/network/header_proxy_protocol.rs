@@ -1,10 +1,19 @@
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::fmt;
 
-
 pub enum ProxyProtocolHeader {
   V1(HeaderV1),
   V2(HeaderV2),
+}
+
+impl ProxyProtocolHeader {
+  // Use this method to writte the header in the backend socket
+  pub fn into_bytes(&self) -> Vec<u8> {
+    match *self {
+      ProxyProtocolHeader::V1(ref header) => header.into_bytes(),
+      ProxyProtocolHeader::V2(_) => unimplemented!(),
+    }
+  }
 }
 
 /// Indicate the proxied INET protocol and family
@@ -57,7 +66,6 @@ impl HeaderV1 {
     }
   }
 
-  // Use this method to writte the header in the backend socket
   pub fn into_bytes(&self) -> Vec<u8> {
     if self.protocol.eq(&ProtocolSupportedV1::UNKNOWN) {
       format!("{} {}\r\n",
