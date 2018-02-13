@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+use std::io::{Write, ErrorKind};
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
@@ -15,6 +16,7 @@ pub struct ProxyProtocol<Front:SocketHandler> {
   frontend_token: Option<Token>,
   backend_token:  Option<Token>,
   pub readiness:  Readiness,
+  cursor_header:  usize,
 }
 
 impl <Front:SocketHandler>ProxyProtocol<Front> {
@@ -31,22 +33,36 @@ impl <Front:SocketHandler>ProxyProtocol<Front> {
         front_readiness: UnixReady::from(Ready::empty()),
         back_readiness:  UnixReady::from(Ready::empty()),
       },
+      cursor_header: 0,
     }
   }
 
   // The header is send immediately at once upon the connection is establish
   // and prepended before any data.
   pub fn back_writable(&mut self) -> (ProtocolResult, ClientResult) {
-    if let Some(ref mut socket) = self.backend {
-      //TODO: writte the header in the backend
-      debug!("Writte proxy protocol header");
-      debug!("The header should be receive. We switch to a Pipe");
-      if let Some(ref header) = self.header {
-        debug!("PROXY PROTOCOL HEADER = {:?}", header);
-      }
-      return (ProtocolResult::Upgrade, ClientResult::Continue)
-    }
+    debug!("Writte proxy protocol header");
 
+    if let Some(ref mut socket) = self.backend {
+      if let Some(ref header) = self.header {
+        let mut header = header.into_bytes();
+        loop {
+          match socket.write(&mut header[self.cursor_header..]) {
+            Ok(sz) => {
+              self.cursor_header += sz;
+
+              if self.cursor_header == header.len() {
+                debug!("The header should be receive. We switch to a Pipe");
+                return (ProtocolResult::Upgrade, ClientResult::Continue)
+              }
+            },
+            Err(e) => {
+              debug!("PROXY PROTOCOL {}", e);
+              break;
+            },
+          }
+        }
+      }
+    }
     (ProtocolResult::Continue, ClientResult::Continue)
   }
 
