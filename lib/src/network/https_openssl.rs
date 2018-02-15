@@ -1348,8 +1348,6 @@ fn setup_curves(_: &mut SslContextBuilder) -> Result<(), ErrorStack> {
   Ok(())
 }
 
-pub type TlsServer = Session<ServerConfiguration,TlsClient>;
-
 pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_listeners   = 1;
@@ -1358,14 +1356,31 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
 
+  let clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(max_buffers);
+  {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    info!("taking token {:?} for channel", entry.index());
+    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+  }
+  {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    info!("taking token {:?} for metrics", entry.index());
+    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+  }
+
+  let token = {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    let e = entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+    Token(e.index().0)
+  };
+
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
   if let Ok((configuration, listeners)) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop,
-    1 + max_listeners, pool, None) {
+    1 + max_listeners, pool, token) {
 
-    //let session = Session::new(max_listeners, max_buffers, 6148914691236517205, configuration, listeners, &mut event_loop);
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
     let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      None, Some(configuration), None, None);
+      clients, Some(configuration), None, None, None);
 
     info!("starting event loop");
     server.run();

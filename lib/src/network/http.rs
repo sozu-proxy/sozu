@@ -31,7 +31,7 @@ use network::backends::BackendMap;
 use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
 use network::protocol::http::DefaultAnswerStatus;
-use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken};
+use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken,ListenClient};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::retry::RetryPolicy;
 use parser::http11::hostname_and_port;
@@ -1041,15 +1041,32 @@ pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel, max_buffers:
   let pool = Rc::new(RefCell::new(
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
-  let (configuration, listeners) = ServerConfiguration::new(config, &mut event_loop, pool, None, Token(0));
+  let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(max_buffers);
+  {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    info!("taking token {:?} for channel", entry.index());
+    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+  }
+  {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    info!("taking token {:?} for metrics", entry.index());
+    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+  }
+
+  let token = {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    let e = entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+    Token(e.index().0)
+  };
+  let (configuration, listeners) = ServerConfiguration::new(config, &mut event_loop, pool, None, token);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
-  let clients = Slab::with_capacity(max_buffers);
+
   let mut server    = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
     clients, Some(configuration), None, None, None);
 
-  info!("starting event loop");
+  println!("starting event loop");
   server.run();
-  info!("ending event loop");
+  println!("ending event loop");
 }
 
 #[cfg(test)]
@@ -1083,6 +1100,7 @@ mod tests {
 
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
     let jg = thread::spawn(move || {
+      setup_test_logger!();
       start(config, channel, 10, 16384);
     });
 

@@ -28,7 +28,7 @@ use sozu_command::messages::{self,TcpFront,Order,Instance,OrderMessage,OrderMess
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
-use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken};
+use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken,ListenClient};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::protocol::Pipe;
@@ -728,9 +728,21 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
     let pool = Rc::new(RefCell::new(
       Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
     ));
-    let (configuration, tokens) = ServerConfiguration::new(10, &mut poll, pool, Vec::new(), Vec::new());
+
+    let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(max_buffers);
+    {
+      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+      info!("taking token {:?} for channel", entry.index());
+      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+    }
+    {
+      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+      info!("taking token {:?} for metrics", entry.index());
+      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+    }
+
+    let (configuration, tokens) = ServerConfiguration::new(10, &mut poll, pool, Vec::new(), vec!());
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
-    let clients = Slab::with_capacity(max_buffers);
     let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()),
       clients, None, None, Some(configuration), None);
     info!("will run");
@@ -776,9 +788,27 @@ pub fn start(max_listeners: usize, max_buffers: usize, buffer_size:usize, channe
   let pool = Rc::new(RefCell::new(
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
-  let (configuration, tokens) = ServerConfiguration::new(max_listeners, &mut poll, pool, Vec::new(), Vec::new());
+
+  let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(max_buffers);
+  {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    info!("taking token {:?} for channel", entry.index());
+    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+  }
+  {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    info!("taking token {:?} for metrics", entry.index());
+    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+  }
+
+  let token = {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    let e = entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+    Token(e.index().0)
+  };
+
+  let (configuration, tokens) = ServerConfiguration::new(max_listeners, &mut poll, pool, Vec::new(), vec!(token));
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
-  let clients = Slab::with_capacity(max_buffers);
   let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), clients, None, None, Some(configuration), None);
 
   info!("starting event loop");
