@@ -682,7 +682,6 @@ impl Server {
         action
       })
     };
-    let res = Err(ConnectionError::HostNotFound);
 
     match res {
       Ok(BackendConnectAction::Reuse) => {
