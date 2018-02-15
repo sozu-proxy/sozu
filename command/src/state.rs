@@ -35,7 +35,8 @@ pub struct ConfigState {
   pub http_fronts:     HashMap<AppId, Vec<HttpFront>>,
   pub https_fronts:    HashMap<AppId, Vec<HttpsFront>>,
   pub tcp_fronts:      HashMap<AppId, Vec<TcpFront>>,
-  pub certificates:    HashMap<CertFingerprint, CertificateAndKey>,
+  // certificate and names
+  pub certificates:    HashMap<CertFingerprint, (CertificateAndKey, Vec<String>)>,
   //ip, port
   pub http_addresses:  Vec<(String, u16)>,
   pub https_addresses: Vec<(String, u16)>,
@@ -94,7 +95,7 @@ impl ConfigState {
         };
 
         if !self.certificates.contains_key(&fingerprint) {
-          self.certificates.insert(fingerprint.clone(), add.certificate.clone());
+          self.certificates.insert(fingerprint.clone(), (add.certificate.clone(), add.names.clone()));
         }
       },
       &Order::RemoveCertificate(ref remove) => {
@@ -112,7 +113,8 @@ impl ConfigState {
         };
 
         if !self.certificates.contains_key(&fingerprint) {
-          self.certificates.insert(fingerprint.clone(), replace.new_certificate.clone());
+          self.certificates.insert(fingerprint.clone(),
+            (replace.new_certificate.clone(), replace.new_names.clone()));
         }
       },
       &Order::AddHttpsFront(ref front) => {
@@ -169,10 +171,10 @@ impl ConfigState {
       }
     }
 
-    for certificate_and_key in self.certificates.values() {
+    for &(ref certificate_and_key, ref names) in self.certificates.values() {
       v.push(Order::AddCertificate(AddCertificate{
         certificate: certificate_and_key.clone(),
-        names: Vec::new(),
+        names: names.clone(),
       }));
     }
 
@@ -268,8 +270,10 @@ impl ConfigState {
     let removed_instances = my_instances.difference(&their_instances);
     let added_instances   = their_instances.difference(&my_instances);
 
-    let my_certificates:    HashSet<(&CertFingerprint, &CertificateAndKey)> = HashSet::from_iter(self.certificates.iter());
-    let their_certificates: HashSet<(&CertFingerprint, &CertificateAndKey)> = HashSet::from_iter(other.certificates.iter());
+    let my_certificates:    HashSet<(&CertFingerprint, &(CertificateAndKey, Vec<String>))> =
+      HashSet::from_iter(self.certificates.iter());
+    let their_certificates: HashSet<(&CertFingerprint, &(CertificateAndKey, Vec<String>))> =
+      HashSet::from_iter(other.certificates.iter());
 
     let removed_certificates = my_certificates.difference(&their_certificates);
     let added_certificates   = their_certificates.difference(&my_certificates);
@@ -284,10 +288,10 @@ impl ConfigState {
       v.push(Order::AddApplication(app.clone()));
     }
 
-    for &(_, certificate_and_key) in added_certificates {
+    for &(_, &(ref certificate_and_key, ref names)) in added_certificates {
       v.push(Order::AddCertificate(AddCertificate{
         certificate: certificate_and_key.clone(),
-        names: Vec::new(),
+        names: names.clone(),
       }));
     }
 
