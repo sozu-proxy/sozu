@@ -451,7 +451,31 @@ impl Server {
     }
     if topics.contains(&Topic::TcpProxyConfig) {
       if let Some(mut tcp) = self.tcp.take() {
-        self.queue.push_back(tcp.notify(&mut self.poll, message));
+        match message {
+          // special case for AddTcpFront because we need to register a listener
+          OrderMessage { id, order: Order::AddTcpFront(tcp_front) } => {
+            let entry = self.clients.vacant_entry().expect("FIXME");
+            let token = Token(entry.index().0);
+            entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::TCPListen })));
+
+            let addr_string = tcp_front.ip_address + ":" + &tcp_front.port.to_string();
+
+            let status = if let Ok(front) = addr_string.parse() {
+               if let Some(token) = tcp.add_tcp_front(&tcp_front.app_id, &front, &mut self.poll, token) {
+                 OrderMessageStatus::Ok
+               } else {
+                 error!("Couldn't add tcp front");
+                 OrderMessageStatus::Error(String::from("cannot add tcp front"))
+               }
+            } else {
+              error!("Couldn't parse tcp front address");
+              OrderMessageStatus::Error(String::from("cannot parse the address"))
+            };
+            let answer = OrderMessageAnswer { id, status, data: None };
+            self.queue.push_back(answer);
+          },
+          m => self.queue.push_back(tcp.notify(&mut self.poll, m)),
+        }
         self.tcp = Some(tcp);
       }
     }
