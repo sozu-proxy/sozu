@@ -112,12 +112,12 @@ impl Server {
 
     let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(10000);
     {
-      let entry = clients.vacant_entry().expect("FIXME");
+      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       info!("taking token {:?} for channel", entry.index());
       entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
     }
     {
-      let entry = clients.vacant_entry().expect("FIXME");
+      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       info!("taking token {:?} for metrics", entry.index());
       entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
     }
@@ -125,7 +125,7 @@ impl Server {
     let max_connections = config.max_connections;
     let max_buffers     = config.max_buffers;
     let http_session = config.http.and_then(|conf| conf.to_http()).map(|http_conf| {
-      let entry = clients.vacant_entry().expect("FIXME");
+      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       let token = Token(entry.index().0);
       let (configuration, listener_tokens) = http::ServerConfiguration::new(http_conf, &mut event_loop,
         pool.clone(), listeners.http.map(|fd| unsafe { TcpListener::from_raw_fd(fd) }), token);
@@ -138,14 +138,11 @@ impl Server {
     });
 
     let https_session = config.https.and_then(|conf| conf.to_tls()).and_then(|https_conf| {
-      let entry = clients.vacant_entry().expect("FIXME");
+      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       let token = Token(entry.index().0);
       https::ServerConfiguration::new(https_conf, &mut event_loop, pool.clone(),
       listeners.tls.map(|fd| unsafe { TcpListener::from_raw_fd(fd) }), token
       ).map(|(configuration, listener_tokens)| {
-        //FIXME
-        //Session::new(max_listeners, max_connections, 6148914691236517205, configuration,
-        //  listener_tokens, &mut event_loop)
         if listener_tokens.len() == 1 {
           entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPSListen })));
         }
@@ -159,7 +156,7 @@ impl Server {
 
     let mut tokens = Vec::new();
     for _ in 0..tcp_listeners.len() {
-      let entry = clients.vacant_entry().expect("FIXME");
+      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       let token = Token(entry.index().0);
       entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::TCPListen })));
       tokens.push(token);
@@ -454,7 +451,19 @@ impl Server {
         match message {
           // special case for AddTcpFront because we need to register a listener
           OrderMessage { id, order: Order::AddTcpFront(tcp_front) } => {
-            let entry = self.clients.vacant_entry().expect("FIXME");
+            let entry = self.clients.vacant_entry();
+
+            if entry.is_none() {
+               self.queue.push_back(OrderMessageAnswer {
+                 id,
+                 status: OrderMessageStatus::Error(String::from("client list is full, cannot add a listener")),
+                 data: None
+               });
+               return;
+            }
+
+            let entry = entry.unwrap();
+
             let token = Token(entry.index().0);
             entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::TCPListen })));
 
@@ -537,9 +546,37 @@ impl Server {
         self.clients.remove(cl);
       }
 
-      for (app_id, address) in backends.into_iter() {
-        //FIXME
-        //self.configuration.close_backend(app_id, &address);
+      let protocol = { client.borrow().protocol() };
+
+      match protocol {
+        Protocol::TCP   => {
+          if let Some(mut tcp) = self.tcp.take() {
+            for (app_id, address) in backends.into_iter() {
+              tcp.close_backend(app_id, &address);
+            }
+
+            self.tcp = Some(tcp);
+          }
+        },
+        Protocol::HTTP   => {
+          if let Some(mut http) = self.http.take() {
+            for (app_id, address) in backends.into_iter() {
+              http.close_backend(app_id, &address);
+            }
+
+            self.http = Some(http);
+          }
+        },
+        Protocol::HTTPS   => {
+          if let Some(mut https) = self.https.take() {
+              for (app_id, address) in backends.into_iter() {
+                https.close_backend(app_id, &address);
+              }
+
+            self.https = Some(https);
+          }
+        },
+        _ => {}
       }
 
       decr!("client.connections");
@@ -551,52 +588,62 @@ impl Server {
   pub fn accept(&mut self, token: ListenToken, protocol: Protocol) -> bool {
     let add = self.from_client_add();
     let res = {
-      let entry = self.clients.vacant_entry().expect("FIXME");
-      let client_token = Token(entry.index().0 + add);
-      let index = entry.index();
-      let res = match protocol {
-        Protocol::TCPListen   => {
-          let mut tcp = self.tcp.take();
-          if let Some(mut configuration) = tcp {
-            let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
-              entry.insert(client);
-              (index, should_connect)
-            });
-            self.tcp = Some(configuration);
-            Some(res1)
-          } else {
-            None
-          }
+
+      //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
+      match self.clients.vacant_entry() {
+        None => {
+          error!("not enough memory to accept another client");
+          //FIXME: should accept in a loop and close connections here instead of letting them wait
+          Err(AcceptError::TooManyClients)
         },
-        Protocol::HTTPListen  => {
-          let mut http = self.http.take();
-          if let Some(mut configuration) = http {
-            let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
-              entry.insert(client);
-              (index, should_connect)
-            });
-            self.http = Some(configuration);
-            Some(res1)
-          } else {
-            None
-          }
-        },
-        Protocol::HTTPSListen => {
-          let mut https = self.https.take();
-          if let Some(mut configuration) = https {
-            let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
-              entry.insert(client);
-              (index, should_connect)
-            });
-            self.https = Some(configuration);
-            Some(res1)
-          } else {
-            None
-          }
-        },
-        _ => panic!("should not call accept() on a HTTP, HTTPS or TCP client"),
-      };
-      res.expect("FIXME")
+        Some(entry) => {
+          let client_token = Token(entry.index().0 + add);
+          let index = entry.index();
+          let res = match protocol {
+            Protocol::TCPListen   => {
+              let mut tcp = self.tcp.take();
+              if let Some(mut configuration) = tcp {
+                let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+                  entry.insert(client);
+                  (index, should_connect)
+                });
+                self.tcp = Some(configuration);
+                Some(res1)
+              } else {
+                None
+              }
+            },
+            Protocol::HTTPListen  => {
+              let mut http = self.http.take();
+              if let Some(mut configuration) = http {
+                let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+                  entry.insert(client);
+                  (index, should_connect)
+                });
+                self.http = Some(configuration);
+                Some(res1)
+              } else {
+                None
+              }
+            },
+            Protocol::HTTPSListen => {
+              let mut https = self.https.take();
+              if let Some(mut configuration) = https {
+                let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+                  entry.insert(client);
+                  (index, should_connect)
+                });
+                self.https = Some(configuration);
+                Some(res1)
+              } else {
+                None
+              }
+            },
+            _ => panic!("should not call accept() on a HTTP, HTTPS or TCP client"),
+          };
+          res.expect("FIXME")
+        }
+      }
     };
 
     match res {
@@ -641,7 +688,6 @@ impl Server {
             self.tcp = Some(tcp);
             r
           } else {
-            //FIXME
             Err(ConnectionError::HostNotFound)
           }
         },
@@ -653,7 +699,6 @@ impl Server {
             self.http = Some(http);
             r
           } else {
-            //FIXME
             Err(ConnectionError::HostNotFound)
           }
         },
@@ -665,7 +710,6 @@ impl Server {
             self.https = Some(https);
             r
           } else {
-            //FIXME
             Err(ConnectionError::HostNotFound)
           }
         },
