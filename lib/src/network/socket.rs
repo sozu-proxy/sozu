@@ -157,11 +157,15 @@ impl SocketHandler for FrontRustls {
       }
 
       match self.session.read(&mut buf[size..]) {
-        Ok(0)  => return (size, SocketResult::Continue),
+        Ok(0)  => if !can_read {
+          return (size, SocketResult::Continue)
+        },
         Ok(sz) => size += sz,
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => {
-            return (size, SocketResult::WouldBlock);
+            if !can_read {
+              return (size, SocketResult::WouldBlock);
+            }
           },
            _ => {
              error!("could not read data from TLS stream: {:?}", e);
