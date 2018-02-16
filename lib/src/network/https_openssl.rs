@@ -42,13 +42,14 @@ use network::{AppId,Backend,ClientResult,ConnectionError,Protocol,Readiness,Sess
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use network::backends::BackendMap;
-use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken};
+use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken,ListenClient};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
 use network::protocol::http::DefaultAnswerStatus;
 use network::retry::RetryPolicy;
+use network::tcp;
 use util::UnwrapLog;
 
 #[derive(Debug,Clone,PartialEq,Eq)]
@@ -67,7 +68,7 @@ pub enum State {
 
 pub struct TlsClient {
   front:          Option<TcpStream>,
-  front_token:    Option<Token>,
+  token:          Option<Token>,
   instance:       Option<Rc<RefCell<Backend>>>,
   back_connected: BackendConnectionStatus,
   protocol:       Option<State>,
@@ -86,7 +87,7 @@ impl TlsClient {
     let handshake = TlsHandshake::new(ssl, s);
     TlsClient {
       front:          Some(sock),
-      front_token:    None,
+      token:          None,
       instance:       None,
       back_connected: BackendConnectionStatus::NotConnected,
       protocol:       Some(State::Handshake(handshake)),
@@ -129,7 +130,7 @@ impl TlsClient {
 
           http.readiness = handshake.readiness;
           http.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-          http.set_front_token(unwrap_msg!(self.front_token.as_ref()).clone());
+          http.set_front_token(unwrap_msg!(self.token.as_ref()).clone());
           self.ssl = handshake.ssl;
           self.protocol = Some(State::Http(http));
           return true;
@@ -254,7 +255,7 @@ impl TlsClient {
   }
 
   fn front_token(&self)  -> Option<Token> {
-    self.front_token
+    self.token
   }
 
   fn back_token(&self)   -> Option<Token> {
@@ -270,7 +271,7 @@ impl TlsClient {
   }
 
   fn set_front_token(&mut self, token: Token) {
-    self.front_token = Some(token);
+    self.token = Some(token);
     self.protocol.as_mut().map(|p| match *p {
       State::Http(ref mut http) => http.set_front_token(token),
       _                         => {}
@@ -337,10 +338,10 @@ impl ProxyClient for TlsClient {
       decr!("backend.connections");
     }
 
-    if let Some(tk) = self.front_token {
+    if let Some(tk) = self.token {
       result.tokens.push(tk)
     }
-    if let Some(tk) = self.backend_token {
+    if let Some(tk) = self.back_token() {
       result.tokens.push(tk)
     }
 
@@ -366,8 +367,20 @@ impl ProxyClient for TlsClient {
     Protocol::HTTPS
   }
 
+  fn as_http(&mut self) -> &mut http::Client {
+    panic!();
+  }
+
+  fn as_tcp(&mut self) -> &mut tcp::Client {
+    panic!();
+  }
+
+  fn as_https(&mut self) -> &mut TlsClient {
+    self
+  }
+
   fn process_events(&mut self, token: Token, events: Ready) {
-    if self.front_token == Some(token) {
+    if self.token == Some(token) {
       self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
     } else if self.back_token() == Some(token) {
       self.readiness().back_readiness = self.readiness().back_readiness | UnixReady::from(events);
@@ -523,14 +536,13 @@ pub struct ServerConfiguration {
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
   config:          HttpsProxyConfiguration,
-  base_token:      usize,
   ssl_options:     SslOption,
 }
 
 impl ServerConfiguration {
-  pub fn new(config: HttpsProxyConfiguration, base_token: usize, event_loop: &mut Poll, start_at: usize,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>)
-      -> io::Result<(ServerConfiguration, HashSet<ListenToken>)> {
+  pub fn new(config: HttpsProxyConfiguration, event_loop: &mut Poll,
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token)
+      -> io::Result<(ServerConfiguration, HashSet<Token>)> {
 
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let     domains  = TrieNode::root();
@@ -562,8 +574,8 @@ impl ServerConfiguration {
 
     let mut listeners = HashSet::new();
     if let Some(ref sock) = listener {
-      event_loop.register(sock, Token(base_token), Ready::readable(), PollOpt::edge());
-      listeners.insert(ListenToken(0));
+      event_loop.register(sock, token, Ready::readable(), PollOpt::edge());
+      listeners.insert(token);
     }
 
     let default = DefaultAnswers {
@@ -590,7 +602,6 @@ impl ServerConfiguration {
       contexts:        rc_ctx,
       pool:            pool,
       answers:         default,
-      base_token:      base_token,
       config:          config,
       ssl_options:     ssl_options,
     }, listeners))
@@ -1034,8 +1045,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     }
   }
 
-  fn connect_to_backend(&mut self, poll: &mut Poll,  clref: Rc<RefCell<TlsClient>>, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
-    let mut client = clref.borrow_mut();
+  fn connect_to_backend(&mut self, poll: &mut Poll,  client: &mut TlsClient, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let h = try!(unwrap_msg!(client.http()).state().get_host().ok_or(ConnectionError::NoHostGiven));
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
@@ -1356,7 +1366,7 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
 
-  let clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(max_buffers);
+  let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(max_buffers);
   {
     let entry = clients.vacant_entry().expect("client list should have enough room at startup");
     info!("taking token {:?} for channel", entry.index());
@@ -1375,12 +1385,11 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
   };
 
   // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok((configuration, listeners)) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop,
-    1 + max_listeners, pool, token) {
+  if let Ok((configuration, listeners)) = ServerConfiguration::new(config, &mut event_loop, pool, None, token) {
 
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
     let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      clients, Some(configuration), None, None, None);
+      clients, None, Some(configuration), None, None);
 
     info!("starting event loop");
     server.run();
@@ -1536,7 +1545,6 @@ mod tests {
       default_context: tls_data,
       contexts: rc_ctx,
       pool:      Rc::new(RefCell::new(Pool::with_capacity(1, 0, || BufferQueue::with_capacity(16384)))),
-      base_token:    6148914691236517205,
       answers:   DefaultAnswers {
         NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
