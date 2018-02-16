@@ -1278,6 +1278,20 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
         }
       }
     },
+    RequestState::HasLength(rl, conn, l) => {
+      match message_header(buf) {
+        IResult::Done(i, header) => {
+          if header.should_delete(&conn) {
+            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasLength(rl, conn, l), &header))
+          } else if header.must_mutate() {
+            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i))), validate_request_header(RequestState::HasLength(rl, conn, l), &header))
+          } else {
+            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasLength(rl, conn, l), &header))
+          }
+        },
+        res => default_request_result(RequestState::HasLength(rl, conn, l), res)
+      }
+    },
     RequestState::HasHostAndLength(rl, conn, h, l) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
