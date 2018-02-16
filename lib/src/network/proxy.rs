@@ -781,16 +781,16 @@ impl Server {
 
     let client_token = ClientToken(token.0);
     if self.clients.contains(client_token) {
-      info!("clients contains {:?}", client_token);
+      //info!("clients contains {:?}", client_token);
       let protocol = self.clients[client_token].borrow().protocol();
-      info!("protocol: {:?}", protocol);
+      //info!("protocol: {:?}", protocol);
       match protocol {
         Protocol::HTTPListen | Protocol::HTTPSListen | Protocol::TCPListen => {
-          info!("PROTOCOL IS LISTEN");
+          //info!("PROTOCOL IS LISTEN");
           if events.is_readable() {
             self.accept_ready.insert(ListenToken(token.0));
             loop {
-              info!("will accept");
+              //info!("will accept");
               if !self.accept(ListenToken(token.0), protocol) {
                 break;
               }
