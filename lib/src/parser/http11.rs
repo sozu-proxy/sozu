@@ -1623,8 +1623,12 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
     }
 
     match current_state {
+      RequestState::Error(_) => {
+        incr!("http1.parser.request.error");
+        break;
+      },
       RequestState::Request(_,_,_) | RequestState::RequestWithBody(_,_,_,_) |
-        RequestState::Error(_) | RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended) => break,
+        RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended) => break,
       _ => ()
     }
   }
@@ -1718,9 +1722,13 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
     }
 
     match current_state {
+      ResponseState::Error(_) => {
+        incr!("http1.parser.response.error");
+        break;
+      }
       ResponseState::Response(_,_) | ResponseState::ResponseWithBody(_,_,_) |
         ResponseState::ResponseUpgrade(_,_,_) |
-        ResponseState::Error(_) | ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended) => break,
+        ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended) => break,
       _ => ()
     }
     //println!("move: {:?}, new state: {:?}, input_queue {:?}, output_queue: {:?}", mv, current_state, buf.input_queue, buf.output_queue);
