@@ -335,10 +335,8 @@ impl ProxyClient for Client {
 
   fn process_events(&mut self, token: Token, events: Ready) {
     if self.token == Some(token) {
-      info!("processing events for front token");
       self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
     } else if self.backend_token ==Some(token) {
-      info!("processing events for back token");
       self.readiness().back_readiness = self.readiness().back_readiness | UnixReady::from(events);
     }
   }
