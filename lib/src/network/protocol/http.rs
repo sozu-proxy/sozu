@@ -257,7 +257,8 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.log_ctx, unwrap_msg!(self.token).0, unwrap_msg!(self.backend_token).0);
+    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.log_ctx, unwrap_msg!(self.token).0,
+      self.backend_token.map(|t| format!("{}", t.0)).unwrap_or("-".to_string()));
     let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
     self.backend       = None;
     self.backend_token = None;
