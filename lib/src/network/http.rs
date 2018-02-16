@@ -963,6 +963,14 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
+  fn accept_flush(&mut self) {
+    if let Some(ref sock) = self.listener {
+      while sock.accept().is_ok() {
+        error!("accepting and closing connection");
+      }
+    }
+  }
+
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {
     self.instances.close_backend_connection(&app_id, &addr);
   }
@@ -1061,7 +1069,7 @@ pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel, max_buffers:
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
 
   let mut server    = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-    clients, Some(configuration), None, None, None);
+    clients, Some(configuration), None, None, None, max_buffers);
 
   println!("starting event loop");
   server.run();

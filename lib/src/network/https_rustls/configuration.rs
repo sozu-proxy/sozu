@@ -332,6 +332,14 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     }
   }
 
+  fn accept_flush(&mut self) {
+    if let Some(ref sock) = self.listener {
+      while sock.accept().is_ok() {
+        error!("accepting and closing connection");
+      }
+    }
+  }
+
   fn connect_to_backend(&mut self, poll: &mut Poll,  client: &mut TlsClient, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let h = try!(unwrap_msg!(client.http()).state().get_host().ok_or(ConnectionError::NoHostGiven));
 
@@ -640,7 +648,7 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
   if let Ok((configuration, listeners)) = ServerConfiguration::new(config, &mut event_loop, pool, None, token) {
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
     let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      clients, None, Some(configuration), None, None);
+      clients, None, Some(configuration), None, None, max_buffers);
 
     info!("starting event loop");
     server.run();

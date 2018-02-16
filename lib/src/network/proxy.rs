@@ -90,6 +90,8 @@ pub struct Server {
   config_state:    ConfigState,
   scm:             ScmSocket,
   clients:         Slab<Rc<RefCell<ProxyClient>>,ClientToken>,
+  max_connections: usize,
+  nb_connections:  usize,
 }
 
 impl Server {
@@ -110,7 +112,9 @@ impl Server {
       tcp:  Vec::new(),
     });
 
-    let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(10000);
+    //FIXME: we will use a few entries for the channel, metrics socket and the listeners
+    //FIXME: for HTTP/2, we will have more than 2 entries per client
+    let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(10+2*config.max_connections);
     {
       let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       info!("taking token {:?} for channel", entry.index());
@@ -122,8 +126,6 @@ impl Server {
       entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
     }
 
-    let max_connections = config.max_connections;
-    let max_buffers     = config.max_buffers;
     let http_session = config.http.and_then(|conf| conf.to_http()).map(|http_conf| {
       let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       let token = Token(entry.index().0);
@@ -175,7 +177,8 @@ impl Server {
       configuration
     });
 
-    Server::new(event_loop, channel, scm, clients, http_session, https_session, tcp_session, Some(config_state))
+    Server::new(event_loop, channel, scm, clients, http_session, https_session, tcp_session, Some(config_state),
+      config.max_connections)
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
@@ -183,7 +186,8 @@ impl Server {
     http:  Option<http::ServerConfiguration>,
     https: Option<https::ServerConfiguration>,
     tcp:  Option<tcp::ServerConfiguration>,
-    config_state: Option<ConfigState>) -> Self {
+    config_state: Option<ConfigState>,
+    max_connections: usize) -> Self {
 
     poll.register(
       &channel,
@@ -213,6 +217,8 @@ impl Server {
       config_state:    ConfigState::new(),
       scm:             scm,
       clients:         clients,
+      max_connections: max_connections,
+      nb_connections:  0,
     };
 
     // initialize the worker with the state we got from a file
@@ -580,6 +586,8 @@ impl Server {
       }
 
       decr!("client.connections");
+      assert!(self.nb_connections != 0);
+      self.nb_connections -= 1;
     }
 
     self.can_accept = true;
@@ -589,59 +597,65 @@ impl Server {
     let add = self.from_client_add();
     let res = {
 
-      //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
-      match self.clients.vacant_entry() {
-        None => {
-          error!("not enough memory to accept another client");
-          //FIXME: should accept in a loop and close connections here instead of letting them wait
-          Err(AcceptError::TooManyClients)
-        },
-        Some(entry) => {
-          let client_token = Token(entry.index().0 + add);
-          let index = entry.index();
-          let res = match protocol {
-            Protocol::TCPListen   => {
-              let mut tcp = self.tcp.take();
-              if let Some(mut configuration) = tcp {
-                let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
-                  entry.insert(client);
-                  (index, should_connect)
-                });
-                self.tcp = Some(configuration);
-                Some(res1)
-              } else {
-                None
-              }
-            },
-            Protocol::HTTPListen  => {
-              let mut http = self.http.take();
-              if let Some(mut configuration) = http {
-                let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
-                  entry.insert(client);
-                  (index, should_connect)
-                });
-                self.http = Some(configuration);
-                Some(res1)
-              } else {
-                None
-              }
-            },
-            Protocol::HTTPSListen => {
-              let mut https = self.https.take();
-              if let Some(mut configuration) = https {
-                let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
-                  entry.insert(client);
-                  (index, should_connect)
-                });
-                self.https = Some(configuration);
-                Some(res1)
-              } else {
-                None
-              }
-            },
-            _ => panic!("should not call accept() on a HTTP, HTTPS or TCP client"),
-          };
-          res.expect("FIXME")
+      if self.nb_connections == self.max_connections {
+        error!("max number of client connection reached, flushing the accept queue");
+        Err(AcceptError::TooManyClients)
+      } else {
+        //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
+        match self.clients.vacant_entry() {
+          None => {
+            error!("not enough memory to accept another client, flushing the accept queue");
+            error!("nb_applications: {}, max_connections: {}", self.nb_connections, self.max_connections);
+            //FIXME: should accept in a loop and close connections here instead of letting them wait
+            Err(AcceptError::TooManyClients)
+          },
+          Some(entry) => {
+            let client_token = Token(entry.index().0 + add);
+            let index = entry.index();
+            let res = match protocol {
+              Protocol::TCPListen   => {
+                let mut tcp = self.tcp.take();
+                if let Some(mut configuration) = tcp {
+                  let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+                    entry.insert(client);
+                    (index, should_connect)
+                  });
+                  self.tcp = Some(configuration);
+                  Some(res1)
+                } else {
+                  None
+                }
+              },
+              Protocol::HTTPListen  => {
+                let mut http = self.http.take();
+                if let Some(mut configuration) = http {
+                  let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+                    entry.insert(client);
+                    (index, should_connect)
+                  });
+                  self.http = Some(configuration);
+                  Some(res1)
+                } else {
+                  None
+                }
+              },
+              Protocol::HTTPSListen => {
+                let mut https = self.https.take();
+                if let Some(mut configuration) = https {
+                  let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+                    entry.insert(client);
+                    (index, should_connect)
+                  });
+                  self.https = Some(configuration);
+                  Some(res1)
+                } else {
+                  None
+                }
+              },
+              _ => panic!("should not call accept() on a HTTP, HTTPS or TCP client"),
+            };
+            res.expect("FIXME")
+          }
         }
       }
     };
@@ -652,6 +666,7 @@ impl Server {
         false
       },
       Err(AcceptError::TooManyClients) => {
+        self.accept_flush();
         self.can_accept = false;
         false
       },
@@ -660,6 +675,9 @@ impl Server {
         false
       },
       Ok((client_token, should_connect)) => {
+        self.nb_connections += 1;
+        assert!(self.nb_connections <= self.max_connections);
+
         if should_connect {
            self.connect_to_backend(client_token);
         }
@@ -667,6 +685,12 @@ impl Server {
         true
       }
     }
+  }
+
+  pub fn accept_flush(&mut self) {
+    self.tcp.as_mut().map(|tcp| tcp.accept_flush());
+    self.http.as_mut().map(|http| http.accept_flush());
+    self.https.as_mut().map(|https| https.accept_flush());
   }
 
   pub fn connect_to_backend(&mut self, token: ClientToken) {

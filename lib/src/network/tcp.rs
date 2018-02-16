@@ -707,6 +707,16 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
+  fn accept_flush(&mut self) {
+    for ref listener in self.listeners.values() {
+      if let Some(ref sock) = listener.sock.as_ref() {
+        while sock.accept().is_ok() {
+          error!("accepting and closing connection");
+        }
+      }
+    }
+  }
+
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {
     if let Some(app_instances) = self.instances.get_mut(&app_id) {
       if let Some(ref mut backend) = app_instances.iter_mut().find(|backend| &backend.address == addr) {
@@ -744,7 +754,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
     let (configuration, tokens) = ServerConfiguration::new(10, &mut poll, pool, Vec::new(), vec!());
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
     let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      clients, None, None, Some(configuration), None);
+      clients, None, None, Some(configuration), None, max_buffers);
     info!("will run");
     s.run();
     info!("ending event loop");
@@ -809,7 +819,7 @@ pub fn start(max_listeners: usize, max_buffers: usize, buffer_size:usize, channe
 
   let (configuration, tokens) = ServerConfiguration::new(max_listeners, &mut poll, pool, Vec::new(), vec!(token));
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
-  let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), clients, None, None, Some(configuration), None);
+  let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), clients, None, None, Some(configuration), None, max_buffers);
 
   info!("starting event loop");
   server.run();
