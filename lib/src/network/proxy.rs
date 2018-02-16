@@ -699,7 +699,12 @@ impl Server {
       let cl = self.clients[token].clone();
       let cl2: Rc<RefCell<ProxyClient>> = self.clients[token].clone();
       let protocol = { cl.borrow().protocol() };
-      let entry = self.clients.vacant_entry().expect("FIXME");
+      let entry = self.clients.vacant_entry();
+      if entry.is_none() {
+        error!("not enough memory, cannot connect to backend");
+        return;
+      }
+      let entry = entry.unwrap();
       let entry = entry.insert(cl);
       let back_token = Token(entry.index().0 + add);
 
