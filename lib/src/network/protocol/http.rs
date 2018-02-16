@@ -383,6 +383,41 @@ impl<Front:SocketHandler> Http<Front> {
         response_time, service_time, metrics.bin, metrics.bout);
   }
 
+  pub fn log_request_error(&self, metrics: &SessionMetrics, message: &str) {
+    let client = match self.get_client_address() {
+      None => String::from("-"),
+      Some(SocketAddr::V4(addr)) => format!("{}", addr),
+      Some(SocketAddr::V6(addr)) => format!("{}", addr),
+    };
+
+    let backend = match self.get_backend_address() {
+      None => String::from("-"),
+      Some(SocketAddr::V4(addr)) => format!("{}", addr),
+      Some(SocketAddr::V6(addr)) => format!("{}", addr),
+    };
+
+    let host         = self.get_host().unwrap_or(String::from("-"));
+    let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or(String::from("-"));
+    let status_line  = self.get_response_status().map(|line| format!("{} {}", line.status, line.reason)).unwrap_or(String::from("-"));
+
+    let response_time = metrics.response_time().num_milliseconds();
+    let service_time  = metrics.service_time().num_milliseconds();
+
+    let app_id = self.app_id.clone().unwrap_or(String::from("-"));
+    /*record_request_time!(&app_id, response_time);
+
+    if let Some(backend_id) = metrics.backend_id.as_ref() {
+      if let Some(backend_response_time) = metrics.backend_response_time() {
+        record_backend_metrics!(backend_id, backend_response_time.num_milliseconds(), metrics.backend_bin, metrics.backend_bout);
+      }
+    }*/
+
+    error!("{}{} -> {}\t{} {} {} {}\t{} {} {} | {}",
+      self.log_ctx, client, backend,
+      response_time, service_time, metrics.bin, metrics.bout,
+      status_line, host, request_line, message);
+  }
+
   // Read content from the client
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
     if let ClientStatus::DefaultAnswer(_) = self.status {
@@ -435,7 +470,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     match res {
       SocketResult::Error => {
-        error!("{}\tfront socket error, closing the connection", self.log_ctx);
+        self.log_request_error(metrics, "front socket error, closing the connection");
         metrics.service_stop();
         incr_ereq!();
         self.readiness.reset();
@@ -458,7 +493,7 @@ impl<Front:SocketHandler> Http<Front> {
       self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
         &mut self.front_buf));
       if unwrap_msg!(self.state.as_ref()).is_front_error() {
-        error!("{}\tfront parsing error, closing the connection", self.log_ctx);
+        self.log_request_error(metrics, "front parsing error, closing the connection");
         metrics.service_stop();
         //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
         self.readiness.front_interest.remove(Ready::readable());
@@ -489,7 +524,7 @@ impl<Front:SocketHandler> Http<Front> {
         ClientResult::Continue
       },
       Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Error)) => {
-        error!("{}\tfront read should have stopped on chunk error", self.log_ctx);
+        self.log_request_error(metrics, "front read should have stopped on chunk error");
         metrics.service_stop();
         self.readiness.reset();
         ClientResult::CloseClient
@@ -500,7 +535,7 @@ impl<Front:SocketHandler> Http<Front> {
           &mut self.front_buf));
 
           if unwrap_msg!(self.state.as_ref()).is_front_error() {
-            error!("{}\tfront chunk parsing error, closing the connection", self.log_ctx);
+            self.log_request_error(metrics, "front chunk parsing error, closing the connection");
             //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             self.readiness.reset();
             return ClientResult::CloseClient;
@@ -518,7 +553,7 @@ impl<Front:SocketHandler> Http<Front> {
           &mut self.front_buf));
 
         if unwrap_msg!(self.state.as_ref()).is_front_error() {
-          error!("{}\tfront parsing error, closing the connection", self.log_ctx);
+          self.log_request_error(metrics, "front parsing error, closing the connection");
           //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
           self.readiness.reset();
           return ClientResult::CloseClient;
@@ -573,7 +608,7 @@ impl<Front:SocketHandler> Http<Front> {
       if res == SocketResult::Error {
         self.readiness.reset();
         metrics.service_stop();
-        error!("{}\terror writing default answer to front socket, closing", self.log_ctx);
+        self.log_request_error(metrics, "error writing default answer to front socket, closing");
         incr_ereq!();
         return ClientResult::CloseClient;
       } else {
@@ -614,7 +649,7 @@ impl<Front:SocketHandler> Http<Front> {
     match res {
       SocketResult::Error => {
         metrics.service_stop();
-        error!("{}\terror writing to front socket, closing", self.log_ctx);
+        self.log_request_error(metrics, "error writing to front socket, closing");
         incr_ereq!();
         self.readiness.reset();
         return ClientResult::CloseClient;
@@ -824,8 +859,11 @@ impl<Front:SocketHandler> Http<Front> {
       return (ProtocolResult::Continue, ClientResult::CloseBoth);
     }
 
-    let sock = unwrap_msg!(self.backend.as_mut());
-    let (sz, r) = sock.socket_read(&mut self.back_buf.buffer.space());
+    let (sz, r) = {
+      let sock = unwrap_msg!(self.backend.as_mut());
+      sock.socket_read(&mut self.back_buf.buffer.space())
+    };
+
     self.back_buf.buffer.fill(sz);
     self.back_buf.sliced_input(sz);
 
@@ -885,7 +923,7 @@ impl<Front:SocketHandler> Http<Front> {
         (ProtocolResult::Continue, ClientResult::Continue)
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Error)) => {
-        error!("{}\tback read should have stopped on chunk error", self.log_ctx);
+        self.log_request_error(metrics, "back read should have stopped on chunk error");
         incr_ereq!();
         self.readiness.reset();
         (ProtocolResult::Continue, ClientResult::CloseClient)
