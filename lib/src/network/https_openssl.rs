@@ -303,7 +303,7 @@ impl TlsClient {
   }
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    unwrap_msg!(self.http()).remove_backend()
+    self.http().map(|http| http.remove_backend()).unwrap_or((None, None))
   }
 
   fn readiness(&mut self)      -> &mut Readiness {
