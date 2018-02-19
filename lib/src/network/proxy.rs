@@ -844,23 +844,23 @@ impl Server {
       }
 
       self.clients[client_token].borrow_mut().process_events(token, events);
-    }
 
-    loop {
-    //self.client_ready(poll, client_token, events);
-      let order = self.clients[client_token].borrow_mut().ready();
-      //info!("client[{:?} -> {:?}] got events {:?} and returned order {:?}", client_token, self.from_client(client_token), events, order);
-      //FIXME: the CloseBackend message might not mean we have nothing else to do
-      //with that client
-      let is_connect = order == ClientResult::ConnectBackend;
-      self.interpret_client_order(client_token, order);
+      loop {
+        //self.client_ready(poll, client_token, events);
+        let order = self.clients[client_token].borrow_mut().ready();
+        //info!("client[{:?} -> {:?}] got events {:?} and returned order {:?}", client_token, self.from_client(client_token), events, order);
+        //FIXME: the CloseBackend message might not mean we have nothing else to do
+        //with that client
+        let is_connect = order == ClientResult::ConnectBackend;
+        self.interpret_client_order(client_token, order);
 
-      // if we had to connect to a backend server, go back to the loop
-      // I'm not sure we would have anything to do right away, though,
-      // so maybe we can just stop there for that client?
-      // also the events would change?
-      if !is_connect {
-        break;
+        // if we had to connect to a backend server, go back to the loop
+        // I'm not sure we would have anything to do right away, though,
+        // so maybe we can just stop there for that client?
+        // also the events would change?
+        if !is_connect {
+          break;
+        }
       }
     }
   }
