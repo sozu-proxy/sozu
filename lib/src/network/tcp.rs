@@ -128,13 +128,27 @@ impl Client {
       let mut backend_socket = pp.backend.take().unwrap();
       let addr = backend_socket.peer_addr().map(|s| s.ip()).ok();
 
-      let pipe = Pipe::new(
+      let front_token = pp.front_token();
+      let back_token = pp.back_token();
+
+      let mut pipe = Pipe::new(
         pp.frontend.take(0).into_inner(),
         Some(backend_socket),
         pp.front_buf,
         pp.back_buf,
         addr,
       );
+
+      pipe.readiness.front_readiness = pp.readiness.front_readiness;
+      pipe.readiness.back_readiness  = pp.readiness.back_readiness;
+      
+      if let Some(front_token) = front_token {
+        pipe.set_front_token(front_token);
+      }
+      if let Some(back_token) = back_token {
+        pipe.set_back_token(back_token);
+      }
+
       self.protocol = Some(State::Pipe(pipe));
     }
   }
