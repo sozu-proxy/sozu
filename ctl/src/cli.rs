@@ -182,6 +182,8 @@ pub enum TcpFrontendCmd {
     ip_address: String,
     #[structopt(short = "p", long = "port", help="TCP port of the frontend")]
     port: u16,
+    #[structopt(long = "proxy-protocol", help="Enable the proxy protocol")]
+    proxy_protocol: bool,
   },
   #[structopt(name = "remove")]
   Remove {
@@ -191,6 +193,8 @@ pub enum TcpFrontendCmd {
     ip_address: String,
     #[structopt(short = "p", long = "port", help="TCP port of the frontend")]
     port: u16,
+    #[structopt(long = "proxy-protocol", help="Proxy protocol is enabled")]
+    proxy_protocol: bool,
   },
 }
 

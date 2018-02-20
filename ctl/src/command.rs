@@ -906,19 +906,21 @@ pub fn remove_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, t
   }
 }
 
-pub fn add_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, ip_address: &str, port: u16) {
+pub fn add_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, ip_address: &str, port: u16, proxy_protocol: bool) {
   order_command(channel, timeout, Order::AddTcpFront(TcpFront {
     app_id: String::from(app_id),
     ip_address: String::from(ip_address),
-    port: port
+    port,
+    proxy_protocol,
   }));
 }
 
-pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, ip_address: &str, port: u16) {
+pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, ip_address: &str, port: u16, proxy_protocol: bool) {
   order_command(channel, timeout, Order::RemoveTcpFront(TcpFront {
     app_id: String::from(app_id),
     ip_address: String::from(ip_address),
-    port: port
+    port,
+    proxy_protocol,
   }));
 }
 

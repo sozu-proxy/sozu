@@ -75,10 +75,10 @@ fn main() {
             remove_http_frontend(channel, timeout, &id, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate),
         },
         FrontendCmd::Tcp { cmd } => match cmd {
-          TcpFrontendCmd::Add{ id, ip_address, port } =>
-            add_tcp_frontend(channel, timeout, &id, &ip_address, port),
-          TcpFrontendCmd::Remove{ id, ip_address, port } =>
-            remove_tcp_frontend(channel, timeout, &id, &ip_address, port),
+          TcpFrontendCmd::Add{ id, ip_address, port, proxy_protocol } =>
+            add_tcp_frontend(channel, timeout, &id, &ip_address, port, proxy_protocol),
+          TcpFrontendCmd::Remove{ id, ip_address, port, proxy_protocol } =>
+            remove_tcp_frontend(channel, timeout, &id, &ip_address, port, proxy_protocol),
         }
       }
     },
