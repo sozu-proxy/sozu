@@ -336,6 +336,10 @@ pub struct ApplicationListener {
   token:          Option<Token>,
   front_address:  SocketAddr,
   back_addresses: Vec<SocketAddr>,
+}
+
+#[derive(Debug)]
+pub struct ApplicationConfiguration {
   proxy_protocol: bool,
 }
 
@@ -345,6 +349,7 @@ pub struct ServerConfiguration {
   fronts:          HashMap<String, ListenToken>,
   instances:       HashMap<String, Vec<Backend>>,
   listeners:       Slab<ApplicationListener,ListenToken>,
+  configs:         HashMap<AppId, ApplicationConfiguration>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   base_token:      usize,
 }
@@ -356,6 +361,7 @@ impl ServerConfiguration {
     let mut configuration = ServerConfiguration {
       instances:     HashMap::new(),
       listeners:     Slab::with_capacity(max_listeners),
+      configs:       HashMap::new(),
       fronts:        HashMap::new(),
       pool:          pool,
       base_token:    start_at,
@@ -371,7 +377,6 @@ impl ServerConfiguration {
           token:          None,
           front_address:  front,
           back_addresses: Vec::new(),
-          proxy_protocol: false,
         };
         if let Some(token) = configuration.add_application_listener(&app_id, al, event_loop) {
           listener_tokens.insert(token);
@@ -408,7 +413,7 @@ impl ServerConfiguration {
     }
   }
 
-  fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, proxy_protocol: bool, event_loop: &mut Poll) -> Option<ListenToken> {
+  fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken> {
     if self.fronts.contains_key(app_id) {
       error!("TCP front already exists for app_id {}", app_id);
       return None;
@@ -428,7 +433,6 @@ impl ServerConfiguration {
         token:          None,
         front_address:  *front,
         back_addresses: addresses,
-        proxy_protocol,
       };
 
       self.add_application_listener(app_id, al, event_loop)
@@ -510,7 +514,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       Order::AddTcpFront(tcp_front) => {
         let addr_string = tcp_front.ip_address + ":" + &tcp_front.port.to_string();
         if let Ok(front) = addr_string.parse() {
-          if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, tcp_front.proxy_protocol, event_loop) {
+          if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, event_loop) {
             OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
           } else {
             error!("Couldn't add tcp front");
@@ -572,10 +576,16 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         });
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
-      // these messages are useless for now
-      Order::AddApplication(_) | Order::RemoveApplication(_) => {
+      Order::AddApplication(application) => {
+        let config = ApplicationConfiguration {
+          proxy_protocol: application.proxy_protocol,
+        };
+        self.configs.insert(application.app_id, config);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
-      }
+      },
+      Order::RemoveApplication(_) => {
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+      },
       command => {
         error!("{} unsupported message, ignoring {:?}", message.id, command);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message")), data: None}
@@ -593,7 +603,13 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         if let Some(ref listener) = application_listener.sock.as_ref() {
           listener.accept().map(|(frontend_sock, _)| {
             frontend_sock.set_nodelay(true);
-            let c = Client::new(frontend_sock, internal_token, front_buf, back_buf, application_listener.proxy_protocol);
+
+            let mut proxy_protocol = false;
+            if let Some(config) = self.configs.get(&application_listener.app_id) {
+              proxy_protocol = config.proxy_protocol;
+            }
+
+            let c = Client::new(frontend_sock, internal_token, front_buf, back_buf, proxy_protocol);
             incr_req!();
             (c, true)
           }).map_err(|e| {
@@ -654,7 +670,6 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       app_id: String::from("yolo"),
       ip_address: String::from("127.0.0.1"),
       port: 1234,
-      proxy_protocol: false,
     };
     let instance = Instance {
       app_id: String::from("yolo"),
@@ -671,7 +686,6 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       app_id: String::from("yolo"),
       ip_address: String::from("127.0.0.1"),
       port: 1235,
-      proxy_protocol: false,
     };
     let instance = Instance {
       app_id: String::from("yolo"),

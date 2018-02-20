@@ -391,7 +391,8 @@ mod tests {
       data:     ConfigCommand::ProxyConfiguration(Order::AddApplication(Application {
                   app_id: String::from("xxx"),
                   sticky_session: true,
-                  https_redirect: true
+                  https_redirect: true,
+                  proxy_protocol: false,
       })),
       proxy_id: None
     });

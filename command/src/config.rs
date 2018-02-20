@@ -269,6 +269,7 @@ impl HttpAppConfig {
       app_id: self.app_id.clone(),
       sticky_session: self.sticky_session.clone(),
       https_redirect: self.https_redirect.clone(),
+      proxy_protocol: false,
     }));
 
     //create the front both for HTTP and HTTPS if possible
@@ -344,13 +345,13 @@ impl TcpAppConfig {
       app_id: self.app_id.clone(),
       sticky_session: false,
       https_redirect: false,
+      proxy_protocol: self.proxy_protocol,
     }));
 
     v.push(Order::AddTcpFront(TcpFront {
       app_id:         self.app_id.clone(),
       ip_address:     self.ip_address.clone(),
       port:           self.port,
-      proxy_protocol: self.proxy_protocol,
     }));
 
     let mut backend_count = 0usize;

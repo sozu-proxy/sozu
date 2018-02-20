@@ -33,10 +33,9 @@ fn main() {
   });
 
   let tcp_front = messages::TcpFront {
-    app_id:         String::from("test"),
-    ip_address:     String::from("127.0.0.1"),
-    port:           8080,
-    proxy_protocol: false,
+    app_id:     String::from("test"),
+    ip_address: String::from("127.0.0.1"),
+    port:       8080,
   };
   let tcp_instance = messages::Instance {
     app_id:      String::from("test"),
