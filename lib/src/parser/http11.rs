@@ -1534,10 +1534,12 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
   let mut current_state  = rs.request.take().expect("the request state should never be None outside of this function");
   let mut header_end     = rs.req_header_end;
   loop {
+    let previous = format!("{:?}", current_state);
     let (mv, new_state) = parse_request(current_state, buf.unparsed_data());
     //println!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, &buf.unparsed_data().to_hex(16), mv, new_state);
     if let &RequestState::Error(ref e) = &new_state {
-      error!("PARSER\t{}\terror: {:?}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, e, &buf.unparsed_data().to_hex(16), mv, new_state);
+      error!("PARSER\t{}\terror: {:?}\tinput:\n{}\nmv: {:?}, previous state: {}, new state: {:?}\n",
+        request_id, e, &buf.unparsed_data().to_hex(16), mv, previous, new_state);
     }
     //trace!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, &buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
@@ -1650,9 +1652,11 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
   let is_head = rs.request.as_ref().map(|request| request.is_head()).unwrap_or(false);
   loop {
     //trace!("PARSER\t{}\tpos[{}]: {:?}", request_id, position, current_state);
+    let previous = format!("{:?}", current_state);
     let (mv, new_state) = parse_response(current_state, buf.unparsed_data(), is_head);
     if let &ResponseState::Error(ref e) = &new_state {
-      error!("PARSER\t{}\terror: {:?}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, e, &buf.unparsed_data().to_hex(16), mv, new_state);
+      error!("PARSER\t{}\terror: {:?}\tinput:\n{}\nmv: {:?}, previous state: {}, new state: {:?}\n",
+        request_id, e, &buf.unparsed_data().to_hex(16), mv, previous, new_state);
     }
     //trace!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
