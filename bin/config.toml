@@ -56,4 +56,4 @@ backends  = [ "127.0.0.1:1026" ] # list of IP/port
 ip_address = "127.0.0.1"
 port = 8081
 backends  = [ "127.0.0.1:1026" ] # list of IP/port
-
+proxy_protocol = false

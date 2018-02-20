@@ -102,7 +102,9 @@ pub enum ApplicationCmd {
     #[structopt(short = "s", long = "sticky-session")]
     sticky_session: bool,
     #[structopt(short = "h", long = "https-redirect")]
-    https_redirect: bool
+    https_redirect: bool,
+    #[structopt(short = "p", long = "proxy-protocol", help="Enable the proxy protocol")]
+    proxy_protocol: bool,
   },
 }
 

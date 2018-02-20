@@ -12,6 +12,7 @@ pub mod protocol;
 pub mod http;
 pub mod backends;
 pub mod retry;
+pub mod header_proxy_protocol;
 
 #[cfg(feature = "splice")]
 mod splice;
@@ -52,7 +53,8 @@ pub type AppId = String;
 pub enum Protocol {
   HTTP,
   HTTPS,
-  TCP
+  TCP,
+  ProxyProtocol,
 }
 
 #[derive(Debug,PartialEq,Eq)]

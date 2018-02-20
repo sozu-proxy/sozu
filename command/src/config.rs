@@ -185,6 +185,7 @@ pub struct FileAppConfig {
   pub backends:          Vec<String>,
   pub sticky_session:    Option<bool>,
   pub https_redirect:    Option<bool>,
+  pub proxy_protocol:    Option<bool>,
 }
 
 impl FileAppConfig {
@@ -194,10 +195,11 @@ impl FileAppConfig {
       match (self.ip_address, self.port) {
         (Some(ip), Some(port)) => {
           Ok(AppConfig::Tcp(TcpAppConfig {
-            app_id:     app_id.to_string(),
-            ip_address: ip,
-            port:       port,
-            backends:   self.backends,
+            app_id:         app_id.to_string(),
+            ip_address:     ip,
+            port:           port,
+            backends:       self.backends,
+            proxy_protocol: self.proxy_protocol.unwrap_or(false),
           }))
         },
         (None, Some(_)) => Err(String::from("missing IP address for TCP application")),
@@ -264,6 +266,7 @@ impl HttpAppConfig {
       app_id: self.app_id.clone(),
       sticky_session: self.sticky_session.clone(),
       https_redirect: self.https_redirect.clone(),
+      proxy_protocol: false,
     }));
 
     //create the front both for HTTP and HTTPS if possible
@@ -328,6 +331,7 @@ pub struct TcpAppConfig {
   pub ip_address:        String,
   pub port:              u16,
   pub backends:          Vec<String>,
+  pub proxy_protocol:    bool,
 }
 
 impl TcpAppConfig {
@@ -338,12 +342,13 @@ impl TcpAppConfig {
       app_id: self.app_id.clone(),
       sticky_session: false,
       https_redirect: false,
+      proxy_protocol: self.proxy_protocol,
     }));
 
     v.push(Order::AddTcpFront(TcpFront {
-      app_id:     self.app_id.clone(),
-      ip_address: self.ip_address.clone(),
-      port:       self.port,
+      app_id:         self.app_id.clone(),
+      ip_address:     self.ip_address.clone(),
+      port:           self.port,
     }));
 
     let mut backend_count = 0usize;
