@@ -186,6 +186,7 @@ pub struct FileAppConfig {
   pub backends:          Vec<String>,
   pub sticky_session:    Option<bool>,
   pub https_redirect:    Option<bool>,
+  pub proxy_protocol:    Option<bool>,
 }
 
 impl FileAppConfig {
@@ -195,10 +196,11 @@ impl FileAppConfig {
       match (self.ip_address, self.port) {
         (Some(ip), Some(port)) => {
           Ok(AppConfig::Tcp(TcpAppConfig {
-            app_id:     app_id.to_string(),
-            ip_address: ip,
-            port:       port,
-            backends:   self.backends,
+            app_id:         app_id.to_string(),
+            ip_address:     ip,
+            port:           port,
+            backends:       self.backends,
+            proxy_protocol: self.proxy_protocol.unwrap_or(false),
           }))
         },
         (None, Some(_)) => Err(String::from("missing IP address for TCP application")),
@@ -331,6 +333,7 @@ pub struct TcpAppConfig {
   pub ip_address:        String,
   pub port:              u16,
   pub backends:          Vec<String>,
+  pub proxy_protocol:    bool,
 }
 
 impl TcpAppConfig {
@@ -344,9 +347,10 @@ impl TcpAppConfig {
     }));
 
     v.push(Order::AddTcpFront(TcpFront {
-      app_id:     self.app_id.clone(),
-      ip_address: self.ip_address.clone(),
-      port:       self.port,
+      app_id:         self.app_id.clone(),
+      ip_address:     self.ip_address.clone(),
+      port:           self.port,
+      proxy_protocol: self.proxy_protocol,
     }));
 
     let mut backend_count = 0usize;

@@ -246,9 +246,10 @@ pub struct HttpsFront {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct TcpFront {
-    pub app_id:     String,
-    pub ip_address: String,
-    pub port:       u16
+    pub app_id:         String,
+    pub ip_address:     String,
+    pub port:           u16,
+    pub proxy_protocol: bool,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]

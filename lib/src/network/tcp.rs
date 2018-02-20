@@ -70,9 +70,15 @@ pub struct Client {
 
 impl Client {
   fn new(sock: TcpStream, accept_token: ListenToken, front_buf: Checkout<BufferQueue>,
-    back_buf: Checkout<BufferQueue>) -> Client {
+    back_buf: Checkout<BufferQueue>, proxy_protocol: bool) -> Client {
     let s = sock.try_clone().expect("could not clone the socket");
     let addr = sock.peer_addr().map(|s| s.ip()).ok();
+
+    let protocol = if proxy_protocol {
+      Some(State::ProxyProtocol(ProxyProtocol::new(s, None, front_buf, back_buf)))
+    } else {
+      Some(State::Pipe(Pipe::new(s, None, front_buf, back_buf, addr)))
+    };
 
     Client {
       sock:           sock,
@@ -86,8 +92,7 @@ impl Client {
       app_id:         None,
       request_id:     Uuid::new_v4().hyphenated().to_string(),
       metrics:        SessionMetrics::new(),
-      //protocol:       State::Pipe(Pipe::new(s, None, front_buf, back_buf, addr)),
-      protocol:       Some(State::ProxyProtocol(ProxyProtocol::new(s, None, front_buf, back_buf))),
+      protocol,
     }
   }
 
@@ -330,7 +335,8 @@ pub struct ApplicationListener {
   sock:           Option<TcpListener>,
   token:          Option<Token>,
   front_address:  SocketAddr,
-  back_addresses: Vec<SocketAddr>
+  back_addresses: Vec<SocketAddr>,
+  proxy_protocol: bool,
 }
 
 type ClientToken = Token;
@@ -364,7 +370,8 @@ impl ServerConfiguration {
           sock:           Some(listener),
           token:          None,
           front_address:  front,
-          back_addresses: Vec::new()
+          back_addresses: Vec::new(),
+          proxy_protocol: false,
         };
         if let Some(token) = configuration.add_application_listener(&app_id, al, event_loop) {
           listener_tokens.insert(token);
@@ -401,7 +408,7 @@ impl ServerConfiguration {
     }
   }
 
-  fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken> {
+  fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, proxy_protocol: bool, event_loop: &mut Poll) -> Option<ListenToken> {
     if self.fronts.contains_key(app_id) {
       error!("TCP front already exists for app_id {}", app_id);
       return None;
@@ -420,7 +427,8 @@ impl ServerConfiguration {
         sock:           Some(listener),
         token:          None,
         front_address:  *front,
-        back_addresses: addresses
+        back_addresses: addresses,
+        proxy_protocol,
       };
 
       self.add_application_listener(app_id, al, event_loop)
@@ -502,7 +510,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       Order::AddTcpFront(tcp_front) => {
         let addr_string = tcp_front.ip_address + ":" + &tcp_front.port.to_string();
         if let Ok(front) = addr_string.parse() {
-          if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, event_loop) {
+          if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, tcp_front.proxy_protocol, event_loop) {
             OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
           } else {
             error!("Couldn't add tcp front");
@@ -580,11 +588,12 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
     if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
       let internal_token = ListenToken(token.0 - 2 - self.base_token);
-      if self.listeners.contains(internal_token) {
-        if let Some(ref listener) = self.listeners[internal_token].sock.as_ref() {
+
+      if let Some(application_listener) = self.listeners.get(internal_token) {
+        if let Some(ref listener) = application_listener.sock.as_ref() {
           listener.accept().map(|(frontend_sock, _)| {
             frontend_sock.set_nodelay(true);
-            let c = Client::new(frontend_sock, internal_token, front_buf, back_buf);
+            let c = Client::new(frontend_sock, internal_token, front_buf, back_buf, application_listener.proxy_protocol);
             incr_req!();
             (c, true)
           }).map_err(|e| {
@@ -645,6 +654,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       app_id: String::from("yolo"),
       ip_address: String::from("127.0.0.1"),
       port: 1234,
+      proxy_protocol: false,
     };
     let instance = Instance {
       app_id: String::from("yolo"),
@@ -661,6 +671,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       app_id: String::from("yolo"),
       ip_address: String::from("127.0.0.1"),
       port: 1235,
+      proxy_protocol: false,
     };
     let instance = Instance {
       app_id: String::from("yolo"),
