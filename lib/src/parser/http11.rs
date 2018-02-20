@@ -1536,6 +1536,9 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
   loop {
     let (mv, new_state) = parse_request(current_state, buf.unparsed_data());
     //println!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, &buf.unparsed_data().to_hex(16), mv, new_state);
+    if let &RequestState::Error(ref e) = &new_state {
+      error!("PARSER\t{}\terror: {:?}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, e, &buf.unparsed_data().to_hex(16), mv, new_state);
+    }
     //trace!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, &buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
     current_state = new_state;
@@ -1648,6 +1651,9 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
   loop {
     //trace!("PARSER\t{}\tpos[{}]: {:?}", request_id, position, current_state);
     let (mv, new_state) = parse_response(current_state, buf.unparsed_data(), is_head);
+    if let &ResponseState::Error(ref e) = &new_state {
+      error!("PARSER\t{}\terror: {:?}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, e, &buf.unparsed_data().to_hex(16), mv, new_state);
+    }
     //trace!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
     current_state = new_state;
