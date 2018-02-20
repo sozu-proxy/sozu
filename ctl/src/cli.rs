@@ -102,7 +102,9 @@ pub enum ApplicationCmd {
     #[structopt(short = "s", long = "sticky-session")]
     sticky_session: bool,
     #[structopt(short = "h", long = "https-redirect")]
-    https_redirect: bool
+    https_redirect: bool,
+    #[structopt(short = "p", long = "proxy-protocol", help="Enable the proxy protocol")]
+    proxy_protocol: bool,
   },
 }
 
@@ -182,8 +184,6 @@ pub enum TcpFrontendCmd {
     ip_address: String,
     #[structopt(short = "p", long = "port", help="TCP port of the frontend")]
     port: u16,
-    #[structopt(long = "proxy-protocol", help="Enable the proxy protocol")]
-    proxy_protocol: bool,
   },
   #[structopt(name = "remove")]
   Remove {
@@ -193,8 +193,6 @@ pub enum TcpFrontendCmd {
     ip_address: String,
     #[structopt(short = "p", long = "port", help="TCP port of the frontend")]
     port: u16,
-    #[structopt(long = "proxy-protocol", help="Proxy protocol is enabled")]
-    proxy_protocol: bool,
   },
 }
 

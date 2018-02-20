@@ -779,11 +779,12 @@ pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bo
   }
 }
 
-pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool) {
+pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, proxy_protocol: bool) {
   order_command(channel, timeout, Order::AddApplication(Application {
     app_id:         String::from(app_id),
     sticky_session: sticky_session,
-    https_redirect: https_redirect
+    https_redirect: https_redirect,
+    proxy_protocol,
   }));
 }
 
@@ -906,21 +907,19 @@ pub fn remove_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, t
   }
 }
 
-pub fn add_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, ip_address: &str, port: u16, proxy_protocol: bool) {
+pub fn add_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, ip_address: &str, port: u16) {
   order_command(channel, timeout, Order::AddTcpFront(TcpFront {
     app_id: String::from(app_id),
     ip_address: String::from(ip_address),
-    port,
-    proxy_protocol,
+    port: port,
   }));
 }
 
-pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, ip_address: &str, port: u16, proxy_protocol: bool) {
+pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, ip_address: &str, port: u16) {
   order_command(channel, timeout, Order::RemoveTcpFront(TcpFront {
     app_id: String::from(app_id),
     ip_address: String::from(ip_address),
-    port,
-    proxy_protocol,
+    port: port,
   }));
 }
 
