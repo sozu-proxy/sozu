@@ -612,49 +612,36 @@ impl Server {
           Some(entry) => {
             let client_token = Token(entry.index().0 + add);
             let index = entry.index();
-            let res = match protocol {
+            match protocol {
               Protocol::TCPListen   => {
-                let mut tcp = self.tcp.take();
-                if let Some(mut configuration) = tcp {
-                  let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
-                    entry.insert(client);
-                    (index, should_connect)
-                  });
-                  self.tcp = Some(configuration);
-                  Some(res1)
-                } else {
-                  None
-                }
+                let mut tcp = self.tcp.take().expect("if we have a TCPListen, we should have a TCP configuration");
+                let res1 = tcp.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+                  entry.insert(client);
+                  (index, should_connect)
+                });
+                self.tcp = Some(tcp);
+                res1
               },
               Protocol::HTTPListen  => {
-                let mut http = self.http.take();
-                if let Some(mut configuration) = http {
-                  let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
-                    entry.insert(client);
-                    (index, should_connect)
-                  });
-                  self.http = Some(configuration);
-                  Some(res1)
-                } else {
-                  None
-                }
+                let mut http = self.http.take().expect("if we have a HTTPListen, we should have a HTTP configuration");
+                let res1 = http.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+                  entry.insert(client);
+                  (index, should_connect)
+                });
+                self.http = Some(http);
+                res1
               },
               Protocol::HTTPSListen => {
-                let mut https = self.https.take();
-                if let Some(mut configuration) = https {
-                  let res1 = configuration.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
-                    entry.insert(client);
-                    (index, should_connect)
-                  });
-                  self.https = Some(configuration);
-                  Some(res1)
-                } else {
-                  None
-                }
+                let mut https = self.https.take().expect("if we have a HTTPSListen, we should have a HTTPS configuration");
+                let res1 = https.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+                  entry.insert(client);
+                  (index, should_connect)
+                });
+                self.https = Some(https);
+                res1
               },
               _ => panic!("should not call accept() on a HTTP, HTTPS or TCP client"),
-            };
-            res.expect("FIXME")
+            }
           }
         }
       }
@@ -774,7 +761,6 @@ impl Server {
     //println!("INTERPRET ORDER: {:?}", order);
     match order {
       ClientResult::CloseClient     => self.close_client(token),
-      //FIXME: we do not deregister in close_backend
       ClientResult::CloseBackend(opt) => {
         if let Some(token) = opt {
           let cl = self.to_client(token);
