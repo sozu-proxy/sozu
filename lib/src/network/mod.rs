@@ -1,8 +1,16 @@
 #![allow(dead_code, unused_must_use, unused_variables, unused_imports)]
 
 use mio;
+use mio::{Poll,Ready};
+use mio::unix::UnixReady;
 use std::fmt;
 use std::net::SocketAddr;
+use std::rc::Rc;
+use std::cell::RefCell;
+use slab::{Entry,VacantEntry};
+use time::{precise_time_ns,SteadyTime,Duration};
+
+use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
 
 pub mod buffer_queue;
 #[macro_use] pub mod metrics;
@@ -18,7 +26,6 @@ mod splice;
 
 pub mod tcp;
 pub mod proxy;
-pub mod session;
 
 #[cfg(feature = "use_openssl")]
 pub mod https_openssl;
@@ -52,7 +59,59 @@ pub type AppId = String;
 pub enum Protocol {
   HTTP,
   HTTPS,
-  TCP
+  TCP,
+  HTTPListen,
+  HTTPSListen,
+  TCPListen,
+}
+
+#[derive(Debug,Clone,Default)]
+pub struct CloseResult {
+  pub tokens:   Vec<Token>,
+  pub backends: Vec<(String, SocketAddr)>,
+}
+
+pub trait ProxyClient {
+  fn protocol(&self)  -> Protocol;
+  fn as_tcp(&mut self) -> &mut tcp::Client;
+  fn as_http(&mut self) -> &mut http::Client;
+  fn as_https(&mut self) -> &mut https::TlsClient;
+  fn ready(&mut self) -> ClientResult;
+  fn process_events(&mut self, token: Token, events: Ready);
+  fn close(&mut self, poll: &mut Poll) -> CloseResult;
+  fn close_backend(&mut self, token: Token, poll: &mut Poll) -> Option<(String, SocketAddr)>;
+}
+
+#[derive(Clone,Copy,Debug,PartialEq)]
+pub enum BackendConnectionStatus {
+  NotConnected,
+  Connecting,
+  Connected,
+}
+
+#[derive(Debug,PartialEq)]
+pub enum BackendConnectAction {
+  New,
+  Reuse,
+  Replace,
+}
+
+#[derive(Debug,PartialEq)]
+pub enum AcceptError {
+  IoError,
+  TooManyClients,
+  WouldBlock,
+}
+
+use self::proxy::{ClientToken,ListenToken};
+pub trait ProxyConfiguration<Client> {
+  fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut Client,
+    back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
+  fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
+  fn accept(&mut self, token: ListenToken, event_loop: &mut Poll, client_token: Token)
+    -> Result<(Rc<RefCell<Client>>, bool), AcceptError>;
+  fn accept_flush(&mut self);
+  fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
 }
 
 #[derive(Debug,PartialEq,Eq)]
@@ -137,8 +196,7 @@ impl RequiredEvents {
 #[derive(Debug,PartialEq,Eq)]
 pub enum ClientResult {
   CloseClient,
-  CloseBackend,
-  CloseBoth,
+  CloseBackend(Option<Token>),
   Continue,
   ConnectBackend
 }
@@ -156,8 +214,7 @@ pub enum ConnectionError {
 #[derive(Debug,PartialEq,Eq)]
 pub enum SocketType {
   Listener,
-  FrontClient,
-  BackClient,
+  FrontClient
 }
 
 #[derive(Debug,PartialEq,Eq)]
@@ -257,6 +314,140 @@ impl Backend {
     }
 
     conn
+  }
+}
+
+#[derive(Debug)]
+pub struct Readiness {
+  pub front_interest:  UnixReady,
+  pub back_interest:   UnixReady,
+  pub front_readiness: UnixReady,
+  pub back_readiness:  UnixReady,
+}
+
+impl Readiness {
+  pub fn new() -> Readiness {
+    Readiness {
+      front_interest:  UnixReady::from(Ready::empty()),
+      back_interest:   UnixReady::from(Ready::empty()),
+      front_readiness: UnixReady::from(Ready::empty()),
+      back_readiness:  UnixReady::from(Ready::empty()),
+    }
+  }
+
+  pub fn reset(&mut self) {
+    self.front_interest  = UnixReady::from(Ready::empty());
+    self.back_interest   = UnixReady::from(Ready::empty());
+    self.front_readiness = UnixReady::from(Ready::empty());
+    self.back_readiness  = UnixReady::from(Ready::empty());
+  }
+}
+
+#[derive(Clone,Debug)]
+pub struct SessionMetrics {
+  /// date at which we started handling that request
+  pub start:        Option<SteadyTime>,
+  /// time actually spent handling the request
+  pub service_time: Duration,
+  /// bytes received by the frontend
+  pub bin:          usize,
+  /// bytes sent by the frontend
+  pub bout:         usize,
+
+  /// date at which we started working on the request
+  pub service_start: Option<SteadyTime>,
+
+  pub backend_id:    Option<String>,
+  pub backend_start: Option<SteadyTime>,
+  pub backend_stop:  Option<SteadyTime>,
+  pub backend_bin:   usize,
+  pub backend_bout:  usize,
+}
+
+impl SessionMetrics {
+  pub fn new() -> SessionMetrics {
+    SessionMetrics {
+      start:         Some(SteadyTime::now()),
+      service_time:  Duration::seconds(0),
+      bin:           0,
+      bout:          0,
+      service_start: None,
+      backend_id:    None,
+      backend_start: None,
+      backend_stop:  None,
+      backend_bin:   0,
+      backend_bout:  0,
+    }
+  }
+
+  pub fn reset(&mut self) {
+    self.start         = None;
+    self.service_time  = Duration::seconds(0);
+    self.bin           = 0;
+    self.bout          = 0;
+    self.service_start = None;
+    self.backend_id    = None;
+    self.backend_start = None;
+    self.backend_stop  = None;
+    self.backend_bin   = 0;
+    self.backend_bout  = 0;
+  }
+
+  pub fn start(&mut self) {
+    if self.start.is_none() {
+      self.start = Some(SteadyTime::now());
+    }
+  }
+
+  pub fn service_start(&mut self) {
+    if self.start.is_none() {
+      self.start = Some(SteadyTime::now());
+    }
+
+    self.service_start = Some(SteadyTime::now());
+  }
+
+  pub fn service_stop(&mut self) {
+    if self.service_start.is_some() {
+      let start = self.service_start.take().unwrap();
+      let duration = SteadyTime::now() - start;
+      self.service_time = self.service_time + duration;
+    }
+  }
+
+  pub fn service_time(&self) -> Duration {
+    match self.service_start {
+      Some(start) => {
+        let last_duration = SteadyTime::now() - start;
+        self.service_time + last_duration
+      },
+      None        => self.service_time,
+    }
+  }
+
+  pub fn response_time(&self) -> Duration {
+    match self.start {
+      Some(start) => SteadyTime::now() - start,
+      None        => Duration::seconds(0),
+    }
+  }
+
+  pub fn backend_start(&mut self) {
+    self.backend_start = Some(SteadyTime::now());
+  }
+
+  pub fn backend_stop(&mut self) {
+    self.backend_stop = Some(SteadyTime::now());
+  }
+
+  pub fn backend_response_time(&self) -> Option<Duration> {
+    match (self.backend_start, self.backend_stop) {
+      (Some(start), Some(end)) => {
+        Some(end - start)
+      },
+      (Some(start), None) => Some(SteadyTime::now() - start),
+      _ => None
+    }
   }
 }
 

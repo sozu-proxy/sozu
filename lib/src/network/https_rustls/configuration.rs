@@ -13,7 +13,7 @@ use std::os::unix::io::{AsRawFd};
 use std::io::{self,Read,Write,ErrorKind,BufReader};
 use std::collections::{HashMap,HashSet};
 use std::error::Error;
-use slab::Slab;
+use slab::{Slab,Entry,VacantEntry};
 use pool::{Pool,Checkout};
 use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
@@ -32,11 +32,10 @@ use sozu_command::certificate::split_certificate_chain;
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::buffer_queue::BufferQueue;
-use network::{AppId,Backend,ClientResult,ConnectionError,Protocol};
+use network::{AppId,Backend,ClientResult,ConnectionError,Protocol,Readiness,SessionMetrics,
+  ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus};
 use network::backends::BackendMap;
-use network::proxy::{Server,ProxyChannel};
-use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,
-  Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
+use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken,ListenClient};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
 use network::trie::*;
@@ -47,10 +46,6 @@ use util::UnwrapLog;
 
 use super::resolver::{CertificateResolver,CertificateResolverWrapper};
 use super::client::TlsClient;
-
-type BackendToken = Token;
-
-type ClientToken = Token;
 
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct TlsApp {
@@ -72,14 +67,13 @@ pub struct ServerConfiguration {
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
   config:          HttpsProxyConfiguration,
-  base_token:      usize,
   ssl_config:      Arc<ServerConfig>,
   resolver:        Arc<CertificateResolverWrapper>,
 }
 
 impl ServerConfiguration {
-  pub fn new(config: HttpsProxyConfiguration, base_token: usize, event_loop: &mut Poll, start_at: usize,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>) -> io::Result<(ServerConfiguration, HashSet<ListenToken>)> {
+  pub fn new(config: HttpsProxyConfiguration, event_loop: &mut Poll,
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> io::Result<(ServerConfiguration, HashSet<Token>)> {
 
     let mut fronts   = HashMap::new();
     let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
@@ -90,8 +84,8 @@ impl ServerConfiguration {
 
     let mut listeners = HashSet::new();
     if let Some(ref sock) = listener {
-      event_loop.register(sock, Token(base_token), Ready::readable(), PollOpt::edge());
-      listeners.insert(ListenToken(0));
+      event_loop.register(sock, token, Ready::readable(), PollOpt::edge());
+      listeners.insert(token);
     }
 
     let default = DefaultAnswers {
@@ -119,7 +113,6 @@ impl ServerConfiguration {
       fronts:          fronts,
       pool:            pool,
       answers:         default,
-      base_token:      base_token,
       config:          config,
       ssl_config:      Arc::new(server_config),
       resolver:        resolver,
@@ -306,7 +299,9 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
-  fn accept(&mut self, token: ListenToken) -> Result<(TlsClient,bool), AcceptError> {
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token)
+    -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
+
     if let Some(ref listener) = self.listener.as_ref() {
       listener.accept().map_err(|e| {
         match e.kind() {
@@ -319,15 +314,33 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       }).map(|(frontend_sock, _)| {
         frontend_sock.set_nodelay(true);
         let session = ServerSession::new(&self.ssl_config);
-        let c = TlsClient::new(session, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address);
-        (c, false)
+        let mut c = TlsClient::new(session, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address);
+
+        c.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+        c.set_front_token(client_token);
+        poll.register(
+          c.front_socket(),
+          client_token,
+          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+          PollOpt::edge()
+        );
+
+        (Rc::new(RefCell::new(c)), false)
       })
     } else {
       Err(AcceptError::IoError)
     }
   }
 
-  fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut TlsClient) -> Result<BackendConnectAction,ConnectionError> {
+  fn accept_flush(&mut self) {
+    if let Some(ref sock) = self.listener {
+      while sock.accept().is_ok() {
+        error!("accepting and closing connection");
+      }
+    }
+  }
+
+  fn connect_to_backend(&mut self, poll: &mut Poll,  client: &mut TlsClient, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let h = try!(unwrap_msg!(client.http()).state().get_host().ok_or(ConnectionError::NoHostGiven));
 
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
@@ -347,6 +360,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         error!("TLS SNI hostname '{:?}' and Host header '{}' don't match", servername, hostname_str);
         unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
         client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+        client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
         return Err(ConnectionError::HostNotFound);
       }
 
@@ -382,7 +396,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           //client.readiness().back_interest  = UnixReady::from(Ready::empty());
           client.readiness().back_readiness = UnixReady::from(Ready::empty());
           client.back_socket().as_ref().map(|sock| {
-            event_loop.deregister(*sock);
+            poll.deregister(*sock);
             sock.shutdown(Shutdown::Both);
           });
         }
@@ -402,7 +416,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         client.readiness().back_interest  = UnixReady::from(Ready::empty());
         client.readiness().back_readiness = UnixReady::from(Ready::empty());
         client.back_socket().as_ref().map(|sock| {
-          event_loop.deregister(*sock);
+          poll.deregister(*sock);
           sock.shutdown(Shutdown::Both);
         });
       }
@@ -426,7 +440,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
             client.back_connected = BackendConnectionStatus::NotConnected;
             client.readiness().back_readiness = UnixReady::from(Ready::empty());
             client.back_socket().as_ref().map(|sock| {
-              event_loop.deregister(*sock);
+              poll.deregister(*sock);
               sock.shutdown(Shutdown::Both);
             });
             // we still want to use the new socket
@@ -449,22 +463,41 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           });
 
           socket.set_nodelay(true);
-          client.set_back_socket(socket);
 
           if old_app_id == new_app_id {
+            poll.register(
+              &socket,
+              client.back_token().expect("FIXME"),
+              Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+              PollOpt::edge()
+            );
+
+            client.set_back_socket(socket);
             Ok(BackendConnectAction::Replace)
           } else {
+            poll.register(
+              &socket,
+              back_token,
+              Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+              PollOpt::edge()
+            );
+
+            client.set_back_socket(socket);
+            client.set_back_token(back_token);
+            incr!("backend.connections");
             Ok(BackendConnectAction::New)
           }
         },
         Err(ConnectionError::NoBackendAvailable) => {
           unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
           client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+          client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::NoBackendAvailable)
         },
         Err(ConnectionError::HostNotFound) => {
           unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
           client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+          client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::HostNotFound)
         },
         e => panic!(e)
@@ -472,6 +505,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     } else {
       unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
       client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+      client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
       Err(ConnectionError::HostNotFound)
     }
   }
@@ -585,8 +619,6 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   }
 }
 
-pub type RustlsServer = Session<ServerConfiguration,TlsClient>;
-
 pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_listeners   = 1;
@@ -595,12 +627,28 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
 
-  // start at max_listeners + 1 because token(0) is the channel, and token(1) is the timer
-  if let Ok((configuration, listeners)) = ServerConfiguration::new(config, 6148914691236517205, &mut event_loop, 1 + max_listeners, pool, None) {
-    let session = Session::new(max_listeners, max_buffers, 6148914691236517205, configuration, listeners, &mut event_loop);
+  let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(max_buffers);
+  {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    info!("taking token {:?} for channel", entry.index());
+    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+  }
+  {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    info!("taking token {:?} for metrics", entry.index());
+    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+  }
+
+  let token = {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    let e = entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+    Token(e.index().0)
+  };
+
+  if let Ok((configuration, listeners)) = ServerConfiguration::new(config, &mut event_loop, pool, None, token) {
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
     let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      None, Some(session), None, None);
+      clients, None, Some(configuration), None, None, max_buffers);
 
     info!("starting event loop");
     server.run();

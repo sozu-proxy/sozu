@@ -7,9 +7,8 @@ use mio::unix::UnixReady;
 use pool::{Pool,Checkout,Reset};
 use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
-use network::{ClientResult,Protocol};
+use network::{ClientResult,Protocol,Readiness,SessionMetrics};
 use network::buffer_queue::BufferQueue;
-use network::session::{Readiness,SessionMetrics};
 use network::socket::{SocketHandler,SocketResult};
 use nom::HexDisplay;
 
@@ -119,15 +118,11 @@ impl<Front:SocketHandler> Pipe<Front> {
   }
 
   pub fn front_hup(&mut self) -> ClientResult {
-    if self.backend_token == None {
-      ClientResult::CloseClient
-    } else {
-      ClientResult::CloseBoth
-    }
+    ClientResult::CloseClient
   }
 
   pub fn back_hup(&mut self) -> ClientResult {
-    ClientResult::CloseBoth
+    ClientResult::CloseClient
   }
 
   // Read content from the client
@@ -274,7 +269,7 @@ impl<Front:SocketHandler> Pipe<Front> {
         metrics.service_stop();
         incr_ereq!();
         self.readiness.reset();
-        return ClientResult::CloseBoth;
+        return ClientResult::CloseClient;
       },
       SocketResult::WouldBlock => {
         self.readiness.back_readiness.remove(Ready::writable());
@@ -319,7 +314,7 @@ impl<Front:SocketHandler> Pipe<Front> {
         metrics.service_stop();
         incr_ereq!();
         self.readiness.reset();
-        return ClientResult::CloseBoth;
+        return ClientResult::CloseClient;
       }
     }
 

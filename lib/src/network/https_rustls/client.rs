@@ -28,24 +28,21 @@ use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::buffer_queue::BufferQueue;
-use network::{AppId,Backend,ClientResult,ConnectionError,Protocol};
+use network::{AppId,Backend,ClientResult,ConnectionError,Protocol,Readiness,SessionMetrics,ClientToken,
+  ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
+  CloseResult};
 use network::backends::BackendMap;
-use network::proxy::{Server,ProxyChannel};
-use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,
-  Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
+use network::proxy::{Server,ProxyChannel,ListenToken};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
 use network::trie::*;
 use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
 use network::protocol::http::DefaultAnswerStatus;
 use network::retry::RetryPolicy;
+use network::tcp;
 use util::UnwrapLog;
-use super::configuration::TlsApp;
+use super::configuration::{ServerConfiguration,TlsApp};
 
-
-type BackendToken = Token;
-
-type ClientToken = Token;
 
 pub enum State {
   Handshake(TlsHandshake),
@@ -149,81 +146,6 @@ impl TlsClient {
       true
     }
   }
-}
-
-impl ProxyClient for TlsClient {
-  fn front_socket(&self) -> &TcpStream {
-    unwrap_msg!(self.front.as_ref())
-  }
-
-  fn back_socket(&self)  -> Option<&TcpStream> {
-    match unwrap_msg!(self.protocol.as_ref()) {
-      &State::Handshake(ref handshake) => None,
-      &State::Http(ref http)           => http.back_socket(),
-      &State::WebSocket(ref pipe)      => pipe.back_socket(),
-    }
-  }
-
-  fn front_token(&self)  -> Option<Token> {
-    self.front_token
-  }
-
-  fn back_token(&self)   -> Option<Token> {
-    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
-      http.back_token()
-    } else {
-      None
-    }
-  }
-
-  fn back_connected(&self)     -> BackendConnectionStatus {
-    self.back_connected
-  }
-
-  fn set_back_connected(&mut self, connected: BackendConnectionStatus) {
-    self.back_connected = connected;
-
-    if connected == BackendConnectionStatus::Connected {
-      self.instance.as_ref().map(|instance| {
-        let ref mut backend = *instance.borrow_mut();
-        backend.failures = 0;
-        backend.retry_policy.succeed();
-      });
-    }
-  }
-
-  fn close(&mut self) {
-    //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
-    self.http().map(|http| http.close());
-  }
-
-  fn log_context(&self)  -> String {
-    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
-      http.log_context()
-    } else {
-      "".to_string()
-    }
-  }
-
-  fn set_back_socket(&mut self, sock:TcpStream) {
-    unwrap_msg!(self.http()).set_back_socket(sock)
-  }
-
-  fn set_front_token(&mut self, token: Token) {
-    self.front_token = Some(token);
-    self.protocol.as_mut().map(|p| match *p {
-      State::Http(ref mut http) => http.set_front_token(token),
-      _                         => {}
-    });
-  }
-
-  fn set_back_token(&mut self, token: Token) {
-    unwrap_msg!(self.http()).set_back_token(token)
-  }
-
-  fn metrics(&mut self)        -> &mut SessionMetrics {
-    &mut self.metrics
-  }
 
   fn front_hup(&mut self)     -> ClientResult {
     self.http().map(|h| h.front_hup()).unwrap_or(ClientResult::CloseClient)
@@ -237,6 +159,14 @@ impl ProxyClient for TlsClient {
         error!("why a backend HUP event while still in frontend handshake?");
         ClientResult::CloseClient
       }
+    }
+  }
+
+  fn log_context(&self)  -> String {
+    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
+      http.log_context()
+    } else {
+      "".to_string()
     }
   }
 
@@ -285,7 +215,7 @@ impl ProxyClient for TlsClient {
           _ => result
         }
       } else {
-        ClientResult::CloseBoth
+        ClientResult::CloseClient
       }
     }
   }
@@ -298,11 +228,71 @@ impl ProxyClient for TlsClient {
     }
   }
 
+  pub fn front_socket(&self) -> &TcpStream {
+    unwrap_msg!(self.front.as_ref())
+  }
+
+  pub fn back_socket(&self)  -> Option<&TcpStream> {
+    match unwrap_msg!(self.protocol.as_ref()) {
+      &State::Handshake(ref handshake) => None,
+      &State::Http(ref http)           => http.back_socket(),
+      &State::WebSocket(ref pipe)      => pipe.back_socket(),
+    }
+  }
+
+  pub fn front_token(&self)  -> Option<Token> {
+    self.front_token
+  }
+
+  pub fn back_token(&self)   -> Option<Token> {
+    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
+      http.back_token()
+    } else {
+      None
+    }
+  }
+
+  pub fn set_back_socket(&mut self, sock:TcpStream) {
+    unwrap_msg!(self.http()).set_back_socket(sock)
+  }
+
+  pub fn set_front_token(&mut self, token: Token) {
+    self.front_token = Some(token);
+    self.protocol.as_mut().map(|p| match *p {
+      State::Http(ref mut http) => http.set_front_token(token),
+      _                         => {}
+    });
+  }
+
+  pub fn set_back_token(&mut self, token: Token) {
+    unwrap_msg!(self.http()).set_back_token(token)
+  }
+
+  fn back_connected(&self)     -> BackendConnectionStatus {
+    self.back_connected
+  }
+
+  fn set_back_connected(&mut self, connected: BackendConnectionStatus) {
+    self.back_connected = connected;
+
+    if connected == BackendConnectionStatus::Connected {
+      self.instance.as_ref().map(|instance| {
+        let ref mut backend = *instance.borrow_mut();
+        backend.failures = 0;
+        backend.retry_policy.succeed();
+      });
+    }
+  }
+
+  fn metrics(&mut self)        -> &mut SessionMetrics {
+    &mut self.metrics
+  }
+
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
     unwrap_msg!(self.http()).remove_backend()
   }
 
-  fn readiness(&mut self)      -> &mut Readiness {
+  pub fn readiness(&mut self)      -> &mut Readiness {
     let r = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Handshake(ref mut handshake) => &mut handshake.readiness,
       State::Http(ref mut http)           => http.readiness(),
@@ -311,8 +301,198 @@ impl ProxyClient for TlsClient {
     //info!("current readiness: {:?}", r);
     r
   }
+}
+
+impl ProxyClient for TlsClient {
+
+  fn close(&mut self, poll: &mut Poll) -> CloseResult {
+    //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
+    self.http().map(|http| http.close());
+    self.metrics.service_stop();
+    self.front_socket().shutdown(Shutdown::Both);
+    poll.deregister(self.front_socket());
+
+    let mut result = CloseResult::default();
+
+    if let (Some(app_id), Some(addr)) = self.remove_backend() {
+      result.backends.push((app_id, addr.clone()));
+    }
+
+    if let Some(sock) = self.back_socket() {
+      sock.shutdown(Shutdown::Both);
+      poll.deregister(sock);
+      decr!("backend.connections");
+    }
+
+    if let Some(tk) = self.front_token {
+      result.tokens.push(tk)
+    }
+    if let Some(tk) = self.back_token() {
+      result.tokens.push(tk)
+    }
+
+    result
+  }
+
+  fn close_backend(&mut self, _: Token, poll: &mut Poll) -> Option<(String,SocketAddr)> {
+    let mut res = None;
+    if let (Some(app_id), Some(addr)) = self.remove_backend() {
+      res = Some((app_id, addr.clone()));
+    }
+
+    if let Some(sock) = self.back_socket() {
+      sock.shutdown(Shutdown::Both);
+      poll.deregister(sock);
+      decr!("backend.connections");
+    }
+
+    res
+  }
 
   fn protocol(&self)           -> Protocol {
     Protocol::HTTPS
+  }
+
+  fn as_http(&mut self) -> &mut http::Client {
+    panic!();
+  }
+
+  fn as_tcp(&mut self) -> &mut tcp::Client {
+    panic!();
+  }
+
+  fn as_https(&mut self) -> &mut TlsClient {
+    self
+  }
+
+  fn process_events(&mut self, token: Token, events: Ready) {
+    if self.front_token == Some(token) {
+      self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
+    } else if self.back_token() == Some(token) {
+      self.readiness().back_readiness = self.readiness().back_readiness | UnixReady::from(events);
+    }
+  }
+
+  fn ready(&mut self) -> ClientResult {
+    let mut counter = 0;
+    let max_loop_iterations = 100000;
+
+    self.metrics().service_start();
+
+    if self.back_connected() == BackendConnectionStatus::Connecting {
+      if self.readiness().back_readiness.is_hup() {
+        //retry connecting the backend
+        //FIXME: there should probably be a circuit breaker per client too
+        error!("error connecting to backend, trying again");
+        self.metrics().service_stop();
+        return ClientResult::ConnectBackend;
+      } else {
+        self.set_back_connected(BackendConnectionStatus::Connected);
+      }
+    }
+
+    let token = self.front_token.clone();
+    while counter < max_loop_iterations {
+      let front_interest = self.readiness().front_interest & self.readiness().front_readiness;
+      let back_interest  = self.readiness().back_interest & self.readiness().back_readiness;
+
+      //info!("PROXY\t{:?} {:?} | front: {:?} | back: {:?} ", token, self.readiness(), front_interest, back_interest);
+
+      if front_interest == UnixReady::from(Ready::empty()) && back_interest == UnixReady::from(Ready::empty()) {
+        break;
+      }
+
+      if front_interest.is_readable() {
+        let order = self.readable();
+        trace!("front readable\tinterpreting client order {:?}", order);
+
+        if order != ClientResult::Continue {
+          return order;
+        }
+      }
+
+      if back_interest.is_writable() {
+        let order = self.back_writable();
+        if order != ClientResult::Continue {
+          return order;
+        }
+      }
+
+      if back_interest.is_readable() {
+        let order = self.back_readable();
+        if order != ClientResult::Continue {
+          return order;
+        }
+      }
+
+      if front_interest.is_writable() {
+        let order = self.writable();
+        trace!("front writable\tinterpreting client order {:?}", order);
+        if order != ClientResult::Continue {
+          return order;
+        }
+      }
+
+      if front_interest.is_hup() {
+        let order = self.front_hup();
+        match order {
+          ClientResult::CloseClient => {
+            return order;
+          },
+          _ => {
+            self.readiness().front_readiness.remove(UnixReady::hup());
+            return order;
+          }
+        }
+      }
+
+      if back_interest.is_hup() {
+        let order = self.back_hup();
+        match order {
+          ClientResult::CloseClient => {
+            return order;
+          },
+          ClientResult::Continue => {
+            self.readiness().front_interest.insert(Ready::writable());
+            if ! self.readiness().front_readiness.is_writable() {
+              break;
+            }
+          },
+          _ => {
+            self.readiness().back_readiness.remove(UnixReady::hup());
+            return order;
+          }
+        };
+      }
+
+      if front_interest.is_error() || back_interest.is_error() {
+        if front_interest.is_error() {
+          error!("PROXY client {:?} front error, disconnecting", self.front_token);
+        } else {
+          error!("PROXY client {:?} back error, disconnecting", self.front_token);
+        }
+
+        self.readiness().front_interest = UnixReady::from(Ready::empty());
+        self.readiness().back_interest  = UnixReady::from(Ready::empty());
+        return ClientResult::CloseClient;
+      }
+
+      counter += 1;
+    }
+
+    if counter == max_loop_iterations {
+      error!("PROXY\thandling client {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.front_token, max_loop_iterations);
+
+      let front_interest = self.readiness().front_interest & self.readiness().front_readiness;
+      let back_interest  = self.readiness().back_interest & self.readiness().back_readiness;
+
+      let token = self.front_token.clone();
+      error!("PROXY\t{:?} readiness: {:?} | front: {:?} | back: {:?} ", token,
+        self.readiness(), front_interest, back_interest);
+
+      return ClientResult::CloseClient;
+    }
+
+    ClientResult::Continue
   }
 }
