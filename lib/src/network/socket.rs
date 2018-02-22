@@ -141,7 +141,6 @@ impl SocketHandler for FrontRustls {
         Ok(sz) => {},
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => {
-            error!("rustls socket_read wouldblock");
             can_read = false;
           },
           _ => {
