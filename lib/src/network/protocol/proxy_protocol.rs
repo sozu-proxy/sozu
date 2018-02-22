@@ -8,8 +8,6 @@ use network::socket::{SocketHandler,SocketResult};
 use network::protocol::ProtocolResult;
 use network::session::Readiness;
 use network::header_proxy_protocol::*;
-use network::buffer_queue::BufferQueue;
-use pool::Checkout;
 
 pub struct ProxyProtocol<Front:SocketHandler> {
   pub header:     Option<ProxyProtocolHeader>,
@@ -19,14 +17,10 @@ pub struct ProxyProtocol<Front:SocketHandler> {
   backend_token:  Option<Token>,
   pub readiness:  Readiness,
   cursor_header:  usize,
-  pub front_buf:      Checkout<BufferQueue>,
-  pub back_buf:       Checkout<BufferQueue>,
 }
 
 impl <Front:SocketHandler>ProxyProtocol<Front> {
-  pub fn new(frontend: Front, backend: Option<TcpStream>, front_buf: Checkout<BufferQueue>,
-    back_buf: Checkout<BufferQueue>) -> Self {
-
+  pub fn new(frontend: Front, backend: Option<TcpStream>) -> Self {
     ProxyProtocol {
       header: None,
       frontend,

@@ -66,6 +66,8 @@ pub struct Client {
   request_id:     String,
   metrics:        SessionMetrics,
   protocol:       Option<State>,
+  front_buf:      Option<Checkout<BufferQueue>>,
+  back_buf:       Option<Checkout<BufferQueue>>,
 }
 
 impl Client {
@@ -73,9 +75,13 @@ impl Client {
     back_buf: Checkout<BufferQueue>, proxy_protocol: bool) -> Client {
     let s = sock.try_clone().expect("could not clone the socket");
     let addr = sock.peer_addr().map(|s| s.ip()).ok();
+    let mut frontend_buffer = None;
+    let mut backend_buffer = None;
 
     let protocol = if proxy_protocol {
-      Some(State::ProxyProtocol(ProxyProtocol::new(s, None, front_buf, back_buf)))
+      frontend_buffer = Some(front_buf);
+      backend_buffer = Some(back_buf);
+      Some(State::ProxyProtocol(ProxyProtocol::new(s, None)))
     } else {
       Some(State::Pipe(Pipe::new(s, None, front_buf, back_buf, addr)))
     };
@@ -93,6 +99,8 @@ impl Client {
       request_id:     Uuid::new_v4().hyphenated().to_string(),
       metrics:        SessionMetrics::new(),
       protocol,
+      front_buf: frontend_buffer,
+      back_buf: backend_buffer,
     }
   }
 
@@ -130,31 +138,35 @@ impl Client {
     let protocol = self.protocol.take();
 
     if let Some(State::ProxyProtocol(mut pp)) = protocol {
-      let mut backend_socket = pp.backend.take().unwrap();
-      let addr = backend_socket.peer_addr().map(|s| s.ip()).ok();
+      if self.back_buf.is_some() && self.front_buf.is_some() {
+        let mut backend_socket = pp.backend.take().unwrap();
+        let addr = backend_socket.peer_addr().map(|s| s.ip()).ok();
 
-      let front_token = pp.front_token();
-      let back_token = pp.back_token();
+        let front_token = pp.front_token();
+        let back_token = pp.back_token();
 
-      let mut pipe = Pipe::new(
-        pp.frontend.take(0).into_inner(),
-        Some(backend_socket),
-        pp.front_buf,
-        pp.back_buf,
-        addr,
-      );
+        let mut pipe = Pipe::new(
+          pp.frontend.take(0).into_inner(),
+          Some(backend_socket),
+          self.front_buf.take().unwrap(),
+          self.back_buf.take().unwrap(),
+          addr,
+        );
 
-      pipe.readiness.front_readiness = pp.readiness.front_readiness;
-      pipe.readiness.back_readiness  = pp.readiness.back_readiness;
-      
-      if let Some(front_token) = front_token {
-        pipe.set_front_token(front_token);
+        pipe.readiness.front_readiness = pp.readiness.front_readiness;
+        pipe.readiness.back_readiness  = pp.readiness.back_readiness;
+
+        if let Some(front_token) = front_token {
+          pipe.set_front_token(front_token);
+        }
+        if let Some(back_token) = back_token {
+          pipe.set_back_token(back_token);
+        }
+
+        self.protocol = Some(State::Pipe(pipe));
+      } else {
+        error!("Missing the frontend or backend buffer queue, we can't switch to a pipe");
       }
-      if let Some(back_token) = back_token {
-        pipe.set_back_token(back_token);
-      }
-
-      self.protocol = Some(State::Pipe(pipe));
     }
   }
 }
