@@ -31,7 +31,8 @@ use network::proxy::{Server,ProxyChannel};
 use network::session::{BackendConnectAction,BackendConnectionStatus,ProxyClient,ProxyConfiguration,Readiness,ListenToken,FrontToken,BackToken,AcceptError,Session,SessionMetrics};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
-use network::protocol::{Pipe, ProxyProtocol, ProtocolResult};
+use network::protocol::{Pipe, ProtocolResult};
+use network::protocol::proxy_protocol::ProxyProtocol;
 
 use util::UnwrapLog;
 

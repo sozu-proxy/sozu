@@ -1,13 +1,16 @@
+mod header;
+
 use std::net::IpAddr;
 use std::io::{Write, ErrorKind};
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
-use network::{ClientResult, Protocol};
-use network::socket::{SocketHandler,SocketResult};
-use network::protocol::ProtocolResult;
+
+use self::header::*;
+use network::{Protocol, ClientResult};
 use network::session::Readiness;
-use network::header_proxy_protocol::*;
+use network::protocol::ProtocolResult;
+use network::socket::SocketHandler;
 
 pub struct ProxyProtocol<Front:SocketHandler> {
   pub header:     Option<ProxyProtocolHeader>,
