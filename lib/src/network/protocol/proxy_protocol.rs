@@ -34,15 +34,13 @@ impl <Front:SocketHandler>ProxyProtocol<Front> {
         back_readiness:  UnixReady::from(Ready::empty()),
       },
       cursor_header: 0,
-      front_buf,
-      back_buf,
     }
   }
 
   // The header is send immediately at once upon the connection is establish
   // and prepended before any data.
   pub fn back_writable(&mut self) -> (ProtocolResult, ClientResult) {
-    debug!("Writte proxy protocol header");
+    debug!("Writing proxy protocol header");
 
     if let Some(ref mut socket) = self.backend {
       if let Some(ref header) = self.header {
@@ -53,7 +51,7 @@ impl <Front:SocketHandler>ProxyProtocol<Front> {
               self.cursor_header += sz;
 
               if self.cursor_header == header.len() {
-                debug!("The header should be receive. We switch to a Pipe");
+                debug!("Proxy protocol sent, upgrading");
                 return (ProtocolResult::Upgrade, ClientResult::Continue)
               }
             },
