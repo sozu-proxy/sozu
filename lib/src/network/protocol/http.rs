@@ -427,7 +427,8 @@ impl<Front:SocketHandler> Http<Front> {
     if self.front_buf.buffer.available_space() == 0 {
       if self.backend_token == None {
         // We don't have a backend to empty the buffer into, close the connection
-        error!("{}\tfront buffer full, no backend, closing the connection", self.log_ctx);
+        metrics.service_stop();
+        self.log_request_error(metrics, "front buffer full, no backend, closing connection");
         incr_ereq!();
         let answer_413 = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
         self.set_answer(DefaultAnswerStatus::Answer413, answer_413.as_bytes());
@@ -749,28 +750,31 @@ impl<Front:SocketHandler> Http<Front> {
     let tokens = self.tokens().clone();
     let output_size = self.front_buf.output_data_size();
     if self.backend.is_none() {
-      error!("{}\tback socket not found, closing connection", self.log_ctx);
+      metrics.service_stop();
+      self.log_request_error(metrics, "back socket not found, closing connection");
       self.readiness.reset();
       return ClientResult::CloseClient;
     }
 
-    let sock = unwrap_msg!(self.backend.as_mut());
     let mut sz = 0usize;
     let mut socket_res = SocketResult::Continue;
 
-    while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
-      // no more data in buffer, stop here
-      if self.front_buf.next_output_data().len() == 0 {
-        self.readiness.front_interest.insert(Ready::readable());
-        self.readiness.back_interest.remove(Ready::writable());
-        metrics.backend_bout += sz;
-        return ClientResult::Continue;
+    {
+      let sock = unwrap_msg!(self.backend.as_mut());
+      while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
+        // no more data in buffer, stop here
+        if self.front_buf.next_output_data().len() == 0 {
+          self.readiness.front_interest.insert(Ready::readable());
+          self.readiness.back_interest.remove(Ready::writable());
+          metrics.backend_bout += sz;
+          return ClientResult::Continue;
+        }
+        let (current_sz, current_res) = sock.socket_write(self.front_buf.next_output_data());
+        socket_res = current_res;
+        self.front_buf.consume_output_data(current_sz);
+        self.front_buf_position += current_sz;
+        sz += current_sz;
       }
-      let (current_sz, current_res) = sock.socket_write(self.front_buf.next_output_data());
-      socket_res = current_res;
-      self.front_buf.consume_output_data(current_sz);
-      self.front_buf_position += current_sz;
-      sz += current_sz;
     }
 
     metrics.backend_bout += sz;
@@ -780,9 +784,9 @@ impl<Front:SocketHandler> Http<Front> {
     }
     match socket_res {
       SocketResult::Error => {
-        error!("{}\tback socket write error, closing connection", self.log_ctx);
-        self.readiness.reset();
         metrics.service_stop();
+        self.log_request_error(metrics, "back socket write error, closing connection");
+        self.readiness.reset();
         incr_ereq!();
         return ClientResult::CloseClient;
       },
@@ -818,7 +822,8 @@ impl<Front:SocketHandler> Http<Front> {
           ClientResult::Continue
         },
         ref s => {
-          error!("{}\tinvalid state, closing connection: {:?}", self.log_ctx, s);
+          metrics.service_stop();
+          self.log_request_error(metrics, "invalid state, closing connection");
           self.readiness.reset();
           ClientResult::CloseClient
         }
@@ -848,7 +853,8 @@ impl<Front:SocketHandler> Http<Front> {
     let tokens     = self.tokens().clone();
 
     if self.backend.is_none() {
-      error!("{}\tback socket not found, closing connection", self.log_ctx);
+      metrics.service_stop();
+      self.log_request_error(metrics, "back socket not found, closing connection");
       self.readiness.reset();
       return (ProtocolResult::Continue, ClientResult::CloseClient);
     }
@@ -872,8 +878,8 @@ impl<Front:SocketHandler> Http<Front> {
     }
 
     if r == SocketResult::Error {
-      error!("{}\tback socket read error, closing connection", self.log_ctx);
       metrics.service_stop();
+      self.log_request_error(metrics, "back socket read error, closing connection");
       self.readiness.reset();
       return (ProtocolResult::Continue, ClientResult::CloseClient);
     }
@@ -928,7 +934,8 @@ impl<Front:SocketHandler> Http<Front> {
           &mut self.back_buf, self.sticky_session.take()));
 
           if unwrap_msg!(self.state.as_ref()).is_back_error() {
-            error!("{}\tback socket chunk parse error, closing connection", self.log_ctx);
+            metrics.service_stop();
+            self.log_request_error(metrics, "back socket chunk parse error, closing connection");
             //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             self.readiness.reset();
             return (ProtocolResult::Continue, ClientResult::CloseClient);
@@ -941,13 +948,14 @@ impl<Front:SocketHandler> Http<Front> {
         self.readiness.front_interest.insert(Ready::writable());
         (ProtocolResult::Continue, ClientResult::Continue)
       },
-      Some(ResponseState::Error(_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
+      Some(ResponseState::Error(_,_,_,_,_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
       _ => {
         self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
         &mut self.back_buf, self.sticky_session.take()));
 
         if unwrap_msg!(self.state.as_ref()).is_back_error() {
-          error!("{}\tback socket parse error, closing connection", self.log_ctx);
+          metrics.service_stop();
+          self.log_request_error(metrics, "back socket parse error, closing connection");
           //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
           self.readiness.reset();
           return (ProtocolResult::Continue, ClientResult::CloseClient);

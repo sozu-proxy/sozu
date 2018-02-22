@@ -656,13 +656,6 @@ pub enum HeaderValue<'a> {
 pub type Host = String;
 
 #[derive(Debug,Clone,PartialEq)]
-pub enum ErrorState {
-  InvalidHttp,
-  MissingHost,
-  TooMuchDataCopied,
-}
-
-#[derive(Debug,Clone,PartialEq)]
 pub enum LengthInformation {
   Length(usize),
   Chunked,
@@ -732,7 +725,7 @@ impl Connection {
 #[derive(Debug,Clone,PartialEq)]
 pub enum RequestState {
   Initial,
-  Error(ErrorState),
+  Error(Option<RRequestLine>, Option<Connection>, Option<Host>, Option<LengthInformation>, Option<Chunk>),
   HasRequestLine(RRequestLine, Connection),
   HasHost(RRequestLine, Connection, Host),
   HasLength(RRequestLine, Connection, LengthInformation),
@@ -743,6 +736,19 @@ pub enum RequestState {
 }
 
 impl RequestState {
+  pub fn into_error(self) -> RequestState {
+    match self {
+      RequestState::Initial => RequestState::Error(None, None, None, None, None),
+      RequestState::HasRequestLine(rl, conn) => RequestState::Error(Some(rl), Some(conn), None, None, None),
+      RequestState::HasHost(rl, conn, host)  => RequestState::Error(Some(rl), Some(conn), Some(host), None, None),
+      RequestState::HasHostAndLength(rl, conn, host, len)  => RequestState::Error(Some(rl), Some(conn), Some(host), Some(len), None),
+      RequestState::Request(rl, conn, host)  => RequestState::Error(Some(rl), Some(conn), Some(host), None, None),
+      RequestState::RequestWithBody(rl, conn, host, len) => RequestState::Error(Some(rl), Some(conn), Some(host), Some(LengthInformation::Length(len)), None),
+      RequestState::RequestWithBodyChunks(rl, conn, host, chunk) => RequestState::Error(Some(rl), Some(conn), Some(host), None, Some(chunk)),
+      err => err,
+    }
+  }
+
   pub fn has_host(&self) -> bool {
     match *self {
       RequestState::HasHost(_, _, _)            |
@@ -780,6 +786,7 @@ impl RequestState {
       RequestState::Request(_, _, ref host)            |
       RequestState::RequestWithBody(_, _, ref host, _) |
       RequestState::RequestWithBodyChunks(_, _, ref host, _) => Some(host.clone()),
+      RequestState::Error(_, _, ref host, _, _)              => host.clone(),
       _                                                      => None
     }
   }
@@ -791,6 +798,7 @@ impl RequestState {
       RequestState::Request(ref rl , _, _)           |
       RequestState::RequestWithBody(ref rl, _, _, _) |
       RequestState::RequestWithBodyChunks(ref rl, _, _, _) => Some(rl.uri.clone()),
+      RequestState::Error(ref rl, _, _, _, _)              => rl.as_ref().map(|r| r.uri.clone()),
       _                                                    => None
     }
   }
@@ -802,6 +810,7 @@ impl RequestState {
       RequestState::Request(ref rl, _, _)            |
       RequestState::RequestWithBody(ref rl, _, _, _) |
       RequestState::RequestWithBodyChunks(ref rl, _, _, _) => Some(rl.clone()),
+      RequestState::Error(ref rl, _, _, _, _)              => rl.clone(),
       _                                                    => None
     }
   }
@@ -815,6 +824,7 @@ impl RequestState {
       RequestState::Request(_, ref conn, _)             |
       RequestState::RequestWithBody(_, ref conn, _, _)  |
       RequestState::RequestWithBodyChunks(_, ref conn, _, _) => Some(conn.clone()),
+      RequestState::Error(_, ref conn, _, _, _)       => conn.clone(),
       _                                                      => None
     }
   }
@@ -869,7 +879,7 @@ pub type UpgradeProtocol = String;
 #[derive(Debug,Clone,PartialEq)]
 pub enum ResponseState {
   Initial,
-  Error(ErrorState),
+  Error(Option<RStatusLine>, Option<Connection>, Option<UpgradeProtocol>, Option<LengthInformation>, Option<Chunk>),
   HasStatusLine(RStatusLine, Connection),
   HasUpgrade(RStatusLine, Connection, UpgradeProtocol),
   HasLength(RStatusLine, Connection, LengthInformation),
@@ -880,6 +890,20 @@ pub enum ResponseState {
 }
 
 impl ResponseState {
+  pub fn into_error(self) -> ResponseState {
+    match self {
+      ResponseState::Initial => ResponseState::Error(None, None, None, None, None),
+      ResponseState::HasStatusLine(sl, conn) => ResponseState::Error(Some(sl), Some(conn), None, None, None),
+      ResponseState::HasLength(sl, conn, length) => ResponseState::Error(Some(sl), Some(conn), None, Some(length), None),
+      ResponseState::HasUpgrade(sl, conn, upgrade) => ResponseState::Error(Some(sl), Some(conn), Some(upgrade), None, None),
+      ResponseState::Response(sl, conn) => ResponseState::Error(Some(sl), Some(conn), None, None, None),
+      ResponseState::ResponseUpgrade(sl, conn, upgrade) => ResponseState::Error(Some(sl), Some(conn), Some(upgrade), None, None),
+      ResponseState::ResponseWithBody(sl, conn, len) => ResponseState::Error(Some(sl), Some(conn), None, Some(LengthInformation::Length(len)), None),
+      ResponseState::ResponseWithBodyChunks(sl, conn, chunk) => ResponseState::Error(Some(sl), Some(conn), None, None, Some(chunk)),
+      err => err
+    }
+  }
+
   pub fn is_proxying(&self) -> bool {
     match *self {
       ResponseState::Response(_, _) | ResponseState::ResponseWithBody(_, _, _) => true,
@@ -896,6 +920,7 @@ impl ResponseState {
       ResponseState::ResponseUpgrade(ref sl, _, _)        |
       ResponseState::ResponseWithBody(ref sl, _, _)       |
       ResponseState::ResponseWithBodyChunks(ref sl, _, _) => Some(sl.clone()),
+      ResponseState::Error(ref sl, _, _, _, _)            => sl.clone(),
       _                                                   => None
     }
   }
@@ -909,6 +934,7 @@ impl ResponseState {
       ResponseState::ResponseUpgrade(_, ref conn, _)        |
       ResponseState::ResponseWithBody(_, ref conn, _)       |
       ResponseState::ResponseWithBodyChunks(_, ref conn, _) => Some(conn.clone()),
+      ResponseState::Error(_, ref conn, _, _, _)            => conn.clone(),
       _                                                     => None
     }
   }
@@ -982,7 +1008,7 @@ impl HttpState {
   }
 
   pub fn is_front_error(&self) -> bool {
-    if let Some(RequestState::Error(_)) = self.request {
+    if let Some(RequestState::Error(_,_,_,_,_)) = self.request {
       true
     } else {
       false
@@ -1050,7 +1076,7 @@ impl HttpState {
   }
 
   pub fn is_back_error(&self) -> bool {
-    if let Some(ResponseState::Error(_)) = self.response {
+    if let Some(ResponseState::Error(_,_,_,_,_)) = self.response {
       true
     } else {
       false
@@ -1097,7 +1123,7 @@ pub enum BufferMove {
 
 pub fn default_request_result<O>(state: RequestState, res: IResult<&[u8], O>) -> (BufferMove, RequestState) {
   match res {
-    IResult::Error(_)      => (BufferMove::None, RequestState::Error(ErrorState::InvalidHttp)),
+    IResult::Error(_)      => (BufferMove::None, state.into_error()),
     IResult::Incomplete(_) => (BufferMove::None, state),
     _                      => unreachable!()
   }
@@ -1109,14 +1135,14 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
       match state {
         RequestState::HasRequestLine(rl, conn) => RequestState::HasHost(rl, conn, host),
         RequestState::HasLength(rl, conn, l)   => RequestState::HasHostAndLength(rl, conn, host, l),
-        _                                      => RequestState::Error(ErrorState::InvalidHttp)
+        s                                      => s.into_error()
       }
     },
     HeaderValue::ContentLength(sz) => {
       match state {
         RequestState::HasRequestLine(rl, conn) => RequestState::HasLength(rl, conn, LengthInformation::Length(sz)),
         RequestState::HasHost(rl, conn, host)  => RequestState::HasHostAndLength(rl, conn, host, LengthInformation::Length(sz)),
-        _                                      => RequestState::Error(ErrorState::InvalidHttp)
+        s                                      => s.into_error()
       }
     },
     HeaderValue::Encoding(TransferEncodingValue::Chunked) => {
@@ -1126,8 +1152,7 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
         // Transfer-Encoding takes the precedence on Content-Length
         RequestState::HasHostAndLength(rl, conn, host,
            LengthInformation::Length(_))         => RequestState::HasHostAndLength(rl, conn, host, LengthInformation::Chunked),
-        RequestState::HasHostAndLength(_, _, _, _) => RequestState::Error(ErrorState::InvalidHttp),
-        _                                        => RequestState::Error(ErrorState::InvalidHttp)
+        s                                        => s.into_error()
       }
     },
     // FIXME: for now, we don't remember if we cancel indications from a previous Connection Header
@@ -1149,7 +1174,7 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
         RequestState::HasHostAndLength(rl, _, host, length) => RequestState::HasHostAndLength(rl, conn, host, length),
         RequestState::Request(rl, _, host)                  => RequestState::Request(rl, conn, host),
         RequestState::RequestWithBody(rl, _, host, length)  => RequestState::RequestWithBody(rl, conn, host, length),
-        _                                                   => RequestState::Error(ErrorState::InvalidHttp)
+        s                                                   => s.into_error()
       }
     },
     HeaderValue::ExpectContinue => {
@@ -1163,7 +1188,7 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
         RequestState::HasHostAndLength(rl, _, host, length) => RequestState::HasHostAndLength(rl, conn, host, length),
         RequestState::Request(rl, _, host)                  => RequestState::Request(rl, conn, host),
         RequestState::RequestWithBody(rl, _, host, length)  => RequestState::RequestWithBody(rl, conn, host, length),
-        _                                                   => RequestState::Error(ErrorState::InvalidHttp)
+        s                                                   => s.into_error()
       }
     }
 
@@ -1174,7 +1199,7 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
     HeaderValue::XForwardedPort(_) => RequestState::Error(ErrorState::InvalidHttp),
     */
     // FIXME: there should be an error for unsupported encoding
-    HeaderValue::Encoding(_) => RequestState::Error(ErrorState::InvalidHttp),
+    HeaderValue::Encoding(_) => state.into_error(),
     HeaderValue::Forwarded   => state,
     HeaderValue::Other(_,_)  => state,
     //FIXME: for now, we don't look at what is asked in upgrade since the backend is the one deciding
@@ -1195,7 +1220,7 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
 
       return state;
     },
-    HeaderValue::Error       => RequestState::Error(ErrorState::InvalidHttp)
+    HeaderValue::Error       => state.into_error()
   }
 }
 
@@ -1220,7 +1245,7 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
               if let Some(host) = Url::parse(&rl.uri).ok().and_then(|u| u.host_str().map(|s| s.to_string())) {
                 (BufferMove::Advance(buf.offset(i)), RequestState::HasHost(rl, conn, host))
               } else {
-                (BufferMove::None, RequestState::Error(ErrorState::InvalidHttp))
+                (BufferMove::None, (RequestState::Initial).into_error())
               }
             } else {
               /*let conn = if rl.version == "11" {
@@ -1233,7 +1258,7 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
               s
             }
           } else {
-            (BufferMove::None, RequestState::Error(ErrorState::InvalidHttp))
+            (BufferMove::None, (RequestState::Initial).into_error())
           }
         },
         res => default_request_result(state, res)
@@ -1328,14 +1353,14 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
     },
     _ => {
       error!("PARSER\tunimplemented state: {:?}", state);
-      (BufferMove::None, RequestState::Error(ErrorState::InvalidHttp))
+      (BufferMove::None, state.into_error())
     }
   }
 }
 
 pub fn default_response_result<O>(state: ResponseState, res: IResult<&[u8], O>) -> (BufferMove, ResponseState) {
   match res {
-    IResult::Error(_)      => (BufferMove::None, ResponseState::Error(ErrorState::InvalidHttp)),
+    IResult::Error(_)      => (BufferMove::None, state.into_error()),
     IResult::Incomplete(_) => (BufferMove::None, state),
     _                      => unreachable!()
   }
@@ -1352,13 +1377,13 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
         } else {
           ResponseState::HasLength(sl, conn, LengthInformation::Length(sz))
         },
-        _                                      => ResponseState::Error(ErrorState::InvalidHttp)
+        s                                      => s.into_error(),
       }
     },
     HeaderValue::Encoding(TransferEncodingValue::Chunked) => {
       match state {
         ResponseState::HasStatusLine(rl, conn) => ResponseState::HasLength(rl, conn, LengthInformation::Chunked),
-        _                                      => ResponseState::Error(ErrorState::InvalidHttp)
+        s                                      => s.into_error(),
       }
     },
     // FIXME: for now, we don't remember if we cancel indications from a previous Connection Header
@@ -1376,16 +1401,16 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
       match state {
         ResponseState::HasStatusLine(rl, _)     => ResponseState::HasStatusLine(rl, conn),
         ResponseState::HasLength(rl, _, length) => ResponseState::HasLength(rl, conn, length),
-        ResponseState::HasUpgrade(rl, _, proto) => {
+        ResponseState::HasUpgrade(rl, conn, proto) => {
           trace!("has upgrade, got conn: \"{:?}\"", conn);
           //FIXME: verify here if the Upgrade header we got is the same as the request Upgrade header
           if conn.has_upgrade {
             ResponseState::HasUpgrade(rl, conn, proto)
           } else {
-            ResponseState::Error(ErrorState::InvalidHttp)
+            ResponseState::Error(Some(rl), Some(conn), Some(proto), None, None)
           }
         }
-        _                                       => ResponseState::Error(ErrorState::InvalidHttp)
+        s                                       => s.into_error(),
       }
     },
     HeaderValue::Upgrade(protocol) => {
@@ -1397,13 +1422,13 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
           conn.upgrade = Some(proto.clone());
           ResponseState::HasUpgrade(sl, conn, proto)
         },
-        _                                      => ResponseState::Error(ErrorState::InvalidHttp)
+        s                                       => s.into_error(),
       }
     }
 
     // FIXME: there should be an error for unsupported encoding
-    HeaderValue::Encoding(_) => ResponseState::Error(ErrorState::InvalidHttp),
-    HeaderValue::Host(_)     => ResponseState::Error(ErrorState::InvalidHttp),
+    HeaderValue::Encoding(_) => state.into_error(),
+    HeaderValue::Host(_)     => state.into_error(),
     /*
     HeaderValue::Forwarded(_)  => ResponseState::Error(ErrorState::InvalidHttp),
     HeaderValue::XForwardedFor(_) => ResponseState::Error(ErrorState::InvalidHttp),
@@ -1414,10 +1439,10 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
     HeaderValue::Other(_,_)  => state,
     HeaderValue::ExpectContinue => {
       // we should not get that one from the server
-      ResponseState::Error(ErrorState::InvalidHttp)
+      state.into_error()
     },
     HeaderValue::Cookie(_)   => state,
-    HeaderValue::Error       => ResponseState::Error(ErrorState::InvalidHttp)
+    HeaderValue::Error       => state.into_error()
   }
 }
 
@@ -1437,7 +1462,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool) -> (Buffe
             let s = (BufferMove::Advance(buf.offset(i)), ResponseState::HasStatusLine(rl, conn));
             s
           } else {
-            (BufferMove::None, ResponseState::Error(ErrorState::InvalidHttp))
+            (BufferMove::None, ResponseState::Error(None, None, None, None, None))
           }
         },
         res => default_response_result(state, res)
@@ -1524,7 +1549,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool) -> (Buffe
     },
     _ => {
       error!("PARSER\tunimplemented state: {:?}", state);
-      (BufferMove::None, ResponseState::Error(ErrorState::InvalidHttp))
+      (BufferMove::None, state.into_error())
     }
   }
 }
@@ -1623,7 +1648,7 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
     }
 
     match current_state {
-      RequestState::Error(_) => {
+      RequestState::Error(_,_,_,_,_) => {
         incr!("http1.parser.request.error");
         break;
       },
@@ -1722,7 +1747,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
     }
 
     match current_state {
-      ResponseState::Error(_) => {
+      ResponseState::Error(_,_,_,_,_) => {
         incr!("http1.parser.response.error");
         break;
       }
