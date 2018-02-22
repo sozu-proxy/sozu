@@ -19,7 +19,6 @@ use sozu_command::messages::OrderMessage;
 use util;
 use logging;
 use command::{CommandServer,Worker};
-use worker::get_executable_path;
 
 #[derive(Deserialize,Serialize,Debug)]
 pub struct SerializedWorker {
@@ -58,7 +57,7 @@ pub struct UpgradeData {
   //pub order_state: HashMap<String, HashSet<usize>>,
 }
 
-pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<(),bool>) {
+pub fn start_new_master_process(executable_path: String, upgrade_data: UpgradeData) -> (pid_t, Channel<(),bool>) {
   trace!("parent({})", unsafe { libc::getpid() });
 
   let mut upgrade_file = tempfile().expect("could not create temporary file for upgrade");
@@ -79,8 +78,6 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<()
   );
   command.set_nonblocking(false);
 
-  let path = unsafe { get_executable_path() };
-
   info!("launching new master");
   //FIXME: remove the expect, return a result?
   match fork().expect("fork failed") {
@@ -92,7 +89,7 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<()
     }
     ForkResult::Child => {
       trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
-      let res = Command::new(path)
+      let res = Command::new(executable_path)
         .arg("upgrade")
         .arg("--fd")
         .arg(client.as_raw_fd().to_string())

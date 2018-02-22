@@ -33,7 +33,7 @@ use clap::{App,Arg,SubCommand};
 use libc::{cpu_set_t,pid_t};
 
 use command::Worker;
-use worker::{begin_worker_process,start_workers};
+use worker::{begin_worker_process,start_workers,get_executable_path};
 use upgrade::begin_new_master_process;
 
 fn main() {
@@ -133,7 +133,8 @@ fn main() {
     let command_socket_path = config.command_socket_path();
 
     if check_process_limits(config.clone()) {
-      match start_workers(&config) {
+      let path = unsafe { get_executable_path() };
+      match start_workers(path, &config) {
         Ok(workers) => {
           info!("created workers: {:?}", workers);
 

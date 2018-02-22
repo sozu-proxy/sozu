@@ -26,11 +26,11 @@ use util;
 use logging;
 use command::Worker;
 
-pub fn start_workers(config: &Config) -> nix::Result<Vec<Worker>> {
+pub fn start_workers(executable_path: String, config: &Config) -> nix::Result<Vec<Worker>> {
   let state = ConfigState::new();
   let mut workers = Vec::new();
   for index in 0..config.worker_count {
-    match start_worker_process(&index.to_string(), config, &state, None) {
+    match start_worker_process(&index.to_string(), config, executable_path.clone(), &state, None) {
       Ok((pid, command, scm)) => {
         let w =  Worker::new(index as u32, pid, command, scm, config);
         workers.push(w);
@@ -41,8 +41,8 @@ pub fn start_workers(config: &Config) -> nix::Result<Vec<Worker>> {
   Ok(workers)
 }
 
-pub fn start_worker(id: u32, config: &Config, state: &ConfigState, listeners: Option<Listeners>) -> nix::Result<Worker> {
-  match start_worker_process(&id.to_string(), config, state, listeners) {
+pub fn start_worker(id: u32, config: &Config, executable_path: String, state: &ConfigState, listeners: Option<Listeners>) -> nix::Result<Worker> {
+  match start_worker_process(&id.to_string(), config, executable_path, state, listeners) {
     Ok((pid, command, scm)) => {
       let w = Worker::new(id, pid, command,  scm, config);
       Ok(w)
@@ -87,7 +87,7 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
   info!("{} ending event loop", id);
 }
 
-pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState, listeners: Option<Listeners>) -> nix::Result<(pid_t, Channel<OrderMessage,OrderMessageAnswer>, ScmSocket)> {
+pub fn start_worker_process(id: &str, config: &Config, executable_path: String, state: &ConfigState, listeners: Option<Listeners>) -> nix::Result<(pid_t, Channel<OrderMessage,OrderMessageAnswer>, ScmSocket)> {
   trace!("parent({})", unsafe { libc::getpid() });
 
   let mut state_file = tempfile().expect("could not create temporary file for configuration state");
@@ -111,10 +111,8 @@ pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState, list
   );
   command.set_nonblocking(false);
 
-  let path = unsafe { get_executable_path() };
-
   info!("{} launching worker", id);
-  debug!("executable path is {}", path);
+  debug!("executable path is {}", executable_path);
   match fork() {
     Ok(ForkResult::Parent{ child }) => {
       info!("{} worker launched: {}", id, child);
@@ -139,7 +137,7 @@ pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState, list
     },
     Ok(ForkResult::Child) => {
       trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
-      Command::new(path)
+      Command::new(executable_path)
         .arg("worker")
         .arg("--id")
         .arg(id)

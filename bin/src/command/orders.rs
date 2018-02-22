@@ -23,7 +23,7 @@ use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAns
 use super::{CommandServer,FrontToken,Worker};
 use super::client::parse;
 use super::state::{MessageType,OrderState};
-use worker::start_worker;
+use worker::{start_worker,get_executable_path};
 use upgrade::{start_new_master_process,SerializedWorker,UpgradeData};
 use util;
 
@@ -265,7 +265,7 @@ impl CommandServer {
 
   pub fn launch_worker(&mut self, token: FrontToken, message: &ConfigMessage, tag: &str) {
     let id = self.next_id;
-    if let Ok(mut worker) = start_worker(id, &self.config, &self.state, None) {
+    if let Ok(mut worker) = start_worker(id, &self.config, self.executable_path.clone(), &self.state, None) {
       self.clients[token].push_message(ConfigMessageAnswer::new(
           message.id.clone(),
           ConfigMessageStatus::Processing,
@@ -345,7 +345,7 @@ impl CommandServer {
 
     // same as launch_worker
     let id = self.next_id;
-    if let Ok(mut worker) = start_worker(id, &self.config, &self.state, listeners) {
+    if let Ok(mut worker) = start_worker(id, &self.config, self.executable_path.clone(), &self.state, listeners) {
       self.clients[token].push_message(ConfigMessageAnswer::new(
           String::from(message_id),
           ConfigMessageStatus::Processing,
@@ -384,7 +384,7 @@ impl CommandServer {
         "".to_string(),
         None
         ));
-    let (pid, mut channel) = start_new_master_process(self.generate_upgrade_data());
+    let (pid, mut channel) = start_new_master_process(self.executable_path.clone(), self.generate_upgrade_data());
     channel.set_blocking(true);
     let res = channel.read_message();
     debug!("upgrade channel sent: {:?}", res);
@@ -594,6 +594,7 @@ impl CommandServer {
 
     let config_state = state.clone();
 
+    let path = unsafe { get_executable_path() };
     CommandServer {
       sock:            listener,
       poll:            poll,
@@ -610,6 +611,7 @@ impl CommandServer {
       //FIXME: deserialize this as well
       order_state:     OrderState::new(),
       must_stop:       false,
+      executable_path: path,
     }
   }
 }

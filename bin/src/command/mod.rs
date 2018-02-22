@@ -25,7 +25,7 @@ pub mod orders;
 pub mod client;
 pub mod state;
 
-use worker::start_worker;
+use worker::{start_worker, get_executable_path};
 use self::client::CommandClient;
 use self::state::MessageType;
 
@@ -106,6 +106,7 @@ pub struct CommandServer {
   token_count:     usize,
   order_state:     state::OrderState,
   must_stop:       bool,
+  executable_path: String,
 }
 
 impl CommandServer {
@@ -165,6 +166,8 @@ impl CommandServer {
       proxies.insert(Token(token_count), proxy);
     }
 
+    let path = unsafe { get_executable_path() };
+
     CommandServer {
       sock:            srv,
       buffer_size:     config.command_buffer_size,
@@ -178,6 +181,7 @@ impl CommandServer {
       token_count:     token_count,
       order_state:     state::OrderState::new(),
       must_stop:       false,
+      executable_path: path,
     }
   }
 
@@ -575,7 +579,7 @@ impl CommandServer {
     self.proxies.remove(&token);
 
     let id = self.next_id;
-    if let Ok(mut worker) = start_worker(id, &self.config, &self.state, None) {
+    if let Ok(mut worker) = start_worker(id, &self.config, self.executable_path.clone(), &self.state, None) {
       info!("created new worker: {}", id);
       self.next_id += 1;
       let worker_token = self.token_count + 1;
