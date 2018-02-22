@@ -314,10 +314,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       }).map(|(frontend_sock, _)| {
         frontend_sock.set_nodelay(true);
         let session = ServerSession::new(&self.ssl_config);
-        let mut c = TlsClient::new(session, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address);
+        let c = TlsClient::new(session, frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address);
 
-        c.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-        c.set_front_token(client_token);
         poll.register(
           c.front_socket(),
           client_token,

@@ -54,7 +54,7 @@ pub enum State {
 pub struct Client {
   pub frontend:   TcpStream,
   backend:        Option<TcpStream>,
-  token:          Option<Token>,
+  frontend_token: Token,
   backend_token:  Option<Token>,
   instance:       Option<Rc<RefCell<Backend>>>,
   back_connected: BackendConnectionStatus,
@@ -65,11 +65,11 @@ pub struct Client {
 }
 
 impl Client {
-  pub fn new(sock: TcpStream, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> Option<Client> {
+  pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> Option<Client> {
     let protocol = if let Some(pool) = pool.upgrade() {
       let mut p = pool.borrow_mut();
       if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-        Some(Http::new(unwrap_msg!(sock.try_clone()), front_buf, back_buf, public_address,
+        Some(Http::new(unwrap_msg!(sock.try_clone()), token, front_buf, back_buf, public_address,
           Protocol::HTTP).expect("should create a HTTP state"))
       } else { None }
     } else { None };
@@ -77,20 +77,22 @@ impl Client {
     protocol.map(|http| {
       let request_id = Uuid::new_v4().hyphenated().to_string();
       let log_ctx    = format!("{}\tunknown\t", &request_id);
-      let client = Client {
+      let mut client = Client {
         backend:        None,
-        token:          None,
         backend_token:  None,
         instance:       None,
         back_connected: BackendConnectionStatus::NotConnected,
         protocol:       Some(State::Http(http)),
         frontend:       sock,
+        frontend_token: token,
         pool:           pool,
         sticky_session: false,
         metrics:        SessionMetrics::new(),
       };
 
-    client
+      client.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+
+      client
     })
   }
 
@@ -99,7 +101,7 @@ impl Client {
     let protocol = unwrap_msg!(self.protocol.take());
     if let State::Http(http) = protocol {
       debug!("switching to pipe");
-      let front_token = unwrap_msg!(http.front_token());
+      let front_token = http.front_token();
       let back_token  = unwrap_msg!(http.back_token());
 
       let mut pipe = Pipe::new(http.frontend, Some(unwrap_msg!(http.backend)),
@@ -205,10 +207,6 @@ impl Client {
     self.backend.as_ref()
   }
 
-  fn front_token(&self)  -> Option<Token> {
-    self.token
-  }
-
   fn back_token(&self)   -> Option<Token> {
     self.backend_token
   }
@@ -222,7 +220,7 @@ impl Client {
   }
 
   fn set_front_token(&mut self, token: Token) {
-    self.token         = Some(token);
+    self.frontend_token = token;
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.set_front_token(token),
       State::WebSocket(ref mut pipe) => pipe.set_front_token(token)
@@ -259,7 +257,7 @@ impl Client {
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
     debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND",
-      self.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), unwrap_msg!(self.token).0,
+      self.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), self.frontend_token.0,
       self.backend_token.map(|t| format!("{}", t.0)).unwrap_or("-".to_string()));
     let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
     self.backend       = None;
@@ -293,9 +291,8 @@ impl ProxyClient for Client {
       poll.deregister(sock);
     }
 
-    if let Some(tk) = self.token {
-      result.tokens.push(tk)
-    }
+    result.tokens.push(self.frontend_token);
+
     if let Some(tk) = self.backend_token {
       result.tokens.push(tk)
     }
@@ -335,9 +332,8 @@ impl ProxyClient for Client {
   }
 
   fn process_events(&mut self, token: Token, events: Ready) {
-    if self.token == Some(token) {
-      self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
-    } else if self.backend_token ==Some(token) {
+    self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
+    if self.backend_token ==Some(token) {
       self.readiness().back_readiness = self.readiness().back_readiness | UnixReady::from(events);
     }
   }
@@ -360,7 +356,7 @@ impl ProxyClient for Client {
       }
     }
 
-    let token = self.token.clone();
+    let token = self.frontend_token.clone();
     while counter < max_loop_iterations {
       let front_interest = self.readiness().front_interest & self.readiness().front_readiness;
       let back_interest  = self.readiness().back_interest & self.readiness().back_readiness;
@@ -437,9 +433,9 @@ impl ProxyClient for Client {
 
       if front_interest.is_error() || back_interest.is_error() {
         if front_interest.is_error() {
-          error!("PROXY client {:?} front error, disconnecting", self.token);
+          error!("PROXY client {:?} front error, disconnecting", self.frontend_token);
         } else {
-          error!("PROXY client {:?} back error, disconnecting", self.token);
+          error!("PROXY client {:?} back error, disconnecting", self.frontend_token);
         }
 
         self.readiness().front_interest = UnixReady::from(Ready::empty());
@@ -451,12 +447,12 @@ impl ProxyClient for Client {
     }
 
     if counter == max_loop_iterations {
-      error!("PROXY\thandling client {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.token, max_loop_iterations);
+      error!("PROXY\thandling client {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
 
       let front_interest = self.readiness().front_interest & self.readiness().front_readiness;
       let back_interest  = self.readiness().back_interest & self.readiness().back_readiness;
 
-      let token = self.token.clone();
+      let token = self.frontend_token.clone();
       error!("PROXY\t{:?} readiness: {:?} | front: {:?} | back: {:?} ", token,
         self.readiness(), front_interest, back_interest);
 
@@ -942,9 +938,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         }
       }).and_then(|(frontend_sock, _)| {
         frontend_sock.set_nodelay(true);
-        if let Some(mut c) = Client::new(frontend_sock, Rc::downgrade(&self.pool), self.config.public_address) {
-          c.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-          c.set_front_token(client_token);
+        if let Some(c) = Client::new(frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address) {
           poll.register(
             c.front_socket(),
             client_token,

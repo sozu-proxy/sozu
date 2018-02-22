@@ -68,7 +68,7 @@ pub enum State {
 
 pub struct TlsClient {
   front:          Option<TcpStream>,
-  token:          Option<Token>,
+  frontend_token: Token,
   instance:       Option<Rc<RefCell<Backend>>>,
   back_connected: BackendConnectionStatus,
   protocol:       Option<State>,
@@ -80,14 +80,14 @@ pub struct TlsClient {
 }
 
 impl TlsClient {
-  pub fn new(ssl:Ssl, sock: TcpStream, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> TlsClient {
+  pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> TlsClient {
     //FIXME: we should not need to clone the socket. Maybe do the accept here instead of
     // in TlsHandshake?
     let s = sock.try_clone().expect("could not clone the socket");
     let handshake = TlsHandshake::new(ssl, s);
-    TlsClient {
+    let mut client = TlsClient {
       front:          Some(sock),
-      token:          None,
+      frontend_token: token,
       instance:       None,
       back_connected: BackendConnectionStatus::NotConnected,
       protocol:       Some(State::Handshake(handshake)),
@@ -96,7 +96,10 @@ impl TlsClient {
       pool:           pool,
       sticky_session: false,
       metrics:        SessionMetrics::new(),
-    }
+    };
+    client.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+
+    client
   }
 
   pub fn http(&mut self) -> Option<&mut Http<SslStream<TcpStream>>> {
@@ -125,12 +128,11 @@ impl TlsClient {
         let mut p = pool.borrow_mut();
 
         if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-          let mut http = Http::new(unwrap_msg!(handshake.stream), front_buf,
+          let mut http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), front_buf,
             back_buf, self.public_address.clone(), Protocol::HTTPS).unwrap();
 
           http.readiness = handshake.readiness;
           http.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-          http.set_front_token(unwrap_msg!(self.token.as_ref()).clone());
           self.ssl = handshake.ssl;
           self.protocol = Some(State::Http(http));
           return true;
@@ -142,7 +144,7 @@ impl TlsClient {
       false
     } else if let State::Http(http) = protocol {
       debug!("https switching to wss");
-      let front_token = unwrap_msg!(http.front_token());
+      let front_token = http.front_token();
       let back_token  = unwrap_msg!(http.back_token());
 
       let mut pipe = Pipe::new(http.frontend, Some(unwrap_msg!(http.backend)),
@@ -254,10 +256,6 @@ impl TlsClient {
     }
   }
 
-  fn front_token(&self)  -> Option<Token> {
-    self.token
-  }
-
   fn back_token(&self)   -> Option<Token> {
     if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
       http.back_token()
@@ -271,7 +269,7 @@ impl TlsClient {
   }
 
   fn set_front_token(&mut self, token: Token) {
-    self.token = Some(token);
+    self.frontend_token = token;
     self.protocol.as_mut().map(|p| match *p {
       State::Http(ref mut http) => http.set_front_token(token),
       _                         => {}
@@ -320,7 +318,7 @@ impl TlsClient {
 impl ProxyClient for TlsClient {
 
   fn close(&mut self, poll: &mut Poll) -> CloseResult {
-    //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
+    //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.frontend_token, *self.temp.front_buf, *self.temp.back_buf);
     self.http().map(|http| http.close());
     self.metrics.service_stop();
     self.front_socket().shutdown(Shutdown::Both);
@@ -338,9 +336,7 @@ impl ProxyClient for TlsClient {
       decr!("backend.connections");
     }
 
-    if let Some(tk) = self.token {
-      result.tokens.push(tk)
-    }
+    result.tokens.push(self.frontend_token);
     if let Some(tk) = self.back_token() {
       result.tokens.push(tk)
     }
@@ -380,9 +376,8 @@ impl ProxyClient for TlsClient {
   }
 
   fn process_events(&mut self, token: Token, events: Ready) {
-    if self.token == Some(token) {
-      self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
-    } else if self.back_token() == Some(token) {
+    self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
+    if self.back_token() == Some(token) {
       self.readiness().back_readiness = self.readiness().back_readiness | UnixReady::from(events);
     }
   }
@@ -405,7 +400,7 @@ impl ProxyClient for TlsClient {
       }
     }
 
-    let token = self.token.clone();
+    let token = self.frontend_token.clone();
     while counter < max_loop_iterations {
       let front_interest = self.readiness().front_interest & self.readiness().front_readiness;
       let back_interest  = self.readiness().back_interest & self.readiness().back_readiness;
@@ -481,9 +476,9 @@ impl ProxyClient for TlsClient {
 
       if front_interest.is_error() || back_interest.is_error() {
         if front_interest.is_error() {
-          error!("PROXY client {:?} front error, disconnecting", self.token);
+          error!("PROXY client {:?} front error, disconnecting", self.frontend_token);
         } else {
-          error!("PROXY client {:?} back error, disconnecting", self.token);
+          error!("PROXY client {:?} back error, disconnecting", self.frontend_token);
         }
 
         self.readiness().front_interest = UnixReady::from(Ready::empty());
@@ -495,12 +490,12 @@ impl ProxyClient for TlsClient {
     }
 
     if counter == max_loop_iterations {
-      error!("PROXY\thandling client {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.token, max_loop_iterations);
+      error!("PROXY\thandling client {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
 
       let front_interest = self.readiness().front_interest & self.readiness().front_readiness;
       let back_interest  = self.readiness().back_interest & self.readiness().back_readiness;
 
-      let token = self.token.clone();
+      let token = self.frontend_token.clone();
       error!("PROXY\t{:?} readiness: {:?} | front: {:?} | back: {:?} ", token,
         self.readiness(), front_interest, back_interest);
 
@@ -1022,10 +1017,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       }).and_then(|(frontend_sock, _)| {
         frontend_sock.set_nodelay(true);
         if let Ok(ssl) = Ssl::new(&self.default_context.context) {
-          let mut c = TlsClient::new(ssl, frontend_sock, Rc::downgrade(&self.pool), self.config.public_address);
-          c.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+          let c = TlsClient::new(ssl, frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address);
 
-          c.set_front_token(client_token);
           poll.register(
             c.front_socket(),
             client_token,

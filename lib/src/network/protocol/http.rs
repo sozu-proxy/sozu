@@ -47,7 +47,7 @@ pub enum DefaultAnswerStatus {
 pub struct Http<Front:SocketHandler> {
   pub frontend:       Front,
   pub backend:        Option<TcpStream>,
-  token:              Option<Token>,
+  frontend_token:     Token,
   backend_token:      Option<Token>,
   rx_count:           usize,
   tx_count:           usize,
@@ -70,14 +70,14 @@ pub struct Http<Front:SocketHandler> {
 }
 
 impl<Front:SocketHandler> Http<Front> {
-  pub fn new(sock: Front, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>,
+  pub fn new(sock: Front, token: Token, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>,
              protocol: Protocol) -> Option<Http<Front>> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{} unknown\t", &request_id);
     let mut client = Http {
       frontend:           sock,
       backend:            None,
-      token:              None,
+      frontend_token:     token,
       backend_token:      None,
       rx_count:           0,
       tx_count:           0,
@@ -126,10 +126,8 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   fn tokens(&self) -> Option<(Token,Token)> {
-    if let Some(front) = self.token {
-      if let Some(back) = self.backend_token {
-        return Some((front, back))
-      }
+    if let Some(back) = self.backend_token {
+      return Some((self.frontend_token, back))
     }
     None
   }
@@ -210,8 +208,8 @@ impl<Front:SocketHandler> Http<Front> {
     self.backend.as_ref()
   }
 
-  pub fn front_token(&self)  -> Option<Token> {
-    self.token
+  pub fn front_token(&self)  -> Token {
+    self.frontend_token
   }
 
   pub fn back_token(&self)   -> Option<Token> {
@@ -234,7 +232,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn set_front_token(&mut self, token: Token) {
-    self.token         = Some(token);
+    self.frontend_token = token;
   }
 
   pub fn set_app_id(&mut self, app_id: String) {
@@ -257,7 +255,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.log_ctx, unwrap_msg!(self.token).0,
+    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.log_ctx, self.frontend_token.0,
       self.backend_token.map(|t| format!("{}", t.0)).unwrap_or("-".to_string()));
     let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
     self.backend       = None;
