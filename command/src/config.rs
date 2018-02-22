@@ -164,7 +164,6 @@ impl ProxyConfig {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct TcpProxyConfig {
-  pub max_listeners : usize,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]

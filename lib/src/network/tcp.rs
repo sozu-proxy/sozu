@@ -413,7 +413,7 @@ pub struct ServerConfiguration {
 }
 
 impl ServerConfiguration {
-  pub fn new(max_listeners: usize, event_loop: &mut Poll, pool: Rc<RefCell<Pool<BufferQueue>>>,
+  pub fn new(event_loop: &mut Poll, pool: Rc<RefCell<Pool<BufferQueue>>>,
     mut tcp_listener: Vec<(AppId, TcpListener)>, mut tokens: Vec<Token>) -> (ServerConfiguration, HashSet<Token>) {
 
     let mut configuration = ServerConfiguration {
@@ -751,7 +751,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
     }
 
-    let (configuration, tokens) = ServerConfiguration::new(10, &mut poll, pool, Vec::new(), vec!());
+    let (configuration, tokens) = ServerConfiguration::new(&mut poll, pool, Vec::new(), vec!());
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
     let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()),
       clients, None, None, Some(configuration), None, max_buffers);
@@ -793,7 +793,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
   command
 }
 
-pub fn start(max_listeners: usize, max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
+pub fn start(max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
   let mut poll          = Poll::new().expect("could not create event loop");
   let pool = Rc::new(RefCell::new(
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
@@ -817,7 +817,7 @@ pub fn start(max_listeners: usize, max_buffers: usize, buffer_size:usize, channe
     Token(e.index().0)
   };
 
-  let (configuration, tokens) = ServerConfiguration::new(max_listeners, &mut poll, pool, Vec::new(), vec!(token));
+  let (configuration, tokens) = ServerConfiguration::new(&mut poll, pool, Vec::new(), vec!(token));
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
   let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), clients, None, None, Some(configuration), None, max_buffers);
 

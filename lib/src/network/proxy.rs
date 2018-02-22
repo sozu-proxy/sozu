@@ -167,8 +167,8 @@ impl Server {
     let tcp_tokens: HashSet<Token> = tokens.iter().cloned().collect();
 
     let tcp_session = config.tcp.map(|conf| {
-      let (configuration, listener_tokens) = tcp::ServerConfiguration::new(conf.max_listeners,
-      &mut event_loop, pool.clone(), tcp_listeners, tokens);
+      let (configuration, listener_tokens) = tcp::ServerConfiguration::new(&mut event_loop,
+        pool.clone(), tcp_listeners, tokens);
 
       let to_remove:Vec<Token> = tcp_tokens.difference(&listener_tokens).cloned().collect();
       for token in to_remove.into_iter() {
