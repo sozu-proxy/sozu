@@ -13,7 +13,7 @@ use network::protocol::ProtocolResult;
 use network::socket::SocketHandler;
 
 pub struct ProxyProtocol<Front:SocketHandler> {
-  pub header:     Option<ProxyProtocolHeader>,
+  pub header:     Option<Vec<u8>>,
   pub frontend:   Front,
   pub backend:    Option<TcpStream>,
   frontend_token: Option<Token>,
@@ -46,8 +46,7 @@ impl <Front:SocketHandler>ProxyProtocol<Front> {
     debug!("Writing proxy protocol header");
 
     if let Some(ref mut socket) = self.backend {
-      if let Some(ref header) = self.header {
-        let mut header = header.into_bytes();
+      if let Some(ref mut header) = self.header {
         loop {
           match socket.write(&mut header[self.cursor_header..]) {
             Ok(sz) => {
@@ -111,6 +110,6 @@ impl <Front:SocketHandler>ProxyProtocol<Front> {
     let addr_backend = socket.peer_addr().unwrap();
 
     let protocol_header = ProxyProtocolHeader::V1(HeaderV1::new(addr_frontend, addr_backend));
-    self.header = Some(protocol_header);
+    self.header = Some(protocol_header.into_bytes());
   }
 }
