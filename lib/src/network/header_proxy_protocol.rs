@@ -95,10 +95,10 @@ mod test {
   fn it_should_return_a_correct_header_with_ipv4() {
     let header = HeaderV1::new(
       SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 80),
-      SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 80)
+      SocketAddr::new(IpAddr::V4(Ipv4Addr::new(172, 17, 40, 59)), 80)
     );
 
-    let header_to_cmp = "PROXY TCP4 127.0.0.1 127.0.0.1 80 80\r\n".as_bytes();
+    let header_to_cmp = "PROXY TCP4 127.0.0.1 172.17.40.59 80 80\r\n".as_bytes();
 
     assert_eq!(header_to_cmp, &header.into_bytes()[..]);
   }
@@ -107,11 +107,10 @@ mod test {
   fn it_should_return_a_correct_header_with_ipv6() {
     let header = HeaderV1::new(
       SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0xffff)), 80),
-      SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0xffff)), 80)
+      SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0x9c, 0x76)), 80)
     );
 
-    let header_to_cmp = "PROXY TCP6 ::0.0.255.255 ::0.0.255.255 80 80\r\n".as_bytes();
-
+    let header_to_cmp = "PROXY TCP6 ::0.0.255.255 ::0.156.0.118 80 80\r\n".as_bytes();
     assert_eq!(header_to_cmp, &header.into_bytes()[..]);
   }
 
