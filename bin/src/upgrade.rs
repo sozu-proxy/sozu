@@ -98,8 +98,10 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<()
         .arg(client.as_raw_fd().to_string())
         .arg("--upgrade-fd")
         .arg(upgrade_file.as_raw_fd().to_string())
-        .arg("--channel-buffer-size")
+        .arg("--command-buffer-size")
         .arg(upgrade_data.config.command_buffer_size.to_string())
+        .arg("--max-command-buffer-size")
+        .arg(upgrade_data.config.max_command_buffer_size.to_string())
         .exec();
 
       error!("exec call failed: {:?}", res);
@@ -108,11 +110,11 @@ pub fn start_new_master_process(upgrade_data: UpgradeData) -> (pid_t, Channel<()
   }
 }
 
-pub fn begin_new_master_process(fd: i32, upgrade_fd: i32, channel_buffer_size: usize) {
+pub fn begin_new_master_process(fd: i32, upgrade_fd: i32, command_buffer_size: usize, max_command_buffer_size: usize) {
   let mut command: Channel<bool,()> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
-    channel_buffer_size,
-    channel_buffer_size *2
+    command_buffer_size,
+    max_command_buffer_size
   );
 
   command.set_blocking(true);

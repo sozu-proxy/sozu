@@ -51,11 +51,12 @@ pub fn start_worker(id: u32, config: &Config, state: &ConfigState, listeners: Op
   }
 }
 
-pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: i32, channel_buffer_size: usize) {
+pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: i32,
+  command_buffer_size: usize, max_command_buffer_size: usize) {
   let mut command: Channel<OrderMessageAnswer,Config> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
-    channel_buffer_size,
-    channel_buffer_size * 2
+    command_buffer_size,
+    max_command_buffer_size
   );
 
   command.set_nonblocking(false);
@@ -103,14 +104,10 @@ pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState, list
   util::disable_close_on_exec(client.as_raw_fd());
   util::disable_close_on_exec(scm_client.as_raw_fd());
 
-  let channel_buffer_size = config.channel_buffer_size;
-  //FIXME
-  let channel_max_buffer_size = config.channel_buffer_size * 2;
-
   let mut command: Channel<Config,OrderMessageAnswer> = Channel::new(
     server,
-    channel_buffer_size,
-    channel_max_buffer_size
+    config.command_buffer_size,
+    config.max_command_buffer_size
   );
   command.set_nonblocking(false);
 
@@ -152,8 +149,10 @@ pub fn start_worker_process(id: &str, config: &Config, state: &ConfigState, list
         .arg(scm_client.as_raw_fd().to_string())
         .arg("--configuration-state-fd")
         .arg(state_file.as_raw_fd().to_string())
-        .arg("--channel-buffer-size")
-        .arg(channel_buffer_size.to_string())
+        .arg("--command-buffer-size")
+        .arg(config.command_buffer_size.to_string())
+        .arg("--max-command-buffer-size")
+        .arg(config.max_command_buffer_size.to_string())
         .exec();
 
       unreachable!();

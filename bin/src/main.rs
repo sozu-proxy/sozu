@@ -59,16 +59,20 @@ fn main() {
                                          .takes_value(true).required(true).help("IPC SCM_RIGHTS file descriptor"))
                                     .arg(Arg::with_name("configuration-state-fd").long("configuration-state-fd")
                                          .takes_value(true).required(true).help("configuration data file descriptor"))
-                                    .arg(Arg::with_name("channel-buffer-size").long("channel-buffer-size")
-                                         .takes_value(true).required(false).help("Worker's channel buffer size")))
+                                    .arg(Arg::with_name("command-buffer-size").long("command-buffer-size")
+                                         .takes_value(true).required(true).help("Worker's channel buffer size"))
+                                    .arg(Arg::with_name("max-command-buffer-size").long("max-command-buffer-size")
+                                         .takes_value(true).required(true).help("Worker's channel max buffer size")))
                         .subcommand(SubCommand::with_name("upgrade")
                                     .about("start a new master process (internal command, should not be used directly)")
                                     .arg(Arg::with_name("fd").long("fd")
                                          .takes_value(true).required(true).help("IPC file descriptor"))
                                     .arg(Arg::with_name("upgrade-fd").long("upgrade-fd")
                                          .takes_value(true).required(true).help("upgrade data file descriptor"))
-                                    .arg(Arg::with_name("channel-buffer-size").long("channel-buffer-size")
-                                         .takes_value(true).required(false).help("Worker's channel buffer size")))
+                                    .arg(Arg::with_name("command-buffer-size").long("command-buffer-size")
+                                         .takes_value(true).required(true).help("Master's command buffer size"))
+                                    .arg(Arg::with_name("max-command-buffer-size").long("max-command-buffer-size")
+                                         .takes_value(true).required(false).help("Master's max command buffer size")))
                         .get_matches();
 
   if let Some(matches) = matches.subcommand_matches("worker") {
@@ -81,11 +85,14 @@ fn main() {
       .parse::<i32>().expect("the file descriptor must be a number");
     let id  = matches.value_of("id").expect("needs a worker id")
       .parse::<i32>().expect("the worker id must be a number");
-    let buffer_size = matches.value_of("channel-buffer-size")
+    let buffer_size = matches.value_of("command-buffer-size")
       .and_then(|size| size.parse::<usize>().ok())
       .unwrap_or(1_000_000);
+    let max_buffer_size = matches.value_of("max-command-buffer-size")
+      .and_then(|size| size.parse::<usize>().ok())
+      .unwrap_or(buffer_size * 2);
 
-    begin_worker_process(fd, scm, configuration_state_fd, id, buffer_size);
+    begin_worker_process(fd, scm, configuration_state_fd, id, buffer_size, max_buffer_size);
     return;
   }
 
@@ -97,8 +104,11 @@ fn main() {
     let buffer_size = matches.value_of("channel-buffer-size")
       .and_then(|size| size.parse::<usize>().ok())
       .unwrap_or(1_000_000);
+    let max_buffer_size = matches.value_of("max-command-buffer-size")
+      .and_then(|size| size.parse::<usize>().ok())
+      .unwrap_or(buffer_size * 2);
 
-    begin_new_master_process(fd, upgrade_fd, buffer_size);
+    begin_new_master_process(fd, upgrade_fd, buffer_size, max_buffer_size);
     return;
   }
 
