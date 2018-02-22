@@ -32,7 +32,7 @@ fn main() {
 
   let config  = Config::load_from_path(config_file.as_str()).expect("could not parse configuration file");
   let channel = create_channel(&config.command_socket_path()).expect("could not connect to the command unix socket");
-  let timeout: u64 = matches.timeout.unwrap_or(config.ctl_commands_timeout);
+  let timeout: u64 = matches.timeout.unwrap_or(config.ctl_command_timeout);
 
   match matches.cmd {
     SubCmd::Shutdown{ hard } => {
