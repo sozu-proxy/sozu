@@ -29,7 +29,7 @@ fn main() {
     let max_buffers   = 500;
     let buffer_size   = 16384;
     Logger::init("TCP".to_string(), "debug", LoggerBackend::Stdout(stdout()));
-    network::tcp::start(max_listeners, max_buffers, buffer_size, channel);
+    network::tcp::start(max_buffers, buffer_size, channel);
   });
 
   let tcp_front = messages::TcpFront {

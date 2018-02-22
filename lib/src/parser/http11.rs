@@ -1990,7 +1990,10 @@ mod tests {
         HttpState {
           req_header_end: None,
           res_header_end: None,
-          request: Some(RequestState::Error(ErrorState::InvalidHttp)),
+          request: Some(RequestState::Error(Some(
+            RRequestLine { method: String::from("GET"), uri: String::from("http://example.com:8888/index.html"), version: String::from("11") },
+          ),
+            Some(Connection::new()), Some(String::from("example.com")), None, None)),
           response: Some(ResponseState::Initial),
           added_req_header: String::from(""),
           added_res_header: String::from(""),
@@ -2162,7 +2165,11 @@ mod tests {
         HttpState {
           req_header_end: None,
           res_header_end: None,
-          request: Some(RequestState::Error(ErrorState::InvalidHttp)),
+          request: Some(RequestState::Error(Some(
+            RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
+          ),
+            Some(Connection::new()), Some(String::from("localhost:8888")),
+            Some(LengthInformation::Length(120)), None)),
           response: Some(ResponseState::Initial),
           added_req_header: String::from(""),
           added_res_header: String::from(""),
