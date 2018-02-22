@@ -263,7 +263,6 @@ pub struct Instance {
 pub struct HttpProxyConfiguration {
     pub front:           SocketAddr,
     pub public_address:  Option<IpAddr>,
-    pub answer_301:      String,
     pub answer_404:      String,
     pub answer_503:      String,
 }
@@ -273,7 +272,6 @@ impl Default for HttpProxyConfiguration {
     HttpProxyConfiguration {
       front:           "127.0.0.1:8080".parse().expect("could not parse address"),
       public_address:  None,
-      answer_301:      String::from("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: {}\r\n\r\n"),
       answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
       answer_503:      String::from("HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
     }
@@ -284,7 +282,6 @@ impl Default for HttpProxyConfiguration {
 pub struct HttpsProxyConfiguration {
     pub front:                     SocketAddr,
     pub public_address:            Option<IpAddr>,
-    pub answer_301:                String,
     pub answer_404:                String,
     pub answer_503:                String,
     pub versions:                  Vec<String>,
@@ -301,7 +298,6 @@ impl Default for HttpsProxyConfiguration {
     HttpsProxyConfiguration {
       front:           "127.0.0.1:8443".parse().expect("could not parse address"),
       public_address:  None,
-      answer_301:      String::from("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: {}\r\n\r\n"),
       answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
       answer_503:      String::from("HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
       cipher_list:     String::from(
