@@ -9,7 +9,7 @@ use std::ptr::null_mut;
 use std::process::Command;
 use std::net::ToSocketAddrs;
 use std::os::unix::process::CommandExt;
-use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd, RawFd};
+use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd};
 use tempfile::tempfile;
 use serde_json;
 use nix;

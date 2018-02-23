@@ -731,7 +731,6 @@ impl Server {
         },
         _ => {
           panic!("should not call connect_to_backend on listeners");
-          Err(ConnectionError::HostNotFound)
         },
       };
  

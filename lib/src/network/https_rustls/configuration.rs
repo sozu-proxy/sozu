@@ -75,11 +75,10 @@ impl ServerConfiguration {
   pub fn new(config: HttpsProxyConfiguration, event_loop: &mut Poll,
     pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> io::Result<(ServerConfiguration, HashSet<Token>)> {
 
-    let mut fronts   = HashMap::new();
     let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
 
     let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
-      error!("could not create listener {:?}: {:?}", fronts, e);
+      error!("could not create listener {:?}: {:?}", config.front, e);
     }).ok());
 
     let mut listeners = HashSet::new();
@@ -110,7 +109,7 @@ impl ServerConfiguration {
       address:         config.front.clone(),
       applications:    HashMap::new(),
       instances:       BackendMap::new(),
-      fronts:          fronts,
+      fronts:          HashMap::new(),
       pool:            pool,
       answers:         default,
       config:          config,

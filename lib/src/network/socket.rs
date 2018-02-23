@@ -277,7 +277,8 @@ pub fn server_bind(addr: &SocketAddr) -> io::Result<TcpListener> {
   try!(sock.bind(addr));
 
   // listen
+  // FIXME: make the backlog configurable?
   let listener = try!(sock.listen(1024));
-  TcpListener::from_listener(listener, addr)
+  TcpListener::from_std(listener)
 }
 
