@@ -578,6 +578,8 @@ impl CommandServer {
 
     self.proxies.remove(&token);
 
+    incr!("worker_restart");
+
     let id = self.next_id;
     if let Ok(mut worker) = start_worker(id, &self.config, self.executable_path.clone(), &self.state, None) {
       info!("created new worker: {}", id);
