@@ -67,7 +67,6 @@ pub enum State {
 }
 
 pub struct TlsClient {
-  front:          Option<TcpStream>,
   frontend_token: Token,
   instance:       Option<Rc<RefCell<Backend>>>,
   back_connected: BackendConnectionStatus,
@@ -81,12 +80,8 @@ pub struct TlsClient {
 
 impl TlsClient {
   pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> TlsClient {
-    //FIXME: we should not need to clone the socket. Maybe do the accept here instead of
-    // in TlsHandshake?
-    let s = sock.try_clone().expect("could not clone the socket");
-    let handshake = TlsHandshake::new(ssl, s);
+    let handshake = TlsHandshake::new(ssl, sock);
     let mut client = TlsClient {
-      front:          Some(sock),
       frontend_token: token,
       instance:       None,
       back_connected: BackendConnectionStatus::NotConnected,
@@ -245,7 +240,11 @@ impl TlsClient {
   }
 
   fn front_socket(&self) -> &TcpStream {
-    unwrap_msg!(self.front.as_ref())
+    match unwrap_msg!(self.protocol.as_ref()) {
+      &State::Handshake(ref handshake) => panic!("we should not need to access the front socket now"),
+      &State::Http(ref http)           => http.front_socket(),
+      &State::WebSocket(ref pipe)      => pipe.front_socket(),
+    }
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
@@ -1017,14 +1016,14 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       }).and_then(|(frontend_sock, _)| {
         frontend_sock.set_nodelay(true);
         if let Ok(ssl) = Ssl::new(&self.default_context.context) {
-          let c = TlsClient::new(ssl, frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address);
-
           poll.register(
-            c.front_socket(),
+            &frontend_sock,
             client_token,
             Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
             PollOpt::edge()
           );
+          let c = TlsClient::new(ssl, frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address);
+
 
           Ok((Rc::new(RefCell::new(c)), false))
         } else {

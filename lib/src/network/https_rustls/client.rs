@@ -51,13 +51,12 @@ pub enum State {
 }
 
 pub struct TlsClient {
-  pub front:          Option<TcpStream>,
   pub frontend_token: Token,
   pub instance:       Option<Rc<RefCell<Backend>>>,
   pub back_connected: BackendConnectionStatus,
-  protocol:       Option<State>,
+  protocol:           Option<State>,
   pub public_address: Option<IpAddr>,
-  pool:           Weak<RefCell<Pool<BufferQueue>>>,
+  pool:               Weak<RefCell<Pool<BufferQueue>>>,
   pub sticky_session: bool,
   pub metrics:        SessionMetrics,
 }
@@ -65,12 +64,8 @@ pub struct TlsClient {
 impl TlsClient {
   pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
     public_address: Option<IpAddr>) -> TlsClient {
-    //FIXME: we should not need to clone the socket. Maybe do the accept here instead of
-    // in TlsHandshake?
-    let s = sock.try_clone().expect("could not clone the socket");
-    let handshake = TlsHandshake::new(ssl, s);
+    let handshake = TlsHandshake::new(ssl, sock);
     let mut client = TlsClient {
-      front:          Some(sock),
       frontend_token: token,
       instance:       None,
       back_connected: BackendConnectionStatus::NotConnected,
@@ -231,7 +226,11 @@ impl TlsClient {
   }
 
   pub fn front_socket(&self) -> &TcpStream {
-    unwrap_msg!(self.front.as_ref())
+    match unwrap_msg!(self.protocol.as_ref()) {
+      &State::Handshake(ref handshake) => &handshake.stream,
+      &State::Http(ref http)           => http.front_socket(),
+      &State::WebSocket(ref pipe)      => pipe.front_socket(),
+    }
   }
 
   pub fn back_socket(&self)  -> Option<&TcpStream> {

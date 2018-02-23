@@ -313,15 +313,16 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         }
       }).map(|(frontend_sock, _)| {
         frontend_sock.set_nodelay(true);
-        let session = ServerSession::new(&self.ssl_config);
-        let c = TlsClient::new(session, frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address);
 
         poll.register(
-          c.front_socket(),
+          &frontend_sock,
           client_token,
           Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
           PollOpt::edge()
         );
+
+        let session = ServerSession::new(&self.ssl_config);
+        let c = TlsClient::new(session, frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address);
 
         (Rc::new(RefCell::new(c)), false)
       })

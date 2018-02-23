@@ -52,8 +52,6 @@ pub enum State {
 }
 
 pub struct Client {
-  pub frontend:   TcpStream,
-  backend:        Option<TcpStream>,
   frontend_token: Token,
   backend_token:  Option<Token>,
   instance:       Option<Rc<RefCell<Backend>>>,
@@ -69,7 +67,7 @@ impl Client {
     let protocol = if let Some(pool) = pool.upgrade() {
       let mut p = pool.borrow_mut();
       if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-        Some(Http::new(unwrap_msg!(sock.try_clone()), token, front_buf, back_buf, public_address,
+        Some(Http::new(sock, token, front_buf, back_buf, public_address,
           Protocol::HTTP).expect("should create a HTTP state"))
       } else { None }
     } else { None };
@@ -78,12 +76,10 @@ impl Client {
       let request_id = Uuid::new_v4().hyphenated().to_string();
       let log_ctx    = format!("{}\tunknown\t", &request_id);
       let mut client = Client {
-        backend:        None,
         backend_token:  None,
         instance:       None,
         back_connected: BackendConnectionStatus::NotConnected,
         protocol:       Some(State::Http(http)),
-        frontend:       sock,
         frontend_token: token,
         pool:           pool,
         sticky_session: false,
@@ -200,11 +196,17 @@ impl Client {
   }
 
   fn front_socket(&self) -> &TcpStream {
-    self.frontend.socket_ref()
+    match *unwrap_msg!(self.protocol.as_ref()) {
+      State::Http(ref http)      => http.front_socket(),
+      State::WebSocket(ref pipe) => pipe.front_socket()
+    }
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
-    self.backend.as_ref()
+    match *unwrap_msg!(self.protocol.as_ref()) {
+      State::Http(ref http)      => http.back_socket(),
+      State::WebSocket(ref pipe) => pipe.back_socket()
+    }
   }
 
   fn back_token(&self)   -> Option<Token> {
@@ -213,10 +215,9 @@ impl Client {
 
   fn set_back_socket(&mut self, socket: TcpStream) {
     match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http)      => http.set_back_socket(unwrap_msg!(socket.try_clone())),
+      State::Http(ref mut http)      => http.set_back_socket(socket),
       State::WebSocket(ref mut pipe) => {} /*pipe.set_back_socket(unwrap_msg!(socket.try_clone()))*/
     }
-    self.backend         = Some(socket);
   }
 
   fn set_front_token(&mut self, token: Token) {
@@ -259,8 +260,7 @@ impl Client {
     debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND",
       self.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), self.frontend_token.0,
       self.backend_token.map(|t| format!("{}", t.0)).unwrap_or("-".to_string()));
-    let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
-    self.backend       = None;
+    let addr:Option<SocketAddr> = self.back_socket().and_then(|sock| sock.peer_addr().ok());
     self.backend_token = None;
     (unwrap_msg!(self.http()).app_id.clone(), addr)
   }
