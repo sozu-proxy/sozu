@@ -125,7 +125,6 @@ fn main() {
 
     if let Some(ref metrics) = config.metrics.as_ref() {
       metrics_set_up!(&metrics.address[..], metrics.port);
-      gauge!("sozu.main.TEST", 42);
     }
 
 
