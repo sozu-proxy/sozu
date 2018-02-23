@@ -27,10 +27,10 @@ mod splice;
 pub mod tcp;
 pub mod proxy;
 
-#[cfg(feature = "use_openssl")]
+#[cfg(feature = "use-openssl")]
 pub mod https_openssl;
 
-#[cfg(feature = "use_openssl")]
+#[cfg(feature = "use-openssl")]
 pub mod https {
   pub type ServerConfiguration = super::https_openssl::ServerConfiguration;
   pub type TlsClient           = super::https_openssl::TlsClient;
@@ -38,10 +38,10 @@ pub mod https {
   pub use super::https_openssl::start;
 }
 
-#[cfg(not(feature = "use_openssl"))]
+#[cfg(not(feature = "use-openssl"))]
 pub mod https_rustls;
 
-#[cfg(not(feature = "use_openssl"))]
+#[cfg(not(feature = "use-openssl"))]
 pub mod https {
   pub type ServerConfiguration = super::https_rustls::configuration::ServerConfiguration;
   pub type TlsClient           = super::https_rustls::client::TlsClient;

@@ -4,7 +4,7 @@ use mio::tcp::{TcpListener,TcpStream};
 use rustls::{ServerSession, Session};
 use net2::TcpBuilder;
 use net2::unix::UnixTcpBuilderExt;
-#[cfg(feature = "use_openssl")]
+#[cfg(feature = "use-openssl")]
 use openssl::ssl::{Error, SslStream};
 
 #[derive(Debug,PartialEq,Copy,Clone)]
@@ -73,7 +73,7 @@ impl SocketHandler for TcpStream {
   fn socket_ref(&self) -> &TcpStream { self }
 }
 
-#[cfg(feature = "use_openssl")]
+#[cfg(feature = "use-openssl")]
 impl SocketHandler for SslStream<TcpStream> {
   fn socket_read(&mut self,  buf: &mut[u8]) -> (usize, SocketResult) {
     let mut size = 0usize;

@@ -55,7 +55,7 @@ splice   = []
 unstable = []
 logs-debug = []
 logs-trace = []
-use_openssl = ["openssl"]
+use-openssl = ["openssl"]
 
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }

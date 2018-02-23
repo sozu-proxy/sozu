@@ -160,7 +160,7 @@ extern crate url;
 extern crate log;
 extern crate time;
 extern crate rand;
-#[cfg(feature = "use_openssl")]
+#[cfg(feature = "use-openssl")]
 extern crate openssl;
 extern crate rustls;
 extern crate pool;
