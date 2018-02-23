@@ -199,6 +199,7 @@ impl<Front:SocketHandler> Pipe<Front> {
     }
 
     if sz > 0 {
+      count!("bytes_out", sz as i64);
       self.readiness.back_interest.insert(Ready::readable());
       metrics.bout += sz;
     }
