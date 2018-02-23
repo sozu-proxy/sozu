@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use mio::net::UdpSocket;
 use std::io::{self,Write,Error,ErrorKind};
 use nom::HexDisplay;
-use hdrsample::Histogram;
+use hdrhistogram::Histogram;
 use sozu_command::buffer::Buffer;
 use sozu_command::messages::{FilteredData,MetricsData,Percentiles,BackendMetricsData,FilteredTimeSerie};
 
@@ -433,7 +433,7 @@ macro_rules! record_request_time (
         let hist = m.app_data.get_mut(key).unwrap();
         hist.record($value as u64);
       } else {
-        if let Ok(mut hist) = ::hdrsample::Histogram::new(3) {
+        if let Ok(mut hist) = ::hdrhistogram::Histogram::new(3) {
           hist.record($value as u64);
           m.app_data.insert(key.to_string(), hist);
         }
@@ -455,7 +455,7 @@ macro_rules! record_backend_metrics (
         bm.bin += $bin;
         bm.bout += $bout;
       } else {
-        if let Ok(hist) = ::hdrsample::Histogram::new(3) {
+        if let Ok(hist) = ::hdrhistogram::Histogram::new(3) {
           let mut bm = $crate::network::metrics::BackendMetrics::new(hist);
           bm.response_time.record($response_time as u64);
           bm.bin += $bin;

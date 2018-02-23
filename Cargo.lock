@@ -361,8 +361,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "hdrsample"
-version = "6.0.2"
+name = "hdrhistogram"
+version = "6.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 dependencies = [
  "base64 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -954,7 +954,7 @@ dependencies = [
 name = "sozu-lib"
 version = "0.5.1"
 dependencies = [
- "hdrsample 6.0.2 (registry+https://github.com/rust-lang/crates.io-index)",
+ "hdrhistogram 6.0.3 (registry+https://github.com/rust-lang/crates.io-index)",
  "hex 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "idna 0.1.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc 0.2.36 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1344,7 +1344,7 @@ dependencies = [
 "checksum fuchsia-zircon-sys 0.3.3 (registry+https://github.com/rust-lang/crates.io-index)" = "3dcaa9ae7725d12cdb85b3ad99a434db70b468c09ded17e012d86b5c1010f7a7"
 "checksum futures 0.1.18 (registry+https://github.com/rust-lang/crates.io-index)" = "0bab5b5e94f5c31fc764ba5dd9ad16568aae5d4825538c01d6bca680c9bf94a7"
 "checksum generic-array 0.9.0 (registry+https://github.com/rust-lang/crates.io-index)" = "ef25c5683767570c2bbd7deba372926a55eaae9982d7726ee2a1050239d45b9d"
-"checksum hdrsample 6.0.2 (registry+https://github.com/rust-lang/crates.io-index)" = "722f489a10b44a18770087b375be1b64fa7d3ed7847ed886984534e6741b6245"
+"checksum hdrhistogram 6.0.3 (registry+https://github.com/rust-lang/crates.io-index)" = "ddfeaecab9872f0764c030fbe4528f8b3374f379ccbb9474e93518d105e39316"
 "checksum hex 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)" = "d6a22814455d41612f41161581c2883c0c6a1c41852729b17d5ed88f01e153aa"
 "checksum idna 0.1.4 (registry+https://github.com/rust-lang/crates.io-index)" = "014b298351066f1512874135335d62a789ffe78a9974f94b43ed5621951eaf7d"
 "checksum iovec 0.1.2 (registry+https://github.com/rust-lang/crates.io-index)" = "dbe6e417e7d0975db6512b90796e8ce223145ac4e33c377e4a42882a0e88bb08"

@@ -169,7 +169,7 @@ extern crate net2;
 extern crate libc;
 extern crate slab;
 extern crate mio_uds;
-extern crate hdrsample;
+extern crate hdrhistogram;
 extern crate sozu_command_lib as sozu_command;
 extern crate idna;
 extern crate webpki;
