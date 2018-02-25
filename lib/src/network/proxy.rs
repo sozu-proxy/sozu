@@ -605,7 +605,7 @@ impl Server {
         match self.clients.vacant_entry() {
           None => {
             error!("not enough memory to accept another client, flushing the accept queue");
-            error!("nb_applications: {}, max_connections: {}", self.nb_connections, self.max_connections);
+            error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
             //FIXME: should accept in a loop and close connections here instead of letting them wait
             Err(AcceptError::TooManyClients)
           },
@@ -733,9 +733,9 @@ impl Server {
           panic!("should not call connect_to_backend on listeners");
         },
       };
- 
+
       res.map(|action| {
-        if action == BackendConnectAction::Replace {
+        if action != BackendConnectAction::New {
           entry.remove();
         }
         action
