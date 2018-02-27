@@ -198,7 +198,7 @@ impl ProxyAddr {
       ProxyAddr::Ipv4Addr{ src_addr: _, dst_addr: _ } => 12,
       ProxyAddr::Ipv6Addr{ src_addr: _, dst_addr: _ } => 36,
       ProxyAddr::UnixAddr{ src_addr: _, dst_addr: _ } => 216,
-      ProxyAddr::AfUnspec => unimplemented!(),
+      ProxyAddr::AfUnspec => 0,
     }
   }
 
@@ -222,7 +222,7 @@ impl ProxyAddr {
         res.extend_from_slice(&src_addr);
         res.extend_from_slice(&dst_addr);
       },
-      ProxyAddr::AfUnspec => unimplemented!(),
+      ProxyAddr::AfUnspec => {},
     };
 
     res
@@ -234,7 +234,7 @@ fn get_family(addr: &ProxyAddr) -> u8 {
     &ProxyAddr::Ipv4Addr{ src_addr: _, dst_addr: _ } => 0x10 | 0x01, // AF_INET  = 1 + STREAM = 1
     &ProxyAddr::Ipv6Addr{ src_addr: _, dst_addr: _ } => 0x20 | 0x01, // AF_INET6 = 2 + STREAM = 1
     &ProxyAddr::UnixAddr{ src_addr: _, dst_addr: _ } => 0x30 | 0x01, // AF_UNIX  = 3 + STREAM = 1
-    &ProxyAddr::AfUnspec => unimplemented!(),
+    &ProxyAddr::AfUnspec => 0x00, // AF_UNSPEC + UNSPEC
   }
 }
 
