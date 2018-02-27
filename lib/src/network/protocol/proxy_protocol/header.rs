@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, IpAddr};
 use std::fmt;
 
 pub enum ProxyProtocolHeader {
@@ -134,7 +134,9 @@ pub struct HeaderV2 {
 }
 
 impl HeaderV2 {
-  fn new(addr: ProxyAddr) -> Self {
+  pub fn new(addr_src: SocketAddr, addr_dst: SocketAddr) -> Self {
+    let addr = ProxyAddr::from(addr_src, addr_dst);
+
     HeaderV2 { 
       signature: [0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A],
       ver_and_cmd: 0x20,
@@ -172,6 +174,25 @@ pub enum ProxyAddr {
 }
 
 impl ProxyAddr {
+
+  pub fn from(addr_src: SocketAddr, addr_dst: SocketAddr) -> Self {
+    match (addr_src, addr_dst) {
+      (SocketAddr::V4(addr_ipv4_src), SocketAddr::V4(addr_ipv4_dst)) => {
+        ProxyAddr::Ipv4Addr{
+          src_addr: addr_ipv4_src,
+          dst_addr: addr_ipv4_dst,
+        }
+      },
+      (SocketAddr::V6(addr_ipv6_src), SocketAddr::V6(addr_ipv6_dst)) => {
+        ProxyAddr::Ipv6Addr{
+          src_addr: addr_ipv6_src,
+          dst_addr: addr_ipv6_dst,
+        }
+      },
+      _ => ProxyAddr::AfUnspec,
+    }
+  }
+
   fn len(&self) -> u16 {
     match *self {
       ProxyAddr::Ipv4Addr{ src_addr: _, dst_addr: _ } => 12,
@@ -238,12 +259,10 @@ mod testV2 {
 
   #[test]
   fn test_deserialize_tcp_ipv4_proxy_protocol_header() {
-    let addrs = ProxyAddr::Ipv4Addr {
-      src_addr: SocketAddrV4::new(Ipv4Addr::new(125, 25, 10, 1), 8080),
-      dst_addr: SocketAddrV4::new(Ipv4Addr::new(10, 4, 5, 8), 4200),
-    };
+    let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(125, 25, 10, 1)), 8080);
+    let dst_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200);
 
-    let header = HeaderV2::new(addrs);
+    let header = HeaderV2::new(src_addr, dst_addr);
     let expected = &[
       0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // MAGIC header
       0x20,                                                                   // Version 2 and command LOCAL
@@ -260,12 +279,10 @@ mod testV2 {
 
   #[test]
   fn test_deserialize_tcp_ipv6_proxy_protocol_header() {
-    let addrs = ProxyAddr::Ipv6Addr {
-      src_addr: SocketAddrV6::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), 8080, 0, 0),
-      dst_addr: SocketAddrV6::new(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1), 4200, 0, 0),
-    };
+    let src_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 8080);
+    let dst_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 4200);
 
-    let header = HeaderV2::new(addrs);
+    let header = HeaderV2::new(src_addr, dst_addr);
     let expected = vec![
       0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,                         // MAGIC header
       0x20,                                                                                           // Version 2 and command LOCAL
