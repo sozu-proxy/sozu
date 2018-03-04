@@ -26,6 +26,7 @@ mod util;
 
 use std::net::ToSocketAddrs;
 use std::env;
+use std::panic;
 use sozu_command::config::Config;
 use clap::{App,Arg,SubCommand};
 
@@ -35,8 +36,11 @@ use libc::{cpu_set_t,pid_t};
 use command::Worker;
 use worker::{begin_worker_process,start_workers,get_executable_path};
 use upgrade::begin_new_master_process;
+use sozu::network::metrics::METRICS;
 
 fn main() {
+  register_panic_hook();
+
   let matches = App::new("sozu")
                         .version(crate_version!())
                         .about("hot reconfigurable proxy")
@@ -243,4 +247,19 @@ fn check_process_limits(config: Config) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn check_process_limits(_: Config) -> bool {
   true
+}
+
+fn register_panic_hook() {
+  // We save the original panic hook so we can call it later
+  // to have the original behavior
+  let original_panic_hook = panic::take_hook();
+
+  panic::set_hook(Box::new(move |panic_info| {
+    incr!("panic");
+    METRICS.with(|metrics| {
+      (*metrics.borrow_mut()).send_data();
+    });
+
+    (*original_panic_hook)(panic_info)
+  }));
 }
