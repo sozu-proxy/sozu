@@ -27,8 +27,7 @@ fn is_token_char(i: u8) -> bool {
 named!(pub token, take_while!(is_token_char));
 
 fn is_status_token_char(i: u8) -> bool {
-  is_alphanumeric(i) ||
-  b"!#$%&'*+-.^_`|~ \t".contains(&i)
+  i >= 32 && i != 127
 }
 
 named!(pub status_token, take_while!(is_status_token_char));
