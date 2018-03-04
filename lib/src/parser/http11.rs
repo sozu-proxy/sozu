@@ -1401,7 +1401,7 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
       match state {
         ResponseState::HasStatusLine(rl, _)     => ResponseState::HasStatusLine(rl, conn),
         ResponseState::HasLength(rl, _, length) => ResponseState::HasLength(rl, conn, length),
-        ResponseState::HasUpgrade(rl, conn, proto) => {
+        ResponseState::HasUpgrade(rl, _, proto) => {
           trace!("has upgrade, got conn: \"{:?}\"", conn);
           //FIXME: verify here if the Upgrade header we got is the same as the request Upgrade header
           if conn.has_upgrade {
