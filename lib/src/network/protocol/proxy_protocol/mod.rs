@@ -1,4 +1,4 @@
-mod header;
+pub mod header;
 
 use std::net::IpAddr;
 use std::io::{Write, ErrorKind};

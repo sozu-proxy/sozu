@@ -1,6 +1,7 @@
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, IpAddr};
 use std::fmt;
 
+#[derive(PartialEq, Debug)]
 pub enum ProxyProtocolHeader {
   V1(HeaderV1),
   V2(HeaderV2),
@@ -39,11 +40,11 @@ impl fmt::Display for ProtocolSupportedV1 {
 /// - TCP/IPv4: `PROXY TCP4 255.255.255.255 255.255.255.255 65535 65535\r\n`
 /// - TCP/IPv6: `PROXY TCP6 ffff:f...f:ffff ffff:f...f:ffff 65535 65535\r\n`
 /// - Unknown: `PROXY UNKNOWN\r\n`
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct HeaderV1 {
-  protocol: ProtocolSupportedV1,
-  addr_src: SocketAddr,
-  addr_dst: SocketAddr,
+  pub protocol: ProtocolSupportedV1,
+  pub addr_src: SocketAddr,
+  pub addr_dst: SocketAddr,
 }
 
 const PROXY_PROTO_IDENTIFIER: &'static str = "PROXY";
@@ -113,31 +114,54 @@ mod test {
     let header_to_cmp = "PROXY TCP6 ::0.0.255.255 ::0.156.0.118 80 80\r\n".as_bytes();
     assert_eq!(header_to_cmp, &header.into_bytes()[..]);
   }
-
-  // #[test]
-  // fn it_should_return_the_an_unknown_header() {
-  //   let header = HeaderV1::new(ProtocolSupportedV1::UNKNOWN, None, None);
-
-  //   let header_to_cmp = "PROXY UNKNOWN\r\n".as_bytes();
-
-  //   assert_eq!(header_to_cmp, &header.into_bytes()[..]);
-  // }
 }
 
+<<<<<<< HEAD
 pub enum Command {
   Local,
   Proxy,
 }
 
+||||||| merged common ancestors
+
+=======
+#[derive(PartialEq, Debug)]
+>>>>>>> Impl the partialEq for ProxyProtocolHeader and refactor the way to create a V2::header to easy build a AfUnspec
 pub struct HeaderV2 {
+<<<<<<< HEAD
   command: Command,
   family: u8,          // protocol family and address
   addr: ProxyAddr,
+||||||| merged common ancestors
+  signature: [u8; 12], // hex 0D 0A 0D 0A 00 0D 0A 51 55 49 54 0A
+  ver_and_cmd: u8,     // protocol version and command
+  family: u8,          // protocol family and address
+  len: u16,            // number of following bytes part of the header
+  addr: ProxyAddr,
+=======
+  pub signature: [u8; 12], // hex 0D 0A 0D 0A 00 0D 0A 51 55 49 54 0A
+  pub ver_and_cmd: u8,     // protocol version and command
+  pub family: u8,          // protocol family and address
+  pub len: u16,            // number of following bytes part of the header
+  pub addr: ProxyAddr,
+>>>>>>> Impl the partialEq for ProxyProtocolHeader and refactor the way to create a V2::header to easy build a AfUnspec
 }
 
 impl HeaderV2 {
+<<<<<<< HEAD
   pub fn new(command: Command, addr_src: SocketAddr, addr_dst: SocketAddr) -> Self {
     let addr = ProxyAddr::from(addr_src, addr_dst);
+||||||| merged common ancestors
+  pub fn new(addr_src: SocketAddr, addr_dst: SocketAddr) -> Self {
+    let addr = ProxyAddr::from(addr_src, addr_dst);
+=======
+  pub fn new(addrs: Option<(SocketAddr,SocketAddr)>) -> Self {
+    let addr = if let Some(addrs) = addrs {
+      ProxyAddr::from(addrs)
+    } else {
+      ProxyAddr::AfUnspec
+    };
+>>>>>>> Impl the partialEq for ProxyProtocolHeader and refactor the way to create a V2::header to easy build a AfUnspec
 
     HeaderV2 {
       command: command,
@@ -189,8 +213,8 @@ pub enum ProxyAddr {
 
 impl ProxyAddr {
 
-  pub fn from(addr_src: SocketAddr, addr_dst: SocketAddr) -> Self {
-    match (addr_src, addr_dst) {
+  pub fn from(addrs: (SocketAddr, SocketAddr)) -> Self {
+    match addrs {
       (SocketAddr::V4(addr_ipv4_src), SocketAddr::V4(addr_ipv4_dst)) => {
         ProxyAddr::Ipv4Addr{
           src_addr: addr_ipv4_src,
@@ -239,6 +263,51 @@ impl ProxyAddr {
   }
 }
 
+// Implemented because we don't have the Debug for [u8; 108] (UnixAddr case)
+impl fmt::Debug for ProxyAddr {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    match *self {
+      ProxyAddr::Ipv4Addr{src_addr, dst_addr} => write!(f, "{:?} {:?}", dst_addr, src_addr),
+      ProxyAddr::Ipv6Addr{src_addr, dst_addr} => write!(f, "{:?} {:?}", dst_addr, src_addr),
+      ProxyAddr::UnixAddr{src_addr, dst_addr} => write!(f, "{:?} {:?}", &dst_addr[..], &src_addr[..]),
+      ProxyAddr::AfUnspec =>  write!(f, "AFUNSPEC"),
+    }
+  }
+}
+
+// Implemented because we don't have the PartialEq for [u8; 108] (UnixAddr case)
+impl PartialEq for ProxyAddr {
+  fn eq(&self, other: &ProxyAddr) -> bool {
+    match *self {
+      ProxyAddr::Ipv4Addr{src_addr, dst_addr} => {
+        match other {
+          &ProxyAddr::Ipv4Addr{src_addr: src_other, dst_addr: dst_other} => src_other == src_addr && dst_other == dst_addr,
+          _ => false,
+        }
+      },
+      ProxyAddr::Ipv6Addr{src_addr, dst_addr} => {
+        match other {
+          &ProxyAddr::Ipv6Addr{src_addr: src_other, dst_addr: dst_other} => src_other == src_addr && dst_other == dst_addr,
+          _ => false,
+        }
+      },
+      ProxyAddr::UnixAddr{src_addr, dst_addr} => {
+        match other {
+          &ProxyAddr::UnixAddr{src_addr: src_other, dst_addr: dst_other} => src_other[..] == src_addr[..] && dst_other[..] == dst_addr[..],
+          _ => false,
+        }
+      },
+      ProxyAddr::AfUnspec => {
+        if let &ProxyAddr::AfUnspec = other {
+          return true
+        }
+        false
+      },
+      _ => false,
+    }
+  }
+}
+
 fn get_family(addr: &ProxyAddr) -> u8 {
   match addr {
     &ProxyAddr::Ipv4Addr{ src_addr: _, dst_addr: _ } => 0x10 | 0x01, // AF_INET  = 1 + STREAM = 1
@@ -272,7 +341,13 @@ mod testV2 {
     let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(125, 25, 10, 1)), 8080);
     let dst_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200);
 
+<<<<<<< HEAD
     let header = HeaderV2::new(Command::Local, src_addr, dst_addr);
+||||||| merged common ancestors
+    let header = HeaderV2::new(src_addr, dst_addr);
+=======
+    let header = HeaderV2::new(Some((src_addr, dst_addr)));
+>>>>>>> Impl the partialEq for ProxyProtocolHeader and refactor the way to create a V2::header to easy build a AfUnspec
     let expected = &[
       0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // MAGIC header
       0x20,                                                                   // Version 2 and command LOCAL
@@ -292,7 +367,13 @@ mod testV2 {
     let src_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 8080);
     let dst_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 4200);
 
+<<<<<<< HEAD
     let header = HeaderV2::new(Command::Proxy, src_addr, dst_addr);
+||||||| merged common ancestors
+    let header = HeaderV2::new(src_addr, dst_addr);
+=======
+    let header = HeaderV2::new(Some((src_addr, dst_addr)));
+>>>>>>> Impl the partialEq for ProxyProtocolHeader and refactor the way to create a V2::header to easy build a AfUnspec
     let expected = vec![
       0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,                         // MAGIC header
       0x21,                                                                                           // Version 2 and command PROXY
