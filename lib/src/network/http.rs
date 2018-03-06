@@ -281,6 +281,10 @@ impl ProxyClient for Client {
 
     let mut result = CloseResult::default();
 
+    if let Some(tk) = self.backend_token {
+      result.tokens.push(tk)
+    }
+
     if let (Some(app_id), Some(addr)) = self.remove_backend() {
       result.backends.push((app_id, addr.clone()));
     }
@@ -292,10 +296,6 @@ impl ProxyClient for Client {
     }
 
     result.tokens.push(self.frontend_token);
-
-    if let Some(tk) = self.backend_token {
-      result.tokens.push(tk)
-    }
 
     result
   }
