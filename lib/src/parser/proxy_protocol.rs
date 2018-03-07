@@ -28,10 +28,25 @@ pub fn parse(buf: &[u8]) -> IResult<&[u8], ProxyProtocolHeader> {
   }
 }
 
+//TODO: Refactor this method using cond! parser if it's possible
+fn read_and_verify_ver_and_command(input: &[u8]) -> IResult<&[u8], u8> {
+  match be_u8(input) {
+    Done(rest, ver_and_cmd) => {
+      // Verify if it's the version 2
+      if (ver_and_cmd >> 4) & 0x0f == 0x02 {
+        return Done(rest, ver_and_cmd)
+      }
+      Error(ErrorKind::Custom(INCORRECT_VERSION))
+    },
+    Error(e)      => Error(e),
+    Incomplete(e) => Incomplete(e)
+  }
+}
+
 fn parse_v2_header(input: &[u8]) -> IResult<&[u8], HeaderV2> {
   do_parse!(
     input,
-    ver_and_cmd: be_u8 >>
+    ver_and_cmd: read_and_verify_ver_and_command >>
     family: be_u8 >>
     len: be_u16 >>
     addr: apply!(parse_addr_v2, family) >>
@@ -163,7 +178,19 @@ mod test {
   }
 
   #[test]
-  fn it_should_not_parse_proxy_protocol_v2_with_unknown_family() {
+  fn it_should_not_parse_proxy_protocol_v2_with_unknown_version() {
+    let unknow_version = 0x30;
+
+    let input = &[
+      0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // MAGIC header
+      unknow_version,                                                         // Version 2 and command LOCAL
+    ];
+
+    assert_eq!(Error(ErrorKind::Custom(INCORRECT_VERSION)), parse(input));
+  }
+
+  #[test]
+  fn it_should_not_parse_proxy_protocol_with_unknown_family() {
     let unknow_family = 0x30;
 
     let input = &[
