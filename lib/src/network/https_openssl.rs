@@ -241,11 +241,11 @@ impl TlsClient {
     }
   }
 
-  fn front_socket(&self) -> &TcpStream {
+  fn front_socket(&self) -> Option<&TcpStream> {
     match unwrap_msg!(self.protocol.as_ref()) {
-      &State::Handshake(ref handshake) => panic!("we should not need to access the front socket now"),
-      &State::Http(ref http)           => http.front_socket(),
-      &State::WebSocket(ref pipe)      => pipe.front_socket(),
+      &State::Handshake(ref handshake) => handshake.socket(),
+      &State::Http(ref http)           => Some(http.front_socket()),
+      &State::WebSocket(ref pipe)      => Some(pipe.front_socket()),
     }
   }
 
@@ -323,8 +323,10 @@ impl ProxyClient for TlsClient {
     //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.frontend_token, *self.temp.front_buf, *self.temp.back_buf);
     self.http().map(|http| http.close());
     self.metrics.service_stop();
-    self.front_socket().shutdown(Shutdown::Both);
-    poll.deregister(self.front_socket());
+    if let Some(front_socket) = self.front_socket() {
+      front_socket.shutdown(Shutdown::Both);
+      poll.deregister(front_socket);
+    }
 
     let mut result = CloseResult::default();
 
