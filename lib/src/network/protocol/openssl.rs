@@ -50,6 +50,7 @@ impl TlsHandshake {
         match ssl.accept(sock) {
           Ok(stream) => {
             self.stream = Some(stream);
+            self.state = TlsState::Established;
             return (ProtocolResult::Upgrade, ClientResult::Continue);
           },
           Err(HandshakeError::SetupFailure(e)) => {
@@ -76,6 +77,7 @@ impl TlsHandshake {
         match mid.handshake() {
           Ok(stream) => {
             self.stream = Some(stream);
+            self.state = TlsState::Established;
             return (ProtocolResult::Upgrade, ClientResult::Continue);
           },
           Err(HandshakeError::SetupFailure(e)) => {
