@@ -359,7 +359,7 @@ impl ProxyClient for TlsClient {
     res
   }
 
-  fn protocol(&self)           -> Protocol {
+  fn protocol(&self) -> Protocol {
     Protocol::HTTPS
   }
 

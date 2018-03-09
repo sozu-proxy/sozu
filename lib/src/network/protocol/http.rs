@@ -250,7 +250,7 @@ impl<Front:SocketHandler> Http<Front> {
     &mut self.readiness
   }
 
-  fn protocol(&self)           -> Protocol {
+  fn protocol(&self) -> Protocol {
     self.protocol
   }
 

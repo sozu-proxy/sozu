@@ -7,7 +7,7 @@ use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 
 use self::header::*;
-use network::{Protocol, ClientResult};
+use network::ClientResult;
 use network::Readiness;
 use network::protocol::ProtocolResult;
 use network::socket::SocketHandler;
@@ -99,10 +99,6 @@ impl <Front:SocketHandler>ProxyProtocol<Front> {
 
   pub fn readiness(&mut self) -> &mut Readiness {
     &mut self.readiness
-  }
-
-  pub fn protocol(&self) -> Protocol {
-    Protocol::ProxyProtocol
   }
 
   fn gen_proxy_protocol_header(&mut self, socket: &TcpStream) {

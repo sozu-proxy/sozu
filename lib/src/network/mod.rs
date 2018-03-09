@@ -65,7 +65,6 @@ pub enum Protocol {
   TCPListen,
   Channel,
   Metrics,
-  ProxyProtocol,
 }
 
 #[derive(Debug,Clone,Default)]

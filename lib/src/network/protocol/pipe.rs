@@ -7,7 +7,7 @@ use mio::unix::UnixReady;
 use pool::{Pool,Checkout,Reset};
 use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
-use network::{ClientResult,Protocol,Readiness,SessionMetrics};
+use network::{ClientResult,Readiness,SessionMetrics};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult};
 use nom::HexDisplay;

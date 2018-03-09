@@ -315,7 +315,7 @@ impl ProxyClient for Client {
     res
   }
 
-  fn protocol(&self)           -> Protocol {
+  fn protocol(&self) -> Protocol {
     Protocol::HTTP
   }
 
