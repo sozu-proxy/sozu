@@ -31,6 +31,7 @@ before_script:
 
 script:
   - cd $ROOT_PATH/lib     && cargo test  --verbose
+  - cd $ROOT_PATH/lib     && cargo test  --verbose --features "use-openssl"
   - cd $ROOT_PATH/command && cargo test  --verbose
   - cd $ROOT_PATH/futures && cargo build --verbose
   - cd $ROOT_PATH/bin     && cargo build --verbose
