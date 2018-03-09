@@ -118,12 +118,12 @@ impl Server {
     {
       let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       info!("taking token {:?} for channel", entry.index());
-      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::Channel })));
     }
     {
       let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       info!("taking token {:?} for metrics", entry.index());
-      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::Metrics })));
     }
 
     let http_session = config.http.and_then(|conf| conf.to_http()).map(|http_conf| {

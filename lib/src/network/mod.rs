@@ -63,6 +63,8 @@ pub enum Protocol {
   HTTPListen,
   HTTPSListen,
   TCPListen,
+  Channel,
+  Metrics,
   ProxyProtocol,
 }
 
