@@ -60,6 +60,7 @@ pub struct Client {
   pool:           Weak<RefCell<Pool<BufferQueue>>>,
   sticky_session: bool,
   metrics:        SessionMetrics,
+  pub app_id:     Option<String>,
 }
 
 impl Client {
@@ -84,6 +85,7 @@ impl Client {
         pool:           pool,
         sticky_session: false,
         metrics:        SessionMetrics::new(),
+        app_id:         None,
       };
 
       client.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
@@ -262,7 +264,7 @@ impl Client {
       self.backend_token.map(|t| format!("{}", t.0)).unwrap_or("-".to_string()));
     let addr:Option<SocketAddr> = self.back_socket().and_then(|sock| sock.peer_addr().ok());
     self.backend_token = None;
-    (unwrap_msg!(self.http()).app_id.clone(), addr)
+    (self.app_id.clone(), addr)
   }
 
   fn readiness(&mut self) -> &mut Readiness {
@@ -755,6 +757,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       }
 
       let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
+      client.app_id = Some(app_id.clone());
 
       let conn = match (front_should_stick, sticky_session) {
         (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session),

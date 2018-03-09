@@ -76,6 +76,7 @@ pub struct TlsClient {
   pool:           Weak<RefCell<Pool<BufferQueue>>>,
   sticky_session: bool,
   metrics:        SessionMetrics,
+  pub app_id:     Vec<String>,
 }
 
 impl TlsClient {
@@ -91,6 +92,7 @@ impl TlsClient {
       pool:           pool,
       sticky_session: false,
       metrics:        SessionMetrics::new(),
+      app_id:         None,
     };
     client.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
 
@@ -300,7 +302,8 @@ impl TlsClient {
   }
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    self.http().map(|http| http.remove_backend()).unwrap_or((None, None))
+    let addr:Option<SocketAddr> = self.back_socket().and_then(|sock| sock.peer_addr().ok());
+    (self.app_id.clone(), addr)
   }
 
   fn readiness(&mut self)      -> &mut Readiness {
@@ -1128,6 +1131,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       }
 
       let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
+      client.app_id = Some(app_id.clone());
 
       let conn   = try!(unwrap_msg!(client.http()).state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
       let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();

@@ -420,6 +420,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       }
 
       let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
+      client.app_id = Some(app_id.clone());
 
       let conn   = try!(unwrap_msg!(client.http()).state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
       let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();

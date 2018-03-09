@@ -59,6 +59,7 @@ pub struct TlsClient {
   pool:               Weak<RefCell<Pool<BufferQueue>>>,
   pub sticky_session: bool,
   pub metrics:        SessionMetrics,
+  pub app_id:         Option<String>,
 }
 
 impl TlsClient {
@@ -74,6 +75,7 @@ impl TlsClient {
       pool:           pool,
       sticky_session: false,
       metrics:        SessionMetrics::new(),
+      app_id:         None,
     };
     client.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
     client
@@ -286,7 +288,8 @@ impl TlsClient {
   }
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    unwrap_msg!(self.http()).remove_backend()
+    let addr:Option<SocketAddr> = self.back_socket().and_then(|sock| sock.peer_addr().ok());
+    (self.app_id.clone(), addr)
   }
 
   pub fn readiness(&mut self)      -> &mut Readiness {
