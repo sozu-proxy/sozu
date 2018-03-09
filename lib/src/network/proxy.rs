@@ -664,6 +664,7 @@ impl Server {
       Ok((client_token, should_connect)) => {
         self.nb_connections += 1;
         assert!(self.nb_connections <= self.max_connections);
+        incr!("client.connections");
 
         if should_connect {
            self.connect_to_backend(client_token);
