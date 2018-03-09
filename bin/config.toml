@@ -36,6 +36,12 @@ max_command_buffer_size = 163840
 
 # the number of worker processes that will handle traffic
 worker_count = 2
+
+# indicates if workers should be automatically restarted if they crash / hang
+# should be true for production and false for development
+# defaults to true
+worker_automatic_restart = true
+
 # indicates if worker process will be pinned on a core. If you activate this, be sure
 # that you do not have more workers than CPU cores (and leave at least one core for
 # the kernel and the master process)
