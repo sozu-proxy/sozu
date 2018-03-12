@@ -1,6 +1,6 @@
 use nom::IResult;
 use nom::IResult::*;
-use nom::{be_u8, be_u16, Err, ErrorKind};
+use nom::{be_u8, be_u16, ErrorKind};
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::convert::AsMut;
@@ -36,7 +36,7 @@ fn read_and_verify_ver_and_command(input: &[u8]) -> IResult<&[u8], u8> {
       if (ver_and_cmd >> 4) & 0x0f == 0x02 {
         return Done(rest, ver_and_cmd)
       }
-      Error(ErrorKind::Custom(INCORRECT_VERSION))
+      Error(error_code!(ErrorKind::Custom(INCORRECT_VERSION)))
     },
     Error(e)      => Error(e),
     Incomplete(e) => Incomplete(e)
@@ -68,7 +68,7 @@ fn parse_addr_v2(input: &[u8], family: u8) -> IResult<&[u8], ProxyAddr> {
     0x00 => Done(input, ProxyAddr::AfUnspec),
     0x01 => parse_ipv4_on_v2(input),
     0x02 => parse_ipv6_on_v2(input),
-    _ => Error(ErrorKind::Custom(UNKNOWN_FAMILY)),
+    _ => Error(error_code!(ErrorKind::Custom(UNKNOWN_FAMILY))),
   }
 }
 
