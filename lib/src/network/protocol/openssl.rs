@@ -11,7 +11,7 @@ pub enum TlsState {
   Initial,
   Handshake,
   Established,
-  Error,
+  Error(HandshakeError<TcpStream>),
 }
 
 pub struct TlsHandshake {
@@ -42,7 +42,7 @@ impl TlsHandshake {
 
   pub fn readable(&mut self) -> (ProtocolResult,ClientResult) {
     match self.state {
-      TlsState::Error   => return (ProtocolResult::Continue, ClientResult::CloseClient),
+      TlsState::Error(_) => return (ProtocolResult::Continue, ClientResult::CloseClient),
       TlsState::Initial => {
         let ssl     = self.ssl.take().expect("TlsHandshake should have a Ssl instance");
         let sock    = self.front.take().expect("TlsHandshake should have a front socket");
@@ -55,12 +55,12 @@ impl TlsHandshake {
           },
           Err(HandshakeError::SetupFailure(e)) => {
             error!("accept: handshake setup failed: {:?}", e);
-            self.state = TlsState::Error;
+            self.state = TlsState::Error(HandshakeError::SetupFailure(e));
             return (ProtocolResult::Continue, ClientResult::CloseClient);
           },
           Err(HandshakeError::Failure(e)) => {
             error!("accept: handshake failed: {:?}", e);
-            self.state = TlsState::Error;
+            self.state = TlsState::Error(HandshakeError::Failure(e));
             return (ProtocolResult::Continue, ClientResult::CloseClient);
           },
           Err(HandshakeError::Interrupted(mid)) => {
@@ -82,12 +82,12 @@ impl TlsHandshake {
           },
           Err(HandshakeError::SetupFailure(e)) => {
             debug!("mid handshake setup failed: {:?}", e);
-            self.state = TlsState::Error;
+            self.state = TlsState::Error(HandshakeError::SetupFailure(e));
             return (ProtocolResult::Continue, ClientResult::CloseClient);
           },
           Err(HandshakeError::Failure(e)) => {
             debug!("mid handshake failed: {:?}", e);
-            self.state = TlsState::Error;
+            self.state = TlsState::Error(HandshakeError::Failure(e));
             return (ProtocolResult::Continue, ClientResult::CloseClient);
           },
           Err(HandshakeError::Interrupted(new_mid)) => {
@@ -103,6 +103,22 @@ impl TlsHandshake {
       }
     }
 
+  }
+
+  pub fn socket(&self) -> Option<&TcpStream> {
+    match self.state {
+      TlsState::Initial => self.front.as_ref(),
+      TlsState::Handshake => self.mid.as_ref().map(|mid| mid.get_ref()),
+      TlsState::Established => self.stream.as_ref().map(|stream| stream.get_ref()),
+      TlsState::Error(ref error) => {
+        match error {
+          &HandshakeError::SetupFailure(_) => {
+            self.front.as_ref().or_else(|| self.mid.as_ref().map(|mid| mid.get_ref()))
+          },
+          &HandshakeError::Failure(ref mid) | &HandshakeError::Interrupted(ref mid) => Some(mid.get_ref())
+        }
+      }
+    }
   }
 }
 
