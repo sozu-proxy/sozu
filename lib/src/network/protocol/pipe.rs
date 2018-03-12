@@ -122,7 +122,11 @@ impl<Front:SocketHandler> Pipe<Front> {
   }
 
   pub fn back_hup(&mut self) -> ClientResult {
-    ClientResult::CloseClient
+    if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
+      ClientResult::CloseClient
+    } else {
+      ClientResult::Continue
+    }
   }
 
   // Read content from the client
