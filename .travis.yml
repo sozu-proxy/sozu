@@ -8,6 +8,26 @@ rust:
   - beta
   - stable
 
+before_install:
+  - export ROOT_PATH=`pwd`
+
+before_script:
+  - export PATH=$HOME/.cargo/bin:$PATH
+  - which cargo-coveralls || cargo install cargo-travis
+  - eval git pull --rebase https://github.com/sozu-proxy/sozu
+  - eval git log --pretty=oneline HEAD~10..HEAD
+
+
+matrix:
+  include:
+    - rust: stable
+      script:
+        - cd $ROOT_PATH/lib     && cargo test  --verbose --features "use-openssl"
+        - cd $ROOT_PATH/command && cargo test  --verbose
+        - cd $ROOT_PATH/futures && cargo build --verbose
+        - cd $ROOT_PATH/bin     && cargo build --verbose --features "use-openssl"
+        - cd $ROOT_PATH/ctl     && cargo build --verbose
+
 # Dependencies of kcov, used by coverage
 addons:
   apt:
@@ -22,12 +42,6 @@ addons:
     sources:
       - kalakris-cmake
 
-before_install:
-  - export ROOT_PATH=`pwd`
-
-before_script:
-  - export PATH=$HOME/.cargo/bin:$PATH
-  - which cargo-coveralls || cargo install cargo-travis
 
 script:
   - cd $ROOT_PATH/lib     && cargo test  --verbose
