@@ -76,7 +76,7 @@ pub struct TlsClient {
   pool:           Weak<RefCell<Pool<BufferQueue>>>,
   sticky_session: bool,
   metrics:        SessionMetrics,
-  pub app_id:     Vec<String>,
+  pub app_id:     Option<String>,
 }
 
 impl TlsClient {
