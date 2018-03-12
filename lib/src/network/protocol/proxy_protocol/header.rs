@@ -147,13 +147,18 @@ impl HeaderV2 {
   }
 
   pub fn into_bytes(&self) -> Vec<u8> {
-    let mut header = Vec::new();
+    let mut header = Vec::with_capacity(self.len());
     header.extend_from_slice(&self.signature);
     header.push(self.ver_and_cmd);
     header.push(self.family);
     header.extend_from_slice(&u16_to_array_of_u8(self.len));
-    header.extend_from_slice(&self.addr.into_bytes());
+    self.addr.into_bytes(&mut header);
     header
+  }
+
+  pub fn len(&self) -> usize {
+    // signature + ver_and_cmd + family + len + addr
+    self.signature.len() + 1 + 1 + 2 + self.addr.len() as usize
   }
 }
 
@@ -202,30 +207,26 @@ impl ProxyAddr {
     }
   }
 
-  fn into_bytes(&self) -> Vec<u8> {
-    let mut res = Vec::new();
-
+  fn into_bytes(&self, buf: &mut Vec<u8>) {
     match *self {
       ProxyAddr::Ipv4Addr{ src_addr, dst_addr } => {
-        res.extend_from_slice(&src_addr.ip().octets());
-        res.extend_from_slice(&dst_addr.ip().octets());
-        res.extend_from_slice(&u16_to_array_of_u8(src_addr.port()));
-        res.extend_from_slice(&u16_to_array_of_u8(dst_addr.port()));
+        buf.extend_from_slice(&src_addr.ip().octets());
+        buf.extend_from_slice(&dst_addr.ip().octets());
+        buf.extend_from_slice(&u16_to_array_of_u8(src_addr.port()));
+        buf.extend_from_slice(&u16_to_array_of_u8(dst_addr.port()));
       },
       ProxyAddr::Ipv6Addr{ src_addr, dst_addr } => {
-        res.extend_from_slice(&src_addr.ip().octets());
-        res.extend_from_slice(&dst_addr.ip().octets());
-        res.extend_from_slice(&u16_to_array_of_u8(src_addr.port()));
-        res.extend_from_slice(&u16_to_array_of_u8(dst_addr.port()));
+        buf.extend_from_slice(&src_addr.ip().octets());
+        buf.extend_from_slice(&dst_addr.ip().octets());
+        buf.extend_from_slice(&u16_to_array_of_u8(src_addr.port()));
+        buf.extend_from_slice(&u16_to_array_of_u8(dst_addr.port()));
       },
-      ProxyAddr::UnixAddr{ src_addr, dst_addr } =>{
-        res.extend_from_slice(&src_addr);
-        res.extend_from_slice(&dst_addr);
+      ProxyAddr::UnixAddr{ src_addr, dst_addr } => {
+        buf.extend_from_slice(&src_addr);
+        buf.extend_from_slice(&dst_addr);
       },
       ProxyAddr::AfUnspec => {},
     };
-
-    res
   }
 }
 
