@@ -358,6 +358,22 @@ impl ProxyMetrics {
         break;
       }
     };
+
+    for (ref key, ref mut am) in self.app_data.iter_mut()
+      .filter(|&(_,ref am)| now.duration_since(am.last_sent) > secs) {
+
+      let p99_res = if self.use_tagged_metrics {
+        self.buffer.write_fmt(format_args!("{}.app.{},origin={},app_id={}:{}|g\n", self.prefix, "p99", self.origin, key, am.response_time.value_at_percentile(99.0)))
+      } else {
+        self.buffer.write_fmt(format_args!("{}.{}.app.{}.{}:{}|g\n", self.prefix, self.origin, key, "p99", am.response_time.value_at_percentile(99.0)))
+      };
+
+      if p99_res.is_ok() {
+        am.last_sent = now;
+      } else {
+        break;
+      }
+    };
   }
 
   pub fn send_data(&mut self) {
