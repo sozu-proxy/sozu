@@ -353,7 +353,7 @@ impl ProxyClient for Client {
         error!("error connecting to backend, trying again");
         self.metrics().service_stop();
         return ClientResult::ConnectBackend;
-      } else {
+      } else if self.readiness().back_readiness != UnixReady::from(Ready::empty()) {
         self.set_back_connected(BackendConnectionStatus::Connected);
       }
     }
