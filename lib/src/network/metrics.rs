@@ -33,11 +33,18 @@ pub struct StoredMetricData {
 }
 
 #[derive(Clone,Debug)]
+pub struct AppMetrics {
+  pub response_time: Histogram<u32>,
+  pub last_sent:     Instant,
+}
+
+#[derive(Clone,Debug)]
 pub struct BackendMetrics {
   pub response_time: Histogram<u32>,
   pub bin:           usize,
   pub bout:          usize,
   pub app_id:        String,
+  pub last_sent:     Instant,
 }
 
 impl BackendMetrics {
@@ -47,6 +54,7 @@ impl BackendMetrics {
       bin:           0,
       bout:          0,
       app_id:        app_id,
+      last_sent:     Instant::now(),
     }
   }
 }
@@ -58,7 +66,7 @@ pub struct ProxyMetrics {
   pub created:         Instant,
   pub data:            BTreeMap<String, StoredMetricData>,
   /// app_id -> response time histogram (in ms)
-  pub app_data:        BTreeMap<String,Histogram<u32>>,
+  pub app_data:        BTreeMap<String,AppMetrics>,
   /// backend_id -> response time histogram (in ms)
   pub backend_data:    BTreeMap<String,BackendMetrics>,
   pub request_counter: TimeSerie,
@@ -134,16 +142,16 @@ impl ProxyMetrics {
   }
 
   pub fn dump_percentiles(&self) -> BTreeMap<String, Percentiles> {
-    self.app_data.iter().map(|(ref app_id, ref hist)| {
+    self.app_data.iter().map(|(ref app_id, ref metrics)| {
       let percentiles = Percentiles {
-        samples:  hist.len(),
-        p_50:     hist.value_at_percentile(50.0),
-        p_90:     hist.value_at_percentile(90.0),
-        p_99:     hist.value_at_percentile(99.0),
-        p_99_9:   hist.value_at_percentile(99.9),
-        p_99_99:  hist.value_at_percentile(99.99),
-        p_99_999: hist.value_at_percentile(99.999),
-        p_100:    hist.value_at_percentile(100.0),
+        samples:  metrics.response_time.len(),
+        p_50:     metrics.response_time.value_at_percentile(50.0),
+        p_90:     metrics.response_time.value_at_percentile(90.0),
+        p_99:     metrics.response_time.value_at_percentile(99.0),
+        p_99_9:   metrics.response_time.value_at_percentile(99.9),
+        p_99_99:  metrics.response_time.value_at_percentile(99.99),
+        p_99_999: metrics.response_time.value_at_percentile(99.999),
+        p_100:    metrics.response_time.value_at_percentile(100.0),
       };
 
       (app_id.to_string(), percentiles)
@@ -330,6 +338,26 @@ impl ProxyMetrics {
       }
     }
 
+    for (ref key, ref mut bm) in self.backend_data.iter_mut()
+      .filter(|&(_,ref bm)| now.duration_since(bm.last_sent) > secs) {
+
+      let bytes_in_res = if self.use_tagged_metrics {
+        self.buffer.write_fmt(format_args!("{}.backend.{},origin={},backend_id={}:{}|g\n", self.prefix, "bytes_in", self.origin, key, bm.bin))
+      } else {
+        self.buffer.write_fmt(format_args!("{}.{}.backend.{}.{}:{}|g\n", self.prefix, self.origin, key, "bytes_in", bm.bin))
+      };
+
+      let bytes_out_res = if self.use_tagged_metrics {
+        self.buffer.write_fmt(format_args!("{}.backend.{},origin={},backend_id={}:{}|g\n", self.prefix, "bytes_out", self.origin, key, bm.bout))
+      } else {
+        self.buffer.write_fmt(format_args!("{}.{}.backend.{}.{}:{}|g\n", self.prefix, self.origin, key, "bytes_out", bm.bout))
+      };
+      if bytes_in_res.is_ok() && bytes_out_res.is_ok() {
+        bm.last_sent = now;
+      } else {
+        break;
+      }
+    };
   }
 
   pub fn send_data(&mut self) {
@@ -473,12 +501,16 @@ macro_rules! record_request_time (
       let key: &str = $app_id;
 
       if m.app_data.contains_key(key) {
-        let hist = m.app_data.get_mut(key).unwrap();
-        hist.record($value as u64);
+        let metrics = m.app_data.get_mut(key).unwrap();
+        metrics.response_time.record($value as u64);
       } else {
         if let Ok(mut hist) = ::hdrhistogram::Histogram::new(3) {
           hist.record($value as u64);
-          m.app_data.insert(key.to_string(), hist);
+          let metrics = $crate::network::metrics::AppMetrics {
+            response_time: hist,
+            last_sent: ::std::time::Instant::now(),
+          };
+          m.app_data.insert(key.to_string(), metrics);
         }
       }
     });
