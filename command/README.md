@@ -80,7 +80,7 @@ with the same id and the `Ok` status.
 
 #### Save state message
 
-This message tells the proxy to dump the current proxy state (instances,
+This message tells the proxy to dump the current proxy state (backends,
 front domains, certificates, etc) as json, to a file. This file can be used later
 to bootstrap the proxy. This message is not forwarded to workers.
 
@@ -231,7 +231,7 @@ The fingerprint is the hexadecimal representation of the SHA256 hash of the cert
   "id":       "ID_ABCD",
   "version":  0,
   "data":{
-    "type": "ADD_INSTANCE",
+    "type": "ADD_BACKEND",
     "data": {
       "app_id": "xxx",
       "ip_address": "127.0.0.1",
@@ -282,7 +282,7 @@ The fingerprint is the hexadecimal representation of the SHA256 hash of the cert
   "id":      "ID_789",
   "version": 0,
   "data": {
-    "type": "REMOVE_INSTANCE",
+    "type": "REMOVE_BACKEND",
     "data": {
       "app_id": "xxx",
       "ip_address": "127.0.0.1",

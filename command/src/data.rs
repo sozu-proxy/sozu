@@ -325,7 +325,7 @@ mod tests {
   use serde_json;
   use hex::FromHex;
   use certificate::split_certificate_chain;
-  use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Instance};
+  use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Backend};
   use messages::{BackendMetricsData,MetricsData,FilteredData,Percentiles};
   use messages::{AddCertificate,RemoveCertificate};
 
@@ -478,24 +478,24 @@ mod tests {
       proxy_id: None
     });
 
-  test_message!(add_instance, "../assets/add_instance.json", ConfigMessage {
+  test_message!(add_backend, "../assets/add_backend.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::AddInstance(Instance{
+      data:     ConfigCommand::ProxyConfiguration(Order::AddBackend(Backend{
                   app_id: String::from("xxx"),
-                  instance_id: String::from("xxx-0"),
+                  backend_id: String::from("xxx-0"),
                   ip_address: String::from("127.0.0.1"),
                   port: 8080,
       })),
       proxy_id: None
     });
 
-  test_message!(remove_instance, "../assets/remove_instance.json", ConfigMessage {
+  test_message!(remove_backend, "../assets/remove_backend.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::RemoveInstance(Instance{
+      data:     ConfigCommand::ProxyConfiguration(Order::RemoveBackend(Backend{
                   app_id: String::from("xxx"),
-                  instance_id: String::from("xxx-0"),
+                  backend_id: String::from("xxx-0"),
                   ip_address: String::from("127.0.0.1"),
                   port: 8080,
       })),

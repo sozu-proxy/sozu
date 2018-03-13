@@ -43,9 +43,9 @@ fn main() {
     path_begin: String::from("/")
   };
 
-  let http_instance = messages::Instance {
+  let http_backend = messages::Backend {
     app_id:      String::from("app_1"),
-    instance_id: String::from("app_1-0"),
+    backend_id: String::from("app_1-0"),
     ip_address:  String::from("127.0.0.1"),
     port:        1026
   };
@@ -57,7 +57,7 @@ fn main() {
 
   command.write_message(&messages::OrderMessage {
     id:    String::from("ID_EFGH"),
-    order: messages::Order::AddInstance(http_instance)
+    order: messages::Order::AddBackend(http_backend)
   });
 
   info!("MAIN\tHTTP -> {:?}", command.read_message());
@@ -117,16 +117,16 @@ fn main() {
     id:    String::from("ID_IJKL2"),
     order: messages::Order::AddHttpsFront(tls_front)
   });
-  let tls_instance = messages::Instance {
+  let tls_backend = messages::Backend {
     app_id:      String::from("app_1"),
-    instance_id: String::from("app_1-0"),
+    backend_id: String::from("app_1-0"),
     ip_address:  String::from("127.0.0.1"),
     port:        1026
   };
 
   command2.write_message(&messages::OrderMessage {
     id:    String::from("ID_MNOP"),
-    order: messages::Order::AddInstance(tls_instance)
+    order: messages::Order::AddBackend(tls_backend)
   });
 
   let cert2 = include_str!("../assets/cert_test.pem");
@@ -158,16 +158,16 @@ fn main() {
     order: messages::Order::AddHttpsFront(tls_front2)
   });
 
-  let tls_instance2 = messages::Instance {
+  let tls_backend2 = messages::Backend {
     app_id:      String::from("app_2"),
-    instance_id: String::from("app_2-0"),
+    backend_id: String::from("app_2-0"),
     ip_address:  String::from("127.0.0.1"),
     port:        1026
   };
 
   command2.write_message(&messages::OrderMessage {
     id:    String::from("ID_UVWX"),
-    order: messages::Order::AddInstance(tls_instance2)
+    order: messages::Order::AddBackend(tls_backend2)
   });
 
   info!("MAIN\tTLS -> {:?}", command2.read_message());

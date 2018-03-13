@@ -6,7 +6,7 @@ use std::iter::FromIterator;
 use certificate::calculate_fingerprint;
 
 use messages::{Application,CertFingerprint,CertificateAndKey,Order,
-  HttpFront,HttpsFront,TcpFront,Instance,QueryAnswerApplication,
+  HttpFront,HttpsFront,TcpFront,Backend,QueryAnswerApplication,
   AddCertificate, RemoveCertificate};
 
 pub type AppId = String;
@@ -16,7 +16,7 @@ pub struct HttpProxy {
   ip_address: String,
   port:       u16,
   fronts:     HashMap<AppId, Vec<HttpFront>>,
-  instances:  HashMap<AppId, Vec<Instance>>,
+  backends:   HashMap<AppId, Vec<Backend>>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize, Deserialize)]
@@ -25,13 +25,13 @@ pub struct HttpsProxy {
   port:         u16,
   certificates: HashMap<CertFingerprint, CertificateAndKey>,
   fronts:       HashMap<AppId, Vec<HttpsFront>>,
-  instances:    HashMap<AppId, Vec<Instance>>,
+  backends:     HashMap<AppId, Vec<Backend>>,
 }
 
 #[derive(Debug,Default,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct ConfigState {
   pub applications:    HashMap<AppId, Application>,
-  pub instances:       HashMap<AppId, Vec<Instance>>,
+  pub backends:        HashMap<AppId, Vec<Backend>>,
   pub http_fronts:     HashMap<AppId, Vec<HttpFront>>,
   pub https_fronts:    HashMap<AppId, Vec<HttpsFront>>,
   pub tcp_fronts:      HashMap<AppId, Vec<TcpFront>>,
@@ -47,7 +47,7 @@ impl ConfigState {
   pub fn new() -> ConfigState {
     ConfigState {
       applications:    HashMap::new(),
-      instances:       HashMap::new(),
+      backends:        HashMap::new(),
       http_fronts:     HashMap::new(),
       https_fronts:    HashMap::new(),
       tcp_fronts:      HashMap::new(),
@@ -139,15 +139,15 @@ impl ConfigState {
           front_list.retain(|el| el.ip_address != front.ip_address || el.port != front.port);
         }
       },
-      &Order::AddInstance(ref instance)  => {
-        let instance_vec = self.instances.entry(instance.app_id.clone()).or_insert(vec!());
-        if !instance_vec.contains(&instance) {
-          instance_vec.push(instance.clone());
+      &Order::AddBackend(ref backend)  => {
+        let backend_vec = self.backends.entry(backend.app_id.clone()).or_insert(vec!());
+        if !backend_vec.contains(&backend) {
+          backend_vec.push(backend.clone());
         }
       },
-      &Order::RemoveInstance(ref instance) => {
-        if let Some(instance_list) = self.instances.get_mut(&instance.app_id) {
-          instance_list.retain(|el| el.ip_address != instance.ip_address || el.port != instance.port);
+      &Order::RemoveBackend(ref backend) => {
+        if let Some(backend_list) = self.backends.get_mut(&backend.app_id) {
+          backend_list.retain(|el| el.ip_address != backend.ip_address || el.port != backend.port);
         }
       },
       // This is to avoid the error message
@@ -190,9 +190,9 @@ impl ConfigState {
       }
     }
 
-    for instance_list in self.instances.values() {
-      for instance in instance_list {
-        v.push(Order::AddInstance(instance.clone()));
+    for backend_list in self.backends.values() {
+      for backend in backend_list {
+        v.push(Order::AddBackend(backend.clone()));
       }
     }
 
@@ -254,21 +254,21 @@ impl ConfigState {
     let removed_tcp_fronts = my_fronts.difference(&their_fronts);
     let added_tcp_fronts   = their_fronts.difference(&my_fronts);
 
-    let mut my_instances: HashSet<(&AppId, &Instance)> = HashSet::new();
-    for (ref app_id, ref instance_list) in self.instances.iter() {
-      for ref instance in instance_list.iter() {
-        my_instances.insert((&app_id, &instance));
+    let mut my_backends: HashSet<(&AppId, &Backend)> = HashSet::new();
+    for (ref app_id, ref backend_list) in self.backends.iter() {
+      for ref backend in backend_list.iter() {
+        my_backends.insert((&app_id, &backend));
       }
     }
-    let mut their_instances: HashSet<(&AppId, &Instance)> = HashSet::new();
-    for (ref app_id, ref instance_list) in other.instances.iter() {
-      for ref instance in instance_list.iter() {
-        their_instances.insert((&app_id, &instance));
+    let mut their_backends: HashSet<(&AppId, &Backend)> = HashSet::new();
+    for (ref app_id, ref backend_list) in other.backends.iter() {
+      for ref backend in backend_list.iter() {
+        their_backends.insert((&app_id, &backend));
       }
     }
 
-    let removed_instances = my_instances.difference(&their_instances);
-    let added_instances   = their_instances.difference(&my_instances);
+    let removed_backends = my_backends.difference(&their_backends);
+    let added_backends   = their_backends.difference(&my_backends);
 
     let my_certificates:    HashSet<(&CertFingerprint, &(CertificateAndKey, Vec<String>))> =
       HashSet::from_iter(self.certificates.iter());
@@ -307,12 +307,12 @@ impl ConfigState {
      v.push(Order::RemoveTcpFront(front.clone()));
     }
 
-    for &(_, instance) in added_instances {
-      v.push(Order::AddInstance(instance.clone()));
+    for &(_, backend) in added_backends {
+      v.push(Order::AddBackend(backend.clone()));
     }
 
-    for &(_, instance) in removed_instances {
-      v.push(Order::RemoveInstance(instance.clone()));
+    for &(_, backend) in removed_backends {
+      v.push(Order::RemoveBackend(backend.clone()));
     }
 
     for &(_, front) in added_http_fronts {
@@ -337,10 +337,10 @@ impl ConfigState {
   }
 
   pub fn hash_state(&self) -> BTreeMap<AppId, u64> {
-    self.instances.keys().map(|app_id| {
+    self.backends.keys().map(|app_id| {
       let mut s = DefaultHasher::new();
       self.applications.get(app_id).hash(&mut s);
-      self.instances.get(app_id).hash(&mut s);
+      self.backends.get(app_id).hash(&mut s);
       self.http_fronts.get(app_id).hash(&mut s);
       self.https_fronts.get(app_id).hash(&mut s);
       self.tcp_fronts.get(app_id).hash(&mut s);
@@ -356,7 +356,7 @@ impl ConfigState {
       http_frontends:  self.http_fronts.get(app_id).cloned().unwrap_or(vec!()),
       https_frontends: self.https_fronts.get(app_id).cloned().unwrap_or(vec!()),
       tcp_frontends:   self.tcp_fronts.get(app_id).cloned().unwrap_or(vec!()),
-      backends:        self.instances.get(app_id).cloned().unwrap_or(vec!()),
+      backends:        self.backends.get(app_id).cloned().unwrap_or(vec!()),
     }
   }
 }
@@ -398,18 +398,18 @@ pub fn get_application_ids_by_domain(state: &ConfigState, hostname: String, path
 #[cfg(test)]
 mod tests {
   use super::*;
-  use messages::{Order,HttpFront,Instance};
+  use messages::{Order,HttpFront,Backend};
 
   #[test]
   fn serialize() {
     let mut state:ConfigState = Default::default();
     state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") }));
     state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc") }));
-    state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), instance_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1026 }));
-    state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), instance_id: String::from("app_1-1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
-    state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_2"), instance_id: String::from("app_2-0"), ip_address: String::from("192.167.1.2"), port: 1026 }));
-    state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), instance_id: String::from("app_1-3"),ip_address: String::from("192.168.1.3"), port: 1027 }));
-    state.handle_order(&Order::RemoveInstance(Instance { app_id: String::from("app_1"), instance_id: String::from("app_1-3"), ip_address: String::from("192.168.1.3"), port: 1027 }));
+    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1026 }));
+    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
+    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_2"), backend_id: String::from("app_2-0"), ip_address: String::from("192.167.1.2"), port: 1026 }));
+    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-3"),ip_address: String::from("192.168.1.3"), port: 1027 }));
+    state.handle_order(&Order::RemoveBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-3"), ip_address: String::from("192.168.1.3"), port: 1027 }));
 
     /*
     let encoded = state.encode();
@@ -427,22 +427,22 @@ mod tests {
     let mut state:ConfigState = Default::default();
     state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") }));
     state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc") }));
-    state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), instance_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1026 }));
-    state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), instance_id: String::from("app_1-1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
-    state.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_2"), instance_id: String::from("app_2-0"), ip_address: String::from("192.167.1.2"), port: 1026 }));
+    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1026 }));
+    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
+    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_2"), backend_id: String::from("app_2-0"), ip_address: String::from("192.167.1.2"), port: 1026 }));
     state.handle_order(&Order::AddApplication(Application { app_id: String::from("app_2"), sticky_session: true, https_redirect: true, proxy_protocol: false }));
 
     let mut state2:ConfigState = Default::default();
     state2.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/") }));
-    state2.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), instance_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1026 }));
-    state2.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), instance_id: String::from("app_1-1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
-    state2.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), instance_id: String::from("app_1-2"), ip_address: String::from("127.0.0.2"), port: 1028 }));
+    state2.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1026 }));
+    state2.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-1"), ip_address: String::from("127.0.0.2"), port: 1027 }));
+    state2.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-2"), ip_address: String::from("127.0.0.2"), port: 1028 }));
     state2.handle_order(&Order::AddApplication(Application { app_id: String::from("app_3"), sticky_session: false, https_redirect: false, proxy_protocol: false }));
 
    let e = vec!(
      Order::RemoveHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc") }),
-     Order::RemoveInstance(Instance { app_id: String::from("app_2"), instance_id: String::from("app_2-0"), ip_address: String::from("192.167.1.2"), port: 1026 }),
-     Order::AddInstance(Instance { app_id: String::from("app_1"), instance_id: String::from("app_1-2"), ip_address: String::from("127.0.0.2"), port: 1028 }),
+     Order::RemoveBackend(Backend { app_id: String::from("app_2"), backend_id: String::from("app_2-0"), ip_address: String::from("192.167.1.2"), port: 1026 }),
+     Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-2"), ip_address: String::from("127.0.0.2"), port: 1028 }),
      Order::RemoveApplication(String::from("app_2")),
      Order::AddApplication(Application { app_id: String::from("app_3"), sticky_session: false, https_redirect: false, proxy_protocol: false }),
    );
@@ -456,7 +456,7 @@ mod tests {
    let hash1 = state.hash_state();
    let hash2 = state2.hash_state();
    let mut state3 = state.clone();
-   state3.handle_order(&Order::AddInstance(Instance { app_id: String::from("app_1"), instance_id: String::from("app_1-2"), ip_address: String::from("127.0.0.2"), port: 1028 }));
+   state3.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-2"), ip_address: String::from("127.0.0.2"), port: 1028 }));
    let hash3 = state3.hash_state();
    println!("state 1 hashes: {:#?}", hash1);
    println!("state 2 hashes: {:#?}", hash2);

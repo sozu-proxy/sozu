@@ -54,7 +54,7 @@ pub enum State {
 pub struct Client {
   frontend_token: Token,
   backend_token:  Option<Token>,
-  instance:       Option<Rc<RefCell<Backend>>>,
+  backend:        Option<Rc<RefCell<Backend>>>,
   back_connected: BackendConnectionStatus,
   protocol:       Option<State>,
   pool:           Weak<RefCell<Pool<BufferQueue>>>,
@@ -78,7 +78,7 @@ impl Client {
       let log_ctx    = format!("{}\tunknown\t", &request_id);
       let mut client = Client {
         backend_token:  None,
-        instance:       None,
+        backend:        None,
         back_connected: BackendConnectionStatus::NotConnected,
         protocol:       Some(State::Http(http)),
         frontend_token: token,
@@ -245,8 +245,8 @@ impl Client {
   fn set_back_connected(&mut self, connected: BackendConnectionStatus) {
     self.back_connected = connected;
     if connected == BackendConnectionStatus::Connected {
-      self.instance.as_ref().map(|instance| {
-        let ref mut backend = *instance.borrow_mut();
+      self.backend.as_ref().map(|backend| {
+        let ref mut backend = *backend.borrow_mut();
         //successful connection, rest failure counter
         backend.failures = 0;
         backend.retry_policy.succeed();
@@ -476,7 +476,7 @@ pub type Hostname = String;
 pub struct ServerConfiguration {
   listener:        Option<TcpListener>,
   address:         SocketAddr,
-  instances:       BackendMap,
+  backends:        BackendMap,
   fronts:          HashMap<Hostname, Vec<HttpFront>>,
   applications:    HashMap<AppId, Application>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
@@ -518,7 +518,7 @@ impl ServerConfiguration {
       listener:       listener,
       address:        config.front,
       applications:   HashMap::new(),
-      instances:      BackendMap::new(),
+      backends:       BackendMap::new(),
       fronts:         HashMap::new(),
       pool:           pool,
       answers:        default,
@@ -576,12 +576,12 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_instance(&mut self, app_id: &str, instance_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
-    self.instances.add_instance(app_id, instance_id, instance_address);
+  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
+    self.backends.add_backend(app_id, backend_id, backend_address);
   }
 
-  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
-    self.instances.remove_instance(app_id, instance_address);
+  pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
+    self.backends.remove_backend(app_id, backend_address);
   }
 
   pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&HttpFront> {
@@ -630,7 +630,7 @@ impl ServerConfiguration {
   pub fn backend_from_app_id(&mut self, client: &mut Client, app_id: &str, front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
     client.http().map(|h| h.set_app_id(String::from(app_id)));
 
-    match self.instances.backend_from_app_id(app_id) {
+    match self.backends.backend_from_app_id(app_id) {
       Err(e) => {
         client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
         Err(e)
@@ -640,9 +640,9 @@ impl ServerConfiguration {
         if front_should_stick {
           client.http().map(|http| http.sticky_session = Some(StickySession::new(backend.borrow().id.clone())));
         }
-        client.metrics.backend_id = Some(backend.borrow().instance_id.clone());
+        client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
         client.metrics.backend_start();
-        client.instance = Some(backend);
+        client.backend = Some(backend);
 
         Ok(conn)
       }
@@ -652,7 +652,7 @@ impl ServerConfiguration {
   pub fn backend_from_sticky_session(&mut self, client: &mut Client, app_id: &str, sticky_session: u32) -> Result<TcpStream,ConnectionError> {
     client.http().map(|h| h.set_app_id(String::from(app_id)));
 
-    match self.instances.backend_from_sticky_session(app_id, sticky_session) {
+    match self.backends.backend_from_sticky_session(app_id, sticky_session) {
       Err(e) => {
         debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
         client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
@@ -661,9 +661,9 @@ impl ServerConfiguration {
       Ok((backend, conn))  => {
         client.back_connected = BackendConnectionStatus::Connecting;
         client.http().map(|http| http.sticky_session = Some(StickySession::new(backend.borrow().id.clone())));
-        client.metrics.backend_id = Some(backend.borrow().instance_id.clone());
+        client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
         client.metrics.backend_start();
-        client.instance = Some(backend);
+        client.backend = Some(backend);
 
         Ok(conn)
       }
@@ -715,17 +715,17 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
 
       if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
-        if client.instance.as_ref().map(|instance| {
-          let ref backend = *instance.borrow();
-          self.instances.has_backend(&app_id, backend)
+        if client.backend.as_ref().map(|backend| {
+          let ref backend = *backend.borrow();
+          self.backends.has_backend(&app_id, backend)
         }).unwrap_or(false) {
           //matched on keepalive
-          client.metrics.backend_id = client.instance.as_ref().map(|i| i.borrow().instance_id.clone());
+          client.metrics.backend_id = client.backend.as_ref().map(|i| i.borrow().backend_id.clone());
           client.metrics.backend_start();
           return Ok(BackendConnectAction::Reuse);
         } else {
 
-          client.instance = None;
+          client.backend = None;
           client.back_connected = BackendConnectionStatus::NotConnected;
           //client.readiness().back_interest  = UnixReady::from(Ready::empty());
           client.readiness().back_readiness = UnixReady::from(Ready::empty());
@@ -738,15 +738,15 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
       // circuit breaker
       if client.back_connected == BackendConnectionStatus::Connecting {
-        client.instance.as_ref().map(|instance| {
-          let ref mut backend = *instance.borrow_mut();
+        client.backend.as_ref().map(|backend| {
+          let ref mut backend = *backend.borrow_mut();
           backend.dec_connections();
           backend.failures += 1;
           backend.retry_policy.fail();
         });
 
         //deregister back socket if it is the wrong one or if it was not connecting
-        client.instance = None;
+        client.backend = None;
         client.back_connected = BackendConnectionStatus::NotConnected;
         client.readiness().back_interest  = UnixReady::from(Ready::empty());
         client.readiness().back_readiness = UnixReady::from(Ready::empty());
@@ -769,7 +769,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           let new_app_id = client.http().and_then(|ref http| http.app_id.clone());
 
           if old_app_id.is_some() && old_app_id != new_app_id {
-            client.instance = None;
+            client.backend = None;
             client.back_connected = BackendConnectionStatus::NotConnected;
             client.readiness().back_readiness = UnixReady::from(Ready::empty());
             client.back_socket().as_ref().map(|sock| {
@@ -859,24 +859,24 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           Err(err) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(err), data: None }
         }
       },
-      Order::AddInstance(instance) => {
-        debug!("{} add instance {:?}", message.id, instance);
-        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+      Order::AddBackend(backend) => {
+        debug!("{} add backend {:?}", message.id, backend);
+        let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
-          self.add_instance(&instance.app_id, &instance.instance_id, &addr, event_loop);
+          self.add_backend(&backend.app_id, &backend.backend_id, &addr, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }
         }
       },
-      Order::RemoveInstance(instance) => {
-        debug!("{} remove instance {:?}", message.id, instance);
-        remove_backend_metrics!(&instance.instance_id);
-        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+      Order::RemoveBackend(backend) => {
+        debug!("{} remove backend {:?}", message.id, backend);
+        remove_backend_metrics!(&backend.backend_id);
+        let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
-          self.remove_instance(&instance.app_id, &addr, event_loop);
+          self.remove_backend(&backend.app_id, &addr, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }
@@ -969,12 +969,12 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   }
 
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {
-    self.instances.close_backend_connection(&app_id, &addr);
+    self.backends.close_backend_connection(&app_id, &addr);
   }
 }
 
 pub struct InitialServerConfiguration {
-  instances:       BackendMap,
+  backends:        BackendMap,
   fronts:          HashMap<Hostname, Vec<HttpFront>>,
   applications:    HashMap<AppId, Application>,
   answers:         DefaultAnswers,
@@ -997,11 +997,11 @@ impl InitialServerConfiguration {
       }),
     };
 
-    let mut instances = BackendMap::new();
-    instances.import_configuration_state(&state.instances);
+    let mut backends = BackendMap::new();
+    backends.import_configuration_state(&state.backends);
 
     InitialServerConfiguration {
-      instances:    instances,
+      backends:     backends,
       fronts:       state.http_fronts.clone(),
       applications: state.applications.clone(),
       answers:      answers,
@@ -1020,7 +1020,7 @@ impl InitialServerConfiguration {
           listener:      Some(sock),
           address:       self.config.front,
           applications:  self.applications,
-          instances:     self.instances,
+          backends:      self.backends,
           fronts:        self.fronts,
           pool:          pool,
           answers:       self.answers,
@@ -1087,7 +1087,7 @@ mod tests {
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
-  use sozu_command::messages::{Order,HttpFront,Instance,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer};
+  use sozu_command::messages::{Order,HttpFront,Backend,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer};
   use network::buffer_queue::BufferQueue;
   use pool::Pool;
 
@@ -1110,8 +1110,8 @@ mod tests {
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
-    let instance = Instance { app_id: String::from("app_1"),instance_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1025 };
-    command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
+    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1025 };
+    command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
     println!("test received: {:?}", command.read_message());
@@ -1162,8 +1162,8 @@ mod tests {
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
-    let instance = Instance { app_id: String::from("app_1"), instance_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1028 };
-    command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddInstance(instance) });
+    let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1028 };
+    command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
     println!("test received: {:?}", command.read_message());
@@ -1237,8 +1237,8 @@ mod tests {
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddApplication(application) });
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddHttpFront(front) });
-    let instance = Instance { app_id: String::from("app_1"),instance_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1040 };
-    command.write_message(&OrderMessage { id: String::from("ID_IJKL"), order: Order::AddInstance(instance) });
+    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1040 };
+    command.write_message(&OrderMessage { id: String::from("ID_IJKL"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
     println!("test received: {:?}", command.read_message());
@@ -1319,7 +1319,7 @@ mod tests {
       listener:  Some(listener),
       address:   front,
       applications: HashMap::new(),
-      instances: BackendMap::new(),
+      backends:  BackendMap::new(),
       fronts:    fronts,
       pool:      Rc::new(RefCell::new(Pool::with_capacity(1,0, || BufferQueue::with_capacity(16384)))),
       answers:   DefaultAnswers {

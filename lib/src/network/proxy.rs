@@ -27,7 +27,7 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::state::{ConfigState,get_application_ids_by_domain};
-use sozu_command::messages::{self,TcpFront,Order,Instance,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer,QueryApplicationType};
+use sozu_command::messages::{self,TcpFront,Order,Backend,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer,QueryApplicationType};
 
 use network::buffer_queue::BufferQueue;
 use network::{ClientResult,ConnectionError,Protocol,RequiredEvents,ProxyClient,ProxyConfiguration,

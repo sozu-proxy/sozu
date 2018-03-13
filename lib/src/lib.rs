@@ -51,7 +51,7 @@
 //!   hostname:   String::from("example.com"),
 //!   path_begin: String::from("/")
 //! };
-//! let http_instance = messages::Instance {
+//! let http_backend = messages::Backend {
 //!   app_id:     String::from("test"),
 //!   ip_address: String::from("192.0.2.1"),
 //!   port:       8080
@@ -64,7 +64,7 @@
 //!
 //! command.write_message(&messages::OrderMessage {
 //!   id:    String::from("ID_EFGH"),
-//!   order: messages::Order::AddInstance(http_instance)
+//!   order: messages::Order::AddBackend(http_backend)
 //! ));
 //!
 //! println!("HTTP -> {:?}", command.read_message());
@@ -72,19 +72,19 @@
 //! ```
 //!
 //! An application is identified by its `app_id`, a string that will be shared
-//! between one or multiple "fronts", and one or multiple "instances".
+//! between one or multiple "fronts", and one or multiple "backends".
 //!
 //! A "front" is a way to recognize a request and match it to an `app_id`,
 //! depending on the hostname and the beginning of the URL path.
 //!
-//! An instance corresponds to one backend server, indicated by its IP and port.
+//! A backend corresponds to one backend server, indicated by its IP and port.
 //!
 //! An application can have multiple backend servers, and they can be added or
 //! removed while the proxy is running. If a backend is removed from the configuration
 //! while the proxy is handling a request to that server, it will finish that
 //! request and stop sending new traffic to that server.
 //!
-//! The fronts and instances are specified with messages sent through the
+//! The fronts and backends are specified with messages sent through the
 //! communication channels with the proxy event loop. Once the configuration
 //! options are added to the proxy's state, it will send back an acknowledgement
 //! message.
@@ -126,7 +126,7 @@
 //!     hostname:   String::from("example.com"),
 //!     path_begin: String::from("/")
 //!   };
-//!   let http_instance = messages::Instance {
+//!   let http_backend = messages::Backend {
 //!     app_id:     String::from("test"),
 //!     ip_address: String::from("192.0.2.1"),
 //!     port:       8080
@@ -139,7 +139,7 @@
 //!
 //!   command.write_message(&messages::OrderMessage {
 //!     id:    String::from("ID_EFGH"),
-//!     order: messages::Order::AddInstance(http_instance)
+//!     order: messages::Order::AddBackend(http_backend)
 //!   ));
 //!
 //!   println!("HTTP -> {:?}", command.read_message());

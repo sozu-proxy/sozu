@@ -229,7 +229,7 @@ pub enum BackendStatus {
 #[derive(Debug,PartialEq,Eq)]
 pub struct Backend {
   pub id:                 u32,
-  pub instance_id:        String,
+  pub backend_id:         String,
   pub address:            SocketAddr,
   pub status:             BackendStatus,
   pub retry_policy:       retry::RetryPolicyWrapper,
@@ -238,11 +238,11 @@ pub struct Backend {
 }
 
 impl Backend {
-  pub fn new(instance_id: &str, addr: SocketAddr, id: u32) -> Backend {
+  pub fn new(backend_id: &str, addr: SocketAddr, id: u32) -> Backend {
     let desired_policy = retry::ExponentialBackoffPolicy::new(10);
     Backend {
       id:                 id,
-      instance_id:        instance_id.to_string(),
+      backend_id:         backend_id.to_string(),
       address:            addr,
       status:             BackendStatus::Normal,
       retry_policy:       desired_policy.into(),

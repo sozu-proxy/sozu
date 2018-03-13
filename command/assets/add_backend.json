@@ -3,10 +3,10 @@
   "version": 0,
   "type": "PROXY",
   "data": {
-    "type": "ADD_INSTANCE",
+    "type": "ADD_BACKEND",
     "data": {
       "app_id": "xxx",
-      "instance_id": "xxx-0",
+      "backend_id": "xxx-0",
       "ip_address": "127.0.0.1",
       "port": 8080
     }

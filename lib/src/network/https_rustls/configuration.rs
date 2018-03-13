@@ -62,7 +62,7 @@ pub struct ServerConfiguration {
   listener:        Option<TcpListener>,
   address:         SocketAddr,
   applications:    HashMap<AppId, Application>,
-  instances:       BackendMap,
+  backends:        BackendMap,
   fronts:          HashMap<HostName, Vec<TlsApp>>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
@@ -108,7 +108,7 @@ impl ServerConfiguration {
       listener:        listener,
       address:         config.front.clone(),
       applications:    HashMap::new(),
-      instances:       BackendMap::new(),
+      backends:        BackendMap::new(),
       fronts:          HashMap::new(),
       pool:            pool,
       answers:         default,
@@ -195,12 +195,12 @@ impl ServerConfiguration {
     (*self.resolver).add_certificate(add);
   }
 
-  pub fn add_instance(&mut self, app_id: &str, instance_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
-    self.instances.add_instance(app_id, instance_id, instance_address);
+  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
+    self.backends.add_backend(app_id, backend_id, backend_address);
   }
 
-  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) {
-    self.instances.remove_instance(app_id, instance_address);
+  pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
+    self.backends.remove_backend(app_id, backend_address);
   }
 
   // ToDo factor out with http.rs
@@ -253,7 +253,7 @@ impl ServerConfiguration {
     if let Some(app_id) = self.frontend_from_request(real_host, uri).map(|ref front| front.app_id.clone()) {
       client.http().map(|h| h.set_app_id(app_id.clone()));
 
-      match self.instances.backend_from_app_id(&app_id) {
+      match self.backends.backend_from_app_id(&app_id) {
         Err(e) => {
           client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
           Err(e)
@@ -263,9 +263,9 @@ impl ServerConfiguration {
           if front_should_stick {
             client.http().map(|http| http.sticky_session = Some(StickySession::new(backend.borrow().id.clone())));
           }
-          client.metrics.backend_id = Some(backend.borrow().instance_id.clone());
+          client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
           client.metrics.backend_start();
-          client.instance = Some(backend);
+          client.backend = Some(backend);
 
           Ok(conn)
         }
@@ -278,7 +278,7 @@ impl ServerConfiguration {
   pub fn backend_from_sticky_session(&mut self, client: &mut TlsClient, app_id: &str, sticky_session: u32) -> Result<TcpStream,ConnectionError> {
     client.http().map(|h| h.set_app_id(String::from(app_id)));
 
-    match self.instances.backend_from_sticky_session(app_id, sticky_session) {
+    match self.backends.backend_from_sticky_session(app_id, sticky_session) {
       Err(e) => {
         debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
         client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
@@ -287,9 +287,9 @@ impl ServerConfiguration {
       Ok((backend, conn))  => {
         client.back_connected = BackendConnectionStatus::Connecting;
         client.http().map(|http| http.sticky_session = Some(StickySession::new(backend.borrow().id.clone())));
-        client.metrics.backend_id = Some(backend.borrow().instance_id.clone());
+        client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
         client.metrics.backend_start();
-        client.instance = Some(backend);
+        client.backend = Some(backend);
 
         Ok(conn)
       }
@@ -380,16 +380,16 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
 
       if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
-        if client.instance.as_ref().map(|instance| {
-           let ref backend = *instance.borrow();
-           self.instances.has_backend(&app_id, backend)
+        if client.backend.as_ref().map(|backend| {
+           let ref backend = *backend.borrow();
+           self.backends.has_backend(&app_id, backend)
         }).unwrap_or(false) {
           //matched on keepalive
-          client.metrics.backend_id = client.instance.as_ref().map(|i| i.borrow().instance_id.clone());
+          client.metrics.backend_id = client.backend.as_ref().map(|i| i.borrow().backend_id.clone());
           client.metrics.backend_start();
           return Ok(BackendConnectAction::Reuse);
         } else {
-          client.instance = None;
+          client.backend = None;
           client.back_connected = BackendConnectionStatus::NotConnected;
           //client.readiness().back_interest  = UnixReady::from(Ready::empty());
           client.readiness().back_readiness = UnixReady::from(Ready::empty());
@@ -402,14 +402,14 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
       // circuit breaker
       if client.back_connected == BackendConnectionStatus::Connecting {
-        client.instance.as_ref().map(|instance| {
-          let ref mut backend = *instance.borrow_mut();
+        client.backend.as_ref().map(|backend| {
+          let ref mut backend = *backend.borrow_mut();
           backend.dec_connections();
           backend.failures += 1;
           backend.retry_policy.fail();
         });
 
-        client.instance = None;
+        client.backend = None;
         client.back_connected = BackendConnectionStatus::NotConnected;
         client.readiness().back_interest  = UnixReady::from(Ready::empty());
         client.readiness().back_readiness = UnixReady::from(Ready::empty());
@@ -435,7 +435,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
           //deregister back socket if it is the wrong one or if it was not connecting
           if old_app_id.is_some() && old_app_id != new_app_id {
-            client.instance = None;
+            client.backend = None;
             client.back_connected = BackendConnectionStatus::NotConnected;
             client.readiness().back_readiness = UnixReady::from(Ready::empty());
             client.back_socket().as_ref().map(|sock| {
@@ -549,24 +549,24 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         //FIXME: should return an error if certificate still has fronts referencing it
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
-      Order::AddInstance(instance) => {
-        debug!("{} add instance {:?}", message.id, instance);
-        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+      Order::AddBackend(backend) => {
+        debug!("{} add backend {:?}", message.id, backend);
+        let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
-          self.add_instance(&instance.app_id, &instance.instance_id, &addr, event_loop);
+          self.add_backend(&backend.app_id, &backend.backend_id, &addr, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }
         }
       },
-      Order::RemoveInstance(instance) => {
-        debug!("{} remove instance {:?}", message.id, instance);
-        remove_backend_metrics!(&instance.instance_id);
-        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+      Order::RemoveBackend(backend) => {
+        debug!("{} remove backend {:?}", message.id, backend);
+        remove_backend_metrics!(&backend.backend_id);
+        let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
-          self.remove_instance(&instance.app_id, &addr, event_loop);
+          self.remove_backend(&backend.app_id, &addr, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }
@@ -614,7 +614,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   }
 
   fn close_backend(&mut self, app_id: AppId, addr: &SocketAddr) {
-    self.instances.close_backend_connection(&app_id, &addr);
+    self.backends.close_backend_connection(&app_id, &addr);
   }
 }
 

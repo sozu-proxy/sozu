@@ -23,7 +23,7 @@ use pool::{Pool,Checkout,Reset};
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
-use sozu_command::messages::{self,TcpFront,Order,Instance,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
+use sozu_command::messages::{self,TcpFront,Order,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
@@ -539,7 +539,7 @@ pub struct ApplicationConfiguration {
 
 pub struct ServerConfiguration {
   fronts:          HashMap<String, Token>,
-  instances:       HashMap<String, Vec<Backend>>,
+  backends:        HashMap<String, Vec<Backend>>,
   listeners:       HashMap<Token, ApplicationListener>,
   configs:         HashMap<AppId, ApplicationConfiguration>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
@@ -550,7 +550,7 @@ impl ServerConfiguration {
     mut tcp_listener: Vec<(AppId, TcpListener)>, mut tokens: Vec<Token>) -> (ServerConfiguration, HashSet<Token>) {
 
     let mut configuration = ServerConfiguration {
-      instances:     HashMap::new(),
+      backends:      HashMap::new(),
       listeners:     HashMap::new(),
       configs:       HashMap::new(),
       fronts:        HashMap::new(),
@@ -604,7 +604,7 @@ impl ServerConfiguration {
     }
 
     if let Ok(listener) = server_bind(front) {
-      let addresses: Vec<SocketAddr> = if let Some(ads) = self.instances.get(app_id) {
+      let addresses: Vec<SocketAddr> = if let Some(ads) = self.backends.get(app_id) {
         let v: Vec<SocketAddr> = ads.iter().map(|backend| backend.address).collect();
         v
       } else {
@@ -646,37 +646,37 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_instance(&mut self, app_id: &str, instance_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken> {
+  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken> {
     use std::borrow::BorrowMut;
-    if let Some(addrs) = self.instances.get_mut(app_id) {
+    if let Some(addrs) = self.backends.get_mut(app_id) {
       let id = addrs.last().map(|mut b| (*b.borrow_mut()).id ).unwrap_or(0) + 1;
-      let backend = Backend::new(instance_id, *instance_address, id);
+      let backend = Backend::new(backend_id, *backend_address, id);
       if !addrs.contains(&backend) {
         addrs.push(backend);
       }
     }
 
-    if self.instances.get(app_id).is_none() {
-      let backend = Backend::new(instance_id, *instance_address, 0);
-      self.instances.insert(String::from(app_id), vec![backend]);
+    if self.backends.get(app_id).is_none() {
+      let backend = Backend::new(backend_id, *backend_address, 0);
+      self.backends.insert(String::from(app_id), vec![backend]);
     }
 
     let opt_tok = self.fronts.get(app_id).clone();
     if let Some(tok) = opt_tok {
       self.listeners.get_mut(&tok).map(|listener| {
-        listener.back_addresses.push(*instance_address);
+        listener.back_addresses.push(*backend_address);
       });
       //let application_listener = &mut self.listeners[&tok];
 
-      //application_listener.back_addresses.push(*instance_address);
+      //application_listener.back_addresses.push(*backend_address);
       Some(ListenToken(tok.0))
     } else {
-      error!("No front for instance {} in app {}", instance_id, app_id);
+      error!("No front for backend {} in app {}", backend_id, app_id);
       None
     }
   }
 
-  pub fn remove_instance(&mut self, app_id: &str, instance_address: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken>{
+  pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken>{
       // ToDo
       None
   }
@@ -737,24 +737,24 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let _ = self.remove_tcp_front(front.app_id, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
       },
-      Order::AddInstance(instance) => {
-        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+      Order::AddBackend(backend) => {
+        let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let addr = &addr_string.parse().unwrap();
-        if let Some(token) = self.add_instance(&instance.app_id, &instance.instance_id, addr, event_loop) {
+        if let Some(token) = self.add_backend(&backend.app_id, &backend.backend_id, addr, event_loop) {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
         } else {
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot add tcp instance")), data: None}
+          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot add tcp backend")), data: None}
         }
       },
-      Order::RemoveInstance(instance) => {
-        trace!("{:?}", instance);
-        let addr_string = instance.ip_address + ":" + &instance.port.to_string();
+      Order::RemoveBackend(backend) => {
+        trace!("{:?}", backend);
+        let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let addr = &addr_string.parse().unwrap();
-        if let Some(token) = self.remove_instance(&instance.app_id, addr, event_loop) {
+        if let Some(token) = self.remove_backend(&backend.app_id, addr, event_loop) {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
         } else {
-          error!("Couldn't remove tcp instance");
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot remove tcp instance")), data: None}
+          error!("Couldn't remove tcp backend");
+          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot remove tcp backend")), data: None}
         }
       },
       Order::SoftStop => {
@@ -861,8 +861,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   }
 
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {
-    if let Some(app_instances) = self.instances.get_mut(&app_id) {
-      if let Some(ref mut backend) = app_instances.iter_mut().find(|backend| &backend.address == addr) {
+    if let Some(app_backends) = self.backends.get_mut(&app_id) {
+      if let Some(ref mut backend) = app_backends.iter_mut().find(|backend| &backend.address == addr) {
         backend.dec_connections();
       }
     }
@@ -908,15 +908,15 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       ip_address: String::from("127.0.0.1"),
       port: 1234,
     };
-    let instance = Instance {
+    let backend = messages::Backend {
       app_id: String::from("yolo"),
-      instance_id: String::from("yolo-0"),
+      backend_id: String::from("yolo-0"),
       ip_address: String::from("127.0.0.1"),
       port: 5678,
     };
 
     command.write_message(&OrderMessage { id: String::from("ID_YOLO1"), order: Order::AddTcpFront(front) });
-    command.write_message(&OrderMessage { id: String::from("ID_YOLO2"), order: Order::AddInstance(instance) });
+    command.write_message(&OrderMessage { id: String::from("ID_YOLO2"), order: Order::AddBackend(backend) });
   }
   {
     let front = TcpFront {
@@ -924,14 +924,14 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       ip_address: String::from("127.0.0.1"),
       port: 1235,
     };
-    let instance = Instance {
+    let backend = messages::Backend {
       app_id: String::from("yolo"),
-      instance_id: String::from("yolo-0"),
+      backend_id: String::from("yolo-0"),
       ip_address: String::from("127.0.0.1"),
       port: 5678,
     };
     command.write_message(&OrderMessage { id: String::from("ID_YOLO3"), order: Order::AddTcpFront(front) });
-    command.write_message(&OrderMessage { id: String::from("ID_YOLO4"), order: Order::AddInstance(instance) });
+    command.write_message(&OrderMessage { id: String::from("ID_YOLO4"), order: Order::AddBackend(backend) });
   }
   command
 }
