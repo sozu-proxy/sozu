@@ -126,7 +126,7 @@ impl Client {
 
     if let Some(backend_id) = self.metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = self.metrics.backend_response_time() {
-        record_backend_metrics!(backend_id, backend_response_time.num_milliseconds(),
+        record_backend_metrics!(app_id, backend_id, backend_response_time.num_milliseconds(),
           self.metrics.backend_bin, self.metrics.backend_bout);
       }
     }

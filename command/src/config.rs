@@ -168,8 +168,10 @@ pub struct TcpProxyConfig {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct MetricsConfig {
-  pub address: String,
-  pub port:    u16,
+  pub address:        String,
+  pub port:           u16,
+  #[serde(default)]
+  pub tagged_metrics: bool,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
@@ -622,6 +624,7 @@ mod tests {
       metrics: Some(MetricsConfig {
         address: String::from("192.168.59.103"),
         port:    8125,
+        tagged_metrics: false,
       }),
       http:  Some(http),
       https: Some(https),

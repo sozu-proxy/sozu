@@ -74,7 +74,9 @@ buffer_size = 16384
 #
 #[metrics]
 # address = "127.0.0.1"
-# port = 8080
+# port = 8125
+# use InfluxDB's statsd protocol flavor to add tags
+# tagged_metrics = false
 
 # options specific to the HTTP (plaintext) proxy
 [http]

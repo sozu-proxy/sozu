@@ -68,7 +68,8 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
   let proxy_config = command.read_message().expect("worker could not read configuration from socket");
   //println!("got message: {:?}", proxy_config);
 
-  logging::setup(format!("{}-{:02}", "WRK", id), &proxy_config.log_level, &proxy_config.log_target);
+  let worker_id = format!("{}-{:02}", "WRK", id);
+  logging::setup(worker_id.clone(), &proxy_config.log_level, &proxy_config.log_target);
   info!("worker {} starting...", id);
 
   command.set_nonblocking(true);
@@ -76,7 +77,7 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
   command.readiness.insert(Ready::readable());
 
   if let Some(ref metrics) = proxy_config.metrics.as_ref() {
-    metrics_set_up!(&metrics.address[..], metrics.port);
+    metrics_set_up!(&metrics.address[..], metrics.port, worker_id,  metrics.tagged_metrics);
   }
 
   let mut server = Server::new_from_config(command, ScmSocket::new(scm), proxy_config, config_state);

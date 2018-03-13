@@ -121,14 +121,14 @@ fn main() {
                       Some(config_file) => config_file,
                       None => option_env!("SOZU_CONFIG").expect("could not find `SOZU_CONFIG` env var at build"),
                     };
-                    
+
   if let Ok(config) = Config::load_from_path(config_file) {
     //FIXME: should have an id for the master too
     logging::setup("MASTER".to_string(), &config.log_level, &config.log_target);
     info!("starting up");
 
     if let Some(ref metrics) = config.metrics.as_ref() {
-      metrics_set_up!(&metrics.address[..], metrics.port);
+      metrics_set_up!(&metrics.address[..], metrics.port, "MASTER".to_string(), metrics.tagged_metrics);
     }
 
 

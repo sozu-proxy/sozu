@@ -37,31 +37,35 @@ pub struct BackendMetrics {
   pub response_time: Histogram<u32>,
   pub bin:           usize,
   pub bout:          usize,
+  pub app_id:        String,
 }
 
 impl BackendMetrics {
-  pub fn new(h: Histogram<u32>) -> BackendMetrics {
+  pub fn new(app_id: String, h: Histogram<u32>) -> BackendMetrics {
     BackendMetrics {
       response_time: h,
       bin:           0,
       bout:          0,
+      app_id:        app_id,
     }
   }
 }
 
 #[derive(Debug)]
 pub struct ProxyMetrics {
-  pub buffer:      Buffer,
-  pub prefix:      String,
-  pub created:     Instant,
-  pub data:        BTreeMap<String, StoredMetricData>,
+  pub buffer:          Buffer,
+  pub prefix:          String,
+  pub created:         Instant,
+  pub data:            BTreeMap<String, StoredMetricData>,
   /// app_id -> response time histogram (in ms)
-  pub app_data:    BTreeMap<String,Histogram<u32>>,
-  /// app_id -> response time histogram (in ms)
-  pub backend_data: BTreeMap<String,BackendMetrics>,
+  pub app_data:        BTreeMap<String,Histogram<u32>>,
+  /// backend_id -> response time histogram (in ms)
+  pub backend_data:    BTreeMap<String,BackendMetrics>,
   pub request_counter: TimeSerie,
-  pub is_writable: bool,
-  remote:          Option<(SocketAddr, UdpSocket)>,
+  pub is_writable:     bool,
+  use_tagged_metrics:  bool,
+  origin:              String,
+  remote:              Option<(SocketAddr, UdpSocket)>,
 }
 
 impl ProxyMetrics {
@@ -74,13 +78,23 @@ impl ProxyMetrics {
       app_data:    BTreeMap::new(),
       backend_data: BTreeMap::new(),
       request_counter: TimeSerie::new(),
-      remote:      None,
       is_writable: false,
+      use_tagged_metrics: false,
+      remote:      None,
+      origin:      String::from("x"),
     }
   }
 
   pub fn set_up_remote(&mut self, socket: UdpSocket, addr: SocketAddr) {
     self.remote = Some((addr, socket));
+  }
+
+  pub fn set_up_origin(&mut self, origin: String) {
+    self.origin = origin;
+  }
+
+  pub fn set_up_tagged_metrics(&mut self, tagged: bool) {
+    self.use_tagged_metrics = tagged;
   }
 
   pub fn socket(&self) -> Option<&UdpSocket> {
@@ -253,8 +267,15 @@ impl ProxyMetrics {
     let now  = Instant::now();
     let secs = Duration::new(2, 0);
 
+    //FIXME: fill app and backend data too
     if now.duration_since(self.request_counter.sent_at) > secs {
-      if self.buffer.write_fmt(format_args!("{}.{}:{}|g\n", self.prefix, "requests", self.request_counter.last_sent)).is_ok() {
+      let res = if self.use_tagged_metrics {
+        self.buffer.write_fmt(format_args!("{}.{},origin={}:{}|g\n", self.prefix, "requests", self.origin, self.request_counter.last_sent))
+      } else {
+        self.buffer.write_fmt(format_args!("{}.{}.{}:{}|g\n", self.prefix, self.origin, "requests", self.request_counter.last_sent))
+      };
+
+      if res.is_ok() {
         self.request_counter.update_sent_at(now);
       }
     }
@@ -263,14 +284,26 @@ impl ProxyMetrics {
       //info!("will write {} -> {:#?}", key, stored_metric);
       match stored_metric.data {
         MetricData::Gauge(value) => {
-          if self.buffer.write_fmt(format_args!("{}.{}:{}|g\n", self.prefix, key, value)).is_ok() {
+          let res = if self.use_tagged_metrics {
+            self.buffer.write_fmt(format_args!("{}.{},origin={}:{}|g\n", self.prefix, key, self.origin, value))
+          } else {
+            self.buffer.write_fmt(format_args!("{}.{}.{}:{}|g\n", self.prefix, self.origin, key, value))
+          };
+
+          if res.is_ok() {
             stored_metric.last_sent = now;
           } else {
             break;
           }
         },
         MetricData::Count(value) => {
-          if self.buffer.write_fmt(format_args!("{}.{}:{}|g\n", self.prefix, key, value)).is_ok() {
+          let res = if self.use_tagged_metrics {
+            self.buffer.write_fmt(format_args!("{}.{},origin={}:{}|g\n", self.prefix, key, self.origin, value))
+          } else {
+            self.buffer.write_fmt(format_args!("{}.{}.{}:{}|g\n", self.prefix, self.origin, key, value))
+          };
+
+          if res.is_ok() {
             stored_metric.last_sent = now;
           } else {
             break;
@@ -279,7 +312,14 @@ impl ProxyMetrics {
         MetricData::Time(begin, Some(end)) => {
           let duration = end.duration_since(begin);
           let millis = duration.as_secs() * 1000 + (duration.subsec_nanos() / 1000000) as u64;
-          if self.buffer.write_fmt(format_args!("{}.{}:{}|ms\n", self.prefix, key, millis)).is_ok() {
+
+          let res = if self.use_tagged_metrics {
+            self.buffer.write_fmt(format_args!("{}.{},origin={}:{}|ms\n", self.prefix, key, self.origin, millis))
+          } else {
+            self.buffer.write_fmt(format_args!("{}.{}.{}:{}|ms\n", self.prefix, self.origin, key, millis))
+          };
+
+          if res.is_ok() {
             //info!("wrote time to buffer:\n{}", str::from_utf8(self.buffer.data()).unwrap());
             stored_metric.last_sent = now;
           } else {
@@ -361,15 +401,18 @@ pub fn udp_bind() -> UdpSocket {
 
 #[macro_export]
 macro_rules! metrics_set_up (
-  ($host:expr, $port: expr) => {
+  ($host:expr, $port: expr, $origin: expr, $use_tagged_metrics: expr) => ({
+    use std::net::ToSocketAddrs;
     let metrics_socket = $crate::network::metrics::udp_bind();
 
     debug!("setting up metrics: local address = {:#?}", metrics_socket.local_addr());
     let metrics_host   = ($host, $port).to_socket_addrs().expect("could not parse address").next().expect("could not get first address");
     $crate::network::metrics::METRICS.with(|metrics| {
       (*metrics.borrow_mut()).set_up_remote(metrics_socket, metrics_host);
+      (*metrics.borrow_mut()).set_up_origin($origin);
+      (*metrics.borrow_mut()).set_up_tagged_metrics($use_tagged_metrics);
     });
-  }
+  })
 );
 
 #[macro_export]
@@ -444,7 +487,7 @@ macro_rules! record_request_time (
 
 #[macro_export]
 macro_rules! record_backend_metrics (
-  ($backend_id:expr, $response_time: expr, $bin: expr, $bout: expr) => {
+  ($app_id:expr, $backend_id:expr, $response_time: expr, $bin: expr, $bout: expr) => {
     $crate::network::metrics::METRICS.with(|metrics| {
       let ref mut m = *metrics.borrow_mut();
       let key: &str = $backend_id;
@@ -456,7 +499,7 @@ macro_rules! record_backend_metrics (
         bm.bout += $bout;
       } else {
         if let Ok(hist) = ::hdrhistogram::Histogram::new(3) {
-          let mut bm = $crate::network::metrics::BackendMetrics::new(hist);
+          let mut bm = $crate::network::metrics::BackendMetrics::new($app_id.clone(), hist);
           bm.response_time.record($response_time as u64);
           bm.bin += $bin;
           bm.bout += $bout;

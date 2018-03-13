@@ -337,7 +337,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
-        record_backend_metrics!(backend_id, backend_response_time.num_milliseconds(), metrics.backend_bin, metrics.backend_bout);
+        record_backend_metrics!(app_id, backend_id, backend_response_time.num_milliseconds(), metrics.backend_bin, metrics.backend_bout);
       }
     }
 
@@ -402,7 +402,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
-        record_backend_metrics!(backend_id, backend_response_time.num_milliseconds(), metrics.backend_bin, metrics.backend_bout);
+        record_backend_metrics!(app_id, backend_id, backend_response_time.num_milliseconds(), metrics.backend_bin, metrics.backend_bout);
       }
     }*/
 

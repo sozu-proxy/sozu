@@ -121,6 +121,9 @@ pub fn begin_new_master_process(fd: i32, upgrade_fd: i32, command_buffer_size: u
 
   //FIXME: should have an id for the master too
   logging::setup("MASTER".to_string(), &upgrade_data.config.log_level, &upgrade_data.config.log_target);
+  if let Some(ref metrics) = upgrade_data.config.metrics.as_ref() {
+    metrics_set_up!(&metrics.address[..], metrics.port, "MASTER".to_string(), metrics.tagged_metrics);
+  }
   //info!("new master got upgrade data: {:?}", upgrade_data);
 
   let mut server = CommandServer::from_upgrade_data(upgrade_data);
