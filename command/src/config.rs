@@ -2,9 +2,11 @@
 use std::fs::File;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::iter::repeat;
 use std::net::ToSocketAddrs;
 use std::collections::HashMap;
 use std::io::{self,Error,ErrorKind,Read};
+
 use certificate::{calculate_fingerprint,split_certificate_chain};
 use toml;
 
@@ -422,10 +424,10 @@ impl FileConfig {
     match toml::from_str(&data) {
       Ok(config) => Ok(config),
       Err(e)     => {
-        println!("decoding error: {:?}", e);
+        display_toml_error(&data, &e);
         Err(Error::new(
           ErrorKind::InvalidData,
-          format!("decoding error: {:?}", e))
+          format!("decoding error: {}", e))
         )
       }
     }
@@ -568,6 +570,15 @@ impl Config {
     let mut data = Vec::new();
     try!(f.read_to_end(&mut data));
     Ok(data)
+  }
+}
+
+pub fn display_toml_error(file: &str, error: &toml::de::Error) {
+  println!("error parsing the configuration file: {}", error);
+  if let Some((line, column)) = error.line_col() {
+    let l_span = line.to_string().len();
+    println!("{}| {}", line + 1, file.lines().nth(line).unwrap());
+    println!("{}^", repeat(' ').take(l_span + 2 + column).collect::<String>());
   }
 }
 
