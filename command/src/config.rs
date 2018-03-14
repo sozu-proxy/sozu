@@ -9,7 +9,7 @@ use certificate::{calculate_fingerprint,split_certificate_chain};
 use toml;
 
 use messages::Application;
-use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,TcpFront,Instance,
+use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,TcpFront,Backend,
   HttpProxyConfiguration,HttpsProxyConfiguration,AddCertificate};
 
 use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
@@ -308,9 +308,9 @@ impl HttpAppConfig {
           let ip   = format!("{}", address.ip());
           let port = address.port();
 
-          v.push(Order::AddInstance(Instance {
+          v.push(Order::AddBackend(Backend {
             app_id:     self.app_id.clone(),
-            instance_id: format!("{}-{}", self.app_id, backend_count),
+            backend_id:  format!("{}-{}", self.app_id, backend_count),
             ip_address: ip,
             port:       port
           }));
@@ -359,9 +359,9 @@ impl TcpAppConfig {
           let ip   = format!("{}", address.ip());
           let port = address.port();
 
-          v.push(Order::AddInstance(Instance {
+          v.push(Order::AddBackend(Backend {
             app_id:     self.app_id.clone(),
-            instance_id: format!("{}-{}", self.app_id, backend_count),
+            backend_id: format!("{}-{}", self.app_id, backend_count),
             ip_address: ip,
             port:       port
           }));

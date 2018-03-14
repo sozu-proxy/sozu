@@ -37,9 +37,9 @@ fn main() {
     ip_address: String::from("127.0.0.1"),
     port:       8080,
   };
-  let tcp_instance = messages::Instance {
+  let tcp_backend = messages::Backend {
     app_id:      String::from("test"),
-    instance_id: String::from("test-0"),
+    backend_id:  String::from("test-0"),
     ip_address:  String::from("127.0.0.1"),
     port:        1026,
   };
@@ -51,7 +51,7 @@ fn main() {
 
   command.write_message(&messages::OrderMessage {
     id:    String::from("ID_EFGH"),
-    order: messages::Order::AddInstance(tcp_instance)
+    order: messages::Order::AddBackend(tcp_backend)
   });
 
   info!("TCP -> {:?}", command.read_message());

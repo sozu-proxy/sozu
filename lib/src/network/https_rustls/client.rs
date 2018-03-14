@@ -52,7 +52,7 @@ pub enum State {
 
 pub struct TlsClient {
   pub frontend_token: Token,
-  pub instance:       Option<Rc<RefCell<Backend>>>,
+  pub backend:        Option<Rc<RefCell<Backend>>>,
   pub back_connected: BackendConnectionStatus,
   protocol:           Option<State>,
   pub public_address: Option<IpAddr>,
@@ -68,7 +68,7 @@ impl TlsClient {
     let handshake = TlsHandshake::new(ssl, sock);
     let mut client = TlsClient {
       frontend_token: token,
-      instance:       None,
+      backend:        None,
       back_connected: BackendConnectionStatus::NotConnected,
       protocol:       Some(State::Handshake(handshake)),
       public_address: public_address,
@@ -275,8 +275,8 @@ impl TlsClient {
     self.back_connected = connected;
 
     if connected == BackendConnectionStatus::Connected {
-      self.instance.as_ref().map(|instance| {
-        let ref mut backend = *instance.borrow_mut();
+      self.backend.as_ref().map(|backend| {
+        let ref mut backend = *backend.borrow_mut();
         backend.failures = 0;
         backend.retry_policy.succeed();
       });

@@ -119,8 +119,8 @@ pub enum Order {
     AddTcpFront(TcpFront),
     RemoveTcpFront(TcpFront),
 
-    AddInstance(Instance),
-    RemoveInstance(Instance),
+    AddBackend(Backend),
+    RemoveBackend(Backend),
 
     HttpProxy(HttpProxyConfiguration),
     HttpsProxy(HttpsProxyConfiguration),
@@ -253,9 +253,9 @@ pub struct TcpFront {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct Instance {
+pub struct Backend {
     pub app_id:      String,
-    pub instance_id: String,
+    pub backend_id:  String,
     pub ip_address:  String,
     pub port:        u16
 }
@@ -364,7 +364,7 @@ pub struct QueryAnswerApplication {
   pub http_frontends:  Vec<HttpFront>,
   pub https_frontends: Vec<HttpsFront>,
   pub tcp_frontends:   Vec<TcpFront>,
-  pub backends:        Vec<Instance>,
+  pub backends:        Vec<Backend>,
 }
 
 impl Default for QueryAnswerApplication {
@@ -393,8 +393,8 @@ impl Order {
       Order::RemoveCertificate(_) => [Topic::HttpsProxyConfig].iter().cloned().collect(),
       Order::AddTcpFront(_)       => [Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::RemoveTcpFront(_)    => [Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::AddInstance(_)       => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::RemoveInstance(_)    => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::AddBackend(_)        => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::RemoveBackend(_)     => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::HttpProxy(_)         => [Topic::HttpProxyConfig].iter().cloned().collect(),
       Order::HttpsProxy(_)        => [Topic::HttpsProxyConfig].iter().cloned().collect(),
       Order::Query(_)             => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
@@ -446,26 +446,26 @@ mod tests {
 
 
   #[test]
-  fn add_instance_test() {
-    let raw_json = r#"{"type": "ADD_INSTANCE", "data": {"app_id": "xxx", "instance_id": "xxx-0", "ip_address": "yyy", "port": 8080}}"#;
+  fn add_backend_test() {
+    let raw_json = r#"{"type": "ADD_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "ip_address": "yyy", "port": 8080}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
-    assert!(command == Order::AddInstance(Instance{
+    assert!(command == Order::AddBackend(Backend{
       app_id: String::from("xxx"),
-      instance_id: String::from("xxx-0"),
+      backend_id: String::from("xxx-0"),
       ip_address: String::from("yyy"),
       port: 8080
     }));
   }
 
   #[test]
-  fn remove_instance_test() {
-    let raw_json = r#"{"type": "REMOVE_INSTANCE", "data": {"app_id": "xxx", "instance_id": "xxx-0", "ip_address": "yyy", "port": 8080}}"#;
+  fn remove_backend_test() {
+    let raw_json = r#"{"type": "REMOVE_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "ip_address": "yyy", "port": 8080}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
-    assert!(command == Order::RemoveInstance(Instance{
+    assert!(command == Order::RemoveBackend(Backend{
       app_id: String::from("xxx"),
-      instance_id: String::from("xxx-0"),
+      backend_id: String::from("xxx-0"),
       ip_address: String::from("yyy"),
       port: 8080
     }));

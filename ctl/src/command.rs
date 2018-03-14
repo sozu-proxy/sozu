@@ -2,7 +2,7 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
-use sozu_command::messages::{Application, Order, Instance, HttpFront, HttpsFront, TcpFront,
+use sozu_command::messages::{Application, Order, Backend, HttpFront, HttpsFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
   AddCertificate, RemoveCertificate, ReplaceCertificate};
 
@@ -847,19 +847,19 @@ pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>,
 }
 
 
-pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, instance_id: &str, ip: &str, port: u16) {
-  order_command(channel, timeout, Order::AddInstance(Instance {
+pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, backend_id: &str, ip: &str, port: u16) {
+  order_command(channel, timeout, Order::AddBackend(Backend {
       app_id: String::from(app_id),
-      instance_id: String::from(instance_id),
+      backend_id: String::from(backend_id),
       ip_address: String::from(ip),
       port: port
     }));
 }
 
-pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, instance_id: &str, ip: &str, port: u16) {
-    order_command(channel, timeout, Order::RemoveInstance(Instance {
+pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, backend_id: &str, ip: &str, port: u16) {
+    order_command(channel, timeout, Order::RemoveBackend(Backend {
       app_id: String::from(app_id),
-      instance_id: String::from(instance_id),
+      backend_id: String::from(backend_id),
       ip_address: String::from(ip),
       port: port
     }));
@@ -1008,7 +1008,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
 
               let mut backend_table = Table::new();
               let mut header = Vec::new();
-              header.push(cell!("instance id"));
+              header.push(cell!("backend id"));
               header.push(cell!("IP address"));
               header.push(cell!("port"));
               for ref key in data.keys() {
@@ -1116,7 +1116,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
 
               for (ref key, ref values) in backend_data.iter() {
                 let mut row = Vec::new();
-                row.push(cell!(key.instance_id));
+                row.push(cell!(key.backend_id));
                 row.push(cell!(key.ip_address));
                 row.push(cell!(format!("{}", key.port)));
 
@@ -1222,8 +1222,8 @@ fn order_command(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeou
             match order {
               Order::AddApplication(_) => println!("application added : {}", message.message),
               Order::RemoveApplication(_) => println!("application removed : {} ", message.message),
-              Order::AddInstance(_) => println!("backend added : {}", message.message),
-              Order::RemoveInstance(_) => println!("backend removed : {} ", message.message),
+              Order::AddBackend(_) => println!("backend added : {}", message.message),
+              Order::RemoveBackend(_) => println!("backend removed : {} ", message.message),
               Order::AddCertificate(_) => println!("certificate added: {}", message.message),
               Order::RemoveCertificate(_) => println!("certificate removed: {}", message.message),
               Order::AddHttpFront(_) => println!("front added: {}", message.message),

@@ -114,8 +114,8 @@ pub enum BackendCmd {
   Remove {
     #[structopt(short = "i", long = "id")]
     id: String,
-    #[structopt(long = "instance-id")]
-    instance_id: String,
+    #[structopt(long = "backend-id")]
+    backend_id: String,
     #[structopt(long = "ip")]
     ip: String,
     #[structopt(short = "p", long = "port")]
@@ -125,8 +125,8 @@ pub enum BackendCmd {
   Add {
     #[structopt(short = "i", long = "id")]
     id: String,
-    #[structopt(long = "instance-id")]
-    instance_id: String,
+    #[structopt(long = "backend-id")]
+    backend_id: String,
     #[structopt(long = "ip")]
     ip: String,
     #[structopt(short = "p", long = "port")]

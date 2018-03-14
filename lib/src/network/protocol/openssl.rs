@@ -44,7 +44,7 @@ impl TlsHandshake {
     match self.state {
       TlsState::Error(_) => return (ProtocolResult::Continue, ClientResult::CloseClient),
       TlsState::Initial => {
-        let ssl     = self.ssl.take().expect("TlsHandshake should have a Ssl instance");
+        let ssl     = self.ssl.take().expect("TlsHandshake should have a Ssl backend");
         let sock    = self.front.take().expect("TlsHandshake should have a front socket");
         let version = ssl.version();
         match ssl.accept(sock) {
@@ -72,7 +72,7 @@ impl TlsHandshake {
         }
       },
       TlsState::Handshake => {
-        let mid = self.mid.take().expect("TlsHandshake should have a MidHandshakeSslStream instance");
+        let mid = self.mid.take().expect("TlsHandshake should have a MidHandshakeSslStream backend");
         let version = mid.ssl().version();
         match mid.handshake() {
           Ok(stream) => {
