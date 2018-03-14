@@ -602,7 +602,7 @@ impl ServerConfiguration {
       */
       unsafe { from_utf8_unchecked(hostname) }
     } else {
-      error!("hostname parsing failed");
+      error!("hostname parsing failed for: '{}'", host);
       return None;
     };
 
@@ -692,7 +692,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         &h
       }
     } else {
-      error!("hostname parsing failed");
+      error!("hostname parsing failed for: '{}'", h);
       return Err(ConnectionError::ToBeDefined);
     };
 

@@ -216,7 +216,7 @@ impl ServerConfiguration {
       // chars in there
       unsafe { from_utf8_unchecked(hostname) }
     } else {
-      error!("hostname parsing failed");
+      error!("hostname parsing failed for: '{}'", host);
       return None;
     };
 
