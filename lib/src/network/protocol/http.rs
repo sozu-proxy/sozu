@@ -9,7 +9,7 @@ use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
 use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop,
   BufferMove, RequestState, ResponseState, Chunk, Continue, RRequestLine, RStatusLine};
-use network::{ClientResult,Protocol,Readiness,SessionMetrics};
+use network::{ClientResult,Protocol,Readiness,SessionMetrics, LogDuration};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult};
 use network::protocol::ProtocolResult;
@@ -329,11 +329,11 @@ impl<Front:SocketHandler> Http<Front> {
     let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or(String::from("-"));
     let status_line  = self.get_response_status().map(|line| format!("{} {}", line.status, line.reason)).unwrap_or(String::from("-"));
 
-    let response_time = metrics.response_time().num_milliseconds();
-    let service_time  = metrics.service_time().num_milliseconds();
+    let response_time = metrics.response_time();
+    let service_time  = metrics.service_time();
 
     let app_id = self.app_id.clone().unwrap_or(String::from("-"));
-    record_request_time!(&app_id, response_time);
+    record_request_time!(&app_id, response_time.num_milliseconds());
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
@@ -343,7 +343,8 @@ impl<Front:SocketHandler> Http<Front> {
 
     info!("{}{} -> {}\t{} {} {} {}\t{} {} {}",
       self.log_ctx, client, backend,
-      response_time, service_time, metrics.bin, metrics.bout,
+      LogDuration(response_time), LogDuration(service_time),
+      metrics.bin, metrics.bout,
       status_line, host, request_line);
   }
 
@@ -365,16 +366,16 @@ impl<Front:SocketHandler> Http<Front> {
     let host         = self.get_host().unwrap_or(String::from("-"));
     let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or(String::from("-"));
 
-    let response_time = metrics.response_time().num_milliseconds();
-    let service_time  = metrics.service_time().num_milliseconds();
+    let response_time = metrics.response_time();
+    let service_time  = metrics.service_time();
 
     if let Some(ref app_id) = self.app_id {
-      record_request_time!(app_id, response_time);
+      record_request_time!(app_id, response_time.num_milliseconds());
     }
 
     info!("{}\t {} -> X\t{} {} {}\t | {} {} {} {}", self.log_ctx,
         client, status_line, host, request_line,
-        response_time, service_time, metrics.bin, metrics.bout);
+        LogDuration(response_time), LogDuration(service_time), metrics.bin, metrics.bout);
   }
 
   pub fn log_request_error(&self, metrics: &SessionMetrics, message: &str) {
@@ -394,8 +395,8 @@ impl<Front:SocketHandler> Http<Front> {
     let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or(String::from("-"));
     let status_line  = self.get_response_status().map(|line| format!("{} {}", line.status, line.reason)).unwrap_or(String::from("-"));
 
-    let response_time = metrics.response_time().num_milliseconds();
-    let service_time  = metrics.service_time().num_milliseconds();
+    let response_time = metrics.response_time();
+    let service_time  = metrics.service_time();
 
     let app_id = self.app_id.clone().unwrap_or(String::from("-"));
     /*record_request_time!(&app_id, response_time);
@@ -408,7 +409,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     error!("{}{} -> {}\t{} {} {} {}\t{} {} {} | {}",
       self.log_ctx, client, backend,
-      response_time, service_time, metrics.bin, metrics.bout,
+      LogDuration(response_time), LogDuration(service_time), metrics.bin, metrics.bout,
       status_line, host, request_line, message);
   }
 
