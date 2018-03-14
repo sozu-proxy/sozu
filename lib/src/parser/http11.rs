@@ -237,7 +237,18 @@ fn is_hostname_char(i: u8) -> bool {
   b"-.".contains(&i)
 }
 
-named!(pub hostname_and_port<(&[u8],Option<&[u8]>)>, pair!(take_while!(is_hostname_char), opt!(complete!(preceded!(tag!(":"), digit)))));
+named!(pub hostname_and_port<(&[u8],Option<&[u8]>)>,
+  terminated!(
+    pair!(
+      take_while!(is_hostname_char),
+      opt!(complete!(preceded!(
+        tag!(":"),
+        digit
+      )))
+    ),
+    eof!()
+  )
+);
 
 use std::str::{from_utf8, FromStr};
 use nom::{Err,ErrorKind,Needed};
@@ -2935,6 +2946,21 @@ mod tests {
     assert_eq!(
       hostname_and_port(&b"rust-test.cleverapps.io"[..]),
       Done(&b""[..], (&b"rust-test.cleverapps.io"[..], None))
+    );
+
+    assert_eq!(
+      hostname_and_port(&b"localhost"[..]),
+      Done(&b""[..], (&b"localhost"[..], None))
+    );
+
+    assert_eq!(
+      hostname_and_port(&b"example.com:8080"[..]),
+      Done(&b""[..], (&b"example.com"[..], Some(&b"8080"[..])))
+    );
+
+    assert_eq!(
+      hostname_and_port(&b"test_example.com"[..]),
+      Error(error_code!(ErrorKind::Eof))
     );
   }
 
