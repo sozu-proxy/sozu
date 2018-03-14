@@ -470,7 +470,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     match res {
       SocketResult::Error => {
-        let error = format!("front socket error, closing the connection. Readiness: {:?}", self.readiness);
+        let error = format!("front socket error, closing the connection(read {} bytes). Readiness: {:?}", sz, self.readiness);
         self.log_request_error(metrics, &error);
         metrics.service_stop();
         incr_ereq!();

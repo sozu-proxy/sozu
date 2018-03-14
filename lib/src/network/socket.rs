@@ -84,10 +84,13 @@ impl SocketHandler for SslStream<TcpStream> {
         Err(Error::WantRead(_))  => return (size, SocketResult::WouldBlock),
         Err(Error::WantWrite(_)) => return (size, SocketResult::WouldBlock),
         Err(Error::Stream(e))    => {
-          error!("SOCKET-TLS\treadable TLS socket err={:?}", e);
+          error!("SOCKET-TLS\treadable TLS socket stream err={:?}", e);
           return (size, SocketResult::Error)
         },
-        _ => return (size, SocketResult::Error)
+        e => {
+          error!("SOCKET-TLS\treadable TLS socket other err={:?}", e);
+          return (size, SocketResult::Error)
+        }
       }
     }
   }
