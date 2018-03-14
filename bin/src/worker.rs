@@ -81,9 +81,9 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
 
   let mut server = Server::new_from_config(command, ScmSocket::new(scm), proxy_config, config_state);
 
-  info!("{} starting event loop", id);
+  info!("starting event loop");
   server.run();
-  info!("{} ending event loop", id);
+  info!("ending event loop");
 }
 
 pub fn start_worker_process(id: &str, config: &Config, executable_path: String, state: &ConfigState, listeners: Option<Listeners>) -> nix::Result<(pid_t, Channel<OrderMessage,OrderMessageAnswer>, ScmSocket)> {

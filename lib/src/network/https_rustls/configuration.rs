@@ -510,7 +510,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   }
 
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
-    info!("{} notified", message);
+    //info!("{} notified", message);
     match message.order {
       Order::AddApplication(application) => {
         debug!("{} add application {:?}", message.id, application);

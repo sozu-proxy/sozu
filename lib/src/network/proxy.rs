@@ -117,12 +117,12 @@ impl Server {
     let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(10+2*config.max_connections);
     {
       let entry = clients.vacant_entry().expect("client list should have enough room at startup");
-      info!("taking token {:?} for channel", entry.index());
+      trace!("taking token {:?} for channel", entry.index());
       entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::Channel })));
     }
     {
       let entry = clients.vacant_entry().expect("client list should have enough room at startup");
-      info!("taking token {:?} for metrics", entry.index());
+      trace!("taking token {:?} for metrics", entry.index());
       entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::Metrics })));
     }
 
@@ -134,7 +134,7 @@ impl Server {
 
       if listener_tokens.len() == 1 {
         let e = entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
-        info!("inserting http listener at token: {:?}", e.index());
+        trace!("inserting http listener at token: {:?}", e.index());
       }
       configuration
     });

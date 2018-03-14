@@ -45,7 +45,7 @@ impl CertificateResolver {
 
       let mut names = add_certificate.names;
       let fingerprint = calculate_fingerprint_from_der(&certified_key.cert[0].0);
-      info!("cert fingerprint: {:?}", fingerprint);
+      //info!("cert fingerprint: {:?}", fingerprint);
 
       let data = TlsData {
         cert:     certified_key,

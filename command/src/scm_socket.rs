@@ -81,7 +81,7 @@ impl ScmSocket {
 
     match self.rcv_msg(&mut buf, &mut received_fds) {
       Err(e) => {
-        error!("{} could not receive listeners: {:?}", self.fd, e);
+        error!("could not receive listeners (from fd {}): {:?}", self.fd, e);
         None
       },
       Ok((sz, fds_len)) => {
@@ -89,7 +89,7 @@ impl ScmSocket {
         match from_utf8(&buf[..sz]) {
           Ok(s) => match serde_json::from_str::<ListenersCount>(s) {
             Err(e) => {
-              error!("{} could not parse listeners list: {:?}", self.fd, e);
+              error!("could not parse listeners list (from fd {}): {:?}", self.fd, e);
               None
             },
             Ok(mut listeners_count) => {
@@ -117,7 +117,7 @@ impl ScmSocket {
             }
           }
           Err(e) => {
-            error!("{} could not parse listeners list: {:?}", self.fd, e);
+            error!("could not parse listeners list (from fd {}): {:?}", self.fd, e);
             None
           }
         }
