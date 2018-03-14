@@ -7,7 +7,6 @@ use std::ffi::CString;
 use std::iter::repeat;
 use std::ptr::null_mut;
 use std::process::Command;
-use std::net::ToSocketAddrs;
 use std::os::unix::process::CommandExt;
 use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd};
 use tempfile::tempfile;

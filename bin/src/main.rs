@@ -24,7 +24,6 @@ mod logging;
 mod upgrade;
 mod util;
 
-use std::net::ToSocketAddrs;
 use std::env;
 use std::panic;
 use sozu_command::config::Config;
