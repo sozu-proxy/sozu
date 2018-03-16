@@ -2981,7 +2981,7 @@ mod tests {
 
     assert_eq!(
       hostname_and_port(&b"test_example.com"[..]),
-      Error(error_code!(ErrorKind::Eof))
+      Error(error_position!(ErrorKind::Eof, &b"_example.com"[..]))
     );
   }
 
