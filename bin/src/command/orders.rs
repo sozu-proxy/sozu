@@ -248,6 +248,11 @@ impl CommandServer {
 
           }
         }
+
+        gauge!("configuration.applications", self.state.applications.len());
+        gauge!("configuration.backends", self.state.backends.len());
+        gauge!("configuration.frontends", self.state.http_fronts.len() + self.state.https_fronts.len()
+              + self.state.tcp_fronts.len());
       }
     }
   }
@@ -482,6 +487,11 @@ impl CommandServer {
       // FIXME: should send back error here
       error!("no proxy found");
     }
+
+    gauge!("configuration.applications", self.state.applications.len());
+    gauge!("configuration.backends", self.state.backends.len());
+    gauge!("configuration.frontends", self.state.http_fronts.len() + self.state.https_fronts.len()
+          + self.state.tcp_fronts.len());
   }
 
   pub fn load_static_application_configuration(&mut self) {

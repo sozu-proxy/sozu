@@ -634,6 +634,11 @@ pub fn start(config: Config, command_socket_path: String, proxies: Vec<Worker>) 
         server.load_state(None, "INITIALIZATION", state_path);
       });
 
+      gauge!("configuration.applications", server.state.applications.len());
+      gauge!("configuration.backends", server.state.backends.len());
+      gauge!("configuration.frontends", server.state.http_fronts.len() + server.state.https_fronts.len()
+            + server.state.tcp_fronts.len());
+
       info!("waiting for configuration client connections");
       server.run();
       //event_loop.run(&mut CommandServer::new(srv, proxies, buffer_size, max_buffer_size)).unwrap()
