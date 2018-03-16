@@ -24,6 +24,8 @@ pub trait RetryPolicy: Debug + PartialEq + Eq {
             Some(RetryAction::OKAY)
         }
     }
+
+    fn is_down(&self) -> bool;
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -93,6 +95,10 @@ impl RetryPolicy for ExponentialBackoffPolicy {
 
         Some(action)
     }
+
+    fn is_down(&self) -> bool {
+      self.current_tries() >= self.max_tries()
+    }
 }
 
 impl Into<RetryPolicyWrapper> for ExponentialBackoffPolicy {
@@ -130,6 +136,12 @@ impl RetryPolicy for RetryPolicyWrapper {
         match *self {
             RetryPolicyWrapper::ExponentialBackoff(ref policy) => policy
         }.can_try()
+    }
+
+    fn is_down(&self) -> bool {
+        match *self {
+            RetryPolicyWrapper::ExponentialBackoff(ref policy) => policy
+        }.is_down()
     }
 }
 

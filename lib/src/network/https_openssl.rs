@@ -1119,7 +1119,13 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           let ref mut backend = *backend.borrow_mut();
           backend.dec_connections();
           backend.failures += 1;
+
+          let already_unavailable = backend.retry_policy.is_down();
           backend.retry_policy.fail();
+          count!("backend.connections.error", 1);
+          if !already_unavailable && backend.retry_policy.is_down() {
+            count!("backend.down", 1);
+          }
         });
 
         client.backend = None;
