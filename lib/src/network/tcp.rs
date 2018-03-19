@@ -34,6 +34,7 @@ use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::{http,https_rustls};
 use network::protocol::{Pipe, ProtocolResult};
 use network::protocol::proxy_protocol::ProxyProtocol;
+use network::protocol::proxy_protocol::frontend::FrontendProxyProtocol;
 
 use util::UnwrapLog;
 
@@ -53,6 +54,7 @@ pub enum ConnectionStatus {
 pub enum State {
   Pipe(Pipe<TcpStream>),
   ProxyProtocol(ProxyProtocol<TcpStream>),
+  FrontendProxyProtocol(FrontendProxyProtocol<TcpStream>),
 }
 
 pub struct Client {
@@ -171,6 +173,7 @@ impl Client {
   fn readable(&mut self) -> ClientResult {
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.readable(&mut self.metrics),
+      Some(State::FrontendProxyProtocol(ref mut pp)) => pp.readable(&mut self.metrics),
       _ => ClientResult::Continue,
     }
   }
@@ -194,9 +197,11 @@ impl Client {
 
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => res.1 = pipe.back_writable(&mut self.metrics),
+      Some(State::FrontendProxyProtocol(ref mut pp)) => {
+        res = pp.back_writable(&mut self.metrics);
+      },
       Some(State::ProxyProtocol(ref mut pp)) => {
-        res.0 = pp.back_writable().0;
-        res.1 = pp.back_writable().1;
+        res = pp.back_writable();
       }
       _ => unreachable!(),
     };
