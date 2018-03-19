@@ -1,4 +1,5 @@
 pub mod header;
+pub mod frontend;
 
 use std::net::IpAddr;
 use std::io::{Write, ErrorKind};
