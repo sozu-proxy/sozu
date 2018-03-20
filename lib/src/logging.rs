@@ -1,4 +1,5 @@
 use libc;
+use std::fs::File;
 use std::str::FromStr;
 use std::cell::RefCell;
 use std::cmp::{self,Ord};
@@ -74,6 +75,11 @@ impl Logger {
             println!("cannot write logs to TCP socket: {:?}", e);
           });
         },
+        LoggerBackend::File(ref mut file) => {
+          let _ = file.write_fmt(args).map_err(|e| {
+            println!("cannot write logs to file: {:?}", e);
+          });
+        },
       }
     }
   }
@@ -99,6 +105,11 @@ impl Logger {
         LoggerBackend::Tcp(ref mut socket) => {
           let _ = socket.write_fmt(args).map_err(|e| {
             println!("cannot write logs to TCP socket: {:?}", e);
+          });
+        },
+        LoggerBackend::File(ref mut file) => {
+          let _ = file.write_fmt(args).map_err(|e| {
+            println!("cannot write logs to file: {:?}", e);
           });
         },
       }
@@ -141,7 +152,8 @@ pub enum LoggerBackend {
   Stdout(Stdout),
   Unix(UnixDatagram),
   Udp(UdpSocket, SocketAddr),
-  Tcp(TcpStream)
+  Tcp(TcpStream),
+  File(File),
 }
 
 #[repr(usize)]

@@ -466,7 +466,8 @@ impl<Front:SocketHandler> Http<Front> {
 
     match res {
       SocketResult::Error => {
-        self.log_request_error(metrics, "front socket error, closing the connection");
+        self.log_request_error(metrics,
+          &format!("front socket error, closing the connection. Readiness: {:?}", self.readiness));
         metrics.service_stop();
         incr_ereq!();
         self.readiness.reset();

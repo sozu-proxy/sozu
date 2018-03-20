@@ -1,6 +1,7 @@
 use env;
 use std::io::stdout;
 use std::path::Path;
+use std::fs::OpenOptions;
 use rand::{Rng,thread_rng};
 use mio_uds::UnixDatagram;
 use std::net::{TcpStream,UdpSocket,ToSocketAddrs};
@@ -44,6 +45,15 @@ pub fn setup(tag: String, level: &str, target: &str) {
         let socket = UnixDatagram::bind(dir).unwrap();
         socket.connect(path).unwrap();
         LoggerBackend::Unix(socket)
+      }
+    } else if target.starts_with("file://") {
+      let path = Path::new(&target[7..]);
+      match OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => LoggerBackend::File(file),
+        Err(e)   => {
+          println!("invalid log target configuration: could not open file at {} (error: {:?})", &target[7..], e);
+          LoggerBackend::Stdout(stdout())
+        }
       }
     } else {
       println!("invalid log target configuration: {}", target);

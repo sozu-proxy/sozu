@@ -20,6 +20,9 @@ log_level = "info"
 # log_target     = "tcp://127.0.0.1:9876"
 # to a unix socket
 # log_target = "unix:///var/sozu/logs
+# to a file
+# log_target = "file:///var/logs/sozu.log"
+# to_stdout
 log_target = "stdout"
 
 # path to the unix socket file used to send commands to sozu
