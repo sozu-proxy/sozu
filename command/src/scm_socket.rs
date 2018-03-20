@@ -138,7 +138,7 @@ impl ScmSocket {
       //println!("{} send with data", self.fd);
       socket::sendmsg(self.fd, &iov, &cmsgs, flags, None)?;
     } else {
-      println!("{} send empty", self.fd);
+      //println!("{} send empty", self.fd);
       socket::sendmsg(self.fd, &iov, &[], flags, None)?;
     };
     Ok(())
