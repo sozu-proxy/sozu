@@ -25,6 +25,10 @@ log_level = "info"
 # to_stdout
 log_target = "stdout"
 
+# optional different target for access logs (IP addresses, domains, URI, HTTP status, etc)
+# It supports the same options as log_target
+# log_access_target = "file:///var/logs/sozu-access.log"
+
 # path to the unix socket file used to send commands to sozu
 command_socket = "./command_folder/sock"
 

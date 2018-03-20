@@ -120,7 +120,8 @@ pub fn begin_new_master_process(fd: i32, upgrade_fd: i32, command_buffer_size: u
   let upgrade_data: UpgradeData = serde_json::from_reader(upgrade_file).expect("could not parse upgrade data");
 
   //FIXME: should have an id for the master too
-  logging::setup("MASTER".to_string(), &upgrade_data.config.log_level, &upgrade_data.config.log_target);
+  logging::setup("MASTER".to_string(), &upgrade_data.config.log_level,
+    &upgrade_data.config.log_target, upgrade_data.config.log_access_target.as_ref().map(|s| s.as_str()));
   if let Some(ref metrics) = upgrade_data.config.metrics.as_ref() {
     metrics_set_up!(&metrics.address[..], metrics.port, "MASTER".to_string(), metrics.tagged_metrics);
   }

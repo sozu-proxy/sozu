@@ -405,6 +405,8 @@ pub struct FileConfig {
   pub saved_state:              Option<String>,
   pub log_level:                Option<String>,
   pub log_target:               Option<String>,
+  #[serde(default)]
+  pub log_access_target:        Option<String>,
   pub worker_count:             Option<u16>,
   pub worker_automatic_restart: Option<bool>,
   pub metrics:                  Option<MetricsConfig>,
@@ -458,6 +460,7 @@ impl FileConfig {
       saved_state: self.saved_state,
       log_level: self.log_level.unwrap_or(String::from("info")),
       log_target: self.log_target.unwrap_or(String::from("stdout")),
+      log_access_target: self.log_access_target,
       worker_count: self.worker_count.unwrap_or(2),
       worker_automatic_restart: self.worker_automatic_restart.unwrap_or(true),
       metrics: self.metrics,
@@ -483,6 +486,8 @@ pub struct Config {
   pub saved_state:              Option<String>,
   pub log_level:                String,
   pub log_target:               String,
+  #[serde(default)]
+  pub log_access_target:        Option<String>,
   pub worker_count:             u16,
   pub worker_automatic_restart: bool,
   pub metrics:                  Option<MetricsConfig>,
@@ -632,6 +637,7 @@ mod tests {
       max_command_buffer_size: None,
       log_level:  None,
       log_target: None,
+      log_access_target: None,
       metrics: Some(MetricsConfig {
         address: String::from("192.168.59.103"),
         port:    8125,

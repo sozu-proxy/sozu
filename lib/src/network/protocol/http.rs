@@ -341,7 +341,7 @@ impl<Front:SocketHandler> Http<Front> {
       }
     }
 
-    info!("{}{} -> {}\t{} {} {} {}\t{} {} {}",
+    info_access!("{}{} -> {}\t{} {} {} {}\t{} {} {}",
       self.log_ctx, client, backend,
       LogDuration(response_time), LogDuration(service_time),
       metrics.bin, metrics.bout,
@@ -373,7 +373,7 @@ impl<Front:SocketHandler> Http<Front> {
       record_request_time!(app_id, response_time.num_milliseconds());
     }
 
-    info!("{}\t {} -> X\t{} {} {}\t | {} {} {} {}", self.log_ctx,
+    info_access!("{}\t {} -> X\t{} {} {}\t | {} {} {} {}", self.log_ctx,
         client, status_line, host, request_line,
         LogDuration(response_time), LogDuration(service_time), metrics.bin, metrics.bout);
   }
@@ -407,7 +407,7 @@ impl<Front:SocketHandler> Http<Front> {
       }
     }*/
 
-    error!("{}{} -> {}\t{} {} {} {}\t{} {} {} | {}",
+    error_access!("{}{} -> {}\t{} {} {} {}\t{} {} {} | {}",
       self.log_ctx, client, backend,
       LogDuration(response_time), LogDuration(service_time), metrics.bin, metrics.bout,
       status_line, host, request_line, message);

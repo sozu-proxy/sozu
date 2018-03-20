@@ -123,7 +123,8 @@ fn main() {
 
   if let Ok(config) = Config::load_from_path(config_file) {
     //FIXME: should have an id for the master too
-    logging::setup("MASTER".to_string(), &config.log_level, &config.log_target);
+    logging::setup("MASTER".to_string(), &config.log_level,
+      &config.log_target, config.log_access_target.as_ref().map(|s| s.as_str()));
     info!("starting up");
 
     if let Some(ref metrics) = config.metrics.as_ref() {

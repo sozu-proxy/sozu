@@ -68,7 +68,8 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
   //println!("got message: {:?}", proxy_config);
 
   let worker_id = format!("{}-{:02}", "WRK", id);
-  logging::setup(worker_id.clone(), &proxy_config.log_level, &proxy_config.log_target);
+  logging::setup(worker_id.clone(), &proxy_config.log_level,
+    &proxy_config.log_target, proxy_config.log_access_target.as_ref().map(|s| s.as_str()));
   info!("worker {} starting...", id);
 
   command.set_nonblocking(true);

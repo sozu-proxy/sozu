@@ -17,10 +17,11 @@ thread_local! {
 
 
 pub struct Logger {
-  pub directives: Vec<LogDirective>,
-  pub backend:    LoggerBackend,
-  pub tag:        String,
-  pub pid:        i32,
+  pub directives:     Vec<LogDirective>,
+  pub backend:        LoggerBackend,
+  pub access_backend: Option<LoggerBackend>,
+  pub tag:            String,
+  pub pid:            i32,
 }
 
 impl Logger {
@@ -30,20 +31,22 @@ impl Logger {
         name:  None,
         level: LogLevelFilter::Error,
       }),
-      backend: LoggerBackend::Stdout(stdout()),
-      tag:     "SOZU".to_string(),
-      pid:     0,
+      backend:        LoggerBackend::Stdout(stdout()),
+      access_backend: None,
+      tag:            "SOZU".to_string(),
+    pid:            0,
     }
   }
 
-  pub fn init(tag: String, spec: &str, backend: LoggerBackend) {
+  pub fn init(tag: String, spec: &str, backend: LoggerBackend, access_backend: Option<LoggerBackend>) {
     let directives = parse_logging_spec(spec);
     LOGGER.with(|l| {
       let ref mut logger = *l.borrow_mut();
       logger.set_directives(directives);
-      logger.backend = backend;
-      logger.tag     = tag;
-      logger.pid     = unsafe { libc::getpid() };
+      logger.backend        = backend;
+      logger.access_backend = access_backend;
+      logger.tag            = tag;
+      logger.pid            = unsafe { libc::getpid() };
     });
 
     let _ = log::set_logger(|max_log_level| {
@@ -55,6 +58,39 @@ impl Logger {
   pub fn log<'a>(&mut self, meta: &LogMetadata, args: Arguments) {
     if self.enabled(meta) {
       match self.backend {
+        LoggerBackend::Stdout(ref mut stdout) => {
+          let _ = stdout.write_fmt(args);
+        },
+        //FIXME: should have a buffer to write to instead of allocating a string
+        LoggerBackend::Unix(ref mut socket) => {
+          let _ = socket.send(format(args).as_bytes()).map_err(|e| {
+            println!("cannot write logs to Unix socket: {:?}", e);
+          });
+        },
+        //FIXME: should have a buffer to write to instead of allocating a string
+        LoggerBackend::Udp(ref mut socket, ref address) => {
+          let _ = socket.send_to(format(args).as_bytes(), address).map_err(|e| {
+            println!("cannot write logs to UDP socket: {:?}", e);
+          });
+        }
+        LoggerBackend::Tcp(ref mut socket) => {
+          let _ = socket.write_fmt(args).map_err(|e| {
+            println!("cannot write logs to TCP socket: {:?}", e);
+          });
+        },
+        LoggerBackend::File(ref mut file) => {
+          let _ = file.write_fmt(args).map_err(|e| {
+            println!("cannot write logs to file: {:?}", e);
+          });
+        },
+      }
+    }
+  }
+
+  pub fn log_access<'a>(&mut self, meta: &LogMetadata, args: Arguments) {
+    if self.enabled(meta) {
+      let backend = self.access_backend.as_mut().unwrap_or(&mut self.backend);
+      match *backend {
         LoggerBackend::Stdout(ref mut stdout) => {
           let _ = stdout.write_fmt(args);
         },
@@ -449,12 +485,62 @@ macro_rules! log {
 }
 
 #[macro_export]
+macro_rules! log_access {
+    (__inner__ $target:expr, $lvl:expr, $format:expr, $level_tag:expr,
+     [$($transformed_args:ident),*], [$first_ident:ident $(, $other_idents:ident)*], $first_arg:expr $(, $other_args:expr)*) => ({
+      let $first_ident = &$first_arg;
+      log_access!(__inner__ $target, $lvl, $format, $level_tag, [$($transformed_args,)* $first_ident], [$($other_idents),*] $(, $other_args)*);
+    });
+
+    (__inner__ $target:expr, $lvl:expr, $format:expr, $level_tag:expr,
+     [$($final_args:ident),*], [$($idents:ident),*]) => ({
+      static _META: $crate::logging::LogMetadata = $crate::logging::LogMetadata {
+          level:  $lvl,
+          target: module_path!(),
+      };
+      {
+        $crate::logging::TAG.with(|tag| {
+          //let tag = t.borrow().tag;
+          $crate::logging::LOGGER.with(|l| {
+            let pid = l.borrow().pid;
+
+            l.borrow_mut().log_access(
+              &_META,
+              format_args!(
+                concat!("{} {} {} {} {}\t", $format, '\n'),
+                ::time::now_utc().rfc3339(), ::time::precise_time_ns(), pid, tag,
+                $level_tag $(, $final_args)*)
+            );
+          })
+        });
+      }
+    });
+    ($lvl:expr, $format:expr, $level_tag:expr $(, $args:expr)+) => {
+      log_access!(__inner__ module_path!(), $lvl, $format, $level_tag, [], [a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v]
+                  $(, $args)+)
+    };
+    ($lvl:expr, $format:expr, $level_tag:expr) => {
+      log_access!(__inner__ module_path!(), $lvl, $format, $level_tag, [], [a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v])
+    };
+}
+
+#[macro_export]
 macro_rules! error {
     ($format:expr, $($arg:tt)*) => {
         log!($crate::logging::LogLevel::Error, $format, "ERROR", $($arg)*);
     };
     ($format:expr) => {
         log!($crate::logging::LogLevel::Error, $format, "ERROR");
+    };
+}
+
+#[macro_export]
+macro_rules! error_access {
+    ($format:expr, $($arg:tt)*) => {
+        log_access!($crate::logging::LogLevel::Error, $format, "ERROR", $($arg)*);
+    };
+    ($format:expr) => {
+        log_access!($crate::logging::LogLevel::Error, $format, "ERROR");
     };
 }
 
@@ -476,6 +562,16 @@ macro_rules! info {
     };
     ($format:expr) => {
         log!($crate::logging::LogLevel::Info, $format, "INFO");
+    }
+}
+
+#[macro_export]
+macro_rules! info_access {
+    ($format:expr, $($arg:tt)*) => {
+        log_access!($crate::logging::LogLevel::Info, $format, "INFO", $($arg)*);
+    };
+    ($format:expr) => {
+        log_access!($crate::logging::LogLevel::Info, $format, "INFO");
     }
 }
 
