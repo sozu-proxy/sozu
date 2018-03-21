@@ -18,7 +18,7 @@ fn main() {
    Logger::init("EXAMPLE".to_string(), "info", LoggerBackend::Stdout(stdout()));
   }
   */
- Logger::init("EXAMPLE".to_string(), "debug", LoggerBackend::Stdout(stdout()));
+ Logger::init("EXAMPLE".to_string(), "debug", LoggerBackend::Stdout(stdout()), None);
 
   info!("starting up");
 
@@ -28,7 +28,7 @@ fn main() {
     let max_listeners = 500;
     let max_buffers   = 500;
     let buffer_size   = 16384;
-    Logger::init("TCP".to_string(), "debug", LoggerBackend::Stdout(stdout()));
+    Logger::init("TCP".to_string(), "debug", LoggerBackend::Stdout(stdout()), None);
     network::tcp::start(max_buffers, buffer_size, channel);
   });
 

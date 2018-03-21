@@ -13,9 +13,9 @@ use sozu::logging::{Logger,LoggerBackend};
 
 fn main() {
   if env::var("RUST_LOG").is_ok() {
-   Logger::init("EXAMPLE".to_string(), &env::var("RUST_LOG").expect("could not get the RUST_LOG env var"), LoggerBackend::Stdout(stdout()));
+   Logger::init("EXAMPLE".to_string(), &env::var("RUST_LOG").expect("could not get the RUST_LOG env var"), LoggerBackend::Stdout(stdout()), None);
   } else {
-   Logger::init("EXAMPLE".to_string(), "info", LoggerBackend::Stdout(stdout()));
+   Logger::init("EXAMPLE".to_string(), "info", LoggerBackend::Stdout(stdout()), None);
   }
 
   info!("starting up");

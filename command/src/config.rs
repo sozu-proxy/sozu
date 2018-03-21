@@ -610,6 +610,7 @@ mod tests {
       default_certificate_chain: None,
       default_key: None,
       default_name: None,
+      use_openssl: None,
     };
     println!("http: {:?}", to_string(&http));
     let https = ProxyConfig {
@@ -625,6 +626,7 @@ mod tests {
       default_certificate_chain: None,
       default_key: None,
       default_name: None,
+      use_openssl: None,
     };
     println!("https: {:?}", to_string(&https));
     let config = FileConfig {

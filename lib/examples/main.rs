@@ -4,7 +4,6 @@ extern crate sozu_command_lib as sozu_command;
 extern crate time;
 extern crate hex;
 
-use std::net::ToSocketAddrs;
 use std::thread;
 use std::env;
 use std::io::stdout;
@@ -15,9 +14,9 @@ use sozu_command::channel::Channel;
 
 fn main() {
   if env::var("RUST_LOG").is_ok() {
-   Logger::init("EXAMPLE".to_string(), &env::var("RUST_LOG").expect("could not get the RUST_LOG env var"), LoggerBackend::Stdout(stdout()));
+   Logger::init("EXAMPLE".to_string(), &env::var("RUST_LOG").expect("could not get the RUST_LOG env var"), LoggerBackend::Stdout(stdout()), None);
   } else {
-   Logger::init("EXAMPLE".to_string(), "info", LoggerBackend::Stdout(stdout()));
+   Logger::init("EXAMPLE".to_string(), "info", LoggerBackend::Stdout(stdout()), None);
   }
 
   info!("MAIN\tstarting up");
@@ -87,7 +86,7 @@ fn main() {
   let jg2 = thread::spawn(move || {
     let max_buffers = 500;
     let buffer_size = 16384;
-    network::https::start(config, channel2, max_buffers, buffer_size);
+    network::https_rustls::configuration::start(config, channel2, max_buffers, buffer_size);
   });
 
   let cert1 = include_str!("../assets/certificate.pem");
