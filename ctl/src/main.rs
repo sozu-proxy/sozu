@@ -56,7 +56,7 @@ fn main() {
     },
     SubCmd::Application{ cmd } => {
       match cmd {
-        ApplicationCmd::Add{ id, sticky_session, https_redirect, proxy_protocol } => add_application(channel, timeout, &id, sticky_session, https_redirect, proxy_protocol),
+        ApplicationCmd::Add{ id, sticky_session, https_redirect, send_proxy } => add_application(channel, timeout, &id, sticky_session, https_redirect, send_proxy),
         ApplicationCmd::Remove{ id } => remove_application(channel, timeout, &id),
       }
     },
