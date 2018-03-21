@@ -129,7 +129,6 @@ pub struct HeaderV2 {
   signature: [u8; 12], // hex 0D 0A 0D 0A 00 0D 0A 51 55 49 54 0A
   ver_and_cmd: u8,     // protocol version and command
   family: u8,          // protocol family and address
-  len: u16,            // number of following bytes part of the header
   addr: ProxyAddr,
 }
 
@@ -141,7 +140,6 @@ impl HeaderV2 {
       signature: [0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A],
       ver_and_cmd: 0x20,
       family: get_family(&addr),
-      len: addr.len(),
       addr,
     }
   }
@@ -151,7 +149,7 @@ impl HeaderV2 {
     header.extend_from_slice(&self.signature);
     header.push(self.ver_and_cmd);
     header.push(self.family);
-    header.extend_from_slice(&u16_to_array_of_u8(self.len));
+    header.extend_from_slice(&u16_to_array_of_u8(self.addr.len()));
     self.addr.into_bytes(&mut header);
     header
   }
