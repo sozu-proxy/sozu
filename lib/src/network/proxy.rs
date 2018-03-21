@@ -28,11 +28,12 @@ use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::state::{ConfigState,get_application_ids_by_domain};
 use sozu_command::messages::{self,TcpFront,Order,Backend,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer,QueryApplicationType};
+use sozu_command::messages::HttpsProxyConfiguration;
 
 use network::buffer_queue::BufferQueue;
 use network::{ClientResult,ConnectionError,Protocol,RequiredEvents,ProxyClient,ProxyConfiguration,
   CloseResult,AcceptError,BackendConnectAction};
-use network::{http,https,tcp};
+use network::{http,tcp,AppId};
 use network::metrics::METRICS;
 
 const SERVER: Token = Token(0);
@@ -85,11 +86,11 @@ pub struct Server {
   channel:         ProxyChannel,
   queue:           VecDeque<OrderMessageAnswer>,
   http:            Option<http::ServerConfiguration>,
-  https:           Option<https::ServerConfiguration>,
+  https:           Option<HttpsProvider>,
   tcp:             Option<tcp::ServerConfiguration>,
   config_state:    ConfigState,
   scm:             ScmSocket,
-  clients:         Slab<Rc<RefCell<ProxyClient>>,ClientToken>,
+  clients:         Slab<Rc<RefCell<ProxyClientCast>>,ClientToken>,
   max_connections: usize,
   nb_connections:  usize,
 }
@@ -114,7 +115,7 @@ impl Server {
 
     //FIXME: we will use a few entries for the channel, metrics socket and the listeners
     //FIXME: for HTTP/2, we will have more than 2 entries per client
-    let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(10+2*config.max_connections);
+    let mut clients: Slab<Rc<RefCell<ProxyClientCast>>,ClientToken> = Slab::with_capacity(10+2*config.max_connections);
     {
       let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       trace!("taking token {:?} for channel", entry.index());
@@ -142,7 +143,7 @@ impl Server {
     let https_session = config.https.and_then(|conf| conf.to_tls()).and_then(|https_conf| {
       let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       let token = Token(entry.index().0);
-      https::ServerConfiguration::new(https_conf, &mut event_loop, pool.clone(),
+      HttpsProvider::new(https_conf, &mut event_loop, pool.clone(),
       listeners.tls.map(|fd| unsafe { TcpListener::from_raw_fd(fd) }), token
       ).map(|(configuration, listener_tokens)| {
         if listener_tokens.len() == 1 {
@@ -182,9 +183,9 @@ impl Server {
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
-    clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken>,
+    clients: Slab<Rc<RefCell<ProxyClientCast>>,ClientToken>,
     http:  Option<http::ServerConfiguration>,
-    https: Option<https::ServerConfiguration>,
+    https: Option<HttpsProvider>,
     tcp:  Option<tcp::ServerConfiguration>,
     config_state: Option<ConfigState>,
     max_connections: usize) -> Self {
@@ -685,7 +686,7 @@ impl Server {
     let add = self.from_client_add();
     let res = {
       let cl = self.clients[token].clone();
-      let cl2: Rc<RefCell<ProxyClient>> = self.clients[token].clone();
+      let cl2: Rc<RefCell<ProxyClientCast>> = self.clients[token].clone();
       let protocol = { cl.borrow().protocol() };
       let entry = self.clients.vacant_entry();
       if entry.is_none() {
@@ -721,9 +722,7 @@ impl Server {
         },
         Protocol::HTTPS => {
           if let Some(mut https) = self.https.take() {
-            let mut b = cl2.borrow_mut();
-            let client: &mut https::TlsClient = b.as_https() ;
-            let r = https.connect_to_backend(&mut self.poll, client, back_token);
+            let r = https.connect_to_backend(&mut self.poll, cl2, back_token);
             self.https = Some(https);
             r
           } else {
@@ -881,18 +880,6 @@ impl ProxyClient for ListenClient {
     self.protocol
   }
 
-  fn as_http(&mut self) ->  &mut http::Client {
-    panic!();
-  }
-
-  fn as_tcp(&mut self) -> &mut tcp::Client {
-    panic!();
-  }
-
-  fn as_https(&mut self) -> &mut https::TlsClient {
-    panic!();
-  }
-
   fn ready(&mut self) -> ClientResult {
     ClientResult::Continue
   }
@@ -907,3 +894,236 @@ impl ProxyClient for ListenClient {
     None
   }
 }
+
+#[cfg(feature = "use-openssl")]
+use network::https_openssl;
+
+use network::https_rustls;
+
+#[cfg(feature = "use-openssl")]
+pub enum HttpsProvider {
+  Openssl(https_openssl::ServerConfiguration),
+  Rustls(https_rustls::configuration::ServerConfiguration),
+}
+
+#[cfg(not(feature = "use-openssl"))]
+pub enum HttpsProvider {
+  Rustls(https_rustls::configuration::ServerConfiguration),
+}
+
+#[cfg(feature = "use-openssl")]
+impl HttpsProvider {
+  pub fn new(config: HttpsProxyConfiguration, event_loop: &mut Poll,
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> io::Result<(HttpsProvider, HashSet<Token>)> {
+    if config.use_openssl {
+      https_openssl::ServerConfiguration::new(config, event_loop, pool,
+        tcp_listener, token).map(|(conf, set)| {
+          (HttpsProvider::Openssl(conf), set)
+      })
+    } else {
+      https_rustls::configuration::ServerConfiguration::new(config, event_loop, pool,
+        tcp_listener, token).map(|(conf, set)| {
+          (HttpsProvider::Rustls(conf), set)
+      })
+    }
+  }
+
+  pub fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
+    match self {
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.notify(event_loop, message),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.notify(event_loop, message),
+    }
+  }
+
+  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
+    match self {
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.give_back_listener(),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.give_back_listener(),
+    }
+  }
+
+  pub fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token) -> Result<(Rc<RefCell<ProxyClientCast>>,bool), AcceptError> {
+    match self {
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.accept(token, poll, client_token).map(|(r,b)| {
+        (r as Rc<RefCell<ProxyClientCast>>, b)
+      }),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.accept(token, poll, client_token).map(|(r,b)| {
+        (r as Rc<RefCell<ProxyClientCast>>, b)
+      }),
+    }
+  }
+
+  pub fn close_backend(&mut self, app_id: AppId, addr: &SocketAddr) {
+    match self {
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.close_backend(app_id, addr),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.close_backend(app_id, addr),
+    }
+  }
+
+  pub fn accept_flush(&mut self) {
+    match self {
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.accept_flush(),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.accept_flush(),
+    }
+  }
+
+  pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_client: Rc<RefCell<ProxyClientCast>>, back_token: Token)
+    -> Result<BackendConnectAction, ConnectionError> {
+
+    match self {
+      &mut HttpsProvider::Rustls(ref mut rustls)   => {
+        let mut b = proxy_client.borrow_mut();
+        let client: &mut https_rustls::client::TlsClient = b.as_https_rustls();
+        rustls.connect_to_backend(poll, client, back_token)
+      },
+      &mut HttpsProvider::Openssl(ref mut openssl) => {
+        let mut b = proxy_client.borrow_mut();
+        let client: &mut https_openssl::TlsClient = b.as_https_openssl();
+        openssl.connect_to_backend(poll, client, back_token)
+      }
+    }
+
+  }
+}
+
+use network::https_rustls::client::TlsClient;
+#[cfg(not(feature = "use-openssl"))]
+impl HttpsProvider {
+  pub fn new(config: HttpsProxyConfiguration, event_loop: &mut Poll,
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> io::Result<(HttpsProvider, HashSet<Token>)> {
+    if config.use_openssl {
+      error!("the openssl provider is not compiled, continuing with the rustls provider");
+    }
+
+    https_rustls::configuration::ServerConfiguration::new(config, event_loop, pool,
+      tcp_listener, token).map(|(conf, set)| {
+        (HttpsProvider::Rustls(conf), set)
+    })
+  }
+
+  pub fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
+    let &mut HttpsProvider::Rustls(ref mut rustls) = self;
+    rustls.notify(event_loop, message)
+  }
+
+  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
+    let &mut HttpsProvider::Rustls(ref mut rustls) = self;
+    rustls.give_back_listener()
+  }
+
+  pub fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token) -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
+    let &mut HttpsProvider::Rustls(ref mut rustls) = self;
+    rustls.accept(token, poll, client_token)
+  }
+
+  pub fn close_backend(&mut self, app_id: AppId, addr: &SocketAddr) {
+    let &mut HttpsProvider::Rustls(ref mut rustls) = self;
+    rustls.close_backend(app_id, addr);
+  }
+
+  pub fn accept_flush(&mut self) {
+    let &mut HttpsProvider::Rustls(ref mut rustls) = self;
+    rustls.accept_flush();
+  }
+
+  pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_client: Rc<RefCell<ProxyClientCast>>, back_token: Token)
+    -> Result<BackendConnectAction, ConnectionError> {
+    let &mut HttpsProvider::Rustls(ref mut rustls) = self;
+
+    let mut b = proxy_client.borrow_mut();
+    let client: &mut https_rustls::client::TlsClient = b.as_https_rustls() ;
+    rustls.connect_to_backend(poll, client, back_token)
+  }
+}
+
+#[cfg(not(feature = "use-openssl"))]
+/// this trait is used to work around the fact that we need to transform
+/// the clients (that are all stored as a ProxyClient in the slab) back
+/// to their original type to call the `connect_to_backend` method of
+/// their corresponding `ServerConfiguration`.
+/// If we find a way to make `connect_to_backend` work wothout transforming
+/// back to the type (example: storing a reference to the configuration
+/// in the client and making `connect_to_backend` a method of `ProxyClient`?),
+/// we'll be able to remove all those ugly casts and panics
+pub trait ProxyClientCast: ProxyClient {
+  fn as_tcp(&mut self) -> &mut tcp::Client;
+  fn as_http(&mut self) -> &mut http::Client;
+  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient;
+}
+
+#[cfg(feature = "use-openssl")]
+pub trait ProxyClientCast: ProxyClient {
+  fn as_tcp(&mut self) -> &mut tcp::Client;
+  fn as_http(&mut self) -> &mut http::Client;
+  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient;
+  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsClient;
+}
+
+#[cfg(not(feature = "use-openssl"))]
+impl ProxyClientCast for ListenClient {
+  fn as_http(&mut self) -> &mut http::Client { panic!() }
+  fn as_tcp(&mut self) -> &mut tcp::Client { panic!() }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { panic!() }
+}
+
+#[cfg(feature = "use-openssl")]
+impl ProxyClientCast for ListenClient {
+  fn as_http(&mut self) -> &mut http::Client { panic!() }
+  fn as_tcp(&mut self) -> &mut tcp::Client { panic!() }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { panic!() }
+  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsClient { panic!() }
+}
+
+#[cfg(not(feature = "use-openssl"))]
+impl ProxyClientCast for http::Client {
+  fn as_http(&mut self) -> &mut http::Client { self }
+  fn as_tcp(&mut self) -> &mut tcp::Client { panic!() }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { panic!() }
+}
+
+#[cfg(feature = "use-openssl")]
+impl ProxyClientCast for http::Client {
+  fn as_http(&mut self) -> &mut http::Client { self }
+  fn as_tcp(&mut self) -> &mut tcp::Client { panic!() }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { panic!() }
+  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsClient { panic!() }
+}
+
+#[cfg(not(feature = "use-openssl"))]
+impl ProxyClientCast for tcp::Client {
+  fn as_http(&mut self) -> &mut http::Client { panic!() }
+  fn as_tcp(&mut self) -> &mut tcp::Client { self }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { panic!() }
+}
+
+#[cfg(feature = "use-openssl")]
+impl ProxyClientCast for tcp::Client {
+  fn as_http(&mut self) -> &mut http::Client { panic!() }
+  fn as_tcp(&mut self) -> &mut tcp::Client { self }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { panic!() }
+  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsClient { panic!() }
+}
+
+#[cfg(not(feature = "use-openssl"))]
+impl ProxyClientCast for https_rustls::client::TlsClient {
+  fn as_http(&mut self) -> &mut http::Client { panic!() }
+  fn as_tcp(&mut self) -> &mut tcp::Client { panic!() }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { self }
+}
+
+#[cfg(feature = "use-openssl")]
+impl ProxyClientCast for https_rustls::client::TlsClient {
+  fn as_http(&mut self) -> &mut http::Client { panic!() }
+  fn as_tcp(&mut self) -> &mut tcp::Client { panic!() }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { self }
+  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsClient { panic!() }
+}
+
+#[cfg(feature = "use-openssl")]
+impl ProxyClientCast for https_openssl::TlsClient {
+  fn as_http(&mut self) -> &mut http::Client { panic!() }
+  fn as_tcp(&mut self) -> &mut tcp::Client { panic!() }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { panic!() }
+  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsClient { self }
+}
+

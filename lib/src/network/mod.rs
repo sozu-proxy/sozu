@@ -30,24 +30,7 @@ pub mod proxy;
 #[cfg(feature = "use-openssl")]
 pub mod https_openssl;
 
-#[cfg(feature = "use-openssl")]
-pub mod https {
-  pub type ServerConfiguration = super::https_openssl::ServerConfiguration;
-  pub type TlsClient           = super::https_openssl::TlsClient;
-
-  pub use super::https_openssl::start;
-}
-
-#[cfg(not(feature = "use-openssl"))]
 pub mod https_rustls;
-
-#[cfg(not(feature = "use-openssl"))]
-pub mod https {
-  pub type ServerConfiguration = super::https_rustls::configuration::ServerConfiguration;
-  pub type TlsClient           = super::https_rustls::client::TlsClient;
-
-  pub use super::https_rustls::configuration::start;
-}
 
 use mio::Token;
 
@@ -75,9 +58,6 @@ pub struct CloseResult {
 
 pub trait ProxyClient {
   fn protocol(&self)  -> Protocol;
-  fn as_tcp(&mut self) -> &mut tcp::Client;
-  fn as_http(&mut self) -> &mut http::Client;
-  fn as_https(&mut self) -> &mut https::TlsClient;
   fn ready(&mut self) -> ClientResult;
   fn process_events(&mut self, token: Token, events: Ready);
   fn close(&mut self, poll: &mut Poll) -> CloseResult;

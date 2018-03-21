@@ -36,13 +36,13 @@ use network::proxy::{Server,ProxyChannel,ListenToken};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
 use network::trie::*;
-use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
+use network::protocol::{ProtocolResult,Http,Pipe,StickySession};
+use network::protocol::rustls::TlsHandshake;
 use network::protocol::http::DefaultAnswerStatus;
 use network::retry::RetryPolicy;
 use network::tcp;
 use util::UnwrapLog;
 use super::configuration::{ServerConfiguration,TlsApp};
-
 
 pub enum State {
   Handshake(TlsHandshake),
@@ -352,18 +352,6 @@ impl ProxyClient for TlsClient {
     Protocol::HTTPS
   }
 
-  fn as_http(&mut self) -> &mut http::Client {
-    panic!();
-  }
-
-  fn as_tcp(&mut self) -> &mut tcp::Client {
-    panic!();
-  }
-
-  fn as_https(&mut self) -> &mut TlsClient {
-    self
-  }
-
   fn process_events(&mut self, token: Token, events: Ready) {
     self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
     if self.back_token() == Some(token) {
@@ -494,3 +482,4 @@ impl ProxyClient for TlsClient {
     ClientResult::Continue
   }
 }
+

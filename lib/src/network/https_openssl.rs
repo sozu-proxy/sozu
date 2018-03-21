@@ -46,11 +46,13 @@ use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken,ListenClient};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
-use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
+use network::protocol::{ProtocolResult,Http,Pipe,StickySession};
+use network::protocol::openssl::TlsHandshake;
 use network::protocol::http::DefaultAnswerStatus;
 use network::retry::RetryPolicy;
 use network::tcp;
 use util::UnwrapLog;
+use network::https_rustls;
 
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct TlsApp {
@@ -366,18 +368,6 @@ impl ProxyClient for TlsClient {
 
   fn protocol(&self) -> Protocol {
     Protocol::HTTPS
-  }
-
-  fn as_http(&mut self) -> &mut http::Client {
-    panic!();
-  }
-
-  fn as_tcp(&mut self) -> &mut tcp::Client {
-    panic!();
-  }
-
-  fn as_https(&mut self) -> &mut TlsClient {
-    self
   }
 
   fn process_events(&mut self, token: Token, events: Ready) {
@@ -1371,7 +1361,10 @@ fn setup_curves(_: &mut SslContextBuilder) -> Result<(), ErrorStack> {
   Ok(())
 }
 
+use network::proxy::HttpsProvider;
 pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
+  use network::proxy::ProxyClientCast;
+
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_listeners   = 1;
 
@@ -1379,7 +1372,7 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
 
-  let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(max_buffers);
+  let mut clients: Slab<Rc<RefCell<ProxyClientCast>>,ClientToken> = Slab::with_capacity(max_buffers);
   {
     let entry = clients.vacant_entry().expect("client list should have enough room at startup");
     info!("taking token {:?} for channel", entry.index());
@@ -1402,7 +1395,7 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
 
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
     let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      clients, None, Some(configuration), None, None, max_buffers);
+      clients, None, Some(HttpsProvider::Openssl(configuration)), None, None, max_buffers);
 
     info!("starting event loop");
     server.run();

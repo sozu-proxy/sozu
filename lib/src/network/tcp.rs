@@ -31,7 +31,7 @@ use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol
 use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken,ListenClient};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
-use network::{http,https};
+use network::{http,https_rustls};
 use network::protocol::{Pipe, ProtocolResult};
 use network::protocol::proxy_protocol::ProxyProtocol;
 
@@ -378,18 +378,6 @@ impl ProxyClient for Client {
 
   fn protocol(&self) -> Protocol {
     Protocol::TCP
-  }
-
-  fn as_http(&mut self) -> &mut http::Client {
-    panic!();
-  }
-
-  fn as_tcp(&mut self) -> &mut Client {
-    self
-  }
-
-  fn as_https(&mut self) -> &mut https::TlsClient {
-    panic!();
   }
 
   fn process_events(&mut self, token: Token, events: Ready) {
@@ -870,6 +858,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 }
 
 pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
+  use network::proxy::ProxyClientCast;
 
   info!("listen for connections");
   let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
@@ -882,7 +871,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
     ));
 
-    let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(max_buffers);
+    let mut clients: Slab<Rc<RefCell<ProxyClientCast>>,ClientToken> = Slab::with_capacity(max_buffers);
     {
       let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       info!("taking token {:?} for channel", entry.index());
@@ -937,12 +926,14 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
 }
 
 pub fn start(max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
+  use network::proxy::ProxyClientCast;
+
   let mut poll          = Poll::new().expect("could not create event loop");
   let pool = Rc::new(RefCell::new(
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
 
-  let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(max_buffers);
+  let mut clients: Slab<Rc<RefCell<ProxyClientCast>>,ClientToken> = Slab::with_capacity(max_buffers);
   {
     let entry = clients.vacant_entry().expect("client list should have enough room at startup");
     info!("taking token {:?} for channel", entry.index());

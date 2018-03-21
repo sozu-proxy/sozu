@@ -30,6 +30,7 @@ pub struct ProxyConfig {
   pub default_certificate_chain: Option<String>,
   pub default_key:               Option<String>,
   pub tls_versions:              Option<Vec<String>>,
+  pub use_openssl:               Option<bool>,
 }
 
 impl ProxyConfig {
@@ -157,6 +158,8 @@ impl ProxyConfig {
         .and_then(|mut file| file.read_to_end(&mut default_key).ok()).is_some() {
         configuration.default_key = Some(default_key);
       }
+
+      configuration.use_openssl = self.use_openssl.unwrap_or(false);
 
       configuration
 

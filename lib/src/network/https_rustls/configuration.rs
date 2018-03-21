@@ -624,7 +624,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   }
 }
 
+use network::proxy::HttpsProvider;
 pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
+  use network::proxy::ProxyClientCast;
+
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_listeners   = 1;
 
@@ -632,7 +635,7 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
 
-  let mut clients: Slab<Rc<RefCell<ProxyClient>>,ClientToken> = Slab::with_capacity(max_buffers);
+  let mut clients: Slab<Rc<RefCell<ProxyClientCast>>,ClientToken> = Slab::with_capacity(max_buffers);
   {
     let entry = clients.vacant_entry().expect("client list should have enough room at startup");
     info!("taking token {:?} for channel", entry.index());
@@ -653,7 +656,7 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
   if let Ok((configuration, listeners)) = ServerConfiguration::new(config, &mut event_loop, pool, None, token) {
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
     let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      clients, None, Some(configuration), None, None, max_buffers);
+      clients, None, Some(HttpsProvider::Rustls(configuration)), None, None, max_buffers);
 
     info!("starting event loop");
     server.run();

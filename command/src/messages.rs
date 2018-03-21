@@ -292,6 +292,8 @@ pub struct HttpsProxyConfiguration {
     pub default_certificate:       Option<Vec<u8>>,
     pub default_key:               Option<Vec<u8>>,
     pub default_certificate_chain: Option<String>,
+    #[serde(default)]
+    pub use_openssl:               bool,
 }
 
 impl Default for HttpsProxyConfiguration {
@@ -322,6 +324,7 @@ impl Default for HttpsProxyConfiguration {
       default_certificate: Some(Vec::from(&include_bytes!("../assets/certificate.pem")[..])),
       default_key:         Some(Vec::from(&include_bytes!("../assets/key.pem")[..])),
       default_certificate_chain: None,
+      use_openssl:         false,
     }
   }
 }
