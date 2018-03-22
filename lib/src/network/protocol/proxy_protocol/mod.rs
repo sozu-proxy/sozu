@@ -9,6 +9,7 @@ use mio::unix::UnixReady;
 use self::header::*;
 use network::ClientResult;
 use network::Readiness;
+use network::BackendConnectionStatus;
 use network::protocol::ProtocolResult;
 use network::socket::SocketHandler;
 
@@ -77,7 +78,6 @@ impl <Front:SocketHandler>ProxyProtocol<Front> {
   }
 
   pub fn set_back_socket(&mut self, socket: TcpStream) {
-    self.gen_proxy_protocol_header(&socket);
     self.backend = Some(socket);
   }
 
@@ -97,13 +97,27 @@ impl <Front:SocketHandler>ProxyProtocol<Front> {
     self.backend_token = Some(token);
   }
 
+  pub fn set_back_connected(&mut self, status: BackendConnectionStatus) {
+    if status == BackendConnectionStatus::Connected {
+      self.gen_proxy_protocol_header();
+    }
+  }
+
   pub fn readiness(&mut self) -> &mut Readiness {
     &mut self.readiness
   }
 
-  fn gen_proxy_protocol_header(&mut self, socket: &TcpStream) {
-    let addr_frontend = self.frontend.socket_ref().peer_addr().unwrap();
-    let addr_backend = socket.peer_addr().unwrap();
+  fn gen_proxy_protocol_header(&mut self) {
+    let addr_frontend = self.frontend.socket_ref().peer_addr().expect("frontend address should be available");
+
+    let addr_backend = self.backend.as_ref().and_then(|socket| {
+      socket.peer_addr().map_err(|e| error!("cannot get backend address: {:?}", e)).ok()
+    });
+
+    let addr_backend = match addr_backend {
+      Some(addr) => addr,
+      None       => return,
+    };
 
     // PROXY command hardcoded for now, but we'll use LOCAL when we implement health checks
     let protocol_header = ProxyProtocolHeader::V2(HeaderV2::new(Command::Proxy, addr_frontend, addr_backend));
