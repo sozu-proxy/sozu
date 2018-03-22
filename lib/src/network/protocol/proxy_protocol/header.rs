@@ -124,21 +124,23 @@ mod test {
   // }
 }
 
+pub enum Command {
+  Local,
+  Proxy,
+}
 
 pub struct HeaderV2 {
-  signature: [u8; 12], // hex 0D 0A 0D 0A 00 0D 0A 51 55 49 54 0A
-  ver_and_cmd: u8,     // protocol version and command
+  command: Command,
   family: u8,          // protocol family and address
   addr: ProxyAddr,
 }
 
 impl HeaderV2 {
-  pub fn new(addr_src: SocketAddr, addr_dst: SocketAddr) -> Self {
+  pub fn new(command: Command, addr_src: SocketAddr, addr_dst: SocketAddr) -> Self {
     let addr = ProxyAddr::from(addr_src, addr_dst);
 
-    HeaderV2 { 
-      signature: [0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A],
-      ver_and_cmd: 0x20,
+    HeaderV2 {
+      command: command,
       family: get_family(&addr),
       addr,
     }
@@ -146,8 +148,17 @@ impl HeaderV2 {
 
   pub fn into_bytes(&self) -> Vec<u8> {
     let mut header = Vec::with_capacity(self.len());
-    header.extend_from_slice(&self.signature);
-    header.push(self.ver_and_cmd);
+
+    let signature = [0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A];
+    header.extend_from_slice(&signature);
+
+    let command = match self.command {
+      Command::Local => 0,
+      Command::Proxy => 1,
+    };
+    let ver_and_cmd = 0x20 | command;
+    header.push(ver_and_cmd);
+
     header.push(self.family);
     header.extend_from_slice(&u16_to_array_of_u8(self.addr.len()));
     self.addr.into_bytes(&mut header);
@@ -156,7 +167,7 @@ impl HeaderV2 {
 
   pub fn len(&self) -> usize {
     // signature + ver_and_cmd + family + len + addr
-    self.signature.len() + 1 + 1 + 2 + self.addr.len() as usize
+    12 + 1 + 1 + 2 + self.addr.len() as usize
   }
 }
 
@@ -261,7 +272,7 @@ mod testV2 {
     let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(125, 25, 10, 1)), 8080);
     let dst_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200);
 
-    let header = HeaderV2::new(src_addr, dst_addr);
+    let header = HeaderV2::new(Command::Local, src_addr, dst_addr);
     let expected = &[
       0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // MAGIC header
       0x20,                                                                   // Version 2 and command LOCAL
@@ -281,10 +292,10 @@ mod testV2 {
     let src_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 8080);
     let dst_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 4200);
 
-    let header = HeaderV2::new(src_addr, dst_addr);
+    let header = HeaderV2::new(Command::Proxy, src_addr, dst_addr);
     let expected = vec![
       0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,                         // MAGIC header
-      0x20,                                                                                           // Version 2 and command LOCAL
+      0x21,                                                                                           // Version 2 and command PROXY
       0x21,                                                                                           // family AF_UNIX with IPv6
       0x00, 0x24,                                                                                     // address sizes = 36
       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // source address

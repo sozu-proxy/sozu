@@ -105,7 +105,8 @@ impl <Front:SocketHandler>ProxyProtocol<Front> {
     let addr_frontend = self.frontend.socket_ref().peer_addr().unwrap();
     let addr_backend = socket.peer_addr().unwrap();
 
-    let protocol_header = ProxyProtocolHeader::V2(HeaderV2::new(addr_frontend, addr_backend));
+    // PROXY command hardcoded for now, but we'll use LOCAL when we implement health checks
+    let protocol_header = ProxyProtocolHeader::V2(HeaderV2::new(Command::Proxy, addr_frontend, addr_backend));
     self.header = Some(protocol_header.into_bytes());
   }
 }
