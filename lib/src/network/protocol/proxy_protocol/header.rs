@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, IpAddr};
 use std::fmt;
 
 pub enum ProxyProtocolHeader {
@@ -11,7 +11,7 @@ impl ProxyProtocolHeader {
   pub fn into_bytes(&self) -> Vec<u8> {
     match *self {
       ProxyProtocolHeader::V1(ref header) => header.into_bytes(),
-      ProxyProtocolHeader::V2(_) => unimplemented!(),
+      ProxyProtocolHeader::V2(ref header) => header.into_bytes(),
     }
   }
 }
@@ -129,37 +129,170 @@ pub struct HeaderV2 {
   signature: [u8; 12], // hex 0D 0A 0D 0A 00 0D 0A 51 55 49 54 0A
   ver_and_cmd: u8,     // protocol version and command
   family: u8,          // protocol family and address
-  len: u16,            // number of following bytes part of the header
-  addr: AddrV2,
+  addr: ProxyAddr,
 }
 
 impl HeaderV2 {
-  fn new(ver_and_cmd: u8, family: u8, addr: AddrV2) -> Self {
+  pub fn new(addr_src: SocketAddr, addr_dst: SocketAddr) -> Self {
+    let addr = ProxyAddr::from(addr_src, addr_dst);
+
     HeaderV2 { 
       signature: [0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A],
-      ver_and_cmd,
-      family,
-      len: 0,
+      ver_and_cmd: 0x20,
+      family: get_family(&addr),
       addr,
     }
   }
+
+  pub fn into_bytes(&self) -> Vec<u8> {
+    let mut header = Vec::with_capacity(self.len());
+    header.extend_from_slice(&self.signature);
+    header.push(self.ver_and_cmd);
+    header.push(self.family);
+    header.extend_from_slice(&u16_to_array_of_u8(self.addr.len()));
+    self.addr.into_bytes(&mut header);
+    header
+  }
+
+  pub fn len(&self) -> usize {
+    // signature + ver_and_cmd + family + len + addr
+    self.signature.len() + 1 + 1 + 2 + self.addr.len() as usize
+  }
 }
 
-pub enum AddrV2 {
-  // len = 12
-  TCP_UDP_IPV4 {
-    addr_src: SocketAddrV4,
-    addr_dst: SocketAddrV4,
+pub enum ProxyAddr {
+  Ipv4Addr {
+    src_addr: SocketAddrV4,
+    dst_addr: SocketAddrV4,
   },
-  // len = 36
-  TCP_UDP_IPV6 {
-    addr_src: SocketAddrV6,
-    addr_dst: SocketAddrV6,
+  Ipv6Addr {
+    src_addr: SocketAddrV6,
+    dst_addr: SocketAddrV6,
   },
-  // len = 216
-  AF_UNIX {
+  UnixAddr {
     src_addr: [u8; 108],
-    dest_addr: [u8; 108],
+    dst_addr: [u8; 108],
   },
-  AF_UNSPEC
+  AfUnspec,
+}
+
+impl ProxyAddr {
+
+  pub fn from(addr_src: SocketAddr, addr_dst: SocketAddr) -> Self {
+    match (addr_src, addr_dst) {
+      (SocketAddr::V4(addr_ipv4_src), SocketAddr::V4(addr_ipv4_dst)) => {
+        ProxyAddr::Ipv4Addr{
+          src_addr: addr_ipv4_src,
+          dst_addr: addr_ipv4_dst,
+        }
+      },
+      (SocketAddr::V6(addr_ipv6_src), SocketAddr::V6(addr_ipv6_dst)) => {
+        ProxyAddr::Ipv6Addr{
+          src_addr: addr_ipv6_src,
+          dst_addr: addr_ipv6_dst,
+        }
+      },
+      _ => ProxyAddr::AfUnspec,
+    }
+  }
+
+  fn len(&self) -> u16 {
+    match *self {
+      ProxyAddr::Ipv4Addr{ src_addr: _, dst_addr: _ } => 12,
+      ProxyAddr::Ipv6Addr{ src_addr: _, dst_addr: _ } => 36,
+      ProxyAddr::UnixAddr{ src_addr: _, dst_addr: _ } => 216,
+      ProxyAddr::AfUnspec => 0,
+    }
+  }
+
+  fn into_bytes(&self, buf: &mut Vec<u8>) {
+    match *self {
+      ProxyAddr::Ipv4Addr{ src_addr, dst_addr } => {
+        buf.extend_from_slice(&src_addr.ip().octets());
+        buf.extend_from_slice(&dst_addr.ip().octets());
+        buf.extend_from_slice(&u16_to_array_of_u8(src_addr.port()));
+        buf.extend_from_slice(&u16_to_array_of_u8(dst_addr.port()));
+      },
+      ProxyAddr::Ipv6Addr{ src_addr, dst_addr } => {
+        buf.extend_from_slice(&src_addr.ip().octets());
+        buf.extend_from_slice(&dst_addr.ip().octets());
+        buf.extend_from_slice(&u16_to_array_of_u8(src_addr.port()));
+        buf.extend_from_slice(&u16_to_array_of_u8(dst_addr.port()));
+      },
+      ProxyAddr::UnixAddr{ src_addr, dst_addr } => {
+        buf.extend_from_slice(&src_addr);
+        buf.extend_from_slice(&dst_addr);
+      },
+      ProxyAddr::AfUnspec => {},
+    };
+  }
+}
+
+fn get_family(addr: &ProxyAddr) -> u8 {
+  match addr {
+    &ProxyAddr::Ipv4Addr{ src_addr: _, dst_addr: _ } => 0x10 | 0x01, // AF_INET  = 1 + STREAM = 1
+    &ProxyAddr::Ipv6Addr{ src_addr: _, dst_addr: _ } => 0x20 | 0x01, // AF_INET6 = 2 + STREAM = 1
+    &ProxyAddr::UnixAddr{ src_addr: _, dst_addr: _ } => 0x30 | 0x01, // AF_UNIX  = 3 + STREAM = 1
+    &ProxyAddr::AfUnspec => 0x00, // AF_UNSPEC + UNSPEC
+  }
+}
+
+fn u16_to_array_of_u8(x: u16) -> [u8; 2] {
+    let b1 : u8 = ((x >> 8) & 0xff) as u8;
+    let b2 : u8 = (x & 0xff) as u8;
+    return [b1, b2]
+}
+
+#[cfg(test)]
+mod testV2 {
+
+  use super::*;
+  use std::net::{Ipv4Addr, Ipv6Addr};
+
+  #[test]
+  fn test_u16_to_array_of_u8() {
+    let val_u16: u16 = 65534;
+    let expected = [0xff, 0xfe];
+    assert_eq!(expected, u16_to_array_of_u8(val_u16));
+  }
+
+  #[test]
+  fn test_deserialize_tcp_ipv4_proxy_protocol_header() {
+    let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(125, 25, 10, 1)), 8080);
+    let dst_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200);
+
+    let header = HeaderV2::new(src_addr, dst_addr);
+    let expected = &[
+      0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // MAGIC header
+      0x20,                                                                   // Version 2 and command LOCAL
+      0x11,                                                                   // family AF_UNIX with IPv4
+      0x00, 0x0C,                                                             // address sizes = 12
+      0x7D, 0x19, 0x0A, 0x01,                                                 // source address
+      0x0A, 0x04, 0x05, 0x08,                                                 // destination address
+      0x1F, 0x90,                                                             // source port
+      0x10, 0x68,                                                             // destination port
+    ];
+
+    assert_eq!(expected, &header.into_bytes()[..]);
+  }
+
+  #[test]
+  fn test_deserialize_tcp_ipv6_proxy_protocol_header() {
+    let src_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 8080);
+    let dst_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 4200);
+
+    let header = HeaderV2::new(src_addr, dst_addr);
+    let expected = vec![
+      0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,                         // MAGIC header
+      0x20,                                                                                           // Version 2 and command LOCAL
+      0x21,                                                                                           // family AF_UNIX with IPv6
+      0x00, 0x24,                                                                                     // address sizes = 36
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // source address
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // destination address
+      0x1F, 0x90,                                                                                     // source port
+      0x10, 0x68,                                                                                     // destination port
+    ];
+
+    assert_eq!(&expected[..], &header.into_bytes()[..]);
+  }
 }

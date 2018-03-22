@@ -191,7 +191,7 @@ pub struct FileAppConfig {
   pub backends:          Vec<String>,
   pub sticky_session:    Option<bool>,
   pub https_redirect:    Option<bool>,
-  pub proxy_protocol:    Option<bool>,
+  pub send_proxy:        Option<bool>,
 }
 
 impl FileAppConfig {
@@ -205,7 +205,7 @@ impl FileAppConfig {
             ip_address:     ip,
             port:           port,
             backends:       self.backends,
-            proxy_protocol: self.proxy_protocol.unwrap_or(false),
+            send_proxy:     self.send_proxy.unwrap_or(false),
           }))
         },
         (None, Some(_)) => Err(String::from("missing IP address for TCP application")),
@@ -272,7 +272,7 @@ impl HttpAppConfig {
       app_id: self.app_id.clone(),
       sticky_session: self.sticky_session.clone(),
       https_redirect: self.https_redirect.clone(),
-      proxy_protocol: false,
+      send_proxy: false,
     }));
 
     //create the front both for HTTP and HTTPS if possible
@@ -337,7 +337,7 @@ pub struct TcpAppConfig {
   pub ip_address:        String,
   pub port:              u16,
   pub backends:          Vec<String>,
-  pub proxy_protocol:    bool,
+  pub send_proxy:        bool,
 }
 
 impl TcpAppConfig {
@@ -348,7 +348,7 @@ impl TcpAppConfig {
       app_id: self.app_id.clone(),
       sticky_session: false,
       https_redirect: false,
-      proxy_protocol: self.proxy_protocol,
+      send_proxy: self.send_proxy,
     }));
 
     v.push(Order::AddTcpFront(TcpFront {

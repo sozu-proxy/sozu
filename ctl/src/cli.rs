@@ -104,7 +104,7 @@ pub enum ApplicationCmd {
     #[structopt(short = "h", long = "https-redirect")]
     https_redirect: bool,
     #[structopt(short = "p", long = "proxy-protocol", help="Enable the proxy protocol")]
-    proxy_protocol: bool,
+    send_proxy: bool,
   },
 }
 

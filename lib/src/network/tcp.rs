@@ -74,13 +74,13 @@ pub struct Client {
 
 impl Client {
   fn new(sock: TcpStream, accept_token: Token, front_buf: Checkout<BufferQueue>,
-    back_buf: Checkout<BufferQueue>, proxy_protocol: bool) -> Client {
+    back_buf: Checkout<BufferQueue>, send_proxy: bool) -> Client {
     let s = sock.try_clone().expect("could not clone the socket");
     let addr = sock.peer_addr().map(|s| s.ip()).ok();
     let mut frontend_buffer = None;
     let mut backend_buffer = None;
 
-    let protocol = if proxy_protocol {
+    let protocol = if send_proxy {
       frontend_buffer = Some(front_buf);
       backend_buffer = Some(back_buf);
       Some(State::ProxyProtocol(ProxyProtocol::new(s, None)))
@@ -522,7 +522,7 @@ pub struct ApplicationListener {
 
 #[derive(Debug)]
 pub struct ApplicationConfiguration {
-  proxy_protocol: bool,
+  send_proxy: bool,
 }
 
 pub struct ServerConfiguration {
@@ -773,7 +773,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       },
       Order::AddApplication(application) => {
         let config = ApplicationConfiguration {
-          proxy_protocol: application.proxy_protocol,
+          send_proxy: application.send_proxy,
         };
         self.configs.insert(application.app_id, config);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
@@ -796,15 +796,15 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
       let internal_token = Token(token.0);//FIXME: ListenToken(token.0 - 2 - self.base_token);
       if self.listeners.contains_key(&internal_token) {
-        let mut proxy_protocol = false;
+        let mut send_proxy = false;
         if let Some(config) = self.configs.get(&self.listeners[&internal_token].app_id) {
-          proxy_protocol = config.proxy_protocol;
+          send_proxy = config.send_proxy;
         }
 
         if let Some(ref listener) = self.listeners[&internal_token].sock.as_ref() {
           listener.accept().map(|(frontend_sock, _)| {
             frontend_sock.set_nodelay(true);
-            let mut c = Client::new(frontend_sock, internal_token, front_buf, back_buf, proxy_protocol);
+            let mut c = Client::new(frontend_sock, internal_token, front_buf, back_buf, send_proxy);
             incr_req!();
 
             c.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
