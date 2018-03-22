@@ -179,4 +179,4 @@ port = 8081
 backends = [ "127.0.0.1:1026" ] # list of IP/port
 
 # activates the proxy protocol to send IP information to the backend
-proxy_protocol = false
+# send_proxy = false

@@ -192,6 +192,7 @@ pub struct Application {
     pub app_id:         String,
     pub sticky_session: bool,
     pub https_redirect: bool,
+    #[serde(default)]
     pub send_proxy:     bool,
 }
 

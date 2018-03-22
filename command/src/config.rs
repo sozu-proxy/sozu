@@ -191,6 +191,7 @@ pub struct FileAppConfig {
   pub backends:          Vec<String>,
   pub sticky_session:    Option<bool>,
   pub https_redirect:    Option<bool>,
+  #[serde(default)]
   pub send_proxy:        Option<bool>,
 }
 
@@ -337,6 +338,7 @@ pub struct TcpAppConfig {
   pub ip_address:        String,
   pub port:              u16,
   pub backends:          Vec<String>,
+  #[serde(default)]
   pub send_proxy:        bool,
 }
 
