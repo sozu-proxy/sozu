@@ -60,6 +60,7 @@ pub struct Client {
   backend:        Option<TcpStream>,
   token:          Option<Token>,
   backend_token:  Option<Token>,
+  back_connected: BackendConnectionStatus,
   accept_token:   Token,
   status:         ConnectionStatus,
   rx_count:       usize,
@@ -93,6 +94,7 @@ impl Client {
       backend:        None,
       token:          None,
       backend_token:  None,
+      back_connected: BackendConnectionStatus::NotConnected,
       accept_token:   accept_token,
       status:         ConnectionStatus::Connected,
       rx_count:       0,
@@ -311,11 +313,16 @@ impl Client {
   }
 
   fn back_connected(&self)     -> BackendConnectionStatus {
-    //FIXME: handle backends correctly when refactoring the TCP proxy
-    BackendConnectionStatus::Connected
+    self.back_connected
   }
 
-  fn set_back_connected(&mut self, _: BackendConnectionStatus) {
+  fn set_back_connected(&mut self, status: BackendConnectionStatus) {
+    self.back_connected = status;
+    if status == BackendConnectionStatus::Connected {
+      if let Some(State::ProxyProtocol(ref mut pp)) = self.protocol {
+        pp.set_back_connected(BackendConnectionStatus::Connected);
+      }
+    }
   }
 
   fn metrics(&mut self)        -> &mut SessionMetrics {
@@ -698,6 +705,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
     client.set_back_token(back_token);
     client.set_back_socket(stream);
+    client.set_back_connected(BackendConnectionStatus::Connecting);
     incr!("backend.connections");
     Ok(BackendConnectAction::New)
   }
