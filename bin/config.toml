@@ -103,12 +103,13 @@ port = 8080
 address = "127.0.0.1"
 port = 8443
 
-# set this to true to use openssl as TLS provider (instead of rustls)
-# will only work if sozu has been compiled with the 'use-openssl' feature
-use_openssl = true
 #answer_404 = "../lib/assets/404.html"
 #answer_503 = "../lib/assets/503.html"
 
+# defines how the TLS protocol will be handled by sozu. Possible values
+# are "openssl" or "rustls". The "openssl" option will only work if sozu
+# was built with the "use-openssl" feature.
+# tls_provider = "rustls"
 
 # supported TLS versions. Possible values are "SSLv2", "SSLv3", "TLSv1",
 # "TLSv1.1", "TLSv1.2". Defaults to "TLSv1.2"

@@ -12,7 +12,7 @@ use toml;
 
 use messages::Application;
 use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,TcpFront,Backend,
-  HttpProxyConfiguration,HttpsProxyConfiguration,AddCertificate};
+  HttpProxyConfiguration,HttpsProxyConfiguration,AddCertificate,TlsProvider};
 
 use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
 
@@ -30,7 +30,7 @@ pub struct ProxyConfig {
   pub default_certificate_chain: Option<String>,
   pub default_key:               Option<String>,
   pub tls_versions:              Option<Vec<String>>,
-  pub use_openssl:               Option<bool>,
+  pub tls_provider:              Option<TlsProvider>,
 }
 
 impl ProxyConfig {
@@ -159,7 +159,7 @@ impl ProxyConfig {
         configuration.default_key = Some(default_key);
       }
 
-      configuration.use_openssl = self.use_openssl.unwrap_or(false);
+      configuration.tls_provider = self.tls_provider.unwrap_or(TlsProvider::Rustls);
 
       configuration
 
@@ -610,7 +610,7 @@ mod tests {
       default_certificate_chain: None,
       default_key: None,
       default_name: None,
-      use_openssl: None,
+      tls_provider: None,
     };
     println!("http: {:?}", to_string(&http));
     let https = ProxyConfig {
@@ -626,7 +626,7 @@ mod tests {
       default_certificate_chain: None,
       default_key: None,
       default_name: None,
-      use_openssl: None,
+      tls_provider: None,
     };
     println!("https: {:?}", to_string(&https));
     let config = FileConfig {

@@ -27,7 +27,9 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::state::{ConfigState,get_application_ids_by_domain};
-use sozu_command::messages::{self,TcpFront,Order,Backend,MessageId,OrderMessageAnswer,OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer,QueryApplicationType};
+use sozu_command::messages::{self,TcpFront,Order,Backend,MessageId,OrderMessageAnswer,
+  OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer,
+  QueryApplicationType,TlsProvider};
 use sozu_command::messages::HttpsProxyConfiguration;
 
 use network::buffer_queue::BufferQueue;
@@ -915,16 +917,19 @@ pub enum HttpsProvider {
 impl HttpsProvider {
   pub fn new(config: HttpsProxyConfiguration, event_loop: &mut Poll,
     pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> io::Result<(HttpsProvider, HashSet<Token>)> {
-    if config.use_openssl {
-      https_openssl::ServerConfiguration::new(config, event_loop, pool,
+    match config.tls_provider {
+      TlsProvider::Openssl => {
+        https_openssl::ServerConfiguration::new(config, event_loop, pool,
         tcp_listener, token).map(|(conf, set)| {
           (HttpsProvider::Openssl(conf), set)
-      })
-    } else {
-      https_rustls::configuration::ServerConfiguration::new(config, event_loop, pool,
+        })
+      },
+      TlsProvider::Rustls => {
+        https_rustls::configuration::ServerConfiguration::new(config, event_loop, pool,
         tcp_listener, token).map(|(conf, set)| {
           (HttpsProvider::Rustls(conf), set)
-      })
+        })
+      }
     }
   }
 
@@ -991,7 +996,7 @@ use network::https_rustls::client::TlsClient;
 impl HttpsProvider {
   pub fn new(config: HttpsProxyConfiguration, event_loop: &mut Poll,
     pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> io::Result<(HttpsProvider, HashSet<Token>)> {
-    if config.use_openssl {
+    if config.tls_provider == TlsProvider::Openssl {
       error!("the openssl provider is not compiled, continuing with the rustls provider");
     }
 

@@ -279,6 +279,17 @@ impl Default for HttpProxyConfiguration {
   }
 }
 
+#[derive(Debug,Copy,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsProvider {
+  Openssl,
+  Rustls,
+}
+
+impl Default for TlsProvider {
+    fn default() -> TlsProvider { TlsProvider::Rustls }
+}
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpsProxyConfiguration {
     pub front:                     SocketAddr,
@@ -293,7 +304,7 @@ pub struct HttpsProxyConfiguration {
     pub default_key:               Option<Vec<u8>>,
     pub default_certificate_chain: Option<String>,
     #[serde(default)]
-    pub use_openssl:               bool,
+    pub tls_provider:              TlsProvider,
 }
 
 impl Default for HttpsProxyConfiguration {
@@ -324,7 +335,7 @@ impl Default for HttpsProxyConfiguration {
       default_certificate: Some(Vec::from(&include_bytes!("../assets/certificate.pem")[..])),
       default_key:         Some(Vec::from(&include_bytes!("../assets/key.pem")[..])),
       default_certificate_chain: None,
-      use_openssl:         false,
+      tls_provider:        TlsProvider::Rustls,
     }
   }
 }
