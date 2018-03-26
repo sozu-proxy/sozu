@@ -19,10 +19,8 @@ named!(pub parse_v2_header<HeaderV2>,
     addr: apply!(parse_addr_v2, family) >>
     (
       HeaderV2 {
-        signature: PROTOCOL_SIGNATURE_V2,
-        ver_and_cmd,
+        command: Command::Local,
         family,
-        len,
         addr
       }
     )
@@ -109,7 +107,7 @@ mod test {
 
     let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(125, 25, 10, 1)), 8080);
     let dst_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200);
-    let expected = HeaderV2::new(Some((src_addr, dst_addr)));
+    let expected = HeaderV2::new(Command::Local, src_addr, dst_addr);
 
     assert_eq!(Done(&[][..], expected), parse_v2_header(input));
   }
@@ -129,7 +127,7 @@ mod test {
 
     let src_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 1)), 8080);
     let dst_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2)), 4200);
-    let expected = HeaderV2::new(Some((src_addr, dst_addr)));
+    let expected = HeaderV2::new(Command::Local, src_addr, dst_addr);
 
     assert_eq!(Done(&[][..], expected), parse_v2_header(input));
   }
@@ -143,7 +141,11 @@ mod test {
       0x00, 0x00,                                                             // address sizes = 0
     ];
 
-    let expected = HeaderV2::new(None);
+    let expected = HeaderV2 {
+                    command: Command::Local,
+                    family: 0,
+                    addr: ProxyAddr::AfUnspec,
+                  };
 
     assert_eq!(Done(&[][..], expected), parse_v2_header(input));
   }
@@ -157,7 +159,7 @@ mod test {
       unknow_version,                                                         // Version 2 and command LOCAL
     ];
 
-    assert_eq!(Error(ErrorKind::Verify), parse_v2_header(input));
+    assert_eq!(Error(error_code!(ErrorKind::Verify)), parse_v2_header(input));
   }
 
   #[test]
@@ -171,7 +173,7 @@ mod test {
       0x00, 0x00,                                                             // address sizes = 0
     ];
 
-    assert_eq!(Error(ErrorKind::Switch), parse_v2_header(input));
+    assert_eq!(Error(error_code!(ErrorKind::Switch)), parse_v2_header(input));
   }
 
   #[test]
@@ -181,7 +183,7 @@ mod test {
       0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, // INCORRECT MAGIC header
     ];
 
-    assert_eq!(Error(ErrorKind::Tag), parse_v2_header(input));
+    assert_eq!(Error(error_code!(ErrorKind::Tag)), parse_v2_header(input));
   }
 
   #[test]
