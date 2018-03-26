@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::iter::repeat;
 use std::net::ToSocketAddrs;
-use std::collections::HashMap;
+use std::collections::{HashMap,HashSet};
 use std::io::{self,Error,ErrorKind,Read};
 
 use certificate::{calculate_fingerprint,split_certificate_chain};
@@ -429,7 +429,6 @@ impl FileConfig {
     let data = try!(Config::load_file(path));
 
     match toml::from_str(&data) {
-      Ok(config) => Ok(config),
       Err(e)     => {
         display_toml_error(&data, &e);
         Err(Error::new(
@@ -437,6 +436,44 @@ impl FileConfig {
           format!("decoding error: {}", e))
         )
       }
+      Ok(config) => {
+        let config: FileConfig = config;
+        let mut reserved_address: HashSet<(String,u16)> = HashSet::new();
+        if let Some(addr) = config.http.as_ref().map(|h| (h.address.clone(), h.port)) {
+          reserved_address.insert(addr);
+        }
+
+        if let Some(addr) = config.https.as_ref().map(|h| (h.address.clone(), h.port)) {
+          if reserved_address.contains(&addr) {
+            println!("listening address ( {}:{} ) is already used in the configuration", addr.0, addr.1);
+            return Err(Error::new(
+              ErrorKind::InvalidData,
+              format!("listening address ( {}:{} ) is already used in the configuration", addr.0, addr.1)));
+          } else {
+            reserved_address.insert(addr);
+          }
+        }
+
+        if let Some(ref apps) = config.applications {
+          for (key, app) in apps.iter() {
+            if let (Some(address), Some(port)) = (app.ip_address.clone(), app.port) {
+              let addr = (address, port);
+              if reserved_address.contains(&addr) {
+                println!("TCP app '{}' listening address ( {}:{} ) is already used in the configuration",
+                  key, addr.0, addr.1);
+                return Err(Error::new(
+                  ErrorKind::InvalidData,
+                  format!("TCP app '{}' listening address ( {}:{} ) is already used in the configuration",
+                    key, addr.0, addr.1)));
+              } else {
+                reserved_address.insert(addr.clone());
+              }
+            }
+          }
+        }
+
+        Ok(config)
+      },
     }
   }
 
