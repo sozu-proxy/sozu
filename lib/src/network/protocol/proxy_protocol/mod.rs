@@ -1,5 +1,5 @@
 pub mod header;
-pub mod frontend;
+pub mod relay;
 
 use std::net::IpAddr;
 use std::io::{Write, ErrorKind};

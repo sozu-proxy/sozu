@@ -17,7 +17,7 @@ use network::protocol::pipe::Pipe;
 use parser::proxy_protocol::parse_v2_header;
 use pool::Checkout;
 
-pub struct FrontendProxyProtocol<Front:SocketHandler> {
+pub struct RelayProxyProtocol<Front:SocketHandler> {
   pub header:         Option<Vec<u8>>,
   pub frontend:       Front,
   pub backend:        Option<TcpStream>,
@@ -28,9 +28,9 @@ pub struct FrontendProxyProtocol<Front:SocketHandler> {
   cursor_header:      usize,
 }
 
-impl <Front:SocketHandler + Read>FrontendProxyProtocol<Front> {
+impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
   pub fn new(frontend: Front, backend: Option<TcpStream>, front_buf: Checkout<BufferQueue>) -> Self {
-    FrontendProxyProtocol {
+    RelayProxyProtocol {
       header: None,
       frontend,
       backend,
