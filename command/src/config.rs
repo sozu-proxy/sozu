@@ -159,7 +159,11 @@ impl ProxyConfig {
         configuration.default_key = Some(default_key);
       }
 
-      configuration.tls_provider = self.tls_provider.unwrap_or(TlsProvider::Rustls);
+      configuration.tls_provider = self.tls_provider.unwrap_or(if cfg!(use_openssl) {
+        TlsProvider::Openssl
+      } else {
+        TlsProvider::Rustls
+      });
 
       configuration
 
