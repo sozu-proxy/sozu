@@ -240,35 +240,21 @@ impl Client {
   pub fn upgrade(&mut self) {
     let protocol = self.protocol.take();
 
-    if let Some(State::ProxyProtocol(mut pp)) = protocol {
+    if let Some(State::ProxyProtocol(pp)) = protocol {
       if self.back_buf.is_some() && self.front_buf.is_some() {
-        let mut backend_socket = pp.backend.take().unwrap();
-        let addr = backend_socket.peer_addr().map(|s| s.ip()).ok();
-
-        let front_token = pp.front_token();
-        let back_token = pp.back_token();
-
-        let mut pipe = Pipe::new(
-          pp.frontend.take(0).into_inner(),
-          Some(backend_socket),
-          self.front_buf.take().unwrap(),
-          self.back_buf.take().unwrap(),
-          addr,
+        self.protocol = Some(
+          State::Pipe(pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap()))
         );
-
-        pipe.readiness.front_readiness = pp.readiness.front_readiness;
-        pipe.readiness.back_readiness  = pp.readiness.back_readiness;
-
-        if let Some(front_token) = front_token {
-          pipe.set_front_token(front_token);
-        }
-        if let Some(back_token) = back_token {
-          pipe.set_back_token(back_token);
-        }
-
-        self.protocol = Some(State::Pipe(pipe));
       } else {
         error!("Missing the frontend or backend buffer queue, we can't switch to a pipe");
+      }
+    } else if let Some(State::FrontendProxyProtocol(mut pp)) = protocol {
+      if self.back_buf.is_some() {
+        self.protocol = Some(
+          State::Pipe(pp.into_pipe(self.back_buf.take().unwrap()))
+        );
+      } else {
+        error!("Missing the backend buffer queue, we can't switch to a pipe");
       }
     }
   }

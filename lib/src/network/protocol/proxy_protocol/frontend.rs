@@ -1,10 +1,11 @@
 use std::net::IpAddr;
 use std::io::{Write, ErrorKind};
+use std::io::Read;
+
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use nom::IResult::*;
-
 use network::protocol::proxy_protocol::header;
 use network::{Protocol, ClientResult};
 use network::Readiness;
@@ -12,21 +13,22 @@ use network::protocol::ProtocolResult;
 use network::socket::{SocketHandler, SocketResult};
 use network::buffer_queue::BufferQueue;
 use network::SessionMetrics;
+use network::protocol::pipe::Pipe;
 use parser::proxy_protocol::parse_v2_header;
 use pool::Checkout;
 
 pub struct FrontendProxyProtocol<Front:SocketHandler> {
-  pub header:     Option<Vec<u8>>,
-  pub frontend:   Front,
-  pub backend:    Option<TcpStream>,
-  frontend_token: Option<Token>,
-  backend_token:  Option<Token>,
-  pub front_buf:  Checkout<BufferQueue>,
-  pub readiness:  Readiness,
-  cursor_header:  usize,
+  pub header:         Option<Vec<u8>>,
+  pub frontend:       Front,
+  pub backend:        Option<TcpStream>,
+  pub frontend_token: Option<Token>,
+  pub backend_token:  Option<Token>,
+  pub front_buf:      Checkout<BufferQueue>,
+  pub readiness:      Readiness,
+  cursor_header:      usize,
 }
 
-impl <Front:SocketHandler>FrontendProxyProtocol<Front> {
+impl <Front:SocketHandler + Read>FrontendProxyProtocol<Front> {
   pub fn new(frontend: Front, backend: Option<TcpStream>, front_buf: Checkout<BufferQueue>) -> Self {
     FrontendProxyProtocol {
       header: None,
@@ -157,7 +159,29 @@ impl <Front:SocketHandler>FrontendProxyProtocol<Front> {
     &mut self.readiness
   }
 
-  pub fn protocol(&self) -> Protocol {
-    Protocol::ProxyProtocol
+  pub fn into_pipe(mut self, back_buf: Checkout<BufferQueue>) -> Pipe<Front> {
+    let backend_socket = self.backend.take().unwrap();
+    let addr = backend_socket.peer_addr().map(|s| s.ip()).ok();
+
+    let mut pipe = Pipe::new(
+      self.frontend.take(0).into_inner(),
+      Some(backend_socket),
+      self.front_buf,
+      back_buf,
+      addr,
+    );
+
+    pipe.readiness.front_readiness = self.readiness.front_readiness;
+    pipe.readiness.back_readiness  = self.readiness.back_readiness;
+
+    if let Some(front_token) = self.frontend_token {
+      pipe.set_front_token(front_token);
+    }
+
+    if let Some(back_token) = self.backend_token {
+      pipe.set_back_token(back_token);
+    }
+
+    pipe
   }
 }
