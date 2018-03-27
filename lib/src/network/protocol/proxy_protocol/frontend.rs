@@ -46,45 +46,54 @@ impl <Front:SocketHandler>FrontendProxyProtocol<Front> {
   }
 
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
-    trace!("pipe readable");
     let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
-    debug!("FRONT proxy protocol [{:?}]: read {} bytes", self.frontend_token, sz);
+    debug!("FRONT proxy protocol [{:?}]: read {} bytes and res={:?}", self.frontend_token, sz, res);
 
     if sz > 0 {
+      self.front_buf.buffer.fill(sz);
+      self.front_buf.sliced_input(sz);
+      self.front_buf.consume_parsed_data(sz);
+      self.front_buf.slice_output(sz);
+
       let buf = self.front_buf.next_output_data();
 
       count!("bytes_in", sz as i64);
       metrics.bin += sz;
     
-      if let SocketResult::Continue = res {
-        match parse_v2_header(buf) {
-          Done(rest, header) => {
-            debug!("We received the proxy protocol header");
-            self.header = Some(header.into_bytes());
-            self.readiness.back_readiness.insert(Ready::writable());
-            self.readiness.front_readiness.remove(Ready::readable());
-            return ClientResult::Continue
-          },
-          Incomplete(_) => {
-            debug!("proxy protocol header not complete");
-            return ClientResult::Continue
-          },
-          Error(e) => {
-            return ClientResult::CloseClient
+      match res {
+        SocketResult::Continue
+        | SocketResult::WouldBlock => {
+          match parse_v2_header(buf) {
+            Done(rest, header) => {
+              debug!("We received the proxy protocol header: {:?}", header);
+              self.header = Some(header.into_bytes());
+              self.readiness.back_interest.insert(Ready::writable());
+              self.readiness.front_readiness.remove(Ready::readable());
+              return ClientResult::Continue
+            },
+            Incomplete(_) => {
+              return ClientResult::Continue
+            },
+            Error(e) => {
+              return ClientResult::CloseClient
+            }
           }
+        },
+        SocketResult::Error => {
+          error!("[{:?}] front socket error, closing the connection", self.frontend_token);
+          metrics.service_stop();
+          incr_ereq!();
+          self.readiness.reset();
+          return ClientResult::CloseClient
         }
-      } else {
-        error!("[{:?}] front socket error, closing the connection", self.frontend_token);
-        metrics.service_stop();
-        incr_ereq!();
-        self.readiness.reset();
-        return ClientResult::CloseClient;
       }
     }
 
     return ClientResult::Continue;
   }
 
+  // The header is send immediately at once upon the connection is establish
+  // and prepended before any data.
   pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, ClientResult) {
     debug!("Writing proxy protocol header");
 
@@ -95,8 +104,7 @@ impl <Front:SocketHandler>FrontendProxyProtocol<Front> {
             Ok(sz) => {
               self.cursor_header += sz;
 
-              count!("bytes_out", sz as i64);
-              metrics.bout += sz;
+              metrics.backend_bout += sz;
 
               if self.cursor_header == header.len() {
                 debug!("Proxy protocol sent, upgrading");
@@ -104,6 +112,9 @@ impl <Front:SocketHandler>FrontendProxyProtocol<Front> {
               }
             },
             Err(e) => {
+              metrics.service_stop();
+              incr_ereq!();
+              self.readiness.reset();
               debug!("PROXY PROTOCOL {}", e);
               break;
             },

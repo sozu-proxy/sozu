@@ -23,6 +23,7 @@ use pool::{Pool,Checkout,Reset};
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
+use sozu_command::config::ProxyProtocolConfig;
 use sozu_command::messages::{self,TcpFront,Order,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
@@ -77,18 +78,23 @@ pub struct Client {
 
 impl Client {
   fn new(sock: TcpStream, accept_token: Token, front_buf: Checkout<BufferQueue>,
-    back_buf: Checkout<BufferQueue>, send_proxy: bool) -> Client {
+    back_buf: Checkout<BufferQueue>, proxy_protocol: Option<ProxyProtocolConfig>) -> Client {
     let s = sock.try_clone().expect("could not clone the socket");
     let addr = sock.peer_addr().map(|s| s.ip()).ok();
     let mut frontend_buffer = None;
     let mut backend_buffer = None;
 
-    let protocol = if send_proxy {
-      frontend_buffer = Some(front_buf);
-      backend_buffer = Some(back_buf);
-      Some(State::ProxyProtocol(ProxyProtocol::new(s, None)))
-    } else {
-      Some(State::Pipe(Pipe::new(s, None, front_buf, back_buf, addr)))
+    let protocol = match proxy_protocol {
+      Some(ProxyProtocolConfig::ExpectHeader) => {
+        backend_buffer = Some(back_buf);
+        Some(State::FrontendProxyProtocol(FrontendProxyProtocol::new(s, None, front_buf)))
+      },
+      Some(ProxyProtocolConfig::SendHeader) => {
+        frontend_buffer = Some(front_buf);
+        backend_buffer = Some(back_buf);
+        Some(State::ProxyProtocol(ProxyProtocol::new(s, None)))
+      },
+      None => Some(State::Pipe(Pipe::new(s, None, front_buf, back_buf, addr)))
     };
 
     Client {
@@ -217,6 +223,7 @@ impl Client {
     match self.protocol {
       Some(State::Pipe(ref pipe)) => pipe.front_socket(),
       Some(State::ProxyProtocol(ref pp)) => pp.front_socket(),
+      Some(State::FrontendProxyProtocol(ref pp)) => pp.front_socket(),
       _ => unreachable!(),
     }
   }
@@ -225,6 +232,7 @@ impl Client {
     match self.protocol {
       Some(State::Pipe(ref pipe)) => pipe.back_socket(),
       Some(State::ProxyProtocol(ref pp)) => pp.back_socket(),
+      Some(State::FrontendProxyProtocol(ref pp)) => pp.back_socket(),
       _ => unreachable!(),
     }
   }
@@ -269,6 +277,7 @@ impl Client {
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.readiness(),
       Some(State::ProxyProtocol(ref mut pp)) => pp.readiness(),
+      Some(State::FrontendProxyProtocol(ref mut pp)) => pp.readiness(),
       _ => unreachable!(),
     }
   }
@@ -277,6 +286,7 @@ impl Client {
     match self.protocol {
       Some(State::Pipe(ref pipe)) => pipe.front_token(),
       Some(State::ProxyProtocol(ref pp)) => pp.front_token(),
+      Some(State::FrontendProxyProtocol(ref pp)) => pp.front_token(),
       _ => unreachable!()
     }
   }
@@ -285,6 +295,7 @@ impl Client {
     match self.protocol {
       Some(State::Pipe(ref pipe)) => pipe.back_token(),
       Some(State::ProxyProtocol(ref pp)) => pp.back_token(),
+      Some(State::FrontendProxyProtocol(ref pp)) => pp.back_token(),
       _ => unreachable!()
     }
   }
@@ -293,6 +304,7 @@ impl Client {
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.set_back_socket(socket),
       Some(State::ProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
+      Some(State::FrontendProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
       _ => unreachable!()
     }
   }
@@ -303,6 +315,7 @@ impl Client {
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.set_front_token(token),
       Some(State::ProxyProtocol(ref mut pp)) => pp.set_front_token(token),
+      Some(State::FrontendProxyProtocol(ref mut pp)) => pp.set_front_token(token),
       _ => unreachable!()
     }
   }
@@ -313,6 +326,7 @@ impl Client {
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.set_back_token(token),
       Some(State::ProxyProtocol(ref mut pp)) => pp.set_back_token(token),
+      Some(State::FrontendProxyProtocol(ref mut pp)) => pp.set_back_token(token),
       _ => unreachable!()
     }
   }
@@ -534,7 +548,7 @@ pub struct ApplicationListener {
 
 #[derive(Debug)]
 pub struct ApplicationConfiguration {
-  send_proxy: bool,
+  proxy_protocol: Option<ProxyProtocolConfig>,
 }
 
 pub struct ServerConfiguration {
@@ -786,7 +800,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       },
       Order::AddApplication(application) => {
         let config = ApplicationConfiguration {
-          send_proxy: application.send_proxy,
+          proxy_protocol: application.proxy_protocol,
         };
         self.configs.insert(application.app_id, config);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
@@ -809,15 +823,15 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
       let internal_token = Token(token.0);//FIXME: ListenToken(token.0 - 2 - self.base_token);
       if self.listeners.contains_key(&internal_token) {
-        let mut send_proxy = false;
-        if let Some(config) = self.configs.get(&self.listeners[&internal_token].app_id) {
-          send_proxy = config.send_proxy;
-        }
+
+        let proxy_protocol = self.configs
+                                .get(&self.listeners[&internal_token].app_id)
+                                .and_then(|c| c.proxy_protocol.clone());
 
         if let Some(ref listener) = self.listeners[&internal_token].sock.as_ref() {
           listener.accept().map(|(frontend_sock, _)| {
             frontend_sock.set_nodelay(true);
-            let mut c = Client::new(frontend_sock, internal_token, front_buf, back_buf, send_proxy);
+            let mut c = Client::new(frontend_sock, internal_token, front_buf, back_buf, proxy_protocol);
             incr_req!();
 
             c.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
