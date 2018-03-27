@@ -26,12 +26,29 @@ use command::{add_application,remove_application,dump_state,load_state,
 use cli::*;
 
 fn main() {
+  match safe_run() {
+    Err(e) => println!("error {}, stopping", e),
+    Ok(_) => {}
+  }
+}
+
+fn safe_run() -> Result<(), io::Error> {
   let matches = App::from_args();
 
   let config_file = matches.config;
 
-  let config  = Config::load_from_path(config_file.as_str()).expect("could not parse configuration file");
-  let channel = create_channel(&config.command_socket_path()).expect("could not connect to the command unix socket");
+  let config = Config::load_from_path(&config_file)
+    .map_err(|err| match err {
+      ref e if e.kind() == io::ErrorKind::NotFound => io::Error::new(e.kind(), format!("configuration file '{}' does not exist", config_file)),
+      ref e if e.kind() == io::ErrorKind::InvalidData => io::Error::new(e.kind(), format!("configuration file '{}' invalid configuration", config_file)),
+      e => e
+    })?;
+  let channel =  create_channel(&config.command_socket_path())
+    .map_err(|err| match err {
+      ref e if e.kind() == io::ErrorKind::NotFound => io::Error::new(e.kind(), format!("command_socket '{}'does not exist", &config.command_socket_path())),
+      e => e
+    })?;
+
   let timeout: u64 = matches.timeout.unwrap_or(config.ctl_command_timeout);
 
   match matches.cmd {
@@ -94,7 +111,8 @@ fn main() {
         QueryCmd::Applications{ id, domain } => query_application(channel, json, id, domain),
       }
     },
-  }
+  };
+  Ok(())
 }
 
 pub fn create_channel(path: &str) -> Result<Channel<ConfigMessage,ConfigMessageAnswer>,io::Error> {
