@@ -736,12 +736,10 @@ impl Server {
         },
       };
 
-      res.map(|action| {
-        if action != BackendConnectAction::New {
-          entry.remove();
-        }
-        action
-      })
+      if res != Ok(BackendConnectAction::New) {
+        entry.remove();
+      }
+      res
     };
 
     match res {
@@ -785,6 +783,17 @@ impl Server {
               };
             }
           }
+        }
+      },
+      ClientResult::ReconnectBackend(main_token, backend_token)  => {
+        if let Some(t) = backend_token {
+          let cl = self.to_client(t);
+          let _ = self.clients.remove(cl);
+        }
+
+        if let Some(t) = main_token {
+          let tok = self.to_client(t);
+          self.connect_to_backend(tok);
         }
       },
       ClientResult::ConnectBackend  => self.connect_to_backend(token),

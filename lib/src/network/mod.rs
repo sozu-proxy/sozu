@@ -179,6 +179,7 @@ impl RequiredEvents {
 pub enum ClientResult {
   CloseClient,
   CloseBackend(Option<Token>),
+  ReconnectBackend(Option<Token>, Option<Token>),
   Continue,
   ConnectBackend
 }
