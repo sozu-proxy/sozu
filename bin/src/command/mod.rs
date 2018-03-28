@@ -10,8 +10,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::collections::{HashMap,VecDeque};
 use std::time::Duration;
 use libc::pid_t;
+use nix::unistd::Pid;
 use nix::sys::signal::{kill,Signal};
-use nix::sys::wait::{waitpid,WaitStatus,WNOHANG};
+use nix::sys::wait::{waitpid,WaitStatus,WaitPidFlag};
 
 use sozu::network::metrics::METRICS;
 use sozu_command::config::Config;
@@ -551,12 +552,12 @@ impl CommandServer {
   pub fn check_worker_status(&mut self, token: Token) {
     {
       let ref mut proxy = self.proxies.get_mut(&token).expect("there should be a worker at that token");
-      let res = waitpid(proxy.pid, Some(WNOHANG));
+      let res = waitpid(Pid::from_raw(proxy.pid), Some(WaitPidFlag::WNOHANG));
 
       if let Ok(WaitStatus::StillAlive) = res {
         if proxy.run_state == RunState::NotAnswering {
           error!("worker process {} (PID = {}) not answering, killing and replacing", proxy.id, proxy.pid);
-          if let Err(e) = kill(proxy.pid, Signal::SIGKILL) {
+          if let Err(e) = kill(Pid::from_raw(proxy.pid), Signal::SIGKILL) {
             error!("failed to kill the worker process: {:?}", e);
           } else {
             proxy.run_state == RunState::Stopped;
@@ -648,7 +649,7 @@ pub fn start(config: Config, command_socket_path: String, proxies: Vec<Worker>) 
       // the workers did not even get the configuration, we can kill them right away
       for proxy in proxies {
         error!("killing worker n°{} (PID {})", proxy.id, proxy.pid);
-        let _ = kill(proxy.pid, Signal::SIGKILL).map_err(|e| {
+        let _ = kill(Pid::from_raw(proxy.pid), Signal::SIGKILL).map_err(|e| {
           error!("could not kill worker: {:?}", e);
         });
       }

@@ -85,7 +85,7 @@ pub fn start_new_master_process(executable_path: String, upgrade_data: UpgradeDa
       info!("master launched: {}", child);
       command.set_nonblocking(true);
 
-      return (child, command);
+      return (child.into(), command);
     }
     ForkResult::Child => {
       trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });

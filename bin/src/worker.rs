@@ -133,7 +133,7 @@ pub fn start_worker_process(id: &str, config: &Config, executable_path: String, 
       info!("sent listeners from master: {:?}", res);
 
       let command: Channel<OrderMessage,OrderMessageAnswer> = command.into();
-      Ok((child, command, scm_server))
+      Ok((child.into(), command, scm_server))
     },
     Ok(ForkResult::Child) => {
       trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
