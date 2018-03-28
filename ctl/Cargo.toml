@@ -15,10 +15,10 @@ name = "sozuctl"
 
 [dependencies]
 rand    = "^0.3"
-prettytable-rs = "^0.6"
+prettytable-rs = { version = "^0.6", default-features = false}
 sozu-command-lib = { version = "^0.5", path = "../command" }
-structopt = "0.1.0"
-structopt-derive = "0.1.0"
+structopt = "^0.2"
+structopt-derive = "^0.2"
 serde = "1.0"
 serde_json = "1.0"
 serde_derive = "1.0"
