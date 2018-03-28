@@ -14,7 +14,7 @@ categories = ["network-programming"]
 name = "sozuctl"
 
 [dependencies]
-rand    = "^0.3"
+rand    = "^0.4"
 prettytable-rs = { version = "^0.6", default-features = false}
 sozu-command-lib = { version = "^0.5", path = "../command" }
 structopt = "^0.2"
