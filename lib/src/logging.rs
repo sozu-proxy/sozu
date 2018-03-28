@@ -23,6 +23,7 @@ pub struct Logger {
   pub access_backend: Option<LoggerBackend>,
   pub tag:            String,
   pub pid:            i32,
+  pub initialized:    bool,
 }
 
 impl Logger {
@@ -35,7 +36,8 @@ impl Logger {
       backend:        LoggerBackend::Stdout(stdout()),
       access_backend: None,
       tag:            "SOZU".to_string(),
-    pid:            0,
+      pid:            0,
+      initialized:    false,
     }
   }
 
@@ -43,15 +45,19 @@ impl Logger {
     let directives = parse_logging_spec(spec);
     LOGGER.with(|l| {
       let ref mut logger = *l.borrow_mut();
-      logger.set_directives(directives);
-      logger.backend        = backend;
-      logger.access_backend = access_backend;
-      logger.tag            = tag;
-      logger.pid            = unsafe { libc::getpid() };
+      if !logger.initialized {
+        logger.set_directives(directives);
+        logger.backend        = backend;
+        logger.access_backend = access_backend;
+        logger.tag            = tag;
+        logger.pid            = unsafe { libc::getpid() };
+        logger.initialized    = true;
+
+        let _ = log::set_logger(&COMPAT_LOGGER).map_err(|e| println!("could not register compat logger: {:?}", e));
+        log::set_max_level(log::LevelFilter::Info);
+      }
     });
 
-    let _ = log::set_logger(&COMPAT_LOGGER).map_err(|e| println!("could not register compat logger: {:?}", e));
-    log::set_max_level(log::LevelFilter::Info);
   }
 
   pub fn log<'a>(&mut self, meta: &Metadata, args: Arguments) {
