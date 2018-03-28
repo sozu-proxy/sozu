@@ -15,6 +15,7 @@ thread_local! {
   pub static TAG:    String          = LOGGER.with(|logger| (*logger.borrow()).tag.clone());
 }
 
+static COMPAT_LOGGER: CompatLogger = CompatLogger;
 
 pub struct Logger {
   pub directives:     Vec<LogDirective>,
@@ -49,13 +50,11 @@ impl Logger {
       logger.pid            = unsafe { libc::getpid() };
     });
 
-    let _ = log::set_logger(|max_log_level| {
-      max_log_level.set(log::LogLevelFilter::Info);
-      Box::new(CompatLogger)
-    });
+    let _ = log::set_logger(&COMPAT_LOGGER).map_err(|e| println!("could not register compat logger: {:?}", e));
+    log::set_max_level(log::LevelFilter::Info);
   }
 
-  pub fn log<'a>(&mut self, meta: &LogMetadata, args: Arguments) {
+  pub fn log<'a>(&mut self, meta: &Metadata, args: Arguments) {
     if self.enabled(meta) {
       match self.backend {
         LoggerBackend::Stdout(ref mut stdout) => {
@@ -87,7 +86,7 @@ impl Logger {
     }
   }
 
-  pub fn log_access<'a>(&mut self, meta: &LogMetadata, args: Arguments) {
+  pub fn log_access<'a>(&mut self, meta: &Metadata, args: Arguments) {
     if self.enabled(meta) {
       let backend = self.access_backend.as_mut().unwrap_or(&mut self.backend);
       match *backend {
@@ -120,7 +119,7 @@ impl Logger {
     }
   }
 
-  pub fn compat_log<'a>(&mut self, meta: &log::LogMetadata, args: Arguments) {
+  pub fn compat_log<'a>(&mut self, meta: &log::Metadata, args: Arguments) {
     if self.compat_enabled(meta) {
       match self.backend {
         LoggerBackend::Stdout(ref mut stdout) => {
@@ -156,7 +155,7 @@ impl Logger {
     self.directives = directives;
   }
 
-  fn enabled(&self, meta: &LogMetadata) -> bool {
+  fn enabled(&self, meta: &Metadata) -> bool {
     // Search for the longest match, the vector is assumed to be pre-sorted.
     for directive in self.directives.iter().rev() {
       match directive.name {
@@ -169,7 +168,7 @@ impl Logger {
     false
   }
 
-  fn compat_enabled(&self, meta: &log::LogMetadata) -> bool {
+  fn compat_enabled(&self, meta: &log::Metadata) -> bool {
     // Search for the longest match, the vector is assumed to be pre-sorted.
     for directive in self.directives.iter().rev() {
       match directive.name {
@@ -378,7 +377,7 @@ impl LogLevelFilter {
 }
 
 /// Metadata about a log message.
-pub struct LogMetadata {
+pub struct Metadata {
   pub level:  LogLevel,
   pub target: &'static str,
 }
@@ -454,7 +453,7 @@ macro_rules! log {
 
     (__inner__ $target:expr, $lvl:expr, $format:expr, $level_tag:expr,
      [$($final_args:ident),*], [$($idents:ident),*]) => ({
-      static _META: $crate::logging::LogMetadata = $crate::logging::LogMetadata {
+      static _META: $crate::logging::Metadata = $crate::logging::Metadata {
           level:  $lvl,
           target: module_path!(),
       };
@@ -494,7 +493,7 @@ macro_rules! log_access {
 
     (__inner__ $target:expr, $lvl:expr, $format:expr, $level_tag:expr,
      [$($final_args:ident),*], [$($idents:ident),*]) => ({
-      static _META: $crate::logging::LogMetadata = $crate::logging::LogMetadata {
+      static _META: $crate::logging::Metadata = $crate::logging::Metadata {
           level:  $lvl,
           target: module_path!(),
       };
@@ -606,24 +605,24 @@ macro_rules! trace {
 use log;
 struct CompatLogger;
 
-impl From<log::LogLevel> for LogLevel {
-  fn from(lvl: log::LogLevel) -> Self {
+impl From<log::Level> for LogLevel {
+  fn from(lvl: log::Level) -> Self {
     match lvl {
-      log::LogLevel::Error => LogLevel::Error,
-      log::LogLevel::Warn  => LogLevel::Warn,
-      log::LogLevel::Info  => LogLevel::Info,
-      log::LogLevel::Debug => LogLevel::Debug,
-      log::LogLevel::Trace => LogLevel::Trace,
+      log::Level::Error => LogLevel::Error,
+      log::Level::Warn  => LogLevel::Warn,
+      log::Level::Info  => LogLevel::Info,
+      log::Level::Debug => LogLevel::Debug,
+      log::Level::Trace => LogLevel::Trace,
     }
   }
 }
 
 impl log::Log for CompatLogger {
-  fn enabled(&self, _: &log::LogMetadata) -> bool {
+  fn enabled(&self, _: &log::Metadata) -> bool {
     true
   }
 
-  fn log(&self, record: &log::LogRecord) {
+  fn log(&self, record: &log::Record) {
 
     TAG.with(|tag| {
       LOGGER.with(|l| {
@@ -638,6 +637,8 @@ impl log::Log for CompatLogger {
       })
     });
   }
+
+  fn flush(&self) {}
 }
 
 #[macro_export]

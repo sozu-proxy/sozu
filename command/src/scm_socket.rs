@@ -130,7 +130,7 @@ impl ScmSocket {
     let flags = if self.blocking {
       socket::MsgFlags::empty()
     } else {
-      socket::MSG_DONTWAIT
+      socket::MsgFlags::MSG_DONTWAIT
     };
 
     if fds.len() > 0 {
@@ -151,7 +151,7 @@ impl ScmSocket {
     let flags = if self.blocking {
       socket::MsgFlags::empty()
     } else {
-      socket::MSG_DONTWAIT
+      socket::MsgFlags::MSG_DONTWAIT
     };
 
     //let msg = socket::recvmsg(self.fd, &iov[..], Some(&mut cmsg), socket::MSG_DONTWAIT)?;

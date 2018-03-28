@@ -21,10 +21,10 @@ include = [
 ]
 
 [dependencies]
-hex = "^0.2"
-log = "^0.3"
-pem = "^0.4"
-nix = "^0.8"
+hex = "^0.3"
+log = "^0.4"
+pem = "^0.5"
+nix = "^0.10"
 mio = "^0.6"
 mio-uds = "^0.6"
 pool = "^0.1"

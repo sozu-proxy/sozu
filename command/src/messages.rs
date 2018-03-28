@@ -1,6 +1,6 @@
 use serde;
 use serde::de::{self, Visitor};
-use hex::{FromHex,ToHex};
+use hex::{self,FromHex};
 use std::net::{IpAddr,SocketAddr};
 use std::collections::{BTreeMap,HashSet};
 use std::default::Default;
@@ -144,13 +144,13 @@ pub struct CertFingerprint(pub Vec<u8>);
 
 impl fmt::Debug for CertFingerprint {
   fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-    write!(f, "CertFingerprint({})", self.0.to_hex())
+    write!(f, "CertFingerprint({})", hex::encode(&self.0))
   }
 }
 
 impl fmt::Display for CertFingerprint {
   fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-    write!(f, "{}", self.0.to_hex())
+    write!(f, "{}", hex::encode(&self.0))
   }
 }
 
@@ -158,7 +158,7 @@ impl serde::Serialize for CertFingerprint {
   fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
       where S: serde::Serializer,
   {
-    serializer.serialize_str(&self.0.to_hex())
+    serializer.serialize_str(&hex::encode(&self.0))
   }
 }
 
