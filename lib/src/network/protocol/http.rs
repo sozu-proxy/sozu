@@ -373,9 +373,11 @@ impl<Front:SocketHandler> Http<Front> {
       record_request_time!(app_id, response_time.num_milliseconds());
     }
 
-    info_access!("{}\t {} -> X\t{} {} {}\t | {} {} {} {}", self.log_ctx,
-        client, status_line, host, request_line,
-        LogDuration(response_time), LogDuration(service_time), metrics.bin, metrics.bout);
+    info_access!("{}{} -> X\t{} {} {} {}\t{} {} {}",
+      self.log_ctx, client,
+      LogDuration(response_time), LogDuration(service_time),
+      metrics.bin, metrics.bout,
+      status_line, host, request_line);
   }
 
   pub fn log_request_error(&self, metrics: &SessionMetrics, message: &str) {
