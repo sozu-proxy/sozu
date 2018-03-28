@@ -1265,12 +1265,12 @@ mod tests {
   }
 
 
-  use self::tiny_http::{ServerBuilder, Response};
+  use self::tiny_http::{Server, Response};
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server(port: u16) {
     thread::spawn(move|| {
-      let server = ServerBuilder::new().with_port(port).build().expect("could not create server");
+      let server = Server::http(&format!("127.0.0.1:{}", port)).expect("could not create server");
       println!("starting web server in port {}", port);
 
       for request in server.incoming_requests() {
