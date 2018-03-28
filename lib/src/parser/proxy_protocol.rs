@@ -159,7 +159,7 @@ mod test {
       unknow_version,                                                         // Version 2 and command LOCAL
     ];
 
-    assert_eq!(Error(error_code!(ErrorKind::Verify)), parse_v2_header(input));
+    assert!(parse_v2_header(input).is_err());
   }
 
   #[test]
@@ -173,7 +173,7 @@ mod test {
       0x00, 0x00,                                                             // address sizes = 0
     ];
 
-    assert_eq!(Error(error_code!(ErrorKind::Switch)), parse_v2_header(input));
+    assert!(parse_v2_header(input).is_err());
   }
 
   #[test]
@@ -183,7 +183,7 @@ mod test {
       0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, 0x0D, // INCORRECT MAGIC header
     ];
 
-    assert_eq!(Error(error_code!(ErrorKind::Tag)), parse_v2_header(input));
+    assert!(parse_v2_header(input).is_err());
   }
 
   #[test]
