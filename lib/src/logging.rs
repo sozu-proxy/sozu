@@ -33,7 +33,7 @@ impl Logger {
         name:  None,
         level: LogLevelFilter::Error,
       }),
-      backend:        LoggerBackend::Stdout(stdout()),
+      backend:        LoggerBackend::Stdout(BufWriter::new(stdout())),
       access_backend: None,
       tag:            "SOZU".to_string(),
       pid:            0,
@@ -190,7 +190,7 @@ impl Logger {
 }
 
 pub enum LoggerBackend {
-  Stdout(Stdout),
+  Stdout(BufWriter<Stdout>),
   Unix(UnixDatagram),
   Udp(UdpSocket, SocketAddr),
   Tcp(TcpStream),
