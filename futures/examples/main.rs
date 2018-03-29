@@ -13,7 +13,7 @@ use command::SozuCommandClient;
 use sozu_command::data::{ConfigCommand,ConfigMessage};
 
 fn main() {
-    env_logger::init().unwrap();
+    env_logger::init();
     let mut core   = Core::new().unwrap();
     let handle     = core.handle();
 
