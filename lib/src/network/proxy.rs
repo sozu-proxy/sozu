@@ -819,10 +819,12 @@ impl Server {
           //info!("PROTOCOL IS LISTEN");
           if events.is_readable() {
             self.accept_ready.insert(ListenToken(token.0));
-            loop {
-              //info!("will accept");
-              if !self.accept(ListenToken(token.0), protocol) {
-                break;
+            if self.can_accept {
+              loop {
+                //info!("will accept");
+                if !self.accept(ListenToken(token.0), protocol) {
+                  break;
+                }
               }
             }
             return;
@@ -869,12 +871,12 @@ impl Server {
   pub fn handle_remaining_readiness(&mut self) {
     // try to accept again after handling all client events,
     // since we might have released a few client slots
-    if !self.accept_ready.is_empty() && self.can_accept {
+    if self.can_accept && !self.accept_ready.is_empty() {
       loop {
         if let Some(token) = self.accept_ready.iter().next().map(|token| ListenToken(token.0)) {
           let protocol = self.clients[ClientToken(token.0)].borrow().protocol();
           if !self.accept(token, protocol) {
-            if !self.accept_ready.is_empty() && self.can_accept {
+            if !self.can_accept || self.accept_ready.is_empty() {
               break;
             }
           }
