@@ -5,7 +5,7 @@ extern crate time;
 
 use std::env;
 use std::thread;
-use std::io::stdout;
+use std::io::{BufWriter,stdout};
 use sozu::network;
 use sozu_command::messages;
 use sozu_command::channel::Channel;
@@ -13,9 +13,10 @@ use sozu::logging::{Logger,LoggerBackend};
 
 fn main() {
   if env::var("RUST_LOG").is_ok() {
-   Logger::init("EXAMPLE".to_string(), &env::var("RUST_LOG").expect("could not get the RUST_LOG env var"), LoggerBackend::Stdout(stdout()), None);
+   Logger::init("EXAMPLE".to_string(), &env::var("RUST_LOG").expect("could not get the RUST_LOG env var"),
+     LoggerBackend::Stdout(BufWriter::new(stdout())), None);
   } else {
-   Logger::init("EXAMPLE".to_string(), "info", LoggerBackend::Stdout(stdout()), None);
+   Logger::init("EXAMPLE".to_string(), "info", LoggerBackend::Stdout(BufWriter::new(stdout())), None);
   }
 
   info!("starting up");
