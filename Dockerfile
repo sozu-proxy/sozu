@@ -11,6 +11,7 @@ RUN apk add --no-cache --virtual .build-dependencies \
   musl-dev \
   rust
 RUN apk add --no-cache openssl-dev llvm-libunwind pkgconfig
+ENV SOZU_CONFIG /etc/sozu/sozu.toml
 WORKDIR /source/ctl
 RUN cargo build --release
 WORKDIR /source/bin
