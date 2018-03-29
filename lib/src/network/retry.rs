@@ -62,6 +62,11 @@ impl RetryPolicy for ExponentialBackoffPolicy {
     }
 
     fn fail(&mut self) {
+        if self.last_try.elapsed().lt(&self.wait) {
+          //we're already in back off
+          return;
+        }
+
         let max_secs = cmp::max(1, 1 << self.current_tries);
         let wait = if max_secs == 1 {
             1
