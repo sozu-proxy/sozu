@@ -67,7 +67,7 @@ impl RetryPolicy for ExponentialBackoffPolicy {
           return;
         }
 
-        let max_secs = cmp::max(1, 1 << self.current_tries);
+        let max_secs = cmp::max(1, 1u64.wrapping_shl(self.current_tries as u32));
         let wait = if max_secs == 1 {
             1
         } else {
