@@ -22,13 +22,13 @@ pub fn setup(tag: String, level: &str, target: &str, access_target: Option<&str>
 
 pub fn target_to_backend(target: &str) -> LoggerBackend {
   if target == "stdout" {
-    LoggerBackend::Stdout(BufWriter::new(stdout()))
+    LoggerBackend::Stdout(stdout())
   } else if target.starts_with("udp://") {
     let addr_res = (&target[6..]).to_socket_addrs();
     match addr_res {
       Err(e) => {
         println!("invalid log target configuration ({:?}): {}", e, target);
-        LoggerBackend::Stdout(BufWriter::new(stdout()))
+        LoggerBackend::Stdout(stdout())
       },
       Ok(mut addrs) => {
         let socket = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
@@ -40,7 +40,7 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
     match addr_res {
       Err(e) => {
         println!("invalid log target configuration ({:?}): {}", e, target);
-        LoggerBackend::Stdout(BufWriter::new(stdout()))
+        LoggerBackend::Stdout(stdout())
       },
       Ok(mut addrs) => {
         LoggerBackend::Tcp(TcpStream::connect(addrs.next().unwrap()).unwrap())
@@ -50,7 +50,7 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
     let path = Path::new(&target[7..]);
     if !path.is_file() {
       println!("invalid log target configuration: {} is not a file", &target[7..]);
-      LoggerBackend::Stdout(BufWriter::new(stdout()))
+      LoggerBackend::Stdout(stdout())
     } else {
       let mut dir = env::temp_dir();
       let s: String = thread_rng().gen_ascii_chars().take(12).collect();
@@ -65,12 +65,12 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
       Ok(file) => LoggerBackend::File(BufWriter::new(file)),
       Err(e)   => {
         println!("invalid log target configuration: could not open file at {} (error: {:?})", &target[7..], e);
-        LoggerBackend::Stdout(BufWriter::new(stdout()))
+        LoggerBackend::Stdout(stdout())
       }
     }
   } else {
     println!("invalid log target configuration: {}", target);
-    LoggerBackend::Stdout(BufWriter::new(stdout()))
+    LoggerBackend::Stdout(stdout())
   }
 }
 
