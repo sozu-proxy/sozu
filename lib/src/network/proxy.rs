@@ -593,7 +593,11 @@ impl Server {
       self.nb_connections -= 1;
     }
 
-    self.can_accept = true;
+    // do not be ready to accept right away, wait until we get back to 10% capacity
+    if !self.can_accept && self.nb_connections < self.max_connections * 90 / 100 {
+      debug!("nb_connections = {}, max_connections = {}, starting to accept again", self.nb_connections, self.max_connections);
+      self.can_accept = true;
+    }
   }
 
   pub fn accept(&mut self, token: ListenToken, protocol: Protocol) -> bool {
