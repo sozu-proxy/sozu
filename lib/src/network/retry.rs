@@ -186,7 +186,7 @@ mod tests {
 
         let can_try = policy.can_try();
 
-        assert_eq!(None, can_try)
+        assert_eq!(Some(RetryAction::WAIT), can_try)
     }
 
     #[test]
