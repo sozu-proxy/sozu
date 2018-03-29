@@ -4,7 +4,7 @@ extern crate sozu_command_lib as sozu_command;
 extern crate time;
 
 use std::thread;
-use std::io::{BufWriter,stdout};
+use std::io::stdout;
 use sozu::network;
 use sozu_command::messages;
 use sozu_command::channel::Channel;
@@ -18,7 +18,7 @@ fn main() {
    Logger::init("EXAMPLE".to_string(), "info", LoggerBackend::Stdout(stdout()));
   }
   */
- Logger::init("EXAMPLE".to_string(), "debug", LoggerBackend::Stdout(BufWriter::new(stdout())), None);
+ Logger::init("EXAMPLE".to_string(), "debug", LoggerBackend::Stdout(stdout()), None);
 
   info!("starting up");
 
@@ -28,7 +28,7 @@ fn main() {
     let max_listeners = 500;
     let max_buffers   = 500;
     let buffer_size   = 16384;
-    Logger::init("TCP".to_string(), "debug", LoggerBackend::Stdout(BufWriter::new(stdout())), None);
+    Logger::init("TCP".to_string(), "debug", LoggerBackend::Stdout(stdout()), None);
     network::tcp::start(max_buffers, buffer_size, channel);
   });
 

@@ -650,11 +650,6 @@ impl log::Log for CompatLogger {
 #[macro_export]
 macro_rules! setup_test_logger {
   () => (
-    $crate::logging::Logger::init(
-      module_path!().to_string(),
-      "error",
-      $crate::logging::LoggerBackend::Stdout(
-        ::std::io::BufWriter::new(::std::io::stdout())),
-      None);
+    $crate::logging::Logger::init(module_path!().to_string(), "error", $crate::logging::LoggerBackend::Stdout(::std::io::stdout()), None);
   );
 }
