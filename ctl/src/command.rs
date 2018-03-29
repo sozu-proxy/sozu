@@ -1241,7 +1241,7 @@ fn order_command(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeou
 }
 
 fn print_json_response<T: ::serde::Serialize>(input: &T) {
-  match serde_json::to_string(&input) {
+  match serde_json::to_string_pretty(&input) {
     Ok(to_print) => println!("{}", to_print),
     Err(e) => {
       eprintln!("Error while parsing response to JSON: {:?}", e);
