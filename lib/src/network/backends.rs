@@ -13,6 +13,7 @@ use network::{AppId,Backend,ConnectionError};
 pub struct BackendMap {
   pub backends:     HashMap<AppId, BackendList>,
   pub max_failures: usize,
+  pub available:    bool,
 }
 
 impl BackendMap {
@@ -20,6 +21,7 @@ impl BackendMap {
     BackendMap {
       backends:     HashMap::new(),
       max_failures: 3,
+      available:    true,
     }
   }
 
@@ -58,6 +60,7 @@ impl BackendMap {
   pub fn backend_from_app_id(&mut self, app_id: &str) -> Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError> {
     if let Some(ref mut app_backends) = self.backends.get_mut(app_id) {
       if app_backends.backends.len() == 0 {
+        self.available = false;
         return Err(ConnectionError::NoBackendAvailable);
       }
 
@@ -71,12 +74,23 @@ impl BackendMap {
             error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
           }
 
-          return conn.map(|c| (b.clone(), c)).map_err(|e| {
+          let res = conn.map(|c| {
+            (b.clone(), c)
+          }).map_err(|e| {
             error!("could not connect {} to {:?} ({} failures)", app_id, backend.address, backend.failures);
             e
           });
+
+          if res.is_ok() {
+            self.available = true;
+          }
+
+          return res;
         } else {
-          error!("no more available backends for app {}", app_id);
+          if self.available {
+            error!("no more available backends for app {}", app_id);
+            self.available = false;
+          }
           return Err(ConnectionError::NoBackendAvailable);
         }
       }
