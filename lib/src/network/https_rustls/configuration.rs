@@ -330,12 +330,14 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     }
   }
 
-  fn accept_flush(&mut self) {
+  fn accept_flush(&mut self) -> usize {
+    let mut counter = 0;
     if let Some(ref sock) = self.listener {
       while sock.accept().is_ok() {
-        error!("accepting and closing connection");
+        counter += 1;
       }
     }
+    counter
   }
 
   fn connect_to_backend(&mut self, poll: &mut Poll,  client: &mut TlsClient, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {

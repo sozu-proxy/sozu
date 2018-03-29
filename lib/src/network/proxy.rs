@@ -679,9 +679,10 @@ impl Server {
   }
 
   pub fn accept_flush(&mut self) {
-    self.tcp.as_mut().map(|tcp| tcp.accept_flush());
-    self.http.as_mut().map(|http| http.accept_flush());
-    self.https.as_mut().map(|https| https.accept_flush());
+    let mut counter = self.tcp.as_mut().map(|tcp| tcp.accept_flush()).unwrap_or(0);
+    counter += self.http.as_mut().map(|http| http.accept_flush()).unwrap_or(0);
+    counter += self.https.as_mut().map(|https| https.accept_flush()).unwrap_or(0);
+    error!("flushed {} new connections", counter);
   }
 
   pub fn connect_to_backend(&mut self, token: ClientToken) {
@@ -974,7 +975,7 @@ impl HttpsProvider {
     }
   }
 
-  pub fn accept_flush(&mut self) {
+  pub fn accept_flush(&mut self) -> usize {
     match self {
       &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.accept_flush(),
       &mut HttpsProvider::Openssl(ref mut openssl) => openssl.accept_flush(),
@@ -1035,9 +1036,9 @@ impl HttpsProvider {
     rustls.close_backend(app_id, addr);
   }
 
-  pub fn accept_flush(&mut self) {
+  pub fn accept_flush(&mut self) -> usize {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.accept_flush();
+    rustls.accept_flush()
   }
 
   pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_client: Rc<RefCell<ProxyClientCast>>, back_token: Token)

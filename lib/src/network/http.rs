@@ -955,12 +955,14 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn accept_flush(&mut self) {
+  fn accept_flush(&mut self) -> usize {
+    let mut counter = 0;
     if let Some(ref sock) = self.listener {
       while sock.accept().is_ok() {
-        error!("accepting and closing connection");
+        counter += 1;
       }
     }
+    counter
   }
 
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {

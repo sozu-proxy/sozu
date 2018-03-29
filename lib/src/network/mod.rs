@@ -92,7 +92,7 @@ pub trait ProxyConfiguration<Client> {
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
   fn accept(&mut self, token: ListenToken, event_loop: &mut Poll, client_token: Token)
     -> Result<(Rc<RefCell<Client>>, bool), AcceptError>;
-  fn accept_flush(&mut self);
+  fn accept_flush(&mut self) -> usize;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
 }
 
