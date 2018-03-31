@@ -58,9 +58,9 @@ fn main() {
     let start = get_config_file_path(&matches)
     .and_then(|config_file| load_configuration(config_file))
     .map(|config| {
-      setup_logging(&config);
+      util::setup_logging(&config);
       info!("Starting up");
-      setup_metrics(&config);
+      util::setup_metrics(&config);
 
       config
     })
@@ -120,18 +120,6 @@ fn load_configuration(config_file: &str) -> Result<Config, StartupError> {
   match Config::load_from_path(config_file) {
     Ok(config) => Ok(config),
     Err(e) => Err(StartupError::ConfigurationFileLoadError(e))
-  }
-}
-
-fn setup_logging(config: &Config) {
-  //FIXME: should have an id for the master too
-  logging::setup("MASTER".to_string(), &config.log_level,
-    &config.log_target, config.log_access_target.as_ref().map(|s| s.as_str()));
-}
-
-fn setup_metrics(config: &Config) {
-  if let Some(ref metrics) = config.metrics.as_ref() {
-    metrics_set_up!(&metrics.address[..], metrics.port, "MASTER".to_string(), metrics.tagged_metrics);
   }
 }
 
