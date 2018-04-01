@@ -42,7 +42,8 @@ enum StartupError {
   ConfigurationFileLoadError(std::io::Error),
   TooManyAllowedConnections(String),
   TooManyAllowedConnectionsForWorker(String),
-  WorkersSpawnFail(nix::Error)
+  WorkersSpawnFail(nix::Error),
+  PIDFileNotWritable(String)
 }
 
 fn main() {
@@ -57,6 +58,11 @@ fn main() {
   if upgrade == None {
     let start = get_config_file_path(&matches)
     .and_then(|config_file| load_configuration(config_file))
+    .and_then(|config| {
+      util::write_pid_file(&config)
+        .map(|()| config)
+        .map_err(|err| StartupError::PIDFileNotWritable(err))
+    })
     .map(|config| {
       util::setup_logging(&config);
       info!("Starting up");
@@ -91,6 +97,10 @@ fn main() {
       },
       Err(StartupError::WorkersSpawnFail(err)) => {
         error!("At least one worker failed to spawn. Error: {:?}", err);
+        std::process::exit(1);
+      },
+      Err(StartupError::PIDFileNotWritable(err)) => {
+        error!("{}", err);
         std::process::exit(1);
       }
     }

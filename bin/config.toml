@@ -75,6 +75,12 @@ buffer_size = 16384
 # Defaults to 1000 milliseconds
 #ctl_command_timeout = 1000
 
+# PID file is a file containing the PID of the master process of sozu.
+# It can be helpful to help systemd or any other service system to keep track
+# of the main process across upgrades. PID file is not created unless this option
+# is set or if SOZU_PID_FILE_PATH environment variable was defined at build time.
+# pid_file_path = "/run/sozu/sozu.pid"
+
 # various statistics can be sent to a server that supports the statsd protocol
 # You can see those statistics with sozuctl, like this: `sozuctl metrics` or
 # `sozuctl metrics --json` for machine consumption
