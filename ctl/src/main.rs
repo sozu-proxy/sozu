@@ -43,7 +43,7 @@ fn main() {
       }
     },
     SubCmd::Upgrade { worker: None } => upgrade_master(channel, &config.command_socket_path()),
-    SubCmd::Upgrade { worker: Some(id) } => upgrade_worker(channel, timeout, id),
+    SubCmd::Upgrade { worker: Some(id) } => { upgrade_worker(channel, timeout, id); },
     SubCmd::Status{ json } => status(channel, json),
     SubCmd::Metrics{ json } => metrics(channel, json),
     SubCmd::Logging{ level } => logging_filter(channel, timeout, &level),
