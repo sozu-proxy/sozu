@@ -8,18 +8,23 @@ use network::protocol::proxy_protocol::header::*;
 
 const PROTOCOL_SIGNATURE_V2: [u8; 12] = [0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A];
 
-named!(read_and_verify_ver_and_command<u8>, verify!(be_u8, |ver_and_cmd: u8| (ver_and_cmd >> 4) & 0x0f == 0x02));
+named!(parse_command<Command>,
+  switch!(be_u8,
+    0x20 => value!(Command::Local) |
+    0x21 => value!(Command::Proxy)
+  )
+);
 
 named!(pub parse_v2_header<HeaderV2>,
   do_parse!(
     signature: tag!(&PROTOCOL_SIGNATURE_V2) >>
-    ver_and_cmd: read_and_verify_ver_and_command >>
+    command: parse_command >>
     family: be_u8 >>
     len: be_u16 >>
     addr: apply!(parse_addr_v2, family) >>
     (
       HeaderV2 {
-        command: Command::Local,
+        command,
         family,
         addr
       }
@@ -92,7 +97,7 @@ mod test {
   use nom::Needed::Size;
 
   #[test]
-  fn test_parse_proxy_protocol_v2_ipv4_addr_header() {
+  fn test_parse_proxy_protocol_v2_local_ipv4_addr_header() {
     let input = &[
       0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // MAGIC header
       0x20,                                                                   // Version 2 and command LOCAL
@@ -107,6 +112,26 @@ mod test {
     let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(125, 25, 10, 1)), 8080);
     let dst_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200);
     let expected = HeaderV2::new(Command::Local, src_addr, dst_addr);
+
+    assert_eq!(Done(&[][..], expected), parse_v2_header(input));
+  }
+
+  #[test]
+  fn test_parse_proxy_protocol_v2_proxy_ipv4_addr_header() {
+    let input = &[
+      0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // MAGIC header
+      0x21,                                                                   // Version 2 and command LOCAL
+      0x11,                                                                   // family AF_UNIX with IPv4
+      0x00, 0x0C,                                                             // address sizes = 12
+      0x7D, 0x19, 0x0A, 0x01,                                                 // source address
+      0x0A, 0x04, 0x05, 0x08,                                                 // destination address
+      0x1F, 0x90,                                                             // source port
+      0x10, 0x68,                                                             // destination port
+    ];
+
+    let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(125, 25, 10, 1)), 8080);
+    let dst_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200);
+    let expected = HeaderV2::new(Command::Proxy, src_addr, dst_addr);
 
     assert_eq!(Done(&[][..], expected), parse_v2_header(input));
   }
@@ -155,7 +180,19 @@ mod test {
 
     let input = &[
       0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // MAGIC header
-      unknow_version,                                                         // Version 2 and command LOCAL
+      unknow_version,                                                         // invalid version
+    ];
+
+    assert!(parse_v2_header(input).is_err());
+  }
+
+  #[test]
+  fn it_should_not_parse_proxy_protocol_v2_with_unknown_command() {
+    let unknow_command = 0x23;
+
+    let input = &[
+      0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A, // MAGIC header
+      unknow_command,                                                         // Version 2 and invalid command
     ];
 
     assert!(parse_v2_header(input).is_err());
