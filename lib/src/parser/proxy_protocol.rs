@@ -67,20 +67,19 @@ named!(parse_ipv6_on_v2<ProxyAddr>,
     dest_port: be_u16 >>
     (
       ProxyAddr::Ipv6Addr {
-        src_addr: SocketAddrV6::new(Ipv6Addr::from(clone_into_array::<[u8; 16], u8>(&src_ip[..])), src_port, 0 ,0),
-        dst_addr: SocketAddrV6::new(Ipv6Addr::from(clone_into_array::<[u8; 16], u8>(&dest_ip[..])), dest_port, 0 ,0),
+        src_addr: SocketAddrV6::new(slice_to_ipv6(&src_ip[..]), src_port, 0 ,0),
+        dst_addr: SocketAddrV6::new(slice_to_ipv6(&dest_ip[..]), dest_port, 0 ,0),
       }
     )
   )
 );
 
-// Transform a slice to an array
-fn clone_into_array<A, T>(slice: &[T]) -> A where A: Sized + Default + AsMut<[T]>, T: Clone {
-  let mut a = Default::default();
-  <A as AsMut<[T]>>::as_mut(&mut a).clone_from_slice(slice);
-  a
+// assumes the slice has 16 bytes
+pub fn slice_to_ipv6(sl: &[u8]) -> Ipv6Addr {
+  let mut arr: [u8; 16] = [0; 16];
+  arr.clone_from_slice(sl);
+  Ipv6Addr::from(arr)
 }
-
 
 #[cfg(test)]
 mod test {
