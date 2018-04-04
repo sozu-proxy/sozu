@@ -85,9 +85,12 @@ impl Client {
     let mut backend_buffer = None;
 
       let protocol = match proxy_protocol {
-      Some(ProxyProtocolConfig::ExpectHeader) => {
+      Some(ProxyProtocolConfig::RelayHeader) => {
         backend_buffer = Some(back_buf);
         Some(State::RelayProxyProtocol(RelayProxyProtocol::new(s, None, front_buf)))
+      },
+      Some(ProxyProtocolConfig::ExpectHeader) => {
+        unimplemented!("ExpectHeader case not handled yet")
       },
       Some(ProxyProtocolConfig::SendHeader) => {
         frontend_buffer = Some(front_buf);

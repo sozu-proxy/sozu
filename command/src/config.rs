@@ -184,9 +184,11 @@ pub struct MetricsConfig {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProxyProtocolConfig {
   ExpectHeader,
   SendHeader,
+  RelayHeader,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
@@ -212,19 +214,14 @@ impl FileAppConfig {
     let send_proxy = self.send_proxy.unwrap_or(false);
     let expect_proxy = self.expect_proxy.unwrap_or(false);
 
-    if send_proxy && expect_proxy {
-      return Err(String::from("Configuration conflict, send_proxy and expect_proxy cannot be combined"))
-    }
-
     if self.hostname.is_none() && self.path_begin.is_none() && self.certificate.is_none() &&
       self.key.is_none() && self.certificate_chain.is_none() && self.sticky_session.is_none() {
-      let mut proxy_protocol = None;
-
-      if send_proxy {
-        proxy_protocol = Some(ProxyProtocolConfig::SendHeader);
-      } else if expect_proxy {
-        proxy_protocol = Some(ProxyProtocolConfig::ExpectHeader);
-      }
+      let mut proxy_protocol = match (send_proxy, expect_proxy) {
+        (true, true)  => Some(ProxyProtocolConfig::RelayHeader),
+        (true, false) => Some(ProxyProtocolConfig::SendHeader),
+        (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
+        _             => None,
+      };
 
       match (self.ip_address, self.port) {
         (Some(ip), Some(port)) => {
