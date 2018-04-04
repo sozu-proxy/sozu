@@ -42,8 +42,13 @@ pub enum OrderMessageAnswerData {
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
 pub struct MetricsData {
   pub proxy:        BTreeMap<String, FilteredData>,
-  pub applications: BTreeMap<String, Percentiles>,
-  pub backends:     BTreeMap<String, BackendMetricsData>,
+  pub applications: BTreeMap<String, AppMetricsData>,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
+pub struct AppMetricsData {
+  pub data: BTreeMap<String, FilteredData>,
+  pub backends: BTreeMap<String, BTreeMap<String, FilteredData>>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
@@ -52,6 +57,7 @@ pub enum FilteredData {
   Gauge(usize),
   Count(i64),
   Time(usize),
+  Percentiles(Percentiles),
   TimeSerie(FilteredTimeSerie),
 }
 
@@ -71,7 +77,7 @@ impl fmt::Debug for FilteredTimeSerie {
   }
 }
 
-#[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct Percentiles {
   pub samples:  u64,
   pub p_50:     u64,

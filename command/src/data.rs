@@ -326,7 +326,7 @@ mod tests {
   use hex::FromHex;
   use certificate::split_certificate_chain;
   use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Backend};
-  use messages::{BackendMetricsData,MetricsData,FilteredData,Percentiles};
+  use messages::{BackendMetricsData,AppMetricsData,MetricsData,FilteredData,Percentiles};
   use messages::{AddCertificate,RemoveCertificate};
   use config::ProxyProtocolConfig;
 
@@ -598,6 +598,14 @@ mod tests {
             (String::from("sozu.time"),  FilteredData::Time(1234)),
           ].iter().cloned().collect(),
           applications: [
+            (String::from("app_1"), AppMetricsData {
+              data: BTreeMap::new(),
+              backends: BTreeMap::new(),
+            })
+          ].iter().cloned().collect()
+          /*  [
+            app_id: String::from("app_1"),
+            b
             (String::from("app_1"), Percentiles {
               samples: 42,
               p_50: 1,
@@ -608,7 +616,8 @@ mod tests {
               p_99_999: 22,
               p_100: 30,
             })
-          ].iter().cloned().collect(),
+          ].iter().cloned().collect()
+          },
           backends: [
             (String::from("app_1-0"), BackendMetricsData {
               bytes_in:  256,
@@ -625,6 +634,7 @@ mod tests {
               }
             })
           ].iter().cloned().collect()
+            */
         })
       ].iter().cloned().collect())),
     });
