@@ -21,7 +21,7 @@ named!(pub parse_v2_header<HeaderV2>,
     command: parse_command >>
     family: be_u8 >>
     len: be_u16 >>
-    addr: apply!(parse_addr_v2, family) >>
+    addr: flat_map!(take!(len), apply!(parse_addr_v2, family)) >>
     (
       HeaderV2 {
         command,
@@ -231,5 +231,21 @@ mod test {
     ];
 
     assert_eq!(Incomplete(Size(16)), parse_v2_header(input));
+  }
+
+  #[test]
+  fn it_should_not_parse_proxy_protocol_v2_with_invalid_length() {
+    let input = &[
+      0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,                         // MAGIC header
+      0x20,                                                                                           // Version 2 and command LOCAL
+      0x21,                                                                                           // family AF_UNIX with IPv6
+      0x00, 0x10,                                                                                     // address sizes = 36
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, // source address
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, // destination address
+      0x1F, 0x90,                                                                                     // source port
+      0x10, 0x68,                                                                                     // destination port
+    ];
+
+    assert_eq!(Incomplete(Size(48)), parse_v2_header(input));
   }
 }
