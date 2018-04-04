@@ -1231,7 +1231,7 @@ mod tests {
       start(config, channel, 10, 16384);
     });
 
-    let application = Application { app_id: String::from("app_1"), sticky_session: false, https_redirect: true, send_proxy: false };
+    let application = Application { app_id: String::from("app_1"), sticky_session: false, https_redirect: true, proxy_protocol: None };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddApplication(application) });
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddHttpFront(front) });

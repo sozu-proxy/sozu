@@ -392,7 +392,7 @@ mod tests {
                   app_id: String::from("xxx"),
                   sticky_session: true,
                   https_redirect: true,
-                  send_proxy: false,
+                  proxy_protocol: None,
       })),
       proxy_id: None
     });

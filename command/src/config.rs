@@ -184,6 +184,12 @@ pub struct MetricsConfig {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+pub enum ProxyProtocolConfig {
+  ExpectHeader,
+  SendHeader,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct FileAppConfig {
   pub ip_address:        Option<String>,
   pub port:              Option<u16>,
@@ -197,12 +203,29 @@ pub struct FileAppConfig {
   pub https_redirect:    Option<bool>,
   #[serde(default)]
   pub send_proxy:        Option<bool>,
+  #[serde(default)]
+  pub expect_proxy:      Option<bool>,
 }
 
 impl FileAppConfig {
   pub fn to_app_config(self, app_id: &str) -> Result<AppConfig, String> {
+    let send_proxy = self.send_proxy.unwrap_or(false);
+    let expect_proxy = self.expect_proxy.unwrap_or(false);
+
+    if send_proxy && expect_proxy {
+      return Err(String::from("Configuration conflict, send_proxy and expect_proxy cannot be combined"))
+    }
+
     if self.hostname.is_none() && self.path_begin.is_none() && self.certificate.is_none() &&
       self.key.is_none() && self.certificate_chain.is_none() && self.sticky_session.is_none() {
+      let mut proxy_protocol = None;
+
+      if send_proxy {
+        proxy_protocol = Some(ProxyProtocolConfig::SendHeader);
+      } else if expect_proxy {
+        proxy_protocol = Some(ProxyProtocolConfig::ExpectHeader);
+      }
+
       match (self.ip_address, self.port) {
         (Some(ip), Some(port)) => {
           Ok(AppConfig::Tcp(TcpAppConfig {
@@ -210,7 +233,7 @@ impl FileAppConfig {
             ip_address:     ip,
             port:           port,
             backends:       self.backends,
-            send_proxy:     self.send_proxy.unwrap_or(false),
+            proxy_protocol,
           }))
         },
         (None, Some(_)) => Err(String::from("missing IP address for TCP application")),
@@ -277,7 +300,7 @@ impl HttpAppConfig {
       app_id: self.app_id.clone(),
       sticky_session: self.sticky_session.clone(),
       https_redirect: self.https_redirect.clone(),
-      send_proxy: false,
+      proxy_protocol: None,
     }));
 
     //create the front both for HTTP and HTTPS if possible
@@ -343,7 +366,7 @@ pub struct TcpAppConfig {
   pub port:              u16,
   pub backends:          Vec<String>,
   #[serde(default)]
-  pub send_proxy:        bool,
+  pub proxy_protocol:    Option<ProxyProtocolConfig>,
 }
 
 impl TcpAppConfig {
@@ -354,7 +377,7 @@ impl TcpAppConfig {
       app_id: self.app_id.clone(),
       sticky_session: false,
       https_redirect: false,
-      send_proxy: self.send_proxy,
+      proxy_protocol: self.proxy_protocol.clone(),
     }));
 
     v.push(Order::AddTcpFront(TcpFront {

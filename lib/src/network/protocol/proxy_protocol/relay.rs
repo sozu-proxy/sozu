@@ -1,6 +1,3 @@
-pub mod header;
-pub mod relay;
-
 use std::net::IpAddr;
 use std::io::{Write, ErrorKind};
 use std::io::Read;
@@ -8,38 +5,41 @@ use std::io::Read;
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
-use network::ClientResult;
+use nom::IResult::*;
+use network::protocol::proxy_protocol::header;
+use network::{Protocol, ClientResult};
 use network::Readiness;
-use network::BackendConnectionStatus;
 use network::protocol::ProtocolResult;
-use network::socket::{SocketHandler,SocketResult,server_bind};
-use network::protocol::pipe::Pipe;
+use network::socket::{SocketHandler, SocketResult};
 use network::buffer_queue::BufferQueue;
+use network::SessionMetrics;
+use network::protocol::pipe::Pipe;
+use parser::proxy_protocol::parse_v2_header;
 use pool::Checkout;
 
-use self::header::*;
-
-pub struct ProxyProtocol<Front:SocketHandler> {
+pub struct RelayProxyProtocol<Front:SocketHandler> {
   pub header:         Option<Vec<u8>>,
   pub frontend:       Front,
   pub backend:        Option<TcpStream>,
   pub frontend_token: Option<Token>,
   pub backend_token:  Option<Token>,
+  pub front_buf:      Checkout<BufferQueue>,
   pub readiness:      Readiness,
   cursor_header:      usize,
 }
 
-impl <Front:SocketHandler + Read>ProxyProtocol<Front> {
-  pub fn new(frontend: Front, backend: Option<TcpStream>) -> Self {
-    ProxyProtocol {
+impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
+  pub fn new(frontend: Front, backend: Option<TcpStream>, front_buf: Checkout<BufferQueue>) -> Self {
+    RelayProxyProtocol {
       header: None,
       frontend,
       backend,
       frontend_token: None,
       backend_token:  None,
+      front_buf,
       readiness: Readiness {
-        front_interest:  UnixReady::hup() | UnixReady::error(),
-        back_interest:   UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error(),
+        front_interest:  UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
+        back_interest:   UnixReady::hup() | UnixReady::error(),
         front_readiness: UnixReady::from(Ready::empty()),
         back_readiness:  UnixReady::from(Ready::empty()),
       },
@@ -47,9 +47,56 @@ impl <Front:SocketHandler + Read>ProxyProtocol<Front> {
     }
   }
 
+  pub fn readable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
+    let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
+    debug!("FRONT proxy protocol [{:?}]: read {} bytes and res={:?}", self.frontend_token, sz, res);
+
+    if sz > 0 {
+      self.front_buf.buffer.fill(sz);
+      self.front_buf.sliced_input(sz);
+      self.front_buf.consume_parsed_data(sz);
+      self.front_buf.slice_output(sz);
+
+      let buf = self.front_buf.next_output_data();
+
+      count!("bytes_in", sz as i64);
+      metrics.bin += sz;
+    
+      match res {
+        SocketResult::Continue
+        | SocketResult::WouldBlock => {
+          match parse_v2_header(buf) {
+            Done(rest, header) => {
+              debug!("We received the proxy protocol header: {:?}", header);
+              self.header = Some(header.into_bytes());
+              self.readiness.back_interest.insert(Ready::writable());
+              self.readiness.front_readiness.remove(Ready::readable());
+              return ClientResult::Continue
+            },
+            Incomplete(_) => {
+              return ClientResult::Continue
+            },
+            Error(e) => {
+              return ClientResult::CloseClient
+            }
+          }
+        },
+        SocketResult::Error => {
+          error!("[{:?}] front socket error, closing the connection", self.frontend_token);
+          metrics.service_stop();
+          incr_ereq!();
+          self.readiness.reset();
+          return ClientResult::CloseClient
+        }
+      }
+    }
+
+    return ClientResult::Continue;
+  }
+
   // The header is send immediately at once upon the connection is establish
   // and prepended before any data.
-  pub fn back_writable(&mut self) -> (ProtocolResult, ClientResult) {
+  pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, ClientResult) {
     debug!("Writing proxy protocol header");
 
     if let Some(ref mut socket) = self.backend {
@@ -59,12 +106,17 @@ impl <Front:SocketHandler + Read>ProxyProtocol<Front> {
             Ok(sz) => {
               self.cursor_header += sz;
 
+              metrics.backend_bout += sz;
+
               if self.cursor_header == header.len() {
                 debug!("Proxy protocol sent, upgrading");
                 return (ProtocolResult::Upgrade, ClientResult::Continue)
               }
             },
             Err(e) => {
+              metrics.service_stop();
+              incr_ereq!();
+              self.readiness.reset();
               debug!("PROXY PROTOCOL {}", e);
               break;
             },
@@ -103,41 +155,18 @@ impl <Front:SocketHandler + Read>ProxyProtocol<Front> {
     self.backend_token = Some(token);
   }
 
-  pub fn set_back_connected(&mut self, status: BackendConnectionStatus) {
-    if status == BackendConnectionStatus::Connected {
-      self.gen_proxy_protocol_header();
-    }
-  }
-
   pub fn readiness(&mut self) -> &mut Readiness {
     &mut self.readiness
   }
 
-  fn gen_proxy_protocol_header(&mut self) {
-    let addr_frontend = self.frontend.socket_ref().peer_addr().expect("frontend address should be available");
-
-    let addr_backend = self.backend.as_ref().and_then(|socket| {
-      socket.peer_addr().map_err(|e| error!("cannot get backend address: {:?}", e)).ok()
-    });
-
-    let addr_backend = match addr_backend {
-      Some(addr) => addr,
-      None       => return,
-    };
-
-    // PROXY command hardcoded for now, but we'll use LOCAL when we implement health checks
-    let protocol_header = ProxyProtocolHeader::V2(HeaderV2::new(Command::Proxy, addr_frontend, addr_backend));
-    self.header = Some(protocol_header.into_bytes());
-  }
-
-  pub fn into_pipe(mut self, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>) -> Pipe<Front> {
+  pub fn into_pipe(mut self, back_buf: Checkout<BufferQueue>) -> Pipe<Front> {
     let backend_socket = self.backend.take().unwrap();
     let addr = backend_socket.peer_addr().map(|s| s.ip()).ok();
 
     let mut pipe = Pipe::new(
       self.frontend.take(0).into_inner(),
       Some(backend_socket),
-      front_buf,
+      self.front_buf,
       back_buf,
       addr,
     );
