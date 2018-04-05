@@ -6,6 +6,7 @@ use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use nom::IResult::*;
+use nom::Offset;
 use network::protocol::proxy_protocol::header;
 use network::{Protocol, ClientResult};
 use network::Readiness;
@@ -18,7 +19,7 @@ use parser::proxy_protocol::parse_v2_header;
 use pool::Checkout;
 
 pub struct RelayProxyProtocol<Front:SocketHandler> {
-  pub header:         Option<Vec<u8>>,
+  pub header_size:    Option<usize>,
   pub frontend:       Front,
   pub backend:        Option<TcpStream>,
   pub frontend_token: Option<Token>,
@@ -31,7 +32,7 @@ pub struct RelayProxyProtocol<Front:SocketHandler> {
 impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
   pub fn new(frontend: Front, backend: Option<TcpStream>, front_buf: Checkout<BufferQueue>) -> Self {
     RelayProxyProtocol {
-      header: None,
+      header_size: None,
       frontend,
       backend,
       frontend_token: None,
@@ -54,41 +55,41 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
     if sz > 0 {
       self.front_buf.buffer.fill(sz);
       self.front_buf.sliced_input(sz);
-      self.front_buf.consume_parsed_data(sz);
-      self.front_buf.slice_output(sz);
 
-      let buf = self.front_buf.next_output_data();
 
       count!("bytes_in", sz as i64);
       metrics.bin += sz;
-    
-      match res {
-        SocketResult::Continue
-        | SocketResult::WouldBlock => {
-          match parse_v2_header(buf) {
-            Done(rest, header) => {
-              debug!("We received the proxy protocol header: {:?}", header);
-              self.header = Some(header.into_bytes());
-              self.readiness.back_interest.insert(Ready::writable());
-              self.readiness.front_readiness.remove(Ready::readable());
-              return ClientResult::Continue
-            },
-            Incomplete(_) => {
-              return ClientResult::Continue
-            },
-            Error(e) => {
-              return ClientResult::CloseClient
-            }
-          }
+
+      if res == SocketResult::Error {
+        error!("[{:?}] front socket error, closing the connection", self.frontend_token);
+        metrics.service_stop();
+        incr_ereq!();
+        self.readiness.reset();
+        return ClientResult::CloseClient;
+      }
+
+      if res == SocketResult::WouldBlock {
+        self.readiness.front_readiness.remove(Ready::readable());
+      }
+
+      let read_sz = match parse_v2_header(self.front_buf.unparsed_data()) {
+        Done(rest, header) => {
+          self.readiness.front_interest.remove(Ready::readable());
+          self.readiness.back_interest.insert(Ready::writable());
+          self.front_buf.next_output_data().offset(rest)
         },
-        SocketResult::Error => {
-          error!("[{:?}] front socket error, closing the connection", self.frontend_token);
-          metrics.service_stop();
-          incr_ereq!();
-          self.readiness.reset();
+        Incomplete(_) => {
+          return ClientResult::Continue
+        },
+        Error(e) => {
           return ClientResult::CloseClient
         }
-      }
+      };
+
+      self.header_size = Some(read_sz);
+      self.front_buf.consume_parsed_data(sz);
+      self.front_buf.slice_output(sz);
+      return ClientResult::Continue
     }
 
     return ClientResult::Continue;
@@ -100,16 +101,17 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
     debug!("Writing proxy protocol header");
 
     if let Some(ref mut socket) = self.backend {
-      if let Some(ref mut header) = self.header {
+      if let Some(ref header_size) = self.header_size {
         loop {
-          match socket.write(&mut header[self.cursor_header..]) {
+          match socket.write(self.front_buf.next_output_data()) {
             Ok(sz) => {
               self.cursor_header += sz;
 
               metrics.backend_bout += sz;
+              self.front_buf.consume_output_data(sz);
 
-              if self.cursor_header == header.len() {
-                debug!("Proxy protocol sent, upgrading");
+              if self.cursor_header >= *header_size {
+                info!("Proxy protocol sent, upgrading");
                 return (ProtocolResult::Upgrade, ClientResult::Continue)
               }
             },
