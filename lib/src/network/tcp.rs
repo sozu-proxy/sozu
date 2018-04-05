@@ -34,7 +34,7 @@ use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::{http,https_rustls};
 use network::protocol::{Pipe, ProtocolResult};
-use network::protocol::proxy_protocol::ProxyProtocol;
+use network::protocol::proxy_protocol::send::SendProxyProtocol;
 use network::protocol::proxy_protocol::relay::RelayProxyProtocol;
 
 use util::UnwrapLog;
@@ -54,7 +54,7 @@ pub enum ConnectionStatus {
 
 pub enum State {
   Pipe(Pipe<TcpStream>),
-  ProxyProtocol(ProxyProtocol<TcpStream>),
+  SendProxyProtocol(SendProxyProtocol<TcpStream>),
   RelayProxyProtocol(RelayProxyProtocol<TcpStream>),
 }
 
@@ -95,7 +95,7 @@ impl Client {
       Some(ProxyProtocolConfig::SendHeader) => {
         frontend_buffer = Some(front_buf);
         backend_buffer = Some(back_buf);
-        Some(State::ProxyProtocol(ProxyProtocol::new(s, None)))
+        Some(State::SendProxyProtocol(SendProxyProtocol::new(s, None)))
       },
       None => Some(State::Pipe(Pipe::new(s, None, front_buf, back_buf, addr)))
     };
@@ -154,7 +154,7 @@ impl Client {
 
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.front_hup(),
-      Some(State::ProxyProtocol(_)) => {
+      Some(State::SendProxyProtocol(_)) => {
         ClientResult::CloseClient
       },
       _ => unreachable!(),
@@ -209,7 +209,7 @@ impl Client {
       Some(State::RelayProxyProtocol(ref mut pp)) => {
         res = pp.back_writable(&mut self.metrics);
       },
-      Some(State::ProxyProtocol(ref mut pp)) => {
+      Some(State::SendProxyProtocol(ref mut pp)) => {
         res = pp.back_writable();
       }
       _ => unreachable!(),
@@ -225,7 +225,7 @@ impl Client {
   fn front_socket(&self) -> &TcpStream {
     match self.protocol {
       Some(State::Pipe(ref pipe)) => pipe.front_socket(),
-      Some(State::ProxyProtocol(ref pp)) => pp.front_socket(),
+      Some(State::SendProxyProtocol(ref pp)) => pp.front_socket(),
       Some(State::RelayProxyProtocol(ref pp)) => pp.front_socket(),
       _ => unreachable!(),
     }
@@ -234,7 +234,7 @@ impl Client {
   fn back_socket(&self)  -> Option<&TcpStream> {
     match self.protocol {
       Some(State::Pipe(ref pipe)) => pipe.back_socket(),
-      Some(State::ProxyProtocol(ref pp)) => pp.back_socket(),
+      Some(State::SendProxyProtocol(ref pp)) => pp.back_socket(),
       Some(State::RelayProxyProtocol(ref pp)) => pp.back_socket(),
       _ => unreachable!(),
     }
@@ -243,7 +243,7 @@ impl Client {
   pub fn upgrade(&mut self) {
     let protocol = self.protocol.take();
 
-    if let Some(State::ProxyProtocol(pp)) = protocol {
+    if let Some(State::SendProxyProtocol(pp)) = protocol {
       if self.back_buf.is_some() && self.front_buf.is_some() {
         self.protocol = Some(
           State::Pipe(pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap()))
@@ -265,7 +265,7 @@ impl Client {
   fn readiness(&mut self) -> &mut Readiness {
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.readiness(),
-      Some(State::ProxyProtocol(ref mut pp)) => pp.readiness(),
+      Some(State::SendProxyProtocol(ref mut pp)) => pp.readiness(),
       Some(State::RelayProxyProtocol(ref mut pp)) => pp.readiness(),
       _ => unreachable!(),
     }
@@ -274,7 +274,7 @@ impl Client {
   fn front_token(&self)  -> Option<Token> {
     match self.protocol {
       Some(State::Pipe(ref pipe)) => pipe.front_token(),
-      Some(State::ProxyProtocol(ref pp)) => pp.front_token(),
+      Some(State::SendProxyProtocol(ref pp)) => pp.front_token(),
       Some(State::RelayProxyProtocol(ref pp)) => pp.front_token(),
       _ => unreachable!()
     }
@@ -283,7 +283,7 @@ impl Client {
   fn back_token(&self)   -> Option<Token> {
     match self.protocol {
       Some(State::Pipe(ref pipe)) => pipe.back_token(),
-      Some(State::ProxyProtocol(ref pp)) => pp.back_token(),
+      Some(State::SendProxyProtocol(ref pp)) => pp.back_token(),
       Some(State::RelayProxyProtocol(ref pp)) => pp.back_token(),
       _ => unreachable!()
     }
@@ -292,7 +292,7 @@ impl Client {
   fn set_back_socket(&mut self, socket: TcpStream) {
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.set_back_socket(socket),
-      Some(State::ProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
+      Some(State::SendProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
       Some(State::RelayProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
       _ => unreachable!()
     }
@@ -303,7 +303,7 @@ impl Client {
 
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.set_front_token(token),
-      Some(State::ProxyProtocol(ref mut pp)) => pp.set_front_token(token),
+      Some(State::SendProxyProtocol(ref mut pp)) => pp.set_front_token(token),
       Some(State::RelayProxyProtocol(ref mut pp)) => pp.set_front_token(token),
       _ => unreachable!()
     }
@@ -314,7 +314,7 @@ impl Client {
 
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.set_back_token(token),
-      Some(State::ProxyProtocol(ref mut pp)) => pp.set_back_token(token),
+      Some(State::SendProxyProtocol(ref mut pp)) => pp.set_back_token(token),
       Some(State::RelayProxyProtocol(ref mut pp)) => pp.set_back_token(token),
       _ => unreachable!()
     }
@@ -327,7 +327,7 @@ impl Client {
   fn set_back_connected(&mut self, status: BackendConnectionStatus) {
     self.back_connected = status;
     if status == BackendConnectionStatus::Connected {
-      if let Some(State::ProxyProtocol(ref mut pp)) = self.protocol {
+      if let Some(State::SendProxyProtocol(ref mut pp)) = self.protocol {
         pp.set_back_connected(BackendConnectionStatus::Connected);
       }
     }

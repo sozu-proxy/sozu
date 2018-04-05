@@ -1,6 +1,3 @@
-pub mod header;
-pub mod relay;
-
 use std::net::IpAddr;
 use std::io::{Write, ErrorKind};
 use std::io::Read;
@@ -17,9 +14,9 @@ use network::protocol::pipe::Pipe;
 use network::buffer_queue::BufferQueue;
 use pool::Checkout;
 
-use self::header::*;
+use super::header::*;
 
-pub struct ProxyProtocol<Front:SocketHandler> {
+pub struct SendProxyProtocol<Front:SocketHandler> {
   pub header:         Option<Vec<u8>>,
   pub frontend:       Front,
   pub backend:        Option<TcpStream>,
@@ -29,9 +26,9 @@ pub struct ProxyProtocol<Front:SocketHandler> {
   cursor_header:      usize,
 }
 
-impl <Front:SocketHandler + Read>ProxyProtocol<Front> {
+impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
   pub fn new(frontend: Front, backend: Option<TcpStream>) -> Self {
-    ProxyProtocol {
+    SendProxyProtocol {
       header: None,
       frontend,
       backend,

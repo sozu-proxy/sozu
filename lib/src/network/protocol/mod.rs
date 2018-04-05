@@ -9,7 +9,7 @@ pub mod proxy_protocol;
 pub use self::openssl::TlsHandshake;
 pub use self::pipe::Pipe;
 pub use self::http::{Http,StickySession};
-pub use self::proxy_protocol::ProxyProtocol;
+pub use self::proxy_protocol::send::SendProxyProtocol;
 
 #[cfg(not(feature = "use-openssl"))]
 pub use self::rustls::TlsHandshake;
