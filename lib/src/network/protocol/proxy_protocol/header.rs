@@ -1,6 +1,7 @@
 use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, IpAddr};
 use std::fmt;
 
+#[derive(PartialEq, Debug)]
 pub enum ProxyProtocolHeader {
   V1(HeaderV1),
   V2(HeaderV2),
@@ -39,11 +40,11 @@ impl fmt::Display for ProtocolSupportedV1 {
 /// - TCP/IPv4: `PROXY TCP4 255.255.255.255 255.255.255.255 65535 65535\r\n`
 /// - TCP/IPv6: `PROXY TCP6 ffff:f...f:ffff ffff:f...f:ffff 65535 65535\r\n`
 /// - Unknown: `PROXY UNKNOWN\r\n`
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct HeaderV1 {
-  protocol: ProtocolSupportedV1,
-  addr_src: SocketAddr,
-  addr_dst: SocketAddr,
+  pub protocol: ProtocolSupportedV1,
+  pub addr_src: SocketAddr,
+  pub addr_dst: SocketAddr,
 }
 
 const PROXY_PROTO_IDENTIFIER: &'static str = "PROXY";
@@ -113,26 +114,19 @@ mod test {
     let header_to_cmp = "PROXY TCP6 ::0.0.255.255 ::0.156.0.118 80 80\r\n".as_bytes();
     assert_eq!(header_to_cmp, &header.into_bytes()[..]);
   }
-
-  // #[test]
-  // fn it_should_return_the_an_unknown_header() {
-  //   let header = HeaderV1::new(ProtocolSupportedV1::UNKNOWN, None, None);
-
-  //   let header_to_cmp = "PROXY UNKNOWN\r\n".as_bytes();
-
-  //   assert_eq!(header_to_cmp, &header.into_bytes()[..]);
-  // }
 }
 
+#[derive(Debug, PartialEq)]
 pub enum Command {
   Local,
   Proxy,
 }
 
+#[derive(Debug, PartialEq)]
 pub struct HeaderV2 {
-  command: Command,
-  family: u8,          // protocol family and address
-  addr: ProxyAddr,
+  pub command: Command,
+  pub family: u8,          // protocol family and address
+  pub addr: ProxyAddr,
 }
 
 impl HeaderV2 {
@@ -189,7 +183,7 @@ pub enum ProxyAddr {
 
 impl ProxyAddr {
 
-  pub fn from(addr_src: SocketAddr, addr_dst: SocketAddr) -> Self {
+  pub fn from(addr_src: SocketAddr, addr_dst : SocketAddr) -> Self {
     match (addr_src, addr_dst) {
       (SocketAddr::V4(addr_ipv4_src), SocketAddr::V4(addr_ipv4_dst)) => {
         ProxyAddr::Ipv4Addr{
@@ -236,6 +230,50 @@ impl ProxyAddr {
       },
       ProxyAddr::AfUnspec => {},
     };
+  }
+}
+
+// Implemented because we don't have the Debug for [u8; 108] (UnixAddr case)
+impl fmt::Debug for ProxyAddr {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    match *self {
+      ProxyAddr::Ipv4Addr{src_addr, dst_addr} => write!(f, "{:?} {:?}", dst_addr, src_addr),
+      ProxyAddr::Ipv6Addr{src_addr, dst_addr} => write!(f, "{:?} {:?}", dst_addr, src_addr),
+      ProxyAddr::UnixAddr{src_addr, dst_addr} => write!(f, "{:?} {:?}", &dst_addr[..], &src_addr[..]),
+      ProxyAddr::AfUnspec =>  write!(f, "AFUNSPEC"),
+    }
+  }
+}
+
+// Implemented because we don't have the PartialEq for [u8; 108] (UnixAddr case)
+impl PartialEq for ProxyAddr {
+  fn eq(&self, other: &ProxyAddr) -> bool {
+    match *self {
+      ProxyAddr::Ipv4Addr{src_addr, dst_addr} => {
+        match other {
+          &ProxyAddr::Ipv4Addr{src_addr: src_other, dst_addr: dst_other} => src_other == src_addr && dst_other == dst_addr,
+          _ => false,
+        }
+      },
+      ProxyAddr::Ipv6Addr{src_addr, dst_addr} => {
+        match other {
+          &ProxyAddr::Ipv6Addr{src_addr: src_other, dst_addr: dst_other} => src_other == src_addr && dst_other == dst_addr,
+          _ => false,
+        }
+      },
+      ProxyAddr::UnixAddr{src_addr, dst_addr} => {
+        match other {
+          &ProxyAddr::UnixAddr{src_addr: src_other, dst_addr: dst_other} => src_other[..] == src_addr[..] && dst_other[..] == dst_addr[..],
+          _ => false,
+        }
+      },
+      ProxyAddr::AfUnspec => {
+        if let &ProxyAddr::AfUnspec = other {
+          return true
+        }
+        false
+      },
+    }
   }
 }
 

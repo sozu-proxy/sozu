@@ -103,8 +103,10 @@ pub enum ApplicationCmd {
     sticky_session: bool,
     #[structopt(short = "h", long = "https-redirect")]
     https_redirect: bool,
-    #[structopt(short = "p", long = "proxy-protocol", help="Enable the proxy protocol")]
+    #[structopt(long = "send-proxy", help = "Enforces use of the PROXY protocol version 2 over any connection established to this server.")]
     send_proxy: bool,
+    #[structopt(long = "expect-proxy", help = "Configures the client-facing connection to receive a PROXY protocol header version 2")]
+    expect_proxy: bool,
   },
 }
 

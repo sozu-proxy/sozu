@@ -7,6 +7,8 @@ use std::default::Default;
 use std::convert::From;
 use std::fmt;
 
+use config::ProxyProtocolConfig;
+
 pub type MessageId = String;
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
@@ -193,7 +195,7 @@ pub struct Application {
     pub sticky_session: bool,
     pub https_redirect: bool,
     #[serde(default)]
-    pub send_proxy:     bool,
+    pub proxy_protocol: Option<ProxyProtocolConfig>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]

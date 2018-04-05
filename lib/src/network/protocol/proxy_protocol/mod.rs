@@ -1,29 +1,35 @@
-mod header;
+pub mod header;
+pub mod relay;
 
 use std::net::IpAddr;
 use std::io::{Write, ErrorKind};
+use std::io::Read;
+
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
-
-use self::header::*;
 use network::ClientResult;
 use network::Readiness;
 use network::BackendConnectionStatus;
 use network::protocol::ProtocolResult;
-use network::socket::SocketHandler;
+use network::socket::{SocketHandler,SocketResult,server_bind};
+use network::protocol::pipe::Pipe;
+use network::buffer_queue::BufferQueue;
+use pool::Checkout;
+
+use self::header::*;
 
 pub struct ProxyProtocol<Front:SocketHandler> {
-  pub header:     Option<Vec<u8>>,
-  pub frontend:   Front,
-  pub backend:    Option<TcpStream>,
-  frontend_token: Option<Token>,
-  backend_token:  Option<Token>,
-  pub readiness:  Readiness,
-  cursor_header:  usize,
+  pub header:         Option<Vec<u8>>,
+  pub frontend:       Front,
+  pub backend:        Option<TcpStream>,
+  pub frontend_token: Option<Token>,
+  pub backend_token:  Option<Token>,
+  pub readiness:      Readiness,
+  cursor_header:      usize,
 }
 
-impl <Front:SocketHandler>ProxyProtocol<Front> {
+impl <Front:SocketHandler + Read>ProxyProtocol<Front> {
   pub fn new(frontend: Front, backend: Option<TcpStream>) -> Self {
     ProxyProtocol {
       header: None,
@@ -122,5 +128,31 @@ impl <Front:SocketHandler>ProxyProtocol<Front> {
     // PROXY command hardcoded for now, but we'll use LOCAL when we implement health checks
     let protocol_header = ProxyProtocolHeader::V2(HeaderV2::new(Command::Proxy, addr_frontend, addr_backend));
     self.header = Some(protocol_header.into_bytes());
+  }
+
+  pub fn into_pipe(mut self, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>) -> Pipe<Front> {
+    let backend_socket = self.backend.take().unwrap();
+    let addr = backend_socket.peer_addr().map(|s| s.ip()).ok();
+
+    let mut pipe = Pipe::new(
+      self.frontend.take(0).into_inner(),
+      Some(backend_socket),
+      front_buf,
+      back_buf,
+      addr,
+    );
+
+    pipe.readiness.front_readiness = self.readiness.front_readiness;
+    pipe.readiness.back_readiness  = self.readiness.back_readiness;
+
+    if let Some(front_token) = self.frontend_token {
+      pipe.set_front_token(front_token);
+    }
+
+    if let Some(back_token) = self.backend_token {
+      pipe.set_back_token(back_token);
+    }
+
+    pipe
   }
 }

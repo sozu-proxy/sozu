@@ -1,4 +1,4 @@
-use sozu_command::config::Config;
+use sozu_command::config::{Config, ProxyProtocolConfig};
 use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
@@ -779,12 +779,19 @@ pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bo
   }
 }
 
-pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool) {
+pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool) {
+  let proxy_protocol = match (send_proxy, expect_proxy) {
+    (true, true) => Some(ProxyProtocolConfig::RelayHeader),
+    (true, false) => Some(ProxyProtocolConfig::SendHeader),
+    (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
+    _ => None,
+  };
+
   order_command(channel, timeout, Order::AddApplication(Application {
-    app_id:         String::from(app_id),
-    sticky_session: sticky_session,
-    https_redirect: https_redirect,
-    send_proxy,
+    app_id: String::from(app_id),
+    sticky_session,
+    https_redirect,
+    proxy_protocol,
   }));
 }
 

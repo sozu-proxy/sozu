@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use state::ConfigState;
 use messages::{MetricsData,Order,Query,QueryAnswer};
+use config::ProxyProtocolConfig;
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
@@ -392,7 +393,7 @@ mod tests {
                   app_id: String::from("xxx"),
                   sticky_session: true,
                   https_redirect: true,
-                  send_proxy: false,
+                  proxy_protocol: Some(ProxyProtocolConfig::ExpectHeader),
       })),
       proxy_id: None
     });

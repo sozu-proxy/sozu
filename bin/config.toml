@@ -180,3 +180,6 @@ backends = [ "127.0.0.1:1026" ] # list of IP/port
 
 # activates the proxy protocol to send IP information to the backend
 # send_proxy = false
+
+# Configures the client-facing connection to receive a PROXY protocol header
+# expect_proxy = false
