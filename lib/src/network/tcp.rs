@@ -823,7 +823,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
             let mut c = Client::new(frontend_sock, internal_token, front_buf, back_buf, proxy_protocol);
             incr_req!();
 
-            c.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
             c.set_front_token(client_token);
             poll.register(
               c.front_socket(),
