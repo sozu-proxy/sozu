@@ -27,7 +27,7 @@ impl TlsHandshake {
       stream:   stream,
       session:   session,
       readiness: Readiness {
-        front_interest:  UnixReady::from(Ready::readable()) | UnixReady::from(Ready::writable())
+        front_interest:  UnixReady::from(Ready::readable())
                            | UnixReady::hup() | UnixReady::error(),
         back_interest:   UnixReady::from(Ready::empty()),
         front_readiness: UnixReady::from(Ready::empty()),
