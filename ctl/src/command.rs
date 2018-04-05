@@ -781,9 +781,7 @@ pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bo
 
 pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool) {
   let proxy_protocol = match (send_proxy, expect_proxy) {
-    (true, true) => {
-      panic!("expect_proxy and send_proxy cannot be combine")
-    },
+    (true, true) => Some(ProxyProtocolConfig::RelayHeader),
     (true, false) => Some(ProxyProtocolConfig::SendHeader),
     (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
     _ => None,

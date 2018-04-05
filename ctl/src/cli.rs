@@ -105,7 +105,6 @@ pub enum ApplicationCmd {
     https_redirect: bool,
     #[structopt(long = "send-proxy", help = "Enforces use of the PROXY protocol version 2 over any connection established to this server.")]
     send_proxy: bool,
-    //TODO: Currently, structopt doesn't provide the conflict_with method to constraint the use of expect_proxy combined with send_proxy.
     #[structopt(long = "expect-proxy", help = "Configures the client-facing connection to receive a PROXY protocol header version 2")]
     expect_proxy: bool,
   },
