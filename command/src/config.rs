@@ -31,6 +31,7 @@ pub struct ProxyConfig {
   pub default_key:               Option<String>,
   pub tls_versions:              Option<Vec<String>>,
   pub tls_provider:              Option<TlsProvider>,
+  pub expect_proxy:              Option<bool>,
 }
 
 impl ProxyConfig {
@@ -50,8 +51,9 @@ impl ProxyConfig {
 
     http_proxy_configuration.map(|addr| {
       let mut configuration = HttpProxyConfiguration {
-        front: addr,
+        front:          addr,
         public_address: public_address,
+        expect_proxy:   self.expect_proxy.unwrap_or(false),
         ..Default::default()
       };
 
@@ -124,6 +126,7 @@ impl ProxyConfig {
         public_address:  public_address,
         cipher_list:     cipher_list,
         versions:        versions,
+        expect_proxy:    self.expect_proxy.unwrap_or(false),
         ..Default::default()
       };
 

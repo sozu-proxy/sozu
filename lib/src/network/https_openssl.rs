@@ -128,7 +128,7 @@ impl TlsClient {
 
         if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
           let mut http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), front_buf,
-            back_buf, self.public_address.clone(), Protocol::HTTPS).unwrap();
+            back_buf, self.public_address.clone(), None, Protocol::HTTPS).unwrap();
 
           http.readiness = handshake.readiness;
           http.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();

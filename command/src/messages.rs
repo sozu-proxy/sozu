@@ -269,6 +269,8 @@ pub struct HttpProxyConfiguration {
     pub public_address:  Option<IpAddr>,
     pub answer_404:      String,
     pub answer_503:      String,
+    #[serde(default)]
+    pub expect_proxy:    bool,
 }
 
 impl Default for HttpProxyConfiguration {
@@ -278,6 +280,7 @@ impl Default for HttpProxyConfiguration {
       public_address:  None,
       answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
       answer_503:      String::from("HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
+      expect_proxy:    false,
     }
   }
 }
@@ -308,6 +311,8 @@ pub struct HttpsProxyConfiguration {
     pub default_certificate_chain: Option<String>,
     #[serde(default)]
     pub tls_provider:              TlsProvider,
+    #[serde(default)]
+    pub expect_proxy:              bool,
 }
 
 impl Default for HttpsProxyConfiguration {
@@ -339,6 +344,7 @@ impl Default for HttpsProxyConfiguration {
       default_key:         Some(Vec::from(&include_bytes!("../assets/key.pem")[..])),
       default_certificate_chain: None,
       tls_provider:        TlsProvider::Rustls,
+      expect_proxy:        false,
     }
   }
 }

@@ -321,7 +321,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         );
 
         let session = ServerSession::new(&self.ssl_config);
-        let c = TlsClient::new(session, frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address);
+        let c = TlsClient::new(session, frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address,
+          self.config.expect_proxy);
 
         (Rc::new(RefCell::new(c)), false)
       })

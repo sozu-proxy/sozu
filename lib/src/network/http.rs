@@ -31,6 +31,7 @@ use network::backends::BackendMap;
 use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
 use network::protocol::http::DefaultAnswerStatus;
+use network::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken,ListenClient};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::retry::RetryPolicy;
@@ -48,6 +49,7 @@ pub enum ClientStatus {
 }
 
 pub enum State {
+  Expect(ExpectProxyProtocol<TcpStream>),
   Http(Http<TcpStream>),
   WebSocket(Pipe<TcpStream>)
 }
@@ -65,23 +67,31 @@ pub struct Client {
 }
 
 impl Client {
-  pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> Option<Client> {
+  pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>, expect_proxy: bool) -> Option<Client> {
     let protocol = if let Some(pool) = pool.upgrade() {
       let mut p = pool.borrow_mut();
-      if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-        Some(Http::new(sock, token, front_buf, back_buf, public_address,
-          Protocol::HTTP).expect("should create a HTTP state"))
-      } else { None }
+      if expect_proxy {
+        if let Some(front_buf) = p.checkout() {
+          info!("starting in expect proxy state");
+          Some(State::Expect(ExpectProxyProtocol::new(sock, token, front_buf)))
+        } else { None }
+
+      } else {
+        if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
+          Some(State::Http(Http::new(sock, token, front_buf, back_buf, public_address,
+            None, Protocol::HTTP).expect("should create a HTTP state")))
+        } else { None }
+      }
     } else { None };
 
-    protocol.map(|http| {
+    protocol.map(|pr| {
       let request_id = Uuid::new_v4().hyphenated().to_string();
       let log_ctx    = format!("{}\tunknown\t", &request_id);
       let mut client = Client {
         backend_token:  None,
         backend:        None,
         back_connected: BackendConnectionStatus::NotConnected,
-        protocol:       Some(State::Http(http)),
+        protocol:       Some(pr),
         frontend_token: token,
         pool:           pool,
         sticky_session: false,
@@ -95,7 +105,7 @@ impl Client {
     })
   }
 
-  pub fn upgrade(&mut self) {
+  pub fn upgrade(&mut self) -> bool {
     debug!("HTTP::upgrade");
     let protocol = unwrap_msg!(self.protocol.take());
     if let State::Http(http) = protocol {
@@ -112,8 +122,32 @@ impl Client {
       pipe.set_back_token(back_token);
 
       self.protocol = Some(State::WebSocket(pipe));
+      true
+    } else if let State::Expect(expect) = protocol {
+      debug!("switching to HTTP");
+      if let Some(ref addresses) = expect.addresses {
+        if let (Some(public_address), Some(client_address)) = (addresses.destination(), addresses.source()) {
+          if let Some(pool) = self.pool.upgrade() {
+            let mut p = pool.borrow_mut();
+            if let Some(back_buf) = p.checkout() {
+              let mut http = Http::new(expect.frontend, expect.frontend_token,
+                expect.front_buf, back_buf, Some(public_address.ip()), Some(client_address),
+                Protocol::HTTP).expect("should create a HTTP state");
+
+              http.readiness.front_readiness = expect.readiness.front_readiness;
+              http.readiness.back_readiness  = expect.readiness.back_readiness;
+              self.protocol = Some(State::Http(http));
+              return true;
+            }
+          }
+        }
+      }
+
+      self.protocol = Some(State::Expect(expect));
+      false
     } else {
       self.protocol = Some(protocol);
+      true
     }
   }
 
@@ -138,7 +172,8 @@ impl Client {
   fn back_hup(&mut self) -> ClientResult {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.back_hup(),
-      State::WebSocket(ref mut pipe) => pipe.back_hup()
+      State::WebSocket(ref mut pipe) => pipe.back_hup(),
+      _                              => ClientResult::CloseClient,
     }
   }
 
@@ -158,9 +193,24 @@ impl Client {
 
   // Read content from the client
   fn readable(&mut self) -> ClientResult {
-    match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http)      => http.readable(&mut self.metrics),
-      State::WebSocket(ref mut pipe) => pipe.readable(&mut self.metrics)
+    let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Expect(ref mut expect)  => expect.readable(&mut self.metrics),
+      State::Http(ref mut http)      => (ProtocolResult::Continue, http.readable(&mut self.metrics)),
+      State::WebSocket(ref mut pipe) => (ProtocolResult::Continue, pipe.readable(&mut self.metrics)),
+    };
+
+    if upgrade == ProtocolResult::Continue {
+      result
+    } else {
+      if self.upgrade() {
+        match *unwrap_msg!(self.protocol.as_mut()) {
+          State::Http(ref mut http) => http.readable(&mut self.metrics),
+          _ => result
+        }
+      } else {
+        error!("failed protocol upgrade");
+        ClientResult::CloseClient
+      }
     }
   }
 
@@ -168,7 +218,8 @@ impl Client {
   fn writable(&mut self) -> ClientResult {
     match  *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.writable(&mut self.metrics),
-      State::WebSocket(ref mut pipe) => pipe.writable(&mut self.metrics)
+      State::WebSocket(ref mut pipe) => pipe.writable(&mut self.metrics),
+      State::Expect(_)               => ClientResult::CloseClient,
     }
   }
 
@@ -176,7 +227,8 @@ impl Client {
   fn back_writable(&mut self) -> ClientResult {
     match *unwrap_msg!(self.protocol.as_mut())  {
       State::Http(ref mut http)      => http.back_writable(&mut self.metrics),
-      State::WebSocket(ref mut pipe) => pipe.back_writable(&mut self.metrics)
+      State::WebSocket(ref mut pipe) => pipe.back_writable(&mut self.metrics),
+      State::Expect(_)               => ClientResult::CloseClient,
     }
   }
 
@@ -184,16 +236,21 @@ impl Client {
   fn back_readable(&mut self) -> ClientResult {
     let (upgrade, result) = match  *unwrap_msg!(self.protocol.as_mut())  {
       State::Http(ref mut http)      => http.back_readable(&mut self.metrics),
-      State::WebSocket(ref mut pipe) => (ProtocolResult::Continue, pipe.back_readable(&mut self.metrics))
+      State::WebSocket(ref mut pipe) => (ProtocolResult::Continue, pipe.back_readable(&mut self.metrics)),
+      State::Expect(_)               => return ClientResult::CloseClient,
     };
 
     if upgrade == ProtocolResult::Continue {
       result
     } else {
-      self.upgrade();
-      match *unwrap_msg!(self.protocol.as_mut()) {
-        State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
-        _ => result
+      if self.upgrade() {
+        match *unwrap_msg!(self.protocol.as_mut()) {
+          State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
+          _ => result
+        }
+      } else {
+        error!("failed protocol upgrade");
+        ClientResult::CloseClient
       }
     }
   }
@@ -201,14 +258,16 @@ impl Client {
   fn front_socket(&self) -> &TcpStream {
     match *unwrap_msg!(self.protocol.as_ref()) {
       State::Http(ref http)      => http.front_socket(),
-      State::WebSocket(ref pipe) => pipe.front_socket()
+      State::WebSocket(ref pipe) => pipe.front_socket(),
+      State::Expect(ref expect)  => expect.front_socket(),
     }
   }
 
   fn back_socket(&self)  -> Option<&TcpStream> {
     match *unwrap_msg!(self.protocol.as_ref()) {
       State::Http(ref http)      => http.back_socket(),
-      State::WebSocket(ref pipe) => pipe.back_socket()
+      State::WebSocket(ref pipe) => pipe.back_socket(),
+      State::Expect(_)           => None,
     }
   }
 
@@ -220,6 +279,7 @@ impl Client {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.set_back_socket(socket),
       State::WebSocket(ref mut pipe) => {} /*pipe.set_back_socket(unwrap_msg!(socket.try_clone()))*/
+      State::Expect(_)               => {},
     }
   }
 
@@ -227,7 +287,8 @@ impl Client {
     self.frontend_token = token;
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.set_front_token(token),
-      State::WebSocket(ref mut pipe) => pipe.set_front_token(token)
+      State::WebSocket(ref mut pipe) => pipe.set_front_token(token),
+      State::Expect(ref mut expect)  => expect.set_front_token(token),
     }
   }
 
@@ -235,7 +296,8 @@ impl Client {
     self.backend_token = Some(token);
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.set_back_token(token),
-      State::WebSocket(ref mut pipe) => pipe.set_back_token(token)
+      State::WebSocket(ref mut pipe) => pipe.set_back_token(token),
+      State::Expect(_)               => {},
     }
   }
 
@@ -271,7 +333,8 @@ impl Client {
   fn readiness(&mut self) -> &mut Readiness {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => &mut http.readiness,
-      State::WebSocket(ref mut pipe) => &mut pipe.readiness
+      State::WebSocket(ref mut pipe) => &mut pipe.readiness,
+      State::Expect(ref mut expect)  => &mut expect.readiness,
     }
   }
 }
@@ -936,7 +999,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         }
       }).and_then(|(frontend_sock, _)| {
         frontend_sock.set_nodelay(true);
-        if let Some(c) = Client::new(frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address) {
+        if let Some(c) = Client::new(frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address, self.config.expect_proxy) {
           poll.register(
             c.front_socket(),
             client_token,

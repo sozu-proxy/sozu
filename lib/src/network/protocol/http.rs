@@ -65,13 +65,14 @@ pub struct Http<Front:SocketHandler> {
   pub readiness:      Readiness,
   pub log_ctx:        String,
   pub public_address: Option<IpAddr>,
+  pub client_address: Option<SocketAddr>,
   pub sticky_session: Option<StickySession>,
   pub protocol:       Protocol,
 }
 
 impl<Front:SocketHandler> Http<Front> {
-  pub fn new(sock: Front, token: Token, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>,
-             protocol: Protocol) -> Option<Http<Front>> {
+  pub fn new(sock: Front, token: Token, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>,
+    public_address: Option<IpAddr>, client_address: Option<SocketAddr>, protocol: Protocol) -> Option<Http<Front>> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{} unknown\t", &request_id);
     let mut client = Http {
@@ -95,10 +96,11 @@ impl<Front:SocketHandler> Http<Front> {
       readiness:          Readiness::new(),
       log_ctx:            log_ctx,
       public_address:     public_address,
+      client_address:     client_address,
       sticky_session:     None,
       protocol:           protocol,
     };
-    let req_header = client.added_request_header(public_address);
+    let req_header = client.added_request_header(public_address, client_address);
     let res_header = client.added_response_header();
     client.state.as_mut().map(|ref mut state| state.added_req_header = req_header);
     client.state.as_mut().map(|ref mut state| state.added_res_header = res_header);
@@ -111,7 +113,7 @@ impl<Front:SocketHandler> Http<Front> {
     //info!("{} RESET TO {}", self.log_ctx, request_id);
     decr!("http.requests");
     self.state.as_mut().map(|state| state.reset());
-    let req_header = self.added_request_header(self.public_address);
+    let req_header = self.added_request_header(self.public_address, self.client_address);
     let res_header = self.added_response_header();
     self.state.as_mut().map(|ref mut state| state.added_req_header = req_header);
     self.state.as_mut().map(|ref mut state| state.added_res_header = res_header);
@@ -158,8 +160,8 @@ impl<Front:SocketHandler> Http<Front> {
     self.status = ClientStatus::DefaultAnswer(answer);
   }
 
-  pub fn added_request_header(&self, public_address: Option<IpAddr>) -> String {
-    let peer = self.front_socket().peer_addr().map(|addr| (addr.ip(), addr.port())).ok();
+  pub fn added_request_header(&self, public_address: Option<IpAddr>, client_address: Option<SocketAddr>) -> String {
+    let peer = client_address.or(self.front_socket().peer_addr().ok()).map(|addr| (addr.ip(), addr.port()));
     let front = public_address.or(self.front_socket().local_addr().map(|addr| addr.ip()).ok());
     if let (Some((peer_ip, peer_port)), Some(front)) = (peer, front) {
       let proto = match self.protocol() {
@@ -305,7 +307,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn get_client_address(&self) -> Option<SocketAddr> {
-    self.frontend.socket_ref().peer_addr().ok()
+    self.client_address.or(self.frontend.socket_ref().peer_addr().ok())
   }
 
   pub fn get_backend_address(&self) -> Option<SocketAddr> {

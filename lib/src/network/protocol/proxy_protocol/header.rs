@@ -210,6 +210,22 @@ impl ProxyAddr {
     }
   }
 
+  pub fn source(&self) -> Option<SocketAddr> {
+    match self {
+      &ProxyAddr::Ipv4Addr { src_addr: src, dst_addr: _ } => Some(SocketAddr::V4(src)),
+      &ProxyAddr::Ipv6Addr { src_addr: src, dst_addr: _ } => Some(SocketAddr::V6(src)),
+      _                              => None,
+    }
+  }
+
+  pub fn destination(&self) -> Option<SocketAddr> {
+    match self {
+      &ProxyAddr::Ipv4Addr { src_addr: _, dst_addr: dst } => Some(SocketAddr::V4(dst)),
+      &ProxyAddr::Ipv6Addr { src_addr: _, dst_addr: dst } => Some(SocketAddr::V6(dst)),
+      _                              => None,
+    }
+  }
+
   fn into_bytes(&self, buf: &mut Vec<u8>) {
     match *self {
       ProxyAddr::Ipv4Addr{ src_addr, dst_addr } => {
