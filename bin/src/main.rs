@@ -23,137 +23,103 @@ mod worker;
 mod logging;
 mod upgrade;
 mod util;
+mod cli;
 
 use std::env;
 use std::panic;
 use sozu_command::config::Config;
-use clap::{App,Arg,SubCommand};
+use clap::ArgMatches;
 
 #[cfg(target_os = "linux")]
 use libc::{cpu_set_t,pid_t};
 
 use command::Worker;
-use worker::{begin_worker_process,start_workers,get_executable_path};
-use upgrade::begin_new_master_process;
+use worker::{start_workers,get_executable_path};
 use sozu::network::metrics::METRICS;
+
+enum StartupError {
+  ConfigurationFileNotSpecified,
+  ConfigurationFileLoadError(std::io::Error),
+  TooManyAllowedConnections(String),
+  TooManyAllowedConnectionsForWorker(String),
+  WorkersSpawnFail(nix::Error)
+}
 
 fn main() {
   register_panic_hook();
 
-  let matches = App::new("sozu")
-                        .version(crate_version!())
-                        .about("hot reconfigurable proxy")
-                        .subcommand(SubCommand::with_name("start")
-                                    .about("launch the master process")
-                                    .arg(Arg::with_name("config")
-                                        .short("c")
-                                        .long("config")
-                                        .value_name("FILE")
-                                        .help("Sets a custom config file")
-                                        .takes_value(true)
-                                        .required(option_env!("SOZU_CONFIG").is_none())))
-                        .subcommand(SubCommand::with_name("worker")
-                                    .about("start a worker (internal command, should not be used directly)")
-                                    .arg(Arg::with_name("id").long("id")
-                                         .takes_value(true).required(true).help("worker identifier"))
-                                    .arg(Arg::with_name("fd").long("fd")
-                                         .takes_value(true).required(true).help("IPC file descriptor"))
-                                    .arg(Arg::with_name("scm").long("scm")
-                                         .takes_value(true).required(true).help("IPC SCM_RIGHTS file descriptor"))
-                                    .arg(Arg::with_name("configuration-state-fd").long("configuration-state-fd")
-                                         .takes_value(true).required(true).help("configuration data file descriptor"))
-                                    .arg(Arg::with_name("command-buffer-size").long("command-buffer-size")
-                                         .takes_value(true).required(true).help("Worker's channel buffer size"))
-                                    .arg(Arg::with_name("max-command-buffer-size").long("max-command-buffer-size")
-                                         .takes_value(true).required(true).help("Worker's channel max buffer size")))
-                        .subcommand(SubCommand::with_name("upgrade")
-                                    .about("start a new master process (internal command, should not be used directly)")
-                                    .arg(Arg::with_name("fd").long("fd")
-                                         .takes_value(true).required(true).help("IPC file descriptor"))
-                                    .arg(Arg::with_name("upgrade-fd").long("upgrade-fd")
-                                         .takes_value(true).required(true).help("upgrade data file descriptor"))
-                                    .arg(Arg::with_name("command-buffer-size").long("command-buffer-size")
-                                         .takes_value(true).required(true).help("Master's command buffer size"))
-                                    .arg(Arg::with_name("max-command-buffer-size").long("max-command-buffer-size")
-                                         .takes_value(true).required(false).help("Master's max command buffer size")))
-                        .get_matches();
+  // Init parsing of arguments
+  let matches = cli::init();
+  // Check if we are upgrading workers or master
+  let upgrade = cli::upgrade_worker(&matches).or_else(|| cli::upgrade_master(&matches));
 
-  if let Some(matches) = matches.subcommand_matches("worker") {
-    let fd  = matches.value_of("fd").expect("needs a file descriptor")
-      .parse::<i32>().expect("the file descriptor must be a number");
-    let scm  = matches.value_of("scm").expect("needs a file descriptor")
-      .parse::<i32>().expect("the SCM_RIGHTS file descriptor must be a number");
-    let configuration_state_fd  = matches.value_of("configuration-state-fd")
-      .expect("needs a configuration state file descriptor")
-      .parse::<i32>().expect("the file descriptor must be a number");
-    let id  = matches.value_of("id").expect("needs a worker id")
-      .parse::<i32>().expect("the worker id must be a number");
-    let buffer_size = matches.value_of("command-buffer-size")
-      .and_then(|size| size.parse::<usize>().ok())
-      .unwrap_or(1_000_000);
-    let max_buffer_size = matches.value_of("max-command-buffer-size")
-      .and_then(|size| size.parse::<usize>().ok())
-      .unwrap_or(buffer_size * 2);
+  // If we are not, then we want to start sozu
+  if upgrade == None {
+    let start = get_config_file_path(&matches)
+    .and_then(|config_file| load_configuration(config_file))
+    .map(|config| {
+      util::setup_logging(&config);
+      info!("Starting up");
+      util::setup_metrics(&config);
 
-    begin_worker_process(fd, scm, configuration_state_fd, id, buffer_size, max_buffer_size);
-    return;
-  }
+      config
+    })
+    .and_then(|config| check_process_limits(&config).map(|()| config))
+    .and_then(|config| init_workers(&config).map(|workers| (config, workers)))
+    .map(|(config, workers)| {
+      if config.handle_process_affinity {
+        set_workers_affinity(&workers);
+      }
+      let command_socket_path = config.command_socket_path();
+      command::start(config, command_socket_path, workers);
+    });
 
-  if let Some(matches) = matches.subcommand_matches("upgrade") {
-    let fd  = matches.value_of("fd").expect("needs a file descriptor")
-      .parse::<i32>().expect("the file descriptor must be a number");
-    let upgrade_fd  = matches.value_of("upgrade-fd").expect("needs an upgrade file descriptor")
-      .parse::<i32>().expect("the file descriptor must be a number");
-    let buffer_size = matches.value_of("channel-buffer-size")
-      .and_then(|size| size.parse::<usize>().ok())
-      .unwrap_or(1_000_000);
-    let max_buffer_size = matches.value_of("max-command-buffer-size")
-      .and_then(|size| size.parse::<usize>().ok())
-      .unwrap_or(buffer_size * 2);
-
-    begin_new_master_process(fd, upgrade_fd, buffer_size, max_buffer_size);
-    return;
-  }
-
-  let submatches = matches.subcommand_matches("start").expect("unknown subcommand");
-  let config_file = match submatches.value_of("config"){
-                      Some(config_file) => config_file,
-                      None => option_env!("SOZU_CONFIG").expect("could not find `SOZU_CONFIG` env var at build"),
-                    };
-
-  if let Ok(config) = Config::load_from_path(config_file) {
-    //FIXME: should have an id for the master too
-    logging::setup("MASTER".to_string(), &config.log_level,
-      &config.log_target, config.log_access_target.as_ref().map(|s| s.as_str()));
-    info!("starting up");
-
-    if let Some(ref metrics) = config.metrics.as_ref() {
-      metrics_set_up!(&metrics.address[..], metrics.port, "MASTER".to_string(), metrics.tagged_metrics);
-    }
-
-
-    // define this here so we can stop before launching workers if necessary
-    let command_socket_path = config.command_socket_path();
-
-    if check_process_limits(config.clone()) {
-      let path = unsafe { get_executable_path() };
-      match start_workers(path, &config) {
-        Ok(workers) => {
-          info!("created workers: {:?}", workers);
-
-          if cfg!(target_os = "linux") && config.handle_process_affinity {
-            set_workers_affinity(&workers);
-          }
-
-          command::start(config, command_socket_path, workers);
-        },
-        Err(e) => error!("Error while creating workers: {}", e)
+    match start {
+      Ok(_) => info!("master process stopped"), // Ok() is only called when the proxy exits
+      Err(StartupError::ConfigurationFileNotSpecified) => {
+        error!("Configuration file hasn't been specified. Either use -c with the start command \
+               or use the SOZU_CONFIG environment variable when building sozu.");
+        std::process::exit(1);
+      },
+      Err(StartupError::ConfigurationFileLoadError(err)) => {
+        error!("Configuration file couldn't been read. Error: {:?}", err);
+        std::process::exit(1);
+      },
+      Err(StartupError::TooManyAllowedConnections(err)) | Err(StartupError::TooManyAllowedConnectionsForWorker(err)) => {
+        error!("{}", err);
+        std::process::exit(1);
+      },
+      Err(StartupError::WorkersSpawnFail(err)) => {
+        error!("At least one worker failed to spawn. Error: {:?}", err);
+        std::process::exit(1);
       }
     }
+  }
+}
 
-    info!("master process stopped");
-  } else {
-    error!("could not load configuration file at '{}', stopping", config_file);
+fn init_workers(config: &Config) -> Result<Vec<Worker>, StartupError> {
+  let path = unsafe { get_executable_path() };
+  match start_workers(path, &config) {
+    Ok(workers) => {
+      info!("created workers: {:?}", workers);
+      Ok(workers)
+    },
+    Err(e) => Err(StartupError::WorkersSpawnFail(e))
+  }
+}
+
+fn get_config_file_path<'a>(matches: &'a ArgMatches<'a>) -> Result<&'a str, StartupError> {
+  let start_matches = matches.subcommand_matches("start").expect("unknown subcommand");
+  match start_matches.value_of("config") {
+    Some(config_file) => Ok(config_file),
+    None => option_env!("SOZU_CONFIG").ok_or(StartupError::ConfigurationFileNotSpecified)
+  }
+}
+
+fn load_configuration(config_file: &str) -> Result<Config, StartupError> {
+  match Config::load_from_path(config_file) {
+    Ok(config) => Ok(config),
+    Err(e) => Err(StartupError::ConfigurationFileLoadError(e))
   }
 }
 
@@ -214,39 +180,39 @@ fn set_process_affinity(pid: pid_t, cpu: usize) {
 #[cfg(target_os="linux")]
 // We check the hard_limit. The soft_limit can be changed at runtime
 // by the process or any user. hard_limit can only be changed by root
-fn check_process_limits(config: Config) -> bool {
+fn check_process_limits(config: &Config) -> Result<(), StartupError> {
   let process_limits = procinfo::pid::limits_self()
     .expect("Couldn't read /proc/self/limits to determine max open file descriptors limit");
 
   // If limit is "unlimited"
   if process_limits.max_open_files.hard.is_none() {
-    return true;
+    return Ok(());
   }
 
   let hard_limit = process_limits.max_open_files.hard.unwrap();
 
   // check if all proxies are under the hard limit
   if config.max_connections > hard_limit {
-    error!("At least one proxy can't have that much of connections. \
+    let error = format!("At least one proxy can't have that much of connections. \
             Current max file descriptor hard limit is: {}", hard_limit);
-    return false;
+    return Err(StartupError::TooManyAllowedConnectionsForWorker(error));
   }
 
   let system_max_fd = procinfo::sys::fs::file_max::file_max()
     .expect("Couldn't read /proc/sys/fs/file-max") as usize;
 
   if config.max_connections > system_max_fd {
-    error!("Proxies total max_connections can't be higher than system's file-max limit. \
+    let error = format!("Proxies total max_connections can't be higher than system's file-max limit. \
             Current limit: {}, current value: {}", system_max_fd, config.max_connections);
-    return false;
+    return Err(StartupError::TooManyAllowedConnections(error))
   }
 
-  true
+  Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn check_process_limits(_: Config) -> bool {
-  true
+fn check_process_limits(_: &Config) -> Result<(), StartupError> {
+  Ok(())
 }
 
 fn register_panic_hook() {

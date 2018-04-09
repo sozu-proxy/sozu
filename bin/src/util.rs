@@ -1,6 +1,9 @@
 use nix::fcntl::{fcntl,FcntlArg,FdFlag};
 use std::os::unix::io::RawFd;
 
+use logging;
+use sozu_command::config::Config;
+
 pub fn enable_close_on_exec(fd: RawFd) -> Option<i32> {
   fcntl(fd, FcntlArg::F_GETFD).map_err(|e| {
     error!("could not get file descriptor flags: {:?}", e);
@@ -24,4 +27,16 @@ pub fn disable_close_on_exec(fd: RawFd) -> Option<i32> {
       error!("could not set file descriptor flags: {:?}", e);
     }).ok()
   })
+}
+
+pub fn setup_logging(config: &Config) {
+  //FIXME: should have an id for the master too
+  logging::setup("MASTER".to_string(), &config.log_level,
+    &config.log_target, config.log_access_target.as_ref().map(|s| s.as_str()));
+}
+
+pub fn setup_metrics(config: &Config) {
+  if let Some(ref metrics) = config.metrics.as_ref() {
+    metrics_set_up!(&metrics.address[..], metrics.port, "MASTER".to_string(), metrics.tagged_metrics);
+  }
 }
