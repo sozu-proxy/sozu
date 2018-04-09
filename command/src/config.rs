@@ -120,13 +120,26 @@ impl ProxyConfig {
       }
     };
 
+    let mut expect_proxy = self.expect_proxy.unwrap_or(false);
+    let tls_provider = self.tls_provider.unwrap_or(if cfg!(use_openssl) {
+      TlsProvider::Openssl
+    } else {
+      TlsProvider::Rustls
+    });
+
+
+    if expect_proxy && tls_provider == TlsProvider::Openssl {
+      error!("the OpenSSL based HTTPS proxy does not support the proxy protocol yet, deactivating the proxy protocol");
+      expect_proxy = false;
+    }
+
     tls_proxy_configuration.map(|addr| {
       let mut configuration = HttpsProxyConfiguration {
         front:           addr,
         public_address:  public_address,
         cipher_list:     cipher_list,
         versions:        versions,
-        expect_proxy:    self.expect_proxy.unwrap_or(false),
+        expect_proxy:    expect_proxy,
         ..Default::default()
       };
 
@@ -162,11 +175,7 @@ impl ProxyConfig {
         configuration.default_key = Some(default_key);
       }
 
-      configuration.tls_provider = self.tls_provider.unwrap_or(if cfg!(use_openssl) {
-        TlsProvider::Openssl
-      } else {
-        TlsProvider::Rustls
-      });
+      configuration.tls_provider = tls_provider;
 
       configuration
 
