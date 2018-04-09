@@ -1,7 +1,6 @@
 use nom::{be_u8, be_u16};
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
-use std::convert::AsMut;
 use std::convert::From;
 
 use network::protocol::proxy_protocol::header::*;
@@ -90,8 +89,6 @@ pub fn slice_to_ipv6(sl: &[u8]) -> Ipv6Addr {
 mod test {
 
   use super::*;
-  use nom::ErrorKind;
-  use nom::IResult;
   use nom::IResult::*;
   use std::net::{IpAddr, SocketAddr};
   use nom::Needed::Size;
