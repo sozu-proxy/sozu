@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 
 use state::ConfigState;
 use messages::{MetricsData,Order,Query,QueryAnswer};
-use config::ProxyProtocolConfig;
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
@@ -329,6 +328,7 @@ mod tests {
   use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Backend};
   use messages::{BackendMetricsData,MetricsData,FilteredData,Percentiles};
   use messages::{AddCertificate,RemoveCertificate};
+  use config::ProxyProtocolConfig;
 
   #[test]
   fn config_message_test() {

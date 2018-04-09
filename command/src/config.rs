@@ -228,7 +228,7 @@ impl FileAppConfig {
 
     if self.hostname.is_none() && self.path_begin.is_none() && self.certificate.is_none() &&
       self.key.is_none() && self.certificate_chain.is_none() && self.sticky_session.is_none() {
-      let mut proxy_protocol = match (send_proxy, expect_proxy) {
+      let proxy_protocol = match (send_proxy, expect_proxy) {
         (true, true)  => Some(ProxyProtocolConfig::RelayHeader),
         (true, false) => Some(ProxyProtocolConfig::SendHeader),
         (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
@@ -689,6 +689,7 @@ mod tests {
       default_key: None,
       default_name: None,
       tls_provider: None,
+      expect_proxy: None,
     };
     println!("http: {:?}", to_string(&http));
     let https = ProxyConfig {
@@ -705,6 +706,7 @@ mod tests {
       default_key: None,
       default_name: None,
       tls_provider: None,
+      expect_proxy: None,
     };
     println!("https: {:?}", to_string(&https));
     let config = FileConfig {
