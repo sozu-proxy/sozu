@@ -132,7 +132,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
     let addr = backend_socket.peer_addr().map(|s| s.ip()).ok();
 
     let mut pipe = Pipe::new(
-      self.frontend.take(0).into_inner(),
+      self.frontend,
       Some(backend_socket),
       front_buf,
       back_buf,
