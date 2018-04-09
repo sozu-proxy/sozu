@@ -456,7 +456,8 @@ pub struct FileConfig {
   pub tcp:                      Option<TcpProxyConfig>,
   pub applications:             Option<HashMap<String, FileAppConfig>>,
   pub handle_process_affinity:  Option<bool>,
-  pub ctl_command_timeout:      Option<u64>
+  pub ctl_command_timeout:      Option<u64>,
+  pub pid_file_path:            Option<String>,
 }
 
 
@@ -547,7 +548,8 @@ impl FileConfig {
       tcp: self.tcp,
       applications: applications,
       handle_process_affinity: self.handle_process_affinity.unwrap_or(false),
-      ctl_command_timeout: self.ctl_command_timeout.unwrap_or(1_000)
+      ctl_command_timeout: self.ctl_command_timeout.unwrap_or(1_000),
+      pid_file_path: self.pid_file_path
     }
   }
 }
@@ -575,6 +577,7 @@ pub struct Config {
   pub applications:             HashMap<String, AppConfig>,
   pub handle_process_affinity:  bool,
   pub ctl_command_timeout:      u64,
+  pub pid_file_path:            Option<String>,
 }
 
 impl Config {
@@ -727,7 +730,8 @@ mod tests {
       https: Some(https),
       tcp:   None,
       applications: None,
-      ctl_command_timeout: None
+      ctl_command_timeout: None,
+      pid_file_path: None
     };
 
     println!("config: {:?}", to_string(&config));

@@ -117,16 +117,25 @@ pub fn begin_new_master_process(fd: i32, upgrade_fd: i32, command_buffer_size: u
 
   let upgrade_file = unsafe { File::from_raw_fd(upgrade_fd) };
   let upgrade_data: UpgradeData = serde_json::from_reader(upgrade_file).expect("could not parse upgrade data");
+  let config = upgrade_data.config.clone();
 
-  util::setup_logging(&upgrade_data.config);
-  util::setup_metrics(&upgrade_data.config);
+  util::setup_logging(&config);
+  util::setup_metrics(&config);
   //info!("new master got upgrade data: {:?}", upgrade_data);
 
   let mut server = CommandServer::from_upgrade_data(upgrade_data);
   server.enable_cloexec_after_upgrade();
   info!("starting new master loop");
-  command.write_message(&true);
-  server.run();
-  info!("master process stopped");
-
+  match util::write_pid_file(&config) {
+    Ok(()) => {
+      command.write_message(&true);
+      server.run();
+      info!("master process stopped");
+    },
+    Err(e) => {
+      command.write_message(&false);
+      error!("Couldn't write PID file. Error: {:?}", e);
+      error!("Couldn't upgrade master process");
+    }
+  }
 }

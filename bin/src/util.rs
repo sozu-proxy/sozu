@@ -1,5 +1,8 @@
 use nix::fcntl::{fcntl,FcntlArg,FdFlag};
 use std::os::unix::io::RawFd;
+use std::fs::File;
+use std::io::Write;
+use libc;
 
 use logging;
 use sozu_command::config::Config;
@@ -38,5 +41,27 @@ pub fn setup_logging(config: &Config) {
 pub fn setup_metrics(config: &Config) {
   if let Some(ref metrics) = config.metrics.as_ref() {
     metrics_set_up!(&metrics.address[..], metrics.port, "MASTER".to_string(), metrics.tagged_metrics);
+  }
+}
+
+pub fn write_pid_file(config: &Config) -> Result<(), String> {
+  let pid_file_path = match config.pid_file_path {
+    Some(ref pid_file_path) => Some(pid_file_path.as_ref()),
+    None => option_env!("SOZU_PID_FILE_PATH")
+  };
+
+  if let Some(ref pid_file_path) = pid_file_path {
+    File::create(pid_file_path)
+      .and_then(|mut file| {
+        let pid = unsafe { libc::getpid() };
+        file
+          .write_all(format!("{}", pid).as_bytes())
+          .map(|()| file)
+      })
+      .and_then(|file| file.sync_all())
+      .map(|()| ())
+      .or_else(|err| Err(format!("Couldn't write the PID file to {}. Error: {:?}", pid_file_path, err)))
+  } else {
+    Ok(())
   }
 }
