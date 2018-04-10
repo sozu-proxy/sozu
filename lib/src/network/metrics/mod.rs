@@ -117,6 +117,10 @@ impl Aggregator {
   pub fn dump_metrics_data(&mut self) -> MetricsData {
     self.local.dump_metrics_data()
   }
+
+  pub fn dump_process_data(&mut self) -> BTreeMap<String, FilteredData> {
+    self.local.dump_process_data()
+  }
 }
 
 impl Subscriber for Aggregator {

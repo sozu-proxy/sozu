@@ -2,7 +2,7 @@ use mio::Token;
 use std::collections::{BTreeMap,HashMap,HashSet};
 
 use sozu::network::metrics::METRICS;
-use sozu_command::messages::{MetricsData,OrderMessageAnswerData,QueryAnswer,QueryApplicationType};
+use sozu_command::messages::{MetricsData,AggregatedMetricsData,OrderMessageAnswerData,QueryAnswer,QueryApplicationType};
 use sozu_command::state::{ConfigState,get_application_ids_by_domain};
 use sozu_command::data::AnswerData;
 use command::FrontToken;
@@ -124,17 +124,22 @@ impl Task {
     match self.message_type {
       MessageType::Metrics => {
         let mut data: BTreeMap<String, MetricsData> = self.data.into_iter().filter_map(|(tag, metrics)| {
-           if let OrderMessageAnswerData::Metrics(d) = metrics {
-             Some((tag, d))
-           } else {
-             None
-           }
+          if let OrderMessageAnswerData::Metrics(d) = metrics {
+            Some((tag, d))
+          } else {
+            None
+          }
         }).collect();
+
         let master_metrics = METRICS.with(|metrics| {
-          (*metrics.borrow_mut()).dump_metrics_data()
+          (*metrics.borrow_mut()).dump_process_data()
         });
-        data.insert(String::from("master"), master_metrics);
-        Some(AnswerData::Metrics(data))
+
+        let aggregated_data = AggregatedMetricsData {
+          master: master_metrics,
+          workers: data,
+        };
+        Some(AnswerData::Metrics(aggregated_data))
       },
       MessageType::QueryApplicationsHashes => {
         let mut data: BTreeMap<String, QueryAnswer> = self.data.into_iter().filter_map(|(tag, query)| {

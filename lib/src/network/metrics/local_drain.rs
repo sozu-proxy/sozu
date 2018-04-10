@@ -131,12 +131,12 @@ impl LocalDrain {
 
   pub fn dump_metrics_data(&mut self) -> MetricsData {
     MetricsData {
-      proxy:        self.dump_data(),
+      proxy:        self.dump_process_data(),
       applications: self.dump_app_data(),
     }
   }
 
-  pub fn dump_data(&mut self) -> BTreeMap<String, FilteredData> {
+  pub fn dump_process_data(&mut self) -> BTreeMap<String, FilteredData> {
     let data: BTreeMap<String, FilteredData> = self.data.iter().map(|(ref key, ref value)| {
       (key.to_string(), aggregated_to_filtered(value))
     }).collect();

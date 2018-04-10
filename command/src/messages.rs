@@ -40,6 +40,12 @@ pub enum OrderMessageAnswerData {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
+pub struct AggregatedMetricsData {
+  pub master: BTreeMap<String, FilteredData>,
+  pub workers: BTreeMap<String, MetricsData>,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
 pub struct MetricsData {
   pub proxy:        BTreeMap<String, FilteredData>,
   pub applications: BTreeMap<String, AppMetricsData>,

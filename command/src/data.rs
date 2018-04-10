@@ -5,7 +5,7 @@ use std::fmt;
 use std::collections::BTreeMap;
 
 use state::ConfigState;
-use messages::{MetricsData,Order,Query,QueryAnswer};
+use messages::{AggregatedMetricsData,Order,Query,QueryAnswer};
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
@@ -54,7 +54,7 @@ pub enum ConfigMessageStatus {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AnswerData {
   Workers(Vec<WorkerInfo>),
-  Metrics(BTreeMap<String, MetricsData>),
+  Metrics(AggregatedMetricsData),
   Query(BTreeMap<String, QueryAnswer>),
   State(ConfigState),
 }
