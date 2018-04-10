@@ -5,7 +5,7 @@ use std::fmt;
 use std::collections::BTreeMap;
 
 use state::ConfigState;
-use messages::{AggregatedMetricsData,Order,Query,QueryAnswer};
+use messages::{BackendMetricsData,AggregatedMetricsData,Percentiles,Order,Query,QueryAnswer};
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
@@ -326,7 +326,7 @@ mod tests {
   use hex::FromHex;
   use certificate::split_certificate_chain;
   use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Backend};
-  use messages::{BackendMetricsData,AppMetricsData,MetricsData,FilteredData,Percentiles};
+  use messages::{AppMetricsData,MetricsData,FilteredData};
   use messages::{AddCertificate,RemoveCertificate};
   use config::ProxyProtocolConfig;
 
@@ -590,52 +590,53 @@ mod tests {
       version:  0,
       status:   ConfigMessageStatus::Ok,
       message:  String::from(""),
-      data:     Some(AnswerData::Metrics([
-        (String::from("master"), MetricsData {
-          proxy: [
-            (String::from("sozu.gauge"), FilteredData::Gauge(1)),
-            (String::from("sozu.count"), FilteredData::Count(-2)),
-            (String::from("sozu.time"),  FilteredData::Time(1234)),
-          ].iter().cloned().collect(),
-          applications: [
-            (String::from("app_1"), AppMetricsData {
-              data: BTreeMap::new(),
-              backends: BTreeMap::new(),
-            })
-          ].iter().cloned().collect()
-          /*  [
-            app_id: String::from("app_1"),
-            b
-            (String::from("app_1"), Percentiles {
-              samples: 42,
-              p_50: 1,
-              p_90: 2,
-              p_99: 10,
-              p_99_9: 12,
-              p_99_99: 20,
-              p_99_999: 22,
-              p_100: 30,
-            })
-          ].iter().cloned().collect()
-          },
-          backends: [
-            (String::from("app_1-0"), BackendMetricsData {
-              bytes_in:  256,
-              bytes_out: 128,
-              percentiles: Percentiles {
-                samples: 42,
-                p_50: 1,
-                p_90: 2,
-                p_99: 10,
-                p_99_9: 12,
-                p_99_99: 20,
-                p_99_999: 22,
-                p_100: 30,
-              }
-            })
-          ].iter().cloned().collect()
-            */
-        })
-      ].iter().cloned().collect())),
+      data:     Some(AnswerData::Metrics(AggregatedMetricsData {
+        master: [
+          (String::from("sozu.gauge"), FilteredData::Gauge(1)),
+          (String::from("sozu.count"), FilteredData::Count(-2)),
+          (String::from("sozu.time"),  FilteredData::Time(1234)),
+        ].iter().cloned().collect(),
+        workers: [
+          (String::from("0"), MetricsData {
+            proxy: [
+              (String::from("sozu.gauge"), FilteredData::Gauge(1)),
+              (String::from("sozu.count"), FilteredData::Count(-2)),
+              (String::from("sozu.time"),  FilteredData::Time(1234)),
+            ].iter().cloned().collect(),
+            applications: [
+              (String::from("app_1"), AppMetricsData {
+                data: [
+                  (String::from("request_time"), FilteredData::Percentiles(Percentiles {
+                    samples: 42,
+                    p_50: 1,
+                    p_90: 2,
+                    p_99: 10,
+                    p_99_9: 12,
+                    p_99_99: 20,
+                    p_99_999: 22,
+                    p_100: 30,
+                  }))
+                ].iter().cloned().collect(),
+                backends: [
+                  (String::from("app_1-0"), [
+                    (String::from("bytes_in"),  FilteredData::Count(256)),
+                    (String::from("bytes_out"), FilteredData::Count(128)),
+                    (String::from("percentiles"), FilteredData::Percentiles(Percentiles {
+                      samples: 42,
+                      p_50: 1,
+                      p_90: 2,
+                      p_99: 10,
+                      p_99_9: 12,
+                      p_99_99: 20,
+                      p_99_999: 22,
+                      p_100: 30,
+                    }))
+                  ].iter().cloned().collect())
+                ].iter().cloned().collect(),
+              })
+            ].iter().cloned().collect()
+          })
+        ].iter().cloned().collect()
+      }))
     });
 }

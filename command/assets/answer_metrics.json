@@ -7,45 +7,77 @@
     "type": "METRICS",
     "data": {
       "master": {
-        "proxy": {
-          "sozu.count": {
-            "type": "COUNT",
-            "data": -2
-          },
-          "sozu.gauge": {
-            "type": "GAUGE",
-            "data": 1
-          },
-          "sozu.time": {
-            "type": "TIME",
-            "data": 1234
-          }
+        "sozu.count": {
+          "type": "COUNT",
+          "data": -2
         },
-        "applications": {
-          "app_1": {
-            "samples": 42,
-            "p_50": 1,
-            "p_90": 2,
-            "p_99": 10,
-            "p_99_9": 12,
-            "p_99_99": 20,
-            "p_99_999": 22,
-            "p_100": 30
-          }
+        "sozu.gauge": {
+          "type": "GAUGE",
+          "data": 1
         },
-        "backends": {
-          "app_1-0": {
-            "bytes_in": 256,
-            "bytes_out": 128,
-            "percentiles": {
-              "samples": 42,
-              "p_50": 1,
-              "p_90": 2,
-              "p_99": 10,
-              "p_99_9": 12,
-              "p_99_99": 20,
-              "p_99_999": 22,
-              "p_100": 30
+        "sozu.time": {
+          "type": "TIME",
+          "data": 1234
+        }
+      },
+      "workers": {
+        "0": {
+          "proxy": {
+            "sozu.count": {
+              "type": "COUNT",
+              "data": -2
+            },
+            "sozu.gauge": {
+              "type": "GAUGE",
+              "data": 1
+            },
+            "sozu.time": {
+              "type": "TIME",
+              "data": 1234
+            }
+          },
+          "applications": {
+            "app_1": {
+              "data": {
+                "request_time": {
+                  "type": "PERCENTILES",
+                  "data": {
+                    "samples": 42,
+                    "p_50": 1,
+                    "p_90": 2,
+                    "p_99": 10,
+                    "p_99_9": 12,
+                    "p_99_99": 20,
+                    "p_99_999": 22,
+                    "p_100": 30
+                  }
+                }
+              },
+              "backends": {
+                "app_1-0": {
+                  "bytes_in": {
+                    "type": "COUNT",
+                    "data": 256
+                  },
+                  "bytes_out": {
+                    "type": "COUNT",
+                    "data": 128
+                  },
+                  "percentiles": {
+                    "type": "PERCENTILES",
+                    "data": {
+                      "samples": 42,
+                      "p_50": 1,
+                      "p_90": 2,
+                      "p_99": 10,
+                      "p_99_9": 12,
+                      "p_99_99": 20,
+                      "p_99_999": 22,
+                      "p_100": 30
+                    }
+                  }
+                }
+              }
             }
           }
         }
