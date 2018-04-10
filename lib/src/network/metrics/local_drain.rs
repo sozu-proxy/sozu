@@ -110,7 +110,7 @@ pub struct LocalDrain {
   pub app_data:        BTreeMap<String, AppMetrics>,
   // backend_id -> response time histogram (in ms)
 //  pub backend_data:    BTreeMap<String, BackendMetrics>,
-  pub request_counter: TimeSerie,
+  //pub request_counter: TimeSerie,
   use_tagged_metrics:  bool,
   origin:              String,
 }
@@ -123,7 +123,7 @@ impl LocalDrain {
       data:        BTreeMap::new(),
       app_data:    BTreeMap::new(),
  //     backend_data: BTreeMap::new(),
-      request_counter: TimeSerie::new(),
+      //request_counter: TimeSerie::new(),
       use_tagged_metrics: false,
       origin:      String::from("x"),
     }
@@ -137,17 +137,19 @@ impl LocalDrain {
   }
 
   pub fn dump_data(&mut self) -> BTreeMap<String, FilteredData> {
-    let mut data: BTreeMap<String, FilteredData> = self.data.iter().map(|(ref key, ref value)| {
+    let data: BTreeMap<String, FilteredData> = self.data.iter().map(|(ref key, ref value)| {
       (key.to_string(), aggregated_to_filtered(value))
     }).collect();
 
-    data.insert(String::from("requests"), FilteredData::TimeSerie(self.request_counter.filtered()));
+    self.data.clear();
+
+    //data.insert(String::from("requests"), FilteredData::TimeSerie(self.request_counter.filtered()));
 
     data
   }
 
   pub fn dump_app_data(&mut self) -> BTreeMap<String,AppMetricsData> {
-    self.app_data.iter().map(|(ref app_id, ref app)| {
+    let data = self.app_data.iter().map(|(ref app_id, ref app)| {
       let data = app.data.iter().map(|(ref key, ref value)| {
          (key.to_string(), aggregated_to_filtered(value))
        }).collect();
@@ -160,8 +162,11 @@ impl LocalDrain {
       }).collect();
 
       (app_id.to_string(), AppMetricsData { data, backends })
-    }).collect()
+    }).collect();
 
+    self.app_data.clear();
+
+    data
   }
 }
 
@@ -169,12 +174,13 @@ impl LocalDrain {
 impl Subscriber for LocalDrain {
   fn receive_metric(&mut self, key: &'static str, app_id: Option<&str>, backend_id: Option<&str>, metric: MetricData) {
     //FIXME: we should not have that special case
-    if key == "request_counter" {
+    /*if key == "request_counter" {
       if let MetricData::Count(val) = metric {
         let v = val as u32;
         self.request_counter.add(v);
       }
     }
+    */
 
     if let Some(id) = app_id {
       let k = String::from(id);
