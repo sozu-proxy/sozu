@@ -633,106 +633,45 @@ pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bo
                   return;
                 }
 
-                if let Some(master) = data.remove("master") {
-                  let mut master_table = Table::new();
-                  master_table.add_row(row![String::from("key"), String::from("value")]);
+                let mut master_table = Table::new();
+                master_table.add_row(row![String::from("Master process")]);
+                master_table.add_row(row![String::from("key"), String::from("value")]);
 
-                  println!("master process metrics:\n");
-                  for (ref key, ref value) in master.proxy.iter() {
-                    master_table.add_row(row![key.to_string(), format!("{:?}", value)]);
-                     //println!("{}:\t{:?}", key, value);
-                  }
-
-                  master_table.printstd();
+                for (ref key, ref value) in data.master.iter() {
+                  master_table.add_row(row![key.to_string(), format!("{:?}", value)]);
                 }
+
+                master_table.printstd();
 
                 println!("\nworker metrics:\n");
 
                 let mut proxy_table = Table::new();
+                proxy_table.add_row(row![String::from("Workers")]);
+
+                let mut worker_keys = HashSet::new();
                 let mut header = Vec::new();
                 header.push(cell!("key"));
-                for ref key in data.keys() {
+                for key in data.workers.keys() {
                   header.push(cell!(&key));
+                  worker_keys.insert(key);
                 }
-                proxy_table.add_row(Row::new(header));
+                proxy_table.add_row(Row::new(header.clone()));
 
-                let mut application_table = Table::new();
-                let mut header = Vec::new();
-                header.push(cell!("application"));
-                for ref key in data.keys() {
-                  header.push(cell!(&format!("{} samples", key)));
-                  header.push(cell!(&format!("{} p50%", key)));
-                  header.push(cell!(&format!("{} p90%", key)));
-                  header.push(cell!(&format!("{} p99%", key)));
-                  header.push(cell!(&format!("{} p99.9%", key)));
-                  header.push(cell!(&format!("{} p99.99%", key)));
-                  header.push(cell!(&format!("{} p99.999%", key)));
-                  header.push(cell!(&format!("{} p100%", key)));
-                }
-                application_table.add_row(Row::new(header));
-
-                let mut backend_table = Table::new();
-                let mut header = Vec::new();
-                header.push(cell!("backend"));
-                for ref key in data.keys() {
-                  header.push(cell!(&format!("{} bytes out", key)));
-                  header.push(cell!(&format!("{} bytes in", key)));
-                  header.push(cell!(&format!("{} samples", key)));
-                  header.push(cell!(&format!("{} p50%", key)));
-                  header.push(cell!(&format!("{} p90%", key)));
-                  header.push(cell!(&format!("{} p99%", key)));
-                  header.push(cell!(&format!("{} p99.9%", key)));
-                  header.push(cell!(&format!("{} p99.99%", key)));
-                  header.push(cell!(&format!("{} p99.999%", key)));
-                  header.push(cell!(&format!("{} p100%", key)));
-                }
-                backend_table.add_row(Row::new(header));
-
-
-                let mut proxy_data = HashMap::new();
-                let mut application_data = HashMap::new();
-                let mut backend_data = HashMap::new();
-
-                for ref metrics in data.values() {
-                  for (ref key, ref value) in metrics.proxy.iter() {
-                    (*(proxy_data.entry(key.clone()).or_insert(Vec::new()))).push(value.clone());
-                  }
-
-                  for (ref key, ref percentiles) in metrics.applications.iter() {
-                    let mut entry = application_data.entry(key.clone()).or_insert(Vec::new());
-                    (*entry).push(percentiles.samples);
-                    (*entry).push(percentiles.p_50);
-                    (*entry).push(percentiles.p_90);
-                    (*entry).push(percentiles.p_99);
-                    (*entry).push(percentiles.p_99_9);
-                    (*entry).push(percentiles.p_99_99);
-                    (*entry).push(percentiles.p_99_999);
-                    (*entry).push(percentiles.p_100);
-                  }
-
-                  for (ref key, ref back) in metrics.backends.iter() {
-                    let mut entry = backend_data.entry(key.clone()).or_insert(Vec::new());
-                    let bout = back.bytes_out as u64;
-                    let bin  = back.bytes_in as u64;
-                    (*entry).push(bout);
-                    (*entry).push(bin);
-                    (*entry).push(back.percentiles.samples);
-                    (*entry).push(back.percentiles.p_50);
-                    (*entry).push(back.percentiles.p_90);
-                    (*entry).push(back.percentiles.p_99);
-                    (*entry).push(back.percentiles.p_99_9);
-                    (*entry).push(back.percentiles.p_99_99);
-                    (*entry).push(back.percentiles.p_99_999);
-                    (*entry).push(back.percentiles.p_100);
+                let mut proxy_metrics = HashSet::new();
+                for metrics in data.workers.values() {
+                  for key in metrics.proxy.keys() {
+                    proxy_metrics.insert(key);
                   }
                 }
 
-                for (ref key, ref values) in proxy_data.iter() {
+                for key in proxy_metrics.iter() {
+                  let k: &str = key;
                   let mut row = Vec::new();
-                  row.push(cell!(key));
-
-                  for val in values.iter() {
-                    row.push(cell!(format!("{:?}", val)));
+                  row.push(cell!(k.to_string()));
+                  for worker_key in worker_keys.iter() {
+                    let wk: &str = worker_key;
+                    row.push(cell!(data.workers[wk].proxy.get(k)
+                                   .map(|value| format!("{:?}", value)).unwrap_or(String::new())));
                   }
 
                   proxy_table.add_row(Row::new(row));
@@ -742,33 +681,84 @@ pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bo
 
                 println!("\napplication metrics:\n");
 
-                for (ref key, ref values) in application_data.iter() {
-                  let mut row = Vec::new();
-                  row.push(cell!(key));
-
-                  for val in values.iter() {
-                    row.push(cell!(format!("{:?}", val)));
+                let mut app_ids = HashSet::new();
+                for metrics in data.workers.values() {
+                  for key in metrics.applications.keys() {
+                    app_ids.insert(key);
                   }
-
-                  application_table.add_row(Row::new(row));
                 }
 
-                application_table.printstd();
+                for app_id in app_ids.iter() {
+                  let id: &str = app_id;
 
-                println!("\nbackend metrics:\n");
+                  let mut application_table = Table::new();
 
-                for (ref key, ref values) in backend_data.iter() {
-                  let mut row = Vec::new();
-                  row.push(cell!(key));
+                  application_table.add_row(row![String::from(id)]);
+                  application_table.add_row(Row::new(header.clone()));
 
-                  for val in values.iter() {
-                    row.push(cell!(format!("{:?}", val)));
+                  let mut app_metrics = HashSet::new();
+                  let mut backend_ids = HashSet::new();
+
+                  for worker in data.workers.values() {
+                    if let Some(app) = worker.applications.get(id) {
+                      for k in app.data.keys() {
+                        app_metrics.insert(k);
+                      }
+
+                      for k in app.backends.keys() {
+                        backend_ids.insert(k);
+                      }
+                    }
                   }
 
-                  backend_table.add_row(Row::new(row));
+                  for app_metric in app_metrics.iter() {
+                    let metric: &str = app_metric;
+                    let mut row = Vec::new();
+                    row.push(cell!(metric.to_string()));
+
+                    for worker in data.workers.values() {
+                      row.push(cell!(worker.applications.get(id).and_then(|app| app.data.get(metric))
+                                     .map(|value| format!("{:?}", value)).unwrap_or(String::new())));
+                    }
+                    application_table.add_row(Row::new(row));
+                  }
+                  application_table.printstd();
+
+                  for backend_id in backend_ids.iter() {
+                    let backend: &str = backend_id;
+                    let mut backend_table = Table::new();
+
+                    backend_table.add_row(row![format!("app: {} - backend: {}", id, backend)]);
+                    backend_table.add_row(Row::new(header.clone()));
+
+                    let mut backend_metrics = HashSet::new();
+                    for worker in data.workers.values() {
+                      if let Some(app) = worker.applications.get(id) {
+                        for b in app.backends.values() {
+                          for k in b.keys() {
+                            backend_metrics.insert(k);
+                          }
+                        }
+                      }
+                    }
+
+                    for backend_metric in backend_metrics.iter() {
+                      let metric: &str = backend_metric;
+                      let mut row = Vec::new();
+                      row.push(cell!(metric.to_string()));
+
+                      for worker in data.workers.values() {
+                        row.push(cell!(worker.applications.get(id).and_then(|app| app.backends.get(backend))
+                                       .and_then(|back| back.get(metric))
+                                       .map(|value| format!("{:?}", value)).unwrap_or(String::new())));
+                      }
+                      backend_table.add_row(Row::new(row));
+                    }
+
+                    backend_table.printstd();
+                  }
                 }
 
-                backend_table.printstd();
                 break;
               }
             }
