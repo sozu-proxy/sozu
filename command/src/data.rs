@@ -5,7 +5,7 @@ use std::fmt;
 use std::collections::BTreeMap;
 
 use state::ConfigState;
-use messages::{BackendMetricsData,AggregatedMetricsData,Percentiles,Order,Query,QueryAnswer};
+use messages::{AggregatedMetricsData,Order,Query,QueryAnswer};
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
@@ -326,7 +326,7 @@ mod tests {
   use hex::FromHex;
   use certificate::split_certificate_chain;
   use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Backend};
-  use messages::{AppMetricsData,MetricsData,FilteredData};
+  use messages::{AppMetricsData,MetricsData,FilteredData,Percentiles};
   use messages::{AddCertificate,RemoveCertificate};
   use config::ProxyProtocolConfig;
 
