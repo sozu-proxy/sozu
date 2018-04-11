@@ -5,7 +5,7 @@ repository = "https://github.com/sozu-proxy/sozu"
 readme = "README.md"
 documentation = "https://docs.rs/sozu-lib"
 homepage = "http://sozu.io"
-version = "0.5.1"
+version = "0.6.0"
 license = "AGPL-3.0"
 authors = ["Clément Delafargue <clement@delafargue.name>", "Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
@@ -38,7 +38,7 @@ openssl = {version="^0.9.5", features= ["v102"], optional = true}
 rustls = "^0.12"
 webpki = "0.18.0-alpha"
 hdrhistogram = "^6.0"
-sozu-command-lib = { version = "^0.5", path = "../command" }
+sozu-command-lib = { version = "^0.6", path = "../command" }
 idna = "^0.1"
 
 [dev-dependencies]
