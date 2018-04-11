@@ -6,6 +6,7 @@ use libc;
 
 use logging;
 use sozu_command::config::Config;
+use sozu::network::metrics;
 
 pub fn enable_close_on_exec(fd: RawFd) -> Option<i32> {
   fcntl(fd, FcntlArg::F_GETFD).map_err(|e| {
@@ -40,7 +41,7 @@ pub fn setup_logging(config: &Config) {
 
 pub fn setup_metrics(config: &Config) {
   if let Some(ref metrics) = config.metrics.as_ref() {
-    metrics_set_up!(&metrics.address[..], metrics.port, "MASTER".to_string(), metrics.tagged_metrics);
+    metrics::setup(&metrics.address, metrics.port, "MASTER", metrics.tagged_metrics);
   }
 }
 

@@ -59,6 +59,20 @@ pub struct StoredMetricData {
   data:      MetricData,
 }
 
+pub fn setup<H: AsRef<str>, O: Into<String>>(host: H, port: u16, origin: O, use_tagged_metrics: bool) {
+  use std::net::ToSocketAddrs;
+  let metrics_socket = udp_bind();
+
+  debug!("setting up metrics: local address = {:#?}", metrics_socket.local_addr());
+  let metrics_host   = (host.as_ref(), port).to_socket_addrs().expect("could not parse address").next().expect("could not get first address");
+
+  METRICS.with(|metrics| {
+    (*metrics.borrow_mut()).set_up_remote(metrics_socket, metrics_host);
+    (*metrics.borrow_mut()).set_up_origin(origin.into());
+    (*metrics.borrow_mut()).set_up_tagged_metrics(use_tagged_metrics);
+  });
+}
+
 pub trait Subscriber {
   fn receive_metric(&mut self, label: &'static str, app_id: Option<&str>, backend_id: Option<&str>, metric: MetricData);
 }
@@ -162,22 +176,6 @@ pub fn udp_bind() -> UdpSocket {
 }
 
 #[macro_export]
-macro_rules! metrics_set_up (
-  ($host:expr, $port: expr, $origin: expr, $use_tagged_metrics: expr) => ({
-    use std::net::ToSocketAddrs;
-    let metrics_socket = $crate::network::metrics::udp_bind();
-
-    debug!("setting up metrics: local address = {:#?}", metrics_socket.local_addr());
-    let metrics_host   = ($host, $port).to_socket_addrs().expect("could not parse address").next().expect("could not get first address");
-    $crate::network::metrics::METRICS.with(|metrics| {
-      (*metrics.borrow_mut()).set_up_remote(metrics_socket, metrics_host);
-      (*metrics.borrow_mut()).set_up_origin($origin);
-      (*metrics.borrow_mut()).set_up_tagged_metrics($use_tagged_metrics);
-    });
-  })
-);
-
-#[macro_export]
 macro_rules! count (
   ($key:expr, $value: expr) => {
     let v = $value;
@@ -202,26 +200,7 @@ macro_rules! gauge (
   ($key:expr, $value: expr) => {
     let v = $value;
     $crate::network::metrics::METRICS.with(|metrics| {
-      //(*metrics.borrow_mut()).write(format_args!("{}.{}:{}|g\n", *$crate::logging::TAG, $key, v));
       (*metrics.borrow_mut()).set_gauge($key, v);
-    });
-  }
-);
-
-#[macro_export]
-macro_rules! time_begin (
-  ($key:expr) => {
-    $crate::network::metrics::METRICS.with(|metrics| {
-      (*metrics.borrow_mut()).set_time_begin($key);
-    });
-  }
-);
-
-#[macro_export]
-macro_rules! time_end (
-  ($key:expr) => {
-    $crate::network::metrics::METRICS.with(|metrics| {
-      (*metrics.borrow_mut()).set_time_end($key);
     });
   }
 );
@@ -237,20 +216,6 @@ macro_rules! record_request_time (
       let key: &str = $app_id;
 
       m.receive_metric("request_time", Some(key), None, MetricData::Time($value as usize));
-      /*
-      if m.app_data.contains_key(key) {
-        let metrics = m.app_data.get_mut(key).unwrap();
-        metrics.response_time.record($value as u64);
-      } else {
-        if let Ok(mut hist) = ::hdrhistogram::Histogram::new(3) {
-          hist.record($value as u64);
-          let metrics = $crate::network::metrics::AppMetrics {
-            response_time: hist,
-            last_sent: ::std::time::Instant::now(),
-          };
-          m.app_data.insert(key.to_string(), metrics);
-        }
-      }*/
     });
   }
 );
@@ -268,21 +233,6 @@ macro_rules! record_backend_metrics (
       m.receive_metric("bin", Some(app_id), Some(backend_id), MetricData::Count($bin as i64));
       m.receive_metric("bout", Some(app_id), Some(backend_id), MetricData::Count($bout as i64));
       m.receive_metric("response_time", Some(app_id), Some(backend_id), MetricData::Time($response_time as usize));
-      /*
-      if m.backend_data.contains_key(key) {
-        let bm = m.backend_data.get_mut(key).unwrap();
-        bm.response_time.record($response_time as u64);
-        bm.bin += $bin;
-        bm.bout += $bout;
-      } else {
-        if let Ok(hist) = ::hdrhistogram::Histogram::new(3) {
-          let mut bm = $crate::network::metrics::BackendMetrics::new($app_id.clone(), hist);
-          bm.response_time.record($response_time as u64);
-          bm.bin += $bin;
-          bm.bout += $bout;
-          m.backend_data.insert(key.to_string(), bm);
-        }
-      }*/
     });
   }
 );

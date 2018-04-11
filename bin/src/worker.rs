@@ -20,6 +20,7 @@ use sozu_command::state::ConfigState;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
 use sozu::network::proxy::Server;
+use sozu::network::metrics;
 
 use util;
 use logging;
@@ -77,7 +78,7 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
   command.readiness.insert(Ready::readable());
 
   if let Some(ref metrics) = proxy_config.metrics.as_ref() {
-    metrics_set_up!(&metrics.address[..], metrics.port, worker_id,  metrics.tagged_metrics);
+    metrics::setup(&metrics.address, metrics.port, worker_id, metrics.tagged_metrics);
   }
 
   let mut server = Server::new_from_config(command, ScmSocket::new(scm), proxy_config, config_state);
