@@ -58,7 +58,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       if res == SocketResult::Error {
         error!("[{:?}] front socket error, closing the connection", self.frontend_token);
         metrics.service_stop();
-        incr_ereq!();
+        incr!("ereq");
         self.readiness.reset();
         return (ProtocolResult::Continue, ClientResult::CloseClient);
       }

@@ -206,16 +206,27 @@ macro_rules! gauge (
 );
 
 #[macro_export]
-macro_rules! record_request_time (
-  ($app_id:expr, $value: expr) => {
+macro_rules! time (
+  ($key:expr, $value: expr) => {
     use std::time::Instant;
     use $crate::network::metrics::{MetricData,Subscriber};
     let v = $value;
     $crate::network::metrics::METRICS.with(|metrics| {
       let ref mut m = *metrics.borrow_mut();
-      let key: &str = $app_id;
+      let app: &str = $app_id;
 
-      m.receive_metric("request_time", Some(key), None, MetricData::Time($value as usize));
+      m.receive_metric($key, None, None, MetricData::Time($value as usize));
+    });
+  }
+  ($key:expr, $app_id:expr, $value: expr) => {
+    use std::time::Instant;
+    use $crate::network::metrics::{MetricData,Subscriber};
+    let v = $value;
+    $crate::network::metrics::METRICS.with(|metrics| {
+      let ref mut m = *metrics.borrow_mut();
+      let app: &str = $app_id;
+
+      m.receive_metric($key, Some(app), None, MetricData::Time($value as usize));
     });
   }
 );
@@ -237,35 +248,3 @@ macro_rules! record_backend_metrics (
   }
 );
 
-///Client-side request errors caused by:
-///
-/// * Client terminates before sending request
-/// * Read error from client
-/// * Client timeout
-/// * Client terminated connection
-#[macro_export]
-macro_rules! incr_ereq (
-  () => (incr!("ereq");)
-);
-
-#[macro_export]
-macro_rules! incr_client_cmd (
-  () => (incr!("client_cmd");)
-);
-
-#[macro_export]
-macro_rules! incr_resp_client_cmd (
-  () => (incr!("incr_resp_client_cmd");)
-);
-
-/// count another accepted request
-#[macro_export]
-macro_rules! incr_req (
-  () => {
-    use $crate::network::metrics::{MetricData,Subscriber};
-    $crate::network::metrics::METRICS.with(|metrics| {
-      let ref mut m = *metrics.borrow_mut();
-      m.receive_metric("request_counter", None, None, MetricData::Count(1));
-    });
-  }
-);

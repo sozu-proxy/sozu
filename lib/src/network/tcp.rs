@@ -135,7 +135,7 @@ impl Client {
     let response_time = self.metrics.response_time().num_milliseconds();
     let service_time  = self.metrics.service_time().num_milliseconds();
     let app_id = self.app_id.clone().unwrap_or(String::from("-"));
-    record_request_time!(&app_id, response_time);
+    time!("request_time", &app_id, response_time);
 
     if let Some(backend_id) = self.metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = self.metrics.backend_response_time() {
@@ -821,7 +821,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           listener.accept().map(|(frontend_sock, _)| {
             frontend_sock.set_nodelay(true);
             let mut c = Client::new(frontend_sock, internal_token, front_buf, back_buf, proxy_protocol);
-            incr_req!();
+            incr!("request_counter");
 
             c.set_front_token(client_token);
             poll.register(

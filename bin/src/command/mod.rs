@@ -452,7 +452,7 @@ impl CommandServer {
                     ));
 
                   } else {
-                    incr_resp_client_cmd!();
+                    incr!("resp_client_cmd");
                     client.queue.push_front(msg);
                   }
                 }
@@ -474,7 +474,7 @@ impl CommandServer {
 
             loop {
               if let Some(message) = self.clients[conn_token].channel.read_message() {
-                incr_client_cmd!();
+                incr!("client_cmd");
                 self.handle_client_message(conn_token, &message);
               } else {
                 break;

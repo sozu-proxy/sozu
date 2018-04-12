@@ -63,7 +63,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
       if res == SocketResult::Error {
         error!("[{:?}] front socket error, closing the connection", self.frontend_token);
         metrics.service_stop();
-        incr_ereq!();
+        incr!("ereq");
         self.readiness.reset();
         return ClientResult::CloseClient;
       }
@@ -117,7 +117,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
             },
             Err(e) => {
               metrics.service_stop();
-              incr_ereq!();
+              incr!("ereq");
               self.readiness.reset();
               debug!("PROXY PROTOCOL {}", e);
               break;
