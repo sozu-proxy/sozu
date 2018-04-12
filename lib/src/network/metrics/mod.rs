@@ -217,7 +217,7 @@ macro_rules! time (
 
       m.receive_metric($key, None, None, MetricData::Time($value as usize));
     });
-  }
+  };
   ($key:expr, $app_id:expr, $value: expr) => {
     use std::time::Instant;
     use $crate::network::metrics::{MetricData,Subscriber};
