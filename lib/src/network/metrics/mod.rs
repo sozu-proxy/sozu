@@ -237,34 +237,6 @@ macro_rules! record_backend_metrics (
   }
 );
 
-#[macro_export]
-macro_rules! remove_app_metrics (
-  ($app_id:expr) => {
-    $crate::network::metrics::METRICS.with(|metrics| {
-      //FIXME!!!
-      /*
-      let ref mut m = *metrics.borrow_mut();
-      let key: &str = $app_id;
-      m.app_data.remove(key);
-      */
-    });
-  }
-);
-
-#[macro_export]
-macro_rules! remove_backend_metrics (
-  ($backend_id:expr) => {
-    $crate::network::metrics::METRICS.with(|metrics| {
-      //FIXME!!!
-      /*
-      let ref mut m = *metrics.borrow_mut();
-      let key: &str = $backend_id;
-      m.backend_data.remove(key);
-      */
-    });
-  }
-);
-
 ///Client-side request errors caused by:
 ///
 /// * Client terminates before sending request

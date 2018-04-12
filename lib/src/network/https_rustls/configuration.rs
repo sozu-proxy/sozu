@@ -528,7 +528,6 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Order::RemoveApplication(application) => {
         debug!("{} remove application {:?}", message.id, application);
-        remove_app_metrics!(&application);
         self.remove_application(&application, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
@@ -571,7 +570,6 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Order::RemoveBackend(backend) => {
         debug!("{} remove backend {:?}", message.id, backend);
-        remove_backend_metrics!(&backend.backend_id);
         let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
