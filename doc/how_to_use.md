@@ -1,6 +1,6 @@
 # How to use Sōzu
 
-> Before a deep dive in the configuration part of the proxy, you should take a look at the [getting start](./getting_started.md) if you haven't done it yet.
+> Before a deep dive in the configuration part of the proxy, you should take a look at the [getting started documentation](./getting_started.md) if you haven't done it yet.
 
 ## Configuration file
 
@@ -68,7 +68,7 @@ default_key = "key.pem"
 max_listeners = 1000
 ```
 
-Sozu will detect alone which type of configuration you have set due to your parameters.
+Sozu will detect which type of proxy you have set due to your parameters.
 It's why you don't have to specify: `https`, `http`...
 Currently we support: `tcp, http, https`.
 
@@ -100,7 +100,7 @@ sticky_session = true
 
 ## Sozuctl
 
-Sozuctl is a command line interface for the proxy. You can send configurations orders (e.g. Add a new worker) or reclaim some metrics at the proxy with this executable. Sozuctl talk to the proxy through a unix socket.
+Sozuctl is a command line interface for the proxy. You can send configuration orders (e.g. Add a new worker) or reclaim some metrics at the proxy with this executable. Sozuctl talks to the proxy through a unix socket.
 
 You can specify its path by adding to your `config.toml`:
 
