@@ -5,6 +5,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+PIDFile=__RUNDIR__/sozu/sozu.pid
 ExecStart=__BINDIR__/sozu start --config __SYSCONFDIR__/sozu/config.toml
 Restart=on-failure
 

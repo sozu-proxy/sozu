@@ -1,50 +1,191 @@
 # sozu proxy test config file
 
+# top level options
+
+# path to a file sozu can use to load an initial configuration state for its
+# routing. You can generate this file from sozu's current routing by running
+# the command `sozuctl state save -f state.json`
+saved_state = "__RUNDIR__/sozu/state.json"
+
+# logging verbosity. Possible values are "error", "warn", "info", "debug" and
+# "trace". For performance reasons, the logs at "debug" or "trace" level are
+# not compiled by default. To activate them, pass the "logs-debug" and
+# "logs-trace" compilation options to cargo
+log_level = "info"
+
+# where the logs will be sent. It defaults to sending the logs on standard output,
+# but they could be written to a UDP address:
+# log_target     = "udp://127.0.0.1:9876"
+# to a TCP address:
+# log_target     = "tcp://127.0.0.1:9876"
+# to a unix socket
+# log_target = "unix:///var/sozu/logs
+# to a file
+# log_target = "file:///var/logs/sozu.log"
+# to_stdout
+log_target = "stdout"
+
+# optional different target for access logs (IP addresses, domains, URI, HTTP status, etc)
+# It supports the same options as log_target
+# log_access_target = "file:///var/logs/sozu-access.log"
+
+# path to the unix socket file used to send commands to sozu
 command_socket = "__RUNDIR__/sozu/command"
-saved_state    = "__RUNDIR__/sozu/state.json"
-log_level      = "info"
-log_target     = "stdout"
-#log_target     = "udp://127.0.0.1:9876"
-#log_target     = "tcp://127.0.0.1:9876"
+
+# size in bytes of the buffer used by the command socket protocol. If the message
+# sent to sozu is too large, or the data that sozu must return is too large, the
+# buffer will grow up to max_command_buffer_size. If the buffer is still not large
+# enough sozu will close the connection
+# defaults to 1000000
 command_buffer_size = 16384
+# defaults to command_buffer_size * 2
+max_command_buffer_size = 163840
+
+# the number of worker processes that will handle traffic
 worker_count = 2
+
+# indicates if workers should be automatically restarted if they crash / hang
+# should be true for production and false for development
+# defaults to true
+worker_automatic_restart = true
+
+# indicates if worker process will be pinned on a core. If you activate this, be sure
+# that you do not have more workers than CPU cores (and leave at least one core for
+# the kernel and the master process)
 handle_process_affinity = false
+
+# maximum number of connections to a worker. If it reached that number and
+# there are new connections available, the worker will accept and close them
+# immediately to indicate it is too busy to handle traffic
 max_connections = 500
+
+# maximum number of buffers used by the protocol implementations for active
+# connections (ie currently serving a request). For now, you should estimate
+# that max_buffers = number of concurrent requests * 2
 max_buffers = 500
+
+# size of the buffers used by the protocol implementations. Each worker will
+# preallocate max_buffers * 2 * buffer_size bytes, so you should plan for this
+# memory usage. If you plan to use sozu's runtime upgrade feature, you should
+# leave enough memory for one more worker (also for the kernel, etc), so total
+# RAM should be larger than (worker count + 1) * max_buffers * 2 * buffer_size bytes
 buffer_size = 16384
 
+# how much time (in milliseconds) sozuctl will wait for a command to complete.
+# Defaults to 1000 milliseconds
+#ctl_command_timeout = 1000
+
+# PID file is a file containing the PID of the master process of sozu.
+# It can be helpful to help systemd or any other service system to keep track
+# of the main process across upgrades. PID file is not created unless this option
+# is set or if SOZU_PID_FILE_PATH environment variable was defined at build time.
+# pid_file_path = "__RUNDIR__/sozu/sozu.pid"
+
+# various statistics can be sent to a server that supports the statsd protocol
+# You can see those statistics with sozuctl, like this: `sozuctl metrics` or
+# `sozuctl metrics --json` for machine consumption
+#
 #[metrics]
-#address = "127.0.0.1"
-#port = 8125
+# address = "127.0.0.1"
+# port = 8125
+# use InfluxDB's statsd protocol flavor to add tags
+# tagged_metrics = false
 
+# options specific to the HTTP (plaintext) proxy
 [http]
+# listening IP
 address = "0.0.0.0"
+# listening port
 port = 80
-answer_404 = "__DATADIR__/html/404.html"
-answer_503 = "__DATADIR__/html/503.html"
 
+# path to custom 404 and 503 answers
+# a 404 response is sent when sozu does not know about the requested domain or path
+# a 503 response is sent if there are no backend servers available
+#answer_404 = "__DATADIR__/html/404.html"
+#answer_503 = "__DATADIR__/html/503.html"
+
+# options specific to the HTTPS (OpenSSL basedor rustls based) proxy
 [https]
 address = "0.0.0.0"
 port = 443
-#default_app_id = "MyApp"
+
+#answer_404 = "__DATADIR__/html/404.html"
+#answer_503 = "__DATADIR__/html/503.html"
+
+# defines how the TLS protocol will be handled by sozu. Possible values
+# are "openssl" or "rustls". The "openssl" option will only work if sozu
+# was built with the "use-openssl" feature.
+# tls_provider = "rustls"
+
+# supported TLS versions. Possible values are "SSLv2", "SSLv3", "TLSv1",
+# "TLSv1.1", "TLSv1.2". Defaults to "TLSv1.2"
 #tls_versions = ["TLSv1.2"]
+
+# cipher combinations used by OpenSSL
 #cipher_list = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256"
+
+# application whose certificate will be used by default by  OpenSSL
+default_app_id = "MyApp"
+
+# default certificate used by OpenSSL
 #default_certificate = "__DATADIR__/ssl/cert_test.pem"
+# default certificate chain used by OpenSSL
 #default_certificate_chain = "__DATADIR__/ssl/cert__chain_test.pem"
+# default key used by OpenSSL
 #default_key = "__DATADIR__/ssl/key_test.pem"
 
-answer_404 = "__DATADIR__/html/404.html"
-answer_503 = "__DATADIR__/html/503.html"
+# options specific to the TCP proxy
+#
+# there is nothing here for now, but to activate the TCP proxy,
+# uncomment that section
+# [tcp]
 
+# static configuration for applications
+#
+# those applications will be routed by sozu directly from start
 [applications]
 
+# every application has an "application id", here it is "MyApp"
+# this is an example of a routing configuration for the HTTP and HTTPS proxies
 [applications.MyApp]
-hostname   = "lolcatho.st"
-#path_begin = "/api" # optional
-certificate = "__DATADIR__/ssl/certificate.pem" # optional
-key = "__DATADIR__/ssl/key.pem" # optional
-certificate_chain = "__DATADIR__/ssl/certificate_chain.pem" # optional
-frontends = ["HTTP", "HTTPS"] # list of proxy tags
-backends  = [ "127.0.0.1:1026" ] # list of IP/port
-#sticky_session = true
 
+# host name of the application
+hostname = "lolcatho.st"
+
+# an application can receive requests going to a hostname and path prefix
+#path_begin = "/api" # optional
+
+# list of backend servers for this application
+backends = [ "127.0.0.1:1026" ] # list of IP/port
+
+# activates sticky sessions for this application
+#sticky_session = false
+#
+# activates automatic redirection to HTTPS for this application
+#https_redirect = false
+
+# TLS related options for the application. If those are active and the HTTPS
+# proxy is activated too, the application will be reachable through TLS
+#
+# certificate for this application
+certificate = "__DATADIR__/ssl/certificate.pem" # optional
+# key for this application
+key = "__DATADIR__/ssl/key.pem" # optional
+# certificate chain for this application
+certificate_chain = "__DATADIR__/ssl/certificate_chain.pem" # optional
+
+# this is an example of a routing configuration for the TCP proxy
+[applications.TcpTest]
+# IP address for the listener
+ip_address = "127.0.0.1"
+# port for the listener
+port = 8081
+
+# list of backend servers for this application
+backends = [ "127.0.0.1:1026" ] # list of IP/port
+
+# activates the proxy protocol to send IP information to the backend
+# send_proxy = false
+
+# Configures the client-facing connection to receive a PROXY protocol header
+# expect_proxy = false
