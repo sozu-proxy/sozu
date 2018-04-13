@@ -111,7 +111,7 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn reset(&mut self) {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     //info!("{} RESET TO {}", self.log_ctx, request_id);
-    gauge_add!("http.requests", -1);
+    gauge_add!("http.active_requests", -1);
     self.state.as_mut().map(|state| state.reset());
     let req_header = self.added_request_header(self.public_address, self.client_address);
     let res_header = self.added_response_header();
@@ -484,8 +484,8 @@ impl<Front:SocketHandler> Http<Front> {
     };
 
     if unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial) {
-      gauge_add!("http.requests", 1);
-      incr!("request_counter");
+      gauge_add!("http.active_requests", 1);
+      incr!("http.requests");
     }
 
     // if there's no host, continue parsing until we find it

@@ -821,7 +821,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           listener.accept().map(|(frontend_sock, _)| {
             frontend_sock.set_nodelay(true);
             let mut c = Client::new(frontend_sock, internal_token, front_buf, back_buf, proxy_protocol);
-            incr!("request_counter");
+            incr!("tcp.requests");
 
             c.set_front_token(client_token);
             poll.register(

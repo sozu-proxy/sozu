@@ -177,15 +177,6 @@ impl LocalDrain {
 
 impl Subscriber for LocalDrain {
   fn receive_metric(&mut self, key: &'static str, app_id: Option<&str>, backend_id: Option<&str>, metric: MetricData) {
-    //FIXME: we should not have that special case
-    /*if key == "request_counter" {
-      if let MetricData::Count(val) = metric {
-        let v = val as u32;
-        self.request_counter.add(v);
-      }
-    }
-    */
-
     if let Some(id) = app_id {
       let k = String::from(id);
       if !self.app_data.contains_key(id) {
