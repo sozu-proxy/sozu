@@ -270,8 +270,8 @@ macro_rules! record_backend_metrics (
       let app_id: &str = $app_id.as_str();
       let backend_id: &str = $backend_id;
 
-      m.receive_metric("bin", Some(app_id), Some(backend_id), MetricData::Count($bin as i64));
-      m.receive_metric("bout", Some(app_id), Some(backend_id), MetricData::Count($bout as i64));
+      m.receive_metric("bytes_in", Some(app_id), Some(backend_id), MetricData::Count($bin as i64));
+      m.receive_metric("bytes_out", Some(app_id), Some(backend_id), MetricData::Count($bout as i64));
       m.receive_metric("response_time", Some(app_id), Some(backend_id), MetricData::Time($response_time as usize));
     });
   }
