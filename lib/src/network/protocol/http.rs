@@ -374,6 +374,7 @@ impl<Front:SocketHandler> Http<Front> {
     if let Some(ref app_id) = self.app_id {
       time!("request_time", &app_id, response_time.num_milliseconds());
     }
+    incr!("http_errors");
 
     info_access!("{}{} -> X\t{} {} {} {}\t{} {} {}",
       self.log_ctx, client,
@@ -403,6 +404,7 @@ impl<Front:SocketHandler> Http<Front> {
     let service_time  = metrics.service_time();
 
     let app_id = self.app_id.clone().unwrap_or(String::from("-"));
+    incr!("http_errors");
     /*time!("request_time", &app_id, response_time);
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
@@ -434,7 +436,6 @@ impl<Front:SocketHandler> Http<Front> {
         // We don't have a backend to empty the buffer into, close the connection
         metrics.service_stop();
         self.log_request_error(metrics, "front buffer full, no backend, closing connection");
-        incr!("ereq");
         let answer_413 = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
         self.set_answer(DefaultAnswerStatus::Answer413, answer_413.as_bytes());
         self.readiness.front_interest.remove(Ready::readable());
@@ -473,7 +474,6 @@ impl<Front:SocketHandler> Http<Front> {
         self.log_request_error(metrics,
           &format!("front socket error, closing the connection. Readiness: {:?}", self.readiness));
         metrics.service_stop();
-        incr!("ereq");
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
@@ -602,7 +602,6 @@ impl<Front:SocketHandler> Http<Front> {
         metrics.service_stop();
         self.log_default_answer_success(&metrics);
         self.readiness.reset();
-        incr!("ereq");
         return ClientResult::CloseClient;
       }
 
@@ -610,7 +609,6 @@ impl<Front:SocketHandler> Http<Front> {
         self.readiness.reset();
         metrics.service_stop();
         self.log_request_error(metrics, "error writing default answer to front socket, closing");
-        incr!("ereq");
         return ClientResult::CloseClient;
       } else {
         return ClientResult::Continue;
@@ -651,7 +649,6 @@ impl<Front:SocketHandler> Http<Front> {
       SocketResult::Error => {
         metrics.service_stop();
         self.log_request_error(metrics, "error writing to front socket, closing");
-        incr!("ereq");
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
@@ -793,7 +790,6 @@ impl<Front:SocketHandler> Http<Front> {
         metrics.service_stop();
         self.log_request_error(metrics, "back socket write error, closing connection");
         self.readiness.reset();
-        incr!("ereq");
         return ClientResult::CloseClient;
       },
       SocketResult::WouldBlock => {
@@ -930,7 +926,6 @@ impl<Front:SocketHandler> Http<Front> {
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Error)) => {
         self.log_request_error(metrics, "back read should have stopped on chunk error");
-        incr!("ereq");
         self.readiness.reset();
         (ProtocolResult::Continue, ClientResult::CloseClient)
       },

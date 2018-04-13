@@ -163,7 +163,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       SocketResult::Error => {
         error!("{}\t[{:?}] front socket error, closing the connection", self.log_ctx, self.token);
         metrics.service_stop();
-        incr!("ereq");
+        incr!("pipe_errors");
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
@@ -217,7 +217,7 @@ impl<Front:SocketHandler> Pipe<Front> {
     match res {
       SocketResult::Error => {
         error!("{}\t[{:?}] error writing to front socket, closing", self.log_ctx, self.token);
-        incr!("ereq");
+        incr!("pipe_errors");
         metrics.service_stop();
         self.readiness.reset();
         return ClientResult::CloseClient;
@@ -272,7 +272,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       SocketResult::Error => {
         error!("{}\tback socket write error, closing connection", self.log_ctx);
         metrics.service_stop();
-        incr!("ereq");
+        incr!("pipe_errors");
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
@@ -317,7 +317,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       if r == SocketResult::Error {
         error!("{}\tback socket read error, closing connection", self.log_ctx);
         metrics.service_stop();
-        incr!("ereq");
+        incr!("pipe_errors");
         self.readiness.reset();
         return ClientResult::CloseClient;
       }
