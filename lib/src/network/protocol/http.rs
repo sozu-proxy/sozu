@@ -372,9 +372,9 @@ impl<Front:SocketHandler> Http<Front> {
     let service_time  = metrics.service_time();
 
     if let Some(ref app_id) = self.app_id {
-      time!("request_time", &app_id, response_time.num_milliseconds());
+      time!("http.request.time", &app_id, response_time.num_milliseconds());
     }
-    incr!("http_errors");
+    incr!("http.errors");
 
     info_access!("{}{} -> X\t{} {} {} {}\t{} {} {}",
       self.log_ctx, client,
@@ -404,7 +404,7 @@ impl<Front:SocketHandler> Http<Front> {
     let service_time  = metrics.service_time();
 
     let app_id = self.app_id.clone().unwrap_or(String::from("-"));
-    incr!("http_errors");
+    incr!("http.errors");
     /*time!("request_time", &app_id, response_time);
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
