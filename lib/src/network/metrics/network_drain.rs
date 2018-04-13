@@ -17,6 +17,8 @@ use sozu_command::messages::{FilteredData,MetricsData,Percentiles,BackendMetrics
 
 use super::{Subscriber,MetricData,StoredMetricData};
 
+const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug,Clone,PartialEq)]
 pub struct MetricLine {
   label:      &'static str,
@@ -91,7 +93,7 @@ impl NetworkDrain {
       let res = match stored_metric.data {
         MetricData::Gauge(value) => {
           if self.use_tagged_metrics {
-            self.remote.write_fmt(format_args!("{}.{},origin={}:{}|g\n", self.prefix, key, self.origin, value))
+            self.remote.write_fmt(format_args!("{}.{},origin={},version={}:{}|g\n", self.prefix, key, self.origin, VERSION, value))
           } else {
             self.remote.write_fmt(format_args!("{}.{}.{}:{}|g\n", self.prefix, self.origin, key, value))
           }
@@ -102,7 +104,7 @@ impl NetworkDrain {
           }
 
           let res = if self.use_tagged_metrics {
-            self.remote.write_fmt(format_args!("{}.{},origin={}:{}|c\n", self.prefix, key, self.origin, value))
+            self.remote.write_fmt(format_args!("{}.{},origin={},version={}:{}|c\n", self.prefix, key, self.origin, VERSION, value))
           } else {
             self.remote.write_fmt(format_args!("{}.{}.{}:{}|c\n", self.prefix, self.origin, key, value))
           };
@@ -146,7 +148,8 @@ impl NetworkDrain {
       let res = match stored_metric.data {
         MetricData::Gauge(value) => {
           if self.use_tagged_metrics {
-            self.remote.write_fmt(format_args!("{}.app.{},origin={},app_id={}:{}|g\n", self.prefix, key.1, self.origin, key.0, value))
+            self.remote.write_fmt(format_args!("{}.app.{},origin={},version={},app_id={}:{}|g\n",
+              self.prefix, key.1, self.origin, VERSION, key.0, value))
           } else {
             self.remote.write_fmt(format_args!("{}.{}.app.{}.{}:{}|g\n", self.prefix, self.origin, key.0, key.1, value))
           }
@@ -157,7 +160,8 @@ impl NetworkDrain {
           }
 
           let res = if self.use_tagged_metrics {
-            self.remote.write_fmt(format_args!("{}.app.{},origin={},app_id={}:{}|c\n", self.prefix, key.1, self.origin, key.0, value))
+            self.remote.write_fmt(format_args!("{}.app.{},origin={},version={},app_id={}:{}|c\n",
+              self.prefix, key.1, self.origin, VERSION, key.0, value))
           } else {
             self.remote.write_fmt(format_args!("{}.{}.app.{}.{}:{}|c\n", self.prefix, self.origin, key.0, key.1, value))
           };
@@ -201,7 +205,8 @@ impl NetworkDrain {
       let res = match stored_metric.data {
         MetricData::Gauge(value) => {
           if self.use_tagged_metrics {
-            self.remote.write_fmt(format_args!("{}.backend.{},origin={},app_id={},backend_id={}:{}|g\n", self.prefix, key.2, self.origin, key.0, key.1, value))
+            self.remote.write_fmt(format_args!("{}.backend.{},origin={},version={},app_id={},backend_id={}:{}|g\n",
+              self.prefix, key.2, self.origin, VERSION, key.0, key.1, value))
           } else {
             self.remote.write_fmt(format_args!("{}.{}.app.{}.backend.{}.{}:{}|g\n", self.prefix, self.origin, key.0, key.1, key.2, value))
           }
@@ -212,7 +217,8 @@ impl NetworkDrain {
           }
 
           let res = if self.use_tagged_metrics {
-            self.remote.write_fmt(format_args!("{}.app.{},origin={},app_id={},backend_id={}:{}|c\n", self.prefix, key.2, self.origin, key.0, key.1, value))
+            self.remote.write_fmt(format_args!("{}.app.{},origin={},version={},app_id={},backend_id={}:{}|c\n",
+              self.prefix, key.2, self.origin, VERSION, key.0, key.1, value))
           } else {
             self.remote.write_fmt(format_args!("{}.{}.app.{}.backend.{}.{}:{}|c\n", self.prefix, self.origin, key.0, key.1, key.2, value))
           };
@@ -254,8 +260,8 @@ impl NetworkDrain {
        let res = match (metric.app_id, metric.backend_id) {
         (Some(app_id), Some(backend_id)) => {
           if self.use_tagged_metrics {
-            self.buffer.write_fmt(format_args!("{}.backend.{},origin={},app_id={},backend_id={}:{}|ms\n", self.prefix, metric.label,
-              self.origin, app_id, backend_id, metric.duration))
+            self.buffer.write_fmt(format_args!("{}.backend.{},origin={},version={},app_id={},backend_id={}:{}|ms\n",
+              self.prefix, metric.label, self.origin, VERSION, app_id, backend_id, metric.duration))
           } else {
             self.buffer.write_fmt(format_args!("{}.{}.app.{}.backend.{}.{}:{}|ms\n", self.prefix, self.origin, app_id, backend_id,
               metric.label, metric.duration))
@@ -263,8 +269,8 @@ impl NetworkDrain {
         },
         (Some(app_id), None) => {
           if self.use_tagged_metrics {
-            self.buffer.write_fmt(format_args!("{}.app.{},origin={},app_id={}:{}|ms\n", self.prefix, metric.label,
-              self.origin, app_id, metric.duration))
+            self.buffer.write_fmt(format_args!("{}.app.{},origin={},version={},app_id={}:{}|ms\n",
+              self.prefix, metric.label, self.origin, VERSION, app_id, metric.duration))
           } else {
             self.buffer.write_fmt(format_args!("{}.{}.app.{}.{}:{}|ms\n", self.prefix, self.origin, app_id,
               metric.label, metric.duration))
@@ -272,8 +278,8 @@ impl NetworkDrain {
         },
         (None, None) => {
           if self.use_tagged_metrics {
-            self.buffer.write_fmt(format_args!("{}.{},origin={},:{}|ms\n", self.prefix, metric.label,
-              self.origin, metric.duration))
+            self.buffer.write_fmt(format_args!("{}.{},origin={},version={}:{}|ms\n",
+              self.prefix, metric.label, self.origin, VERSION, metric.duration))
           } else {
             self.buffer.write_fmt(format_args!("{}.{}.{}:{}|ms\n", self.prefix, self.origin,
               metric.label, metric.duration))
