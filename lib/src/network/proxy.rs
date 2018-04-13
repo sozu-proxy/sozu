@@ -588,9 +588,9 @@ impl Server {
         _ => {}
       }
 
-      decr!("client.connections");
       assert!(self.nb_connections != 0);
       self.nb_connections -= 1;
+      gauge!("client.connections", self.nb_connections);
     }
 
     // do not be ready to accept right away, wait until we get back to 10% capacity
@@ -671,7 +671,7 @@ impl Server {
       Ok((client_token, should_connect)) => {
         self.nb_connections += 1;
         assert!(self.nb_connections <= self.max_connections);
-        incr!("client.connections");
+        gauge!("client.connections", self.nb_connections);
 
         if should_connect {
            self.connect_to_backend(client_token);
