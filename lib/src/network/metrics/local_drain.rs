@@ -31,6 +31,7 @@ impl AggregatedMetric {
   fn new(metric: MetricData) -> AggregatedMetric {
     match metric {
       MetricData::Gauge(value) => AggregatedMetric::Gauge(value),
+      MetricData::GaugeAdd(value) => AggregatedMetric::Gauge(value as usize),
       MetricData::Count(value) => AggregatedMetric::Count(value),
       MetricData::Time(value)  => {
         //FIXME: do not unwrap here
@@ -45,6 +46,9 @@ impl AggregatedMetric {
     match (self, m) {
       (&mut AggregatedMetric::Gauge(ref mut v1), MetricData::Gauge(v2)) => {
         *v1 = v2;
+      },
+      (&mut AggregatedMetric::Gauge(ref mut v1), MetricData::GaugeAdd(v2)) => {
+        *v1 = (*v1 as i64 + v2) as usize;
       },
       (&mut AggregatedMetric::Count(ref mut v1), MetricData::Count(v2)) => {
         *v1 += v2;

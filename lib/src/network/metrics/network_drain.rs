@@ -325,10 +325,7 @@ impl Subscriber for NetworkDrain {
           if !self.backend_data.contains_key(&k) {
             self.backend_data.insert(
               k,
-              StoredMetricData {
-                last_sent: self.created,
-                data: metric,
-              }
+              StoredMetricData::new(self.created, metric)
             );
           } else {
             self.backend_data.get_mut(&k).map(|stored_metric| {
@@ -340,10 +337,7 @@ impl Subscriber for NetworkDrain {
           if !self.app_data.contains_key(&k) {
             self.app_data.insert(
               k,
-              StoredMetricData {
-                last_sent: self.created,
-                data: metric,
-              }
+              StoredMetricData::new(self.created, metric)
             );
           } else {
             self.app_data.get_mut(&k).map(|stored_metric| {
@@ -355,10 +349,7 @@ impl Subscriber for NetworkDrain {
         if !self.data.contains_key(key) {
           self.data.insert(
             String::from(key),
-            StoredMetricData {
-              last_sent: self.created,
-              data: metric,
-            }
+            StoredMetricData::new(self.created, metric)
           );
         } else {
           self.data.get_mut(key).map(|stored_metric| {

@@ -366,7 +366,7 @@ impl ProxyClient for Client {
     if let Some(sock) = self.back_socket() {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
-      decr!("backend.connections");
+      gauge_add!("backend.connections", -1);
     }
 
     if let Some(tk) = self.token {
@@ -385,7 +385,7 @@ impl ProxyClient for Client {
     if let Some(sock) = self.back_socket() {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
-      decr!("backend.connections");
+      gauge_add!("backend.connections", -1);
     }
 
     res
@@ -714,7 +714,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     client.set_back_token(back_token);
     client.set_back_socket(stream);
     client.set_back_connected(BackendConnectionStatus::Connecting);
-    incr!("backend.connections");
+    gauge_add!("backend.connections", 1);
     Ok(BackendConnectAction::New)
   }
 

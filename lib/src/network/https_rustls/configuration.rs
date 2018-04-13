@@ -492,7 +492,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
             client.set_back_socket(socket);
             client.set_back_token(back_token);
-            incr!("backend.connections");
+            gauge_add!("backend.connections", 1);
             Ok(BackendConnectAction::New)
           }
         },

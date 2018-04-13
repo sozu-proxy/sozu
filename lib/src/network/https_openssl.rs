@@ -343,7 +343,7 @@ impl ProxyClient for TlsClient {
     if let Some(sock) = self.back_socket() {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
-      decr!("backend.connections");
+      gauge_add!("backend.connections", -1);
     }
 
     result.tokens.push(self.frontend_token);
@@ -360,7 +360,7 @@ impl ProxyClient for TlsClient {
     if let Some(sock) = self.back_socket() {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
-      decr!("backend.connections");
+      gauge_add!("backend.connections", -1);
     }
 
     res
@@ -1194,7 +1194,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
             client.set_back_socket(socket);
             client.set_back_token(back_token);
-            incr!("backend.connections");
+            gauge_add!("backend.connections", 1);
             Ok(BackendConnectAction::New)
           }
         },

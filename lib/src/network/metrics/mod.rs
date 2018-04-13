@@ -28,6 +28,7 @@ thread_local! {
 #[derive(Debug,Clone,PartialEq)]
 pub enum MetricData {
   Gauge(usize),
+  GaugeAdd(i64),
   Count(i64),
   Time(usize),
 }
@@ -45,6 +46,9 @@ impl MetricData {
       (&mut MetricData::Gauge(ref mut v1), MetricData::Gauge(v2)) => {
         *v1 = v2;
       },
+      (&mut MetricData::Gauge(ref mut v1), MetricData::GaugeAdd(v2)) => {
+        *v1 = (*v1 as i64 + v2) as usize;
+      },
       (&mut MetricData::Count(ref mut v1), MetricData::Count(v2)) => {
         *v1 += v2;
       },
@@ -57,6 +61,17 @@ impl MetricData {
 pub struct StoredMetricData {
   last_sent: Instant,
   data:      MetricData,
+}
+
+impl StoredMetricData {
+  pub fn new(last_sent: Instant, data: MetricData) -> StoredMetricData {
+    StoredMetricData {
+      last_sent: last_sent,
+      data: if let MetricData::GaugeAdd(v) = data {
+        MetricData::Gauge(v as usize)
+      } else { data }
+    }
+  }
 }
 
 pub fn setup<H: AsRef<str>, O: Into<String>>(host: H, port: u16, origin: O, use_tagged_metrics: bool) {
@@ -114,6 +129,10 @@ impl Aggregator {
 
   pub fn set_gauge(&mut self, key: &'static str, gauge_value: usize) {
     self.receive_metric(key, None, None, MetricData::Gauge(gauge_value));
+  }
+
+  pub fn gauge_add(&mut self, key: &'static str, gauge_value: i64) {
+    self.receive_metric(key, None, None, MetricData::GaugeAdd(gauge_value));
   }
 
   pub fn writable(&mut self) {
@@ -201,6 +220,16 @@ macro_rules! gauge (
     let v = $value;
     $crate::network::metrics::METRICS.with(|metrics| {
       (*metrics.borrow_mut()).set_gauge($key, v);
+    });
+  }
+);
+
+#[macro_export]
+macro_rules! gauge_add (
+  ($key:expr, $value: expr) => {
+    let v = $value;
+    $crate::network::metrics::METRICS.with(|metrics| {
+      (*metrics.borrow_mut()).gauge_add($key, v);
     });
   }
 );
