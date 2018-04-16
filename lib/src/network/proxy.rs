@@ -468,6 +468,7 @@ impl Server {
                 status: OrderMessageStatus::Error(String::from("client list is full, cannot add a listener")),
                 data: None
               });
+              self.tcp = Some(tcp);
               return;
             }
 
