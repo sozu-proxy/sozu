@@ -463,12 +463,12 @@ impl Server {
             let entry = self.clients.vacant_entry();
 
             if entry.is_none() {
-               self.queue.push_back(OrderMessageAnswer {
-                 id,
-                 status: OrderMessageStatus::Error(String::from("client list is full, cannot add a listener")),
-                 data: None
-               });
-               return;
+              self.queue.push_back(OrderMessageAnswer {
+                id,
+                status: OrderMessageStatus::Error(String::from("client list is full, cannot add a listener")),
+                data: None
+              });
+              return;
             }
 
             let entry = entry.unwrap();
@@ -479,12 +479,12 @@ impl Server {
             let addr_string = tcp_front.ip_address + ":" + &tcp_front.port.to_string();
 
             let status = if let Ok(front) = addr_string.parse() {
-               if let Some(token) = tcp.add_tcp_front(&tcp_front.app_id, &front, &mut self.poll, token) {
-                 OrderMessageStatus::Ok
-               } else {
-                 error!("Couldn't add tcp front");
-                 OrderMessageStatus::Error(String::from("cannot add tcp front"))
-               }
+              if let Some(token) = tcp.add_tcp_front(&tcp_front.app_id, &front, &mut self.poll, token) {
+                OrderMessageStatus::Ok
+              } else {
+                error!("Couldn't add tcp front");
+                OrderMessageStatus::Error(String::from("cannot add tcp front"))
+              }
             } else {
               error!("Couldn't parse tcp front address");
               OrderMessageStatus::Error(String::from("cannot parse the address"))
