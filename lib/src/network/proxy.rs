@@ -447,12 +447,30 @@ impl Server {
       if let Some(mut http) = self.http.take() {
         self.queue.push_back(http.notify(&mut self.poll, message.clone()));
         self.http = Some(http);
+      } else {
+        match message.clone() {
+          OrderMessage{ id, order: Order::AddHttpFront(http_front) } => {
+            warn!("No HTTP proxy configured to handle {:?}", message);
+            let status = OrderMessageStatus::Error(String::from("No HTTP proxy configured"));
+            self.queue.push_back(OrderMessageAnswer{ id: id.clone(), status, data: None });
+          },
+          _ => {}
+        }
       }
     }
     if topics.contains(&Topic::HttpsProxyConfig) {
       if let Some(mut https) = self.https.take() {
         self.queue.push_back(https.notify(&mut self.poll, message.clone()));
         self.https = Some(https);
+      } else {
+        match message.clone() {
+          OrderMessage{ id, order: Order::AddHttpsFront(https_front) } => {
+            warn!("No HTTPS proxy configured to handle {:?}", message);
+            let status = OrderMessageStatus::Error(String::from("No HTTPS proxy configured"));
+            self.queue.push_back(OrderMessageAnswer{ id: id.clone(), status, data: None });
+          },
+          _ => {}
+        }
       }
     }
     if topics.contains(&Topic::TcpProxyConfig) {
@@ -495,6 +513,15 @@ impl Server {
           m => self.queue.push_back(tcp.notify(&mut self.poll, m)),
         }
         self.tcp = Some(tcp);
+      } else {
+        match message.clone() {
+          OrderMessage { id, order: Order::AddTcpFront(tcp_front) } => {
+            warn!("No TCP proxy configured to handle {:?}", message);
+            let status = OrderMessageStatus::Error(String::from("No TCP proxy configured"));
+            self.queue.push_back(OrderMessageAnswer{ id, status, data: None });
+          },
+          _ => {}
+        }
       }
     }
   }
