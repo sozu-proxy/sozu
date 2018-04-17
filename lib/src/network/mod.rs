@@ -85,7 +85,7 @@ pub enum AcceptError {
   WouldBlock,
 }
 
-use self::proxy::{ClientToken,ListenToken};
+use self::proxy::{ClientToken,ListenToken,ListenPortState};
 pub trait ProxyConfiguration<Client> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut Client,
     back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
@@ -94,6 +94,7 @@ pub trait ProxyConfiguration<Client> {
     -> Result<(Rc<RefCell<Client>>, bool), AcceptError>;
   fn accept_flush(&mut self) -> usize;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
+  fn listen_port_state(&self, port: &u16) -> ListenPortState;
 }
 
 #[derive(Debug,PartialEq,Eq)]

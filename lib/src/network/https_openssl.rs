@@ -42,7 +42,7 @@ use network::{AppId,Backend,ClientResult,ConnectionError,Protocol,Readiness,Sess
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use network::backends::BackendMap;
-use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken,ListenClient};
+use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,ClientToken,ListenClient};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
@@ -1327,6 +1327,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
   fn close_backend(&mut self, app_id: AppId, addr: &SocketAddr) {
     self.backends.close_backend_connection(&app_id, &addr);
+  }
+
+  fn listen_port_state(&self, port: &u16) -> ListenPortState {
+    if port == &self.address.port() { ListenPortState::InUse } else { ListenPortState::Available }
   }
 }
 

@@ -32,7 +32,7 @@ use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
 use network::protocol::http::DefaultAnswerStatus;
 use network::protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken,ListenClient};
+use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,ClientToken,ListenClient};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::retry::RetryPolicy;
 use parser::http11::hostname_and_port;
@@ -1028,6 +1028,10 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {
     self.backends.close_backend_connection(&app_id, &addr);
+  }
+
+  fn listen_port_state(&self, port: &u16) -> ListenPortState {
+    if port == &self.address.port() { ListenPortState::InUse } else { ListenPortState::Available }
   }
 }
 
