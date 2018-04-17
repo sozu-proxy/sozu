@@ -29,7 +29,7 @@ use sozu_command::messages::{self,TcpFront,Order,OrderMessage,OrderMessageAnswer
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
-use network::proxy::{Server,ProxyChannel,ListenToken,ClientToken,ListenClient};
+use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,ClientToken,ListenClient};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::{http,https_rustls};
@@ -870,6 +870,13 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       if let Some(ref mut backend) = app_backends.iter_mut().find(|backend| &backend.address == addr) {
         backend.dec_connections();
       }
+    }
+  }
+
+  fn listen_port_state(&self, port: &u16) -> ListenPortState {
+    match self.listeners.values().find(|listener| &listener.front_address.port() == port) {
+      Some(_) => ListenPortState::InUse,
+      None => ListenPortState::Available
     }
   }
 }

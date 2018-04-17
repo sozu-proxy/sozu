@@ -51,6 +51,12 @@ enum ProxyType {
   TCP,
 }
 
+#[derive(PartialEq)]
+pub enum ListenPortState {
+  Available,
+  InUse
+}
+
 #[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
 pub struct ListenToken(pub usize);
 #[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
@@ -478,6 +484,17 @@ impl Server {
         match message {
           // special case for AddTcpFront because we need to register a listener
           OrderMessage { id, order: Order::AddTcpFront(tcp_front) } => {
+            if self.listen_port_state(&tcp_front.port, &tcp) == ListenPortState::InUse {
+              error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
+              self.queue.push_back(OrderMessageAnswer {
+                id,
+                status: OrderMessageStatus::Error(String::from("Couldn't add TCP front: port already in use")),
+                data: None
+              });
+              self.tcp = Some(tcp);
+              return;
+            }
+
             let entry = self.clients.vacant_entry();
 
             if entry.is_none() {
@@ -914,6 +931,25 @@ impl Server {
         }
       }
     }
+  }
+
+  fn listen_port_state(&self, port: &u16, tcp_proxy: &tcp::ServerConfiguration) -> ListenPortState {
+    let http_binded = self.http.as_ref().map(|http| http.listen_port_state(&port)).unwrap_or(ListenPortState::Available);
+
+    if http_binded == ListenPortState::Available {
+      let https_binded = match self.https.as_ref() {
+        #[cfg(feature = "use-openssl")]
+        Some(&HttpsProvider::Openssl(ref openssl)) => openssl.listen_port_state(&port),
+        Some(&HttpsProvider::Rustls(ref rustls)) => rustls.listen_port_state(&port),
+        None => ListenPortState::Available
+      };
+
+      if https_binded == ListenPortState::Available {
+        return tcp_proxy.listen_port_state(&port);
+      }
+    }
+
+    ListenPortState::InUse
   }
 }
 
