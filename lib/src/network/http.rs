@@ -361,6 +361,7 @@ impl ProxyClient for Client {
       poll.deregister(sock);
     }
 
+    gauge_add!("http.active_requests", -1);
     result.tokens.push(self.frontend_token);
 
     result

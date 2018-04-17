@@ -346,6 +346,7 @@ impl ProxyClient for TlsClient {
       gauge_add!("backend.connections", -1);
     }
 
+    gauge_add!("http.active_requests", -1);
     result.tokens.push(self.frontend_token);
 
     result
