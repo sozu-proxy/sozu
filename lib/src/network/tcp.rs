@@ -327,6 +327,7 @@ impl Client {
   fn set_back_connected(&mut self, status: BackendConnectionStatus) {
     self.back_connected = status;
     if status == BackendConnectionStatus::Connected {
+      gauge_add!("backend.connections", 1);
       if let Some(State::SendProxyProtocol(ref mut pp)) = self.protocol {
         pp.set_back_connected(BackendConnectionStatus::Connected);
       }
@@ -714,7 +715,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     client.set_back_token(back_token);
     client.set_back_socket(stream);
     client.set_back_connected(BackendConnectionStatus::Connecting);
-    gauge_add!("backend.connections", 1);
     Ok(BackendConnectAction::New)
   }
 

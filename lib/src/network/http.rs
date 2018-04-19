@@ -308,6 +308,7 @@ impl Client {
   fn set_back_connected(&mut self, connected: BackendConnectionStatus) {
     self.back_connected = connected;
     if connected == BackendConnectionStatus::Connected {
+      gauge_add!("backend.connections", 1);
       self.backend.as_ref().map(|backend| {
         let ref mut backend = *backend.borrow_mut();
         //successful connection, rest failure counter
@@ -863,7 +864,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
             client.set_back_socket(socket);
             client.set_back_token(back_token);
-            gauge_add!("backend.connections", 1);
             Ok(BackendConnectAction::New)
           }
           //Ok(())

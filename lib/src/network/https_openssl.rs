@@ -291,6 +291,7 @@ impl TlsClient {
     self.back_connected = connected;
 
     if connected == BackendConnectionStatus::Connected {
+      gauge_add!("backend.connections", 1);
       self.backend.as_ref().map(|backend| {
         let ref mut backend = *backend.borrow_mut();
         backend.failures = 0;
@@ -1195,7 +1196,6 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
             client.set_back_socket(socket);
             client.set_back_token(back_token);
-            gauge_add!("backend.connections", 1);
             Ok(BackendConnectAction::New)
           }
         },
