@@ -604,31 +604,25 @@ impl Server {
 
       match protocol {
         Protocol::TCP   => {
-          if let Some(mut tcp) = self.tcp.take() {
+          self.tcp.as_mut().map(|tcp| {
             for (app_id, address) in backends.into_iter() {
               tcp.close_backend(app_id, &address);
             }
-
-            self.tcp = Some(tcp);
-          }
+          });
         },
         Protocol::HTTP   => {
-          if let Some(mut http) = self.http.take() {
+          self.http.as_mut().map(|http| {
             for (app_id, address) in backends.into_iter() {
               http.close_backend(app_id, &address);
             }
-
-            self.http = Some(http);
-          }
+          });
         },
         Protocol::HTTPS   => {
-          if let Some(mut https) = self.https.take() {
-              for (app_id, address) in backends.into_iter() {
-                https.close_backend(app_id, &address);
-              }
-
-            self.https = Some(https);
-          }
+          self.https.as_mut().map(|https| {
+            for (app_id, address) in backends.into_iter() {
+              https.close_backend(app_id, &address);
+            }
+          });
         },
         _ => {}
       }
