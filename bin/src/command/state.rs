@@ -93,6 +93,7 @@ pub enum MessageType {
   QueryApplicationsHashes,
   QueryApplications(QueryApplicationType),
   Stop,
+  StopWorker,
 }
 
 #[derive(Clone,Debug)]

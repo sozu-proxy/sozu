@@ -203,7 +203,8 @@ impl CommandServer {
                 let mut found = false;
                 let id = format!("LOAD-STATE-{}-{}", message_id, counter);
 
-                for ref mut proxy in self.proxies.values_mut() {
+                for ref mut proxy in self.proxies.values_mut()
+                  .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
                   let o = order.clone();
                   proxy.push_message(OrderMessage { id: id.clone(), order: o });
                   self.order_state.insert_worker_message(message_id, &id, proxy.token.expect("worker should have a token"));
@@ -342,9 +343,8 @@ impl CommandServer {
       error!("could not get the list of listeners from the previous worker");
     }
 
-    //FIXME: soft stop the old worker correctly
-    //self.order_state.insert_task(message_id, MessageType::Stop, Some(token));
-    //self.order_state.insert_worker_message(message_id, message_id, old_worker_token);
+    self.order_state.insert_task(message_id, MessageType::StopWorker, Some(token));
+    self.order_state.insert_worker_message(message_id, message_id, old_worker_token);
     trace!("sending to {:?}, inflight is now {:#?}", old_worker_token.0, self.order_state);
 
 
@@ -412,7 +412,9 @@ impl CommandServer {
   pub fn metrics(&mut self, token: FrontToken, message_id: &str) {
     self.order_state.insert_task(message_id, MessageType::Metrics, Some(token));
 
-    for ref mut proxy in self.proxies.values_mut() {
+    for ref mut proxy in self.proxies.values_mut()
+      .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
+
       self.order_state.insert_worker_message(message_id, message_id, proxy.token.expect("worker should have a valid token"));
       trace!("sending to {:?}, inflight is now {:#?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
 
@@ -428,7 +430,9 @@ impl CommandServer {
 
     self.order_state.insert_task(message_id, message_type, Some(token));
 
-    for ref mut proxy in self.proxies.values_mut() {
+    for ref mut proxy in self.proxies.values_mut()
+      .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
+
       self.order_state.insert_worker_message(message_id, message_id, proxy.token.expect("worker should have a valid token"));
       trace!("sending to {:?}, inflight is now {:#?}", proxy.token.expect("worker should have a valid token").0, self.order_state);
 
@@ -456,14 +460,20 @@ impl CommandServer {
 
     self.state.handle_order(&order);
 
-    if (order == Order::SoftStop || order == Order::HardStop) && proxy_id.is_none() {
-      self.order_state.insert_task(message_id, MessageType::Stop, Some(token));
+    if order == Order::SoftStop || order == Order::HardStop {
+      if proxy_id.is_none() {
+        self.order_state.insert_task(message_id, MessageType::Stop, Some(token));
+      } else {
+        self.order_state.insert_task(message_id, MessageType::StopWorker, Some(token));
+      }
     } else {
       self.order_state.insert_task(message_id, MessageType::WorkerOrder, Some(token));
     }
 
     let mut found = false;
-    for ref mut proxy in self.proxies.values_mut() {
+    for ref mut proxy in self.proxies.values_mut()
+      .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
+
       if let Some(id) = proxy_id {
         if id != proxy.id {
           continue;
@@ -506,7 +516,9 @@ impl CommandServer {
           debug!("config generated {:?}", order);
         }
         let mut found = false;
-        for ref mut proxy in self.proxies.values_mut() {
+        for ref mut proxy in self.proxies.values_mut()
+          .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
+
           let o = order.clone();
           proxy.push_message(OrderMessage { id: message.id.clone(), order: o });
           found = true;

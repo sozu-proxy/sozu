@@ -487,7 +487,7 @@ impl CommandServer {
   }
 
   fn handle_worker_message(&mut self, token: Token, msg: OrderMessageAnswer) {
-    trace!("proxy handle message: token {:?} got answer msg: {:?}", token, msg);
+    trace!("worker handle message: token {:?} got answer msg: {:?}", token, msg);
     if msg.status != OrderMessageStatus::Processing {
 
       let tag = self.proxies.get(&token).map(|worker| worker.id.to_string()).unwrap_or(String::from(""));
@@ -523,6 +523,12 @@ impl CommandServer {
               if task.message_type == MessageType::Stop {
                 self.must_stop = true;
               }
+
+              if task.message_type == MessageType::Stop || task.message_type == MessageType::StopWorker {
+                let ref mut proxy = self.proxies.get_mut(&token).expect("there should be a worker at that token");
+                proxy.run_state = RunState::Stopped;
+              }
+
               ConfigMessageAnswer::new(
                 id,
                 ConfigMessageStatus::Ok,
