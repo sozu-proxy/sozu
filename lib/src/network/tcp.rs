@@ -364,10 +364,13 @@ impl ProxyClient for Client {
       result.backends.push((app_id, addr.clone()));
     }
 
+    if self.back_connected() == BackendConnectionStatus::Connected {
+      gauge_add!("backend.connections", -1);
+    }
+
     if let Some(sock) = self.back_socket() {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
-      gauge_add!("backend.connections", -1);
     }
 
     if let Some(tk) = self.token {
