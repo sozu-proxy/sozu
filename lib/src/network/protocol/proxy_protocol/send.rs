@@ -20,19 +20,19 @@ pub struct SendProxyProtocol<Front:SocketHandler> {
   pub header:         Option<Vec<u8>>,
   pub frontend:       Front,
   pub backend:        Option<TcpStream>,
-  pub frontend_token: Option<Token>,
+  pub frontend_token: Token,
   pub backend_token:  Option<Token>,
   pub readiness:      Readiness,
   cursor_header:      usize,
 }
 
 impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
-  pub fn new(frontend: Front, backend: Option<TcpStream>) -> Self {
+  pub fn new(frontend: Front, frontend_token: Token, backend: Option<TcpStream>) -> Self {
     SendProxyProtocol {
       header: None,
       frontend,
       backend,
-      frontend_token: None,
+      frontend_token,
       backend_token:  None,
       readiness: Readiness {
         front_interest:  UnixReady::hup() | UnixReady::error(),
@@ -84,14 +84,6 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
     self.backend = Some(socket);
   }
 
-  pub fn front_token(&self) -> Option<Token> {
-    self.frontend_token
-  }
-
-  pub fn set_front_token(&mut self, token: Token) {
-    self.frontend_token = Some(token);
-  }
-
   pub fn back_token(&self) -> Option<Token> {
     self.backend_token
   }
@@ -133,6 +125,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
 
     let mut pipe = Pipe::new(
       self.frontend,
+      self.frontend_token,
       Some(backend_socket),
       front_buf,
       back_buf,
@@ -141,10 +134,6 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
 
     pipe.readiness.front_readiness = self.readiness.front_readiness;
     pipe.readiness.back_readiness  = self.readiness.back_readiness;
-
-    if let Some(front_token) = self.frontend_token {
-      pipe.set_front_token(front_token);
-    }
 
     if let Some(back_token) = self.backend_token {
       pipe.set_back_token(back_token);

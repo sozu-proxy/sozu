@@ -110,15 +110,14 @@ impl Client {
     let protocol = unwrap_msg!(self.protocol.take());
     if let State::Http(http) = protocol {
       debug!("switching to pipe");
-      let front_token = http.front_token();
+      let front_token = self.frontend_token;
       let back_token  = unwrap_msg!(http.back_token());
 
-      let mut pipe = Pipe::new(http.frontend, Some(unwrap_msg!(http.backend)),
+      let mut pipe = Pipe::new(http.frontend, front_token, Some(unwrap_msg!(http.backend)),
         http.front_buf, http.back_buf, http.public_address);
 
       pipe.readiness.front_readiness = http.readiness.front_readiness;
       pipe.readiness.back_readiness  = http.readiness.back_readiness;
-      pipe.set_front_token(front_token);
       pipe.set_back_token(back_token);
 
       self.protocol = Some(State::WebSocket(pipe));
@@ -280,15 +279,6 @@ impl Client {
       State::Http(ref mut http)      => http.set_back_socket(socket),
       State::WebSocket(ref mut pipe) => {} /*pipe.set_back_socket(unwrap_msg!(socket.try_clone()))*/
       State::Expect(_)               => {},
-    }
-  }
-
-  fn set_front_token(&mut self, token: Token) {
-    self.frontend_token = token;
-    match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http)      => http.set_front_token(token),
-      State::WebSocket(ref mut pipe) => pipe.set_front_token(token),
-      State::Expect(ref mut expect)  => expect.set_front_token(token),
     }
   }
 

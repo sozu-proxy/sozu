@@ -93,30 +93,6 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
     self.frontend.socket_ref()
   }
 
-  pub fn back_socket(&self) -> Option<&TcpStream> {
-    unimplemented!()
-  }
-
-  pub fn set_back_socket(&mut self, socket: TcpStream) {
-    unimplemented!()
-  }
-
-  pub fn front_token(&self) -> Option<Token> {
-    Some(self.frontend_token)
-  }
-
-  pub fn set_front_token(&mut self, token: Token) {
-    self.frontend_token = token;
-  }
-
-  pub fn back_token(&self) -> Option<Token> {
-    unimplemented!()
-  }
-
-  pub fn set_back_token(&mut self, token: Token) {
-    unimplemented!()
-  }
-
   pub fn readiness(&mut self) -> &mut Readiness {
     &mut self.readiness
   }

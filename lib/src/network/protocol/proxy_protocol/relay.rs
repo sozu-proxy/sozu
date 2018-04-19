@@ -22,7 +22,7 @@ pub struct RelayProxyProtocol<Front:SocketHandler> {
   pub header_size:    Option<usize>,
   pub frontend:       Front,
   pub backend:        Option<TcpStream>,
-  pub frontend_token: Option<Token>,
+  pub frontend_token: Token,
   pub backend_token:  Option<Token>,
   pub front_buf:      Checkout<BufferQueue>,
   pub readiness:      Readiness,
@@ -30,12 +30,12 @@ pub struct RelayProxyProtocol<Front:SocketHandler> {
 }
 
 impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
-  pub fn new(frontend: Front, backend: Option<TcpStream>, front_buf: Checkout<BufferQueue>) -> Self {
+  pub fn new(frontend: Front, frontend_token: Token,backend: Option<TcpStream>, front_buf: Checkout<BufferQueue>) -> Self {
     RelayProxyProtocol {
       header_size: None,
       frontend,
       backend,
-      frontend_token: None,
+      frontend_token,
       backend_token:  None,
       front_buf,
       readiness: Readiness {
@@ -141,14 +141,6 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
     self.backend = Some(socket);
   }
 
-  pub fn front_token(&self) -> Option<Token> {
-    self.frontend_token
-  }
-
-  pub fn set_front_token(&mut self, token: Token) {
-    self.frontend_token = Some(token);
-  }
-
   pub fn back_token(&self) -> Option<Token> {
     self.backend_token
   }
@@ -167,6 +159,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
 
     let mut pipe = Pipe::new(
       self.frontend.take(0).into_inner(),
+      self.frontend_token,
       Some(backend_socket),
       self.front_buf,
       back_buf,
@@ -175,10 +168,6 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
 
     pipe.readiness.front_readiness = self.readiness.front_readiness;
     pipe.readiness.back_readiness  = self.readiness.back_readiness;
-
-    if let Some(front_token) = self.frontend_token {
-      pipe.set_front_token(front_token);
-    }
 
     if let Some(back_token) = self.backend_token {
       pipe.set_back_token(back_token);

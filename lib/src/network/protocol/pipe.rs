@@ -23,7 +23,7 @@ pub enum ClientStatus {
 pub struct Pipe<Front:SocketHandler> {
   pub frontend:       Front,
   backend:            Option<TcpStream>,
-  token:              Option<Token>,
+  frontend_token:     Token,
   backend_token:      Option<Token>,
   pub front_buf:      Checkout<BufferQueue>,
   back_buf:           Checkout<BufferQueue>,
@@ -37,13 +37,13 @@ pub struct Pipe<Front:SocketHandler> {
 }
 
 impl<Front:SocketHandler> Pipe<Front> {
-  pub fn new(frontend: Front, backend: Option<TcpStream>, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Pipe<Front> {
+  pub fn new(frontend: Front, frontend_token: Token, backend: Option<TcpStream>, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Pipe<Front> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{}\tunknown\t", &request_id);
     let client = Pipe {
       frontend:           frontend,
       backend:            backend,
-      token:              None,
+      frontend_token:     frontend_token,
       backend_token:      None,
       front_buf:          front_buf,
       back_buf:           back_buf,
@@ -66,10 +66,8 @@ impl<Front:SocketHandler> Pipe<Front> {
   }
 
   fn tokens(&self) -> Option<(Token,Token)> {
-    if let Some(front) = self.token {
-      if let Some(back) = self.backend_token {
-        return Some((front, back))
-      }
+    if let Some(back) = self.backend_token {
+      return Some((self.frontend_token, back))
     }
     None
   }
@@ -86,10 +84,6 @@ impl<Front:SocketHandler> Pipe<Front> {
     self.backend = Some(socket);
   }
 
-  pub fn front_token(&self)  -> Option<Token> {
-    self.token
-  }
-
   pub fn back_token(&self)   -> Option<Token> {
     self.backend_token
   }
@@ -103,10 +97,6 @@ impl<Front:SocketHandler> Pipe<Front> {
     } else {
       format!("{}\tunknown\t", self.request_id)
     }
-  }
-
-  pub fn set_front_token(&mut self, token: Token) {
-    self.token         = Some(token);
   }
 
   pub fn set_back_token(&mut self, token: Token) {
@@ -139,7 +129,7 @@ impl<Front:SocketHandler> Pipe<Front> {
     }
 
     let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
-    debug!("{}\tFRONT [{:?}]: read {} bytes", self.log_ctx, self.token, sz);
+    debug!("{}\tFRONT [{:?}]: read {} bytes", self.log_ctx, self.frontend_token, sz);
 
     if sz > 0 {
       //FIXME: replace with copy()
@@ -161,7 +151,7 @@ impl<Front:SocketHandler> Pipe<Front> {
 
     match res {
       SocketResult::Error => {
-        error!("{}\t[{:?}] front socket error, closing the connection", self.log_ctx, self.token);
+        error!("{}\t[{:?}] front socket error, closing the connection", self.log_ctx, self.frontend_token);
         metrics.service_stop();
         incr!("pipe.errors");
         self.readiness.reset();
@@ -216,7 +206,7 @@ impl<Front:SocketHandler> Pipe<Front> {
 
     match res {
       SocketResult::Error => {
-        error!("{}\t[{:?}] error writing to front socket, closing", self.log_ctx, self.token);
+        error!("{}\t[{:?}] error writing to front socket, closing", self.log_ctx, self.frontend_token);
         incr!("pipe.errors");
         metrics.service_stop();
         self.readiness.reset();

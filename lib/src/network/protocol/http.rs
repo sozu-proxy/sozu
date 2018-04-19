@@ -210,10 +210,6 @@ impl<Front:SocketHandler> Http<Front> {
     self.backend.as_ref()
   }
 
-  pub fn front_token(&self)  -> Token {
-    self.frontend_token
-  }
-
   pub fn back_token(&self)   -> Option<Token> {
     self.backend_token
   }
@@ -231,10 +227,6 @@ impl<Front:SocketHandler> Http<Front> {
 
   pub fn set_back_socket(&mut self, socket: TcpStream) {
     self.backend         = Some(socket);
-  }
-
-  pub fn set_front_token(&mut self, token: Token) {
-    self.frontend_token = token;
   }
 
   pub fn set_app_id(&mut self, app_id: String) {

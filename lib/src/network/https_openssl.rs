@@ -143,15 +143,14 @@ impl TlsClient {
       false
     } else if let State::Http(http) = protocol {
       debug!("https switching to wss");
-      let front_token = http.front_token();
+      let front_token = self.frontend_token;
       let back_token  = unwrap_msg!(http.back_token());
 
-      let mut pipe = Pipe::new(http.frontend, Some(unwrap_msg!(http.backend)),
+      let mut pipe = Pipe::new(http.frontend, front_token, Some(unwrap_msg!(http.backend)),
         http.front_buf, http.back_buf, http.public_address);
 
       pipe.readiness.front_readiness = http.readiness.front_readiness;
       pipe.readiness.back_readiness  = http.readiness.back_readiness;
-      pipe.set_front_token(front_token);
       pipe.set_back_token(back_token);
 
       self.protocol = Some(State::WebSocket(pipe));
@@ -269,14 +268,6 @@ impl TlsClient {
 
   fn set_back_socket(&mut self, sock:TcpStream) {
     unwrap_msg!(self.http()).set_back_socket(sock)
-  }
-
-  fn set_front_token(&mut self, token: Token) {
-    self.frontend_token = token;
-    self.protocol.as_mut().map(|p| match *p {
-      State::Http(ref mut http) => http.set_front_token(token),
-      _                         => {}
-    });
   }
 
   fn set_back_token(&mut self, token: Token) {
