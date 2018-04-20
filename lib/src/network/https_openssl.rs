@@ -20,8 +20,8 @@ use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{precise_time_s, precise_time_ns};
 use rand::random;
-use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod,
-                   Ssl, SslOption, SslRef, SslStream, SniError};
+use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod, SslAlert,
+                   Ssl, SslOptions, SslRef, SslStream, SniError, NameType};
 use openssl::x509::X509;
 use openssl::dh::Dh;
 use openssl::pkey::PKey;
@@ -498,7 +498,7 @@ impl ProxyClient for TlsClient {
 }
 
 fn get_cert_common_name(cert: &X509) -> Option<String> {
-    cert.subject_name().entries_by_nid(nid::COMMONNAME).next().and_then(|name| name.data().as_utf8().ok().map(|name| (&*name).to_string()))
+    cert.subject_name().entries_by_nid(nid::Nid::COMMONNAME).next().and_then(|name| name.data().as_utf8().ok().map(|name| (&*name).to_string()))
 }
 
 pub type HostName  = String;
@@ -522,7 +522,7 @@ pub struct ServerConfiguration {
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
   config:          HttpsProxyConfiguration,
-  ssl_options:     SslOption,
+  ssl_options:     SslOptions,
 }
 
 impl ServerConfiguration {
@@ -539,7 +539,7 @@ impl ServerConfiguration {
     let ref_domains  = rc_domains.clone();
     let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
 
-    let (fingerprint, tls_data, names, ssl_options):(CertFingerprint,TlsData, Vec<String>, SslOption) =
+    let (fingerprint, tls_data, names, ssl_options):(CertFingerprint,TlsData, Vec<String>, SslOptions) =
       Self::create_default_context(&config, ref_ctx, ref_domains, default_name).expect("could not create default context");
     let cert = try!(X509::from_pem(&tls_data.certificate));
 
@@ -593,7 +593,7 @@ impl ServerConfiguration {
     }, listeners))
   }
 
-  pub fn create_default_context(config: &HttpsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>, SslOption)> {
+  pub fn create_default_context(config: &HttpsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>, SslOptions)> {
     let ctx = SslContext::builder(SslMethod::tls());
     if let Err(e) = ctx {
       //return Err(io::Error::new(io::ErrorKind::Other, e.description()));
@@ -602,24 +602,24 @@ impl ServerConfiguration {
 
     let mut context = ctx.expect("should have built a correct SSL context");
 
-    let mut mode = ssl::SSL_MODE_ENABLE_PARTIAL_WRITE;
-    mode.insert(ssl::SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
-    //FIXME: maybe activate ssl::SSL_MODE_RELEASE_BUFFERS to save some memory?
+    let mut mode = ssl::SslMode::ENABLE_PARTIAL_WRITE;
+    mode.insert(ssl::SslMode::ACCEPT_MOVING_WRITE_BUFFER);
+    //FIXME: maybe activate ssl::SslMode::RELEASE_BUFFERS to save some memory?
     context.set_mode(mode);
 
 
-    let mut ssl_options = ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION | ssl::SSL_OP_NO_TICKET;
-    let mut versions = ssl::SSL_OP_NO_SSLV2 |
-      ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1 |
-      ssl::SSL_OP_NO_TLSV1_1 | ssl::SSL_OP_NO_TLSV1_2;
+    let mut ssl_options = ssl::SslOptions::CIPHER_SERVER_PREFERENCE | ssl::SslOptions::NO_COMPRESSION | ssl::SslOptions::NO_TICKET;
+    let mut versions = ssl::SslOptions::NO_SSLV2 |
+      ssl::SslOptions::NO_SSLV3 | ssl::SslOptions::NO_TLSV1 |
+      ssl::SslOptions::NO_TLSV1_1 | ssl::SslOptions::NO_TLSV1_2;
 
     for version in config.versions.iter() {
       match version.as_str() {
-        "SSLv2"   => versions.remove(ssl::SSL_OP_NO_SSLV2),
-        "SSLv3"   => versions.remove(ssl::SSL_OP_NO_SSLV3),
-        "TLSv1"   => versions.remove(ssl::SSL_OP_NO_TLSV1),
-        "TLSv1.1" => versions.remove(ssl::SSL_OP_NO_TLSV1_1),
-        "TLSv1.2" => versions.remove(ssl::SSL_OP_NO_TLSV1_2),
+        "SSLv2"   => versions.remove(ssl::SslOptions::NO_SSLV2),
+        "SSLv3"   => versions.remove(ssl::SslOptions::NO_SSLV3),
+        "TLSv1"   => versions.remove(ssl::SslOptions::NO_TLSV1),
+        "TLSv1.1" => versions.remove(ssl::SslOptions::NO_TLSV1_1),
+        "TLSv1.2" => versions.remove(ssl::SslOptions::NO_TLSV1_2),
         s         => error!("unrecognized TLS version: {}", s)
       };
     }
@@ -667,12 +667,12 @@ impl ServerConfiguration {
           names.push(common_name);
         }
 
-        context.set_servername_callback(move |ssl: &mut SslRef| {
+        context.set_servername_callback(move |ssl: &mut SslRef, alert: &mut SslAlert| {
           let contexts = unwrap_msg!(ref_ctx.lock());
           let domains  = unwrap_msg!(ref_domains.lock());
 
           trace!("ref: {:?}", ssl);
-          if let Some(servername) = ssl.servername().map(|s| s.to_string()) {
+          if let Some(servername) = ssl.servername(NameType::HOST_NAME).map(|s| s.to_string()) {
             debug!("checking servername: {}", servername);
             if &servername == &default_name {
               return Ok(());
@@ -689,10 +689,11 @@ impl ServerConfiguration {
                 }
                 let context: &SslContext = &tls_data.context;
                 if let Ok(()) = ssl.set_ssl_context(context) {
-                  debug!("servername is now {:?}", ssl.servername());
+                  debug!("servername is now {:?}", ssl.servername(NameType::HOST_NAME));
                   return Ok(());
                 } else {
                   error!("no context found for {:?}", servername);
+                  *alert = SslAlert::UNRECOGNIZED_NAME;
                 }
               }
             }
@@ -1054,7 +1055,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       let hostname_str =  unsafe { from_utf8_unchecked(hostname) };
 
       //FIXME: what if we don't use SNI?
-      let servername: Option<String> = unwrap_msg!(client.http()).frontend.ssl().servername().map(|s| s.to_string());
+      let servername: Option<String> = unwrap_msg!(client.http()).frontend.ssl().servername(NameType::HOST_NAME).map(|s| s.to_string());
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
         error!("TLS SNI hostname '{:?}' and Host header '{}' don't match", servername, hostname_str);
         unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
@@ -1555,8 +1556,8 @@ mod tests {
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
       },
       config: Default::default(),
-      ssl_options: ssl::SSL_OP_CIPHER_SERVER_PREFERENCE | ssl::SSL_OP_NO_COMPRESSION | ssl::SSL_OP_NO_TICKET |
-        ssl::SSL_OP_NO_SSLV2 | ssl::SSL_OP_NO_SSLV3 | ssl::SSL_OP_NO_TLSV1 | ssl::SSL_OP_NO_TLSV1_1,
+      ssl_options: ssl::SslOptions::CIPHER_SERVER_PREFERENCE | ssl::SslOptions::NO_COMPRESSION | ssl::SslOptions::NO_TICKET |
+        ssl::SslOptions::NO_SSLV2 | ssl::SslOptions::NO_SSLV3 | ssl::SslOptions::NO_TLSV1 | ssl::SslOptions::NO_TLSV1_1,
     };
 
     println!("TEST {}", line!());

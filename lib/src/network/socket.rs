@@ -5,7 +5,7 @@ use rustls::{ServerSession, Session};
 use net2::TcpBuilder;
 use net2::unix::UnixTcpBuilderExt;
 #[cfg(feature = "use-openssl")]
-use openssl::ssl::{Error, SslStream};
+use openssl::ssl::{Error, ErrorCode, SslStream};
 
 #[derive(Debug,PartialEq,Copy,Clone)]
 pub enum SocketResult {
@@ -84,13 +84,17 @@ impl SocketHandler for SslStream<TcpStream> {
       match self.ssl_read(&mut buf[size..]) {
         Ok(0)  => return (size, SocketResult::Continue),
         Ok(sz) => size += sz,
-        Err(Error::WantRead(_))  => return (size, SocketResult::WouldBlock),
-        Err(Error::WantWrite(_)) => return (size, SocketResult::WouldBlock),
-        Err(Error::Stream(e))    => {
-          error!("SOCKET-TLS\treadable TLS socket err={:?}", e);
-          return (size, SocketResult::Error)
-        },
-        _ => return (size, SocketResult::Error)
+        Err(e) => {
+          match e.code() {
+            ErrorCode::WANT_READ  => return (size, SocketResult::WouldBlock),
+            ErrorCode::WANT_WRITE => return (size, SocketResult::WouldBlock),
+            ErrorCode::SSL        => {
+              error!("SOCKET-TLS\treadable TLS socket err");
+              return (size, SocketResult::Error)
+            },
+            _ => return (size, SocketResult::Error)
+          }
+        }
       }
     }
   }
@@ -104,15 +108,19 @@ impl SocketHandler for SslStream<TcpStream> {
       match self.ssl_write(&buf[size..]) {
         Ok(0)  => return (size, SocketResult::Continue),
         Ok(sz) => size +=sz,
-        Err(Error::WantRead(_))  => return (size, SocketResult::WouldBlock),
-        Err(Error::WantWrite(_)) => return (size, SocketResult::WouldBlock),
-        Err(Error::Stream(e))    => {
-          error!("SOCKET-TLS\twritable TLS socket err={:?}", e);
-          return (size, SocketResult::Error)
-        },
-        e => {
-          error!("SOCKET-TLS\twritable TLS socket err={:?}", e);
-          return (size, SocketResult::Error)
+        Err(e) => {
+          match e.code() {
+            ErrorCode::WANT_READ  => return (size, SocketResult::WouldBlock),
+            ErrorCode::WANT_WRITE => return (size, SocketResult::WouldBlock),
+            ErrorCode::SSL        => {
+              error!("SOCKET-TLS\twritable TLS socket err");
+              return (size, SocketResult::Error)
+            },
+            err => {
+              error!("SOCKET-TLS\twritable TLS socket err={:?}", err);
+              return (size, SocketResult::Error)
+            }
+          }
         }
       }
     }

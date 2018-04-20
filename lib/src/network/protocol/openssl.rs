@@ -46,7 +46,6 @@ impl TlsHandshake {
       TlsState::Initial => {
         let ssl     = self.ssl.take().expect("TlsHandshake should have a Ssl backend");
         let sock    = self.front.take().expect("TlsHandshake should have a front socket");
-        let version = ssl.version();
         match ssl.accept(sock) {
           Ok(stream) => {
             self.stream = Some(stream);
@@ -63,7 +62,7 @@ impl TlsHandshake {
             self.state = TlsState::Error(HandshakeError::Failure(e));
             return (ProtocolResult::Continue, ClientResult::CloseClient);
           },
-          Err(HandshakeError::Interrupted(mid)) => {
+          Err(HandshakeError::WouldBlock(mid)) => {
             self.state = TlsState::Handshake;
             self.mid = Some(mid);
             self.readiness.front_readiness.remove(Ready::readable());
@@ -73,7 +72,6 @@ impl TlsHandshake {
       },
       TlsState::Handshake => {
         let mid = self.mid.take().expect("TlsHandshake should have a MidHandshakeSslStream backend");
-        let version = mid.ssl().version();
         match mid.handshake() {
           Ok(stream) => {
             self.stream = Some(stream);
@@ -90,7 +88,7 @@ impl TlsHandshake {
             self.state = TlsState::Error(HandshakeError::Failure(e));
             return (ProtocolResult::Continue, ClientResult::CloseClient);
           },
-          Err(HandshakeError::Interrupted(new_mid)) => {
+          Err(HandshakeError::WouldBlock(new_mid)) => {
             self.state = TlsState::Handshake;
             self.mid = Some(new_mid);
             self.readiness.front_readiness.remove(Ready::readable());
@@ -115,7 +113,7 @@ impl TlsHandshake {
           &HandshakeError::SetupFailure(_) => {
             self.front.as_ref().or_else(|| self.mid.as_ref().map(|mid| mid.get_ref()))
           },
-          &HandshakeError::Failure(ref mid) | &HandshakeError::Interrupted(ref mid) => Some(mid.get_ref())
+          &HandshakeError::Failure(ref mid) | &HandshakeError::WouldBlock(ref mid) => Some(mid.get_ref())
         }
       }
     }
