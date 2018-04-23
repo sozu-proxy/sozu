@@ -700,22 +700,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
     match message.order {
-      /*FIXME
-      Order::AddTcpFront(tcp_front) => {
-        let addr_string = tcp_front.ip_address + ":" + &tcp_front.port.to_string();
-        if let Ok(front) = addr_string.parse() {
-          if let Some(token) = self.add_tcp_front(&tcp_front.app_id, &front, event_loop) {
-            OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
-          } else {
-            error!("Couldn't add tcp front");
-            OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot add tcp front")), data: None}
-          }
-        } else {
-          error!("Couldn't parse tcp front address");
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None}
-        }
-      },
-      */
       Order::RemoveTcpFront(front) => {
         trace!("{:?}", front);
         let _ = self.remove_tcp_front(front.app_id, event_loop);
