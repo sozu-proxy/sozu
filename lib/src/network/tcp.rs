@@ -37,6 +37,7 @@ use network::{http,https_rustls};
 use network::protocol::{Pipe, ProtocolResult};
 use network::protocol::proxy_protocol::send::SendProxyProtocol;
 use network::protocol::proxy_protocol::relay::RelayProxyProtocol;
+use network::retry::RetryPolicy;
 
 use util::UnwrapLog;
 
@@ -314,6 +315,13 @@ impl Client {
       if let Some(State::SendProxyProtocol(ref mut pp)) = self.protocol {
         pp.set_back_connected(BackendConnectionStatus::Connected);
       }
+
+      self.backend.as_ref().map(|backend| {
+        let ref mut backend = *backend.borrow_mut();
+        //successful connection, rest failure counter
+        backend.failures = 0;
+        backend.retry_policy.succeed();
+      });
     }
   }
 
@@ -686,6 +694,32 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
     let app_id = self.listeners[&client.accept_token].app_id.clone();
     client.app_id = Some(app_id.clone());
+
+    // Circuit breaker
+    if client.back_connected == BackendConnectionStatus::Connecting {
+      client.backend.as_ref().map(|backend| {
+        let ref mut backend = *backend.borrow_mut();
+        backend.dec_connections();
+        backend.failures += 1;
+
+        let already_unavailable = backend.retry_policy.is_down();
+        backend.retry_policy.fail();
+        count!("backend.connections.error", 1);
+        if !already_unavailable && backend.retry_policy.is_down() {
+          count!("backend.down", 1);
+        }
+      });
+
+      //deregister back socket if it is the wrong one or if it was not connecting
+      client.backend = None;
+      client.back_connected = BackendConnectionStatus::NotConnected;
+      client.readiness().back_interest  = UnixReady::from(Ready::empty());
+      client.readiness().back_readiness = UnixReady::from(Ready::empty());
+      client.back_socket().as_ref().map(|sock| {
+        poll.deregister(*sock);
+        sock.shutdown(Shutdown::Both);
+      });
+    }
 
     let conn = self.backend_from_app_id(client, &app_id);
     match conn {
