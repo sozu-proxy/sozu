@@ -40,7 +40,9 @@ use sozu::network::metrics::METRICS;
 enum StartupError {
   ConfigurationFileNotSpecified,
   ConfigurationFileLoadError(std::io::Error),
+  #[allow(dead_code)]
   TooManyAllowedConnections(String),
+  #[allow(dead_code)]
   TooManyAllowedConnectionsForWorker(String),
   WorkersSpawnFail(nix::Error),
   PIDFileNotWritable(String)

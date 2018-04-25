@@ -16,7 +16,6 @@ use url::Url;
 use std::str;
 use std::cmp::min;
 use std::convert::From;
-use std::ascii::AsciiExt;
 use std::collections::HashSet;
 
 // Primitives

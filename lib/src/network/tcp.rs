@@ -800,7 +800,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         if let Some(ref listener) = self.listeners[&internal_token].sock.as_ref() {
           listener.accept().map(|(frontend_sock, _)| {
             frontend_sock.set_nodelay(true);
-            let mut c = Client::new(frontend_sock, client_token, internal_token, front_buf, back_buf, proxy_protocol);
+            let c = Client::new(frontend_sock, client_token, internal_token, front_buf, back_buf, proxy_protocol);
             incr!("tcp.requests");
 
             poll.register(
