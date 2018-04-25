@@ -848,7 +848,7 @@ impl Server {
   pub fn ready(&mut self, token: Token, events: Ready) {
     trace!("PROXY\t{:?} got events: {:?}", token, events);
 
-    let client_token = ClientToken(token.0);
+    let mut client_token = ClientToken(token.0);
     if self.clients.contains(client_token) {
       //info!("clients contains {:?}", client_token);
       let protocol = self.clients[client_token].borrow().protocol();
@@ -893,7 +893,18 @@ impl Server {
         trace!("client[{:?} -> {:?}] got events {:?} and returned order {:?}", client_token, self.from_client(client_token), events, order);
         //FIXME: the CloseBackend message might not mean we have nothing else to do
         //with that client
-        let is_connect = order == ClientResult::ConnectBackend;
+        let is_connect = match order {
+          ClientResult::ConnectBackend | ClientResult::ReconnectBackend(_,_) => true,
+          _ => false,
+        };
+
+        // if we got ReconnectBackend, that means the current client_token
+        // corresponds to an entry that will be removed in interpret_client_order
+        // so we ask for the "main" token, ie the one for the front socket
+        if let ClientResult::ReconnectBackend(Some(t), _) = order {
+          client_token = self.to_client(t);
+        }
+
         self.interpret_client_order(client_token, order);
 
         // if we had to connect to a backend server, go back to the loop
