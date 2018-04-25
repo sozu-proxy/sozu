@@ -391,6 +391,19 @@ impl ProxyClient for TlsClient {
       }
     }
 
+    if self.readiness().front_readiness.is_hup() {
+      let order = self.front_hup();
+      match order {
+        ClientResult::CloseClient => {
+          return order;
+        },
+        _ => {
+          self.readiness().front_readiness.remove(UnixReady::hup());
+          return order;
+        }
+      }
+    }
+
     let token = self.frontend_token.clone();
     while counter < max_loop_iterations {
       let front_interest = self.readiness().front_interest & self.readiness().front_readiness;
@@ -430,19 +443,6 @@ impl ProxyClient for TlsClient {
         trace!("front writable\tinterpreting client order {:?}", order);
         if order != ClientResult::Continue {
           return order;
-        }
-      }
-
-      if front_interest.is_hup() {
-        let order = self.front_hup();
-        match order {
-          ClientResult::CloseClient => {
-            return order;
-          },
-          _ => {
-            self.readiness().front_readiness.remove(UnixReady::hup());
-            return order;
-          }
         }
       }
 
