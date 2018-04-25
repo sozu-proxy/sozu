@@ -63,7 +63,7 @@ impl NetworkDrain {
     NetworkDrain {
       queue:  VecDeque::new(),
       prefix: prefix,
-      remote: BufWriter::new(MetricSocket {
+      remote: BufWriter::with_capacity(1500, MetricSocket {
         addr, socket
       }),
       is_writable: true,
