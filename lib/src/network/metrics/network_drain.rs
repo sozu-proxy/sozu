@@ -12,7 +12,6 @@ use mio::net::UdpSocket;
 use std::io::{self,BufWriter,Write,Error,ErrorKind};
 use nom::HexDisplay;
 use hdrhistogram::Histogram;
-use sozu_command::buffer::Buffer;
 use sozu_command::messages::{FilteredData,MetricsData,Percentiles,BackendMetricsData,FilteredTimeSerie};
 
 use super::{Subscriber,MetricData,StoredMetricData};
@@ -46,7 +45,6 @@ impl Write for MetricSocket {
 
 pub struct NetworkDrain {
   queue:              VecDeque<MetricLine>,
-  buffer:             Buffer,
   pub prefix:         String,
   pub remote:         BufWriter<MetricSocket>,
   is_writable:        bool,
@@ -64,7 +62,6 @@ impl NetworkDrain {
   pub fn new(prefix: String, socket: UdpSocket, addr: SocketAddr) -> Self {
     NetworkDrain {
       queue:  VecDeque::new(),
-      buffer: Buffer::with_capacity(2048),
       prefix: prefix,
       remote: BufWriter::new(MetricSocket {
         addr, socket
@@ -260,28 +257,28 @@ impl NetworkDrain {
        let res = match (metric.app_id, metric.backend_id) {
         (Some(app_id), Some(backend_id)) => {
           if self.use_tagged_metrics {
-            self.buffer.write_fmt(format_args!("{}.backend.{},origin={},version={},app_id={},backend_id={}:{}|ms\n",
+            self.remote.write_fmt(format_args!("{}.backend.{},origin={},version={},app_id={},backend_id={}:{}|ms\n",
               self.prefix, metric.label, self.origin, VERSION, app_id, backend_id, metric.duration))
           } else {
-            self.buffer.write_fmt(format_args!("{}.{}.app.{}.backend.{}.{}:{}|ms\n", self.prefix, self.origin, app_id, backend_id,
+            self.remote.write_fmt(format_args!("{}.{}.app.{}.backend.{}.{}:{}|ms\n", self.prefix, self.origin, app_id, backend_id,
               metric.label, metric.duration))
           }
         },
         (Some(app_id), None) => {
           if self.use_tagged_metrics {
-            self.buffer.write_fmt(format_args!("{}.app.{},origin={},version={},app_id={}:{}|ms\n",
+            self.remote.write_fmt(format_args!("{}.app.{},origin={},version={},app_id={}:{}|ms\n",
               self.prefix, metric.label, self.origin, VERSION, app_id, metric.duration))
           } else {
-            self.buffer.write_fmt(format_args!("{}.{}.app.{}.{}:{}|ms\n", self.prefix, self.origin, app_id,
+            self.remote.write_fmt(format_args!("{}.{}.app.{}.{}:{}|ms\n", self.prefix, self.origin, app_id,
               metric.label, metric.duration))
           }
         },
         (None, None) => {
           if self.use_tagged_metrics {
-            self.buffer.write_fmt(format_args!("{}.{},origin={},version={}:{}|ms\n",
+            self.remote.write_fmt(format_args!("{}.{},origin={},version={}:{}|ms\n",
               self.prefix, metric.label, self.origin, VERSION, metric.duration))
           } else {
-            self.buffer.write_fmt(format_args!("{}.{}.{}:{}|ms\n", self.prefix, self.origin,
+            self.remote.write_fmt(format_args!("{}.{}.{}:{}|ms\n", self.prefix, self.origin,
               metric.label, metric.duration))
           }
         },
