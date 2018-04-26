@@ -425,8 +425,9 @@ impl ProxyClient for TlsClient {
   }
 
   fn process_events(&mut self, token: Token, events: Ready) {
-    self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
-    if self.back_token() == Some(token) {
+    if self.frontend_token == token {
+      self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
+    } else if self.back_token() == Some(token) {
       self.readiness().back_readiness = self.readiness().back_readiness | UnixReady::from(events);
     }
   }
