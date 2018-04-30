@@ -96,4 +96,30 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
   pub fn readiness(&mut self) -> &mut Readiness {
     &mut self.readiness
   }
+
+  pub fn into_pipe(self, back_buf: Checkout<BufferQueue>, backend_socket: Option<TcpStream>, backend_token: Option<Token>) -> Pipe<Front> {
+    let addr = if let Some(ref backend_socket) = backend_socket {
+      backend_socket.peer_addr().map(|s| s.ip()).ok()
+    } else {
+      None
+    };
+
+    let mut pipe = Pipe::new(
+      self.frontend,
+      self.frontend_token,
+      backend_socket,
+      self.front_buf,
+      back_buf,
+      addr,
+    );
+
+    pipe.readiness.front_readiness = self.readiness.front_readiness;
+    pipe.readiness.back_readiness  = self.readiness.back_readiness;
+
+    if let Some(backend_token) = backend_token {
+      pipe.set_back_token(backend_token);
+    }
+
+    pipe
+  }
 }

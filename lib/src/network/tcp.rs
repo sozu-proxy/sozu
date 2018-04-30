@@ -183,12 +183,24 @@ impl Client {
   }
 
   fn readable(&mut self) -> ClientResult {
-    match self.protocol {
+    let mut should_upgrade_protocol = ProtocolResult::Continue;
+
+    let res = match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.readable(&mut self.metrics),
       Some(State::RelayProxyProtocol(ref mut pp)) => pp.readable(&mut self.metrics),
-      Some(State::ExpectProxyProtocol(ref mut pp)) => pp.readable(&mut self.metrics).1,
+      Some(State::ExpectProxyProtocol(ref mut pp)) => {
+        let res = pp.readable(&mut self.metrics);
+        should_upgrade_protocol = res.0;
+        res.1
+      },
       _ => ClientResult::Continue,
+    };
+
+    if let ProtocolResult::Upgrade = should_upgrade_protocol {
+      self.upgrade();
     }
+
+    res
   }
 
   fn writable(&mut self) -> ClientResult {
@@ -261,6 +273,14 @@ impl Client {
       if self.back_buf.is_some() {
         self.protocol = Some(
           State::Pipe(pp.into_pipe(self.back_buf.take().unwrap()))
+        );
+      } else {
+        error!("Missing the backend buffer queue, we can't switch to a pipe");
+      }
+    } else if let Some(State::ExpectProxyProtocol(mut pp)) = protocol {
+      if self.back_buf.is_some() {
+        self.protocol = Some(
+          State::Pipe(pp.into_pipe(self.back_buf.take().unwrap(), self.backend.take(), self.backend_token))
         );
       } else {
         error!("Missing the backend buffer queue, we can't switch to a pipe");
