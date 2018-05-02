@@ -7,7 +7,7 @@ use std::default::Default;
 use std::convert::From;
 use std::fmt;
 
-use config::ProxyProtocolConfig;
+use config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
 
 pub type MessageId = String;
 
@@ -203,11 +203,12 @@ impl<'de> serde::Deserialize<'de> for CertFingerprint {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct Application {
-    pub app_id:         String,
-    pub sticky_session: bool,
-    pub https_redirect: bool,
+    pub app_id:            String,
+    pub sticky_session:    bool,
+    pub https_redirect:    bool,
     #[serde(default)]
-    pub proxy_protocol: Option<ProxyProtocolConfig>,
+    pub proxy_protocol:    Option<ProxyProtocolConfig>,
+    pub load_balacing_alg: LoadBalancingAlgorithms,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]

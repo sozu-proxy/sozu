@@ -266,6 +266,7 @@ impl FileAppConfig {
             port:           port,
             backends:       self.backends,
             proxy_protocol,
+            load_balacing_alg: self.loadbalancing_alg,
           }))
         },
         (None, Some(_)) => Err(String::from("missing IP address for TCP application")),
@@ -306,6 +307,7 @@ impl FileAppConfig {
         backends:          self.backends,
         sticky_session:    sticky_session,
         https_redirect:    https_redirect,
+        load_balacing_alg: self.loadbalancing_alg,
       }))
     }
   }
@@ -322,6 +324,7 @@ pub struct HttpAppConfig {
   pub backends:          Vec<BackendConfig>,
   pub sticky_session:    bool,
   pub https_redirect:    bool,
+  pub load_balacing_alg: LoadBalancingAlgorithms,
 }
 
 impl HttpAppConfig {
@@ -333,6 +336,7 @@ impl HttpAppConfig {
       sticky_session: self.sticky_session.clone(),
       https_redirect: self.https_redirect.clone(),
       proxy_protocol: None,
+      load_balacing_alg: self.load_balacing_alg,
     }));
 
     //create the front both for HTTP and HTTPS if possible
@@ -398,6 +402,7 @@ pub struct TcpAppConfig {
   pub backends:          Vec<BackendConfig>,
   #[serde(default)]
   pub proxy_protocol:    Option<ProxyProtocolConfig>,
+  pub load_balacing_alg: LoadBalancingAlgorithms,
 }
 
 impl TcpAppConfig {
@@ -409,6 +414,7 @@ impl TcpAppConfig {
       sticky_session: false,
       https_redirect: false,
       proxy_protocol: self.proxy_protocol.clone(),
+      load_balacing_alg: self.load_balacing_alg,
     }));
 
     v.push(Order::AddTcpFront(TcpFront {
