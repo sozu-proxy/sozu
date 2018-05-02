@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use rand::random;
 use mio::net::TcpStream;
 
-use sozu_command::messages;
+use sozu_command::{messages, config::LoadBalancingAlgorithms};
 
 use network::{AppId,Backend,ConnectionError};
 
@@ -125,6 +125,14 @@ impl BackendMap {
       return self.backend_from_app_id(app_id);
     }
   }
+
+  pub fn set_load_balacing_algo_for_app(&mut self, app_id: &str, lb_algo: LoadBalancingAlgorithms) {
+    if let Some(ref mut app_backends) = self.backends.get_mut(app_id) {
+      app_backends.set_load_balacing_algo(lb_algo);
+    } else {
+      error!("could not set the load balacing algorithm for {}", app_id);
+    }
+  }
 }
 
 const MAX_FAILURES_PER_BACKEND: usize = 10;
@@ -133,6 +141,7 @@ const MAX_FAILURES_PER_BACKEND: usize = 10;
 pub struct BackendList {
   pub backends:  Vec<Rc<RefCell<Backend>>>,
   pub next_id:   u32,
+  pub load_balacing_algo: LoadBalancingAlgorithms,
 }
 
 impl BackendList {
@@ -140,6 +149,7 @@ impl BackendList {
     BackendList {
       backends:  Vec::new(),
       next_id:   0,
+      load_balacing_algo: LoadBalancingAlgorithms::default(),
     }
   }
 
@@ -204,5 +214,9 @@ impl BackendList {
     let idx = rnd % backends.len();
 
     Some(backends.remove(idx))
+  }
+
+  pub fn set_load_balacing_algo(&mut self, load_balacing_algo: LoadBalancingAlgorithms) {
+    self.load_balacing_algo = load_balacing_algo;
   }
 }
