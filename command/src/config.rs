@@ -3,7 +3,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::iter::repeat;
-use std::net::ToSocketAddrs;
+use std::net::{ToSocketAddrs, SocketAddr};
 use std::collections::{HashMap,HashSet};
 use std::io::{self,Error,ErrorKind,Read};
 
@@ -214,13 +214,34 @@ pub struct FileAppConfig {
   pub certificate:       Option<String>,
   pub key:               Option<String>,
   pub certificate_chain: Option<String>,
-  pub backends:          Vec<String>,
+  pub backends:          Vec<BackendConfig>,
   pub sticky_session:    Option<bool>,
   pub https_redirect:    Option<bool>,
   #[serde(default)]
   pub send_proxy:        Option<bool>,
   #[serde(default)]
   pub expect_proxy:      Option<bool>,
+  #[serde(default)]
+  pub loadbalancing_alg: LoadBalancingAlgorithms,
+}
+
+#[derive(Debug,Copy,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoadBalancingAlgorithms {
+  RoundRobin,
+  LeastConnections,
+}
+
+impl Default for LoadBalancingAlgorithms {
+  fn default() -> Self {
+    LoadBalancingAlgorithms::RoundRobin
+  }
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+pub struct BackendConfig {
+  pub address: SocketAddr,
+  pub weight: Option<u8>,
 }
 
 impl FileAppConfig {
@@ -298,7 +319,7 @@ pub struct HttpAppConfig {
   pub certificate:       Option<String>,
   pub key:               Option<String>,
   pub certificate_chain: Option<Vec<String>>,
-  pub backends:          Vec<String>,
+  pub backends:          Vec<BackendConfig>,
   pub sticky_session:    bool,
   pub https_redirect:    bool,
 }
@@ -346,24 +367,18 @@ impl HttpAppConfig {
     }
 
     let mut backend_count = 0usize;
-    for address_str in self.backends.iter() {
-      if let Ok(address_list) = address_str.to_socket_addrs() {
-        for address in address_list {
-          let ip   = format!("{}", address.ip());
-          let port = address.port();
+    for backend in self.backends.iter() {
+        let ip   = format!("{}", backend.address.ip());
+        let port = backend.address.port();
 
-          v.push(Order::AddBackend(Backend {
-            app_id:     self.app_id.clone(),
-            backend_id:  format!("{}-{}", self.app_id, backend_count),
-            ip_address: ip,
-            port:       port
-          }));
+        v.push(Order::AddBackend(Backend {
+          app_id:     self.app_id.clone(),
+          backend_id:  format!("{}-{}", self.app_id, backend_count),
+          ip_address: ip,
+          port:       port
+        }));
 
-          backend_count += 1;
-        }
-      } else {
-        error!("could not parse address: {}", address_str);
-      }
+        backend_count += 1;
     }
 
     v
@@ -375,7 +390,7 @@ pub struct TcpAppConfig {
   pub app_id:            String,
   pub ip_address:        String,
   pub port:              u16,
-  pub backends:          Vec<String>,
+  pub backends:          Vec<BackendConfig>,
   #[serde(default)]
   pub proxy_protocol:    Option<ProxyProtocolConfig>,
 }
@@ -398,24 +413,18 @@ impl TcpAppConfig {
     }));
 
     let mut backend_count = 0usize;
-    for address_str in self.backends.iter() {
-      if let Ok(address_list) = address_str.to_socket_addrs() {
-        for address in address_list {
-          let ip   = format!("{}", address.ip());
-          let port = address.port();
+    for backend in self.backends.iter() {
+      let ip   = format!("{}", backend.address.ip());
+      let port = backend.address.port();
 
-          v.push(Order::AddBackend(Backend {
-            app_id:     self.app_id.clone(),
-            backend_id: format!("{}-{}", self.app_id, backend_count),
-            ip_address: ip,
-            port:       port
-          }));
+      v.push(Order::AddBackend(Backend {
+        app_id:     self.app_id.clone(),
+        backend_id: format!("{}-{}", self.app_id, backend_count),
+        ip_address: ip,
+        port:       port
+      }));
 
-          backend_count += 1;
-        }
-      } else {
-        error!("could not parse address: {}", address_str);
-      }
+      backend_count += 1;
     }
 
     v
