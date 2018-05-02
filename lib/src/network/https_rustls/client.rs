@@ -256,11 +256,21 @@ impl TlsClient {
   }
 
   fn writable(&mut self)      -> ClientResult {
-    match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Expect(_,_)                  => ClientResult::CloseClient,
-      State::Handshake(_)                 => ClientResult::CloseClient,
-      State::Http(ref mut http)           => http.writable(&mut self.metrics),
-      State::WebSocket(ref mut pipe)      => pipe.writable(&mut self.metrics),
+    let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Expect(_,_)                  => return ClientResult::CloseClient,
+      State::Handshake(ref mut handshake) => handshake.writable(),
+      State::Http(ref mut http)           => (ProtocolResult::Continue, http.writable(&mut self.metrics)),
+      State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.writable(&mut self.metrics)),
+    };
+
+    if upgrade == ProtocolResult::Continue {
+      result
+    } else {
+      if self.upgrade() {
+        self.writable()
+      } else {
+        ClientResult::CloseClient
+      }
     }
   }
 

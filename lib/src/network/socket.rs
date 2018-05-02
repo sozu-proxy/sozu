@@ -138,8 +138,10 @@ impl SocketHandler for FrontRustls {
   fn socket_read(&mut self,  buf: &mut[u8]) -> (usize, SocketResult) {
     let mut size = 0usize;
     let mut can_read = true;
+    let mut can_work = true;
 
-    while self.session.wants_read() && can_read {
+
+    while can_work {
       if size == buf.len() {
         return (size, SocketResult::Continue);
       }
@@ -181,6 +183,8 @@ impl SocketHandler for FrontRustls {
         }
 
       }
+
+      can_work = self.session.wants_read() && can_read;
     }
 
     if can_read {

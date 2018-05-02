@@ -38,7 +38,6 @@ impl TlsHandshake {
 
   pub fn readable(&mut self) -> (ProtocolResult,ClientResult) {
     let mut can_read  = true;
-    let mut can_write = true;
 
     loop {
       let mut can_work = false;
@@ -49,27 +48,10 @@ impl TlsHandshake {
         match self.session.read_tls(&mut self.stream) {
           Ok(_) => {},
           Err(e) => match e.kind() {
-            ErrorKind::WouldBlock => can_read = false,
-            _ => {
-              error!("could not perform handshake: {:?}", e);
-              return (ProtocolResult::Continue, ClientResult::CloseClient);
-            }
-          }
-        }
-
-        if let Err(e) = self.session.process_new_packets() {
-          error!("could not perform handshake: {:?}", e);
-          return (ProtocolResult::Continue, ClientResult::CloseClient);
-        }
-      }
-
-      if self.session.wants_write() && can_write {
-        can_work = true;
-
-        match self.session.write_tls(&mut self.stream) {
-          Ok(_) => {},
-          Err(e) => match e.kind() {
-            ErrorKind::WouldBlock => can_write = false,
+            ErrorKind::WouldBlock => {
+              self.readiness.front_readiness.remove(Ready::readable());
+              can_read = false
+            },
             _ => {
               error!("could not perform handshake: {:?}", e);
               return (ProtocolResult::Continue, ClientResult::CloseClient);
@@ -88,10 +70,81 @@ impl TlsHandshake {
       }
     }
 
+    if !self.session.wants_read() {
+      self.readiness.front_interest.remove(Ready::readable());
+    }
+
+    if self.session.wants_write() {
+      self.readiness.front_interest.insert(Ready::writable());
+    }
+
     if self.session.is_handshaking() {
       (ProtocolResult::Continue, ClientResult::Continue)
     } else {
-      (ProtocolResult::Upgrade, ClientResult::Continue)
+      // handshake might be finished but we still have something to send
+      if self.session.wants_write() {
+        (ProtocolResult::Continue, ClientResult::Continue)
+      } else {
+        self.readiness.front_interest.insert(Ready::readable());
+        self.readiness.front_readiness.insert(Ready::readable());
+        self.readiness.front_interest.insert(Ready::writable());
+        (ProtocolResult::Upgrade, ClientResult::Continue)
+      }
+    }
+  }
+
+  pub fn writable(&mut self) -> (ProtocolResult,ClientResult) {
+    let mut can_write = true;
+
+    loop {
+      let mut can_work = false;
+
+      if self.session.wants_write() && can_write {
+        can_work = true;
+
+        match self.session.write_tls(&mut self.stream) {
+          Ok(_) => {},
+          Err(e) => match e.kind() {
+            ErrorKind::WouldBlock => {
+              self.readiness.front_readiness.remove(Ready::writable());
+              can_write = false
+            },
+            _ => {
+              error!("could not perform handshake: {:?}", e);
+              return (ProtocolResult::Continue, ClientResult::CloseClient);
+            }
+          }
+        }
+
+        if let Err(e) = self.session.process_new_packets() {
+          error!("could not perform handshake: {:?}", e);
+          return (ProtocolResult::Continue, ClientResult::CloseClient);
+        }
+      }
+
+      if !can_work {
+        break;
+      }
+    }
+
+    if !self.session.wants_write() {
+      self.readiness.front_interest.remove(Ready::writable());
+    }
+
+    if self.session.wants_read() {
+      self.readiness.front_interest.insert(Ready::readable());
+    }
+
+    if self.session.is_handshaking() {
+      (ProtocolResult::Continue, ClientResult::Continue)
+    } else {
+      if self.session.wants_read() {
+        (ProtocolResult::Continue, ClientResult::Continue)
+      } else {
+        self.readiness.front_interest.insert(Ready::writable());
+        self.readiness.front_interest.insert(Ready::readable());
+        (ProtocolResult::Upgrade, ClientResult::Continue)
+      }
     }
   }
 }
