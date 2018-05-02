@@ -36,6 +36,7 @@ use network::{http,https_rustls};
 use network::protocol::{Pipe, ProtocolResult};
 use network::protocol::proxy_protocol::send::SendProxyProtocol;
 use network::protocol::proxy_protocol::relay::RelayProxyProtocol;
+use network::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 
 use util::UnwrapLog;
 
@@ -56,6 +57,7 @@ pub enum State {
   Pipe(Pipe<TcpStream>),
   SendProxyProtocol(SendProxyProtocol<TcpStream>),
   RelayProxyProtocol(RelayProxyProtocol<TcpStream>),
+  ExpectProxyProtocol(ExpectProxyProtocol<TcpStream>),
 }
 
 pub struct Client {
@@ -90,7 +92,8 @@ impl Client {
         Some(State::RelayProxyProtocol(RelayProxyProtocol::new(s, frontend_token, None, front_buf)))
       },
       Some(ProxyProtocolConfig::ExpectHeader) => {
-        unimplemented!("ExpectHeader case not handled yet")
+        backend_buffer = Some(back_buf);
+        Some(State::ExpectProxyProtocol(ExpectProxyProtocol::new(s, frontend_token, front_buf)))
       },
       Some(ProxyProtocolConfig::SendHeader) => {
         frontend_buffer = Some(front_buf);
@@ -180,11 +183,24 @@ impl Client {
   }
 
   fn readable(&mut self) -> ClientResult {
-    match self.protocol {
+    let mut should_upgrade_protocol = ProtocolResult::Continue;
+
+    let res = match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.readable(&mut self.metrics),
       Some(State::RelayProxyProtocol(ref mut pp)) => pp.readable(&mut self.metrics),
+      Some(State::ExpectProxyProtocol(ref mut pp)) => {
+        let res = pp.readable(&mut self.metrics);
+        should_upgrade_protocol = res.0;
+        res.1
+      },
       _ => ClientResult::Continue,
+    };
+
+    if let ProtocolResult::Upgrade = should_upgrade_protocol {
+      self.upgrade();
     }
+
+    res
   }
 
   fn writable(&mut self) -> ClientResult {
@@ -227,6 +243,7 @@ impl Client {
       Some(State::Pipe(ref pipe)) => pipe.front_socket(),
       Some(State::SendProxyProtocol(ref pp)) => pp.front_socket(),
       Some(State::RelayProxyProtocol(ref pp)) => pp.front_socket(),
+      Some(State::ExpectProxyProtocol(ref pp)) => pp.front_socket(),
       _ => unreachable!(),
     }
   }
@@ -236,6 +253,7 @@ impl Client {
       Some(State::Pipe(ref pipe)) => pipe.back_socket(),
       Some(State::SendProxyProtocol(ref pp)) => pp.back_socket(),
       Some(State::RelayProxyProtocol(ref pp)) => pp.back_socket(),
+      Some(State::ExpectProxyProtocol(_)) => self.backend.as_ref(),
       _ => unreachable!(),
     }
   }
@@ -259,6 +277,14 @@ impl Client {
       } else {
         error!("Missing the backend buffer queue, we can't switch to a pipe");
       }
+    } else if let Some(State::ExpectProxyProtocol(mut pp)) = protocol {
+      if self.back_buf.is_some() {
+        self.protocol = Some(
+          State::Pipe(pp.into_pipe(self.back_buf.take().unwrap(), self.backend.take(), self.backend_token))
+        );
+      } else {
+        error!("Missing the backend buffer queue, we can't switch to a pipe");
+      }
     }
   }
 
@@ -267,6 +293,7 @@ impl Client {
       Some(State::Pipe(ref mut pipe)) => pipe.readiness(),
       Some(State::SendProxyProtocol(ref mut pp)) => pp.readiness(),
       Some(State::RelayProxyProtocol(ref mut pp)) => pp.readiness(),
+      Some(State::ExpectProxyProtocol(ref mut pp)) => pp.readiness(),
       _ => unreachable!(),
     }
   }
@@ -276,6 +303,7 @@ impl Client {
       Some(State::Pipe(ref pipe)) => pipe.back_token(),
       Some(State::SendProxyProtocol(ref pp)) => pp.back_token(),
       Some(State::RelayProxyProtocol(ref pp)) => pp.back_token(),
+      Some(State::ExpectProxyProtocol(_)) => self.back_token(),
       _ => unreachable!()
     }
   }
@@ -285,6 +313,7 @@ impl Client {
       Some(State::Pipe(ref mut pipe)) => pipe.set_back_socket(socket),
       Some(State::SendProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
       Some(State::RelayProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
+      Some(State::ExpectProxyProtocol(_)) => self.backend = Some(socket),
       _ => unreachable!()
     }
   }
@@ -296,6 +325,7 @@ impl Client {
       Some(State::Pipe(ref mut pipe)) => pipe.set_back_token(token),
       Some(State::SendProxyProtocol(ref mut pp)) => pp.set_back_token(token),
       Some(State::RelayProxyProtocol(ref mut pp)) => pp.set_back_token(token),
+      Some(State::ExpectProxyProtocol(_)) => self.backend_token = Some(token),
       _ => unreachable!()
     }
   }
