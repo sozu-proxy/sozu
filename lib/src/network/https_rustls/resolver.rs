@@ -156,14 +156,13 @@ impl ResolvesServerCert for CertificateResolverWrapper {
         sigschemes: &[SignatureScheme]
     ) -> Option<CertifiedKey> {
 
-    info!("trying to resolve name: {:?} for signature scheme: {:?}", server_name, sigschemes);
+    trace!("trying to resolve name: {:?} for signature scheme: {:?}", server_name, sigschemes);
     if let Ok(ref mut resolver) = self.0.try_lock() {
-      info!("got the resolver");
       if let Some(name) = server_name {
-        resolver.domains.print();
+        //resolver.domains.print();
         let s: &str = name.into();
         if let Some(kv) = resolver.domains.domain_lookup(s.as_bytes()) {
-           info!("looking for certificate for {:?} with fingerprint {:?}", s, kv.1);
+           trace!("looking for certificate for {:?} with fingerprint {:?}", s, kv.1);
            return resolver.certificates.get(&kv.1).as_ref().map(|data| data.cert.clone());
         }
       }
