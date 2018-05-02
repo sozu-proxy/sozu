@@ -272,7 +272,21 @@ pub struct Backend {
     pub app_id:      String,
     pub backend_id:  String,
     pub ip_address:  String,
-    pub port:        u16
+    pub port:        u16,
+    pub lb_params:   LoadBalacingParams,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct LoadBalacingParams {
+    pub weight: u8,
+}
+
+impl Default for LoadBalacingParams {
+  fn default() -> Self {
+    Self {
+      weight: 100,
+    }
+  }
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]

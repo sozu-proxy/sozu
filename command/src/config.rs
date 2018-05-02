@@ -12,7 +12,7 @@ use toml;
 
 use messages::Application;
 use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,TcpFront,Backend,
-  HttpProxyConfiguration,HttpsProxyConfiguration,AddCertificate,TlsProvider};
+  HttpProxyConfiguration,HttpsProxyConfiguration,AddCertificate,TlsProvider,LoadBalacingParams};
 
 use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
 
@@ -371,11 +371,16 @@ impl HttpAppConfig {
         let ip   = format!("{}", backend.address.ip());
         let port = backend.address.port();
 
+        let lb_params = LoadBalacingParams {
+          weight: backend.weight.unwrap_or(100),
+        };
+
         v.push(Order::AddBackend(Backend {
           app_id:     self.app_id.clone(),
           backend_id:  format!("{}-{}", self.app_id, backend_count),
           ip_address: ip,
-          port:       port
+          port:       port,
+          lb_params,
         }));
 
         backend_count += 1;
@@ -417,11 +422,16 @@ impl TcpAppConfig {
       let ip   = format!("{}", backend.address.ip());
       let port = backend.address.port();
 
+      let lb_params = LoadBalacingParams {
+        weight: backend.weight.unwrap_or(100),
+      };
+
       v.push(Order::AddBackend(Backend {
         app_id:     self.app_id.clone(),
         backend_id: format!("{}-{}", self.app_id, backend_count),
         ip_address: ip,
-        port:       port
+        port:       port,
+        lb_params,
       }));
 
       backend_count += 1;

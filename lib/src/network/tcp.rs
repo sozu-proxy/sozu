@@ -24,7 +24,7 @@ use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::config::ProxyProtocolConfig;
-use sozu_command::messages::{self,TcpFront,Order,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
+use sozu_command::messages::{self,TcpFront,Order,OrderMessage,OrderMessageAnswer,OrderMessageStatus,LoadBalacingParams};
 
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
@@ -980,6 +980,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       backend_id: String::from("yolo-0"),
       ip_address: String::from("127.0.0.1"),
       port: 5678,
+      lb_params: LoadBalacingParams::default(),
     };
 
     command.write_message(&OrderMessage { id: String::from("ID_YOLO1"), order: Order::AddTcpFront(front) });
@@ -996,6 +997,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       backend_id: String::from("yolo-0"),
       ip_address: String::from("127.0.0.1"),
       port: 5678,
+      lb_params: LoadBalacingParams::default(),
     };
     command.write_message(&OrderMessage { id: String::from("ID_YOLO3"), order: Order::AddTcpFront(front) });
     command.write_message(&OrderMessage { id: String::from("ID_YOLO4"), order: Order::AddBackend(backend) });
