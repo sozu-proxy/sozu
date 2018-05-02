@@ -21,7 +21,7 @@ fn main() {
 
   info!("MAIN\tstarting up");
 
-  network::metrics::setup("127.0.0.1", 8125, "main", false);
+  network::metrics::setup("127.0.0.1", 8125, "main", false, None);
   gauge!("sozu.TEST", 42);
 
   let config = messages::HttpProxyConfiguration {

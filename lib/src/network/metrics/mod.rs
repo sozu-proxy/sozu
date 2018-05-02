@@ -74,7 +74,7 @@ impl StoredMetricData {
   }
 }
 
-pub fn setup<H: AsRef<str>, O: Into<String>>(host: H, port: u16, origin: O, use_tagged_metrics: bool) {
+pub fn setup<H: AsRef<str>, O: Into<String>>(host: H, port: u16, origin: O, use_tagged_metrics: bool, prefix: Option<String>) {
   use std::net::ToSocketAddrs;
   let metrics_socket = udp_bind();
 
@@ -82,6 +82,9 @@ pub fn setup<H: AsRef<str>, O: Into<String>>(host: H, port: u16, origin: O, use_
   let metrics_host   = (host.as_ref(), port).to_socket_addrs().expect("could not parse address").next().expect("could not get first address");
 
   METRICS.with(|metrics| {
+    if let Some(p) = prefix {
+      (*metrics.borrow_mut()).set_up_prefix(p);
+    }
     (*metrics.borrow_mut()).set_up_remote(metrics_socket, metrics_host);
     (*metrics.borrow_mut()).set_up_origin(origin.into());
     (*metrics.borrow_mut()).set_up_tagged_metrics(use_tagged_metrics);
@@ -105,6 +108,10 @@ impl Aggregator {
       network: None,
       local: LocalDrain::new(prefix),
     }
+  }
+
+  pub fn set_up_prefix(&mut self, prefix: String) {
+    self.prefix = prefix;
   }
 
   pub fn set_up_remote(&mut self, socket: UdpSocket, addr: SocketAddr) {
