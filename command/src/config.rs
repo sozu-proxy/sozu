@@ -230,6 +230,7 @@ pub struct FileAppConfig {
 pub enum LoadBalancingAlgorithms {
   RoundRobin,
   LeastConnections,
+  Random,
 }
 
 impl Default for LoadBalancingAlgorithms {
