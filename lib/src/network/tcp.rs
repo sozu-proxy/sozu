@@ -29,6 +29,7 @@ use sozu_command::messages::{self,TcpFront,Order,OrderMessage,OrderMessageAnswer
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
+use network::backends::BackendMap;
 use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,ClientToken,ListenClient};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -37,6 +38,7 @@ use network::protocol::{Pipe, ProtocolResult};
 use network::protocol::proxy_protocol::send::SendProxyProtocol;
 use network::protocol::proxy_protocol::relay::RelayProxyProtocol;
 use network::protocol::proxy_protocol::expect::ExpectProxyProtocol;
+use network::retry::RetryPolicy;
 
 use util::UnwrapLog;
 
@@ -53,6 +55,12 @@ pub enum ConnectionStatus {
   Closed
 }
 
+pub enum UpgradeResult {
+  Continue,
+  Close,
+  ConnectBackend,
+}
+
 pub enum State {
   Pipe(Pipe<TcpStream>),
   SendProxyProtocol(SendProxyProtocol<TcpStream>),
@@ -62,7 +70,7 @@ pub enum State {
 
 pub struct Client {
   sock:           TcpStream,
-  backend:        Option<TcpStream>,
+  backend:        Option<Rc<RefCell<Backend>>>,
   frontend_token: Token,
   backend_token:  Option<Token>,
   back_connected: BackendConnectionStatus,
@@ -129,7 +137,9 @@ impl Client {
       Some(SocketAddr::V6(addr)) => format!("{}", addr),
     };
 
-    let backend = match self.backend.as_ref().and_then(|backend| backend.peer_addr().ok()) {
+    let backend_address = self.backend.as_ref().map(|backend| (*backend.borrow_mut()).address);
+
+    let backend = match backend_address {
       None => String::from("-"),
       Some(SocketAddr::V4(addr)) => format!("{}", addr),
       Some(SocketAddr::V6(addr)) => format!("{}", addr),
@@ -197,10 +207,14 @@ impl Client {
     };
 
     if let ProtocolResult::Upgrade = should_upgrade_protocol {
-      self.upgrade();
+      match self.upgrade() {
+        UpgradeResult::Continue => ClientResult::Continue,
+        UpgradeResult::Close    => ClientResult::CloseClient,
+        UpgradeResult::ConnectBackend => ClientResult::ConnectBackend,
+      }
+    } else {
+      res
     }
-
-    res
   }
 
   fn writable(&mut self) -> ClientResult {
@@ -253,12 +267,12 @@ impl Client {
       Some(State::Pipe(ref pipe)) => pipe.back_socket(),
       Some(State::SendProxyProtocol(ref pp)) => pp.back_socket(),
       Some(State::RelayProxyProtocol(ref pp)) => pp.back_socket(),
-      Some(State::ExpectProxyProtocol(_)) => self.backend.as_ref(),
+      Some(State::ExpectProxyProtocol(_)) => None,
       _ => unreachable!(),
     }
   }
 
-  pub fn upgrade(&mut self) {
+  pub fn upgrade(&mut self) -> UpgradeResult {
     let protocol = self.protocol.take();
 
     if let Some(State::SendProxyProtocol(pp)) = protocol {
@@ -266,25 +280,33 @@ impl Client {
         self.protocol = Some(
           State::Pipe(pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap()))
         );
+        UpgradeResult::Continue
       } else {
         error!("Missing the frontend or backend buffer queue, we can't switch to a pipe");
+        UpgradeResult::Close
       }
     } else if let Some(State::RelayProxyProtocol(mut pp)) = protocol {
       if self.back_buf.is_some() {
         self.protocol = Some(
           State::Pipe(pp.into_pipe(self.back_buf.take().unwrap()))
         );
+        UpgradeResult::Continue
       } else {
         error!("Missing the backend buffer queue, we can't switch to a pipe");
+        UpgradeResult::Close
       }
     } else if let Some(State::ExpectProxyProtocol(mut pp)) = protocol {
       if self.back_buf.is_some() {
         self.protocol = Some(
-          State::Pipe(pp.into_pipe(self.back_buf.take().unwrap(), self.backend.take(), self.backend_token))
+          State::Pipe(pp.into_pipe(self.back_buf.take().unwrap(), None, None))
         );
+        UpgradeResult::ConnectBackend
       } else {
         error!("Missing the backend buffer queue, we can't switch to a pipe");
+        UpgradeResult::Close
       }
+    } else {
+      UpgradeResult::Close
     }
   }
 
@@ -313,7 +335,7 @@ impl Client {
       Some(State::Pipe(ref mut pipe)) => pipe.set_back_socket(socket),
       Some(State::SendProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
       Some(State::RelayProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
-      Some(State::ExpectProxyProtocol(_)) => self.backend = Some(socket),
+      Some(State::ExpectProxyProtocol(_)) => panic!("we should not set the back socket for the expect proxy protocol"),
       _ => unreachable!()
     }
   }
@@ -341,6 +363,13 @@ impl Client {
       if let Some(State::SendProxyProtocol(ref mut pp)) = self.protocol {
         pp.set_back_connected(BackendConnectionStatus::Connected);
       }
+
+      self.backend.as_ref().map(|backend| {
+        let ref mut backend = *backend.borrow_mut();
+        //successful connection, rest failure counter
+        backend.failures = 0;
+        backend.retry_policy.succeed();
+      });
     }
   }
 
@@ -350,7 +379,8 @@ impl Client {
 
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
 
-    let addr = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
+    let addr = self.backend.as_ref().map(|backend| (*backend.borrow_mut()).address);
+
     self.backend       = None;
     self.backend_token = None;
     (self.app_id.clone(), addr)
@@ -553,7 +583,7 @@ pub struct ApplicationConfiguration {
 
 pub struct ServerConfiguration {
   fronts:          HashMap<String, Token>,
-  backends:        HashMap<String, Vec<Backend>>,
+  backends:        BackendMap,
   listeners:       HashMap<Token, ApplicationListener>,
   configs:         HashMap<AppId, ApplicationConfiguration>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
@@ -564,7 +594,7 @@ impl ServerConfiguration {
     mut tcp_listener: Vec<(AppId, TcpListener)>, mut tokens: Vec<Token>) -> (ServerConfiguration, HashSet<Token>) {
 
     let mut configuration = ServerConfiguration {
-      backends:      HashMap::new(),
+      backends:      BackendMap::new(),
       listeners:     HashMap::new(),
       configs:       HashMap::new(),
       fronts:        HashMap::new(),
@@ -618,8 +648,8 @@ impl ServerConfiguration {
     }
 
     if let Ok(listener) = server_bind(front) {
-      let addresses: Vec<SocketAddr> = if let Some(ads) = self.backends.get(app_id) {
-        let v: Vec<SocketAddr> = ads.iter().map(|backend| backend.address).collect();
+      let addresses: Vec<SocketAddr> = if let Some(backend_list) = self.backends.backends.get(app_id) {
+        let v: Vec<SocketAddr> = backend_list.backends.iter().map(|backend| (*backend.borrow_mut()).address).collect();
         v
       } else {
         Vec::new()
@@ -662,18 +692,7 @@ impl ServerConfiguration {
 
   pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken> {
     use std::borrow::BorrowMut;
-    if let Some(addrs) = self.backends.get_mut(app_id) {
-      let id = addrs.last().map(|mut b| (*b.borrow_mut()).id ).unwrap_or(0) + 1;
-      let backend = Backend::new(backend_id, *backend_address, id);
-      if !addrs.contains(&backend) {
-        addrs.push(backend);
-      }
-    }
-
-    if self.backends.get(app_id).is_none() {
-      let backend = Backend::new(backend_id, *backend_address, 0);
-      self.backends.insert(String::from(app_id), vec![backend]);
-    }
+    self.backends.add_backend(app_id, backend_id, backend_address);
 
     let opt_tok = self.fronts.get(app_id).clone();
     if let Some(tok) = opt_tok {
@@ -695,6 +714,17 @@ impl ServerConfiguration {
       None
   }
 
+  fn backend_from_app_id(&mut self, client: &mut Client, app_id: &str) -> Result<TcpStream,ConnectionError> {
+    match self.backends.backend_from_app_id(app_id) {
+      Err(e) => Err(e),
+      Ok((backend, conn))  => {
+        client.back_connected = BackendConnectionStatus::Connecting;
+        client.backend = Some(backend);
+
+        Ok(conn)
+      }
+    }
+  }
 }
 
 impl ProxyConfiguration<Client> for ServerConfiguration {
@@ -710,22 +740,56 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     let rnd = random::<usize>();
     let idx = rnd % len;
 
-    client.app_id = Some(self.listeners[&client.accept_token].app_id.clone());
-    let backend_addr = try!(self.listeners[&client.accept_token].back_addresses.get(idx).ok_or(ConnectionError::ToBeDefined));
-    let stream = try!(TcpStream::connect(backend_addr).map_err(|_| ConnectionError::ToBeDefined));
-    stream.set_nodelay(true);
+    let app_id = self.listeners[&client.accept_token].app_id.clone();
+    client.app_id = Some(app_id.clone());
 
-    poll.register(
-      &stream,
-      back_token,
-      Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-      PollOpt::edge()
-    );
+    // Circuit breaker
+    if client.back_connected == BackendConnectionStatus::Connecting {
+      client.backend.as_ref().map(|backend| {
+        let ref mut backend = *backend.borrow_mut();
+        backend.dec_connections();
+        backend.failures += 1;
 
-    client.set_back_token(back_token);
-    client.set_back_socket(stream);
-    client.set_back_connected(BackendConnectionStatus::Connecting);
-    Ok(BackendConnectAction::New)
+        let already_unavailable = backend.retry_policy.is_down();
+        backend.retry_policy.fail();
+        count!("backend.connections.error", 1);
+        if !already_unavailable && backend.retry_policy.is_down() {
+          count!("backend.down", 1);
+        }
+      });
+
+      //deregister back socket if it is the wrong one or if it was not connecting
+      client.backend = None;
+      client.back_connected = BackendConnectionStatus::NotConnected;
+      client.readiness().back_interest  = UnixReady::from(Ready::empty());
+      client.readiness().back_readiness = UnixReady::from(Ready::empty());
+      client.back_socket().as_ref().map(|sock| {
+        poll.deregister(*sock);
+        sock.shutdown(Shutdown::Both);
+      });
+    }
+
+    let conn = self.backend_from_app_id(client, &app_id);
+    match conn {
+      Ok(stream) => {
+        stream.set_nodelay(true);
+
+        poll.register(
+          &stream,
+          back_token,
+          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+          PollOpt::edge()
+        );
+
+        client.set_back_token(back_token);
+        client.set_back_socket(stream);
+        Ok(BackendConnectAction::New)
+      },
+      Err(ConnectionError::NoBackendAvailable) => Err(ConnectionError::NoBackendAvailable),
+      Err(e) => {
+        panic!(format!("tcp connect_to_backend: unexpected error: {:?}", e));
+      }
+    }
   }
 
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
@@ -814,7 +878,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         if let Some(ref listener) = self.listeners[&internal_token].sock.as_ref() {
           listener.accept().map(|(frontend_sock, _)| {
             frontend_sock.set_nodelay(true);
-            let c = Client::new(frontend_sock, client_token, internal_token, front_buf, back_buf, proxy_protocol);
+            let c = Client::new(frontend_sock, client_token, internal_token, front_buf, back_buf, proxy_protocol.clone());
             incr!("tcp.requests");
 
             poll.register(
@@ -824,7 +888,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
               PollOpt::edge()
             );
 
-            (Rc::new(RefCell::new(c)), true)
+            let should_connect_backend = proxy_protocol != Some(ProxyProtocolConfig::ExpectHeader);
+            (Rc::new(RefCell::new(c)), should_connect_backend)
           }).map_err(|e| {
             match e.kind() {
               ErrorKind::WouldBlock => AcceptError::WouldBlock,
@@ -859,11 +924,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   }
 
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {
-    if let Some(app_backends) = self.backends.get_mut(&app_id) {
-      if let Some(ref mut backend) = app_backends.iter_mut().find(|backend| &backend.address == addr) {
-        backend.dec_connections();
-      }
-    }
+    self.backends.close_backend_connection(&app_id, &addr);
   }
 
   fn listen_port_state(&self, port: &u16) -> ListenPortState {

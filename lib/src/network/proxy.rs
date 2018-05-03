@@ -730,7 +730,7 @@ impl Server {
 
   pub fn connect_to_backend(&mut self, token: ClientToken) {
     let add = self.from_client_add();
-    let res = {
+    let (protocol, res) = {
       let cl = self.clients[token].clone();
       let cl2: Rc<RefCell<ProxyClientCast>> = self.clients[token].clone();
       let protocol = { cl.borrow().protocol() };
@@ -743,9 +743,9 @@ impl Server {
       let entry = entry.insert(cl);
       let back_token = Token(entry.index().0 + add);
 
-      let res = match protocol {
+      let (protocol, res) = match protocol {
         Protocol::TCP   => {
-          if let Some(mut tcp) = self.tcp.take() {
+          let r = if let Some(mut tcp) = self.tcp.take() {
             let mut b = cl2.borrow_mut();
             let client: &mut tcp::Client = b.as_tcp() ;
             let r = tcp.connect_to_backend(&mut self.poll, client, back_token);
@@ -753,10 +753,12 @@ impl Server {
             r
           } else {
             Err(ConnectionError::HostNotFound)
-          }
+          };
+
+          (Protocol::TCP, r)
         },
         Protocol::HTTP  => {
-          if let Some(mut http) = self.http.take() {
+          (Protocol::HTTP, if let Some(mut http) = self.http.take() {
             let mut b = cl2.borrow_mut();
             let client: &mut http::Client = b.as_http() ;
             let r = http.connect_to_backend(&mut self.poll, client, back_token);
@@ -764,16 +766,16 @@ impl Server {
             r
           } else {
             Err(ConnectionError::HostNotFound)
-          }
+          })
         },
         Protocol::HTTPS => {
-          if let Some(mut https) = self.https.take() {
+          (Protocol::HTTPS, if let Some(mut https) = self.https.take() {
             let r = https.connect_to_backend(&mut self.poll, cl2, back_token);
             self.https = Some(https);
             r
           } else {
             Err(ConnectionError::HostNotFound)
-          }
+          })
         },
         _ => {
           panic!("should not call connect_to_backend on listeners");
@@ -783,7 +785,7 @@ impl Server {
       if res != Ok(BackendConnectAction::New) {
         entry.remove();
       }
-      res
+      (protocol, res)
     };
 
     match res {
@@ -795,13 +797,16 @@ impl Server {
       Ok(BackendConnectAction::New) => {
       },
       Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) | Err(ConnectionError::HttpsRedirect) => {
+        if protocol == Protocol::TCP {
+          self.close_client(token);
+        }
       },
       _ => self.close_client(token),
     }
   }
 
   pub fn interpret_client_order(&mut self, token: ClientToken, order: ClientResult) {
-    //println!("INTERPRET ORDER: {:?}", order);
+    //trace!("INTERPRET ORDER: {:?}", order);
     match order {
       ClientResult::CloseClient     => self.close_client(token),
       ClientResult::CloseBackend(opt) => {
@@ -837,7 +842,7 @@ impl Server {
 
         if let Some(t) = main_token {
           let tok = self.to_client(t);
-          self.connect_to_backend(tok);
+          self.connect_to_backend(tok)
         }
       },
       ClientResult::ConnectBackend  => self.connect_to_backend(token),
@@ -889,6 +894,10 @@ impl Server {
 
       loop {
         //self.client_ready(poll, client_token, events);
+        if !self.clients.contains(client_token) {
+          break;
+        }
+
         let order = self.clients[client_token].borrow_mut().ready();
         trace!("client[{:?} -> {:?}] got events {:?} and returned order {:?}", client_token, self.from_client(client_token), events, order);
         //FIXME: the CloseBackend message might not mean we have nothing else to do

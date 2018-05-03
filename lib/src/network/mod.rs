@@ -38,7 +38,7 @@ use self::retry::RetryPolicy;
 
 pub type AppId = String;
 
-#[derive(Debug,Clone,Copy)]
+#[derive(Debug,Clone,Copy,PartialEq)]
 pub enum Protocol {
   HTTP,
   HTTPS,
