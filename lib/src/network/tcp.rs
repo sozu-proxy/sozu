@@ -55,6 +55,12 @@ pub enum ConnectionStatus {
   Closed
 }
 
+pub enum UpgradeResult {
+  Continue,
+  Close,
+  ConnectBackend,
+}
+
 pub enum State {
   Pipe(Pipe<TcpStream>),
   SendProxyProtocol(SendProxyProtocol<TcpStream>),
@@ -201,10 +207,14 @@ impl Client {
     };
 
     if let ProtocolResult::Upgrade = should_upgrade_protocol {
-      self.upgrade();
+      match self.upgrade() {
+        UpgradeResult::Continue => ClientResult::Continue,
+        UpgradeResult::Close    => ClientResult::CloseClient,
+        UpgradeResult::ConnectBackend => ClientResult::ConnectBackend,
+      }
+    } else {
+      res
     }
-
-    res
   }
 
   fn writable(&mut self) -> ClientResult {
@@ -257,12 +267,12 @@ impl Client {
       Some(State::Pipe(ref pipe)) => pipe.back_socket(),
       Some(State::SendProxyProtocol(ref pp)) => pp.back_socket(),
       Some(State::RelayProxyProtocol(ref pp)) => pp.back_socket(),
-      Some(State::ExpectProxyProtocol(_)) => self.backend.as_ref(),
+      Some(State::ExpectProxyProtocol(_)) => None,
       _ => unreachable!(),
     }
   }
 
-  pub fn upgrade(&mut self) {
+  pub fn upgrade(&mut self) -> UpgradeResult {
     let protocol = self.protocol.take();
 
     if let Some(State::SendProxyProtocol(pp)) = protocol {
@@ -270,25 +280,33 @@ impl Client {
         self.protocol = Some(
           State::Pipe(pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap()))
         );
+        UpgradeResult::Continue
       } else {
         error!("Missing the frontend or backend buffer queue, we can't switch to a pipe");
+        UpgradeResult::Close
       }
     } else if let Some(State::RelayProxyProtocol(mut pp)) = protocol {
       if self.back_buf.is_some() {
         self.protocol = Some(
           State::Pipe(pp.into_pipe(self.back_buf.take().unwrap()))
         );
+        UpgradeResult::Continue
       } else {
         error!("Missing the backend buffer queue, we can't switch to a pipe");
+        UpgradeResult::Close
       }
     } else if let Some(State::ExpectProxyProtocol(mut pp)) = protocol {
       if self.back_buf.is_some() {
         self.protocol = Some(
-          State::Pipe(pp.into_pipe(self.back_buf.take().unwrap(), self.backend.take(), self.backend_token))
+          State::Pipe(pp.into_pipe(self.back_buf.take().unwrap(), None, None))
         );
+        UpgradeResult::ConnectBackend
       } else {
         error!("Missing the backend buffer queue, we can't switch to a pipe");
+        UpgradeResult::Close
       }
+    } else {
+      UpgradeResult::Close
     }
   }
 
@@ -317,7 +335,7 @@ impl Client {
       Some(State::Pipe(ref mut pipe)) => pipe.set_back_socket(socket),
       Some(State::SendProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
       Some(State::RelayProxyProtocol(ref mut pp)) => pp.set_back_socket(socket),
-      Some(State::ExpectProxyProtocol(_)) => self.backend = Some(socket),
+      Some(State::ExpectProxyProtocol(_)) => panic!("we should not set the back socket for the expect proxy protocol"),
       _ => unreachable!()
     }
   }
@@ -860,7 +878,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         if let Some(ref listener) = self.listeners[&internal_token].sock.as_ref() {
           listener.accept().map(|(frontend_sock, _)| {
             frontend_sock.set_nodelay(true);
-            let c = Client::new(frontend_sock, client_token, internal_token, front_buf, back_buf, proxy_protocol);
+            let c = Client::new(frontend_sock, client_token, internal_token, front_buf, back_buf, proxy_protocol.clone());
             incr!("tcp.requests");
 
             poll.register(
@@ -870,7 +888,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
               PollOpt::edge()
             );
 
-            (Rc::new(RefCell::new(c)), true)
+            let should_connect_backend = proxy_protocol != Some(ProxyProtocolConfig::ExpectHeader);
+            (Rc::new(RefCell::new(c)), should_connect_backend)
           }).map_err(|e| {
             match e.kind() {
               ErrorKind::WouldBlock => AcceptError::WouldBlock,
