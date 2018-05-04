@@ -7,7 +7,7 @@ use mio::net::TcpStream;
 
 use sozu_command::{messages, config::LoadBalancingAlgorithms};
 
-use network::{AppId,Backend,ConnectionError};
+use network::{AppId,Backend,ConnectionError,load_balancing::*};
 
 #[derive(Debug)]
 pub struct BackendMap {
@@ -139,17 +139,17 @@ const MAX_FAILURES_PER_BACKEND: usize = 10;
 
 #[derive(Debug)]
 pub struct BackendList {
-  pub backends:  Vec<Rc<RefCell<Backend>>>,
-  pub next_id:   u32,
-  pub load_balacing_algo: LoadBalancingAlgorithms,
+  pub backends:       Vec<Rc<RefCell<Backend>>>,
+  pub next_id:        u32,
+  pub load_balancing: Box<LoadBalacingAlg>,
 }
 
 impl BackendList {
   pub fn new() -> BackendList {
     BackendList {
-      backends:  Vec::new(),
-      next_id:   0,
-      load_balacing_algo: LoadBalancingAlgorithms::default(),
+      backends:       Vec::new(),
+      next_id:        0,
+      load_balancing: Box::new(RandAlg{}),
     }
   }
 
@@ -168,7 +168,7 @@ impl BackendList {
 
   pub fn add_backend(&mut self, backend_id: &str, backend_address: &SocketAddr) {
     if self.backends.iter().find(|b| &(*b.borrow()).address == backend_address).is_none() {
-      let backend = Rc::new(RefCell::new(Backend::new(backend_id, *backend_address, self.next_id)));
+      let backend = Rc::new(RefCell::new(Backend::new(backend_id, *backend_address, self.next_id, 0)));
       self.backends.push(backend);
       self.next_id += 1;
     }
@@ -198,25 +198,19 @@ impl BackendList {
       })
   }
 
-  pub fn available_backends(&mut self) -> Vec<&mut Rc<RefCell<Backend>>> {
-    self.backends.iter_mut()
-      .filter(|backend| (*backend.borrow()).can_open())
-      .collect()
-  }
-
   pub fn next_available_backend(&mut self) -> Option<&mut Rc<RefCell<Backend>>> {
-    let mut backends:Vec<&mut Rc<RefCell<Backend>>> = self.available_backends();
-    if backends.is_empty() {
-      return None;
+    if self.backends.len() == 0 {
+      return None
     }
 
-    let rnd = random::<usize>();
-    let idx = rnd % backends.len();
-
-    Some(backends.remove(idx))
+    self.load_balancing.next_available_backend(&mut self.backends)
   }
 
-  pub fn set_load_balacing_algo(&mut self, load_balacing_algo: LoadBalancingAlgorithms) {
-    self.load_balacing_algo = load_balacing_algo;
+  pub fn set_load_balacing_algo(&mut self, load_balancing_algo: LoadBalancingAlgorithms) {
+    match load_balancing_algo {
+      LoadBalancingAlgorithms::RoundRobin => self.load_balancing = Box::new(RoundRobinAlg{ next_backend: 0 }),
+      LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(RandAlg{}),
+      LoadBalancingAlgorithms::LeastConnections => unimplemented!(),
+    }
   }
 }
