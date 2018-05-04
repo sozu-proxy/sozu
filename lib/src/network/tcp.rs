@@ -1083,61 +1083,6 @@ mod tests {
     //assert!(false);
   }
 
-  /*
-  #[allow(unused_mut, unused_must_use, unused_variables)]
-  #[test]
-  fn concurrent() {
-    use std::sync::mpsc;
-    use time;
-    let thread_nb = 127;
-
-    thread::spawn(|| { start_server(); });
-    start();
-    thread::sleep_ms(300);
-
-    let (tx, rx) = mpsc::channel();
-
-    let begin = time::precise_time_s();
-    for i in 0..thread_nb {
-      let id = i;
-      let tx = tx.clone();
-      thread::Builder::new().name(id.to_string()).spawn(move || {
-        let s = format!("[{}] Hello world!\n", id);
-        let v: Vec<u8> = s.bytes().collect();
-        if let Ok(mut conn) = TcpStream::connect("127.0.0.1:1234") {
-          let mut res = [0; 128];
-          for j in 0..10000 {
-            conn.write(&v[..]);
-
-            if j % 5 == 0 {
-              if let Ok(sz) = conn.read(&mut res[..]) {
-                //println!("[{}] received({}): {:?}", id, sz, str::from_utf8(&res[..sz]));
-              } else {
-                println!("failed reading");
-                tx.send(());
-                return;
-              }
-            }
-          }
-          tx.send(());
-          return;
-        } else {
-          println!("failed connecting");
-          tx.send(());
-          return;
-        }
-      });
-    }
-    //thread::sleep_ms(5000);
-    for i in 0..thread_nb {
-      rx.recv();
-    }
-    let end = time::precise_time_s();
-    println!("executed in {} seconds", end - begin);
-    assert!(false);
-  }
-  */
-
   #[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server() {
     let listener = TcpListener::bind("127.0.0.1:5678").expect("could not parse address");

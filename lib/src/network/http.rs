@@ -1141,7 +1141,10 @@ mod tests {
   use std::net::{TcpListener, TcpStream, Shutdown};
   use std::io::{Read,Write};
   use std::{thread,str};
-  use std::sync::mpsc::channel;
+  use std::sync::{
+    Arc, Barrier,
+    mpsc::channel
+  };
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
@@ -1153,7 +1156,10 @@ mod tests {
   #[test]
   fn mi() {
     setup_test_logger!();
-    start_server(1025);
+    let barrier = Arc::new(Barrier::new(2));
+    start_server(1025, barrier.clone());
+    barrier.wait();
+
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
     let config = HttpProxyConfiguration {
       front: front,
@@ -1175,36 +1181,42 @@ mod tests {
     println!("test received: {:?}", command.read_message());
 
     let mut client = TcpStream::connect(("127.0.0.1", 1024)).expect("could not parse address");
+
     // 5 seconds of timeout
     client.set_read_timeout(Some(Duration::new(5,0)));
-    thread::sleep(Duration::from_millis(100));
     let mut w  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\nConnection: Close\r\n\r\n"[..]);
     println!("http client write: {:?}", w);
+
+    barrier.wait();
     let mut buffer = [0;4096];
-    thread::sleep(Duration::from_millis(500));
-    let mut r = client.read(&mut buffer[..]);
-    println!("http client read: {:?}", r);
-    match r {
-      Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
-      Ok(sz) => {
-        // Read the Response.
-        println!("read response");
+    let mut index = 0;
 
-        println!("Response: {}", str::from_utf8(&buffer[..]).expect("could not make string from buffer"));
+    loop {
+      assert!(index <= 201);
+      if index == 201 {
+        break;
+      }
 
-        //thread::sleep(Duration::from_millis(300));
-        //assert_eq!(&body, &"Hello World!"[..]);
-        assert_eq!(sz, 201);
-        //assert!(false);
+      let mut r = client.read(&mut buffer[index..]);
+      println!("http client read: {:?}", r);
+      match r {
+        Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
+        Ok(sz) => {
+          index += sz;
+        }
       }
     }
+    println!("Response: {}", str::from_utf8(&buffer[..index]).expect("could not make string from buffer"));
   }
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn keep_alive() {
     setup_test_logger!();
-    start_server(1028);
+    let barrier = Arc::new(Barrier::new(2));
+    start_server(1028, barrier.clone());
+    barrier.wait();
+
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1031").expect("could not parse address");
     let config = HttpProxyConfiguration {
       front: front,
@@ -1228,56 +1240,61 @@ mod tests {
     let mut client = TcpStream::connect(("127.0.0.1", 1031)).expect("could not parse address");
     // 5 seconds of timeout
     client.set_read_timeout(Some(Duration::new(5,0)));
-    thread::sleep(Duration::from_millis(100));
+
     let mut w  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..]);
     println!("http client write: {:?}", w);
+    barrier.wait();
+
     let mut buffer = [0;4096];
-    thread::sleep(Duration::from_millis(500));
-    let mut r = client.read(&mut buffer[..]);
-    println!("http client read: {:?}", r);
-    match r {
-      Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
-      Ok(sz) => {
-        // Read the Response.
-        println!("read response");
+    let mut index = 0;
 
-        println!("Response: {}", str::from_utf8(&buffer[..]).expect("could not make string from buffer"));
+    loop {
+      assert!(index <= 201);
+      if index == 201 {
+        break;
+      }
 
-        //thread::sleep(Duration::from_millis(300));
-        //assert_eq!(&body, &"Hello World!"[..]);
-        assert_eq!(sz, 201);
-        //assert!(false);
+      let mut r = client.read(&mut buffer[index..]);
+      println!("http client read: {:?}", r);
+      match r {
+        Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
+        Ok(sz) => {
+          index += sz;
+        }
       }
     }
+    println!("Response: {}", str::from_utf8(&buffer[..index]).expect("could not make string from buffer"));
 
     println!("first request ended, will send second one");
-    let mut buffer2 = [0;4096];
     let mut w2  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..]);
     println!("http client write: {:?}", w2);
-    thread::sleep(Duration::from_millis(500));
-    let mut r2 = client.read(&mut buffer2[..]);
-    println!("http client read: {:?}", r2);
-    match r2 {
-      Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
-      Ok(sz) => {
-        // Read the Response.
-        println!("read response");
+    barrier.wait();
 
-        println!("Response: {}", str::from_utf8(&buffer2[..]).expect("could not make string from buffer"));
+    let mut buffer2 = [0;4096];
+    let mut index = 0;
 
-        //thread::sleep(Duration::from_millis(300));
-        //assert_eq!(&body, &"Hello World!"[..]);
-        assert_eq!(sz, 201);
-        //assert!(false);
+    loop {
+      assert!(index <= 201);
+      if index == 201 {
+        break;
+      }
+
+      let mut r2 = client.read(&mut buffer2[index..]);
+      println!("http client read: {:?}", r2);
+      match r2 {
+        Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
+        Ok(sz) => {
+          index += sz;
+        }
       }
     }
+    println!("Response: {}", str::from_utf8(&buffer2[..index]).expect("could not make string from buffer"));
   }
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn https_redirect() {
     setup_test_logger!();
-    start_server(1040);
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1041").expect("could not parse address");
     let config = HttpProxyConfiguration {
       front: front,
@@ -1303,34 +1320,43 @@ mod tests {
     let mut client = TcpStream::connect(("127.0.0.1", 1041)).expect("could not parse address");
     // 5 seconds of timeout
     client.set_read_timeout(Some(Duration::new(5,0)));
-    thread::sleep(Duration::from_millis(100));
+
     let mut w  = client.write(&b"GET /redirected?true HTTP/1.1\r\nHost: localhost\r\nConnection: Close\r\n\r\n"[..]);
     println!("http client write: {:?}", w);
+
+    let expected_answer = "HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://localhost/redirected?true\r\n\r\n";
     let mut buffer = [0;4096];
-    thread::sleep(Duration::from_millis(500));
-    let mut r = client.read(&mut buffer[..]);
-    println!("http client read: {:?}", r);
-    match r {
-      Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
-      Ok(sz) => {
-        let answer = str::from_utf8(&buffer[0..sz]).expect("could not make string from buffer");
-        // Read the Response.
-        println!("read response");
-        println!("Response: {}", answer);
-        let expected_answer = "HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://localhost/redirected?true\r\n\r\n";
-        assert_eq!(answer, expected_answer);
+    let mut index = 0;
+    loop {
+      assert!(index <= expected_answer.len());
+      if index == expected_answer.len() {
+        break;
+      }
+
+      let mut r = client.read(&mut buffer[..]);
+      println!("http client read: {:?}", r);
+      match r {
+        Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
+        Ok(sz) => {
+          index += sz;
+        }
       }
     }
+
+    let answer = str::from_utf8(&buffer[..index]).expect("could not make string from buffer");
+    println!("Response: {}", answer);
+    assert_eq!(answer, expected_answer);
   }
 
 
   use self::tiny_http::{Server, Response};
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
-  fn start_server(port: u16) {
+  fn start_server(port: u16, barrier: Arc<Barrier>) {
     thread::spawn(move|| {
       let server = Server::http(&format!("127.0.0.1:{}", port)).expect("could not create server");
-      println!("starting web server in port {}", port);
+      info!("starting web server in port {}", port);
+      barrier.wait();
 
       for request in server.incoming_requests() {
         println!("backend web server got request -> method: {:?}, url: {:?}, headers: {:?}",
@@ -1342,6 +1368,8 @@ mod tests {
         let response = Response::from_string("hello world");
         request.respond(response);
         println!("backend web server sent response");
+        barrier.wait();
+        println!("server session stopped");
       }
 
       println!("server on port {} closed", port);

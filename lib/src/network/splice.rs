@@ -72,13 +72,18 @@ mod tests {
   use std::ptr;
   use std::net::SocketAddr;
   use std::str::FromStr;
+  use std::sync::{Arc, Barrier};
 
   #[test]
   fn zerocopy() {
+    let barrier = Arc::new(Barrier::new(2));
     start_server();
-    start_server2();
+    start_server2(barrier.clone());
+
     let mut stream = TcpStream::connect("127.0.0.1:2121").expect("could not connect tcp socket");
     stream.write(&b"hello world"[..]);
+    barrier.wait();
+
     let mut res = [0; 128];
     let mut sz = stream.read(&mut res[..]).expect("could not read from stream");
     println!("stream received {:?}", str::from_utf8(&res[..sz]));
@@ -96,7 +101,6 @@ mod tests {
         if sz > 0 {
           println!("[{}] {:?}", id, str::from_utf8(&buf[..sz]));
           stream.write(&buf[..sz]);
-          //thread::sleep_ms(200);
         }
       }
     }
@@ -119,17 +123,16 @@ mod tests {
   }
 
 #[allow(unused_mut, unused_must_use, unused_variables)]
-  fn start_server2() {
+  fn start_server2(barrier: Arc<Barrier>) {
     let listener = TcpListener::bind("127.0.0.1:2121").expect("could not bind socket");
 
-    fn handle_client(stream: &mut TcpStream, backend: &mut TcpStream, id: u8) {
+    fn handle_client(stream: &mut TcpStream, backend: &mut TcpStream, id: u8, barrier: &Arc<Barrier>) {
       let mut buf = [0; 128];
       let response = b" END";
       unsafe {
 
         if let (Some(pipe_in), Some(pipe_out)) = (create_pipe(), create_pipe()) {
-
-          thread::sleep_ms(200);
+          barrier.wait();
           println!("{:?}", splice_in(stream, pipe_in));
           println!("{:?}", splice_out(pipe_in, backend));
           println!("{:?}", splice_in(backend, pipe_out));
@@ -141,15 +144,15 @@ mod tests {
 
     let mut count = 0;
     thread::spawn(move|| {
+      barrier.wait();
+
       for conn in listener.incoming() {
         match conn {
           Ok(mut stream) => {
-          thread::spawn(move|| {
             let addr: SocketAddr = FromStr::from_str("127.0.0.1:4242").expect("could not parse address");
             let mut backend  = TcpStream::connect(&addr).expect("could not create tcp stream");
             println!("got a new client: {}", count);
-            handle_client(&mut stream, &mut backend, count)
-            });
+            handle_client(&mut stream, &mut backend, count, &barrier)
           }
           Err(e) => { println!("connection failed"); }
         }

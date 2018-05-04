@@ -1428,73 +1428,8 @@ mod tests {
   use sozu_command::messages::{Order,HttpsFront,Backend,OrderMessage,OrderMessageAnswer};
   use openssl::ssl::{SslContext, SslMethod, Ssl, SslStream};
   use openssl::x509::X509;
-
-  /*
-  #[allow(unused_mut, unused_must_use, unused_variables)]
-  #[test]
-  fn mi() {
-    thread::spawn(|| { start_server(); });
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
-    let (tx,rx) = channel::<OrderMessageAnswer>();
-    let (sender, jg) = start_listener(front, 10, 10, tx.clone());
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost:1024"), path_begin: String::from("/") };
-    sender.send(OrderMessage::Order(Order::AddHttpFront(front)));
-    let backend = Backend { app_id: String::from("app_1"), ip_address: String::from("127.0.0.1"), port: 1025 };
-    sender.send(OrderMessage::Order(Order::AddBackend(backend)));
-    println!("test received: {:?}", rx.recv());
-    println!("test received: {:?}", rx.recv());
-    thread::sleep_ms(300);
-
-    let mut client = TcpStream::connect(("127.0.0.1", 1024)).expect("could not parse address");
-    // 5 seconds of timeout
-    client.set_read_timeout(Some(Duration::new(5,0)));
-    thread::sleep_ms(100);
-    let mut w  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\nConnection: Close\r\n\r\n"[..]);
-    println!("http client write: {:?}", w);
-    let mut buffer = [0;4096];
-    thread::sleep_ms(500);
-    let mut r = client.read(&mut buffer[..]);
-    println!("http client read: {:?}", r);
-    match r {
-      Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
-      Ok(sz) => {
-        // Read the Response.
-        println!("read response");
-
-        println!("Response: {}", str::from_utf8(&buffer[..]).expect("could not make string from buffer"));
-
-        //thread::sleep_ms(300);
-        //assert_eq!(&body, &"Hello World!"[..]);
-        assert_eq!(sz, 154);
-        //assert!(false);
-      }
-    }
-  }
-
-  use self::tiny_http::{ServerBuilder, Response};
-
-  #[allow(unused_mut, unused_must_use, unused_variables)]
-  fn start_server() {
-    thread::spawn(move|| {
-      let server = ServerBuilder::new().with_port(1025).build().expect("could not create server");
-      println!("starting web server");
-
-      for request in server.incoming_requests() {
-        println!("backend web server got request -> method: {:?}, url: {:?}, headers: {:?}",
-          request.method(),
-          request.url(),
-          request.headers()
-        );
-
-        let response = Response::from_string("hello world");
-        request.respond(response);
-        println!("backend web server sent response");
-      }
-    });
-  }
-*/
-
   use mio::net;
+
   #[test]
   fn frontend_from_request_test() {
     let app_id1 = "app_1".to_owned();
