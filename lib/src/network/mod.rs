@@ -218,10 +218,11 @@ pub struct Backend {
   pub retry_policy:       retry::RetryPolicyWrapper,
   pub active_connections: usize,
   pub failures:           usize,
+  pub weight:             u8,
 }
 
 impl Backend {
-  pub fn new(backend_id: &str, addr: SocketAddr, id: u32) -> Backend {
+  pub fn new(backend_id: &str, addr: SocketAddr, id: u32, weight: u8) -> Backend {
     let desired_policy = retry::ExponentialBackoffPolicy::new(10);
     Backend {
       id:                 id,
@@ -231,6 +232,7 @@ impl Backend {
       retry_policy:       desired_policy.into(),
       active_connections: 0,
       failures:           0,
+      weight,
     }
   }
 
