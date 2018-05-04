@@ -156,7 +156,9 @@ hostname = "lolcatho.st"
 #path_begin = "/api" # optional
 
 # list of backend servers for this application
-backends = [ "127.0.0.1:1026" ] # list of IP/port
+[[applications.MyApp.backends]]
+address = "127.0.0.1:1026"
+weight = 100
 
 # activates sticky sessions for this application
 #sticky_session = false
@@ -179,13 +181,21 @@ certificate_chain = "../lib/assets/certificate_chain.pem" # optional
 # IP address for the listener
 ip_address = "127.0.0.1"
 # port for the listener
-port = 8081
+port = 4200
 
 # list of backend servers for this application
-backends = [ "127.0.0.1:1026" ] # list of IP/port
+#backends = [ "127.0.0.1:1026", "127.0.0.1:1027" ] # list of IP/port
 
 # activates the proxy protocol to send IP information to the backend
 # send_proxy = false
 
 # Configures the client-facing connection to receive a PROXY protocol header
 # expect_proxy = false
+
+[[applications.TcpTest.backends]]
+address = "127.0.0.1:4001"
+weight = 100
+
+[[applications.TcpTest.backends]]
+address = "127.0.0.1:4000"
+weight = 50
