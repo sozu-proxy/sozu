@@ -588,6 +588,10 @@ impl CommandServer {
     let max_buffer_size = config.max_command_buffer_size;
 
     let workers: HashMap<Token, Worker> = workers.iter().filter_map(|serialized| {
+      if serialized.run_state == RunState::Stopped {
+        return None;
+      }
+
       let stream = unsafe { UnixStream::from_raw_fd(serialized.fd) };
       if let Some(token) = serialized.token {
         let _register = poll.register(&stream, Token(token),
