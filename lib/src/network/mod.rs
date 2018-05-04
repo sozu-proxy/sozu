@@ -20,6 +20,7 @@ pub mod protocol;
 pub mod http;
 pub mod backends;
 pub mod retry;
+pub mod load_balancing;
 
 #[cfg(feature = "splice")]
 mod splice;
