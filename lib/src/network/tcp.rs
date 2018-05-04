@@ -1053,17 +1053,16 @@ mod tests {
     setup_test_logger!();
     thread::spawn(|| { start_server(); });
     let tx = start_example();
-    thread::sleep(Duration::from_millis(300));
+    thread::sleep(Duration::from_millis(100));
 
     let mut s1 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
     let mut s3 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
-    thread::sleep(Duration::from_millis(300));
     let mut s2 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
     s1.write(&b"hello"[..]);
     println!("s1 sent");
     s2.write(&b"pouet pouet"[..]);
     println!("s2 sent");
-    thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(100));
 
     let mut res = [0; 128];
     s1.write(&b"coucou"[..]);
@@ -1076,7 +1075,7 @@ mod tests {
     assert_eq!(&res[..sz2], &b"pouet pouet END"[..]);
 
 
-    thread::sleep(Duration::from_millis(400));
+    thread::sleep(Duration::from_millis(100));
     sz1 = s1.read(&mut res[..]).expect("could not read from socket");
     println!("s1 received again({}): {:?}", sz1, str::from_utf8(&res[..sz1]));
     assert_eq!(&res[..sz1], &b"coucou END"[..]);
