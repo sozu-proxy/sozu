@@ -208,8 +208,6 @@ impl Server {
     METRICS.with(|metrics| {
       if let Some(sock) = (*metrics.borrow()).socket() {
         poll.register(sock, Token(1), Ready::writable(), PollOpt::edge()).expect("should register the metrics socket");
-      } else {
-        error!("could not register metrics socket");
       }
     });
 
