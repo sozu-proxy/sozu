@@ -5,7 +5,7 @@ use std::fmt;
 use std::collections::BTreeMap;
 
 use state::ConfigState;
-use messages::{AggregatedMetricsData,Order,Query,QueryAnswer, LoadBalacingParams};
+use messages::{AggregatedMetricsData,Order,Query,QueryAnswer, LoadBalancingParams};
 use config::LoadBalancingAlgorithms;
 
 pub const PROTOCOL_VERSION: u8 = 0;
@@ -489,7 +489,7 @@ mod tests {
                   backend_id: String::from("xxx-0"),
                   ip_address: String::from("127.0.0.1"),
                   port: 8080,
-                  lb_params: Some(LoadBalacingParams{ weight: 0 }),
+                  lb_params: Some(LoadBalancingParams{ weight: 0 }),
       })),
       proxy_id: None
     });

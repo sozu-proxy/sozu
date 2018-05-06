@@ -277,15 +277,15 @@ pub struct Backend {
     pub port:        u16,
     #[serde(default)]
     #[serde(skip_serializing_if="Option::is_none")]
-    pub lb_params:   Option<LoadBalacingParams>,
+    pub lb_params:   Option<LoadBalancingParams>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct LoadBalacingParams {
+pub struct LoadBalancingParams {
     pub weight: u8,
 }
 
-impl Default for LoadBalacingParams {
+impl Default for LoadBalancingParams {
   fn default() -> Self {
     Self {
       weight: 0,
@@ -508,7 +508,7 @@ mod tests {
       backend_id: String::from("xxx-0"),
       ip_address: String::from("yyy"),
       port: 8080,
-      lb_params: Some(LoadBalacingParams{ weight: 0 }),
+      lb_params: Some(LoadBalancingParams{ weight: 0 }),
     }));
   }
 

@@ -4,7 +4,7 @@ use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 use sozu_command::messages::{Application, Order, Backend, HttpFront, HttpsFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
-  AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalacingParams};
+  AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams};
 
 use serde_json;
 use std::collections::{HashMap,HashSet};
@@ -851,7 +851,7 @@ pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout:
       backend_id: String::from(backend_id),
       ip_address: String::from(ip),
       port: port,
-      lb_params: Some(LoadBalacingParams::default()),
+      lb_params: Some(LoadBalancingParams::default()),
     }));
 }
 
@@ -861,7 +861,7 @@ pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
       backend_id: String::from(backend_id),
       ip_address: String::from(ip),
       port: port,
-      lb_params: Some(LoadBalacingParams::default()),
+      lb_params: Some(LoadBalancingParams::default()),
     }));
 }
 

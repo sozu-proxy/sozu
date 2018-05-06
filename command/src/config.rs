@@ -13,7 +13,7 @@ use toml;
 
 use messages::Application;
 use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,TcpFront,Backend,
-  HttpProxyConfiguration,HttpsProxyConfiguration,AddCertificate,TlsProvider,LoadBalacingParams};
+  HttpProxyConfiguration,HttpsProxyConfiguration,AddCertificate,TlsProvider,LoadBalancingParams};
 
 use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
 
@@ -408,7 +408,7 @@ impl HttpAppConfig {
         let ip   = format!("{}", backend.address.ip());
         let port = backend.address.port();
 
-        let lb_params = Some(LoadBalacingParams {
+        let lb_params = Some(LoadBalancingParams {
           weight: backend.weight.unwrap_or(100),
         });
 
@@ -461,7 +461,7 @@ impl TcpAppConfig {
       let ip   = format!("{}", backend.address.ip());
       let port = backend.address.port();
 
-      let lb_params = Some(LoadBalacingParams {
+      let lb_params = Some(LoadBalancingParams {
         weight: backend.weight.unwrap_or(100),
       });
 
