@@ -1,10 +1,10 @@
-use sozu_command::config::{Config, ProxyProtocolConfig};
+use sozu_command::config::{Config, ProxyProtocolConfig, LoadBalancingAlgorithms};
 use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 use sozu_command::messages::{Application, Order, Backend, HttpFront, HttpsFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
-  AddCertificate, RemoveCertificate, ReplaceCertificate};
+  AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalacingParams};
 
 use serde_json;
 use std::collections::{HashMap,HashSet};
@@ -769,7 +769,7 @@ pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bo
   }
 }
 
-pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool) {
+pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool, load_balancing_policy: LoadBalancingAlgorithms) {
   let proxy_protocol = match (send_proxy, expect_proxy) {
     (true, true) => Some(ProxyProtocolConfig::RelayHeader),
     (true, false) => Some(ProxyProtocolConfig::SendHeader),
@@ -782,6 +782,7 @@ pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, time
     sticky_session,
     https_redirect,
     proxy_protocol,
+    load_balancing_policy,
   }));
 }
 
@@ -849,7 +850,8 @@ pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout:
       app_id: String::from(app_id),
       backend_id: String::from(backend_id),
       ip_address: String::from(ip),
-      port: port
+      port: port,
+      lb_params: Some(LoadBalacingParams::default()),
     }));
 }
 
@@ -858,7 +860,8 @@ pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
       app_id: String::from(app_id),
       backend_id: String::from(backend_id),
       ip_address: String::from(ip),
-      port: port
+      port: port,
+      lb_params: Some(LoadBalacingParams::default()),
     }));
 }
 

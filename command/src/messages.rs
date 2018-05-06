@@ -208,7 +208,8 @@ pub struct Application {
     pub https_redirect:    bool,
     #[serde(default)]
     pub proxy_protocol:    Option<ProxyProtocolConfig>,
-    pub load_balacing_alg: LoadBalancingAlgorithms,
+    #[serde(rename = "lb_policy")]
+    pub load_balancing_policy: LoadBalancingAlgorithms,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -274,7 +275,9 @@ pub struct Backend {
     pub backend_id:  String,
     pub ip_address:  String,
     pub port:        u16,
-    pub lb_params:   LoadBalacingParams,
+    #[serde(default)]
+    #[serde(skip_serializing_if="Option::is_none")]
+    pub lb_params:   Option<LoadBalacingParams>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -285,7 +288,7 @@ pub struct LoadBalacingParams {
 impl Default for LoadBalacingParams {
   fn default() -> Self {
     Self {
-      weight: 100,
+      weight: 0,
     }
   }
 }
@@ -497,14 +500,15 @@ mod tests {
 
   #[test]
   fn add_backend_test() {
-    let raw_json = r#"{"type": "ADD_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "ip_address": "yyy", "port": 8080}}"#;
+    let raw_json = r#"{"type": "ADD_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "ip_address": "yyy", "port": 8080, "lb_params": { "weight": 0 }}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::AddBackend(Backend{
       app_id: String::from("xxx"),
       backend_id: String::from("xxx-0"),
       ip_address: String::from("yyy"),
-      port: 8080
+      port: 8080,
+      lb_params: Some(LoadBalacingParams{ weight: 0 }),
     }));
   }
 
@@ -517,7 +521,8 @@ mod tests {
       app_id: String::from("xxx"),
       backend_id: String::from("xxx-0"),
       ip_address: String::from("yyy"),
-      port: 8080
+      port: 8080,
+      lb_params: None,
     }));
   }
 
