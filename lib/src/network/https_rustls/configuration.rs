@@ -123,7 +123,11 @@ impl ServerConfiguration {
   }
 
   pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
+    let app_id = &application.app_id.clone();
+    let lb_alg = application.load_balancing_policy;
+
     self.applications.insert(application.app_id.clone(), application);
+    self.backends.set_load_balancing_policy_for_app(app_id, lb_alg);
   }
 
   pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
