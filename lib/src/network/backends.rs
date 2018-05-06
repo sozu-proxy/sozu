@@ -126,12 +126,15 @@ impl BackendMap {
     }
   }
 
-  pub fn set_load_balacing_algo_for_app(&mut self, app_id: &str, lb_algo: LoadBalancingAlgorithms) {
-    if let Some(ref mut app_backends) = self.backends.get_mut(app_id) {
-      app_backends.set_load_balacing_algo(lb_algo);
-    } else {
-      error!("could not set the load balacing algorithm for {}", app_id);
-    }
+  pub fn set_load_balancing_policy_for_app(&mut self, app_id: &str, lb_algo: LoadBalancingAlgorithms) {
+    // The application can be create before the backends were registered because of the async config messages.
+    // So when we set the load balancing policy, we have to create the backend list if if it doesn't exist yet.
+    let app_backends = self.get_or_create_backend_list_for_app(app_id);
+    app_backends.set_load_balancing_policy(lb_algo);
+  }
+
+  pub fn get_or_create_backend_list_for_app(&mut self, app_id: &str) -> &mut BackendList {
+    self.backends.entry(app_id.to_string()).or_insert(BackendList::new())
   }
 }
 
@@ -206,11 +209,125 @@ impl BackendList {
     self.load_balancing.next_available_backend(&mut self.backends)
   }
 
-  pub fn set_load_balacing_algo(&mut self, load_balancing_algo: LoadBalancingAlgorithms) {
-    match load_balancing_algo {
+  pub fn set_load_balancing_policy(&mut self, load_balancing_policy: LoadBalancingAlgorithms) {
+    match load_balancing_policy {
       LoadBalancingAlgorithms::RoundRobin => self.load_balancing = Box::new(RoundRobinAlg{ next_backend: 0 }),
       LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(RandAlg{}),
-      LoadBalancingAlgorithms::LeastConnections => unimplemented!(),
     }
+  }
+}
+
+#[cfg(test)]
+mod backends_test {
+
+  use super::*;
+  use std::{thread,sync::mpsc::*,net::TcpListener};
+
+
+  fn run_mock_tcp_server(addr: &str, stoper: Receiver<()>) {
+    let mut run = true;
+    let listener = TcpListener::bind(addr).unwrap();
+    listener.set_nonblocking(true).expect("Cannot set non-blocking");
+
+    thread::spawn(move || {
+      while run {
+        for stream in listener.incoming() {
+          // accept connections
+        }
+
+        if let Ok(()) = stoper.try_recv() {
+          run = false;
+        }
+      }
+    });
+  }
+
+  #[test]
+  fn it_should_retrieve_a_backend_from_app_id_when_backends_have_been_recorded() {
+    let mut backend_map = BackendMap::new();
+    let app_id = "myapp";
+
+    let backend_addr = "127.0.0.1:4567";
+    let (sender, receiver) = channel();
+    run_mock_tcp_server(backend_addr, receiver);
+
+    backend_map.add_backend(app_id, &format!("{}-1", app_id), &(backend_addr.parse().unwrap()));
+
+    assert!(backend_map.backend_from_app_id(app_id).is_ok());
+    sender.send(());
+  }
+
+  #[test]
+  fn it_should_not_retrieve_a_backend_from_app_id_when_backend_has_not_been_recorded() {
+    let mut backend_map = BackendMap::new();
+    let app_not_recorded = "not";
+    backend_map.add_backend("foo", "foo-1", &("127.0.0.1:9001".parse().unwrap()));
+
+    assert!(backend_map.backend_from_app_id(app_not_recorded).is_err());
+  }
+
+  #[test]
+  fn it_should_not_retrieve_a_backend_from_app_id_when_backend_list_is_empty() {
+    let mut backend_map = BackendMap::new();
+
+    assert!(backend_map.backend_from_app_id("dumb").is_err());
+  }
+
+  #[test]
+  fn it_should_retrieve_a_backend_from_sticky_session_when_the_backend_has_been_recorded() {
+    let mut backend_map = BackendMap::new();
+    let app_id = "myapp";
+    let sticky_session = 2;
+
+    let backend_addr = "127.0.0.1:3456";
+    let (sender, receiver) = channel();
+    run_mock_tcp_server(backend_addr, receiver);
+
+    backend_map.add_backend(app_id, &format!("{}-1", app_id), &("127.0.0.1:9001".parse().unwrap()));
+    backend_map.add_backend(app_id, &format!("{}-2", app_id), &("127.0.0.1:9000".parse().unwrap()));
+    // sticky backend
+    backend_map.add_backend(app_id, &format!("{}-3", app_id), &(backend_addr.parse().unwrap()));
+
+    assert!(backend_map.backend_from_sticky_session(app_id, sticky_session).is_ok());
+    sender.send(());
+  }
+
+  #[test]
+  fn it_should_not_retrieve_a_backend_from_sticky_session_when_the_backend_has_not_been_recorded() {
+    let mut backend_map = BackendMap::new();
+    let app_id = "myapp";
+    let sticky_session = 2;
+
+    assert!(backend_map.backend_from_sticky_session(app_id, sticky_session).is_err());
+  }
+
+  #[test]
+  fn it_should_not_retrieve_a_backend_from_sticky_session_when_the_backend_list_is_empty() {
+    let mut backend_map = BackendMap::new();
+    let myapp_not_recorded = "myapp";
+    let sticky_session = 2;
+
+    assert!(backend_map.backend_from_sticky_session(myapp_not_recorded, sticky_session).is_err());
+  }
+
+  #[test]
+  fn it_should_add_a_backend_when_he_doesnt_already_exist() {
+    let backend_id = "myback";
+    let mut backends_list = BackendList::new();
+    backends_list.add_backend(backend_id, &("127.0.0.1:80".parse().unwrap()));
+
+    assert_eq!(1, backends_list.backends.len());
+  }
+
+  #[test]
+  fn it_should_not_add_a_backend_when_he_already_exist() {
+    let backend_id = "myback";
+    let mut backends_list = BackendList::new();
+    backends_list.add_backend(backend_id, &("127.0.0.1:80".parse().unwrap()));
+
+    //same backend id
+    backends_list.add_backend(backend_id, &("127.0.0.1:80".parse().unwrap()));
+
+    assert_eq!(1, backends_list.backends.len());
   }
 }
