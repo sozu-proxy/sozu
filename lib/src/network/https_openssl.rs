@@ -30,6 +30,7 @@ use openssl::nid;
 use openssl::error::ErrorStack;
 use nom::IResult;
 
+use sozu_command::config::LoadBalancingAlgorithms;
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
@@ -726,6 +727,7 @@ impl ServerConfiguration {
 
   pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
     self.applications.insert(application.app_id.clone(), application);
+    self.backends.set_load_balancing_policy_for_app(application.app_id.clone(), application.load_balacing_alg)
   }
 
   pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
