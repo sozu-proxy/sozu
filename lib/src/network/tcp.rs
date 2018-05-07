@@ -23,7 +23,7 @@ use pool::{Pool,Checkout,Reset};
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
-use sozu_command::config::ProxyProtocolConfig;
+use sozu_command::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
 use sozu_command::messages::{self,TcpFront,Order,OrderMessage,OrderMessageAnswer,OrderMessageStatus,LoadBalancingParams};
 
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
@@ -579,6 +579,7 @@ pub struct ApplicationListener {
 #[derive(Debug)]
 pub struct ApplicationConfiguration {
   proxy_protocol: Option<ProxyProtocolConfig>,
+  load_balancing_policy: LoadBalancingAlgorithms,
 }
 
 pub struct ServerConfiguration {
@@ -848,8 +849,11 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       Order::AddApplication(application) => {
         let config = ApplicationConfiguration {
           proxy_protocol: application.proxy_protocol,
+          load_balancing_policy: application.load_balancing_policy,
         };
-        self.configs.insert(application.app_id, config);
+        self.configs.insert(application.app_id.clone(), config);
+        self.backends.set_load_balancing_policy_for_app(&application.app_id, application.load_balancing_policy);
+
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::RemoveApplication(_) => {
