@@ -10,6 +10,7 @@ use openssl::ssl::{Error, ErrorCode, SslStream};
 #[derive(Debug,PartialEq,Copy,Clone)]
 pub enum SocketResult {
   Continue,
+  Closed,
   WouldBlock,
   Error
 }
@@ -32,9 +33,8 @@ impl SocketHandler for TcpStream {
         Ok(sz) => size +=sz,
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
-          ErrorKind::BrokenPipe => {
-            error!("SOCKET\tbroken pipe reading from the socket");
-            return (size, SocketResult::Error)
+          ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe => {
+            return (size, SocketResult::Closed)
           },
           _ => {
             error!("SOCKET\tsocket_read error={:?}", e);
@@ -56,9 +56,8 @@ impl SocketHandler for TcpStream {
         Ok(sz) => size += sz,
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
-          ErrorKind::BrokenPipe => {
-            error!("SOCKET\tbroken pipe writing to the socket");
-            return (size, SocketResult::Error)
+          ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe => {
+            return (size, SocketResult::Closed)
           },
           _ => {
             //FIXME: timeout and other common errors should be sent up
@@ -92,6 +91,9 @@ impl SocketHandler for SslStream<TcpStream> {
               error!("SOCKET-TLS\treadable TLS socket err");
               return (size, SocketResult::Error)
             },
+            ErrorCode::ZERO_RETURN => {
+              return (size, SocketResult::Closed)
+            },
             _ => return (size, SocketResult::Error)
           }
         }
@@ -116,6 +118,9 @@ impl SocketHandler for SslStream<TcpStream> {
               error!("SOCKET-TLS\twritable TLS socket err");
               return (size, SocketResult::Error)
             },
+            ErrorCode::ZERO_RETURN => {
+              return (size, SocketResult::Closed)
+            },
             err => {
               error!("SOCKET-TLS\twritable TLS socket err={:?}", err);
               return (size, SocketResult::Error)
@@ -139,7 +144,7 @@ impl SocketHandler for FrontRustls {
     let mut size = 0usize;
     let mut can_read = true;
     let mut can_work = true;
-
+    let mut closed   = false;
 
     while can_work {
       if size == buf.len() {
@@ -152,6 +157,13 @@ impl SocketHandler for FrontRustls {
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => {
             can_read = false;
+          },
+          ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe => {
+            if size > 0 {
+              closed = true;
+            } else {
+              return (size, SocketResult::Closed)
+            }
           },
           _ => {
             error!("could not read TLS stream from socket: {:?}", e);
@@ -176,21 +188,30 @@ impl SocketHandler for FrontRustls {
               return (size, SocketResult::WouldBlock);
             }
           },
-           _ => {
-             error!("could not read data from TLS stream: {:?}", e);
+          ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe => {
+            if size > 0 {
+              closed = true;
+            } else {
+              return (size, SocketResult::Closed)
+            }
+          },
+          _ => {
+            error!("could not read data from TLS stream: {:?}", e);
             return (size, SocketResult::Error)
-           }
+          }
         }
 
       }
 
-      can_work = self.session.wants_read() && can_read;
+      can_work = self.session.wants_read() && can_read && !closed;
     }
 
-    if can_read {
-    (size, SocketResult::Continue)
+    if closed {
+      (size, SocketResult::Closed)
+    } else if can_read {
+      (size, SocketResult::Continue)
     } else {
-    (size, SocketResult::WouldBlock)
+      (size, SocketResult::WouldBlock)
     }
   }
 
@@ -198,7 +219,9 @@ impl SocketHandler for FrontRustls {
     let mut sent_size = 0usize;
     let mut buffered_size = 0usize;
     let mut can_write = true;
+    let mut closed   = false;
 
+    //FIXME: maybe put this in the loop?
     match self.session.write(buf) {
       Ok(0)  => {
       },
@@ -210,6 +233,13 @@ impl SocketHandler for FrontRustls {
           // we don't need to do anything, the session will return false in wants_write?
           error!("rustls socket_write wouldblock");
         },
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe => {
+          if buffered_size > 0 {
+            closed = true;
+          } else {
+            return (buffered_size, SocketResult::Closed)
+          }
+        },
         _ => {
           error!("could not write data to TLS stream: {:?}", e);
           return (buffered_size, SocketResult::Error)
@@ -217,7 +247,7 @@ impl SocketHandler for FrontRustls {
       }
     }
 
-    while self.session.wants_write() && can_write {
+    while self.session.wants_write() && can_write && !closed {
       if sent_size == buf.len() {
         return (buffered_size, SocketResult::Continue);
       }
@@ -253,6 +283,13 @@ impl SocketHandler for FrontRustls {
         },
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => can_write = false,
+          ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe => {
+            if buffered_size > 0 {
+              closed = true;
+            } else {
+              return (buffered_size, SocketResult::Closed)
+            }
+          },
           _ => {
             error!("could not write TLS stream to socket: {:?}", e);
             return (buffered_size, SocketResult::Error)
@@ -262,7 +299,9 @@ impl SocketHandler for FrontRustls {
 
     }
 
-    if can_write {
+    if closed {
+      (buffered_size, SocketResult::Closed)
+    } else if can_write {
       (buffered_size, SocketResult::Continue)
     } else {
       (buffered_size, SocketResult::WouldBlock)

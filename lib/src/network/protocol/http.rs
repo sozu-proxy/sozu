@@ -469,6 +469,21 @@ impl<Front:SocketHandler> Http<Front> {
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
+      SocketResult::Closed => {
+        //we were in keep alive but the peer closed the connection
+        //FIXME: what happens if the connection was just opened but no data came?
+        if unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial) {
+          metrics.service_stop();
+          self.readiness.reset();
+          return ClientResult::CloseClient;
+        } else {
+          self.log_request_error(metrics,
+            &format!("front socket error, closing the connection. Readiness: {:?}", self.readiness));
+          metrics.service_stop();
+          self.readiness.reset();
+          return ClientResult::CloseClient;
+        }
+      },
       SocketResult::WouldBlock => {
         self.readiness.front_readiness.remove(Ready::readable());
       },
@@ -638,7 +653,7 @@ impl<Front:SocketHandler> Http<Front> {
     }
 
     match res {
-      SocketResult::Error => {
+      SocketResult::Error | SocketResult::Closed => {
         metrics.service_stop();
         self.log_request_error(metrics, "error writing to front socket, closing");
         self.readiness.reset();
@@ -778,7 +793,7 @@ impl<Front:SocketHandler> Http<Front> {
       debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", self.log_ctx, front.0, back.0, sz, output_size);
     }
     match socket_res {
-      SocketResult::Error => {
+      SocketResult::Error | SocketResult::Closed => {
         metrics.service_stop();
         self.log_request_error(metrics, "back socket write error, closing connection");
         self.readiness.reset();

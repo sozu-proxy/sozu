@@ -157,6 +157,11 @@ impl<Front:SocketHandler> Pipe<Front> {
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
+      SocketResult::Closed => {
+        metrics.service_stop();
+        self.readiness.reset();
+        return ClientResult::CloseClient;
+      },
       SocketResult::WouldBlock => {
         self.readiness.front_readiness.remove(Ready::readable());
       },
@@ -205,7 +210,7 @@ impl<Front:SocketHandler> Pipe<Front> {
     }
 
     match res {
-      SocketResult::Error => {
+      SocketResult::Error | SocketResult::Closed => {
         error!("{}\t[{:?}] error writing to front socket, closing", self.log_ctx, self.frontend_token);
         incr!("pipe.errors");
         metrics.service_stop();
@@ -259,7 +264,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", self.log_ctx, front.0, back.0, sz, output_size);
     }
     match socket_res {
-      SocketResult::Error => {
+      SocketResult::Error | SocketResult::Closed => {
         error!("{}\tback socket write error, closing connection", self.log_ctx);
         metrics.service_stop();
         incr!("pipe.errors");
@@ -304,12 +309,23 @@ impl<Front:SocketHandler> Pipe<Front> {
         metrics.backend_bin += sz;
       }
 
-      if r == SocketResult::Error {
-        error!("{}\tback socket read error, closing connection", self.log_ctx);
-        metrics.service_stop();
-        incr!("pipe.errors");
-        self.readiness.reset();
-        return ClientResult::CloseClient;
+      match r {
+        SocketResult::Error => {
+          error!("{}\tback socket read error, closing connection", self.log_ctx);
+          metrics.service_stop();
+          incr!("pipe.errors");
+          self.readiness.reset();
+          return ClientResult::CloseClient;
+        },
+        SocketResult::Closed => {
+          metrics.service_stop();
+          self.readiness.reset();
+          return ClientResult::CloseClient;
+        },
+        SocketResult::WouldBlock => {
+          self.readiness.back_readiness.remove(Ready::readable());
+        },
+        SocketResult::Continue => {}
       }
     }
 
