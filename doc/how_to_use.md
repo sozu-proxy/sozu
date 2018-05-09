@@ -142,3 +142,48 @@ Furthermore, we can enable it, so that it is activated by default on future boot
 
 [un]: https://github.com/sozu-proxy/sozu/blob/master/os-build/systemd/sozu.service.in
 [gen]: https://github.com/sozu-proxy/sozu/blob/master/os-build/exherbo/generate.sh
+
+## PROXY Protocol
+
+Sōzu use its own IP stack to get connected on remote servers. Because of this, we lose the initial L3/4 client connection information (like source and destination IP and port).
+Sōzu support the *version 2* of the `PROXY protocol` to receive client connection information passed through proxy servers and load balancers.
+For example, this can be used to configure a website, keeping a blacklist of IP addresses, or logging/metrics purposes.
+
+The information L3/4 passed via the `PROXY protocol` is:
+ - the client IP address
+ - the proxy server IP address
+ - both port numbers.
+
+More infos here: [proxy-protocol spec](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt)
+
+
+### Configuring Sōzu to *expect* a PROXY Protocol
+
+Configures the client-facing connection to receive a PROXY protocol header before any byte is read from the socket.
+
+```toml
+[applications.NameOfYourApp]
+expect_proxy = true
+```
+
+### Configuring Sōzu to *send* a PROXY Protocol to an upstream backend
+
+Send a PROXY protocol header over any connection established to the backends declared in the application.
+The PROXY protocol informs the upstream backend about the L3/4 addresses of the incoming connection.
+
+```toml
+[applications.NameOfYourApp]
+send_proxy = true
+```
+
+NOTE: Currently supported only for `tcp` applications.
+
+### Configuring Sōzu to *relay* a PROXY Protocol header to an upstream
+
+Expect the client-facing connection to receive a PROXY protocol header, check its validity and then forward it to an upstream backend. This enable to chain proxies / reverse-proxies without losing the client connection information.
+
+```toml
+[applications.NameOfYourApp]
+send_proxy = true
+expect_proxy = true
+```
