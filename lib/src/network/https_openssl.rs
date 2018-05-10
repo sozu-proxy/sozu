@@ -341,7 +341,13 @@ impl ProxyClient for TlsClient {
       poll.deregister(sock);
     }
 
-    gauge_add!("http.active_requests", -1);
+    if let Some(State::Http(ref http)) = self.protocol {
+      //if the state was initial, the connection was already reset
+      if unwrap_msg!(http.state.as_ref()).request != Some(RequestState::Initial) {
+        gauge_add!("http.active_requests", -1);
+      }
+    }
+
     result.tokens.push(self.frontend_token);
 
     result

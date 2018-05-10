@@ -35,7 +35,7 @@ use network::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,ClientToken,ListenClient};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::retry::RetryPolicy;
-use parser::http11::hostname_and_port;
+use parser::http11::{hostname_and_port, RequestState};
 use network::tcp;
 use util::UnwrapLog;
 use network::https_rustls;
@@ -355,7 +355,13 @@ impl ProxyClient for Client {
       poll.deregister(sock);
     }
 
-    gauge_add!("http.active_requests", -1);
+    if let Some(State::Http(ref http)) = self.protocol {
+      //if the state was initial, the connection was already reset
+      if unwrap_msg!(http.state.as_ref()).request != Some(RequestState::Initial) {
+        gauge_add!("http.active_requests", -1);
+      }
+    }
+
     result.tokens.push(self.frontend_token);
 
     result

@@ -105,6 +105,8 @@ impl<Front:SocketHandler> Http<Front> {
     client.state.as_mut().map(|ref mut state| state.added_req_header = req_header);
     client.state.as_mut().map(|ref mut state| state.added_res_header = res_header);
 
+    gauge_add!("http.active_requests", 1);
+
     Some(client)
   }
 
@@ -490,11 +492,6 @@ impl<Front:SocketHandler> Http<Front> {
       SocketResult::Continue => {}
     };
 
-    if unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial) {
-      gauge_add!("http.active_requests", 1);
-      incr!("http.requests");
-    }
-
     // if there's no host, continue parsing until we find it
     let has_host = unwrap_msg!(self.state.as_ref()).has_host();
     if !has_host {
@@ -507,6 +504,8 @@ impl<Front:SocketHandler> Http<Front> {
         self.readiness.front_interest.remove(Ready::readable());
         return ClientResult::CloseClient;
       }
+
+      incr!("http.requests");
 
       if unwrap_msg!(self.state.as_ref()).has_host() {
         self.readiness.back_interest.insert(Ready::writable());
