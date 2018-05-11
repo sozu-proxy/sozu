@@ -255,7 +255,7 @@ impl SocketHandler for FrontRustls {
       loop {
         match self.session.write_tls(&mut self.stream) {
           Ok(0)  => {
-            can_write = false;
+            //can_write = false;
             break;
           },
           Ok(sz) => {
