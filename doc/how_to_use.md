@@ -161,6 +161,18 @@ More infos here: [proxy-protocol spec](https://www.haproxy.org/download/1.8/doc/
 
 Configures the client-facing connection to receive a PROXY protocol header before any byte is read from the socket.
 
+```
+                            send PROXY               expect PROXY
+                            protocol header          protocol header
+    +--------+
+    | client |             +---------+                   +------------+      +-----------+
+    |        |             | proxy   |                   | Sozu       |      | upstream  |
+    +--------+  ---------> | server  |  ---------------> |            |------| server    |
+   /        /              |         |                   |            |      |           |
+  /________/               +---------+                   +------------+      +-----------+
+```
+
+*Configuration:*
 ```toml
 [applications.NameOfYourApp]
 expect_proxy = true
@@ -171,6 +183,17 @@ expect_proxy = true
 Send a PROXY protocol header over any connection established to the backends declared in the application.
 The PROXY protocol informs the upstream backend about the L3/4 addresses of the incoming connection.
 
+```
+                                send PROXY
+    +--------+                  protocol header
+    | client |             +---------+                +-----------------+
+    |        |             | Sozu    |                | proxy/upstream  |
+    +--------+  ---------> |         |  ------------> | server          |
+   /        /              |         |                |                 |
+  /________/               +---------+                +-----------------+
+```
+
+*Configuration:*
 ```toml
 [applications.NameOfYourApp]
 send_proxy = true
