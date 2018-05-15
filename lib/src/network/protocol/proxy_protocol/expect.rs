@@ -123,3 +123,74 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
     pipe
   }
 }
+
+#[cfg(test)]
+mod expect_test {
+
+ use super::*;
+
+  use parser::proxy_protocol::parse_v2_header;
+  use nom::IResult::Done;
+  use pool::Pool;
+
+  use std::{thread, thread::JoinHandle, time::Duration, net::{SocketAddr, IpAddr, Ipv4Addr}};
+  use mio::net::{TcpListener, TcpStream};
+  use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
+
+  use network::protocol::proxy_protocol::header::*;
+
+  // Flow diagram of the test below
+  //                [connect]   [send proxy protocol]
+  //upfront proxy  ----------------------X
+  //              /     |           |
+  //  sozu     ---------v-----------v----X
+  #[test]
+  fn middleware_should_receive_proxy_protocol_header_from_an_upfront_middleware() {
+    setup_test_logger!();
+    let middleware_addr: SocketAddr = "127.0.0.1:3500".parse().expect("parse address error");
+
+    let upfront = start_upfront_middleware(middleware_addr.clone());
+    start_middleware(middleware_addr);
+
+    upfront.join().expect("should join");
+  }
+
+  // Accept connection from an upfront proxy and expect to read a proxy protocol header in this stream.
+  fn start_middleware(middleware_addr: SocketAddr) {
+    let upfront_middleware_conn_listener = TcpListener::bind(&middleware_addr).expect("could not accept upfront middleware connection");
+    let mut client_stream: Option<TcpStream> = None;
+
+    // mio::TcpListener use a nonblocking mode so we have to loop on accept
+    loop {
+      if let Ok((stream, _addr)) = upfront_middleware_conn_listener.accept() {
+        client_stream = Some(stream);
+        break;
+      }
+    }
+
+    let mut session_metrics = SessionMetrics::new();
+    let mut pool = Pool::with_capacity(1, 0, || BufferQueue::with_capacity(16384));
+    let mut front_buf = pool.checkout().unwrap();
+    let mut expect_pp = ExpectProxyProtocol::new(client_stream.unwrap(), Token(0), front_buf);
+
+    if (ProtocolResult::Upgrade, ClientResult::Continue) != expect_pp.readable(&mut session_metrics) {
+      panic!("Should receive a complete proxy protocol header");
+    };
+  }
+
+  // Connect to the next middleware and send a proxy protocol header
+  fn start_upfront_middleware(next_middleware_addr: SocketAddr) -> JoinHandle<()> {
+    thread::spawn(move|| {
+      let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(125, 25, 10, 1)), 8080);
+      let dst_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200);
+      let proxy_protocol = HeaderV2::new(Command::Local, src_addr, dst_addr).into_bytes();
+
+      match StdTcpStream::connect(&next_middleware_addr) {
+        Ok(mut stream) => {
+          stream.write(&proxy_protocol);
+        },
+        Err(e) => panic!("could not connect to the next middleware: {}", e),
+      };
+    })
+  }
+}
