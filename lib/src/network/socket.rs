@@ -156,7 +156,10 @@ impl SocketHandler for FrontRustls {
       }
 
       match self.session.read_tls(&mut self.stream) {
-        Ok(0)  => can_read = false,
+        Ok(0)  => {
+          can_read  = false;
+          is_closed = true;
+        },
         Ok(sz) => {},
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => {
