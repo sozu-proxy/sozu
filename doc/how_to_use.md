@@ -205,6 +205,18 @@ NOTE: Currently supported only for `tcp` applications.
 
 Expect the client-facing connection to receive a PROXY protocol header, check its validity and then forward it to an upstream backend. This enable to chain proxies / reverse-proxies without losing the client connection information.
 
+```
+                                 send PROXY           expect PROXY    send PROXY
+                                 protocol header      protocol header protocol header
+    +--------+
+    | client |             +---------+                      +------------+             +-------------------+
+    |        |             | proxy   |                      | Sozu       |             | proxy/upstream    |
+    +--------+  +--------> | server  |  +-----------------> |            | +---------> | server            |
+   /        /              |         |                      |            |             |                   |
+  /________/               +---------+                      +------------+             +-------------------+
+```
+
+*Configuration:*
 ```toml
 [applications.NameOfYourApp]
 send_proxy = true
