@@ -145,9 +145,9 @@ Furthermore, we can enable it, so that it is activated by default on future boot
 
 ## PROXY Protocol
 
-Sōzu use its own IP stack to get connected on remote servers. Because of this, we lose the initial L3/4 client connection information (like source and destination IP and port).
-Sōzu support the *version 2* of the `PROXY protocol` to receive client connection information passed through proxy servers and load balancers.
-For example, this can be used to configure a website, keeping a blacklist of IP addresses, or logging/metrics purposes.
+Sōzu use its own layer 3 and 4 information to get connected on remote servers. Because of this, we lose the initial L3/4 client connection information (like source and destination IP and port) which can be use by upstream proxy/server to configure a website, basic IP-level security, logging/metrics purposes...
+
+Sōzu support the *version 2* of the `PROXY protocol` to solve the problem of L3/4 connection parameters being lost when relaying L3/4 connections through proxies. Thanks to that, Sōzu will informs the other end about the L3/4 addresses of the incoming connection before any byte is exchange from the socket. Furthermore, Sōzu can forward to the upstream service this client connection information sent by downstream proxy servers and load balancers.
 
 The information L3/4 passed via the `PROXY protocol` is:
  - the client IP address
