@@ -489,7 +489,7 @@ mod tests {
                   backend_id: String::from("xxx-0"),
                   ip_address: String::from("127.0.0.1"),
                   port: 8080,
-                  lb_params: Some(LoadBalancingParams{ weight: 0 }),
+                  load_balancing_parameters: Some(LoadBalancingParams{ weight: 0 }),
       })),
       proxy_id: None
     });
@@ -502,7 +502,7 @@ mod tests {
                   backend_id: String::from("xxx-0"),
                   ip_address: String::from("127.0.0.1"),
                   port: 8080,
-                  lb_params: None,
+                  load_balancing_parameters: None,
       })),
       proxy_id: None
     });

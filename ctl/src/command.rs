@@ -851,7 +851,7 @@ pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout:
       backend_id: String::from(backend_id),
       ip_address: String::from(ip),
       port: port,
-      lb_params: Some(LoadBalancingParams::default()),
+      load_balancing_parameters: Some(LoadBalancingParams::default()),
     }));
 }
 
@@ -861,7 +861,7 @@ pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
       backend_id: String::from(backend_id),
       ip_address: String::from(ip),
       port: port,
-      lb_params: Some(LoadBalancingParams::default()),
+      load_balancing_parameters: Some(LoadBalancingParams::default()),
     }));
 }
 

@@ -223,7 +223,7 @@ pub struct FileAppConfig {
   #[serde(default)]
   pub expect_proxy:      Option<bool>,
   #[serde(default)]
-  pub lb_policy: LoadBalancingAlgorithms,
+  pub load_balancing_policy: LoadBalancingAlgorithms,
 }
 
 #[derive(Debug,Copy,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -299,7 +299,7 @@ impl FileAppConfig {
             port:           port,
             backends:       self.backends,
             proxy_protocol,
-            load_balancing_policy: self.lb_policy,
+            load_balancing_policy: self.load_balancing_policy,
           }))
         },
         (None, Some(_)) => Err(String::from("missing IP address for TCP application")),
@@ -340,7 +340,7 @@ impl FileAppConfig {
         backends:          self.backends,
         sticky_session:    sticky_session,
         https_redirect:    https_redirect,
-        load_balancing_policy: self.lb_policy,
+        load_balancing_policy: self.load_balancing_policy,
       }))
     }
   }
@@ -408,7 +408,7 @@ impl HttpAppConfig {
         let ip   = format!("{}", backend.address.ip());
         let port = backend.address.port();
 
-        let lb_params = Some(LoadBalancingParams {
+        let load_balancing_parameters = Some(LoadBalancingParams {
           weight: backend.weight.unwrap_or(100),
         });
 
@@ -417,7 +417,7 @@ impl HttpAppConfig {
           backend_id:  format!("{}-{}", self.app_id, backend_count),
           ip_address: ip,
           port:       port,
-          lb_params,
+          load_balancing_parameters,
         }));
 
         backend_count += 1;
@@ -461,7 +461,7 @@ impl TcpAppConfig {
       let ip   = format!("{}", backend.address.ip());
       let port = backend.address.port();
 
-      let lb_params = Some(LoadBalancingParams {
+      let load_balancing_parameters = Some(LoadBalancingParams {
         weight: backend.weight.unwrap_or(100),
       });
 
@@ -470,7 +470,7 @@ impl TcpAppConfig {
         backend_id: format!("{}-{}", self.app_id, backend_count),
         ip_address: ip,
         port:       port,
-        lb_params,
+        load_balancing_parameters,
       }));
 
       backend_count += 1;

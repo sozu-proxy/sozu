@@ -144,7 +144,7 @@ const MAX_FAILURES_PER_BACKEND: usize = 10;
 pub struct BackendList {
   pub backends:       Vec<Rc<RefCell<Backend>>>,
   pub next_id:        u32,
-  pub load_balancing: Box<LoadBalacingAlg>,
+  pub load_balancing: Box<LoadBalancingAlgorithm>,
 }
 
 impl BackendList {
@@ -152,7 +152,7 @@ impl BackendList {
     BackendList {
       backends:       Vec::new(),
       next_id:        0,
-      load_balancing: Box::new(RandAlg{}),
+      load_balancing: Box::new(RandomAlgorithm{}),
     }
   }
 
@@ -211,8 +211,8 @@ impl BackendList {
 
   pub fn set_load_balancing_policy(&mut self, load_balancing_policy: LoadBalancingAlgorithms) {
     match load_balancing_policy {
-      LoadBalancingAlgorithms::RoundRobin => self.load_balancing = Box::new(RoundRobinAlg{ next_backend: 0 }),
-      LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(RandAlg{}),
+      LoadBalancingAlgorithms::RoundRobin => self.load_balancing = Box::new(RoundRobinAlgorithm{ next_backend: 0 }),
+      LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(RandomAlgorithm{}),
     }
   }
 }
@@ -247,7 +247,7 @@ mod backends_test {
     let mut backend_map = BackendMap::new();
     let app_id = "myapp";
 
-    let backend_addr = "127.0.0.1:4567";
+    let backend_addr = "127.0.0.1:1236";
     let (sender, receiver) = channel();
     run_mock_tcp_server(backend_addr, receiver);
 

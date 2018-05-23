@@ -208,7 +208,7 @@ pub struct Application {
     pub https_redirect:    bool,
     #[serde(default)]
     pub proxy_protocol:    Option<ProxyProtocolConfig>,
-    #[serde(rename = "lb_policy")]
+    #[serde(rename = "load_balancing_policy")]
     pub load_balancing_policy: LoadBalancingAlgorithms,
 }
 
@@ -277,7 +277,7 @@ pub struct Backend {
     pub port:        u16,
     #[serde(default)]
     #[serde(skip_serializing_if="Option::is_none")]
-    pub lb_params:   Option<LoadBalancingParams>,
+    pub load_balancing_parameters: Option<LoadBalancingParams>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -500,7 +500,7 @@ mod tests {
 
   #[test]
   fn add_backend_test() {
-    let raw_json = r#"{"type": "ADD_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "ip_address": "yyy", "port": 8080, "lb_params": { "weight": 0 }}}"#;
+    let raw_json = r#"{"type": "ADD_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "ip_address": "yyy", "port": 8080, "load_balancing_parameters": { "weight": 0 }}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::AddBackend(Backend{
@@ -508,7 +508,7 @@ mod tests {
       backend_id: String::from("xxx-0"),
       ip_address: String::from("yyy"),
       port: 8080,
-      lb_params: Some(LoadBalancingParams{ weight: 0 }),
+      load_balancing_parameters: Some(LoadBalancingParams{ weight: 0 }),
     }));
   }
 
@@ -522,7 +522,7 @@ mod tests {
       backend_id: String::from("xxx-0"),
       ip_address: String::from("yyy"),
       port: 8080,
-      lb_params: None,
+      load_balancing_parameters: None,
     }));
   }
 

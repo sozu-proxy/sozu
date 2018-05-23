@@ -1179,7 +1179,7 @@ mod tests {
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
-    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1025, lb_params: Some(LoadBalancingParams::default()) };
+    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1025, load_balancing_parameters: Some(LoadBalancingParams::default()) };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1236,7 +1236,7 @@ mod tests {
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
-    let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1028, lb_params: Some(LoadBalancingParams::default()) };
+    let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1028, load_balancing_parameters: Some(LoadBalancingParams::default()) };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1315,7 +1315,7 @@ mod tests {
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddApplication(application) });
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddHttpFront(front) });
-    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1040, lb_params: Some(LoadBalancingParams::default()) };
+    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1040, load_balancing_parameters: Some(LoadBalancingParams::default()) };
     command.write_message(&OrderMessage { id: String::from("ID_IJKL"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());

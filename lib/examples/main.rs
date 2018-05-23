@@ -48,7 +48,7 @@ fn main() {
     backend_id: String::from("app_1-0"),
     ip_address:  String::from("127.0.0.1"),
     port:        1026,
-    lb_params:   Some(LoadBalancingParams::default()),
+    load_balancing_parameters: Some(LoadBalancingParams::default()),
   };
 
   command.write_message(&messages::OrderMessage {
@@ -123,7 +123,7 @@ fn main() {
     backend_id: String::from("app_1-0"),
     ip_address:  String::from("127.0.0.1"),
     port:        1026,
-    lb_params:   Some(LoadBalancingParams::default()),
+    load_balancing_parameters: Some(LoadBalancingParams::default()),
   };
 
   command2.write_message(&messages::OrderMessage {
@@ -165,7 +165,7 @@ fn main() {
     backend_id: String::from("app_2-0"),
     ip_address:  String::from("127.0.0.1"),
     port:        1026,
-    lb_params:   Some(LoadBalancingParams::default()),
+    load_balancing_parameters: Some(LoadBalancingParams::default()),
   };
 
   command2.write_message(&messages::OrderMessage {

@@ -984,7 +984,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       backend_id: String::from("yolo-0"),
       ip_address: String::from("127.0.0.1"),
       port: 5678,
-      lb_params: Some(LoadBalancingParams::default()),
+      load_balancing_parameters: Some(LoadBalancingParams::default()),
     };
 
     command.write_message(&OrderMessage { id: String::from("ID_YOLO1"), order: Order::AddTcpFront(front) });
@@ -1001,7 +1001,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       backend_id: String::from("yolo-0"),
       ip_address: String::from("127.0.0.1"),
       port: 5678,
-      lb_params: Some(LoadBalancingParams::default()),
+      load_balancing_parameters: Some(LoadBalancingParams::default()),
     };
     command.write_message(&OrderMessage { id: String::from("ID_YOLO3"), order: Order::AddTcpFront(front) });
     command.write_message(&OrderMessage { id: String::from("ID_YOLO4"), order: Order::AddBackend(backend) });

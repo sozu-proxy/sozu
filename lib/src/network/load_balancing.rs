@@ -6,16 +6,16 @@ use sozu_command::config::LoadBalancingAlgorithms;
 use std::{ rc::Rc, cell::RefCell };
 use std::fmt::Debug;
 
-pub trait LoadBalacingAlg: Debug {
+pub trait LoadBalancingAlgorithm: Debug {
   fn next_available_backend<'a>(&mut self, backends: &'a mut Vec<Rc<RefCell<Backend>>>) -> Option<&'a mut Rc<RefCell<Backend>>>;
 }
 
 #[derive(Debug)]
-pub struct RoundRobinAlg {
+pub struct RoundRobinAlgorithm {
   pub next_backend: u32,
 }
 
-impl LoadBalacingAlg for RoundRobinAlg {
+impl LoadBalancingAlgorithm for RoundRobinAlgorithm {
 
   fn next_available_backend<'a>(&mut self , backends: &'a mut Vec<Rc<RefCell<Backend>>>) -> Option<&'a mut Rc<RefCell<Backend>>> {
     let sz = backends.len() as u32;
@@ -32,7 +32,7 @@ impl LoadBalacingAlg for RoundRobinAlg {
 
 }
 
-impl RoundRobinAlg {
+impl RoundRobinAlgorithm {
 
   fn new() -> Self {
     Self {
@@ -43,9 +43,9 @@ impl RoundRobinAlg {
 }
 
 #[derive(Debug)]
-pub struct RandAlg;
+pub struct RandomAlgorithm;
 
-impl LoadBalacingAlg for RandAlg {
+impl LoadBalancingAlgorithm for RandomAlgorithm {
 
   fn next_available_backend<'a>(&mut self, backends: &'a mut Vec<Rc<RefCell<Backend>>>) -> Option<&'a mut Rc<RefCell<Backend>>> {
     let rnd = random::<usize>();
