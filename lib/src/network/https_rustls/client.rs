@@ -281,7 +281,11 @@ impl TlsClient {
       result
     } else {
       if self.upgrade() {
+        if (self.readiness().front_readiness & self.readiness().front_interest).is_writable() {
         self.writable()
+        } else {
+          ClientResult::Continue
+        }
       } else {
         ClientResult::CloseClient
       }
