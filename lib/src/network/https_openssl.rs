@@ -35,7 +35,7 @@ use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,Order,HttpsFront,HttpsProxyConfiguration,OrderMessage,
-  OrderMessageAnswer,OrderMessageStatus};
+  OrderMessageAnswer,OrderMessageStatus,LoadBalancingParams};
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::buffer_queue::BufferQueue;
@@ -898,8 +898,8 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
-    self.backends.add_backend(app_id, backend_id, backend_address);
+  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll, load_balancing_parameters: Option<LoadBalancingParams>) {
+    self.backends.add_backend(app_id, backend_id, backend_address, load_balancing_parameters);
   }
 
   pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
@@ -1269,7 +1269,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
-          self.add_backend(&backend.app_id, &backend.backend_id, &addr, event_loop);
+          self.add_backend(&backend.app_id, &backend.backend_id, &addr, event_loop, backend.load_balancing_parameters);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }

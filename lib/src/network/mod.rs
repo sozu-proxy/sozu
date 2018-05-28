@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use slab::{Entry,VacantEntry};
 use time::{precise_time_ns,SteadyTime,Duration};
 
-use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
+use sozu_command::messages::{OrderMessage,OrderMessageAnswer,LoadBalancingParams};
 
 pub mod buffer_queue;
 #[macro_use] pub mod metrics;
@@ -211,18 +211,18 @@ pub enum BackendStatus {
 
 #[derive(Debug,PartialEq,Eq)]
 pub struct Backend {
-  pub id:                 u32,
-  pub backend_id:         String,
-  pub address:            SocketAddr,
-  pub status:             BackendStatus,
-  pub retry_policy:       retry::RetryPolicyWrapper,
-  pub active_connections: usize,
-  pub failures:           usize,
-  pub weight:             u8,
+  pub id:                        u32,
+  pub backend_id:                String,
+  pub address:                   SocketAddr,
+  pub status:                    BackendStatus,
+  pub retry_policy:              retry::RetryPolicyWrapper,
+  pub active_connections:        usize,
+  pub failures:                  usize,
+  pub load_balancing_parameters: Option<LoadBalancingParams>,
 }
 
 impl Backend {
-  pub fn new(backend_id: &str, addr: SocketAddr, id: u32, weight: u8) -> Backend {
+  pub fn new(backend_id: &str, addr: SocketAddr, id: u32, load_balancing_parameters: Option<LoadBalancingParams>) -> Backend {
     let desired_policy = retry::ExponentialBackoffPolicy::new(10);
     Backend {
       id:                 id,
@@ -232,7 +232,7 @@ impl Backend {
       retry_policy:       desired_policy.into(),
       active_connections: 0,
       failures:           0,
-      weight,
+      load_balancing_parameters,
     }
   }
 
