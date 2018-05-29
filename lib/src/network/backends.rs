@@ -201,12 +201,21 @@ impl BackendList {
       })
   }
 
-  pub fn next_available_backend(&mut self) -> Option<&mut Rc<RefCell<Backend>>> {
-    if self.backends.len() == 0 {
-      return None
-    }
+  pub fn available_backends(&mut self) -> Vec<Rc<RefCell<Backend>>> {
+    self.backends.iter()
+      .filter(|backend| (*backend.borrow()).can_open())
+      .map(|backend| (*backend).clone())
+      .collect()
+  }
 
-    self.load_balancing.next_available_backend(&mut self.backends)
+  pub fn next_available_backend(&mut self) -> Option<Rc<RefCell<Backend>>> {
+    let backends = self.available_backends();
+
+    if backends.len() == 0 {
+      None
+    } else {
+      self.load_balancing.next_available_backend(&backends)
+    }
   }
 
   pub fn set_load_balancing_policy(&mut self, load_balancing_policy: LoadBalancingAlgorithms) {
