@@ -261,7 +261,10 @@ impl ServerConfiguration {
         Ok((backend, conn))  => {
           client.back_connected = BackendConnectionStatus::Connecting;
           if front_should_stick {
-            client.http().map(|http| http.sticky_session = Some(StickySession::new(backend.borrow().id.clone())));
+            client.http().map(|http| {
+              http.sticky_session = Some(StickySession::new(backend.borrow().id.clone()));
+              http.sticky_name = self.config.sticky_name.clone();
+            });
           }
           client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
           client.metrics.backend_start();
@@ -286,7 +289,10 @@ impl ServerConfiguration {
       },
       Ok((backend, conn))  => {
         client.back_connected = BackendConnectionStatus::Connecting;
-        client.http().map(|http| http.sticky_session = Some(StickySession::new(backend.borrow().id.clone())));
+        client.http().map(|http| {
+          http.sticky_session = Some(StickySession::new(backend.borrow().id.clone()));
+          http.sticky_name = self.config.sticky_name.clone();
+        });
         client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
         client.metrics.backend_start();
         client.backend = Some(backend);

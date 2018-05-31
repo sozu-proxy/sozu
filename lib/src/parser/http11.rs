@@ -527,7 +527,7 @@ impl<'a> Header<'a> {
     }
   }
 
-  pub fn should_delete(&self, conn: &Connection) -> bool {
+  pub fn should_delete(&self, conn: &Connection, sticky_name: &str) -> bool {
     let lowercase = self.name.to_ascii_lowercase();
     //FIXME: we should delete this header anyway, and add a Connection: Upgrade if we detected an upgrade
     if &lowercase[..] == b"connection" {
@@ -537,8 +537,7 @@ impl<'a> Header<'a> {
         None         => true
       }
     } else if &lowercase[..] == b"set-cookie" {
-      let look_for = b"SOZUBALANCEID=";
-      self.value.starts_with(look_for)
+      self.value.starts_with(sticky_name.as_bytes())
     } else {
       &lowercase[..] == b"connection" && &self.value.to_ascii_lowercase()[..] != b"upgrade" ||
       &lowercase[..] == b"forwarded"         ||
@@ -558,17 +557,17 @@ impl<'a> Header<'a> {
     }
   }
 
-  pub fn mutate_header(&self, buf: &[u8], offset: usize) -> Vec<BufferMove> {
+  pub fn mutate_header(&self, buf: &[u8], offset: usize, sticky_name: &str) -> Vec<BufferMove> {
     match &self.name.to_ascii_lowercase()[..] {
-      b"cookie" => self.remove_sticky_cookie_in_request(buf, offset),
+      b"cookie" => self.remove_sticky_cookie_in_request(buf, offset, sticky_name),
       _ => vec![BufferMove::Advance(offset)]
     }
   }
 
-  pub fn remove_sticky_cookie_in_request(&self, buf: &[u8], offset: usize) -> Vec<BufferMove> {
+  pub fn remove_sticky_cookie_in_request(&self, buf: &[u8], offset: usize, sticky_name: &str) -> Vec<BufferMove> {
     if let Some(cookies) = parse_request_cookies(self.value) {
       // if we don't find the cookie, don't go further
-      if let Some(sozu_balance_position) = cookies.iter().position(|cookie| &cookie.name[..] == b"SOZUBALANCEID") {
+      if let Some(sozu_balance_position) = cookies.iter().position(|cookie| &cookie.name[..] == sticky_name.as_bytes()) {
         // If we have only one cookie and that's the one, then we drop the whole header
         if cookies.len() == 1 {
           return vec![BufferMove::Delete(offset)];
@@ -1138,7 +1137,7 @@ pub fn default_request_result<O>(state: RequestState, res: IResult<&[u8], O>) ->
   }
 }
 
-pub fn validate_request_header(state: RequestState, header: &Header) -> RequestState {
+pub fn validate_request_header(state: RequestState, header: &Header, sticky_name: &str) -> RequestState {
   match header.value() {
     HeaderValue::Host(host) => {
       match state {
@@ -1218,7 +1217,7 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
       st
     },
     HeaderValue::Cookie(cookies) => {
-      let sticky_session_header = cookies.into_iter().find(|ref cookie| &cookie.name[..] == b"SOZUBALANCEID");
+      let sticky_session_header = cookies.into_iter().find(|ref cookie| &cookie.name[..] == sticky_name.as_bytes());
       if let Some(sticky_session) = sticky_session_header {
         let mut st = state;
         let backend_id = u32::from_str_radix(unsafe { str::from_utf8_unchecked(sticky_session.value) }, 10);
@@ -1233,15 +1232,15 @@ pub fn validate_request_header(state: RequestState, header: &Header) -> RequestS
   }
 }
 
-pub fn parse_header(buf: &mut Buffer, state: RequestState) -> IResult<&[u8], RequestState> {
+pub fn parse_header<'a>(buf: &'a mut Buffer, state: RequestState, sticky_name: &str) -> IResult<&'a [u8], RequestState> {
   match message_header(buf.data()) {
     IResult::Incomplete(i)   => IResult::Incomplete(i),
     IResult::Error(e)        => IResult::Error(e),
-    IResult::Done(i, header) => IResult::Done(i, validate_request_header(state, &header))
+    IResult::Done(i, header) => IResult::Done(i, validate_request_header(state, &header, sticky_name))
   }
 }
 
-pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestState) {
+pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (BufferMove, RequestState) {
   match state {
     RequestState::Initial => {
       match request_line(buf) {
@@ -1276,12 +1275,12 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
     RequestState::HasRequestLine(rl, conn) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          if header.should_delete(&conn) {
-            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
+          if header.should_delete(&conn, sticky_name) {
+            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header, sticky_name))
           } else if header.must_mutate() {
-            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i))), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
+            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header, sticky_name))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header))
+            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header, sticky_name))
           }
         },
         res => default_request_result(RequestState::HasRequestLine(rl, conn), res)
@@ -1290,12 +1289,12 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
     RequestState::HasHost(rl, conn, h) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          if header.should_delete(&conn) {
-            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
+          if header.should_delete(&conn, sticky_name) {
+            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header, sticky_name))
           } else if header.must_mutate() {
-            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i))), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
+            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name)), validate_request_header(RequestState::HasHost(rl, conn, h), &header, sticky_name))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header))
+            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header, sticky_name))
           }
         },
         IResult::Incomplete(_) => (BufferMove::None, RequestState::HasHost(rl, conn, h)),
@@ -1315,12 +1314,12 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
     RequestState::HasLength(rl, conn, l) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          if header.should_delete(&conn) {
-            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasLength(rl, conn, l), &header))
+          if header.should_delete(&conn, sticky_name) {
+            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasLength(rl, conn, l), &header, sticky_name))
           } else if header.must_mutate() {
-            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i))), validate_request_header(RequestState::HasLength(rl, conn, l), &header))
+            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name)), validate_request_header(RequestState::HasLength(rl, conn, l), &header, sticky_name))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasLength(rl, conn, l), &header))
+            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasLength(rl, conn, l), &header, sticky_name))
           }
         },
         res => default_request_result(RequestState::HasLength(rl, conn, l), res)
@@ -1329,12 +1328,12 @@ pub fn parse_request(state: RequestState, buf: &[u8]) -> (BufferMove, RequestSta
     RequestState::HasHostAndLength(rl, conn, h, l) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          if header.should_delete(&conn) {
-            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
+          if header.should_delete(&conn, sticky_name) {
+            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header, sticky_name))
           } else if header.must_mutate() {
-            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i))), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
+            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header, sticky_name))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header))
+            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header, sticky_name))
           }
         },
         IResult::Incomplete(_) => (BufferMove::None, RequestState::HasHostAndLength(rl, conn, h, l)),
@@ -1455,7 +1454,7 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
   }
 }
 
-pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool) -> (BufferMove, ResponseState) {
+pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_name: &str) -> (BufferMove, ResponseState) {
   match state {
     ResponseState::Initial => {
       match status_line(buf) {
@@ -1480,7 +1479,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool) -> (Buffe
     ResponseState::HasStatusLine(sl, conn) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          if header.should_delete(&conn) {
+          if header.should_delete(&conn, sticky_name) {
             (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header, is_head))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header, is_head))
@@ -1504,7 +1503,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool) -> (Buffe
     ResponseState::HasLength(sl, conn, length) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          if header.should_delete(&conn) {
+          if header.should_delete(&conn, sticky_name) {
             (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header, is_head))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header, is_head))
@@ -1531,7 +1530,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool) -> (Buffe
     ResponseState::HasUpgrade(sl, conn, protocol) => {
       match message_header(buf) {
         IResult::Done(i, header) => {
-          if header.should_delete(&conn) {
+          if header.should_delete(&conn, sticky_name) {
             (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasUpgrade(sl, conn, protocol), &header, is_head))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasUpgrade(sl, conn, protocol), &header, is_head))
@@ -1564,11 +1563,11 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool) -> (Buffe
 }
 
 #[allow(unused_variables)]
-pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue) -> HttpState {
+pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue, sticky_name: &str) -> HttpState {
   let mut current_state  = rs.request.take().expect("the request state should never be None outside of this function");
   let mut header_end     = rs.req_header_end;
   loop {
-    let (mv, new_state) = parse_request(current_state, buf.unparsed_data());
+    let (mv, new_state) = parse_request(current_state, buf.unparsed_data(), sticky_name);
     //println!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, &buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, &buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
@@ -1675,13 +1674,15 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
 }
 
 #[allow(unused_variables)]
-pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue, sticky_session: Option<StickySession>) -> HttpState {
+pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue,
+  sticky_name: &str, sticky_session: Option<StickySession>) -> HttpState {
+
   let mut current_state = rs.response.take().expect("the response state should never be None outside of this function");
   let mut header_end    = rs.res_header_end;
   let is_head = rs.request.as_ref().map(|request| request.is_head()).unwrap_or(false);
   loop {
     //trace!("PARSER\t{}\tpos[{}]: {:?}", request_id, position, current_state);
-    let (mv, new_state) = parse_response(current_state, buf.unparsed_data(), is_head);
+    let (mv, new_state) = parse_response(current_state, buf.unparsed_data(), is_head, sticky_name);
     //trace!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
     current_state = new_state;
@@ -1698,7 +1699,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
             ResponseState::ResponseWithBodyChunks(_,_,_) => {
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
-              add_sticky_session_to_response(&mut rs, buf, sticky_session);
+              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session);
 
               buf.slice_output(sz);
             },
@@ -1706,7 +1707,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
 
-              add_sticky_session_to_response(&mut rs, buf, sticky_session);
+              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session);
 
               buf.slice_output(sz+content_length);
               buf.consume_parsed_data(content_length);
@@ -1730,7 +1731,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
               //println!("FOUND HEADER END (delete):{}", buf.start_parsing_position);
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
-              add_sticky_session_to_response(&mut rs, buf, sticky_session);
+              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session);
 
               buf.delete_output(length);
             },
@@ -1739,7 +1740,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
               buf.delete_output(length);
 
-              add_sticky_session_to_response(&mut rs, buf, sticky_session);
+              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session);
 
               buf.slice_output(content_length);
               buf.consume_parsed_data(content_length);
@@ -1775,7 +1776,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
   rs
 }
 
-fn add_sticky_session_to_response(rs: &mut HttpState, buf: &mut BufferQueue, sticky_session: Option<StickySession>) {
+fn add_sticky_session_to_response(rs: &mut HttpState, buf: &mut BufferQueue, sticky_name: &str, sticky_session: Option<StickySession>) {
   if let Some(sticky_backend) = sticky_session {
     // if the client has a sticky session that's different from the current backend
     // (because the backend can no longer exist)
@@ -1787,7 +1788,7 @@ fn add_sticky_session_to_response(rs: &mut HttpState, buf: &mut BufferQueue, sti
       .unwrap_or(true);
 
     if send_sticky_to_client {
-      let sticky_cookie = format!("Set-Cookie: SOZUBALANCEID={}; Path=/\r\n", sticky_session.unwrap().backend_id);
+      let sticky_cookie = format!("Set-Cookie: {}={}; Path=/\r\n", sticky_name, sticky_session.unwrap().backend_id);
       buf.insert_output(Vec::from(sticky_cookie.as_bytes()));
     }
   }

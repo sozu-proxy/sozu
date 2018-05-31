@@ -66,6 +66,7 @@ pub struct Http<Front:SocketHandler> {
   pub log_ctx:        String,
   pub public_address: Option<IpAddr>,
   pub client_address: Option<SocketAddr>,
+  pub sticky_name:    String,
   pub sticky_session: Option<StickySession>,
   pub protocol:       Protocol,
 }
@@ -97,6 +98,7 @@ impl<Front:SocketHandler> Http<Front> {
       log_ctx:            log_ctx,
       public_address:     public_address,
       client_address:     client_address,
+      sticky_name:        String::from("SOZUBALANCEID"),
       sticky_session:     None,
       protocol:           protocol,
     };
@@ -500,7 +502,7 @@ impl<Front:SocketHandler> Http<Front> {
     let has_host = unwrap_msg!(self.state.as_ref()).has_host();
     if !has_host {
       self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-        &mut self.front_buf));
+        &mut self.front_buf, &self.sticky_name));
       if unwrap_msg!(self.state.as_ref()).is_front_error() {
         self.log_request_error(metrics, "front parsing error, closing the connection");
         metrics.service_stop();
@@ -547,7 +549,7 @@ impl<Front:SocketHandler> Http<Front> {
       Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
         if ! self.front_buf.needs_input() {
           self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-          &mut self.front_buf));
+          &mut self.front_buf, &self.sticky_name));
 
           if unwrap_msg!(self.state.as_ref()).is_front_error() {
             self.log_request_error(metrics, "front chunk parsing error, closing the connection");
@@ -565,7 +567,7 @@ impl<Front:SocketHandler> Http<Front> {
       },
     _ => {
         self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-          &mut self.front_buf));
+          &mut self.front_buf, &self.sticky_name));
 
         if unwrap_msg!(self.state.as_ref()).is_front_error() {
           self.log_request_error(metrics, "front parsing error, closing the connection");
@@ -946,7 +948,7 @@ impl<Front:SocketHandler> Http<Front> {
       Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
         if ! self.back_buf.needs_input() {
           self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-          &mut self.back_buf, self.sticky_session.take()));
+          &mut self.back_buf, &self.sticky_name, self.sticky_session.take()));
 
           if unwrap_msg!(self.state.as_ref()).is_back_error() {
             metrics.service_stop();
@@ -966,7 +968,7 @@ impl<Front:SocketHandler> Http<Front> {
       Some(ResponseState::Error(_,_,_,_,_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
       _ => {
         self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-        &mut self.back_buf, self.sticky_session.take()));
+        &mut self.back_buf, &self.sticky_name, self.sticky_session.take()));
 
         if unwrap_msg!(self.state.as_ref()).is_back_error() {
           metrics.service_stop();

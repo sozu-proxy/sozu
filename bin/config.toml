@@ -104,6 +104,10 @@ port = 8080
 #answer_404 = "../lib/assets/404.html"
 #answer_503 = "../lib/assets/503.html"
 
+# defines the sticky session cookie's name, if `sticky_session` is activated for
+# an application. Defaults to "SOZUBALANCEID"
+# sticky_name = "SOZUBALANCEID"
+
 # options specific to the HTTPS (OpenSSL basedor rustls based) proxy
 [https]
 address = "127.0.0.1"
@@ -111,6 +115,7 @@ port = 8443
 
 #answer_404 = "../lib/assets/404.html"
 #answer_503 = "../lib/assets/503.html"
+# sticky_name = "SOZUBALANCEID"
 
 # defines how the TLS protocol will be handled by sozu. Possible values
 # are "openssl" or "rustls". The "openssl" option will only work if sozu
