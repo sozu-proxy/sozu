@@ -1,4 +1,4 @@
-use rand::random;
+use rand::{thread_rng, Rng};
 
 use network::Backend;
 use sozu_command::config::LoadBalancingAlgorithms;
@@ -18,16 +18,10 @@ pub struct RoundRobinAlgorithm {
 impl LoadBalancingAlgorithm for RoundRobinAlgorithm {
 
   fn next_available_backend(&mut self , backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
-    let sz = backends.len() as u32;
     let res = backends.get(self.next_backend as usize)
                       .map(|backend| (*backend).clone());
 
-    self.next_backend = if self.next_backend + 1 == sz {
-      0
-    } else {
-      self.next_backend + 1
-    };
-
+    self.next_backend = (self.next_backend + 1) % backends.len() as u32;
     res
   }
 
@@ -49,11 +43,10 @@ pub struct RandomAlgorithm;
 impl LoadBalancingAlgorithm for RandomAlgorithm {
 
   fn next_available_backend(&mut self, backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
-    let rnd = random::<usize>();
-    let idx = rnd % backends.len();
+    let mut rng = thread_rng();
 
-    backends.get(idx)
-            .map(|backend| (*backend).clone())
+    rng.choose(backends)
+      .map(|backend| (*backend).clone())
   }
 
 }
