@@ -758,6 +758,7 @@ mod tests {
       default_name: None,
       tls_provider: None,
       expect_proxy: None,
+      sticky_name: "SOZUBALANCEID".to_string(),
     };
     println!("http: {:?}", to_string(&http));
     let https = ProxyConfig {
@@ -775,6 +776,7 @@ mod tests {
       default_name: None,
       tls_provider: None,
       expect_proxy: None,
+      sticky_name: "SOZUBALANCEID".to_string(),
     };
     println!("https: {:?}", to_string(&https));
     let config = FileConfig {

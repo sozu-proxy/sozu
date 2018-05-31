@@ -1944,7 +1944,7 @@ mod tests {
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);
@@ -1987,7 +1987,7 @@ mod tests {
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);
@@ -2026,7 +2026,7 @@ mod tests {
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);
@@ -2089,7 +2089,7 @@ mod tests {
       println!("unparsed data after consume(26):\n{}", buf.unparsed_data().to_hex(16));
       println!("buffer output: {:?}", buf.output_queue);
 
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("unparsed data after parsing:\n{}", buf.unparsed_data().to_hex(16));
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
@@ -2132,7 +2132,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 116);
       assert_eq!(
@@ -2167,7 +2167,7 @@ mod tests {
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]);
 
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 128);
       assert_eq!(
@@ -2203,7 +2203,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 136);
       assert_eq!(
@@ -2237,7 +2237,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer output: {:?}", buf.output_queue);
@@ -2274,7 +2274,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 40);
       assert_eq!(
@@ -2308,7 +2308,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer output: {:?}", buf.output_queue);
@@ -2346,7 +2346,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("end buf:\n{}", buf.buffer.data().to_hex(16));
       println!("result: {:?}", result);
       assert_eq!(buf.output_queue, vec!(
@@ -2384,7 +2384,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("end buf:\n{}", buf.buffer.data().to_hex(16));
       println!("result: {:?}", result);
       assert_eq!(buf.output_queue, vec!(
@@ -2425,7 +2425,7 @@ mod tests {
 
       let new_header = b"Sozu-Id: 123456789\r\n";
       initial.added_req_header = String::from("Sozu-Id: 123456789\r\n");
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer output: {:?}", buf.output_queue);
@@ -2528,7 +2528,7 @@ mod tests {
       buf.write(&input[..]);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 160);
       assert_eq!(
@@ -2571,7 +2571,7 @@ mod tests {
       buf.write(&input[..125]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 124);
       assert_eq!(
@@ -2595,7 +2595,7 @@ mod tests {
       buf.write(&input[125..140]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_request_until_stop(result, "", &mut buf);
+      let result = parse_request_until_stop(result, "", &mut buf,"SOZUBALANCEID");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 153);
       assert_eq!(
@@ -2617,7 +2617,7 @@ mod tests {
 
       buf.write(&input[153..]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_request_until_stop(result, "", &mut buf);
+      let result = parse_request_until_stop(result, "", &mut buf, "SOZUBALANCEID");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 160);
       assert_eq!(
@@ -2659,7 +2659,7 @@ mod tests {
       buf.write(&input[..78]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_response_until_stop(initial, "", &mut buf, None);
+      let result = parse_response_until_stop(initial, "", &mut buf, "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 81);
       assert_eq!(
@@ -2682,7 +2682,7 @@ mod tests {
       buf.write(&input[81..100]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_response_until_stop(result, "", &mut buf, None);
+      let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 110);
       assert_eq!(
@@ -2705,7 +2705,7 @@ mod tests {
       println!("remaining:\n{}", &input[110..].to_hex(16));
       buf.write(&input[110..116]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf, None);
+      let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 115);
       assert_eq!(
@@ -2727,7 +2727,7 @@ mod tests {
       //buf.consume(5);
       buf.write(&input[116..]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf, None);
+      let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 117);
       assert_eq!(
@@ -2781,7 +2781,7 @@ mod tests {
       buf.write(&input[..74]);
       buf.consume_parsed_data(72);
       //println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(initial, "", &mut buf, None);
+      let result = parse_response_until_stop(initial, "", &mut buf, "SOZUBALANCEID", None);
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("initial input:\n{}", &input[..72].to_hex(8));
@@ -2807,7 +2807,7 @@ mod tests {
       // we got the chunk header, but not the chunk content
       buf.write(&input[74..77]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf, None);
+      let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 81);
       assert_eq!(
@@ -2832,7 +2832,7 @@ mod tests {
       // the external code copied the chunk content directly, starting at next chunk end
       buf.write(&input[81..115]);
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf, None);
+      let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 115);
       assert_eq!(
@@ -2852,7 +2852,7 @@ mod tests {
       );
       buf.write(&input[115..]);
       println!("parsing\n{}", &input[115..].to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf, None);
+      let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 117);
       assert_eq!(
@@ -2887,7 +2887,7 @@ mod tests {
 
     let new_header = b"Sozu-Id: 123456789\r\n";
     initial.added_res_header = String::from("Sozu-Id: 123456789\r\n");
-    let result = parse_response_until_stop(initial, "", &mut buf, None);
+    let result = parse_response_until_stop(initial, "", &mut buf, "SOZUBALANCEID", None);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
@@ -2934,7 +2934,7 @@ mod tests {
 
     let new_header = b"Sozu-Id: 123456789\r\n";
     initial.added_res_header = String::from("Sozu-Id: 123456789\r\n");
-    let result = parse_response_until_stop(initial, "", &mut buf, None);
+    let result = parse_response_until_stop(initial, "", &mut buf, "SOZUBALANCEID", None);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
@@ -3008,7 +3008,7 @@ mod tests {
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
-      let result = parse_response_until_stop(initial, "", &mut buf, None);
+      let result = parse_response_until_stop(initial, "", &mut buf, "SOZUBALANCEID", None);
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);
@@ -3053,7 +3053,7 @@ mod tests {
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf);
+      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);
@@ -3118,9 +3118,9 @@ mod tests {
       _ => panic!()
     };
 
-    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len());
-    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len());
-    let moves3 = header3.remove_sticky_cookie_in_request(header_line3, header_line3.len());
+    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len(), "SOZUBALANCEID");
+    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len(), "SOZUBALANCEID");
+    let moves3 = header3.remove_sticky_cookie_in_request(header_line3, header_line3.len(), "SOZUBALANCEID");
     let expected1 = vec![BufferMove::Advance(header_line1.len())];
     let expected2 = vec![BufferMove::Advance(header_line2.len())];
     let expected3 = vec![BufferMove::Advance(header_line3.len())];
@@ -3145,8 +3145,8 @@ mod tests {
       _ => panic!()
     };
 
-    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len());
-    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len());
+    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len(), "SOZUBALANCEID");
+    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len(), "SOZUBALANCEID");
     let expected1 = vec![BufferMove::Delete(header_line1.len())];
     let expected2 = vec![BufferMove::Delete(header_line2.len())];
 
@@ -3175,9 +3175,9 @@ mod tests {
       _ => panic!()
     };
 
-    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len());
-    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len());
-    let moves3 = header3.remove_sticky_cookie_in_request(header_line3, header_line3.len());
+    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len(), "SOZUBALANCEID");
+    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len(), "SOZUBALANCEID");
+    let moves3 = header3.remove_sticky_cookie_in_request(header_line3, header_line3.len(), "SOZUBALANCEID");
     let expected1 = vec![BufferMove::Advance(7), BufferMove::Delete(16), BufferMove::Advance(7), BufferMove::Advance(2)];
     let expected2 = vec![BufferMove::Advance(8), BufferMove::Delete(18), BufferMove::Advance(7), BufferMove::Advance(2)];
     let expected3 = vec![BufferMove::Advance(8), BufferMove::Delete(17), BufferMove::Advance(7), BufferMove::Advance(2)];
@@ -3208,9 +3208,9 @@ mod tests {
       _ => panic!()
     };
 
-    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len());
-    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len());
-    let moves3 = header3.remove_sticky_cookie_in_request(header_line3, header_line3.len());
+    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len(), "SOZUBALANCEID");
+    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len(), "SOZUBALANCEID");
+    let moves3 = header3.remove_sticky_cookie_in_request(header_line3, header_line3.len(), "SOZUBALANCEID");
     let expected1 = vec![BufferMove::Advance(8), BufferMove::Advance(9), BufferMove::Delete(16), BufferMove::Advance(7), BufferMove::Advance(2)];
     let expected2 = vec![BufferMove::Advance(7), BufferMove::Advance(8), BufferMove::Delete(18), BufferMove::Advance(7), BufferMove::Advance(2)];
     let expected3 = vec![BufferMove::Advance(8), BufferMove::Advance(9), BufferMove::Delete(17), BufferMove::Advance(7), BufferMove::Advance(2)];
@@ -3247,10 +3247,10 @@ mod tests {
       _ => panic!()
     };
 
-    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len());
-    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len());
-    let moves3 = header3.remove_sticky_cookie_in_request(header_line3, header_line3.len());
-    let moves4 = header4.remove_sticky_cookie_in_request(header_line4, header_line4.len());
+    let moves1 = header1.remove_sticky_cookie_in_request(header_line1, header_line1.len(), "SOZUBALANCEID");
+    let moves2 = header2.remove_sticky_cookie_in_request(header_line2, header_line2.len(), "SOZUBALANCEID");
+    let moves3 = header3.remove_sticky_cookie_in_request(header_line3, header_line3.len(), "SOZUBALANCEID");
+    let moves4 = header4.remove_sticky_cookie_in_request(header_line4, header_line4.len(), "SOZUBALANCEID");
     let expected1 = vec![BufferMove::Advance(8), BufferMove::Advance(7), BufferMove::Delete(3), BufferMove::Delete(15), BufferMove::Advance(2)];
     let expected2 = vec![BufferMove::Advance(7), BufferMove::Advance(7), BufferMove::Delete(1), BufferMove::Delete(18), BufferMove::Advance(2)];
     let expected3 = vec![BufferMove::Advance(8), BufferMove::Advance(7), BufferMove::Delete(2), BufferMove::Delete(17), BufferMove::Advance(2)];
