@@ -66,6 +66,7 @@ pub struct Http<Front:SocketHandler> {
   pub log_ctx:        String,
   pub public_address: Option<IpAddr>,
   pub client_address: Option<SocketAddr>,
+  pub sticky_name:    String,
   pub sticky_session: Option<StickySession>,
   pub protocol:       Protocol,
 }
@@ -97,6 +98,7 @@ impl<Front:SocketHandler> Http<Front> {
       log_ctx:            log_ctx,
       public_address:     public_address,
       client_address:     client_address,
+      sticky_name:        String::from("SOZUBALANCEID"),
       sticky_session:     None,
       protocol:           protocol,
     };
@@ -469,28 +471,50 @@ impl<Front:SocketHandler> Http<Front> {
         self.readiness.reset();
         return ClientResult::CloseClient;
       },
+      SocketResult::Closed => {
+        //we were in keep alive but the peer closed the connection
+        //FIXME: what happens if the connection was just opened but no data came?
+        if unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial) {
+          metrics.service_stop();
+          self.readiness.reset();
+          return ClientResult::CloseClient;
+        } else {
+          self.log_request_error(metrics,
+            &format!("front socket error, closing the connection. Readiness: {:?}", self.readiness));
+          metrics.service_stop();
+          self.readiness.reset();
+          return ClientResult::CloseClient;
+        }
+      },
       SocketResult::WouldBlock => {
         self.readiness.front_readiness.remove(Ready::readable());
       },
       SocketResult::Continue => {}
     };
 
-    if unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial) {
-      gauge_add!("http.active_requests", 1);
-      incr!("http.requests");
-    }
+    self.readable_parse(metrics)
+  }
 
+
+  pub fn readable_parse(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
+    let is_initial = unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial);
     // if there's no host, continue parsing until we find it
     let has_host = unwrap_msg!(self.state.as_ref()).has_host();
     if !has_host {
       self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-        &mut self.front_buf));
+        &mut self.front_buf, &self.sticky_name));
       if unwrap_msg!(self.state.as_ref()).is_front_error() {
         self.log_request_error(metrics, "front parsing error, closing the connection");
         metrics.service_stop();
         //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
         self.readiness.front_interest.remove(Ready::readable());
         return ClientResult::CloseClient;
+      }
+
+      let is_now_initial = unwrap_msg!(self.state.as_ref()).request == Some(RequestState::Initial);
+      if is_initial && !is_now_initial {
+        gauge_add!("http.active_requests", 1);
+        incr!("http.requests");
       }
 
       if unwrap_msg!(self.state.as_ref()).has_host() {
@@ -525,7 +549,7 @@ impl<Front:SocketHandler> Http<Front> {
       Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
         if ! self.front_buf.needs_input() {
           self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-          &mut self.front_buf));
+          &mut self.front_buf, &self.sticky_name));
 
           if unwrap_msg!(self.state.as_ref()).is_front_error() {
             self.log_request_error(metrics, "front chunk parsing error, closing the connection");
@@ -543,7 +567,7 @@ impl<Front:SocketHandler> Http<Front> {
       },
     _ => {
         self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-          &mut self.front_buf));
+          &mut self.front_buf, &self.sticky_name));
 
         if unwrap_msg!(self.state.as_ref()).is_front_error() {
           self.log_request_error(metrics, "front parsing error, closing the connection");
@@ -638,7 +662,7 @@ impl<Front:SocketHandler> Http<Front> {
     }
 
     match res {
-      SocketResult::Error => {
+      SocketResult::Error | SocketResult::Closed => {
         metrics.service_stop();
         self.log_request_error(metrics, "error writing to front socket, closing");
         self.readiness.reset();
@@ -778,7 +802,7 @@ impl<Front:SocketHandler> Http<Front> {
       debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", self.log_ctx, front.0, back.0, sz, output_size);
     }
     match socket_res {
-      SocketResult::Error => {
+      SocketResult::Error | SocketResult::Closed => {
         metrics.service_stop();
         self.log_request_error(metrics, "back socket write error, closing connection");
         self.readiness.reset();
@@ -924,7 +948,7 @@ impl<Front:SocketHandler> Http<Front> {
       Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
         if ! self.back_buf.needs_input() {
           self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-          &mut self.back_buf, self.sticky_session.take()));
+          &mut self.back_buf, &self.sticky_name, self.sticky_session.take()));
 
           if unwrap_msg!(self.state.as_ref()).is_back_error() {
             metrics.service_stop();
@@ -944,7 +968,7 @@ impl<Front:SocketHandler> Http<Front> {
       Some(ResponseState::Error(_,_,_,_,_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
       _ => {
         self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-        &mut self.back_buf, self.sticky_session.take()));
+        &mut self.back_buf, &self.sticky_name, self.sticky_session.take()));
 
         if unwrap_msg!(self.state.as_ref()).is_back_error() {
           metrics.service_stop();

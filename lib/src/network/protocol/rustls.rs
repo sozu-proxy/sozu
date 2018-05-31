@@ -46,7 +46,12 @@ impl TlsHandshake {
         can_work = true;
 
         match self.session.read_tls(&mut self.stream) {
-          Ok(_) => {},
+          Ok(0) => {
+            error!("connection closed during handshake");
+            return (ProtocolResult::Continue, ClientResult::CloseClient);
+          },
+          Ok(_) => {
+          },
           Err(e) => match e.kind() {
             ErrorKind::WouldBlock => {
               self.readiness.front_readiness.remove(Ready::readable());

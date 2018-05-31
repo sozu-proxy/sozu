@@ -33,6 +33,12 @@ pub struct ProxyConfig {
   pub tls_versions:              Option<Vec<String>>,
   pub tls_provider:              Option<TlsProvider>,
   pub expect_proxy:              Option<bool>,
+  #[serde(default = "default_sticky_name")]
+  pub sticky_name:               String,
+}
+
+fn default_sticky_name() -> String {
+  String::from("SOZUBALANCEID")
 }
 
 impl ProxyConfig {
@@ -55,6 +61,7 @@ impl ProxyConfig {
         front:          addr,
         public_address: public_address,
         expect_proxy:   self.expect_proxy.unwrap_or(false),
+        sticky_name:    self.sticky_name.clone(),
         ..Default::default()
       };
 
@@ -141,6 +148,7 @@ impl ProxyConfig {
         cipher_list:     cipher_list,
         versions:        versions,
         expect_proxy:    expect_proxy,
+        sticky_name:     self.sticky_name.clone(),
         ..Default::default()
       };
 

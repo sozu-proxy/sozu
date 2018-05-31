@@ -163,15 +163,29 @@ impl TlsClient {
       self.protocol = Some(State::Expect(expect, ssl));
       false
     } else if let State::Handshake(handshake) = protocol {
-      info!("upgrading from handshake to HTTPS");
+      //info!("upgrading from handshake to HTTPS");
       if let Some(pool) = self.pool.upgrade() {
         let mut p = pool.borrow_mut();
 
-        if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-          let front_stream = FrontRustls {
+        if let (Some(mut front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
+          let mut front_stream = FrontRustls {
             stream:  handshake.stream,
             session: handshake.session,
           };
+
+          let res = front_stream.session.read(front_buf.buffer.space());
+          match res {
+            Ok(sz) =>{
+              //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
+              front_buf.buffer.fill(sz);
+              front_buf.sliced_input(sz);
+              count!("bytes_in", sz as i64);
+              self.metrics.bin += sz;
+            },
+            Err(e) => {
+              error!("read error: {:?}", e);
+            }
+          }
 
           let mut http = Http::new(front_stream, self.frontend_token, front_buf,
             back_buf, self.public_address.clone(), None, Protocol::HTTPS).unwrap();
@@ -267,7 +281,11 @@ impl TlsClient {
       result
     } else {
       if self.upgrade() {
+        if (self.readiness().front_readiness & self.readiness().front_interest).is_writable() {
         self.writable()
+        } else {
+          ClientResult::Continue
+        }
       } else {
         ClientResult::CloseClient
       }
@@ -400,16 +418,21 @@ impl ProxyClient for TlsClient {
       result.backends.push((app_id, addr.clone()));
     }
 
-    if self.back_connected() == BackendConnectionStatus::Connected {
-      gauge_add!("backend.connections", -1);
-    }
-
     if let Some(sock) = self.back_socket() {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
+      if self.back_connected() == BackendConnectionStatus::Connected {
+        gauge_add!("backend.connections", -1);
+      }
     }
 
-    gauge_add!("http.active_requests", -1);
+    if let Some(State::Http(ref http)) = self.protocol {
+      //if the state was initial, the connection was already reset
+      if unwrap_msg!(http.state.as_ref()).request != Some(RequestState::Initial) {
+        gauge_add!("http.active_requests", -1);
+      }
+    }
+
     result.tokens.push(self.frontend_token);
 
     result
@@ -424,7 +447,9 @@ impl ProxyClient for TlsClient {
     if let Some(sock) = self.back_socket() {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
-      gauge_add!("backend.connections", -1);
+      if self.back_connected() == BackendConnectionStatus::Connected {
+        gauge_add!("backend.connections", -1);
+      }
     }
 
     res

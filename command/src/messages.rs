@@ -293,6 +293,10 @@ impl Default for LoadBalancingParams {
   }
 }
 
+pub fn default_sticky_name() -> String {
+  String::from("SOZUBALANCEID")
+}
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpProxyConfiguration {
     pub front:           SocketAddr,
@@ -301,6 +305,8 @@ pub struct HttpProxyConfiguration {
     pub answer_503:      String,
     #[serde(default)]
     pub expect_proxy:    bool,
+    #[serde(default = "default_sticky_name")]
+    pub sticky_name:     String,
 }
 
 impl Default for HttpProxyConfiguration {
@@ -311,6 +317,7 @@ impl Default for HttpProxyConfiguration {
       answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
       answer_503:      String::from("HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
       expect_proxy:    false,
+      sticky_name:     String::from("SOZUBALANCEID"),
     }
   }
 }
@@ -343,6 +350,8 @@ pub struct HttpsProxyConfiguration {
     pub tls_provider:              TlsProvider,
     #[serde(default)]
     pub expect_proxy:              bool,
+    #[serde(default = "default_sticky_name")]
+    pub sticky_name:               String,
 }
 
 impl Default for HttpsProxyConfiguration {
@@ -375,6 +384,7 @@ impl Default for HttpsProxyConfiguration {
       default_certificate_chain: None,
       tls_provider:        TlsProvider::Rustls,
       expect_proxy:        false,
+      sticky_name:     String::from("SOZUBALANCEID"),
     }
   }
 }

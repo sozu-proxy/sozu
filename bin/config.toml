@@ -104,6 +104,10 @@ port = 8080
 #answer_404 = "../lib/assets/404.html"
 #answer_503 = "../lib/assets/503.html"
 
+# defines the sticky session cookie's name, if `sticky_session` is activated for
+# an application. Defaults to "SOZUBALANCEID"
+# sticky_name = "SOZUBALANCEID"
+
 # options specific to the HTTPS (OpenSSL basedor rustls based) proxy
 [https]
 address = "127.0.0.1"
@@ -111,6 +115,7 @@ port = 8443
 
 #answer_404 = "../lib/assets/404.html"
 #answer_503 = "../lib/assets/503.html"
+# sticky_name = "SOZUBALANCEID"
 
 # defines how the TLS protocol will be handled by sozu. Possible values
 # are "openssl" or "rustls". The "openssl" option will only work if sozu
@@ -149,8 +154,9 @@ default_app_id = "MyApp"
 # this is an example of a routing configuration for the HTTP and HTTPS proxies
 [applications.MyApp]
 
-# defaults to "roundrobin"
-load_balancing_policy="roundrobin"
+# per application load balancing algorithm. The possible values are
+# "roundrobin" and "random". Defaults to "roundrobin"
+# load_balancing_policy="roundrobin"
 
 # host name of the application
 hostname = "lolcatho.st"
@@ -161,6 +167,7 @@ hostname = "lolcatho.st"
 # list of backend servers for this application
 [[applications.MyApp.backends]]
 address = "127.0.0.1:1026"
+# used as load balancing parameter
 weight = 100
 
 # activates sticky sessions for this application
@@ -199,3 +206,4 @@ weight = 100
 [[applications.TcpTest.backends]]
 address = "127.0.0.1:4000"
 weight = 50
+

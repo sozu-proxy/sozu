@@ -47,7 +47,14 @@ impl MetricData {
         *v1 = v2;
       },
       (&mut MetricData::Gauge(ref mut v1), MetricData::GaugeAdd(v2)) => {
-        *v1 = (*v1 as i64 + v2) as usize;
+        debug_assert!(*v1 as i64 + v2 >= 0, "metric {} underflow: previous value: {}, adding: {}", key, v1, v2);
+        let res = *v1 as i64 + v2;
+        *v1 = if res >= 0 {
+          res as usize
+        } else {
+          error!("metric {} underflow: previous value: {}, adding: {}", key, v1, v2);
+          0
+        }
       },
       (&mut MetricData::Count(ref mut v1), MetricData::Count(v2)) => {
         *v1 += v2;

@@ -333,16 +333,21 @@ impl ProxyClient for TlsClient {
       result.backends.push((app_id, addr.clone()));
     }
 
-    if self.back_connected() == BackendConnectionStatus::Connected {
-      gauge_add!("backend.connections", -1);
-    }
-
     if let Some(sock) = self.back_socket() {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
+      if self.back_connected() == BackendConnectionStatus::Connected {
+        gauge_add!("backend.connections", -1);
+      }
     }
 
-    gauge_add!("http.active_requests", -1);
+    if let Some(State::Http(ref http)) = self.protocol {
+      //if the state was initial, the connection was already reset
+      if unwrap_msg!(http.state.as_ref()).request != Some(RequestState::Initial) {
+        gauge_add!("http.active_requests", -1);
+      }
+    }
+
     result.tokens.push(self.frontend_token);
 
     result
@@ -357,7 +362,9 @@ impl ProxyClient for TlsClient {
     if let Some(sock) = self.back_socket() {
       sock.shutdown(Shutdown::Both);
       poll.deregister(sock);
-      gauge_add!("backend.connections", -1);
+      if self.back_connected() == BackendConnectionStatus::Connected {
+        gauge_add!("backend.connections", -1);
+      }
     }
 
     res
@@ -964,7 +971,10 @@ impl ServerConfiguration {
         Ok((backend, conn))  => {
           client.back_connected = BackendConnectionStatus::Connecting;
           if front_should_stick {
-            client.http().map(|http| http.sticky_session = Some(StickySession::new(backend.borrow().id.clone())));
+            client.http().map(|http| {
+              http.sticky_session = Some(StickySession::new(backend.borrow().id.clone()))
+              http.sticky_name = self.config.sticky_name.clone();
+            });
           }
           client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
           client.metrics.backend_start();
@@ -989,7 +999,10 @@ impl ServerConfiguration {
       },
       Ok((backend, conn))  => {
         client.back_connected = BackendConnectionStatus::Connecting;
-        client.http().map(|http| http.sticky_session = Some(StickySession::new(backend.borrow().id.clone())));
+        client.http().map(|http| {
+          http.sticky_session = Some(StickySession::new(backend.borrow().id.clone()))
+          http.sticky_name = self.config.sticky_name.clone();
+        });
         client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
         client.metrics.backend_start();
         client.backend = Some(backend);
