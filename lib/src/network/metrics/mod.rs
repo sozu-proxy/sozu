@@ -52,6 +52,7 @@ impl MetricData {
         *v1 = if res >= 0 {
           res as usize
         } else {
+          error!("metric {} underflow: previous value: {}, adding: {}", key, v1, v2);
           0
         }
       },
