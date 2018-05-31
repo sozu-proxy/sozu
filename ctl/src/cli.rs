@@ -109,7 +109,7 @@ pub enum ApplicationCmd {
     send_proxy: bool,
     #[structopt(long = "expect-proxy", help = "Configures the client-facing connection to receive a PROXY protocol header version 2")]
     expect_proxy: bool,
-    #[structopt(long = "lb-policy", help = "Configures the load balacing policy")]
+    #[structopt(long = "load-balancing-policy", help = "Configures the load balancing policy")]
     load_balancing_policy: LoadBalancingAlgorithms,
   },
 }
