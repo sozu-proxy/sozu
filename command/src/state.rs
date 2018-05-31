@@ -5,10 +5,9 @@ use std::hash::{Hash, Hasher};
 use std::iter::FromIterator;
 use certificate::calculate_fingerprint;
 
-use config::LoadBalancingAlgorithms;
 use messages::{Application,CertFingerprint,CertificateAndKey,Order,
   HttpFront,HttpsFront,TcpFront,Backend,QueryAnswerApplication,
-  AddCertificate, RemoveCertificate,LoadBalancingParams};
+  AddCertificate, RemoveCertificate};
 
 pub type AppId = String;
 
@@ -399,7 +398,8 @@ pub fn get_application_ids_by_domain(state: &ConfigState, hostname: String, path
 #[cfg(test)]
 mod tests {
   use super::*;
-  use messages::{Order,HttpFront,Backend};
+  use config::LoadBalancingAlgorithms;
+  use messages::{Order,HttpFront,Backend,LoadBalancingParams};
 
   #[test]
   fn serialize() {

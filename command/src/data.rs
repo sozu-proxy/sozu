@@ -5,8 +5,7 @@ use std::fmt;
 use std::collections::BTreeMap;
 
 use state::ConfigState;
-use messages::{AggregatedMetricsData,Order,Query,QueryAnswer, LoadBalancingParams};
-use config::LoadBalancingAlgorithms;
+use messages::{AggregatedMetricsData,Order,Query,QueryAnswer};
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
@@ -328,8 +327,8 @@ mod tests {
   use certificate::split_certificate_chain;
   use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Backend};
   use messages::{AppMetricsData,MetricsData,FilteredData,Percentiles};
-  use messages::{AddCertificate,RemoveCertificate};
-  use config::ProxyProtocolConfig;
+  use messages::{AddCertificate,RemoveCertificate,LoadBalancingParams};
+  use config::{LoadBalancingAlgorithms,ProxyProtocolConfig};
 
   #[test]
   fn config_message_test() {

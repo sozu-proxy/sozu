@@ -4,7 +4,7 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::iter::repeat;
-use std::net::{ToSocketAddrs, SocketAddr};
+use std::net::SocketAddr;
 use std::collections::{HashMap,HashSet};
 use std::io::{self,Error,ErrorKind,Read};
 
