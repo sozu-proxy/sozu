@@ -326,7 +326,7 @@ mod tests {
   use hex::FromHex;
   use certificate::split_certificate_chain;
   use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Backend};
-  use messages::{AppMetricsData,MetricsData,FilteredData,Percentiles};
+  use messages::{AppMetricsData,MetricsData,FilteredData,Percentiles,RemoveBackend};
   use messages::{AddCertificate,RemoveCertificate,LoadBalancingParams};
   use config::{LoadBalancingAlgorithms,ProxyProtocolConfig};
 
@@ -489,6 +489,7 @@ mod tests {
                   ip_address: String::from("127.0.0.1"),
                   port: 8080,
                   load_balancing_parameters: Some(LoadBalancingParams{ weight: 0 }),
+                  sticky_id: Some(String::from("xxx-0")),
       })),
       proxy_id: None
     });
@@ -496,12 +497,11 @@ mod tests {
   test_message!(remove_backend, "../assets/remove_backend.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::RemoveBackend(Backend{
+      data:     ConfigCommand::ProxyConfiguration(Order::RemoveBackend(RemoveBackend{
                   app_id: String::from("xxx"),
                   backend_id: String::from("xxx-0"),
                   ip_address: String::from("127.0.0.1"),
                   port: 8080,
-                  load_balancing_parameters: None,
       })),
       proxy_id: None
     });

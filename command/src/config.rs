@@ -283,6 +283,7 @@ impl FromStr for LoadBalancingAlgorithms {
 pub struct BackendConfig {
   pub address: SocketAddr,
   pub weight: Option<u8>,
+  pub sticky_id: Option<String>,
 }
 
 impl FileAppConfig {
@@ -426,6 +427,7 @@ impl HttpAppConfig {
           ip_address: ip,
           port:       port,
           load_balancing_parameters,
+          sticky_id:  backend.sticky_id.clone(),
         }));
 
         backend_count += 1;
@@ -479,6 +481,7 @@ impl TcpAppConfig {
         ip_address: ip,
         port:       port,
         load_balancing_parameters,
+        sticky_id:  backend.sticky_id.clone(),
       }));
 
       backend_count += 1;

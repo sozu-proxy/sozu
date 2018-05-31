@@ -134,7 +134,7 @@ pub enum Order {
     RemoveTcpFront(TcpFront),
 
     AddBackend(Backend),
-    RemoveBackend(Backend),
+    RemoveBackend(RemoveBackend),
 
     HttpProxy(HttpProxyConfiguration),
     HttpsProxy(HttpsProxyConfiguration),
@@ -275,9 +275,18 @@ pub struct Backend {
     pub backend_id:  String,
     pub ip_address:  String,
     pub port:        u16,
+    pub sticky_id:   Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if="Option::is_none")]
     pub load_balancing_parameters: Option<LoadBalancingParams>,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct RemoveBackend {
+    pub app_id:      String,
+    pub backend_id:  String,
+    pub ip_address:  String,
+    pub port:        u16,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -518,6 +527,7 @@ mod tests {
       backend_id: String::from("xxx-0"),
       ip_address: String::from("yyy"),
       port: 8080,
+      sticky_id: None,
       load_balancing_parameters: Some(LoadBalancingParams{ weight: 0 }),
     }));
   }
@@ -527,12 +537,11 @@ mod tests {
     let raw_json = r#"{"type": "REMOVE_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "ip_address": "yyy", "port": 8080}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
-    assert!(command == Order::RemoveBackend(Backend{
+    assert!(command == Order::RemoveBackend(RemoveBackend {
       app_id: String::from("xxx"),
       backend_id: String::from("xxx-0"),
       ip_address: String::from("yyy"),
       port: 8080,
-      load_balancing_parameters: None,
     }));
   }
 

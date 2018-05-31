@@ -692,7 +692,7 @@ pub struct Connection {
   pub upgrade:        Option<String>,
   pub to_delete:      HashSet<String>,
   pub continues:      Continue,
-  pub sticky_session: Option<u32>,
+  pub sticky_session: Option<String>,
 }
 
 impl Connection {
@@ -1043,7 +1043,7 @@ impl HttpState {
     self.request.as_ref().map(|r| r.get_keep_alive()).expect("there should be a request")
   }
 
-  pub fn get_request_sticky_session(&self) -> Option<u32> {
+  pub fn get_request_sticky_session(&self) -> Option<String> {
     self.request.as_ref().and_then(|r| r.get_keep_alive()).and_then(|con| con.sticky_session)
   }
 
@@ -1220,8 +1220,7 @@ pub fn validate_request_header(state: RequestState, header: &Header, sticky_name
       let sticky_session_header = cookies.into_iter().find(|ref cookie| &cookie.name[..] == sticky_name.as_bytes());
       if let Some(sticky_session) = sticky_session_header {
         let mut st = state;
-        let backend_id = u32::from_str_radix(unsafe { str::from_utf8_unchecked(sticky_session.value) }, 10);
-        st.get_mut_connection().map(|conn| conn.sticky_session = backend_id.ok());
+        st.get_mut_connection().map(|conn| conn.sticky_session = str::from_utf8(sticky_session.value).map(|s| s.to_string()).ok());
 
         return st;
       }
@@ -1699,7 +1698,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
             ResponseState::ResponseWithBodyChunks(_,_,_) => {
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
-              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session);
+              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session.clone());
 
               buf.slice_output(sz);
             },
@@ -1707,7 +1706,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
 
-              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session);
+              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session.clone());
 
               buf.slice_output(sz+content_length);
               buf.consume_parsed_data(content_length);
@@ -1731,7 +1730,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
               //println!("FOUND HEADER END (delete):{}", buf.start_parsing_position);
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
-              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session);
+              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session.clone());
 
               buf.delete_output(length);
             },
@@ -1740,7 +1739,7 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
               buf.delete_output(length);
 
-              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session);
+              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session.clone());
 
               buf.slice_output(content_length);
               buf.consume_parsed_data(content_length);
@@ -1777,18 +1776,18 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
 }
 
 fn add_sticky_session_to_response(rs: &mut HttpState, buf: &mut BufferQueue, sticky_name: &str, sticky_session: Option<StickySession>) {
-  if let Some(sticky_backend) = sticky_session {
+  if let Some(sticky_backend) = sticky_session.as_ref() {
     // if the client has a sticky session that's different from the current backend
     // (because the backend can no longer exist)
     let send_sticky_to_client = rs.request
       .as_ref()
       .and_then(|request| request.get_keep_alive())
       .and_then(|conn| conn.sticky_session)
-      .map(|sticky_client| sticky_client != sticky_backend.backend_id)
+      .map(|sticky_client| sticky_client != sticky_backend.sticky_id)
       .unwrap_or(true);
 
     if send_sticky_to_client {
-      let sticky_cookie = format!("Set-Cookie: {}={}; Path=/\r\n", sticky_name, sticky_session.unwrap().backend_id);
+      let sticky_cookie = format!("Set-Cookie: {}={}; Path=/\r\n", sticky_name, sticky_backend.sticky_id);
       buf.insert_output(Vec::from(sticky_cookie.as_bytes()));
     }
   }

@@ -9,6 +9,7 @@
       "backend_id": "xxx-0",
       "ip_address": "127.0.0.1",
       "port": 8080,
+      "sticky_id": "xxx-0",
       "load_balancing_parameters": {
         "weight": 0
       }

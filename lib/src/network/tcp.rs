@@ -691,9 +691,10 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll, load_balancing_parameters: Option<LoadBalancingParams>) -> Option<ListenToken> {
+  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr,
+    sticky_id: Option<String>, load_balancing_parameters: Option<LoadBalancingParams>, event_loop: &mut Poll) -> Option<ListenToken> {
     use std::borrow::BorrowMut;
-    self.backends.add_backend(app_id, backend_id, backend_address, load_balancing_parameters);
+    self.backends.add_backend(app_id, backend_id, backend_address, sticky_id, load_balancing_parameters);
 
     let opt_tok = self.fronts.get(app_id).clone();
     if let Some(tok) = opt_tok {
@@ -803,7 +804,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       Order::AddBackend(backend) => {
         let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let addr = &addr_string.parse().unwrap();
-        if let Some(token) = self.add_backend(&backend.app_id, &backend.backend_id, addr, event_loop, backend.load_balancing_parameters) {
+        if let Some(token) = self.add_backend(&backend.app_id, &backend.backend_id, addr, backend.sticky_id.clone(), backend.load_balancing_parameters, event_loop) {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
         } else {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot add tcp backend")), data: None}
@@ -985,6 +986,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       ip_address: String::from("127.0.0.1"),
       port: 5678,
       load_balancing_parameters: Some(LoadBalancingParams::default()),
+      sticky_id: None,
     };
 
     command.write_message(&OrderMessage { id: String::from("ID_YOLO1"), order: Order::AddTcpFront(front) });
@@ -1002,6 +1004,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       ip_address: String::from("127.0.0.1"),
       port: 5678,
       load_balancing_parameters: Some(LoadBalancingParams::default()),
+      sticky_id: None,
     };
     command.write_message(&OrderMessage { id: String::from("ID_YOLO3"), order: Order::AddTcpFront(front) });
     command.write_message(&OrderMessage { id: String::from("ID_YOLO4"), order: Order::AddBackend(backend) });

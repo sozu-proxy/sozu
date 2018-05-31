@@ -199,8 +199,9 @@ impl ServerConfiguration {
     (*self.resolver).add_certificate(add);
   }
 
-  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll, load_balancing_parameters: Option<LoadBalancingParams>) {
-    self.backends.add_backend(app_id, backend_id, backend_address, load_balancing_parameters);
+  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr, sticky_id: Option<String>,
+    load_balancing_parameters: Option<LoadBalancingParams>,  event_loop: &mut Poll) {
+    self.backends.add_backend(app_id, backend_id, backend_address, sticky_id, load_balancing_parameters);
   }
 
   pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
@@ -266,7 +267,8 @@ impl ServerConfiguration {
           client.back_connected = BackendConnectionStatus::Connecting;
           if front_should_stick {
             client.http().map(|http| {
-              http.sticky_session = Some(StickySession::new(backend.borrow().id.clone()));
+              http.sticky_session =
+                Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or(backend.borrow().backend_id.clone())));
               http.sticky_name = self.config.sticky_name.clone();
             });
           }
@@ -282,10 +284,10 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_sticky_session(&mut self, client: &mut TlsClient, app_id: &str, sticky_session: u32) -> Result<TcpStream,ConnectionError> {
+  pub fn backend_from_sticky_session(&mut self, client: &mut TlsClient, app_id: &str, sticky_session: String) -> Result<TcpStream,ConnectionError> {
     client.http().map(|h| h.set_app_id(String::from(app_id)));
 
-    match self.backends.backend_from_sticky_session(app_id, sticky_session) {
+    match self.backends.backend_from_sticky_session(app_id, &sticky_session) {
       Err(e) => {
         debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
         client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
@@ -294,7 +296,7 @@ impl ServerConfiguration {
       Ok((backend, conn))  => {
         client.back_connected = BackendConnectionStatus::Connecting;
         client.http().map(|http| {
-          http.sticky_session = Some(StickySession::new(backend.borrow().id.clone()));
+          http.sticky_session = Some(StickySession::new(sticky_session));
           http.sticky_name = self.config.sticky_name.clone();
         });
         client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
@@ -571,7 +573,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
-          self.add_backend(&backend.app_id, &backend.backend_id, &addr, event_loop, backend.load_balancing_parameters);
+          self.add_backend(&backend.app_id, &backend.backend_id, &addr, backend.sticky_id.clone(), backend.load_balancing_parameters, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }

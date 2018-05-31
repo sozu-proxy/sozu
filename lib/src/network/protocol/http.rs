@@ -15,15 +15,15 @@ use network::socket::{SocketHandler,SocketResult};
 use network::protocol::ProtocolResult;
 use util::UnwrapLog;
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub struct StickySession {
-  pub backend_id: u32
+  pub sticky_id: String
 }
 
 impl StickySession {
-  pub fn new(backend_id: u32) -> StickySession {
+  pub fn new(backend_id: String) -> StickySession {
     StickySession {
-      backend_id: backend_id
+      sticky_id: backend_id
     }
   }
 }

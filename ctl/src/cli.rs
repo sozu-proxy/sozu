@@ -137,6 +137,8 @@ pub enum BackendCmd {
     ip: String,
     #[structopt(short = "p", long = "port")]
     port: u16,
+    #[structopt(short = "s", long = "sticky-id", help = "value for the sticky session cookie")]
+    sticky_id: Option<String>,
   },
 }
 

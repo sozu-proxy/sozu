@@ -169,6 +169,8 @@ hostname = "lolcatho.st"
 address = "127.0.0.1:1026"
 # used as load balancing parameter
 weight = 100
+# value of the sticky session cookie
+# sticky_id = "backend-1026"
 
 # activates sticky sessions for this application
 #sticky_session = false

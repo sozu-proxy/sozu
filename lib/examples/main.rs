@@ -45,7 +45,8 @@ fn main() {
 
   let http_backend = messages::Backend {
     app_id:      String::from("app_1"),
-    backend_id: String::from("app_1-0"),
+    backend_id:  String::from("app_1-0"),
+    sticky_id:   None,
     ip_address:  String::from("127.0.0.1"),
     port:        1026,
     load_balancing_parameters: Some(LoadBalancingParams::default()),
@@ -120,7 +121,8 @@ fn main() {
   });
   let tls_backend = messages::Backend {
     app_id:      String::from("app_1"),
-    backend_id: String::from("app_1-0"),
+    backend_id:  String::from("app_1-0"),
+    sticky_id:   None,
     ip_address:  String::from("127.0.0.1"),
     port:        1026,
     load_balancing_parameters: Some(LoadBalancingParams::default()),
@@ -162,7 +164,8 @@ fn main() {
 
   let tls_backend2 = messages::Backend {
     app_id:      String::from("app_2"),
-    backend_id: String::from("app_2-0"),
+    backend_id:  String::from("app_2-0"),
+    sticky_id:   None,
     ip_address:  String::from("127.0.0.1"),
     port:        1026,
     load_balancing_parameters: Some(LoadBalancingParams::default()),

@@ -211,7 +211,7 @@ pub enum BackendStatus {
 
 #[derive(Debug,PartialEq,Eq)]
 pub struct Backend {
-  pub id:                        u32,
+  pub sticky_id:                 Option<String>,
   pub backend_id:                String,
   pub address:                   SocketAddr,
   pub status:                    BackendStatus,
@@ -222,10 +222,10 @@ pub struct Backend {
 }
 
 impl Backend {
-  pub fn new(backend_id: &str, addr: SocketAddr, id: u32, load_balancing_parameters: Option<LoadBalancingParams>) -> Backend {
+  pub fn new(backend_id: &str, addr: SocketAddr, sticky_id: Option<String>, load_balancing_parameters: Option<LoadBalancingParams>) -> Backend {
     let desired_policy = retry::ExponentialBackoffPolicy::new(10);
     Backend {
-      id:                 id,
+      sticky_id:          sticky_id,
       backend_id:         backend_id.to_string(),
       address:            addr,
       status:             BackendStatus::Normal,

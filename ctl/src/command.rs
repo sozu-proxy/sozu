@@ -4,7 +4,7 @@ use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 use sozu_command::messages::{Application, Order, Backend, HttpFront, HttpsFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
-  AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams};
+  AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend};
 
 use serde_json;
 use std::collections::{HashMap,HashSet};
@@ -845,23 +845,23 @@ pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>,
 }
 
 
-pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, backend_id: &str, ip: &str, port: u16) {
+pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, backend_id: &str, ip: &str, port: u16, sticky_id: Option<String>) {
   order_command(channel, timeout, Order::AddBackend(Backend {
       app_id: String::from(app_id),
       backend_id: String::from(backend_id),
       ip_address: String::from(ip),
       port: port,
       load_balancing_parameters: Some(LoadBalancingParams::default()),
+      sticky_id: sticky_id,
     }));
 }
 
 pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, backend_id: &str, ip: &str, port: u16) {
-    order_command(channel, timeout, Order::RemoveBackend(Backend {
+    order_command(channel, timeout, Order::RemoveBackend(RemoveBackend {
       app_id: String::from(app_id),
       backend_id: String::from(backend_id),
       ip_address: String::from(ip),
       port: port,
-      load_balancing_parameters: Some(LoadBalancingParams::default()),
     }));
 }
 
