@@ -1,3 +1,5 @@
+use sozu_command::config::LoadBalancingAlgorithms;
+
 #[derive(StructOpt, PartialEq, Debug)]
 pub struct App {
   #[structopt(short="c", long = "config", help = "Sets a custom config file")]
@@ -107,6 +109,8 @@ pub enum ApplicationCmd {
     send_proxy: bool,
     #[structopt(long = "expect-proxy", help = "Configures the client-facing connection to receive a PROXY protocol header version 2")]
     expect_proxy: bool,
+    #[structopt(long = "load-balancing-policy", help = "Configures the load balancing policy")]
+    load_balancing_policy: LoadBalancingAlgorithms,
   },
 }
 

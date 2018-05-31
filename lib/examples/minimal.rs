@@ -9,6 +9,7 @@ use std::io::stdout;
 use sozu::network;
 use sozu_command::messages;
 use sozu_command::channel::Channel;
+use sozu_command::messages::LoadBalancingParams;
 use sozu::logging::{Logger,LoggerBackend};
 
 fn main() {
@@ -39,10 +40,11 @@ fn main() {
     path_begin: String::from("/"),
   };
   let http_backend = messages::Backend {
-    app_id:      String::from("test"),
-    backend_id: String::from("test-0"),
-    ip_address:  String::from("127.0.0.1"),
-    port:        8000
+    app_id:                    String::from("test"),
+    backend_id:                String::from("test-0"),
+    ip_address:                String::from("127.0.0.1"),
+    port:                      8000,
+    load_balancing_parameters: Some(LoadBalancingParams::default()),
   };
 
   command.write_message(&messages::OrderMessage {

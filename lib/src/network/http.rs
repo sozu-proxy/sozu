@@ -22,7 +22,7 @@ use slab::{Entry,VacantEntry,Slab};
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::scm_socket::ScmSocket;
-use sozu_command::messages::{self,Application,Order,HttpFront,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
+use sozu_command::messages::{self,Application,Order,HttpFront,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus, LoadBalancingParams};
 
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
@@ -588,7 +588,11 @@ impl ServerConfiguration {
   }
 
   pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
+    let app_id = &application.app_id.clone();
+    let lb_alg = application.load_balancing_policy;
+
     self.applications.insert(application.app_id.clone(), application);
+    self.backends.set_load_balancing_policy_for_app(app_id, lb_alg);
   }
 
   pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
@@ -633,8 +637,8 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
-    self.backends.add_backend(app_id, backend_id, backend_address);
+  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll, load_balancing_parameters: Option<LoadBalancingParams>) {
+    self.backends.add_backend(app_id, backend_id, backend_address, load_balancing_parameters);
   }
 
   pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
@@ -931,7 +935,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
-          self.add_backend(&backend.app_id, &backend.backend_id, &addr, event_loop);
+          self.add_backend(&backend.app_id, &backend.backend_id, &addr, event_loop, backend.load_balancing_parameters);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }
@@ -1163,9 +1167,10 @@ mod tests {
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
-  use sozu_command::messages::{Order,HttpFront,Backend,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer};
+  use sozu_command::messages::{Order,HttpFront,Backend,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer, LoadBalancingParams};
   use network::buffer_queue::BufferQueue;
   use pool::Pool;
+  use sozu_command::config::LoadBalancingAlgorithms;
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
@@ -1189,7 +1194,7 @@ mod tests {
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
-    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1025 };
+    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1025, load_balancing_parameters: Some(LoadBalancingParams::default()) };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1246,7 +1251,7 @@ mod tests {
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
-    let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1028 };
+    let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1028, load_balancing_parameters: Some(LoadBalancingParams::default()) };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1321,11 +1326,11 @@ mod tests {
       start(config, channel, 10, 16384);
     });
 
-    let application = Application { app_id: String::from("app_1"), sticky_session: false, https_redirect: true, proxy_protocol: None };
+    let application = Application { app_id: String::from("app_1"), sticky_session: false, https_redirect: true, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::default() };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddApplication(application) });
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddHttpFront(front) });
-    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1040 };
+    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1040, load_balancing_parameters: Some(LoadBalancingParams::default()) };
     command.write_message(&OrderMessage { id: String::from("ID_IJKL"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());

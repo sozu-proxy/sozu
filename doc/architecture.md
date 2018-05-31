@@ -21,7 +21,7 @@ TODO
 
 TODO
 
-## Load balacing
+## Load balancing
 
 TODO
 

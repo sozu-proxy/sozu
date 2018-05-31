@@ -8,7 +8,8 @@
       "app_id": "xxx",
       "sticky_session": true,
       "https_redirect": true,
-      "proxy_protocol": "EXPECT_HEADER"
+      "proxy_protocol": "EXPECT_HEADER",
+      "load_balancing_policy": "roundrobin"
     }
   }
 }

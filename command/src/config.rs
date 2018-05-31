@@ -1,9 +1,10 @@
 //! parsing data from the configuration file
+use std::{error, fmt};
 use std::fs::File;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::iter::repeat;
-use std::net::ToSocketAddrs;
+use std::net::{ToSocketAddrs, SocketAddr};
 use std::collections::{HashMap,HashSet};
 use std::io::{self,Error,ErrorKind,Read};
 
@@ -12,7 +13,7 @@ use toml;
 
 use messages::Application;
 use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,TcpFront,Backend,
-  HttpProxyConfiguration,HttpsProxyConfiguration,AddCertificate,TlsProvider};
+  HttpProxyConfiguration,HttpsProxyConfiguration,AddCertificate,TlsProvider,LoadBalancingParams};
 
 use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
 
@@ -222,13 +223,66 @@ pub struct FileAppConfig {
   pub certificate:       Option<String>,
   pub key:               Option<String>,
   pub certificate_chain: Option<String>,
-  pub backends:          Vec<String>,
+  pub backends:          Vec<BackendConfig>,
   pub sticky_session:    Option<bool>,
   pub https_redirect:    Option<bool>,
   #[serde(default)]
   pub send_proxy:        Option<bool>,
   #[serde(default)]
   pub expect_proxy:      Option<bool>,
+  #[serde(default)]
+  pub load_balancing_policy: LoadBalancingAlgorithms,
+}
+
+#[derive(Debug,Copy,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoadBalancingAlgorithms {
+  RoundRobin,
+  Random,
+}
+
+impl Default for LoadBalancingAlgorithms {
+  fn default() -> Self {
+    LoadBalancingAlgorithms::RoundRobin
+  }
+}
+
+#[derive(Debug)]
+pub struct ParseErrorLoadBalancing;
+
+impl fmt::Display for ParseErrorLoadBalancing {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Cannot find the load balancing policy asked")
+    }
+}
+
+impl error::Error for ParseErrorLoadBalancing {
+    fn description(&self) -> &str {
+        "Cannot find the load balancing policy asked"
+    }
+
+    fn cause(&self) -> Option<&error::Error> {
+        None
+    }
+}
+
+impl FromStr for LoadBalancingAlgorithms {
+  type Err = ParseErrorLoadBalancing;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    match s {
+      "roundrobin" => Ok(LoadBalancingAlgorithms::RoundRobin),
+      "random" => Ok(LoadBalancingAlgorithms::Random),
+      _ => Err(ParseErrorLoadBalancing{}),
+    }
+  }
+}
+
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+pub struct BackendConfig {
+  pub address: SocketAddr,
+  pub weight: Option<u8>,
 }
 
 impl FileAppConfig {
@@ -253,6 +307,7 @@ impl FileAppConfig {
             port:           port,
             backends:       self.backends,
             proxy_protocol,
+            load_balancing_policy: self.load_balancing_policy,
           }))
         },
         (None, Some(_)) => Err(String::from("missing IP address for TCP application")),
@@ -293,6 +348,7 @@ impl FileAppConfig {
         backends:          self.backends,
         sticky_session:    sticky_session,
         https_redirect:    https_redirect,
+        load_balancing_policy: self.load_balancing_policy,
       }))
     }
   }
@@ -306,9 +362,10 @@ pub struct HttpAppConfig {
   pub certificate:       Option<String>,
   pub key:               Option<String>,
   pub certificate_chain: Option<Vec<String>>,
-  pub backends:          Vec<String>,
+  pub backends:          Vec<BackendConfig>,
   pub sticky_session:    bool,
   pub https_redirect:    bool,
+  pub load_balancing_policy: LoadBalancingAlgorithms,
 }
 
 impl HttpAppConfig {
@@ -320,6 +377,7 @@ impl HttpAppConfig {
       sticky_session: self.sticky_session.clone(),
       https_redirect: self.https_redirect.clone(),
       proxy_protocol: None,
+      load_balancing_policy: self.load_balancing_policy,
     }));
 
     //create the front both for HTTP and HTTPS if possible
@@ -354,24 +412,23 @@ impl HttpAppConfig {
     }
 
     let mut backend_count = 0usize;
-    for address_str in self.backends.iter() {
-      if let Ok(address_list) = address_str.to_socket_addrs() {
-        for address in address_list {
-          let ip   = format!("{}", address.ip());
-          let port = address.port();
+    for backend in self.backends.iter() {
+        let ip   = format!("{}", backend.address.ip());
+        let port = backend.address.port();
 
-          v.push(Order::AddBackend(Backend {
-            app_id:     self.app_id.clone(),
-            backend_id:  format!("{}-{}", self.app_id, backend_count),
-            ip_address: ip,
-            port:       port
-          }));
+        let load_balancing_parameters = Some(LoadBalancingParams {
+          weight: backend.weight.unwrap_or(100),
+        });
 
-          backend_count += 1;
-        }
-      } else {
-        error!("could not parse address: {}", address_str);
-      }
+        v.push(Order::AddBackend(Backend {
+          app_id:     self.app_id.clone(),
+          backend_id:  format!("{}-{}", self.app_id, backend_count),
+          ip_address: ip,
+          port:       port,
+          load_balancing_parameters,
+        }));
+
+        backend_count += 1;
     }
 
     v
@@ -383,9 +440,10 @@ pub struct TcpAppConfig {
   pub app_id:            String,
   pub ip_address:        String,
   pub port:              u16,
-  pub backends:          Vec<String>,
+  pub backends:          Vec<BackendConfig>,
   #[serde(default)]
   pub proxy_protocol:    Option<ProxyProtocolConfig>,
+  pub load_balancing_policy: LoadBalancingAlgorithms,
 }
 
 impl TcpAppConfig {
@@ -397,6 +455,7 @@ impl TcpAppConfig {
       sticky_session: false,
       https_redirect: false,
       proxy_protocol: self.proxy_protocol.clone(),
+      load_balancing_policy: self.load_balancing_policy,
     }));
 
     v.push(Order::AddTcpFront(TcpFront {
@@ -406,24 +465,23 @@ impl TcpAppConfig {
     }));
 
     let mut backend_count = 0usize;
-    for address_str in self.backends.iter() {
-      if let Ok(address_list) = address_str.to_socket_addrs() {
-        for address in address_list {
-          let ip   = format!("{}", address.ip());
-          let port = address.port();
+    for backend in self.backends.iter() {
+      let ip   = format!("{}", backend.address.ip());
+      let port = backend.address.port();
 
-          v.push(Order::AddBackend(Backend {
-            app_id:     self.app_id.clone(),
-            backend_id: format!("{}-{}", self.app_id, backend_count),
-            ip_address: ip,
-            port:       port
-          }));
+      let load_balancing_parameters = Some(LoadBalancingParams {
+        weight: backend.weight.unwrap_or(100),
+      });
 
-          backend_count += 1;
-        }
-      } else {
-        error!("could not parse address: {}", address_str);
-      }
+      v.push(Order::AddBackend(Backend {
+        app_id:     self.app_id.clone(),
+        backend_id: format!("{}-{}", self.app_id, backend_count),
+        ip_address: ip,
+        port:       port,
+        load_balancing_parameters,
+      }));
+
+      backend_count += 1;
     }
 
     v

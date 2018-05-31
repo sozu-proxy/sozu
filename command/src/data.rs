@@ -5,7 +5,8 @@ use std::fmt;
 use std::collections::BTreeMap;
 
 use state::ConfigState;
-use messages::{AggregatedMetricsData,Order,Query,QueryAnswer};
+use messages::{AggregatedMetricsData,Order,Query,QueryAnswer, LoadBalancingParams};
+use config::LoadBalancingAlgorithms;
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
@@ -394,6 +395,7 @@ mod tests {
                   sticky_session: true,
                   https_redirect: true,
                   proxy_protocol: Some(ProxyProtocolConfig::ExpectHeader),
+                  load_balancing_policy: LoadBalancingAlgorithms::RoundRobin,
       })),
       proxy_id: None
     });
@@ -487,6 +489,7 @@ mod tests {
                   backend_id: String::from("xxx-0"),
                   ip_address: String::from("127.0.0.1"),
                   port: 8080,
+                  load_balancing_parameters: Some(LoadBalancingParams{ weight: 0 }),
       })),
       proxy_id: None
     });
@@ -499,6 +502,7 @@ mod tests {
                   backend_id: String::from("xxx-0"),
                   ip_address: String::from("127.0.0.1"),
                   port: 8080,
+                  load_balancing_parameters: None,
       })),
       proxy_id: None
     });

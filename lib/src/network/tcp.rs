@@ -23,8 +23,8 @@ use pool::{Pool,Checkout,Reset};
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
-use sozu_command::config::ProxyProtocolConfig;
-use sozu_command::messages::{self,TcpFront,Order,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
+use sozu_command::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
+use sozu_command::messages::{self,TcpFront,Order,OrderMessage,OrderMessageAnswer,OrderMessageStatus,LoadBalancingParams};
 
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
@@ -579,6 +579,7 @@ pub struct ApplicationListener {
 #[derive(Debug)]
 pub struct ApplicationConfiguration {
   proxy_protocol: Option<ProxyProtocolConfig>,
+  load_balancing_policy: LoadBalancingAlgorithms,
 }
 
 pub struct ServerConfiguration {
@@ -690,9 +691,9 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken> {
+  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll, load_balancing_parameters: Option<LoadBalancingParams>) -> Option<ListenToken> {
     use std::borrow::BorrowMut;
-    self.backends.add_backend(app_id, backend_id, backend_address);
+    self.backends.add_backend(app_id, backend_id, backend_address, load_balancing_parameters);
 
     let opt_tok = self.fronts.get(app_id).clone();
     if let Some(tok) = opt_tok {
@@ -802,7 +803,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       Order::AddBackend(backend) => {
         let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let addr = &addr_string.parse().unwrap();
-        if let Some(token) = self.add_backend(&backend.app_id, &backend.backend_id, addr, event_loop) {
+        if let Some(token) = self.add_backend(&backend.app_id, &backend.backend_id, addr, event_loop, backend.load_balancing_parameters) {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
         } else {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot add tcp backend")), data: None}
@@ -848,8 +849,11 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       Order::AddApplication(application) => {
         let config = ApplicationConfiguration {
           proxy_protocol: application.proxy_protocol,
+          load_balancing_policy: application.load_balancing_policy,
         };
-        self.configs.insert(application.app_id, config);
+        self.configs.insert(application.app_id.clone(), config);
+        self.backends.set_load_balancing_policy_for_app(&application.app_id, application.load_balancing_policy);
+
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::RemoveApplication(_) => {
@@ -980,6 +984,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       backend_id: String::from("yolo-0"),
       ip_address: String::from("127.0.0.1"),
       port: 5678,
+      load_balancing_parameters: Some(LoadBalancingParams::default()),
     };
 
     command.write_message(&OrderMessage { id: String::from("ID_YOLO1"), order: Order::AddTcpFront(front) });
@@ -996,6 +1001,7 @@ pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
       backend_id: String::from("yolo-0"),
       ip_address: String::from("127.0.0.1"),
       port: 5678,
+      load_balancing_parameters: Some(LoadBalancingParams::default()),
     };
     command.write_message(&OrderMessage { id: String::from("ID_YOLO3"), order: Order::AddTcpFront(front) });
     command.write_message(&OrderMessage { id: String::from("ID_YOLO4"), order: Order::AddBackend(backend) });

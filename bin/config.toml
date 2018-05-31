@@ -154,6 +154,10 @@ default_app_id = "MyApp"
 # this is an example of a routing configuration for the HTTP and HTTPS proxies
 [applications.MyApp]
 
+# per application load balancing algorithm. The possible values are
+# "roundrobin" and "random". Defaults to "roundrobin"
+# load_balancing_policy="roundrobin"
+
 # host name of the application
 hostname = "lolcatho.st"
 
@@ -161,7 +165,10 @@ hostname = "lolcatho.st"
 #path_begin = "/api" # optional
 
 # list of backend servers for this application
-backends = [ "127.0.0.1:1026" ] # list of IP/port
+[[applications.MyApp.backends]]
+address = "127.0.0.1:1026"
+# used as load balancing parameter
+weight = 100
 
 # activates sticky sessions for this application
 #sticky_session = false
@@ -186,11 +193,17 @@ ip_address = "127.0.0.1"
 # port for the listener
 port = 8081
 
-# list of backend servers for this application
-backends = [ "127.0.0.1:1026" ] # list of IP/port
-
 # activates the proxy protocol to send IP information to the backend
 # send_proxy = false
 
 # Configures the client-facing connection to receive a PROXY protocol header
 # expect_proxy = false
+
+[[applications.TcpTest.backends]]
+address = "127.0.0.1:4001"
+weight = 100
+
+[[applications.TcpTest.backends]]
+address = "127.0.0.1:4000"
+weight = 50
+
