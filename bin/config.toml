@@ -149,6 +149,9 @@ default_app_id = "MyApp"
 # this is an example of a routing configuration for the HTTP and HTTPS proxies
 [applications.MyApp]
 
+# defaults to "roundrobin"
+load_balancing_policy="roundrobin"
+
 # host name of the application
 hostname = "lolcatho.st"
 
@@ -182,9 +185,6 @@ certificate_chain = "../lib/assets/certificate_chain.pem" # optional
 ip_address = "127.0.0.1"
 # port for the listener
 port = 8081
-
-# list of backend servers for this application
-#backends = [ "127.0.0.1:1026", "127.0.0.1:1027" ] # list of IP/port
 
 # activates the proxy protocol to send IP information to the backend
 # send_proxy = false
