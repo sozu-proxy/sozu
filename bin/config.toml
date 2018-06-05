@@ -164,14 +164,6 @@ hostname = "lolcatho.st"
 # an application can receive requests going to a hostname and path prefix
 #path_begin = "/api" # optional
 
-# list of backend servers for this application
-[[applications.MyApp.backends]]
-address = "127.0.0.1:1026"
-# used as load balancing parameter
-weight = 100
-# value of the sticky session cookie
-# sticky_id = "backend-1026"
-
 # activates sticky sessions for this application
 #sticky_session = false
 #
@@ -187,6 +179,14 @@ certificate = "../lib/assets/certificate.pem" # optional
 key = "../lib/assets/key.pem" # optional
 # certificate chain for this application
 certificate_chain = "../lib/assets/certificate_chain.pem" # optional
+
+# list of backend servers for this application
+[[applications.MyApp.backends]]
+address = "127.0.0.1:1026"
+# used as load balancing parameter
+weight = 100
+# value of the sticky session cookie
+# sticky_id = "backend-1026"
 
 # this is an example of a routing configuration for the TCP proxy
 [applications.TcpTest]
