@@ -727,7 +727,7 @@ impl ServerConfiguration {
       Ok((backend, conn))  => {
         client.back_connected = BackendConnectionStatus::Connecting;
         client.http().map(|http| {
-          http.sticky_session = Some(StickySession::new(sticky_session));
+          http.sticky_session = Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or(sticky_session.clone())));
           http.sticky_name = self.config.sticky_name.clone();
         });
         client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
