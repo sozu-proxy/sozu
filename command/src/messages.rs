@@ -275,6 +275,7 @@ pub struct Backend {
     pub backend_id:  String,
     pub ip_address:  String,
     pub port:        u16,
+    #[serde(default)]
     pub sticky_id:   Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if="Option::is_none")]
