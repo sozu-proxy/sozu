@@ -64,10 +64,12 @@ pub struct Client {
   sticky_session: bool,
   metrics:        SessionMetrics,
   pub app_id:     Option<String>,
+  sticky_name:    String,
 }
 
 impl Client {
-  pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>, expect_proxy: bool) -> Option<Client> {
+  pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
+    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String) -> Option<Client> {
     let protocol = if let Some(pool) = pool.upgrade() {
       let mut p = pool.borrow_mut();
       if expect_proxy {
@@ -78,8 +80,11 @@ impl Client {
 
       } else {
         if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-          Some(State::Http(Http::new(sock, token, front_buf, back_buf, public_address,
-            None, Protocol::HTTP).expect("should create a HTTP state")))
+          let mut http = State::Http(Http::new(sock, token, front_buf, back_buf, public_address,
+            None, sticky_name.clone(),
+            Protocol::HTTP).expect("should create a HTTP state"));
+
+          Some(http)
         } else { None }
       }
     } else { None };
@@ -97,6 +102,7 @@ impl Client {
         sticky_session: false,
         metrics:        SessionMetrics::new(),
         app_id:         None,
+        sticky_name:    sticky_name,
       };
 
       client.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
@@ -131,6 +137,7 @@ impl Client {
             if let Some(back_buf) = p.checkout() {
               let mut http = Http::new(expect.frontend, expect.frontend_token,
                 expect.front_buf, back_buf, Some(public_address.ip()), Some(client_address),
+                self.sticky_name.clone(),
                 Protocol::HTTP).expect("should create a HTTP state");
 
               http.readiness.front_readiness = expect.readiness.front_readiness;
@@ -1013,7 +1020,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         }
       }).and_then(|(frontend_sock, _)| {
         frontend_sock.set_nodelay(true);
-        if let Some(c) = Client::new(frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address, self.config.expect_proxy) {
+        if let Some(c) = Client::new(frontend_sock, client_token, Rc::downgrade(&self.pool),
+          self.config.public_address, self.config.expect_proxy, self.config.sticky_name.clone()) {
           poll.register(
             c.front_socket(),
             client_token,

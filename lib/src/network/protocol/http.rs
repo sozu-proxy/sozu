@@ -73,7 +73,9 @@ pub struct Http<Front:SocketHandler> {
 
 impl<Front:SocketHandler> Http<Front> {
   pub fn new(sock: Front, token: Token, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>,
-    public_address: Option<IpAddr>, client_address: Option<SocketAddr>, protocol: Protocol) -> Option<Http<Front>> {
+    public_address: Option<IpAddr>, client_address: Option<SocketAddr>, sticky_name: String,
+    protocol: Protocol) -> Option<Http<Front>> {
+
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{} unknown\t", &request_id);
     let mut client = Http {
@@ -98,7 +100,7 @@ impl<Front:SocketHandler> Http<Front> {
       log_ctx:            log_ctx,
       public_address:     public_address,
       client_address:     client_address,
-      sticky_name:        String::from("SOZUBALANCEID"),
+      sticky_name:        sticky_name,
       sticky_session:     None,
       protocol:           protocol,
     };

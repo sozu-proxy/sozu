@@ -77,13 +77,14 @@ pub struct TlsClient {
   public_address: Option<IpAddr>,
   ssl:            Option<Ssl>,
   pool:           Weak<RefCell<Pool<BufferQueue>>>,
-  sticky_session: bool,
+  sticky_name:    String,
   metrics:        SessionMetrics,
   pub app_id:     Option<String>,
 }
 
 impl TlsClient {
-  pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>) -> TlsClient {
+  pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>,
+    sticky_name: String) -> TlsClient {
     let handshake = TlsHandshake::new(ssl, sock);
     let mut client = TlsClient {
       frontend_token: token,
@@ -93,7 +94,7 @@ impl TlsClient {
       public_address: public_address,
       ssl:            None,
       pool:           pool,
-      sticky_session: false,
+      sticky_name:    sticky_name,
       metrics:        SessionMetrics::new(),
       app_id:         None,
     };
@@ -129,7 +130,7 @@ impl TlsClient {
 
         if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
           let mut http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), front_buf,
-            back_buf, self.public_address.clone(), None, Protocol::HTTPS).unwrap();
+            back_buf, self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS).unwrap();
 
           http.readiness = handshake.readiness;
           http.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
@@ -1036,8 +1037,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
             Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
             PollOpt::edge()
           );
-          let c = TlsClient::new(ssl, frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address);
-
+          let c = TlsClient::new(ssl, frontend_sock, client_token, Rc::downgrade(&self.pool),
+            self.config.public_address, self.config.sticky_name.clone());
 
           Ok((Rc::new(RefCell::new(c)), false))
         } else {

@@ -60,14 +60,14 @@ pub struct TlsClient {
   protocol:           Option<State>,
   pub public_address: Option<IpAddr>,
   pool:               Weak<RefCell<Pool<BufferQueue>>>,
-  pub sticky_session: bool,
   pub metrics:        SessionMetrics,
   pub app_id:         Option<String>,
+  sticky_name:        String,
 }
 
 impl TlsClient {
   pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
-    public_address: Option<IpAddr>, expect_proxy: bool) -> TlsClient {
+    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String) -> TlsClient {
     let state = if expect_proxy {
       if let Some(pool) = pool.upgrade() {
         let mut p = pool.borrow_mut();
@@ -92,9 +92,9 @@ impl TlsClient {
       protocol:       state,
       public_address: public_address,
       pool:           pool,
-      sticky_session: false,
       metrics:        SessionMetrics::new(),
       app_id:         None,
+      sticky_name:    sticky_name,
     };
     client.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
     client
@@ -188,7 +188,7 @@ impl TlsClient {
           }
 
           let mut http = Http::new(front_stream, self.frontend_token, front_buf,
-            back_buf, self.public_address.clone(), None, Protocol::HTTPS).unwrap();
+            back_buf, self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS).unwrap();
 
           http.readiness = handshake.readiness;
           http.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
