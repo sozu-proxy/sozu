@@ -780,7 +780,7 @@ impl Server {
         },
       };
 
-      if res != Ok(BackendConnectAction::New) {
+      if res != Ok(BackendConnectAction::New) && res != Ok(BackendConnectAction::Replace) {
         entry.remove();
       }
       (protocol, res)
