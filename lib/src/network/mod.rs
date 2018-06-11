@@ -4,6 +4,7 @@ use mio;
 use mio::{Poll,Ready};
 use mio::unix::UnixReady;
 use std::fmt;
+use std::str;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -304,7 +305,6 @@ impl Backend {
   }
 }
 
-#[derive(Debug)]
 pub struct Readiness {
   pub front_interest:  UnixReady,
   pub back_interest:   UnixReady,
@@ -327,6 +327,55 @@ impl Readiness {
     self.back_interest   = UnixReady::from(Ready::empty());
     self.front_readiness = UnixReady::from(Ready::empty());
     self.back_readiness  = UnixReady::from(Ready::empty());
+  }
+}
+
+pub fn display_unix_ready(s: &mut [u8], readiness: UnixReady) {
+  if readiness.is_readable() {
+    s[0] = b'R';
+  }
+  if readiness.is_writable() {
+    s[1] = b'W';
+  }
+  if readiness.is_error() {
+    s[2] = b'E';
+  }
+  if readiness.is_hup() {
+    s[3] = b'H';
+  }
+}
+
+pub fn unix_ready_to_string(readiness: UnixReady) -> String {
+  let s = &mut [b'-'; 4];
+  display_unix_ready(s, readiness);
+  String::from_utf8(s.to_vec()).unwrap()
+}
+
+impl fmt::Debug for Readiness {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+
+    let front_i = &mut [b'-'; 4];
+    let front_r = &mut [b'-'; 4];
+    let back_i  = &mut [b'-'; 4];
+    let back_r  = &mut [b'-'; 4];
+    let front   = &mut [b'-'; 4];
+    let back    = &mut [b'-'; 4];
+
+    display_unix_ready(front_i, self.front_interest);
+    display_unix_ready(front_r, self.front_readiness);
+    display_unix_ready(back_i, self.back_interest);
+    display_unix_ready(back_r, self.back_readiness);
+    display_unix_ready(front, self.front_interest & self.front_readiness);
+    display_unix_ready(back, self.back_interest & self.back_readiness);
+
+    write!(f, "Readiness {{ front_interest: {}, front_readiness: {}, back_interest: {}, back_readiness: {} }} | front: {}, back: {}",
+      str::from_utf8(front_i).unwrap(),
+      str::from_utf8(front_r).unwrap(),
+      str::from_utf8(back_i).unwrap(),
+      str::from_utf8(back_r).unwrap(),
+      str::from_utf8(front).unwrap(),
+      str::from_utf8(back).unwrap())
+
   }
 }
 

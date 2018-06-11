@@ -438,6 +438,8 @@ impl ProxyClient for Client {
   }
 
   fn process_events(&mut self, token: Token, events: Ready) {
+    trace!("token {:?} got event {}", token, super::unix_ready_to_string(UnixReady::from(events)));
+
     if self.frontend_token == token {
       self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
     } else if self.backend_token == Some(token) {
@@ -481,7 +483,7 @@ impl ProxyClient for Client {
       let front_interest = self.readiness().front_interest & self.readiness().front_readiness;
       let back_interest  = self.readiness().back_interest & self.readiness().back_readiness;
 
-      trace!("PROXY\t{:?} {:?} | front: {:?} | back: {:?} ", token, self.readiness(), front_interest, back_interest);
+      trace!("PROXY\t{} {:?} {:?}", self.log_context(), token, self.readiness());
 
       if front_interest == UnixReady::from(Ready::empty()) && back_interest == UnixReady::from(Ready::empty()) {
         break;
