@@ -459,7 +459,8 @@ impl ProxyClient for Client {
         //FIXME: there should probably be a circuit breaker per client too
         error!("error connecting to backend, trying again");
         self.metrics().service_stop();
-        return ClientResult::ReconnectBackend(Some(self.frontend_token), self.backend_token.clone());
+        let backend_token = self.backend_token.take();
+        return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.readiness().back_readiness != UnixReady::from(Ready::empty()) {
         self.set_back_connected(BackendConnectionStatus::Connected);
       }

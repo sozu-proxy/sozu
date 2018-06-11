@@ -463,9 +463,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
               poll.deregister(*sock);
               sock.shutdown(Shutdown::Both);
             });
-            // we still want to use the new socket
-            client.readiness().back_interest  = UnixReady::from(Ready::writable());
           }
+
+          // we still want to use the new socket
+          client.readiness().back_interest  = UnixReady::from(Ready::writable());
 
           let req_state = unwrap_msg!(client.http()).state().request.clone();
           let req_header_end = unwrap_msg!(client.http()).state().req_header_end;
@@ -484,7 +485,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
           socket.set_nodelay(true);
 
-          if old_app_id == new_app_id {
+          if client.back_token().is_some() {
             poll.register(
               &socket,
               client.back_token().expect("FIXME"),

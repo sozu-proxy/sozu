@@ -479,9 +479,11 @@ impl ProxyClient for TlsClient {
       if self.readiness().back_readiness.is_hup() {
         //retry connecting the backend
         //FIXME: there should probably be a circuit breaker per client too
-        error!("error connecting to backend, trying again");
+        error!("{} error connecting to backend, trying again", self.log_context());
+        let backend_token = self.back_token();
+        self.http().map(|h| h.remove_backend());
         self.metrics().service_stop();
-        return ClientResult::ReconnectBackend(Some(self.frontend_token), self.back_token());
+        return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.readiness().back_readiness != UnixReady::from(Ready::empty()) {
         self.set_back_connected(BackendConnectionStatus::Connected);
       }

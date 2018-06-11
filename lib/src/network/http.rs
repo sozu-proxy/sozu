@@ -416,9 +416,11 @@ impl ProxyClient for Client {
       if self.readiness().back_readiness.is_hup() {
         //retry connecting the backend
         //FIXME: there should probably be a circuit breaker per client too
-        error!("error connecting to backend, trying again");
+        error!("{} error connecting to backend, trying again", self.log_context());
         self.metrics().service_stop();
-        return ClientResult::ReconnectBackend(Some(self.frontend_token), self.backend_token.clone());
+
+        let backend_token = self.backend_token.take();
+        return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.readiness().back_readiness != UnixReady::from(Ready::empty()) {
         self.set_back_connected(BackendConnectionStatus::Connected);
       }
@@ -860,16 +862,17 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
               poll.deregister(*sock);
               sock.shutdown(Shutdown::Both);
             });
-            // we still want to use the new socket
-            client.readiness().back_interest  = UnixReady::from(Ready::writable());
           }
+
+          // we still want to use the new socket
+          client.readiness().back_interest  = UnixReady::from(Ready::writable());
 
 
           socket.set_nodelay(true);
           client.readiness().back_interest.insert(Ready::writable());
           client.readiness().back_interest.insert(UnixReady::hup());
           client.readiness().back_interest.insert(UnixReady::error());
-          if old_app_id == new_app_id {
+          if client.back_token().is_some() {
             poll.register(
               &socket,
               client.back_token().expect("FIXME"),
