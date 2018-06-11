@@ -714,8 +714,8 @@ impl<Front:SocketHandler> Http<Front> {
           debug!("{} keep alive front/back", self.log_ctx);
           self.reset();
           self.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-          self.readiness.back_interest  = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
-          
+          self.readiness.back_interest  = UnixReady::hup() | UnixReady::error();
+
           ClientResult::Continue
           //FIXME: issues reusing the backend socket
           //self.readiness.back_interest  = UnixReady::hup() | UnixReady::error();
