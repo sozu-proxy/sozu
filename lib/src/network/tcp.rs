@@ -404,14 +404,19 @@ impl ProxyClient for Client {
       result.backends.push((app_id, addr.clone()));
     }
 
-    if self.back_connected() == BackendConnectionStatus::Connected {
+    let back_connected = self.back_connected();
+    if back_connected != BackendConnectionStatus::NotConnected {
+      if let Some(sock) = self.back_socket() {
+        sock.shutdown(Shutdown::Both);
+        poll.deregister(sock);
+      }
+    }
+
+    if back_connected == BackendConnectionStatus::Connected {
       gauge_add!("backend.connections", -1);
     }
 
-    if let Some(sock) = self.back_socket() {
-      sock.shutdown(Shutdown::Both);
-      poll.deregister(sock);
-    }
+    self.set_back_connected(BackendConnectionStatus::NotConnected);
 
     result.tokens.push(self.frontend_token);
 
@@ -424,11 +429,19 @@ impl ProxyClient for Client {
       res = Some((app_id, addr.clone()));
     }
 
-    if let Some(sock) = self.back_socket() {
-      sock.shutdown(Shutdown::Both);
-      poll.deregister(sock);
+    let back_connected = self.back_connected();
+    if back_connected != BackendConnectionStatus::NotConnected {
+      if let Some(sock) = self.back_socket() {
+        sock.shutdown(Shutdown::Both);
+        poll.deregister(sock);
+      }
+    }
+
+    if back_connected == BackendConnectionStatus::Connected {
       gauge_add!("backend.connections", -1);
     }
+
+    self.set_back_connected(BackendConnectionStatus::NotConnected);
 
     res
   }

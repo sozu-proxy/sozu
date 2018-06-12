@@ -334,13 +334,19 @@ impl ProxyClient for TlsClient {
       result.backends.push((app_id, addr.clone()));
     }
 
-    if let Some(sock) = self.back_socket() {
-      sock.shutdown(Shutdown::Both);
-      poll.deregister(sock);
-      if self.back_connected() == BackendConnectionStatus::Connected {
-        gauge_add!("backend.connections", -1);
+    let back_connected = self.back_connected();
+    if back_connected != BackendConnectionStatus::NotConnected {
+      if let Some(sock) = self.back_socket() {
+        sock.shutdown(Shutdown::Both);
+        poll.deregister(sock);
       }
     }
+
+    if back_connected == BackendConnectionStatus::Connected {
+      gauge_add!("backend.connections", -1);
+    }
+
+    self.set_back_connected(BackendConnectionStatus::NotConnected);
 
     if let Some(State::Http(ref http)) = self.protocol {
       //if the state was initial, the connection was already reset
@@ -360,13 +366,19 @@ impl ProxyClient for TlsClient {
       res = Some((app_id, addr.clone()));
     }
 
-    if let Some(sock) = self.back_socket() {
-      sock.shutdown(Shutdown::Both);
-      poll.deregister(sock);
-      if self.back_connected() == BackendConnectionStatus::Connected {
-        gauge_add!("backend.connections", -1);
+    let back_connected = self.back_connected();
+    if back_connected != BackendConnectionStatus::NotConnected {
+      if let Some(sock) = self.back_socket() {
+        sock.shutdown(Shutdown::Both);
+        poll.deregister(sock);
       }
     }
+
+    if back_connected == BackendConnectionStatus::Connected {
+      gauge_add!("backend.connections", -1);
+    }
+
+    self.set_back_connected(BackendConnectionStatus::NotConnected);
 
     res
   }
