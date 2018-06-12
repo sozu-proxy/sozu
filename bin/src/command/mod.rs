@@ -110,6 +110,8 @@ pub struct CommandServer {
   executable_path: String,
   //caching the number of backends instead of going through the whole state.backends hashmap
   backends_count:  usize,
+  //caching the number of frontends instead of going through the whole state.http/hhtps/tcp_fronts hashmaps
+  frontends_count: usize,
 }
 
 impl CommandServer {
@@ -171,7 +173,8 @@ impl CommandServer {
 
     let path = unsafe { get_executable_path() };
 
-    let backends_count = state.backends.values().fold(0, |acc, v| acc + v.len());
+    let backends_count = state.count_backends();
+    let frontends_count = state.count_frontends();
 
     CommandServer {
       sock:            srv,
@@ -188,6 +191,7 @@ impl CommandServer {
       must_stop:       false,
       executable_path: path,
       backends_count:  backends_count,
+      frontends_count:  frontends_count,
     }
   }
 
@@ -648,8 +652,7 @@ pub fn start(config: Config, command_socket_path: String, proxies: Vec<Worker>) 
 
       gauge!("configuration.applications", server.state.applications.len());
       gauge!("configuration.backends", server.backends_count);
-      gauge!("configuration.frontends", server.state.http_fronts.len() + server.state.https_fronts.len()
-            + server.state.tcp_fronts.len());
+      gauge!("configuration.frontends", server.frontends_count);
 
       info!("waiting for configuration client connections");
       server.run();

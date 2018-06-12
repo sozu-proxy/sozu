@@ -364,6 +364,16 @@ impl ConfigState {
       backends:        self.backends.get(app_id).cloned().unwrap_or(vec!()),
     }
   }
+
+  pub fn count_backends(&self) -> usize {
+    self.backends.values().fold(0, |acc, v| acc + v.len())
+  }
+
+  pub fn count_frontends(&self) -> usize {
+    self.http_fronts.values().fold(0, |acc, v| acc + v.len()) +
+    self.https_fronts.values().fold(0, |acc, v| acc + v.len()) +
+    self.tcp_fronts.values().fold(0, |acc, v| acc + v.len())
+  }
 }
 
 pub fn get_application_ids_by_domain(state: &ConfigState, hostname: String, path_begin: Option<String>) -> HashSet<AppId> {

@@ -250,11 +250,11 @@ impl CommandServer {
           }
         }
 
-        self.backends_count = self.state.backends.values().fold(0, |acc, v| acc + v.len());
+        self.backends_count = self.state.count_backends();
+        self.frontends_count = self.state.count_frontends();
         gauge!("configuration.applications", self.state.applications.len());
         gauge!("configuration.backends", self.backends_count);
-        gauge!("configuration.frontends", self.state.http_fronts.len() + self.state.https_fronts.len()
-              + self.state.tcp_fronts.len());
+        gauge!("configuration.frontends", self.frontends_count);
       }
     }
   }
@@ -502,13 +502,18 @@ impl CommandServer {
     match order {
       Order::AddBackend(_) => self.backends_count += 1,
       Order::RemoveBackend(_) => self.backends_count -= 1,
+      Order::AddHttpFront(_) | Order::AddHttpsFront(_) | Order::AddTcpFront(_) => {
+        self.frontends_count += 1;
+      },
+      Order::RemoveHttpFront(_) | Order::RemoveHttpsFront(_) | Order::RemoveTcpFront(_) => {
+        self.frontends_count -= 1;
+      },
       _ => {}
     };
 
     gauge!("configuration.applications", self.state.applications.len());
     gauge!("configuration.backends", self.backends_count);
-    gauge!("configuration.frontends", self.state.http_fronts.len() + self.state.https_fronts.len()
-          + self.state.tcp_fronts.len());
+    gauge!("configuration.frontends", self.frontends_count);
   }
 
   pub fn load_static_application_configuration(&mut self) {
@@ -627,7 +632,8 @@ impl CommandServer {
 
     let config_state = state.clone();
 
-    let backends_count = config_state.backends.values().fold(0, |acc, v| acc + v.len());
+    let backends_count  = config_state.count_backends();
+    let frontends_count = config_state.count_frontends();
 
     let path = unsafe { get_executable_path() };
     CommandServer {
@@ -648,6 +654,7 @@ impl CommandServer {
       must_stop:       false,
       executable_path: path,
       backends_count:  backends_count,
+      frontends_count: frontends_count,
     }
   }
 }
