@@ -508,6 +508,7 @@ impl<Front:SocketHandler> Http<Front> {
       if unwrap_msg!(self.state.as_ref()).is_front_error() {
         self.log_request_error(metrics, "front parsing error, closing the connection");
         metrics.service_stop();
+        incr!("http.front_parse_errors");
 
         // increment active requests here because it will be decremented right away
         // when closing the connection. It's slightly easier than decrementing it
