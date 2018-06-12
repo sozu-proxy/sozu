@@ -508,6 +508,12 @@ impl<Front:SocketHandler> Http<Front> {
       if unwrap_msg!(self.state.as_ref()).is_front_error() {
         self.log_request_error(metrics, "front parsing error, closing the connection");
         metrics.service_stop();
+
+        // increment active requests here because it will be decremented right away
+        // when closing the connection. It's slightly easier than decrementing it
+        // at every place we return ClientResult::CloseClient
+        gauge_add!("http.active_requests", 1);
+
         //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
         self.readiness.front_interest.remove(Ready::readable());
         return ClientResult::CloseClient;
