@@ -108,6 +108,8 @@ pub struct CommandServer {
   order_state:     state::OrderState,
   must_stop:       bool,
   executable_path: String,
+  //caching the number of backends instead of going through the whole state.backends hashmap
+  backends_count:  usize,
 }
 
 impl CommandServer {
@@ -169,6 +171,8 @@ impl CommandServer {
 
     let path = unsafe { get_executable_path() };
 
+    let backends_count = state.backends.values().fold(0, |acc, v| acc + v.len());
+
     CommandServer {
       sock:            srv,
       buffer_size:     config.command_buffer_size,
@@ -183,6 +187,7 @@ impl CommandServer {
       order_state:     state::OrderState::new(),
       must_stop:       false,
       executable_path: path,
+      backends_count:  backends_count,
     }
   }
 
@@ -642,7 +647,7 @@ pub fn start(config: Config, command_socket_path: String, proxies: Vec<Worker>) 
       });
 
       gauge!("configuration.applications", server.state.applications.len());
-      gauge!("configuration.backends", server.state.backends.len());
+      gauge!("configuration.backends", server.backends_count);
       gauge!("configuration.frontends", server.state.http_fronts.len() + server.state.https_fronts.len()
             + server.state.tcp_fronts.len());
 
