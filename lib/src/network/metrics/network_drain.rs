@@ -63,7 +63,7 @@ impl NetworkDrain {
     NetworkDrain {
       queue:  VecDeque::new(),
       prefix: prefix,
-      remote: BufWriter::with_capacity(1500, MetricSocket {
+      remote: BufWriter::with_capacity(65507, MetricSocket {
         addr, socket
       }),
       is_writable: true,
@@ -83,6 +83,7 @@ impl NetworkDrain {
   pub fn send_data(&mut self) {
     let now  = Instant::now();
     let secs = Duration::new(2, 0);
+    let mut send_count = 0;
 
     if self.is_writable {
     for (ref key, ref mut stored_metric) in self.data.iter_mut().filter(|&(_, ref value)| now.duration_since(value.last_sent) > secs) {
@@ -118,6 +119,12 @@ impl NetworkDrain {
       match res {
         Ok(()) => {
           stored_metric.last_sent = now;
+
+          send_count += 1;
+          if send_count >= 10 {
+            self.remote.flush();
+            send_count = 0;
+          }
         },
         Err(e) => match e.kind() {
           ErrorKind::WriteZero => {
@@ -175,6 +182,12 @@ impl NetworkDrain {
       match res {
         Ok(()) => {
           stored_metric.last_sent = now;
+
+          send_count += 1;
+          if send_count >= 10 {
+            self.remote.flush();
+            send_count = 0;
+          }
         },
         Err(e) => match e.kind() {
           ErrorKind::WriteZero => {
@@ -232,6 +245,12 @@ impl NetworkDrain {
       match res {
         Ok(()) => {
           stored_metric.last_sent = now;
+
+          send_count += 1;
+          if send_count >= 10 {
+            self.remote.flush();
+            send_count = 0;
+          }
         },
         Err(e) => match e.kind() {
           ErrorKind::WriteZero => {
@@ -287,6 +306,11 @@ impl NetworkDrain {
 
       match res {
         Ok(()) => {
+          send_count += 1;
+          if send_count >= 10 {
+            self.remote.flush();
+            send_count = 0;
+          }
         },
         Err(e) => match e.kind() {
           ErrorKind::WriteZero => {
