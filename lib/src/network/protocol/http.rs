@@ -123,7 +123,14 @@ impl<Front:SocketHandler> Http<Front> {
     self.state.as_mut().map(|ref mut state| state.added_res_header = res_header);
     self.front_buf_position = 0;
     self.back_buf_position = 0;
-    self.front_buf.reset();
+
+    // if HTTP requests are pipelined, we might still have some data in the front buffer
+    if !self.front_buf.empty() {
+      self.readiness.front_readiness.insert(Ready::readable());
+    } else {
+      self.front_buf.reset();
+    }
+
     self.back_buf.reset();
     //self.readiness = Readiness::new();
     self.request_id = request_id;
