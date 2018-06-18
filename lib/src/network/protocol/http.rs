@@ -425,7 +425,6 @@ impl<Front:SocketHandler> Http<Front> {
     }
 
     assert!(!unwrap_msg!(self.state.as_ref()).is_front_error());
-    assert!(self.back_buf.empty(), "investigating single buffer usage: the back->front buffer should not be used while parsing and forwarding the request");
 
     if self.front_buf.buffer.available_space() == 0 {
       if self.backend_token == None {
@@ -597,8 +596,6 @@ impl<Front:SocketHandler> Http<Front> {
   // Forward content to client
   pub fn writable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
 
-    assert!(self.front_buf.empty(), "investigating single buffer usage: the front->back buffer should not be used while parsing and forwarding the response");
-
     //handle default answers
     let output_size = self.back_buf.output_data_size();
     if let ClientStatus::DefaultAnswer(answer) = self.status {
@@ -767,8 +764,6 @@ impl<Front:SocketHandler> Http<Front> {
       return ClientResult::Continue;
     }
 
-    assert!(self.back_buf.empty(), "investigating single buffer usage: the back->front buffer should not be used while parsing and forwarding the request");
-
     if self.front_buf.output_data_size() == 0 || self.front_buf.next_output_data().len() == 0 {
       self.readiness.front_interest.insert(Ready::readable());
       self.readiness.back_interest.remove(Ready::writable());
@@ -869,8 +864,6 @@ impl<Front:SocketHandler> Http<Front> {
       self.readiness.back_interest.remove(Ready::readable());
       return (ProtocolResult::Continue, ClientResult::Continue);
     }
-
-    assert!(self.front_buf.empty(), "investigating single buffer usage: the front->back buffer should not be used while parsing and forwarding the response");
 
     if self.back_buf.buffer.available_space() == 0 {
       self.readiness.back_interest.remove(Ready::readable());
