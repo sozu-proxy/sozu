@@ -783,7 +783,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       }
     } else {
       error!("hostname parsing failed for: '{}'", h);
-      return Err(ConnectionError::ToBeDefined);
+      return Err(ConnectionError::HostNotFound);
     };
 
     let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();
