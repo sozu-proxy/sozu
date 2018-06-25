@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 use std::fmt::Arguments;
 use std::net::SocketAddr;
 use mio::net::UdpSocket;
-use std::io::{self,BufWriter,Write,Error,ErrorKind};
+use std::io::{self,LineWriter,Write,Error,ErrorKind};
 use nom::HexDisplay;
 use hdrhistogram::Histogram;
 use sozu_command::messages::{FilteredData,MetricsData,Percentiles,BackendMetricsData,FilteredTimeSerie};
@@ -46,7 +46,7 @@ impl Write for MetricSocket {
 pub struct NetworkDrain {
   queue:              VecDeque<MetricLine>,
   pub prefix:         String,
-  pub remote:         BufWriter<MetricSocket>,
+  pub remote:         LineWriter<MetricSocket>,
   is_writable:        bool,
   data:               BTreeMap<String, StoredMetricData>,
   /// (app_id, key) -> metric
@@ -63,7 +63,7 @@ impl NetworkDrain {
     NetworkDrain {
       queue:  VecDeque::new(),
       prefix: prefix,
-      remote: BufWriter::with_capacity(65507, MetricSocket {
+      remote: LineWriter::with_capacity(2048, MetricSocket {
         addr, socket
       }),
       is_writable: true,
