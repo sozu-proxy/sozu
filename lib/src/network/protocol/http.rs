@@ -161,6 +161,9 @@ impl<Front:SocketHandler> Http<Front> {
     self.back_buf.reset();
 
     self.status = ClientStatus::DefaultAnswer(answer, buf, 0);
+    self.readiness.front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+    self.readiness.back_interest  = UnixReady::hup() | UnixReady::error();
+
   }
 
   pub fn added_request_header(&self, public_address: Option<IpAddr>, client_address: Option<SocketAddr>) -> String {

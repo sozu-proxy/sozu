@@ -765,8 +765,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       if i != &b""[..] {
         error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
         client.set_answer(DefaultAnswerStatus::Answer400, self.answers.BadRequest.clone());
-        client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
-        client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
         return Err(ConnectionError::InvalidHost);
       }
 
@@ -783,8 +781,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     } else {
       error!("hostname parsing failed for: '{}'", h);
       client.set_answer(DefaultAnswerStatus::Answer400, self.answers.BadRequest.clone());
-      client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
-      client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
       return Err(ConnectionError::InvalidHost);
     };
 
@@ -798,8 +794,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       if front_should_redirect_https {
         let answer = format!("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://{}{}\r\n\r\n", host, rl.uri);
         client.set_answer(DefaultAnswerStatus::Answer301, Rc::new(answer.into_bytes()));
-        client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
-        client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
         return Err(ConnectionError::HttpsRedirect);
       }
 
@@ -908,21 +902,16 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         },
         Err(ConnectionError::NoBackendAvailable) => {
           client.set_answer(DefaultAnswerStatus::Answer503, self.answers.ServiceUnavailable.clone());
-          client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
-          client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::NoBackendAvailable)
         }
         Err(ConnectionError::HostNotFound) => {
           client.set_answer(DefaultAnswerStatus::Answer404, self.answers.NotFound.clone());
-          client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
-          client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::HostNotFound)
         }
         e => panic!(e)
       }
     } else {
       client.set_answer(DefaultAnswerStatus::Answer404, self.answers.NotFound.clone());
-      client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
       Err(ConnectionError::HostNotFound)
     }
   }
