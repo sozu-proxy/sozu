@@ -191,6 +191,7 @@ pub enum ClientResult {
 pub enum ConnectionError {
   NoHostGiven,
   NoRequestLineGiven,
+  InvalidHost,
   HostNotFound,
   NoBackendAvailable,
   ToBeDefined,

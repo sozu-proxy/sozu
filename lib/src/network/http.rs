@@ -546,7 +546,8 @@ impl ProxyClient for Client {
 #[allow(non_snake_case)]
 pub struct DefaultAnswers {
   pub NotFound:           Vec<u8>,
-  pub ServiceUnavailable: Vec<u8>
+  pub ServiceUnavailable: Vec<u8>,
+  pub BadRequest:         Vec<u8>,
 }
 
 pub type Hostname = String;
@@ -590,6 +591,9 @@ impl ServerConfiguration {
                 } else {
                   &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
                 }),
+      BadRequest: Vec::from(
+                  &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+                ),
     };
 
     (ServerConfiguration {
@@ -768,7 +772,10 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
-        return Err(ConnectionError::ToBeDefined);
+        client.set_answer(DefaultAnswerStatus::Answer400, &self.answers.BadRequest);
+        client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+        client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
+        return Err(ConnectionError::InvalidHost);
       }
 
       //FIXME: we should check that the port is right too
@@ -782,8 +789,11 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         &h
       }
     } else {
-      error!("hostname parsing failed for: '{}'", h);
-      return Err(ConnectionError::HostNotFound);
+      error!("connect to backend: hostname parsing failed for: '{}'", h);
+      client.set_answer(DefaultAnswerStatus::Answer400, &self.answers.BadRequest);
+      client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+      client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
+      return Err(ConnectionError::InvalidHost);
     };
 
     let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();
@@ -981,6 +991,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         self.answers = DefaultAnswers {
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
+          BadRequest: Vec::from(
+            &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+          ),
         };
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
@@ -1096,6 +1109,9 @@ impl InitialServerConfiguration {
       } else {
         &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
       }),
+      BadRequest: Vec::from(
+        &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+      ),
     };
 
     let mut backends = BackendMap::new();
@@ -1453,6 +1469,9 @@ mod tests {
       answers:   DefaultAnswers {
         NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
+        BadRequest: Vec::from(
+          &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+        ),
       },
       config: Default::default(),
     };

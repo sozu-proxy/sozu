@@ -601,6 +601,9 @@ impl ServerConfiguration {
         } else {
           &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
         }),
+      BadRequest: Vec::from(
+        &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+      ),
     };
 
     Ok((ServerConfiguration {
@@ -1084,7 +1087,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
-        return Err(ConnectionError::ToBeDefined);
+        client.set_answer(DefaultAnswerStatus::Answer400, &self.answers.BadRequest);
+        client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+        client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
+        return Err(ConnectionError::InvalidHost);
       }
 
       // it is alright to call from_utf8_unchecked,
@@ -1111,7 +1117,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       }
     } else {
       error!("hostname parsing failed");
-      return Err(ConnectionError::HostNotFound);
+      client.set_answer(DefaultAnswerStatus::Answer400, &self.answers.BadRequest);
+      client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+      client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
+      return Err(ConnectionError::InvalidHost);
     };
 
     let rl:RRequestLine = try!(unwrap_msg!(client.http()).state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
@@ -1324,6 +1333,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         self.answers = DefaultAnswers {
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
+          BadRequest: Vec::from(
+            &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+          ),
         };
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
@@ -1528,6 +1540,7 @@ mod tests {
       answers:   DefaultAnswers {
         NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
         ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
+        BadRequest: Vec::from(&b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]),
       },
       config: Default::default(),
       ssl_options: ssl::SslOptions::CIPHER_SERVER_PREFERENCE | ssl::SslOptions::NO_COMPRESSION | ssl::SslOptions::NO_TICKET |

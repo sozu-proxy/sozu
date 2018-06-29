@@ -794,7 +794,8 @@ impl Server {
       },
       Ok(BackendConnectAction::New) => {
       },
-      Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) | Err(ConnectionError::HttpsRedirect) => {
+      Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) |
+        Err(ConnectionError::HttpsRedirect) | Err(ConnectionError::InvalidHost) => {
         if protocol == Protocol::TCP {
           self.close_client(token);
         }

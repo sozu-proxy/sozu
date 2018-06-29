@@ -98,6 +98,9 @@ impl ServerConfiguration {
         } else {
           &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
         }),
+      BadRequest: Vec::from(
+        &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+      ),
     };
 
     let mut server_config = ServerConfig::new(NoClientAuth::new());
@@ -359,7 +362,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("invalid remaining chars after hostname");
-        return Err(ConnectionError::ToBeDefined);
+        client.set_answer(DefaultAnswerStatus::Answer400, &self.answers.BadRequest);
+        client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+        client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
+        return Err(ConnectionError::InvalidHost);
       }
 
       // it is alright to call from_utf8_unchecked,
@@ -386,7 +392,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       }
     } else {
       error!("hostname parsing failed");
-      return Err(ConnectionError::HostNotFound);
+      client.set_answer(DefaultAnswerStatus::Answer400, &self.answers.BadRequest);
+      client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+      client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
+      return Err(ConnectionError::InvalidHost);
     };
 
     let rl:RRequestLine = try!(unwrap_msg!(client.http()).state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
@@ -596,6 +605,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         self.answers = DefaultAnswers {
           NotFound:           configuration.answer_404.into_bytes(),
           ServiceUnavailable: configuration.answer_503.into_bytes(),
+          BadRequest: Vec::from(
+            &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+          ),
         };
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
