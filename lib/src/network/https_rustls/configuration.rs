@@ -88,16 +88,8 @@ impl ServerConfiguration {
     }
 
     let default = DefaultAnswers {
-      NotFound: Rc::new(Vec::from(if config.answer_404.len() > 0 {
-          config.answer_404.as_bytes()
-        } else {
-          &b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-        })),
-      ServiceUnavailable: Rc::new(Vec::from(if config.answer_503.len() > 0 {
-          config.answer_503.as_bytes()
-        } else {
-          &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-        })),
+      NotFound: Rc::new(Vec::from(config.answer_404.as_bytes())),
+      ServiceUnavailable: Rc::new(Vec::from(config.answer_503.as_bytes())),
       BadRequest: Rc::new(Vec::from(
         &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
       )),
