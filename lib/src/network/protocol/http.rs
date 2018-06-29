@@ -1,6 +1,7 @@
 use std::cmp::min;
-use std::net::{SocketAddr,IpAddr};
 use std::io::Write;
+use std::rc::Rc;
+use std::net::{SocketAddr,IpAddr};
 use mio::*;
 use mio::unix::UnixReady;
 use mio::tcp::TcpStream;
@@ -30,10 +31,11 @@ impl StickySession {
 
 type BackendToken = Token;
 
-#[derive(Debug,Clone,Copy,PartialEq)]
+#[derive(Debug,Clone,PartialEq)]
 pub enum ClientStatus {
   Normal,
-  DefaultAnswer(DefaultAnswerStatus),
+  /// status, HTTP answer, index in HTTP answer
+  DefaultAnswer(DefaultAnswerStatus, Rc<Vec<u8>>, usize),
 }
 
 #[derive(Debug,Clone,Copy,PartialEq)]
@@ -154,22 +156,11 @@ impl<Front:SocketHandler> Http<Front> {
     self.state = Some(state);
   }
 
-  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: &[u8])  {
+  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Rc<Vec<u8>>)  {
     self.front_buf.reset();
     self.back_buf.reset();
-    match self.back_buf.write(buf) {
-      Ok(sz) => {
-        self.back_buf.consume_parsed_data(sz);
-        self.back_buf.slice_output(sz);
 
-        if sz < buf.len() {
-          error!("The backend buffer is too small, we couldn't write the entire answer");
-        }
-      }
-      Err(e) => error!("The backend buffer is too small: {}", e),
-    }
-
-    self.status = ClientStatus::DefaultAnswer(answer);
+    self.status = ClientStatus::DefaultAnswer(answer, buf, 0);
   }
 
   pub fn added_request_header(&self, public_address: Option<IpAddr>, client_address: Option<SocketAddr>) -> String {
@@ -363,11 +354,11 @@ impl<Front:SocketHandler> Http<Front> {
 
     let status_line = match self.status {
       ClientStatus::Normal => "-",
-      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer301) => "301 Moved Permanently",
-      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer400) => "400 Bad Request",
-      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer404) => "404 Not Found",
-      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer503) => "503 Service Unavailable",
-      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer413) => "413 Payload Too Large",
+      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer301, _, _) => "301 Moved Permanently",
+      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer400, _, _) => "400 Bad Request",
+      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer404, _, _) => "404 Not Found",
+      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer503, _, _) => "503 Service Unavailable",
+      ClientStatus::DefaultAnswer(DefaultAnswerStatus::Answer413, _, _) => "413 Payload Too Large",
     };
 
     let host         = self.get_host().unwrap_or(String::from("-"));
@@ -426,7 +417,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Read content from the client
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
-    if let ClientStatus::DefaultAnswer(_) = self.status {
+    if let ClientStatus::DefaultAnswer(_,_,_) = self.status {
       self.readiness.front_interest.insert(Ready::writable());
       self.readiness.back_interest.remove(Ready::readable());
       self.readiness.back_interest.remove(Ready::writable());
@@ -441,7 +432,7 @@ impl<Front:SocketHandler> Http<Front> {
         metrics.service_stop();
         self.log_request_error(metrics, "front buffer full, no backend, closing connection");
         let answer_413 = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
-        self.set_answer(DefaultAnswerStatus::Answer413, answer_413.as_bytes());
+        self.set_answer(DefaultAnswerStatus::Answer413, Rc::new(Vec::from(answer_413.as_bytes())));
         self.readiness.front_interest.remove(Ready::readable());
         self.readiness.front_interest.insert(Ready::writable());
       } else {
@@ -602,24 +593,17 @@ impl<Front:SocketHandler> Http<Front> {
     }
   }
 
-  // Forward content to client
-  pub fn writable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
-
-    //handle default answers
-    let output_size = self.back_buf.output_data_size();
-    if let ClientStatus::DefaultAnswer(answer) = self.status {
-      if self.back_buf.output_data_size() == 0 {
-        self.readiness.front_interest.remove(Ready::writable());
-      }
+  fn writable_default_answer(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
+    if let ClientStatus::DefaultAnswer(answer, ref buf, mut index) = self.status {
+      let len = buf.len();
 
       let mut sz = 0usize;
       let mut res = SocketResult::Continue;
-      while res == SocketResult::Continue && self.back_buf.output_data_size() > 0 {
-        let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
+      while res == SocketResult::Continue && index < len {
+        let (current_sz, current_res) = self.frontend.socket_write(&buf[index..]);
         res = current_res;
-        self.back_buf.consume_output_data(current_sz);
-        self.back_buf_position += current_sz;
         sz += current_sz;
+        index += current_sz;
       }
 
       count!("bytes_out", sz as i64);
@@ -629,7 +613,7 @@ impl<Front:SocketHandler> Http<Front> {
         self.readiness.front_readiness.remove(Ready::writable());
       }
 
-      if self.back_buf.buffer.available_data() == 0 {
+      if index == len {
         metrics.service_stop();
         self.log_default_answer_success(&metrics);
         self.readiness.reset();
@@ -644,6 +628,18 @@ impl<Front:SocketHandler> Http<Front> {
       } else {
         return ClientResult::Continue;
       }
+    } else {
+      ClientResult::CloseClient
+    }
+  }
+
+  // Forward content to client
+  pub fn writable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
+
+    //handle default answers
+    let output_size = self.back_buf.output_data_size();
+    if let ClientStatus::DefaultAnswer(_,_,_) = self.status {
+      return self.writable_default_answer(metrics);
     }
 
     if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
@@ -766,7 +762,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Forward content to application
   pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
-    if let ClientStatus::DefaultAnswer(_) = self.status {
+    if let ClientStatus::DefaultAnswer(_,_,_) = self.status {
       error!("{}\tsending default answer, should not write to back", self.log_ctx);
       self.readiness.back_interest.remove(Ready::writable());
       self.readiness.front_interest.insert(Ready::writable());
@@ -868,7 +864,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Read content from application
   pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, ClientResult) {
-    if let ClientStatus::DefaultAnswer(_) = self.status {
+    if let ClientStatus::DefaultAnswer(_,_,_) = self.status {
       error!("{}\tsending default answer, should not read from back socket", self.log_ctx);
       self.readiness.back_interest.remove(Ready::readable());
       return (ProtocolResult::Continue, ClientResult::Continue);

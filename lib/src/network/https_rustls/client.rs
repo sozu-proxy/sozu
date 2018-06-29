@@ -110,7 +110,7 @@ impl TlsClient {
     })
   }
 
-  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: &[u8])  {
+  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Rc<Vec<u8>>)  {
     self.protocol.as_mut().map(|protocol| {
       if let &mut State::Http(ref mut http) = protocol {
         http.set_answer(answer, buf);

@@ -88,19 +88,19 @@ impl ServerConfiguration {
     }
 
     let default = DefaultAnswers {
-      NotFound: Vec::from(if config.answer_404.len() > 0 {
+      NotFound: Rc::new(Vec::from(if config.answer_404.len() > 0 {
           config.answer_404.as_bytes()
         } else {
           &b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-        }),
-      ServiceUnavailable: Vec::from(if config.answer_503.len() > 0 {
+        })),
+      ServiceUnavailable: Rc::new(Vec::from(if config.answer_503.len() > 0 {
           config.answer_503.as_bytes()
         } else {
           &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-        }),
-      BadRequest: Vec::from(
+        })),
+      BadRequest: Rc::new(Vec::from(
         &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-      ),
+      )),
     };
 
     let mut server_config = ServerConfig::new(NoClientAuth::new());
@@ -263,7 +263,7 @@ impl ServerConfiguration {
 
       match self.backends.backend_from_app_id(&app_id) {
         Err(e) => {
-          client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
+          client.set_answer(DefaultAnswerStatus::Answer503, self.answers.ServiceUnavailable.clone());
           Err(e)
         },
         Ok((backend, conn))  => {
@@ -293,7 +293,7 @@ impl ServerConfiguration {
     match self.backends.backend_from_sticky_session(app_id, &sticky_session) {
       Err(e) => {
         debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
-        client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
+        client.set_answer(DefaultAnswerStatus::Answer503, self.answers.ServiceUnavailable.clone());
         Err(e)
       },
       Ok((backend, conn))  => {
@@ -362,7 +362,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("invalid remaining chars after hostname");
-        client.set_answer(DefaultAnswerStatus::Answer400, &self.answers.BadRequest);
+        client.set_answer(DefaultAnswerStatus::Answer400, self.answers.BadRequest.clone());
         client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
         client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
         return Err(ConnectionError::InvalidHost);
@@ -377,7 +377,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       let servername: Option<String> = unwrap_msg!(client.http()).frontend.session.get_sni_hostname().map(|s| s.to_string());
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
         error!("TLS SNI hostname '{:?}' and Host header '{}' don't match", servername, hostname_str);
-        unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
+        unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, self.answers.NotFound.clone());
         client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
         client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
         return Err(ConnectionError::HostNotFound);
@@ -392,7 +392,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       }
     } else {
       error!("hostname parsing failed");
-      client.set_answer(DefaultAnswerStatus::Answer400, &self.answers.BadRequest);
+      client.set_answer(DefaultAnswerStatus::Answer400, self.answers.BadRequest.clone());
       client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
       client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
       return Err(ConnectionError::InvalidHost);
@@ -518,13 +518,13 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           }
         },
         Err(ConnectionError::NoBackendAvailable) => {
-          unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
+          unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer503, self.answers.ServiceUnavailable.clone());
           client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
           client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::NoBackendAvailable)
         },
         Err(ConnectionError::HostNotFound) => {
-          unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
+          unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, self.answers.NotFound.clone());
           client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
           client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::HostNotFound)
@@ -532,7 +532,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         e => panic!(e)
       }
     } else {
-      unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
+      unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, self.answers.NotFound.clone());
       client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
       client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
       Err(ConnectionError::HostNotFound)
@@ -603,11 +603,11 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       Order::HttpProxy(configuration) => {
         debug!("{} modifying proxy configuration: {:?}", message.id, configuration);
         self.answers = DefaultAnswers {
-          NotFound:           configuration.answer_404.into_bytes(),
-          ServiceUnavailable: configuration.answer_503.into_bytes(),
-          BadRequest: Vec::from(
+          NotFound:           Rc::new(configuration.answer_404.into_bytes()),
+          ServiceUnavailable: Rc::new(configuration.answer_503.into_bytes()),
+          BadRequest: Rc::new(Vec::from(
             &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-          ),
+          )),
         };
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },

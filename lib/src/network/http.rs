@@ -157,7 +157,7 @@ impl Client {
     }
   }
 
-  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: &[u8])  {
+  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Rc<Vec<u8>>)  {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http) => http.set_answer(answer, buf),
       _ => {}
@@ -545,9 +545,9 @@ impl ProxyClient for Client {
 
 #[allow(non_snake_case)]
 pub struct DefaultAnswers {
-  pub NotFound:           Vec<u8>,
-  pub ServiceUnavailable: Vec<u8>,
-  pub BadRequest:         Vec<u8>,
+  pub NotFound:           Rc<Vec<u8>>,
+  pub ServiceUnavailable: Rc<Vec<u8>>,
+  pub BadRequest:         Rc<Vec<u8>>,
 }
 
 pub type Hostname = String;
@@ -581,19 +581,19 @@ impl ServerConfiguration {
 
 
     let default = DefaultAnswers {
-      NotFound: Vec::from(if config.answer_404.len() > 0 {
+      NotFound: Rc::new(Vec::from(if config.answer_404.len() > 0 {
                   config.answer_404.as_bytes()
                 } else {
                   &b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-                }),
-      ServiceUnavailable: Vec::from(if config.answer_503.len() > 0 {
+                })),
+      ServiceUnavailable: Rc::new(Vec::from(if config.answer_503.len() > 0 {
                   config.answer_503.as_bytes()
                 } else {
                   &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-                }),
-      BadRequest: Vec::from(
+                })),
+      BadRequest: Rc::new(Vec::from(
                   &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-                ),
+                )),
     };
 
     (ServerConfiguration {
@@ -719,7 +719,7 @@ impl ServerConfiguration {
 
     match self.backends.backend_from_app_id(app_id) {
       Err(e) => {
-        client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
+        client.set_answer(DefaultAnswerStatus::Answer503, self.answers.ServiceUnavailable.clone());
         Err(e)
       },
       Ok((backend, conn))  => {
@@ -746,7 +746,7 @@ impl ServerConfiguration {
     match self.backends.backend_from_sticky_session(app_id, &sticky_session) {
       Err(e) => {
         debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
-        client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
+        client.set_answer(DefaultAnswerStatus::Answer503, self.answers.ServiceUnavailable.clone());
         Err(e)
       },
       Ok((backend, conn))  => {
@@ -772,7 +772,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
-        client.set_answer(DefaultAnswerStatus::Answer400, &self.answers.BadRequest);
+        client.set_answer(DefaultAnswerStatus::Answer400, self.answers.BadRequest.clone());
         client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
         client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
         return Err(ConnectionError::InvalidHost);
@@ -789,8 +789,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         &h
       }
     } else {
-      error!("connect to backend: hostname parsing failed for: '{}'", h);
-      client.set_answer(DefaultAnswerStatus::Answer400, &self.answers.BadRequest);
+      error!("hostname parsing failed for: '{}'", h);
+      client.set_answer(DefaultAnswerStatus::Answer400, self.answers.BadRequest.clone());
       client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
       client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
       return Err(ConnectionError::InvalidHost);
@@ -805,8 +805,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       let front_should_redirect_https = self.applications.get(&app_id).map(|ref app| app.https_redirect).unwrap_or(false);
       if front_should_redirect_https {
         let answer = format!("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://{}{}\r\n\r\n", host, rl.uri);
-        //FIXME: the buffer is copied but it's not needed
-        client.set_answer(DefaultAnswerStatus::Answer301, answer.as_bytes());
+        client.set_answer(DefaultAnswerStatus::Answer301, Rc::new(answer.into_bytes()));
         client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
         client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
         return Err(ConnectionError::HttpsRedirect);
@@ -916,13 +915,13 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           //Ok(())
         },
         Err(ConnectionError::NoBackendAvailable) => {
-          client.set_answer(DefaultAnswerStatus::Answer503, &self.answers.ServiceUnavailable);
+          client.set_answer(DefaultAnswerStatus::Answer503, self.answers.ServiceUnavailable.clone());
           client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
           client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::NoBackendAvailable)
         }
         Err(ConnectionError::HostNotFound) => {
-          client.set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
+          client.set_answer(DefaultAnswerStatus::Answer404, self.answers.NotFound.clone());
           client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
           client.readiness().back_interest  = UnixReady::hup() | UnixReady::error();
           Err(ConnectionError::HostNotFound)
@@ -930,7 +929,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         e => panic!(e)
       }
     } else {
-      client.set_answer(DefaultAnswerStatus::Answer404, &self.answers.NotFound);
+      client.set_answer(DefaultAnswerStatus::Answer404, self.answers.NotFound.clone());
       client.readiness().front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
       Err(ConnectionError::HostNotFound)
     }
@@ -989,11 +988,11 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       Order::HttpProxy(configuration) => {
         debug!("{} modifying proxy configuration: {:?}", message.id, configuration);
         self.answers = DefaultAnswers {
-          NotFound:           configuration.answer_404.into_bytes(),
-          ServiceUnavailable: configuration.answer_503.into_bytes(),
-          BadRequest: Vec::from(
+          NotFound:           Rc::new(configuration.answer_404.into_bytes()),
+          ServiceUnavailable: Rc::new(configuration.answer_503.into_bytes()),
+          BadRequest: Rc::new(Vec::from(
             &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-          ),
+          )),
         };
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
@@ -1099,19 +1098,19 @@ impl InitialServerConfiguration {
   pub fn new(config: HttpProxyConfiguration, state: &ConfigState) -> InitialServerConfiguration {
 
     let answers = DefaultAnswers {
-      NotFound: Vec::from(if config.answer_404.len() > 0 {
+      NotFound: Rc::new(Vec::from(if config.answer_404.len() > 0 {
                   config.answer_404.as_bytes()
                 } else {
                   &b"HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-                }),
-      ServiceUnavailable: Vec::from(if config.answer_503.len() > 0 {
+                })),
+      ServiceUnavailable: Rc::new(Vec::from(if config.answer_503.len() > 0 {
         config.answer_503.as_bytes()
       } else {
         &b"HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-      }),
-      BadRequest: Vec::from(
+      })),
+      BadRequest: Rc::new(Vec::from(
         &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-      ),
+      )),
     };
 
     let mut backends = BackendMap::new();
@@ -1467,11 +1466,11 @@ mod tests {
       fronts:    fronts,
       pool:      Rc::new(RefCell::new(Pool::with_capacity(1,0, || BufferQueue::with_capacity(16384)))),
       answers:   DefaultAnswers {
-        NotFound: Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..]),
-        ServiceUnavailable: Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..]),
-        BadRequest: Vec::from(
+        NotFound: Rc::new(Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..])),
+        ServiceUnavailable: Rc::new(Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..])),
+        BadRequest: Rc::new(Vec::from(
           &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-        ),
+        )),
       },
       config: Default::default(),
     };
