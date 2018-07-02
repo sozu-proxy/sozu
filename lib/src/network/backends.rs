@@ -222,6 +222,7 @@ impl BackendList {
     match load_balancing_policy {
       LoadBalancingAlgorithms::RoundRobin => self.load_balancing = Box::new(RoundRobinAlgorithm{ next_backend: 0 }),
       LoadBalancingAlgorithms::Random => self.load_balancing = Box::new(RandomAlgorithm{}),
+      LoadBalancingAlgorithms::LeastConnections => self.load_balancing = Box::new(LeastConnectionsAlgorithm{}),
     }
   }
 }
