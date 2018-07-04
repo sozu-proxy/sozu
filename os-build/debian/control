@@ -1,0 +1,15 @@
+Source: sozu
+Section: net
+Priority: optional
+Maintainer: Alessio Coltellacci <alessio.coltellacci@clever-cloud.com>
+Build-Depends: debhelper (>= 10),
+               dh-cargo,
+               dh-systemd,
+Standards-Version: 4.1.2
+Homepage: https://www.sozu.io/
+
+Package: sozu
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: HTTP reverse proxy
+ HTTP reverse proxy, configurable at runtime, fast and safe, built in Rust. It will be awesome when it will be ready. Not So Secret Project! Ping us on gitter to know more

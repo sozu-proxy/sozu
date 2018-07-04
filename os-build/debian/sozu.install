@@ -1,0 +1,2 @@
+#!/usr/bin/dh-exec
+os-build/debian/config.toml => etc/sozu/config.toml
