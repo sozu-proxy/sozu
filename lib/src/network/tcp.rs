@@ -240,7 +240,7 @@ impl Client {
         res = pp.back_writable(&mut self.metrics);
       },
       Some(State::SendProxyProtocol(ref mut pp)) => {
-        res = pp.back_writable();
+        res = pp.back_writable(&mut self.metrics);
       }
       _ => unreachable!(),
     };
