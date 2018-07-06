@@ -1182,7 +1182,7 @@ mod tests {
   use std::time::Duration;
   use sozu_command::messages::{Order,HttpFront,Backend,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer, LoadBalancingParams};
   use network::buffer_queue::BufferQueue;
-  use pool::Pool;
+  use network::pool::Pool;
   use sozu_command::config::LoadBalancingAlgorithms;
 
   #[allow(unused_mut, unused_must_use, unused_variables)]

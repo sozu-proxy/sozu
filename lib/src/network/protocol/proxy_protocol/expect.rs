@@ -131,7 +131,7 @@ mod expect_test {
 
   use parser::proxy_protocol::parse_v2_header;
   use nom::IResult::Done;
-  use pool::Pool;
+  use network::pool::Pool;
 
   use std::{thread, thread::JoinHandle, time::Duration, net::{SocketAddr, IpAddr, Ipv4Addr}};
   use mio::net::{TcpListener, TcpStream};
