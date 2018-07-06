@@ -163,7 +163,7 @@ extern crate rand;
 #[cfg(feature = "use-openssl")]
 extern crate openssl;
 extern crate rustls;
-extern crate pool;
+extern crate pool as pool_crate;
 extern crate uuid;
 extern crate net2;
 extern crate libc;

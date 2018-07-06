@@ -13,8 +13,9 @@ use time::{precise_time_ns,SteadyTime,Duration};
 
 use sozu_command::messages::{OrderMessage,OrderMessageAnswer,LoadBalancingParams};
 
-pub mod buffer_queue;
 #[macro_use] pub mod metrics;
+pub mod pool;
+pub mod buffer_queue;
 pub mod socket;
 pub mod trie;
 pub mod protocol;

@@ -14,7 +14,6 @@ use std::os::unix::io::{AsRawFd,FromRawFd};
 use nom::HexDisplay;
 use std::error::Error;
 use slab::Slab;
-use pool::Pool;
 use std::io::Write;
 use std::str::FromStr;
 use std::marker::PhantomData;
@@ -36,6 +35,7 @@ use network::buffer_queue::BufferQueue;
 use network::{ClientResult,ConnectionError,Protocol,RequiredEvents,ProxyClient,ProxyConfiguration,
   CloseResult,AcceptError,BackendConnectAction};
 use network::{http,tcp,AppId};
+use network::pool::Pool;
 use network::metrics::METRICS;
 
 const SERVER: Token = Token(0);

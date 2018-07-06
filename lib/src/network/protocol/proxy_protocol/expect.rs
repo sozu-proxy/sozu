@@ -15,8 +15,8 @@ use network::socket::{SocketHandler, SocketResult};
 use network::buffer_queue::BufferQueue;
 use network::SessionMetrics;
 use network::protocol::pipe::Pipe;
+use network::pool::Checkout;
 use parser::proxy_protocol::parse_v2_header;
-use pool::Checkout;
 use super::header::ProxyAddr;
 
 pub struct ExpectProxyProtocol<Front:SocketHandler> {

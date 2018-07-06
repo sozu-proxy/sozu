@@ -1,5 +1,5 @@
 use sozu_command::buffer::Buffer;
-use pool::Reset;
+use pool_crate::Reset;
 use nom::HexDisplay;
 use std::io::{self,Write};
 use std::cmp::{min,max};

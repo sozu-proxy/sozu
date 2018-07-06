@@ -12,7 +12,6 @@ use mio::*;
 use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
-use pool::{Pool,Checkout,Reset};
 use uuid::Uuid;
 use nom::{HexDisplay,IResult};
 use rand::random;
@@ -28,6 +27,7 @@ use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use network::backends::BackendMap;
+use network::pool::{Pool,Checkout,Reset};
 use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
 use network::protocol::http::DefaultAnswerStatus;

@@ -18,7 +18,6 @@ use std::str::FromStr;
 use time::{Duration,precise_time_s};
 use rand::random;
 use uuid::Uuid;
-use pool::{Pool,Checkout,Reset};
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
@@ -31,6 +30,7 @@ use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol
   CloseResult};
 use network::backends::BackendMap;
 use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,ClientToken,ListenClient};
+use network::pool::{Pool,Checkout,Reset};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::{http,https_rustls};

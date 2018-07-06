@@ -15,7 +15,6 @@ use std::io::{self,Read,Write,ErrorKind,BufReader};
 use std::collections::{HashMap,HashSet};
 use std::error::Error;
 use slab::{Slab,Entry,VacantEntry};
-use pool::{Pool,Checkout};
 use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{precise_time_s, precise_time_ns};
@@ -38,6 +37,7 @@ use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,
   OrderMessageAnswer,OrderMessageStatus,LoadBalancingParams};
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
+use network::pool::{Pool,Checkout};
 use network::buffer_queue::BufferQueue;
 use network::{AppId,Backend,ClientResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,

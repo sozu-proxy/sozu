@@ -13,8 +13,8 @@ use network::{
   protocol::{ProtocolResult, pipe::Pipe},
   socket::{SocketHandler, SocketResult, server_bind},
   buffer_queue::BufferQueue,
+  pool::Checkout,
 };
-use pool::Checkout;
 
 use super::header::*;
 

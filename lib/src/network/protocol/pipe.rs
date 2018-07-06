@@ -4,12 +4,12 @@ use std::io::Write;
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
-use pool::{Pool,Checkout,Reset};
 use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
 use network::{ClientResult,Readiness,SessionMetrics};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult};
+use network::pool::{Pool,Checkout,Reset};
 use nom::HexDisplay;
 
 type BackendToken = Token;

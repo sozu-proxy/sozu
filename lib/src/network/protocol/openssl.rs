@@ -1,11 +1,11 @@
 use mio::*;
 use mio::net::*;
 use mio::unix::UnixReady;
-use pool::Checkout;
 use network::buffer_queue::BufferQueue;
-use openssl::ssl::{self,HandshakeError,MidHandshakeSslStream,Ssl,SslStream};
+use network::pool::Checkout;
 use network::{ClientResult,Readiness};
 use network::protocol::ProtocolResult;
+use openssl::ssl::{self,HandshakeError,MidHandshakeSslStream,Ssl,SslStream};
 
 pub enum TlsState {
   Initial,

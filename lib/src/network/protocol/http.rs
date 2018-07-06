@@ -5,7 +5,6 @@ use std::net::{SocketAddr,IpAddr};
 use mio::*;
 use mio::unix::UnixReady;
 use mio::tcp::TcpStream;
-use pool::{Pool,Checkout,Reset};
 use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
 use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop,
@@ -14,6 +13,8 @@ use network::{ClientResult,Protocol,Readiness,SessionMetrics, LogDuration};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult};
 use network::protocol::ProtocolResult;
+use network::pool::{Pool,Checkout};
+use pool_crate::Reset;
 use util::UnwrapLog;
 
 #[derive(Clone)]
