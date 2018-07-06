@@ -5,13 +5,15 @@ use std::io::Read;
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
-use network::ClientResult;
-use network::Readiness;
-use network::BackendConnectionStatus;
-use network::protocol::ProtocolResult;
-use network::socket::{SocketHandler,SocketResult,server_bind};
-use network::protocol::pipe::Pipe;
-use network::buffer_queue::BufferQueue;
+use network::{
+  SessionMetrics,
+  ClientResult,
+  Readiness,
+  BackendConnectionStatus,
+  protocol::{ProtocolResult, pipe::Pipe},
+  socket::{SocketHandler, SocketResult, server_bind},
+  buffer_queue::BufferQueue,
+};
 use pool::Checkout;
 
 use super::header::*;
@@ -46,7 +48,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
 
   // The header is send immediately at once upon the connection is establish
   // and prepended before any data.
-  pub fn back_writable(&mut self) -> (ProtocolResult, ClientResult) {
+  pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, ClientResult) {
     debug!("Writing proxy protocol header");
 
     if let Some(ref mut socket) = self.backend {
@@ -55,6 +57,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
           match socket.write(&mut header[self.cursor_header..]) {
             Ok(sz) => {
               self.cursor_header += sz;
+              metrics.backend_bout += sz;
 
               if self.cursor_header == header.len() {
                 debug!("Proxy protocol sent, upgrading");
@@ -62,6 +65,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
               }
             },
             Err(e) => {
+              incr!("proxy_protocol.errors");
               debug!("PROXY PROTOCOL {}", e);
               break;
             },
@@ -184,10 +188,11 @@ mod send_test {
     }
 
     let mut send_pp = SendProxyProtocol::new(client_stream.expect("dazdaz"), Token(0), Some(backend_stream));
+    let mut session_metrics = SessionMetrics::new();
 
     send_pp.set_back_connected(BackendConnectionStatus::Connected);
 
-    while (ProtocolResult::Upgrade, ClientResult::Continue) != send_pp.back_writable() {};
+    while (ProtocolResult::Upgrade, ClientResult::Continue) != send_pp.back_writable(&mut session_metrics) {};
   }
 
   // Only connect to the middleware
