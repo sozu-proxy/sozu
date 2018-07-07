@@ -158,6 +158,7 @@ mod send_test {
   use std::{sync::{Arc, Barrier}, thread::{self, JoinHandle}, time::Duration, net::SocketAddr};
   use mio::net::{TcpListener, TcpStream};
   use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
+  use std::os::unix::io::{FromRawFd,IntoRawFd};
 
   #[test]
   fn it_should_send_a_proxy_protocol_header_to_the_upstream_backend() {
@@ -189,7 +190,11 @@ mod send_test {
       }
     }
 
-    let backend_stream = TcpStream::connect(&addr_backend).expect("could not connect to the backend");
+    // connect in blocking first, then convert to a mio socket
+    let backend_stream = StdTcpStream::connect(&addr_backend).expect("could not connect to the backend");
+    let fd = backend_stream.into_raw_fd();
+    let backend_stream = unsafe { TcpStream::from_raw_fd(fd) };
+
     let mut send_pp = SendProxyProtocol::new(client_stream.unwrap(), Token(0), Some(backend_stream));
     let mut session_metrics = SessionMetrics::new();
 
@@ -198,7 +203,7 @@ mod send_test {
     loop {
       let (protocol, client) = send_pp.back_writable(&mut session_metrics);
       if client != ClientResult::Continue {
-        panic!("state machine error");
+        panic!("state machine error: protocol result = {:?}, client result = {:?}", protocol, client);
       }
 
       if protocol == ProtocolResult::Upgrade {
@@ -245,7 +250,7 @@ mod send_test {
             }
           },
           Ok(sz) => {
-            println!("read {} bytes", sz);
+            println!("backend read {} bytes", sz);
             index += sz;
           },
         }
