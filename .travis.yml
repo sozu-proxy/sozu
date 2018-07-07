@@ -1,6 +1,6 @@
 language: rust
 # sudo is required to enable kcov to use the personality syscall
-sudo: false
+sudo: required
 dist: trusty
 cache: cargo
 
@@ -14,7 +14,6 @@ before_install:
 
 before_script:
   - export PATH=$HOME/.cargo/bin:$PATH
-  - which cargo-coveralls || cargo install cargo-travis
   - eval git pull --rebase https://github.com/sozu-proxy/sozu
   - eval git log --pretty=oneline HEAD~10..HEAD
 
@@ -22,12 +21,10 @@ before_script:
 matrix:
   include:
     - rust: stable
+      before_script:
+        - which cargo-tarpaulin || `RUSTFLAGS="--cfg procmacro2_semver_exempt" cargo install cargo-tarpaulin`
       script:
-        - cd $ROOT_PATH/lib     && cargo test  --verbose --features "use-openssl"
-        - cd $ROOT_PATH/command && cargo test  --verbose
-        - cd $ROOT_PATH/futures && cargo build --verbose
-        - cd $ROOT_PATH/bin     && cargo build --verbose --features "use-openssl"
-        - cd $ROOT_PATH/ctl     && cargo build --verbose
+        cd $ROOT_PATH && cargo tarpaulin --all --features use-openssl --ciserver travis-ci --coveralls $TRAVIS_JOB_ID
 
 # Dependencies of kcov, used by coverage
 addons:
@@ -45,16 +42,11 @@ addons:
 
 
 script:
-  - cd $ROOT_PATH/lib     && cargo test  --verbose
+  - cd $ROOT_PATH/lib     && cargo test  --verbose --features "use-openssl"
   - cd $ROOT_PATH/command && cargo test  --verbose
   - cd $ROOT_PATH/futures && cargo test  --verbose
-  - cd $ROOT_PATH/bin     && cargo build --verbose
+  - cd $ROOT_PATH/bin     && cargo build --verbose --features "use-openssl"
   - cd $ROOT_PATH/ctl     && cargo build --verbose
-
-after_success:
-  - if [ "$TRAVIS_RUST_VERSION" == "nightly" ]; then
-      cargo coveralls --all --verbose;
-    fi
 
 notifications:
   webhooks:
