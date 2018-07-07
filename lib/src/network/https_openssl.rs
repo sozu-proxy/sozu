@@ -1450,7 +1450,7 @@ mod tests {
   use std::sync::{Arc,Mutex};
   use std::cell::RefCell;
   use slab::Slab;
-  use pool::Pool;
+  use network::pool::Pool;
   use sozu_command::buffer::Buffer;
   use network::buffer_queue::BufferQueue;
   use network::http::DefaultAnswers;
