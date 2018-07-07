@@ -55,38 +55,44 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       count!("bytes_in", sz as i64);
       metrics.bin += sz;
 
-      if res == SocketResult::Error {
-        error!("[{:?}] front socket error, closing the connection", self.frontend_token);
+      if self.front_buf.buffer.available_space() == 0 {
+        self.readiness.front_interest.remove(Ready::readable());
+      }
+    }
+
+    if res == SocketResult::Error {
+      error!("[{:?}] front socket error, closing the connection", self.frontend_token);
+      metrics.service_stop();
+      incr!("proxy_protocol.errors");
+      self.readiness.reset();
+      return (ProtocolResult::Continue, ClientResult::CloseClient);
+    }
+
+    if res == SocketResult::WouldBlock {
+      self.readiness.front_readiness.remove(Ready::readable());
+    }
+
+    let read_sz = match parse_v2_header(self.front_buf.unparsed_data()) {
+      Done(rest, header) => {
+        self.addresses = Some(header.addr);
+        self.front_buf.next_output_data().offset(rest)
+      },
+      Incomplete(_) => {
+        return (ProtocolResult::Continue, ClientResult::Continue)
+      },
+      Error(e) => {
+        error!("[{:?}] front socket parse error, closing the connection", self.frontend_token);
         metrics.service_stop();
         incr!("proxy_protocol.errors");
         self.readiness.reset();
-        return (ProtocolResult::Continue, ClientResult::CloseClient);
+        return (ProtocolResult::Continue, ClientResult::CloseClient)
       }
+    };
 
-      if res == SocketResult::WouldBlock {
-        self.readiness.front_readiness.remove(Ready::readable());
-      }
-
-      let read_sz = match parse_v2_header(self.front_buf.unparsed_data()) {
-        Done(rest, header) => {
-          self.addresses = Some(header.addr);
-          self.front_buf.next_output_data().offset(rest)
-        },
-        Incomplete(_) => {
-          return (ProtocolResult::Continue, ClientResult::Continue)
-        },
-        Error(e) => {
-          return (ProtocolResult::Continue, ClientResult::CloseClient)
-        }
-      };
-
-      self.front_buf.consume_parsed_data(read_sz);
-      self.front_buf.delete_output(read_sz);
-      info!("read {} bytes of proxy protocol, {} remaining", read_sz, self.front_buf.available_input_data());
-      return (ProtocolResult::Upgrade, ClientResult::Continue)
-    }
-
-    return (ProtocolResult::Continue, ClientResult::Continue);
+    self.front_buf.consume_parsed_data(read_sz);
+    self.front_buf.delete_output(read_sz);
+    info!("read {} bytes of proxy protocol, {} remaining", read_sz, self.front_buf.available_input_data());
+    (ProtocolResult::Upgrade, ClientResult::Continue)
   }
 
   pub fn front_socket(&self) -> &TcpStream {
