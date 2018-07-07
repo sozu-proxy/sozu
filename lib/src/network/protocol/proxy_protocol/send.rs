@@ -38,7 +38,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
       backend_token:  None,
       readiness: Readiness {
         front_interest:  UnixReady::hup() | UnixReady::error(),
-        back_interest:   UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error(),
+        back_interest:   UnixReady::hup() | UnixReady::error(),
         front_readiness: UnixReady::from(Ready::empty()),
         back_readiness:  UnixReady::from(Ready::empty()),
       },
@@ -61,19 +61,27 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
 
               if self.cursor_header == header.len() {
                 debug!("Proxy protocol sent, upgrading");
-                return (ProtocolResult::Upgrade, ClientResult::Continue)
+                return (ProtocolResult::Upgrade, ClientResult::Continue);
               }
             },
-            Err(e) => {
-              incr!("proxy_protocol.errors");
-              debug!("PROXY PROTOCOL {}", e);
-              break;
+            Err(e) => match e.kind() {
+              ErrorKind::WouldBlock => {
+                self.readiness.back_readiness.remove(Ready::writable());
+                return (ProtocolResult::Continue, ClientResult::Continue);
+              },
+              e => {
+                incr!("proxy_protocol.errors");
+                debug!("send proxy protocol write error {:?}", e);
+                return (ProtocolResult::Continue, ClientResult::CloseClient);
+              }
             },
           }
         }
       }
     }
-    (ProtocolResult::Continue, ClientResult::Continue)
+
+    error!("started Send proxy protocol with no header or backend socket");
+    (ProtocolResult::Continue, ClientResult::CloseClient)
   }
 
   pub fn front_socket(&self) -> &TcpStream {
@@ -99,6 +107,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
   pub fn set_back_connected(&mut self, status: BackendConnectionStatus) {
     if status == BackendConnectionStatus::Connected {
       self.gen_proxy_protocol_header();
+      self.readiness.back_interest.insert(UnixReady::from(Ready::writable()));
     }
   }
 
