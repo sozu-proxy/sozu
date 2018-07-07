@@ -133,7 +133,7 @@ mod expect_test {
   use nom::IResult::Done;
   use network::pool::Pool;
 
-  use std::{thread, thread::JoinHandle, time::Duration, net::{SocketAddr, IpAddr, Ipv4Addr}};
+  use std::{sync::{Arc, Barrier}, thread::{self, JoinHandle}, time::Duration, net::{SocketAddr, IpAddr, Ipv4Addr}};
   use mio::net::{TcpListener, TcpStream};
   use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
 
@@ -148,17 +148,19 @@ mod expect_test {
   fn middleware_should_receive_proxy_protocol_header_from_an_upfront_middleware() {
     setup_test_logger!();
     let middleware_addr: SocketAddr = "127.0.0.1:3500".parse().expect("parse address error");
+    let barrier = Arc::new(Barrier::new(2));
 
-    let upfront = start_upfront_middleware(middleware_addr.clone());
-    start_middleware(middleware_addr);
+    let upfront = start_upfront_middleware(middleware_addr.clone(), barrier.clone());
+    start_middleware(middleware_addr, barrier);
 
     upfront.join().expect("should join");
   }
 
   // Accept connection from an upfront proxy and expect to read a proxy protocol header in this stream.
-  fn start_middleware(middleware_addr: SocketAddr) {
+  fn start_middleware(middleware_addr: SocketAddr, barrier: Arc<Barrier>) {
     let upfront_middleware_conn_listener = TcpListener::bind(&middleware_addr).expect("could not accept upfront middleware connection");
     let mut client_stream: Option<TcpStream> = None;
+    barrier.wait();
 
     // mio::TcpListener use a nonblocking mode so we have to loop on accept
     loop {
@@ -179,15 +181,16 @@ mod expect_test {
   }
 
   // Connect to the next middleware and send a proxy protocol header
-  fn start_upfront_middleware(next_middleware_addr: SocketAddr) -> JoinHandle<()> {
+  fn start_upfront_middleware(next_middleware_addr: SocketAddr, barrier: Arc<Barrier>) -> JoinHandle<()> {
     thread::spawn(move|| {
       let src_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(125, 25, 10, 1)), 8080);
       let dst_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200);
       let proxy_protocol = HeaderV2::new(Command::Local, src_addr, dst_addr).into_bytes();
 
+      barrier.wait();
       match StdTcpStream::connect(&next_middleware_addr) {
         Ok(mut stream) => {
-          stream.write(&proxy_protocol);
+          stream.write(&proxy_protocol).unwrap();
         },
         Err(e) => panic!("could not connect to the next middleware: {}", e),
       };
