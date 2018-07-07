@@ -956,77 +956,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   }
 }
 
-pub fn start_example() -> Channel<OrderMessage,OrderMessageAnswer> {
-  use network::proxy::ProxyClientCast;
-
-  info!("listen for connections");
-  let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
-  thread::spawn(move|| {
-    info!("starting event loop");
-    let mut poll = Poll::new().expect("could not create event loop");
-    let max_buffers = 10;
-    let buffer_size = 16384;
-    let pool = Rc::new(RefCell::new(
-      Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
-    ));
-
-    let mut clients: Slab<Rc<RefCell<ProxyClientCast>>,ClientToken> = Slab::with_capacity(max_buffers);
-    {
-      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
-      info!("taking token {:?} for channel", entry.index());
-      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
-    }
-    {
-      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
-      info!("taking token {:?} for metrics", entry.index());
-      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
-    }
-
-    let (configuration, tokens) = ServerConfiguration::new(&mut poll, pool, Vec::new(), vec!());
-    let (scm_server, scm_client) = UnixStream::pair().unwrap();
-    let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      clients, None, None, Some(configuration), None, max_buffers);
-    info!("will run");
-    s.run();
-    info!("ending event loop");
-  });
-  {
-    let front = TcpFront {
-      app_id: String::from("yolo"),
-      ip_address: String::from("127.0.0.1"),
-      port: 1234,
-    };
-    let backend = messages::Backend {
-      app_id: String::from("yolo"),
-      backend_id: String::from("yolo-0"),
-      ip_address: String::from("127.0.0.1"),
-      port: 5678,
-      load_balancing_parameters: Some(LoadBalancingParams::default()),
-      sticky_id: None,
-    };
-
-    command.write_message(&OrderMessage { id: String::from("ID_YOLO1"), order: Order::AddTcpFront(front) });
-    command.write_message(&OrderMessage { id: String::from("ID_YOLO2"), order: Order::AddBackend(backend) });
-  }
-  {
-    let front = TcpFront {
-      app_id: String::from("yolo"),
-      ip_address: String::from("127.0.0.1"),
-      port: 1235,
-    };
-    let backend = messages::Backend {
-      app_id: String::from("yolo"),
-      backend_id: String::from("yolo-0"),
-      ip_address: String::from("127.0.0.1"),
-      port: 5678,
-      load_balancing_parameters: Some(LoadBalancingParams::default()),
-      sticky_id: None,
-    };
-    command.write_message(&OrderMessage { id: String::from("ID_YOLO3"), order: Order::AddTcpFront(front) });
-    command.write_message(&OrderMessage { id: String::from("ID_YOLO4"), order: Order::AddBackend(backend) });
-  }
-  command
-}
 
 pub fn start(max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
   use network::proxy::ProxyClientCast;
@@ -1071,6 +1000,7 @@ mod tests {
   use std::io::{Read,Write};
   use std::time::Duration;
   use std::{thread,str};
+  use std::sync::{Arc, Barrier};
   use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
   static TEST_FINISHED: AtomicBool = ATOMIC_BOOL_INIT;
 
@@ -1078,26 +1008,27 @@ mod tests {
   #[test]
   fn mi() {
     setup_test_logger!();
-    thread::spawn(|| { start_server(); });
-    let tx = start_example();
-    thread::sleep(Duration::from_millis(300));
+    let barrier = Arc::new(Barrier::new(2));
+    start_server(barrier.clone());
+    let tx = start_proxy();
+    barrier.wait();
 
     let mut s1 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
     let mut s3 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
-    thread::sleep(Duration::from_millis(300));
     let mut s2 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
-    s1.write(&b"hello"[..]).map_err(|e| {
+
+    s1.write(&b"hello "[..]).map_err(|e| {
       TEST_FINISHED.store(true, Ordering::Relaxed);
       e
     }).unwrap();
     println!("s1 sent");
+
     s2.write(&b"pouet pouet"[..]).map_err(|e| {
       TEST_FINISHED.store(true, Ordering::Relaxed);
       e
     }).unwrap();
 
     println!("s2 sent");
-    thread::sleep(Duration::from_millis(500));
 
     let mut res = [0; 128];
     s1.write(&b"coucou"[..]).map_err(|e| {
@@ -1105,34 +1036,25 @@ mod tests {
       e
     }).unwrap();
 
-    let mut sz1 = s1.read(&mut res[..]).map_err(|e| {
-      TEST_FINISHED.store(true, Ordering::Relaxed);
-      e
-    }).expect("could not read from socket");
-    println!("s1 received {:?}", str::from_utf8(&res[..sz1]));
-    assert_eq!(&res[..sz1], &b"hello END"[..]);
     s3.shutdown(Shutdown::Both);
     let sz2 = s2.read(&mut res[..]).map_err(|e| {
       TEST_FINISHED.store(true, Ordering::Relaxed);
       e
     }).expect("could not read from socket");
     println!("s2 received {:?}", str::from_utf8(&res[..sz2]));
-    assert_eq!(&res[..sz2], &b"pouet pouet END"[..]);
+    assert_eq!(&res[..sz2], &b"pouet pouet"[..]);
 
-
-    thread::sleep(Duration::from_millis(400));
-    sz1 = s1.read(&mut res[..]).map_err(|e| {
+    let sz1 = s1.read(&mut res[..]).map_err(|e| {
       TEST_FINISHED.store(true, Ordering::Relaxed);
       e
     }).expect("could not read from socket");
     println!("s1 received again({}): {:?}", sz1, str::from_utf8(&res[..sz1]));
-    assert_eq!(&res[..sz1], &b"coucou END"[..]);
-    //assert!(false);
+    assert_eq!(&res[..sz1], &b"hello coucou"[..]);
     TEST_FINISHED.store(true, Ordering::Relaxed);
   }
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
-  fn start_server() {
+  fn start_server(barrier: Arc<Barrier>) {
     let listener = TcpListener::bind("127.0.0.1:5678").expect("could not parse address");
     fn handle_client(stream: &mut TcpStream, id: u8) {
       let mut buf = [0; 128];
@@ -1141,8 +1063,6 @@ mod tests {
         if sz > 0 {
           println!("ECHO[{}] got \"{:?}\"", id, str::from_utf8(&buf[..sz]));
           stream.write(&buf[..sz]);
-          thread::sleep(Duration::from_millis(20));
-          stream.write(&response[..]);
         }
         if TEST_FINISHED.load(Ordering::Relaxed) {
           println!("backend server stopping");
@@ -1153,6 +1073,7 @@ mod tests {
 
     let mut count = 0;
     thread::spawn(move|| {
+      barrier.wait();
       for conn in listener.incoming() {
         match conn {
           Ok(mut stream) => {
@@ -1168,4 +1089,83 @@ mod tests {
     });
   }
 
+  pub fn start_proxy() -> Channel<OrderMessage,OrderMessageAnswer> {
+    use network::proxy::ProxyClientCast;
+
+    info!("listen for connections");
+    let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
+    thread::spawn(move|| {
+      info!("starting event loop");
+      let mut poll = Poll::new().expect("could not create event loop");
+      let max_buffers = 10;
+      let buffer_size = 16384;
+      let pool = Rc::new(RefCell::new(
+        Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
+      ));
+
+      let mut clients: Slab<Rc<RefCell<ProxyClientCast>>,ClientToken> = Slab::with_capacity(max_buffers);
+      {
+        let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+        info!("taking token {:?} for channel", entry.index());
+        entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+      }
+      {
+        let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+        info!("taking token {:?} for metrics", entry.index());
+        entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+      }
+
+      let (configuration, tokens) = ServerConfiguration::new(&mut poll, pool, Vec::new(), vec!());
+      let (scm_server, scm_client) = UnixStream::pair().unwrap();
+      let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()),
+        clients, None, None, Some(configuration), None, max_buffers);
+      info!("will run");
+      s.run();
+      info!("ending event loop");
+    });
+
+    command.set_blocking(true);
+    {
+      let front = TcpFront {
+        app_id: String::from("yolo"),
+        ip_address: String::from("127.0.0.1"),
+        port: 1234,
+      };
+      let backend = messages::Backend {
+        app_id: String::from("yolo"),
+        backend_id: String::from("yolo-0"),
+        ip_address: String::from("127.0.0.1"),
+        port: 5678,
+        load_balancing_parameters: Some(LoadBalancingParams::default()),
+        sticky_id: None,
+      };
+
+      command.write_message(&OrderMessage { id: String::from("ID_YOLO1"), order: Order::AddTcpFront(front) });
+      command.write_message(&OrderMessage { id: String::from("ID_YOLO2"), order: Order::AddBackend(backend) });
+    }
+    {
+      let front = TcpFront {
+        app_id: String::from("yolo"),
+        ip_address: String::from("127.0.0.1"),
+        port: 1235,
+      };
+      let backend = messages::Backend {
+        app_id: String::from("yolo"),
+        backend_id: String::from("yolo-0"),
+        ip_address: String::from("127.0.0.1"),
+        port: 5678,
+        load_balancing_parameters: Some(LoadBalancingParams::default()),
+        sticky_id: None,
+      };
+      command.write_message(&OrderMessage { id: String::from("ID_YOLO3"), order: Order::AddTcpFront(front) });
+      command.write_message(&OrderMessage { id: String::from("ID_YOLO4"), order: Order::AddBackend(backend) });
+    }
+
+    println!("read_message: {:?}", command.read_message().unwrap());
+    println!("read_message: {:?}", command.read_message().unwrap());
+    println!("read_message: {:?}", command.read_message().unwrap());
+    println!("read_message: {:?}", command.read_message().unwrap());
+
+    command
+  }
 }
