@@ -1071,6 +1071,8 @@ mod tests {
   use std::io::{Read,Write};
   use std::time::Duration;
   use std::{thread,str};
+  use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
+  static TEST_FINISHED: AtomicBool = ATOMIC_BOOL_INIT;
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
@@ -1084,28 +1086,49 @@ mod tests {
     let mut s3 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
     thread::sleep(Duration::from_millis(300));
     let mut s2 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
-    s1.write(&b"hello"[..]);
+    s1.write(&b"hello"[..]).map_err(|e| {
+      TEST_FINISHED.store(true, Ordering::Relaxed);
+      e
+    }).unwrap();
     println!("s1 sent");
-    s2.write(&b"pouet pouet"[..]);
+    s2.write(&b"pouet pouet"[..]).map_err(|e| {
+      TEST_FINISHED.store(true, Ordering::Relaxed);
+      e
+    }).unwrap();
+
     println!("s2 sent");
     thread::sleep(Duration::from_millis(500));
 
     let mut res = [0; 128];
-    s1.write(&b"coucou"[..]);
-    let mut sz1 = s1.read(&mut res[..]).expect("could not read from socket");
+    s1.write(&b"coucou"[..]).map_err(|e| {
+      TEST_FINISHED.store(true, Ordering::Relaxed);
+      e
+    }).unwrap();
+
+    let mut sz1 = s1.read(&mut res[..]).map_err(|e| {
+      TEST_FINISHED.store(true, Ordering::Relaxed);
+      e
+    }).expect("could not read from socket");
     println!("s1 received {:?}", str::from_utf8(&res[..sz1]));
     assert_eq!(&res[..sz1], &b"hello END"[..]);
     s3.shutdown(Shutdown::Both);
-    let sz2 = s2.read(&mut res[..]).expect("could not read from socket");
+    let sz2 = s2.read(&mut res[..]).map_err(|e| {
+      TEST_FINISHED.store(true, Ordering::Relaxed);
+      e
+    }).expect("could not read from socket");
     println!("s2 received {:?}", str::from_utf8(&res[..sz2]));
     assert_eq!(&res[..sz2], &b"pouet pouet END"[..]);
 
 
     thread::sleep(Duration::from_millis(400));
-    sz1 = s1.read(&mut res[..]).expect("could not read from socket");
+    sz1 = s1.read(&mut res[..]).map_err(|e| {
+      TEST_FINISHED.store(true, Ordering::Relaxed);
+      e
+    }).expect("could not read from socket");
     println!("s1 received again({}): {:?}", sz1, str::from_utf8(&res[..sz1]));
     assert_eq!(&res[..sz1], &b"coucou END"[..]);
     //assert!(false);
+    TEST_FINISHED.store(true, Ordering::Relaxed);
   }
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
@@ -1120,6 +1143,10 @@ mod tests {
           stream.write(&buf[..sz]);
           thread::sleep(Duration::from_millis(20));
           stream.write(&response[..]);
+        }
+        if TEST_FINISHED.load(Ordering::Relaxed) {
+          println!("backend server stopping");
+          break;
         }
       }
     }

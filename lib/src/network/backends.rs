@@ -233,20 +233,19 @@ mod backends_test {
   use std::{thread,sync::mpsc::*,net::TcpListener};
 
 
-  fn run_mock_tcp_server(addr: &str, stoper: Receiver<()>) {
+  fn run_mock_tcp_server(addr: &str, stopper: Receiver<()>) {
     let mut run = true;
     let listener = TcpListener::bind(addr).unwrap();
-    listener.set_nonblocking(true).expect("Cannot set non-blocking");
 
     thread::spawn(move || {
       while run {
         for stream in listener.incoming() {
           // accept connections
+          if let Ok(()) = stopper.try_recv() {
+            run = false;
+          }
         }
 
-        if let Ok(()) = stoper.try_recv() {
-          run = false;
-        }
       }
     });
   }
