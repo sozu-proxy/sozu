@@ -15,7 +15,7 @@ name = "sozuctl"
 
 [dependencies]
 rand    = "^0.4"
-prettytable-rs = { version = "^0.6", default-features = false}
+prettytable-rs = { version = "^0.7", default-features = false}
 sozu-command-lib = { version = "^0.7", path = "../command" }
 structopt = "^0.2"
 structopt-derive = "^0.2"
