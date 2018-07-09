@@ -265,19 +265,18 @@ impl Backend {
   }
 
   pub fn dec_connections(&mut self) -> Option<usize> {
-    if self.active_connections == 0 {
-      self.status = BackendStatus::Closed;
-      return None;
-    }
-
     match self.status {
       BackendStatus::Normal => {
-        self.active_connections -= 1;
+        if self.active_connections > 0 {
+          self.active_connections -= 1;
+        }
         Some(self.active_connections)
       }
       BackendStatus::Closed  => None,
       BackendStatus::Closing => {
-        self.active_connections -= 1;
+        if self.active_connections > 0 {
+          self.active_connections -= 1;
+        }
         if self.active_connections == 0 {
           self.status = BackendStatus::Closed;
           None
