@@ -90,7 +90,7 @@ fn main() {
         std::process::exit(1);
       },
       Err(StartupError::ConfigurationFileLoadError(err)) => {
-        error!("Configuration file couldn't been read. Error: {:?}", err);
+        error!("Invalid configuration file. Error: {:?}", err);
         std::process::exit(1);
       },
       Err(StartupError::TooManyAllowedConnections(err)) | Err(StartupError::TooManyAllowedConnectionsForWorker(err)) => {

@@ -129,7 +129,7 @@ impl ProxyConfig {
       }
     };
 
-    let mut expect_proxy = self.expect_proxy.unwrap_or(false);
+    let expect_proxy = self.expect_proxy.unwrap_or(false);
     let tls_provider = self.tls_provider.unwrap_or(if cfg!(use_openssl) {
       TlsProvider::Openssl
     } else {
@@ -317,8 +317,12 @@ impl FileAppConfig {
         (None, None) => Err(String::from("missing IP address port for TCP application")),
       }
     } else {
+      if self.expect_proxy.is_some() {
+        return Err(String::from("invalid `expect_proxy` field in HTTP application"));
+      }
+
       if self.hostname.is_none() {
-        return Err(String::from("missing hostname for TCP application"));
+        return Err(String::from("missing hostname for HTTP application"));
       }
 
       let path_begin     = self.path_begin.unwrap_or(String::new());
@@ -595,7 +599,7 @@ impl FileConfig {
         match app.to_app_config(id.as_str()) {
           Ok(app_config) => { applications.insert(id, app_config); },
           Err(s)         => {
-            println!("error parsing application configuration for {}: {}", id, s);
+            panic!("error parsing application configuration for {}: {}", id, s);
           },
         }
       }
