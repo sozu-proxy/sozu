@@ -21,7 +21,7 @@ pub struct Pool<T:pool_crate::Reset> {
 }
 
 impl<T: pool_crate::Reset> Pool<T> {
-  pub fn with_capacity<F>(count: usize, mut extra: usize, init: F) -> Pool<T>
+  pub fn with_capacity<F>(count: usize, extra: usize, init: F) -> Pool<T>
     where F: Fn() -> T {
     Pool {
       inner: pool_crate::Pool::with_capacity(count, extra, init),
