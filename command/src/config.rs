@@ -18,6 +18,7 @@ use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,TcpF
 use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
   pub address:                   String,
   pub public_address:            Option<String>,
@@ -188,10 +189,12 @@ impl ProxyConfig {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TcpProxyConfig {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
   pub address:        String,
   pub port:           u16,
@@ -203,6 +206,7 @@ pub struct MetricsConfig {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(deny_unknown_fields)]
 pub enum ProxyProtocolConfig {
   ExpectHeader,
   SendHeader,
@@ -210,6 +214,7 @@ pub enum ProxyProtocolConfig {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileAppConfig {
   pub ip_address:        Option<String>,
   pub port:              Option<u16>,
@@ -275,6 +280,7 @@ impl FromStr for LoadBalancingAlgorithms {
 
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BackendConfig {
   pub address: SocketAddr,
   pub weight: Option<u8>,
@@ -351,6 +357,7 @@ impl FileAppConfig {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HttpAppConfig {
   pub app_id:            String,
   pub hostname:          String,
