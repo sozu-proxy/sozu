@@ -323,9 +323,16 @@ impl Client {
     debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND",
       self.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), self.frontend_token.0,
       self.backend_token.map(|t| format!("{}", t.0)).unwrap_or("-".to_string()));
-    let addr:Option<SocketAddr> = self.back_socket().and_then(|sock| sock.peer_addr().ok());
-    self.backend_token = None;
-    (self.app_id.clone(), addr)
+
+    let backend = self.backend.take();
+    if backend.is_some() {
+      let addr:Option<SocketAddr> = self.back_socket().and_then(|sock| sock.peer_addr().ok());
+      self.backend_token = None;
+
+      (self.app_id.clone(), addr)
+    } else {
+      (None, None)
+    }
   }
 
   fn readiness(&mut self) -> &mut Readiness {
