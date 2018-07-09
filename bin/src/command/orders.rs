@@ -542,6 +542,12 @@ impl CommandServer {
         }
       }
     }
+
+    self.backends_count = self.state.count_backends();
+    self.frontends_count = self.state.count_frontends();
+    gauge!("configuration.applications", self.state.applications.len());
+    gauge!("configuration.backends", self.backends_count);
+    gauge!("configuration.frontends", self.frontends_count);
   }
 
   pub fn disable_cloexec_before_upgrade(&mut self) {
