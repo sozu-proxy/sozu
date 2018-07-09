@@ -341,68 +341,7 @@ pub fn upgrade_master(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
             for (i, ref worker) in running_workers.iter().enumerate() {
               println!("Upgrading worker {} (of {})", i+1, running_count);
 
-              let id = generate_tagged_id("LAUNCH-WORKER");
-              let msg = ConfigMessage::new(
-                id.clone(),
-                ConfigCommand::LaunchWorker("BLAH".to_string()),
-                None,
-              );
-              channel.write_message(&msg);
-
-              loop {
-                match channel.read_message() {
-                  None          => {
-                    println!("Error: the proxy didn't launch a new worker");
-                    return;
-                  },
-                  Some(message) => {
-                    if &id != &message.id {
-                      println!("Error: received unexpected message: {:?}", message);
-                      return;
-                    }
-                    match message.status {
-                      ConfigMessageStatus::Processing => {},
-                      ConfigMessageStatus::Error => {
-                        println!("Error: failed to launch a new worker: {}", message.message);
-                        return;
-                      },
-                      ConfigMessageStatus::Ok => break,
-                    }
-                  }
-                }
-              }
-
-              // Stop the old worker
-              let id = generate_tagged_id("SOFT-STOP-WORKER");
-              let msg = ConfigMessage::new(
-                id.clone(),
-                ConfigCommand::ProxyConfiguration(Order::SoftStop),
-                Some(worker.id),
-              );
-              channel.write_message(&msg);
-
-              loop {
-                match channel.read_message() {
-                  None          => {
-                    println!("Error: the proxy didn't stop the old worker");
-                    return;
-                  }
-                  Some(message) => {
-                    if &id != &message.id {
-                      println!("Error: received unexpected message: {:?}", message);
-                      return;
-                    }
-                    match message.status {
-                      ConfigMessageStatus::Processing => {},
-                      ConfigMessageStatus::Error => {
-                        println!("Error: failed to stop old worker: {}", message.message);
-                        return;
-                      },
-                      ConfigMessageStatus::Ok => break,
-                    }
-                  }
-                }
-              }
+              channel = upgrade_worker(channel, 1000, worker.id);
             }
 
             println!("Proxy successfully upgraded!");
@@ -413,7 +352,7 @@ pub fn upgrade_master(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
   }
 }
 
-pub fn upgrade_worker(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, worker_id: u32) {
+pub fn upgrade_worker(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, worker_id: u32) -> Channel<ConfigMessage,ConfigMessageAnswer> {
   println!("upgrading worker {}", worker_id);
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
@@ -423,7 +362,11 @@ pub fn upgrade_worker(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, t
     None,
   ));
 
-  command_timeout!(timeout,
+  // We do our own timeout so we can return the Channel object from the thread
+  // and avoid ownership issues
+  let (send, recv) = mpsc::channel();
+
+  let timeout_thread = thread::spawn(move || {
     loop {
       match channel.read_message() {
         None          => println!("the proxy didn't answer"),
@@ -434,6 +377,7 @@ pub fn upgrade_worker(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, t
             },
             ConfigMessageStatus::Error => {
               println!("could not stop the proxy: {}", message.message);
+              break;
             },
             ConfigMessageStatus::Ok => {
               if &id == &message.id {
@@ -445,7 +389,15 @@ pub fn upgrade_worker(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, t
         }
       }
     }
-  );
+    send.send(()).unwrap();
+    channel
+  });
+
+  if timeout > 0 && recv.recv_timeout(Duration::from_millis(timeout)).is_err() {
+    eprintln!("Command timeout. The proxy didn't send answer");
+  }
+
+  timeout_thread.join().expect("upgrade_worker: Timeout thread should correctly terminate")
 }
 
 pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bool) {
