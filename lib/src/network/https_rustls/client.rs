@@ -69,18 +69,8 @@ impl TlsClient {
   pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
     public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String) -> TlsClient {
     let state = if expect_proxy {
-      if let Some(pool) = pool.upgrade() {
-        let mut p = pool.borrow_mut();
-        if let Some(front_buf) = p.checkout() {
-          trace!("starting in expect proxy state");
-          Some(State::Expect(ExpectProxyProtocol::new(sock, token, front_buf), ssl))
-        } else {
-          error!("FIXME: TlsClient creation can fail now");
-          None
-        }
-      } else {
-        None
-      }
+      trace!("starting in expect proxy state");
+      Some(State::Expect(ExpectProxyProtocol::new(sock, token), ssl))
     } else {
       Some(State::Handshake(TlsHandshake::new(ssl, sock)))
     };
@@ -121,41 +111,22 @@ impl TlsClient {
   pub fn upgrade(&mut self) -> bool {
     let protocol = unwrap_msg!(self.protocol.take());
 
-    if let State::Expect(expect, mut ssl) = protocol {
+    if let State::Expect(expect, ssl) = protocol {
       debug!("switching to TLS handshake");
       if let Some(ref addresses) = expect.addresses {
         if let (Some(public_address), Some(client_address)) = (addresses.destination(), addresses.source()) {
-          if let Some(pool) = self.pool.upgrade() {
-            let mut p = pool.borrow_mut();
-            if let Some(back_buf) = p.checkout() {
+          self.public_address = Some(public_address.ip());
 
-              let ExpectProxyProtocol {
-                frontend, frontend_token, mut front_buf, readiness, .. } = expect;
-              let available = front_buf.available_input_data();
-              let res = {
-                let mut c = Cursor::new(front_buf.unparsed_data());
-                ssl.read_tls(&mut c)
-              };
-              match res {
-                Ok(sz) => {
-                  front_buf.consume_parsed_data(sz);
-                  if let Err(e) = ssl.process_new_packets() {
-                    error!("could not perform handshake: {:?}", e);
-                    return false;
-                  }
-                },
-                Err(e) => {
-                  error!("error in read_tls: {:?}", e);
-                },
-              };
-              let mut tls = TlsHandshake::new(ssl, frontend);
-              tls.readiness.front_readiness = readiness.front_readiness;
-              tls.readiness.back_readiness  = readiness.back_readiness;
+          let ExpectProxyProtocol {
+            frontend, frontend_token, readiness, .. } = expect;
 
-              self.protocol = Some(State::Handshake(tls));
-              return true;
-            }
-          }
+          let mut tls = TlsHandshake::new(ssl, frontend);
+          tls.readiness.front_readiness = readiness.front_readiness;
+          tls.readiness.back_readiness  = readiness.back_readiness;
+          tls.readiness.front_readiness.insert(Ready::readable());
+
+          self.protocol = Some(State::Handshake(tls));
+          return true;
         }
       }
 

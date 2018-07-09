@@ -73,11 +73,8 @@ impl Client {
     let protocol = if let Some(pool) = pool.upgrade() {
       let mut p = pool.borrow_mut();
       if expect_proxy {
-        if let Some(front_buf) = p.checkout() {
-          info!("starting in expect proxy state");
-          Some(State::Expect(ExpectProxyProtocol::new(sock, token, front_buf)))
-        } else { None }
-
+        trace!("starting in expect proxy state");
+        Some(State::Expect(ExpectProxyProtocol::new(sock, token)))
       } else {
         if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
           let mut http = State::Http(Http::new(sock, token, front_buf, back_buf, public_address,
@@ -134,9 +131,9 @@ impl Client {
         if let (Some(public_address), Some(client_address)) = (addresses.destination(), addresses.source()) {
           if let Some(pool) = self.pool.upgrade() {
             let mut p = pool.borrow_mut();
-            if let Some(back_buf) = p.checkout() {
+            if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
               let mut http = Http::new(expect.frontend, expect.frontend_token,
-                expect.front_buf, back_buf, Some(public_address.ip()), Some(client_address),
+                front_buf, back_buf, Some(public_address.ip()), Some(client_address),
                 self.sticky_name.clone(),
                 Protocol::HTTP).expect("should create a HTTP state");
 

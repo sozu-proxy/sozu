@@ -19,21 +19,32 @@ use network::pool::Checkout;
 use parser::proxy_protocol::parse_v2_header;
 use super::header::ProxyAddr;
 
+#[derive(Clone,Copy)]
+pub enum HeaderLen {
+  V4,
+  V6,
+  Unix
+}
+
 pub struct ExpectProxyProtocol<Front:SocketHandler> {
   pub frontend:       Front,
   pub frontend_token: Token,
-  pub front_buf:      Checkout<BufferQueue>,
+  pub buf:            [u8; 232],
+  pub index:          usize,
+  pub header_len:     HeaderLen,
   pub readiness:      Readiness,
   pub addresses:      Option<ProxyAddr>,
 }
 
 impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
-  pub fn new(frontend: Front, frontend_token: Token, front_buf: Checkout<BufferQueue>) -> Self {
+  pub fn new(frontend: Front, frontend_token: Token) -> Self {
     println!("expect starting, connection from {:?}", frontend.socket_ref().peer_addr());
     ExpectProxyProtocol {
       frontend,
       frontend_token,
-      front_buf,
+      buf: [0; 232],
+      index: 0,
+      header_len: HeaderLen::V4,
       readiness: Readiness {
         front_interest:  UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
         back_interest:   UnixReady::hup() | UnixReady::error(),
@@ -45,17 +56,23 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
   }
 
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, ClientResult) {
-    let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
-    info!("FRONT proxy protocol [{:?}]: read {} bytes and res={:?}", self.frontend_token, sz, res);
+    let total_len = match self.header_len {
+      HeaderLen::V4   => 28,
+      HeaderLen::V6   => 52,
+      HeaderLen::Unix => 232,
+    };
+
+    let (sz, res) = self.frontend.socket_read(&mut self.buf[self.index..total_len]);
+    trace!("FRONT proxy protocol [{:?}]: read {} bytes and res={:?}, index = {}, total_len = {}",
+      self.frontend_token, sz, res, self.index, total_len);
 
     if sz > 0 {
-      self.front_buf.buffer.fill(sz);
-      self.front_buf.sliced_input(sz);
+      self.index += sz;
 
       count!("bytes_in", sz as i64);
       metrics.bin += sz;
 
-      if self.front_buf.buffer.available_space() == 0 {
+      if self.index == self.buf.len() {
         self.readiness.front_interest.remove(Ready::readable());
       }
     }
@@ -72,16 +89,32 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       self.readiness.front_readiness.remove(Ready::readable());
     }
 
-    let read_sz = match parse_v2_header(self.front_buf.unparsed_data()) {
+    match parse_v2_header(&self.buf[..self.index]) {
       Done(rest, header) => {
+        trace!("got expect header: {:?}, rest.len() = {}", header, rest.len());
         self.addresses = Some(header.addr);
-        self.front_buf.next_output_data().offset(rest)
+        return (ProtocolResult::Upgrade, ClientResult::Continue);
       },
       Incomplete(_) => {
+        match self.header_len {
+          HeaderLen::V4 => if self.index == 28 {
+            self.header_len = HeaderLen::V6;
+          },
+          HeaderLen::V6 => if self.index == 52 {
+            self.header_len = HeaderLen::Unix;
+          },
+          HeaderLen::Unix => if self.index == 232 {
+            error!("[{:?}] front socket parse error, closing the connection", self.frontend_token);
+            metrics.service_stop();
+            incr!("proxy_protocol.errors");
+            self.readiness.reset();
+            return (ProtocolResult::Continue, ClientResult::CloseClient)
+          }
+        };
         return (ProtocolResult::Continue, ClientResult::Continue)
       },
       Error(e) => {
-        error!("[{:?}] front socket parse error, closing the connection", self.frontend_token);
+        error!("[{:?}] front socket parse error, closing the connection: {:?}", self.frontend_token, e);
         metrics.service_stop();
         incr!("proxy_protocol.errors");
         self.readiness.reset();
@@ -89,9 +122,6 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       }
     };
 
-    self.front_buf.consume_parsed_data(read_sz);
-    self.front_buf.delete_output(read_sz);
-    info!("read {} bytes of proxy protocol, {} remaining", read_sz, self.front_buf.available_input_data());
     (ProtocolResult::Upgrade, ClientResult::Continue)
   }
 
@@ -103,7 +133,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
     &mut self.readiness
   }
 
-  pub fn into_pipe(self, back_buf: Checkout<BufferQueue>, backend_socket: Option<TcpStream>, backend_token: Option<Token>) -> Pipe<Front> {
+  pub fn into_pipe(self, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, backend_socket: Option<TcpStream>, backend_token: Option<Token>) -> Pipe<Front> {
     let addr = if let Some(ref backend_socket) = backend_socket {
       backend_socket.peer_addr().map(|s| s.ip()).ok()
     } else {
@@ -114,7 +144,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       self.frontend,
       self.frontend_token,
       backend_socket,
-      self.front_buf,
+      front_buf,
       back_buf,
       addr,
     );
@@ -177,9 +207,7 @@ mod expect_test {
     }
 
     let mut session_metrics = SessionMetrics::new();
-    let mut pool = Pool::with_capacity(1, 0, || BufferQueue::with_capacity(16384));
-    let mut front_buf = pool.checkout().unwrap();
-    let mut expect_pp = ExpectProxyProtocol::new(client_stream.unwrap(), Token(0), front_buf);
+    let mut expect_pp = ExpectProxyProtocol::new(client_stream.unwrap(), Token(0));
 
     if (ProtocolResult::Upgrade, ClientResult::Continue) != expect_pp.readable(&mut session_metrics) {
       panic!("Should receive a complete proxy protocol header");

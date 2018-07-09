@@ -50,6 +50,7 @@ use network::trie::*;
 use network::protocol::{ProtocolResult,Http,Pipe,StickySession};
 use network::protocol::openssl::TlsHandshake;
 use network::protocol::http::DefaultAnswerStatus;
+use network::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use network::retry::RetryPolicy;
 use network::tcp;
 use util::UnwrapLog;
@@ -64,6 +65,7 @@ pub struct TlsApp {
 }
 
 pub enum State {
+  Expect(ExpectProxyProtocol<TcpStream>, Ssl),
   Handshake(TlsHandshake),
   Http(Http<SslStream<TcpStream>>),
   WebSocket(Pipe<SslStream<TcpStream>>)
@@ -84,13 +86,20 @@ pub struct TlsClient {
 
 impl TlsClient {
   pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>,
-    sticky_name: String) -> TlsClient {
-    let handshake = TlsHandshake::new(ssl, sock);
+    expect_proxy: bool, sticky_name: String) -> TlsClient {
+    info!("TLS CLIENT NEW: expect_proxy = {}", expect_proxy);
+    let protocol = if expect_proxy {
+      trace!("starting in expect proxy state");
+      Some(State::Expect(ExpectProxyProtocol::new(sock, token), ssl))
+    } else {
+      Some(State::Handshake(TlsHandshake::new(ssl, sock)))
+    };
+
     let mut client = TlsClient {
       frontend_token: token,
       backend:        None,
       back_connected: BackendConnectionStatus::NotConnected,
-      protocol:       Some(State::Handshake(handshake)),
+      protocol:       protocol,
       public_address: public_address,
       ssl:            None,
       pool:           pool,
@@ -124,7 +133,28 @@ impl TlsClient {
   pub fn upgrade(&mut self) -> bool {
     let protocol = unwrap_msg!(self.protocol.take());
 
-    if let State::Handshake(handshake) = protocol {
+    if let State::Expect(expect, ssl) = protocol {
+      debug!("switching to TLS handshake");
+      if let Some(ref addresses) = expect.addresses {
+        if let (Some(public_address), Some(client_address)) = (addresses.destination(), addresses.source()) {
+          self.public_address = Some(public_address.ip());
+
+          let ExpectProxyProtocol {
+            frontend, frontend_token, readiness, .. } = expect;
+          let mut tls = TlsHandshake::new(ssl, frontend);
+          tls.readiness.front_readiness = readiness.front_readiness;
+          tls.readiness.back_readiness  = readiness.back_readiness;
+
+          self.protocol = Some(State::Handshake(tls));
+          return true;
+        }
+      }
+
+      error!("failed to upgrade from expect");
+      self.protocol = Some(State::Expect(expect, ssl));
+      false
+
+    } else if let State::Handshake(handshake) = protocol {
       if let Some(pool) = self.pool.upgrade() {
         let mut p = pool.borrow_mut();
 
@@ -174,6 +204,10 @@ impl TlsClient {
       State::Handshake(_)            => {
         error!("why a backend HUP event while still in frontend handshake?");
         ClientResult::CloseClient
+      },
+      State::Expect(_,_)             => {
+        error!("why a backend HUP event while still in frontend proxy protocol expect?");
+        ClientResult::CloseClient
       }
     }
   }
@@ -188,6 +222,7 @@ impl TlsClient {
 
   fn readable(&mut self)      -> ClientResult {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Expect(ref mut expect,_)     => expect.readable(&mut self.metrics),
       State::Handshake(ref mut handshake) => handshake.readable(),
       State::Http(ref mut http)           => (ProtocolResult::Continue, http.readable(&mut self.metrics)),
       State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.readable(&mut self.metrics)),
@@ -209,6 +244,7 @@ impl TlsClient {
 
   fn writable(&mut self)      -> ClientResult {
     match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Expect(_,_)                  => ClientResult::CloseClient,
       State::Handshake(ref mut handshake) => ClientResult::CloseClient,
       State::Http(ref mut http)           => http.writable(&mut self.metrics),
       State::WebSocket(ref mut pipe)      => pipe.writable(&mut self.metrics),
@@ -217,6 +253,7 @@ impl TlsClient {
 
   fn back_readable(&mut self) -> ClientResult {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Expect(_,_)                  => (ProtocolResult::Continue, ClientResult::CloseClient),
       State::Http(ref mut http)           => http.back_readable(&mut self.metrics),
       State::Handshake(ref mut handshake) => (ProtocolResult::Continue, ClientResult::CloseClient),
       State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.back_readable(&mut self.metrics)),
@@ -238,6 +275,7 @@ impl TlsClient {
 
   fn back_writable(&mut self) -> ClientResult {
     match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Expect(_,_)                  => ClientResult::CloseClient,
       State::Handshake(ref mut handshake) => ClientResult::CloseClient,
       State::Http(ref mut http)           => http.back_writable(&mut self.metrics),
       State::WebSocket(ref mut pipe)      => pipe.back_writable(&mut self.metrics),
@@ -246,6 +284,7 @@ impl TlsClient {
 
   fn front_socket(&self) -> Option<&TcpStream> {
     match unwrap_msg!(self.protocol.as_ref()) {
+      &State::Expect(ref expect,_)     => Some(expect.front_socket()),
       &State::Handshake(ref handshake) => handshake.socket(),
       &State::Http(ref http)           => Some(http.front_socket()),
       &State::WebSocket(ref pipe)      => Some(pipe.front_socket()),
@@ -254,6 +293,7 @@ impl TlsClient {
 
   fn back_socket(&self)  -> Option<&TcpStream> {
     match unwrap_msg!(self.protocol.as_ref()) {
+      &State::Expect(_,_)              => None,
       &State::Handshake(ref handshake) => None,
       &State::Http(ref http)           => http.back_socket(),
       &State::WebSocket(ref pipe)      => pipe.back_socket(),
@@ -304,6 +344,7 @@ impl TlsClient {
 
   fn readiness(&mut self)      -> &mut Readiness {
     let r = match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Expect(ref mut expect, _)    => &mut expect.readiness,
       State::Handshake(ref mut handshake) => &mut handshake.readiness,
       State::Http(ref mut http)           => http.readiness(),
       State::WebSocket(ref mut pipe)      => &mut pipe.readiness,
@@ -1049,7 +1090,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
             PollOpt::edge()
           );
           let c = TlsClient::new(ssl, frontend_sock, client_token, Rc::downgrade(&self.pool),
-            self.config.public_address, self.config.sticky_name.clone());
+            self.config.public_address, self.config.expect_proxy, self.config.sticky_name.clone());
 
           Ok((Rc::new(RefCell::new(c)), false))
         } else {

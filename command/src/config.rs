@@ -136,11 +136,6 @@ impl ProxyConfig {
     });
 
 
-    if expect_proxy && tls_provider == TlsProvider::Openssl {
-      error!("the OpenSSL based HTTPS proxy does not support the proxy protocol yet, deactivating the proxy protocol");
-      expect_proxy = false;
-    }
-
     tls_proxy_configuration.map(|addr| {
       let mut configuration = HttpsProxyConfiguration {
         front:           addr,

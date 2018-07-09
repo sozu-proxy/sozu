@@ -100,8 +100,9 @@ impl Client {
         Some(State::RelayProxyProtocol(RelayProxyProtocol::new(s, frontend_token, None, front_buf)))
       },
       Some(ProxyProtocolConfig::ExpectHeader) => {
+        frontend_buffer = Some(front_buf);
         backend_buffer = Some(back_buf);
-        Some(State::ExpectProxyProtocol(ExpectProxyProtocol::new(s, frontend_token, front_buf)))
+        Some(State::ExpectProxyProtocol(ExpectProxyProtocol::new(s, frontend_token)))
       },
       Some(ProxyProtocolConfig::SendHeader) => {
         frontend_buffer = Some(front_buf);
@@ -296,9 +297,9 @@ impl Client {
         UpgradeResult::Close
       }
     } else if let Some(State::ExpectProxyProtocol(mut pp)) = protocol {
-      if self.back_buf.is_some() {
+      if self.front_buf.is_some() && self.back_buf.is_some() {
         self.protocol = Some(
-          State::Pipe(pp.into_pipe(self.back_buf.take().unwrap(), None, None))
+          State::Pipe(pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap(), None, None))
         );
         UpgradeResult::ConnectBackend
       } else {
