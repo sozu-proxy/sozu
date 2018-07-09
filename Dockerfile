@@ -1,32 +1,44 @@
-FROM alpine:edge as builder
+FROM alpine:latest as builder
 
 COPY . /source/
-COPY bin/config.toml /etc/sozu/sozu.toml
 
-RUN apk add --no-cache --virtual .build-dependencies \
+RUN apk update && apk add --no-cache --virtual .build-dependencies \
   cargo \
   build-base \
   file \
   libgcc \
   musl-dev \
   rust
-RUN apk add --no-cache openssl-dev llvm-libunwind pkgconfig
-ENV SOZU_CONFIG /etc/sozu/sozu.toml
-ENV SOZU_PID_FILE_PATH /run/sozu/sozu.pid
-WORKDIR /source/ctl
-RUN cargo build --release
+RUN apk add --no-cache openssl-dev \
+  llvm-libunwind \
+  pkgconfig
+
 WORKDIR /source/bin
-RUN cargo build --release
+
+RUN cargo build --release --features use-openssl
 
 
 
-FROM alpine:edge
-COPY bin/config.toml /etc/sozu/sozu.toml
-RUN apk add --no-cache openssl llvm-libunwind libgcc
-COPY --from=builder /source/target/release/sozu /sozu
-COPY --from=builder /source/target/release/sozuctl /sozuctl
+FROM alpine:latest as bin
+
+COPY bin/config.toml /etc/sozu/config.toml
+
+RUN apk update && apk add --no-cache openssl-dev \
+  llvm-libunwind \
+  libgcc
+
+COPY --from=builder /source/target/release/sozu sozu
+
+ENV SOZU_CONFIG /etc/sozu/sozu.toml
+
+VOLUME /etc/sozu
+
+RUN mkdir command_folder
+VOLUME command_folder
 
 EXPOSE 80
 EXPOSE 443
 
-CMD ["/sozu", "--help"]
+ENTRYPOINT ["/sozu"]
+
+CMD ["start", "-c", "/etc/sozu/config.toml"]
