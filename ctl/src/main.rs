@@ -31,6 +31,13 @@ fn main() {
   let config_file = matches.config;
 
   let config  = Config::load_from_path(config_file.as_str()).expect("could not parse configuration file");
+
+  // If the command is `config check` then exit because if we are here, the configuration is valid
+  if let SubCmd::Config{ cmd: ConfigCmd::Check{} } = matches.cmd {
+    println!("Configuration file is valid");
+    std::process::exit(0);
+  }
+
   let channel = create_channel(&config.command_socket_path()).expect("could not connect to the command unix socket");
   let timeout: u64 = matches.timeout.unwrap_or(config.ctl_command_timeout);
 
@@ -102,6 +109,7 @@ fn main() {
         QueryCmd::Applications{ id, domain } => query_application(channel, json, id, domain),
       }
     },
+    SubCmd::Config{ cmd: _ } => {} // noop, handled at the beginning of the method
   }
 }
 
