@@ -33,8 +33,8 @@ ENV SOZU_CONFIG /etc/sozu/sozu.toml
 
 VOLUME /etc/sozu
 
-RUN mkdir command_folder
-VOLUME command_folder
+RUN mkdir -p /run/sozu
+VOLUME /run/sozu
 
 EXPOSE 80
 EXPOSE 443
