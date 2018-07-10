@@ -21,7 +21,7 @@ RUN cargo build --release --features use-openssl
 
 FROM alpine:latest as bin
 
-COPY bin/config.toml /etc/sozu/config.toml
+COPY os-build/docker/config.toml /etc/sozu/config.toml
 
 RUN apk update && apk add --no-cache openssl-dev \
   llvm-libunwind \
@@ -29,7 +29,7 @@ RUN apk update && apk add --no-cache openssl-dev \
 
 COPY --from=builder /source/target/release/sozu sozu
 
-ENV SOZU_CONFIG /etc/sozu/sozu.toml
+ENV SOZU_CONFIG /etc/sozu/config.toml
 
 VOLUME /etc/sozu
 

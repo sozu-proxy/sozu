@@ -4,7 +4,8 @@
 target
 LICENSE
 README.md
-ctl
 doc
-os-build
 CONTRIBUTING.md
+bin/command_folder
+os-build
+!os-build/docker
