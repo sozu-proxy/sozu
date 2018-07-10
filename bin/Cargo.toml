@@ -45,6 +45,7 @@ unstable = []
 logs-debug = ["sozu-lib/logs-debug", "sozu-command-lib/logs-debug"]
 logs-trace = ["sozu-lib/logs-trace", "sozu-command-lib/logs-trace"]
 use-openssl = ["sozu-lib/use-openssl"]
+tolerant-http1-parser = ["sozu-lib/tolerant-http1-parser"]
 
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }

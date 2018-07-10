@@ -48,8 +48,17 @@ fn is_vchar_or_ws(i: u8) -> bool {
   is_vchar(i) || is_ws(i)
 }
 
+// allows ISO-8859-1 characters in header values
+// this is allowed in RFC 2616 but not in rfc7230
+// cf https://github.com/sozu-proxy/sozu/issues/479
+#[cfg(feature = "tolerant-http1-parser")]
 fn is_header_value_char(i: u8) -> bool {
-  i >= 32 && i <= 126
+  i == 9 || (i >= 32 && i <= 126) || i >= 160
+}
+
+#[cfg(not(feature = "tolerant-http1-parser"))]
+fn is_header_value_char(i: u8) -> bool {
+  i == 9 || (i >= 32 && i <= 126)
 }
 
 named!(pub vchar_1, take_while!(is_vchar));
@@ -208,6 +217,17 @@ named!(pub message_header<Header>,
 );
 
 //not a space nor a comma
+//
+// allows ISO-8859-1 characters in header values
+// this is allowed in RFC 2616 but not in rfc7230
+// cf https://github.com/sozu-proxy/sozu/issues/479
+#[cfg(feature = "tolerant-http1-parser")]
+fn is_single_header_value_char(i: u8) -> bool {
+  (i > 33 && i <= 126 && i != 44) || i >= 160
+}
+
+//not a space nor a comma
+#[cfg(not(feature = "tolerant-http1-parser"))]
 fn is_single_header_value_char(i: u8) -> bool {
   i > 33 && i <= 126 && i != 44
 }
@@ -225,6 +245,22 @@ pub fn comma_separated_header_values(input:&[u8]) -> Option<Vec<&[u8]>> {
 
 named!(pub headers< Vec<Header> >, terminated!(many0!(message_header), opt!(crlf)));
 
+#[cfg(feature = "tolerant-http1-parser")]
+fn is_hostname_char(i: u8) -> bool {
+  is_alphanumeric(i) ||
+  // the domain name should not start with a hyphen or dot
+  // but is it important here, since we will match this to
+  // the list of accepted applications?
+  // BTW each label between dots has a max of 63 chars,
+  // and the whole domain shuld not be larger than 253 chars
+  //
+  // this tolerant parser also allows underscore, which is wrong
+  // in domain names but accepted by some proxies and web servers
+  // see https://github.com/sozu-proxy/sozu/issues/480
+  b"-._".contains(&i)
+}
+
+#[cfg(not(feature = "tolerant-http1-parser"))]
 fn is_hostname_char(i: u8) -> bool {
   is_alphanumeric(i) ||
   // the domain name should not start with a hyphen or dot
@@ -1831,6 +1867,32 @@ mod tests {
   }
 
   #[test]
+  #[cfg(not(feature = "tolerant-http1-parser"))]
+  fn header_iso_8859_1_test() {
+      let input = "Test: Aéo\r\n";
+      let result = message_header(input.as_bytes());
+      let expected = Header {
+        name: b"Test",
+        value: "Aéo".as_bytes()
+      };
+
+      assert_eq!(result, Error(error_position!(ErrorKind::Tag, input)));
+  }
+
+  #[test]
+  #[cfg(feature = "tolerant-http1-parser")]
+  fn header_iso_8859_1_test() {
+      let input = "Test: Aéo\r\n";
+      let result = message_header(input.as_bytes());
+      let expected = Header {
+        name: b"Test",
+        value: "Aéo".as_bytes()
+      };
+
+      assert_eq!(result, Done(&b""[..], expected))
+  }
+
+  #[test]
   fn header_without_space_test() {
       let input = b"Host:localhost\r\n";
       let result = message_header(input);
@@ -2977,10 +3039,24 @@ mod tests {
       hostname_and_port(&b"example.com:8080"[..]),
       Done(&b""[..], (&b"example.com"[..], Some(&b"8080"[..])))
     );
+  }
 
+
+  #[test]
+  #[cfg(not(feature = "tolerant-http1-parser"))]
+  fn hostname_parsing_underscore_test() {
     assert_eq!(
       hostname_and_port(&b"test_example.com"[..]),
       Error(error_position!(ErrorKind::Eof, &b"_example.com"[..]))
+    );
+  }
+
+  #[test]
+  #[cfg(feature = "tolerant-http1-parser")]
+  fn hostname_parsing_underscore_test() {
+    assert_eq!(
+      hostname_and_port(&b"test_example.com"[..]),
+      Done(&b""[..], (&b"test_example.com"[..], None))
     );
   }
 
