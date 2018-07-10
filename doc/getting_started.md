@@ -56,7 +56,33 @@ You can build the image by doing:
 
 And run it with the command
 
-`docker run -p 8000:80 -p 8443:443 sozu`
+```bash
+docker run \
+  --name sozu-proxy
+  -v /run/sozu:/run/sozu \
+  -v /path/to/config/file:/etc/sozu \
+  -v /my/state/:/var/lib/sozu \
+  -p 8080:80 \
+  -p 8443:443 \
+  sozu
+```
+
+#### Using a custom `config.toml` configuration file
+
+The default configuration for sozu can be found in `../os-build/docker/config.toml`.
+If `/my/custom/config.toml` is the path and name of your custom configuration file, you can start your sozu container with this in a volume to override the default configuration (note that only the directory path of the custom config file is used in this command):
+`docker run -v /my/custom:/etc/sozu sozu`
+
+#### Using sozuctl with the docker container
+
+To use `sozuctl` CLI from the host with the docker container you have to bind `/run/sozu` with the host by using a docker volume:
+`docker run -v /run/sozu:/run/sozu sozu`
+
+
+#### Provide an initial configuration state
+Sozu can use a JSON file to load an initial configuration state for its routing.
+you can mount it by using a volume, you can start your sozu container with this in a volume (note that only the directory path of the custom config file is used in this command):
+`docker run -v /my/state:/var/lib/sozu sozu`
 
 [cr]: https://crates.io/
 [cfg]: https://github.com/sozu-proxy/sozu/blob/master/bin/config.toml
