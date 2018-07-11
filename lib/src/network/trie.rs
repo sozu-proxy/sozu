@@ -407,22 +407,27 @@ mod tests {
     let mut root: TrieNode<u8> = TrieNode::root();
 
     assert_eq!(root.domain_insert(Vec::from(&b"www.example.com"[..]), 1), InsertResult::Ok);
-    root.print();
+    //root.print();
     assert_eq!(root.domain_insert(Vec::from(&b"test.example.com"[..]), 2), InsertResult::Ok);
-    root.print();
+    //root.print();
     assert_eq!(root.domain_insert(Vec::from(&b"*.alldomains.org"[..]), 3), InsertResult::Ok);
-    root.print();
+    //root.print();
     assert_eq!(root.domain_insert(Vec::from(&b"alldomains.org"[..]), 4), InsertResult::Ok);
-    root.print();
-    assert_eq!(root.domain_insert(Vec::from(&b"hello.com"[..]), 5), InsertResult::Ok);
+    //root.print();
+    assert_eq!(root.domain_insert(Vec::from(&b"pouet.alldomains.org"[..]), 5), InsertResult::Ok);
+    //root.print();
+    assert_eq!(root.domain_insert(Vec::from(&b"hello.com"[..]), 6), InsertResult::Ok);
+    assert_eq!(root.domain_insert(Vec::from(&b"*.hello.com"[..]), 7), InsertResult::Ok);
     root.print();
 
     assert_eq!(root.domain_lookup(&b"example.com"[..]), None);
     assert_eq!(root.domain_lookup(&b"blah.test.example.com"[..]), None);
     assert_eq!(root.domain_lookup(&b"www.example.com"[..]), Some(&((&b"www.example.com"[..]).to_vec(), 1)));
     assert_eq!(root.domain_lookup(&b"alldomains.org"[..]), Some(&((&b"alldomains.org"[..]).to_vec(), 4)));
+    assert_eq!(root.domain_lookup(&b"test.hello.com"[..]), Some(&((&b"*.hello.com"[..]).to_vec(), 7)));
     assert_eq!(root.domain_lookup(&b"test.alldomains.org"[..]), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
     assert_eq!(root.domain_lookup(&b"hello.alldomains.org"[..]), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
+    assert_eq!(root.domain_lookup(&b"pouet.alldomains.org"[..]), Some(&((&b"pouet.alldomains.org"[..]).to_vec(), 5)));
     assert_eq!(root.domain_lookup(&b"blah.test.alldomains.org"[..]), None);
 
     assert_eq!(root.domain_remove(&Vec::from(&b"alldomains.org"[..])), RemoveResult::Ok);
@@ -431,6 +436,9 @@ mod tests {
     assert_eq!(root.domain_lookup(&b"alldomains.org"[..]), None);
     assert_eq!(root.domain_lookup(&b"test.alldomains.org"[..]), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
     assert_eq!(root.domain_lookup(&b"hello.alldomains.org"[..]), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
+    assert_eq!(root.domain_lookup(&b"pouet.alldomains.org"[..]), Some(&((&b"pouet.alldomains.org"[..]).to_vec(), 5)));
+    assert_eq!(root.domain_lookup(&b"test.hello.com"[..]), Some(&((&b"*.hello.com"[..]).to_vec(), 7)));
     assert_eq!(root.domain_lookup(&b"blah.test.alldomains.org"[..]), None);
   }
+
 }
