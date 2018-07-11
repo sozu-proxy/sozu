@@ -63,7 +63,7 @@ pub struct ServerConfiguration {
   address:         SocketAddr,
   applications:    HashMap<AppId, Application>,
   backends:        BackendMap,
-  fronts:          HashMap<HostName, Vec<TlsApp>>,
+  fronts:          TrieNode<Vec<TlsApp>>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
   config:          HttpsProxyConfiguration,
@@ -104,7 +104,7 @@ impl ServerConfiguration {
       address:         config.front.clone(),
       applications:    HashMap::new(),
       backends:        BackendMap::new(),
-      fronts:          HashMap::new(),
+      fronts:          TrieNode::root(),
       pool:            pool,
       answers:         default,
       config:          config,
@@ -142,13 +142,13 @@ impl ServerConfiguration {
       cert_fingerprint: tls_front.fingerprint.clone(),
     };
 
-    if let Some(fronts) = self.fronts.get_mut(&tls_front.hostname) {
+    if let Some((_,fronts)) = self.fronts.domain_lookup_mut(&tls_front.hostname.as_bytes()) {
         if ! fronts.contains(&app) {
           fronts.push(app.clone());
         }
     }
-    if self.fronts.get(&tls_front.hostname).is_none() {
-      self.fronts.insert(tls_front.hostname, vec![app]);
+    if self.fronts.domain_lookup(&tls_front.hostname.as_bytes()).is_none() {
+      self.fronts.domain_insert(tls_front.hostname.into_bytes(), vec![app]);
     }
 
     true
@@ -157,13 +157,22 @@ impl ServerConfiguration {
   pub fn remove_https_front(&mut self, front: HttpsFront, event_loop: &mut Poll) {
     debug!("removing tls_front {:?}", front);
 
-    if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
-      if let Some(pos) = fronts.iter()
-        .position(|f| &f.app_id == &front.app_id && &f.cert_fingerprint == &front.fingerprint) {
+    let should_delete = {
+      let fronts_opt = self.fronts.domain_lookup_mut(front.hostname.as_bytes());
+      if let Some((_, fronts)) = fronts_opt {
+        if let Some(pos) = fronts.iter()
+          .position(|f| &f.app_id == &front.app_id && &f.cert_fingerprint == &front.fingerprint) {
 
-        let front = fronts.remove(pos);
-        (*self.resolver).remove_front(&front.cert_fingerprint) 
+          let front = fronts.remove(pos);
+          (*self.resolver).remove_front(&front.cert_fingerprint) 
+        }
       }
+
+      fronts_opt.as_ref().map(|(_,fronts)| fronts.len() == 0).unwrap_or(false)
+    };
+
+    if should_delete {
+      self.fronts.domain_remove(&front.hostname.into());
     }
   }
 
@@ -220,7 +229,7 @@ impl ServerConfiguration {
       return None;
     };
 
-    if let Some(http_fronts) = self.fronts.get(host) {
+    if let Some((_,http_fronts)) = self.fronts.domain_lookup(host.as_bytes()) {
       let matching_fronts = http_fronts.iter().filter(|f| uri.starts_with(&f.path_begin)); // ToDo match on uri
       let mut front = None;
 

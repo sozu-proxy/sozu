@@ -582,7 +582,7 @@ pub struct ServerConfiguration {
   address:         SocketAddr,
   applications:    HashMap<AppId, Application>,
   backends:        BackendMap,
-  fronts:          HashMap<HostName, Vec<TlsApp>>,
+  fronts:          TrieNode<Vec<TlsApp>>,
   domains:         Arc<Mutex<TrieNode<CertFingerprint>>>,
   default_context: TlsData,
   contexts:        Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
@@ -599,7 +599,7 @@ impl ServerConfiguration {
 
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let     domains  = TrieNode::root();
-    let mut fronts   = HashMap::new();
+    let mut fronts   = TrieNode::root();
     let rc_ctx       = Arc::new(Mutex::new(contexts));
     let ref_ctx      = rc_ctx.clone();
     let rc_domains   = Arc::new(Mutex::new(domains));
@@ -619,7 +619,9 @@ impl ServerConfiguration {
       path_begin:       String::new(),
       cert_fingerprint: fingerprint,
     };
-    fronts.insert(config.default_name.clone().unwrap_or(String::from("")), vec![app]);
+    if let Some(ref name) = config.default_name {
+      fronts.domain_insert(name.clone().into(), vec![app]);
+    }
 
     let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
        error!("could not create listener {:?}: {:?}", fronts, e);
@@ -820,13 +822,13 @@ impl ServerConfiguration {
       cert_fingerprint: tls_front.fingerprint.clone(),
     };
 
-    if let Some(fronts) = self.fronts.get_mut(&tls_front.hostname) {
+    if let Some((_, ref mut fronts)) = self.fronts.domain_lookup_mut(&tls_front.hostname.clone().into_bytes()) {
         if ! fronts.contains(&app) {
           fronts.push(app.clone());
         }
     }
-    if self.fronts.get(&tls_front.hostname).is_none() {
-      self.fronts.insert(tls_front.hostname, vec![app]);
+    if self.fronts.domain_lookup(&tls_front.hostname.clone().into_bytes()).is_none() {
+      self.fronts.domain_insert(tls_front.hostname.into_bytes(), vec![app]);
     }
 
     true
@@ -835,21 +837,30 @@ impl ServerConfiguration {
   pub fn remove_https_front(&mut self, front: HttpsFront, event_loop: &mut Poll) {
     debug!("removing tls_front {:?}", front);
 
-    if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
-      if let Some(pos) = fronts.iter().position(|f| &f.app_id == &front.app_id && &f.cert_fingerprint == &front.fingerprint) {
-        let front = fronts.remove(pos);
+    let should_delete = {
+      let fronts_opt = self.fronts.domain_lookup_mut(front.hostname.as_bytes());
+      if let Some((_, fronts)) = fronts_opt {
+        if let Some(pos) = fronts.iter().position(|f| &f.app_id == &front.app_id && &f.cert_fingerprint == &front.fingerprint) {
+          let front = fronts.remove(pos);
 
-        {
-          let mut contexts = unwrap_msg!(self.contexts.lock());
-          let domains  = unwrap_msg!(self.domains.lock());
-          let must_delete = contexts.get_mut(&front.cert_fingerprint).map(|tls_data| {
-            if tls_data.refcount > 0 {
-              tls_data.refcount -= 1;
-            }
-            tls_data.refcount == 0
-          });
+          {
+            let mut contexts = unwrap_msg!(self.contexts.lock());
+            let domains  = unwrap_msg!(self.domains.lock());
+            let must_delete = contexts.get_mut(&front.cert_fingerprint).map(|tls_data| {
+              if tls_data.refcount > 0 {
+                tls_data.refcount -= 1;
+              }
+              tls_data.refcount == 0
+            });
+          }
         }
       }
+
+      fronts_opt.as_ref().map(|(_,fronts)| fronts.len() == 0).unwrap_or(false)
+    };
+
+    if should_delete {
+      self.fronts.domain_remove(&front.hostname.into());
     }
   }
 
@@ -984,7 +995,7 @@ impl ServerConfiguration {
       return None;
     };
 
-    if let Some(http_fronts) = self.fronts.get(host) {
+    if let Some((_, http_fronts)) = self.fronts.domain_lookup(host.as_bytes()) {
       let matching_fronts = http_fronts.iter().filter(|f| uri.starts_with(&f.path_begin)); // ToDo match on uri
       let mut front = None;
 
@@ -1510,8 +1521,8 @@ mod tests {
     let uri2 = "/yolo".to_owned();
     let uri3 = "/yolo/swag".to_owned();
 
-    let mut fronts = HashMap::new();
-    fronts.insert("lolcatho.st".to_owned(), vec![
+    let mut fronts = TrieNode::root();
+    fronts.domain_insert(Vec::from(&b"lolcatho.st"[..]), vec![
       TlsApp {
         app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1,
         cert_fingerprint: CertFingerprint(vec!()),
@@ -1525,7 +1536,7 @@ mod tests {
         cert_fingerprint: CertFingerprint(vec!()),
       }
     ]);
-    fronts.insert("other.domain".to_owned(), vec![
+    fronts.domain_insert(Vec::from(&b"other.domain"[..]), vec![
       TlsApp {
         app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(),
         cert_fingerprint: CertFingerprint(vec!()),

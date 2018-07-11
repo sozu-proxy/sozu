@@ -251,6 +251,53 @@ impl<V:Debug> TrieNode<V> {
     }
   }
 
+  // specific version that will handle wildcard domains
+  pub fn domain_lookup_mut(&mut self, key: &[u8]) -> Option<&mut KeyValue<Key,V>> {
+    let mut partial_key = key.to_vec();
+    partial_key.reverse();
+    self.domain_lookup_recursive_mut(&partial_key)
+  }
+
+  // specific version that will handle wildcard domains
+  pub fn domain_lookup_recursive_mut(&mut self, partial_key: &[u8]) -> Option<&mut KeyValue<Key,V>> {
+    assert_ne!(partial_key, &b""[..]);
+    let pos = partial_key.iter().zip(self.partial_key.iter()).position(|(&a,&b)| a != b);
+    //info!("lookup at level: {}, testing {}", str::from_utf8(&self.partial_key).unwrap(),
+    //  str::from_utf8(partial_key).unwrap());
+
+    match pos {
+      Some(i) => {
+        // check for wildcard
+        if i+1 == self.partial_key.len() && self.partial_key[i] == '*' as u8 {
+          let c = '.' as u8;
+          if (&partial_key[i..]).contains(&c) {
+            None
+          } else {
+            self.key_value.as_mut()
+          }
+        } else {
+          None
+        }
+      },
+      None    => {
+        if partial_key.len() > self.partial_key.len() {
+          for child in self.children.iter_mut() {
+            let res = child.domain_lookup_recursive_mut(&partial_key[self.partial_key.len()..]);
+            if res.is_some() {
+              return res
+            }
+          }
+          None
+        } else if partial_key.len() == self.partial_key.len() {
+          self.key_value.as_mut()
+        } else {
+          None
+        }
+
+      }
+    }
+  }
+
   pub fn print(&self) {
     self.print_recursive(0)
   }

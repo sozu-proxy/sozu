@@ -36,6 +36,7 @@ use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,ClientToken
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::retry::RetryPolicy;
 use parser::http11::{hostname_and_port, RequestState};
+use network::trie::TrieNode;
 use network::tcp;
 use util::UnwrapLog;
 use network::https_rustls;
@@ -560,7 +561,7 @@ pub struct ServerConfiguration {
   listener:        Option<TcpListener>,
   address:         SocketAddr,
   backends:        BackendMap,
-  fronts:          HashMap<Hostname, Vec<HttpFront>>,
+  fronts:          TrieNode<Vec<HttpFront>>,
   applications:    HashMap<AppId, Application>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
@@ -597,7 +598,7 @@ impl ServerConfiguration {
       address:        config.front,
       applications:   HashMap::new(),
       backends:       BackendMap::new(),
-      fronts:         HashMap::new(),
+      fronts:         TrieNode::root(),
       pool:           pool,
       answers:        default,
       config:         config,
@@ -626,7 +627,7 @@ impl ServerConfiguration {
         http_front.hostname = hostname;
         let front2 = http_front.clone();
         let front3 = http_front.clone();
-        if let Some(fronts) = self.fronts.get_mut(&http_front.hostname) {
+        if let Some((_, ref mut fronts)) = self.fronts.domain_lookup_mut(&http_front.hostname.clone().into_bytes()) {
             if !fronts.contains(&front2) {
               fronts.push(front2);
             }
@@ -635,8 +636,8 @@ impl ServerConfiguration {
         // FIXME: check that http front port matches the listener's port
         // FIXME: separate the port and hostname, match the hostname separately
 
-        if self.fronts.get(&http_front.hostname).is_none() {
-          self.fronts.insert(http_front.hostname, vec![front3]);
+        if self.fronts.domain_lookup(&http_front.hostname.clone().into_bytes()).is_none() {
+          self.fronts.domain_insert(http_front.hostname.into_bytes(), vec![front3]);
         }
         Ok(())
       },
@@ -649,9 +650,21 @@ impl ServerConfiguration {
     match ::idna::domain_to_ascii(&front.hostname) {
       Ok(hostname) => {
         front.hostname = hostname;
-        if let Some(fronts) = self.fronts.get_mut(&front.hostname) {
-          fronts.retain(|f| f != &front);
+
+        let should_delete = {
+          let fronts_opt = self.fronts.domain_lookup_mut(front.hostname.as_bytes());
+
+          if let Some((_, fronts)) = fronts_opt {
+            fronts.retain(|f| f != &front);
+          }
+
+          fronts_opt.as_ref().map(|(_,fronts)| fronts.len() == 0).unwrap_or(false)
+        };
+
+        if should_delete {
+          self.fronts.domain_remove(&front.hostname.into());
         }
+
         Ok(())
       },
       Err(_) => Err(format!("Couldn't parse hostname {} to ascii", front.hostname))
@@ -689,7 +702,7 @@ impl ServerConfiguration {
       return None;
     };
 
-    if let Some(http_fronts) = self.fronts.get(host) {
+    if let Some((_, http_fronts)) = self.fronts.domain_lookup(host.as_bytes()) {
       let matching_fronts = http_fronts.iter().filter(|f| uri.starts_with(&f.path_begin)); // ToDo match on uri
       let mut front = None;
 
@@ -1073,7 +1086,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
 pub struct InitialServerConfiguration {
   backends:        BackendMap,
-  fronts:          HashMap<Hostname, Vec<HttpFront>>,
+  fronts:          TrieNode<Vec<HttpFront>>,
   applications:    HashMap<AppId, Application>,
   answers:         DefaultAnswers,
   config:          HttpProxyConfiguration,
@@ -1093,9 +1106,15 @@ impl InitialServerConfiguration {
     let mut backends = BackendMap::new();
     backends.import_configuration_state(&state.backends);
 
+    let mut fronts = TrieNode::root();
+
+    for (domain, http_fronts) in state.http_fronts.iter() {
+      fronts.domain_insert(domain.clone().into_bytes(), http_fronts.clone());
+    }
+
     InitialServerConfiguration {
       backends:     backends,
-      fronts:       state.http_fronts.clone(),
+      fronts:       fronts,
       applications: state.applications.clone(),
       answers:      answers,
       config:       config,
@@ -1423,13 +1442,13 @@ mod tests {
     let uri2 = "/yolo".to_owned();
     let uri3 = "/yolo/swag".to_owned();
 
-    let mut fronts = HashMap::new();
-    fronts.insert("lolcatho.st".to_owned(), vec![
+    let mut fronts = TrieNode::root();
+    fronts.domain_insert(Vec::from(&b"lolcatho.st"[..]), vec![
       HttpFront { app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1 },
       HttpFront { app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2 },
       HttpFront { app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3 }
     ]);
-    fronts.insert("other.domain".to_owned(), vec![
+    fronts.domain_insert(Vec::from(&b"other.domain"[..]), vec![
       HttpFront { app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned() },
     ]);
 
