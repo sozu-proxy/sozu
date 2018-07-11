@@ -121,8 +121,6 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
         return (ProtocolResult::Continue, ClientResult::CloseClient)
       }
     };
-
-    (ProtocolResult::Upgrade, ClientResult::Continue)
   }
 
   pub fn front_socket(&self) -> &TcpStream {
