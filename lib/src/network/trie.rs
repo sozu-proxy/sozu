@@ -230,22 +230,36 @@ impl<V:Debug> TrieNode<V> {
 
   // specific version that will handle wildcard domains
   pub fn domain_lookup(&self, key: &[u8]) -> Option<&KeyValue<Key,V>> {
-    println!("looking up: {}", str::from_utf8(key).unwrap());
+    //println!("looking up: {}", str::from_utf8(key).unwrap());
     let mut partial_key = key.to_vec();
     partial_key.reverse();
     let res = self.domain_lookup_recursive(&partial_key);
-    println!(" => {:?}", res.map(|(k,v)| (str::from_utf8(k).unwrap().to_owned(), v)));
+    //println!(" => {:?}", res.map(|(k,v)| (str::from_utf8(k).unwrap().to_owned(), v)));
     res
   }
 
   // specific version that will handle wildcard domains
   pub fn domain_lookup_recursive(&self, partial_key: &[u8]) -> Option<&KeyValue<Key,V>> {
     assert_ne!(partial_key, &b""[..]);
+    //println!("lookup '{}' in {:?}", str::from_utf8(partial_key).unwrap(), self.keys.iter().map(|k| str::from_utf8(k).unwrap()).collect::<Vec<_>>());
+
+    // if we found a result with a wildcard, store it until the end of search
+    // because we might find a more precise result
+    let mut wildcard_res = None;
 
     for (index, ref child_key) in self.keys.iter().enumerate() {
       let pos = partial_key.iter().zip(child_key.iter()).position(|(&a,&b)| a != b);
       match pos {
-        Some(0) => continue,
+        Some(0) => {
+          if child_key[0] == '*' as u8 {
+            let c = '.' as u8;
+            if partial_key.contains(&c) {
+              return None;
+            } else {
+              wildcard_res = self.children[index].key_value.as_ref();
+            }
+          }
+        },
         Some(i) => {
           // check for wildcard
           if i+1 == child_key.len() && child_key[i] == '*' as u8 {
@@ -253,10 +267,8 @@ impl<V:Debug> TrieNode<V> {
             if (&partial_key[i..]).contains(&c) {
               return None;
             } else {
-              return self.children[index].key_value.as_ref();
+              wildcard_res = self.children[index].key_value.as_ref();
             }
-          } else {
-            return None;
           }
         },
         None    => {
@@ -271,7 +283,7 @@ impl<V:Debug> TrieNode<V> {
       }
     }
 
-    None
+    wildcard_res
   }
 
   // specific version that will handle wildcard domains
@@ -285,10 +297,21 @@ impl<V:Debug> TrieNode<V> {
   pub fn domain_lookup_mut_recursive(&mut self, partial_key: &[u8]) -> Option<&mut KeyValue<Key,V>> {
     assert_ne!(partial_key, &b""[..]);
 
+    // if we found a result with a wildcard, store it until the end of search
+    // because we might find a more precise result
+    let mut wildcard_res = None;
+
     for (index, ref child_key) in self.keys.iter().enumerate() {
       let pos = partial_key.iter().zip(child_key.iter()).position(|(&a,&b)| a != b);
       match pos {
-        Some(0) => continue,
+        Some(0) => if child_key[0] == '*' as u8 {
+          let c = '.' as u8;
+          if partial_key.contains(&c) {
+            return None;
+          } else {
+            wildcard_res = Some(index);//self.children[index].key_value.as_mut();
+          }
+        },
         Some(i) => {
           // check for wildcard
           if i+1 == child_key.len() && child_key[i] == '*' as u8 {
@@ -296,10 +319,8 @@ impl<V:Debug> TrieNode<V> {
             if (&partial_key[i..]).contains(&c) {
               return None;
             } else {
-              return self.children[index].key_value.as_mut();
+              wildcard_res = Some(index);//self.children[index].key_value.as_mut();
             }
-          } else {
-            return None;
           }
         },
         None    => {
@@ -314,7 +335,7 @@ impl<V:Debug> TrieNode<V> {
       }
     }
 
-    None
+    wildcard_res.and_then(move |index| self.children[index].key_value.as_mut())
   }
 
   pub fn print(&self) {
@@ -426,15 +447,10 @@ mod tests {
     let mut root: TrieNode<u8> = TrieNode::root();
 
     assert_eq!(root.domain_insert(Vec::from(&b"www.example.com"[..]), 1), InsertResult::Ok);
-    //root.print();
     assert_eq!(root.domain_insert(Vec::from(&b"test.example.com"[..]), 2), InsertResult::Ok);
-    //root.print();
     assert_eq!(root.domain_insert(Vec::from(&b"*.alldomains.org"[..]), 3), InsertResult::Ok);
-    //root.print();
     assert_eq!(root.domain_insert(Vec::from(&b"alldomains.org"[..]), 4), InsertResult::Ok);
-    //root.print();
     assert_eq!(root.domain_insert(Vec::from(&b"pouet.alldomains.org"[..]), 5), InsertResult::Ok);
-    //root.print();
     assert_eq!(root.domain_insert(Vec::from(&b"hello.com"[..]), 6), InsertResult::Ok);
     assert_eq!(root.domain_insert(Vec::from(&b"*.hello.com"[..]), 7), InsertResult::Ok);
     root.print();
