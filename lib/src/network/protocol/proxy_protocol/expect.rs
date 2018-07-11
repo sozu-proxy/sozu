@@ -209,8 +209,13 @@ mod expect_test {
     let mut session_metrics = SessionMetrics::new();
     let mut expect_pp = ExpectProxyProtocol::new(client_stream.unwrap(), Token(0));
 
-    if (ProtocolResult::Upgrade, ClientResult::Continue) != expect_pp.readable(&mut session_metrics) {
-      panic!("Should receive a complete proxy protocol header");
+    let mut res = (ProtocolResult::Continue, ClientResult::Continue);
+    while res == (ProtocolResult::Continue, ClientResult::Continue) {
+      res = expect_pp.readable(&mut session_metrics);
+    }
+
+    if res != (ProtocolResult::Upgrade, ClientResult::Continue) {
+      panic!("Should receive a complete proxy protocol header, res = {:?}", res);
     };
   }
 
