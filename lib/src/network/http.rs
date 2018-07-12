@@ -400,7 +400,6 @@ impl ProxyClient for Client {
         ClientResult::CloseClient
       }
     } else {
-      error!("invalid timeout token");
       ClientResult::Continue
     }
   }
