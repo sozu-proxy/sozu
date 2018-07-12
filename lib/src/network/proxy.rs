@@ -604,10 +604,6 @@ impl Server {
     Token(token.0)
   }
 
-  pub fn from_client_add(&self) -> usize {
-    0
-  }
-
   pub fn close_client(&mut self, token: ClientToken) {
     if self.clients.contains(token) {
       let client = self.clients.remove(token).expect("client shoud be there");
@@ -659,7 +655,6 @@ impl Server {
   }
 
   pub fn accept(&mut self, token: ListenToken, protocol: Protocol) -> bool {
-    let add = self.from_client_add();
     let res = {
 
       if self.nb_connections == self.max_connections {
@@ -675,7 +670,7 @@ impl Server {
             Err(AcceptError::TooManyClients)
           },
           Some(entry) => {
-            let client_token = Token(entry.index().0 + add);
+            let client_token = Token(entry.index().0);
             let index = entry.index();
             let timeout = self.timer.set_timeout(Duration::from_secs(60), client_token);
             match protocol {
@@ -749,7 +744,6 @@ impl Server {
   }
 
   pub fn connect_to_backend(&mut self, token: ClientToken) {
-    let add = self.from_client_add();
     let (protocol, res) = {
       let cl = self.clients[token].clone();
       let cl2: Rc<RefCell<ProxyClientCast>> = self.clients[token].clone();
@@ -761,7 +755,7 @@ impl Server {
       }
       let entry = entry.unwrap();
       let entry = entry.insert(cl);
-      let back_token = Token(entry.index().0 + add);
+      let back_token = Token(entry.index().0);
 
       let (protocol, res) = match protocol {
         Protocol::TCP   => {
