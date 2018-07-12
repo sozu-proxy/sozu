@@ -57,7 +57,7 @@ pub struct Http<Front:SocketHandler> {
   pub status:         ClientStatus,
   pub state:          Option<HttpState>,
   pub front_buf:      Checkout<BufferQueue>,
-  pub back_buf:       Checkout<BufferQueue>,
+  pub back_buf:       Option<Checkout<BufferQueue>>,
   pub app_id:         Option<String>,
   pub request_id:     String,
   pub readiness:      Readiness,
@@ -93,7 +93,7 @@ impl<Front:SocketHandler> Http<Front> {
         status:             ClientStatus::Normal,
         state:              Some(HttpState::new()),
         front_buf:          front_buf,
-        back_buf:           back_buf,
+        back_buf:           None,
         app_id:             None,
         request_id:         request_id,
         readiness:          Readiness::new(),
@@ -133,7 +133,7 @@ impl<Front:SocketHandler> Http<Front> {
       self.front_buf.reset();
     }
 
-    self.back_buf.reset();
+    self.back_buf = None;
     //self.readiness = Readiness::new();
     self.request_id = request_id;
     self.log_ctx = format!("{} {}\t",
@@ -157,7 +157,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Rc<Vec<u8>>)  {
     self.front_buf.reset();
-    self.back_buf.reset();
+    self.back_buf = None;
 
     self.status = ClientStatus::DefaultAnswer(answer, buf, 0);
     self.readiness.front_interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
@@ -267,11 +267,15 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn back_hup(&mut self) -> ClientResult {
-    //FIXME: closing the client might not be a good idea if we do keep alive on the front here?
-    if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
-      ClientResult::CloseClient
+    if let Some(ref buf) = self.back_buf {
+      //FIXME: closing the client might not be a good idea if we do keep alive on the front here?
+      if buf.output_data_size() == 0 || buf.next_output_data().len() == 0 {
+        ClientResult::CloseClient
+      } else {
+        ClientResult::Continue
+      }
     } else {
-      ClientResult::Continue
+      ClientResult::CloseClient
     }
   }
 
@@ -636,12 +640,17 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn writable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
 
     //handle default answers
-    let output_size = self.back_buf.output_data_size();
     if let ClientStatus::DefaultAnswer(_,_,_) = self.status {
       return self.writable_default_answer(metrics);
     }
 
-    if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
+    if self.back_buf.is_none() {
+      error!("no back buffer to write on the front socket");
+      return ClientResult::CloseClient;
+    }
+
+    let output_size = self.back_buf.as_ref().unwrap().output_data_size();
+    if self.back_buf.as_ref().unwrap().output_data_size() == 0 || self.back_buf.as_ref().unwrap().next_output_data().len() == 0 {
       self.readiness.back_interest.insert(Ready::readable());
       self.readiness.front_interest.remove(Ready::writable());
       return ClientResult::Continue;
@@ -649,25 +658,25 @@ impl<Front:SocketHandler> Http<Front> {
 
     let mut sz = 0usize;
     let mut res = SocketResult::Continue;
-    while res == SocketResult::Continue && self.back_buf.output_data_size() > 0 {
+    while res == SocketResult::Continue && self.back_buf.as_ref().unwrap().output_data_size() > 0 {
       // no more data in buffer, stop here
-      if self.back_buf.next_output_data().len() == 0 {
+      if self.back_buf.as_ref().unwrap().next_output_data().len() == 0 {
         self.readiness.back_interest.insert(Ready::readable());
         self.readiness.front_interest.remove(Ready::writable());
         count!("bytes_out", sz as i64);
         metrics.bout += sz;
         return ClientResult::Continue;
       }
-      let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
+      let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.as_ref().unwrap().next_output_data());
       res = current_res;
-      self.back_buf.consume_output_data(current_sz);
+      self.back_buf.as_mut().unwrap().consume_output_data(current_sz);
       sz += current_sz;
     }
     count!("bytes_out", sz as i64);
     metrics.bout += sz;
 
     if let Some((front,back)) = self.tokens() {
-      debug!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}, buffer position {} restart position {}", self.log_ctx, front.0, back.0, sz, output_size, self.back_buf.buffer_position, self.back_buf.start_parsing_position);
+      debug!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}, buffer position {} restart position {}", self.log_ctx, front.0, back.0, sz, output_size, self.back_buf.as_ref().unwrap().buffer_position, self.back_buf.as_ref().unwrap().start_parsing_position);
     }
 
     match res {
@@ -683,7 +692,7 @@ impl<Front:SocketHandler> Http<Front> {
       SocketResult::Continue => {},
     }
 
-    if !self.back_buf.can_restart_parsing() {
+    if !self.back_buf.as_ref().unwrap().can_restart_parsing() {
       self.readiness.back_interest.insert(Ready::readable());
       return ClientResult::Continue;
     }
@@ -700,7 +709,7 @@ impl<Front:SocketHandler> Http<Front> {
       return ClientResult::Continue;
     }
 
-    
+
     match unwrap_msg!(self.state.as_ref()).response {
       // FIXME: should only restart parsing if we are using keepalive
       Some(ResponseState::Response(_,_))                            |
@@ -866,7 +875,18 @@ impl<Front:SocketHandler> Http<Front> {
       return (ProtocolResult::Continue, ClientResult::Continue);
     }
 
-    if self.back_buf.buffer.available_space() == 0 {
+    if self.back_buf.is_none() {
+      if let Some(p) = self.pool.upgrade() {
+        if let Some(buf) = p.borrow_mut().checkout() {
+          self.back_buf = Some(buf);
+        } else {
+          error!("cannot get back buffer from pool, closing");
+          return (ProtocolResult::Continue, ClientResult::CloseClient);
+        }
+      }
+    }
+
+    if self.back_buf.as_ref().unwrap().buffer.available_space() == 0 {
       self.readiness.back_interest.remove(Ready::readable());
       return (ProtocolResult::Continue, ClientResult::Continue);
     }
@@ -882,11 +902,11 @@ impl<Front:SocketHandler> Http<Front> {
 
     let (sz, r) = {
       let sock = unwrap_msg!(self.backend.as_mut());
-      sock.socket_read(&mut self.back_buf.buffer.space())
+      sock.socket_read(&mut self.back_buf.as_mut().unwrap().buffer.space())
     };
 
-    self.back_buf.buffer.fill(sz);
-    self.back_buf.sliced_input(sz);
+    self.back_buf.as_mut().unwrap().buffer.fill(sz);
+    self.back_buf.as_mut().unwrap().sliced_input(sz);
 
     metrics.backend_bin += sz;
 
@@ -933,7 +953,7 @@ impl<Front:SocketHandler> Http<Front> {
       },
       Some(ResponseState::ResponseWithBody(_,_,_)) => {
         self.readiness.front_interest.insert(Ready::writable());
-        if ! self.back_buf.needs_input() {
+        if ! self.back_buf.as_ref().unwrap().needs_input() {
           self.readiness.back_interest.remove(Ready::readable());
         }
         (ProtocolResult::Continue, ClientResult::Continue)
@@ -949,9 +969,9 @@ impl<Front:SocketHandler> Http<Front> {
         (ProtocolResult::Continue, ClientResult::CloseClient)
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
-        if ! self.back_buf.needs_input() {
+        if ! self.back_buf.as_ref().unwrap().needs_input() {
           self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-          &mut self.back_buf, &self.sticky_name, self.sticky_session.take()));
+          &mut self.back_buf.as_mut().unwrap(), &self.sticky_name, self.sticky_session.take()));
 
           if unwrap_msg!(self.state.as_ref()).is_back_error() {
             metrics.service_stop();
@@ -970,7 +990,7 @@ impl<Front:SocketHandler> Http<Front> {
       Some(ResponseState::Error(_,_,_,_,_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
       _ => {
         self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-        &mut self.back_buf, &self.sticky_name, self.sticky_session.take()));
+        &mut self.back_buf.as_mut().unwrap(), &self.sticky_name, self.sticky_session.take()));
 
         if unwrap_msg!(self.state.as_ref()).is_back_error() {
           metrics.service_stop();

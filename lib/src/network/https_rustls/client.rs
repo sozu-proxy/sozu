@@ -181,8 +181,21 @@ impl TlsClient {
       let front_token = self.frontend_token;
       let back_token  = unwrap_msg!(http.back_token());
 
+      let back_buf = match http.back_buf {
+        Some(buf) => buf,
+        None => if let Some(p) = self.pool.upgrade() {
+          if let Some(buf) = p.borrow_mut().checkout() {
+            buf
+          } else {
+            return false;
+          }
+        } else {
+          return false;
+        }
+      };
+
       let mut pipe = Pipe::new(http.frontend, front_token, http.backend,
-        http.front_buf, http.back_buf, http.public_address);
+        http.front_buf, back_buf, http.public_address);
 
       pipe.readiness.front_readiness = http.readiness.front_readiness;
       pipe.readiness.back_readiness  = http.readiness.back_readiness;
