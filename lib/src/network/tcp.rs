@@ -619,6 +619,17 @@ pub struct ApplicationListener {
   back_addresses: Vec<SocketAddr>,
 }
 
+impl ApplicationListener {
+
+  fn remove_backend_address(&mut self, backend_address: &SocketAddr) {
+    self.back_addresses
+        .iter()
+        .position(|back_addr| *back_addr == *backend_address)
+        .map(|i| self.back_addresses.remove(i));
+  }
+
+}
+
 #[derive(Debug)]
 pub struct ApplicationConfiguration {
   proxy_protocol: Option<ProxyProtocolConfig>,
@@ -755,8 +766,20 @@ impl ServerConfiguration {
   }
 
   pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken>{
-      // ToDo
-      None
+    let backend = self.backends.remove_backend(app_id, backend_address);
+
+    let front_token = self.fronts.get(app_id);
+
+    if let Some(f_token) = front_token {
+      if let Some(app_listener) = self.listeners.get_mut(&f_token) {
+        app_listener.remove_backend_address(backend_address);
+      }
+
+      return Some(ListenToken(f_token.0))
+    }
+
+    error!("Can't find a front to remove for the backend {} in app {}", backend_address, app_id);
+    None
   }
 
   fn backend_from_app_id(&mut self, client: &mut Client, app_id: &str) -> Result<TcpStream,ConnectionError> {
@@ -1029,7 +1052,7 @@ pub fn start(max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::net::{TcpListener, TcpStream, Shutdown};
+  use std::net::{TcpListener, TcpStream, Shutdown, IpAddr, Ipv4Addr, SocketAddr};
   use std::io::{Read,Write};
   use std::time::Duration;
   use std::{thread,str};
@@ -1205,5 +1228,44 @@ mod tests {
     println!("read_message: {:?}", command.read_message().unwrap());
 
     command
+  }
+  #[test]
+  fn it_should_remove_the_backend_address_in_app_listener() {
+    let mut application_listener  = ApplicationListener {
+      app_id:         "".to_string(),
+      sock:           None,
+      token:          None,
+      front_address:  SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0000),
+      back_addresses: vec![
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3000),
+      ],
+    };
+
+    let back_address_to_remove = &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
+
+    application_listener.remove_backend_address(back_address_to_remove);
+
+    assert!(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3000)] == application_listener.back_addresses)
+  }
+
+  #[test]
+  fn it_should_not_remove_a_backend_address_in_app_listener_when_he_is_not_there() {
+    let mut application_listener  = ApplicationListener {
+      app_id:         "".to_string(),
+      sock:           None,
+      token:          None,
+      front_address:  SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0000),
+      back_addresses: vec![
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3000),
+      ],
+    };
+
+    let back_address_to_remove = &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 1)), 4040);
+
+    application_listener.remove_backend_address(back_address_to_remove);
+
+    assert!(2 == application_listener.back_addresses.len())
   }
 }
