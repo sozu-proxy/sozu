@@ -139,6 +139,12 @@ impl TlsClient {
       self.protocol = Some(State::Expect(expect, ssl));
       false
     } else if let State::Handshake(handshake) = protocol {
+      let mut front_buf = self.pool.upgrade().and_then(|p| p.borrow_mut().checkout());
+      if front_buf.is_none() {
+        self.protocol = Some(State::Handshake(handshake));
+        return false;
+      }
+
       let mut front_stream = FrontRustls {
         stream:  handshake.stream,
         session: handshake.session,
@@ -148,12 +154,12 @@ impl TlsClient {
       let http = Http::new(front_stream, self.frontend_token, self.pool.clone(),
         self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
 
-        let res = http.frontend.session.read(http.front_buf.buffer.space());
+        let res = http.frontend.session.read(front_buf.as_mut().unwrap().buffer.space());
         match res {
           Ok(sz) =>{
             //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
-            http.front_buf.buffer.fill(sz);
-            http.front_buf.sliced_input(sz);
+            front_buf.as_mut().unwrap().buffer.fill(sz);
+            front_buf.as_mut().unwrap().sliced_input(sz);
             count!("bytes_in", sz as i64);
             self.metrics.bin += sz;
           },
@@ -162,6 +168,7 @@ impl TlsClient {
           }
         }
 
+        http.front_buf = front_buf;
         http.readiness = readiness;
         http.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
         State::Http(http)
@@ -181,6 +188,19 @@ impl TlsClient {
       let front_token = self.frontend_token;
       let back_token  = unwrap_msg!(http.back_token());
 
+
+      let front_buf = match http.front_buf {
+        Some(buf) => buf,
+        None => if let Some(p) = self.pool.upgrade() {
+          if let Some(buf) = p.borrow_mut().checkout() {
+            buf
+          } else {
+            return false;
+          }
+        } else {
+          return false;
+        }
+      };
       let back_buf = match http.back_buf {
         Some(buf) => buf,
         None => if let Some(p) = self.pool.upgrade() {
@@ -195,7 +215,7 @@ impl TlsClient {
       };
 
       let mut pipe = Pipe::new(http.frontend, front_token, http.backend,
-        http.front_buf, back_buf, http.public_address);
+        front_buf, back_buf, http.public_address);
 
       pipe.readiness.front_readiness = http.readiness.front_readiness;
       pipe.readiness.back_readiness  = http.readiness.back_readiness;

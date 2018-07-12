@@ -113,6 +113,19 @@ impl Client {
       let front_token = self.frontend_token;
       let back_token  = unwrap_msg!(http.back_token());
 
+      let front_buf = match http.front_buf {
+        Some(buf) => buf,
+        None => if let Some(p) = self.pool.upgrade() {
+          if let Some(buf) = p.borrow_mut().checkout() {
+            buf
+          } else {
+            return false;
+          }
+        } else {
+          return false;
+        }
+      };
+
       let back_buf = match http.back_buf {
         Some(buf) => buf,
         None => if let Some(p) = self.pool.upgrade() {
@@ -127,7 +140,7 @@ impl Client {
       };
 
       let mut pipe = Pipe::new(http.frontend, front_token, Some(unwrap_msg!(http.backend)),
-        http.front_buf, back_buf, http.public_address);
+        front_buf, back_buf, http.public_address);
 
       pipe.readiness.front_readiness = http.readiness.front_readiness;
       pipe.readiness.back_readiness  = http.readiness.back_readiness;
