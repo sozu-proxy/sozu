@@ -54,17 +54,10 @@ pub struct Http<Front:SocketHandler> {
   pub backend:        Option<TcpStream>,
   frontend_token:     Token,
   backend_token:      Option<Token>,
-  rx_count:           usize,
-  tx_count:           usize,
   pub status:         ClientStatus,
   pub state:          Option<HttpState>,
   pub front_buf:      Checkout<BufferQueue>,
   pub back_buf:       Checkout<BufferQueue>,
-  front_buf_position: usize,
-  back_buf_position:  usize,
-  start:              u64,
-  req_size:           usize,
-  res_size:           usize,
   pub app_id:         Option<String>,
   pub request_id:     String,
   pub readiness:      Readiness,
@@ -97,17 +90,10 @@ impl<Front:SocketHandler> Http<Front> {
         backend:            None,
         frontend_token:     token,
         backend_token:      None,
-        rx_count:           0,
-        tx_count:           0,
         status:             ClientStatus::Normal,
         state:              Some(HttpState::new()),
         front_buf:          front_buf,
         back_buf:           back_buf,
-        front_buf_position: 0,
-        back_buf_position:  0,
-        start:              precise_time_ns(),
-        req_size:           0,
-        res_size:           0,
         app_id:             None,
         request_id:         request_id,
         readiness:          Readiness::new(),
@@ -139,8 +125,6 @@ impl<Front:SocketHandler> Http<Front> {
     let res_header = self.added_response_header();
     self.state.as_mut().map(|ref mut state| state.added_req_header = req_header);
     self.state.as_mut().map(|ref mut state| state.added_res_header = res_header);
-    self.front_buf_position = 0;
-    self.back_buf_position = 0;
 
     // if HTTP requests are pipelined, we might still have some data in the front buffer
     if !self.front_buf.empty() {
@@ -532,7 +516,6 @@ impl<Front:SocketHandler> Http<Front> {
         // at every place we return ClientResult::CloseClient
         gauge_add!("http.active_requests", 1);
 
-        //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
         self.readiness.front_interest.remove(Ready::readable());
         return ClientResult::CloseClient;
       }
@@ -579,7 +562,6 @@ impl<Front:SocketHandler> Http<Front> {
 
           if unwrap_msg!(self.state.as_ref()).is_front_error() {
             self.log_request_error(metrics, "front chunk parsing error, closing the connection");
-            //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             self.readiness.reset();
             return ClientResult::CloseClient;
           }
@@ -597,7 +579,6 @@ impl<Front:SocketHandler> Http<Front> {
 
         if unwrap_msg!(self.state.as_ref()).is_front_error() {
           self.log_request_error(metrics, "front parsing error, closing the connection");
-          //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
           self.readiness.reset();
           return ClientResult::CloseClient;
         }
@@ -680,7 +661,6 @@ impl<Front:SocketHandler> Http<Front> {
       let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
       res = current_res;
       self.back_buf.consume_output_data(current_sz);
-      self.back_buf_position += current_sz;
       sz += current_sz;
     }
     count!("bytes_out", sz as i64);
@@ -818,7 +798,6 @@ impl<Front:SocketHandler> Http<Front> {
         let (current_sz, current_res) = sock.socket_write(self.front_buf.next_output_data());
         socket_res = current_res;
         self.front_buf.consume_output_data(current_sz);
-        self.front_buf_position += current_sz;
         sz += current_sz;
       }
     }
@@ -843,7 +822,6 @@ impl<Front:SocketHandler> Http<Front> {
     }
 
     // FIXME/ should read exactly as much data as needed
-    //if self.front_buf_position >= self.state.req_position {
     if self.front_buf.can_restart_parsing() {
       match unwrap_msg!(self.state.as_ref()).request {
         Some(RequestState::Request(_,_,_))                            |
@@ -978,7 +956,6 @@ impl<Front:SocketHandler> Http<Front> {
           if unwrap_msg!(self.state.as_ref()).is_back_error() {
             metrics.service_stop();
             self.log_request_error(metrics, "back socket chunk parse error, closing connection");
-            //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
             self.readiness.reset();
             return (ProtocolResult::Continue, ClientResult::CloseClient);
           }
@@ -998,7 +975,6 @@ impl<Front:SocketHandler> Http<Front> {
         if unwrap_msg!(self.state.as_ref()).is_back_error() {
           metrics.service_stop();
           self.log_request_error(metrics, "back socket parse error, closing connection");
-          //time!("http_proxy.failure", (precise_time_ns() - self.start) / 1000);
           self.readiness.reset();
           return (ProtocolResult::Continue, ClientResult::CloseClient);
         }
