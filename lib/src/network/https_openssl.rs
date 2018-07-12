@@ -17,7 +17,7 @@ use std::error::Error;
 use slab::{Slab,Entry,VacantEntry};
 use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
-use time::{precise_time_s, precise_time_ns};
+use time::{precise_time_s, precise_time_ns, SteadyTime, Duration};
 use rand::random;
 use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod, SslAlert,
                    Ssl, SslOptions, SslRef, SslStream, SniError, NameType};
@@ -28,6 +28,7 @@ use openssl::hash::MessageDigest;
 use openssl::nid;
 use openssl::error::ErrorStack;
 use nom::IResult;
+use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::config::LoadBalancingAlgorithms;
 use sozu_command::buffer::Buffer;
@@ -82,11 +83,13 @@ pub struct TlsClient {
   sticky_name:    String,
   metrics:        SessionMetrics,
   pub app_id:     Option<String>,
+  timeout:        Timeout,
+  last_event:     SteadyTime,
 }
 
 impl TlsClient {
   pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>,
-    expect_proxy: bool, sticky_name: String) -> TlsClient {
+    expect_proxy: bool, sticky_name: String, timeout: Timeout) -> TlsClient {
     info!("TLS CLIENT NEW: expect_proxy = {}", expect_proxy);
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
@@ -106,6 +109,8 @@ impl TlsClient {
       sticky_name:    sticky_name,
       metrics:        SessionMetrics::new(),
       app_id:         None,
+      timeout,
+      last_event:     SteadyTime::now(),
     };
     client.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
 
@@ -401,6 +406,26 @@ impl ProxyClient for TlsClient {
     result
   }
 
+  fn timeout(&self, token: Token, timer: &mut Timer<Token>) -> ClientResult {
+    if self.frontend_token == token {
+      let dur = SteadyTime::now() - self.last_event;
+      let keepalive_timeout = Duration::seconds(60);
+      if dur < keepalive_timeout {
+        timer.set_timeout((keepalive_timeout - dur).to_std().unwrap(), token);
+        ClientResult::Continue
+      } else {
+        ClientResult::CloseClient
+      }
+    } else {
+      // invalid token, obsolete timeout triggered
+      ClientResult::Continue
+    }
+  }
+
+  fn cancel_timeouts(&self, timer: &mut Timer<Token>) {
+    timer.cancel_timeout(&self.timeout);
+  }
+
   fn close_backend(&mut self, _: Token, poll: &mut Poll) -> Option<(String,SocketAddr)> {
     let mut res = None;
     if let (Some(app_id), Some(addr)) = self.remove_backend() {
@@ -430,6 +455,7 @@ impl ProxyClient for TlsClient {
 
   fn process_events(&mut self, token: Token, events: Ready) {
     trace!("token {:?} got event {}", token, super::unix_ready_to_string(UnixReady::from(events)));
+    self.last_event = SteadyTime::now();
 
     if self.frontend_token == token {
       self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
@@ -1080,7 +1106,7 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token)
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
     if let Some(ref sock) = self.listener {
       sock.accept().map_err(|e| {
@@ -1101,7 +1127,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
             PollOpt::edge()
           );
           let c = TlsClient::new(ssl, frontend_sock, client_token, Rc::downgrade(&self.pool),
-            self.config.public_address, self.config.expect_proxy, self.config.sticky_name.clone());
+            self.config.public_address, self.config.expect_proxy, self.config.sticky_name.clone(), timeout);
 
           Ok((Rc::new(RefCell::new(c)), false))
         } else {
@@ -1459,6 +1485,11 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
   {
     let entry = clients.vacant_entry().expect("client list should have enough room at startup");
     info!("taking token {:?} for channel", entry.index());
+    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+  }
+  {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    info!("taking token {:?} for timer", entry.index());
     entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
   }
   {

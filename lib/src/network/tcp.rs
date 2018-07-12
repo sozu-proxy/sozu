@@ -15,9 +15,10 @@ use std::rc::Rc;
 use std::cell::{RefCell,RefMut};
 use std::net::{SocketAddr,Shutdown};
 use std::str::FromStr;
-use time::{Duration,precise_time_s};
+use time::{Duration,SteadyTime,precise_time_s};
 use rand::random;
 use uuid::Uuid;
+use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
@@ -84,11 +85,13 @@ pub struct Client {
   protocol:       Option<State>,
   front_buf:      Option<Checkout<BufferQueue>>,
   back_buf:       Option<Checkout<BufferQueue>>,
+  timeout:        Timeout,
+  last_event:     SteadyTime,
 }
 
 impl Client {
   fn new(sock: TcpStream, frontend_token: Token, accept_token: Token, front_buf: Checkout<BufferQueue>,
-    back_buf: Checkout<BufferQueue>, proxy_protocol: Option<ProxyProtocolConfig>) -> Client {
+    back_buf: Checkout<BufferQueue>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Client {
     let s = sock.try_clone().expect("could not clone the socket");
     let addr = sock.peer_addr().map(|s| s.ip()).ok();
     let mut frontend_buffer = None;
@@ -128,6 +131,8 @@ impl Client {
       protocol,
       front_buf: frontend_buffer,
       back_buf: backend_buffer,
+      timeout,
+      last_event:     SteadyTime::now(),
     }
   }
 
@@ -424,6 +429,26 @@ impl ProxyClient for Client {
     result
   }
 
+  fn timeout(&self, token: Token, timer: &mut Timer<Token>) -> ClientResult {
+    if self.frontend_token == token {
+      let dur = SteadyTime::now() - self.last_event;
+      let keepalive_timeout = Duration::seconds(60);
+      if dur < keepalive_timeout {
+        timer.set_timeout((keepalive_timeout - dur).to_std().unwrap(), token);
+        ClientResult::Continue
+      } else {
+        ClientResult::CloseClient
+      }
+    } else {
+      // invalid token, obsolete timeout triggered
+      ClientResult::Continue
+    }
+  }
+
+  fn cancel_timeouts(&self, timer: &mut Timer<Token>) {
+    timer.cancel_timeout(&self.timeout);
+  }
+
   fn close_backend(&mut self, _: Token, poll: &mut Poll) -> Option<(String,SocketAddr)> {
     let mut res = None;
     if let (Some(app_id), Some(addr)) = self.remove_backend() {
@@ -453,6 +478,7 @@ impl ProxyClient for Client {
 
   fn process_events(&mut self, token: Token, events: Ready) {
     trace!("token {:?} got event {}", token, super::unix_ready_to_string(UnixReady::from(events)));
+    self.last_event = SteadyTime::now();
 
     if self.frontend_token == token {
       self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
@@ -884,7 +910,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token)
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<Client>>, bool), AcceptError> {
 
     let mut p = (*self.pool).borrow_mut();
@@ -900,7 +926,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         if let Some(ref listener) = self.listeners[&internal_token].sock.as_ref() {
           listener.accept().map(|(frontend_sock, _)| {
             frontend_sock.set_nodelay(true);
-            let c = Client::new(frontend_sock, client_token, internal_token, front_buf, back_buf, proxy_protocol.clone());
+            let c = Client::new(frontend_sock, client_token, internal_token, front_buf, back_buf, proxy_protocol.clone(),
+              timeout);
             incr!("tcp.requests");
 
             poll.register(
@@ -970,6 +997,11 @@ pub fn start(max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
   {
     let entry = clients.vacant_entry().expect("client list should have enough room at startup");
     info!("taking token {:?} for channel", entry.index());
+    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+  }
+  {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    info!("taking token {:?} for timer", entry.index());
     entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
   }
   {
@@ -1098,7 +1130,7 @@ mod tests {
     thread::spawn(move|| {
       info!("starting event loop");
       let mut poll = Poll::new().expect("could not create event loop");
-      let max_buffers = 10;
+      let max_buffers = 100;
       let buffer_size = 16384;
       let pool = Rc::new(RefCell::new(
         Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
@@ -1108,6 +1140,11 @@ mod tests {
       {
         let entry = clients.vacant_entry().expect("client list should have enough room at startup");
         info!("taking token {:?} for channel", entry.index());
+        entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+      }
+      {
+        let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+        info!("taking token {:?} for timer", entry.index());
         entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
       }
       {

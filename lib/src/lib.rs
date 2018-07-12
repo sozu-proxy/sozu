@@ -173,6 +173,7 @@ extern crate hdrhistogram;
 extern crate sozu_command_lib as sozu_command;
 extern crate idna;
 extern crate webpki;
+extern crate mio_extras;
 
 #[macro_use] pub mod util;
 #[macro_use] pub mod logging;

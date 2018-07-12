@@ -16,10 +16,11 @@ use slab::Slab;
 use std::io::Cursor;
 use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
-use time::{precise_time_s, precise_time_ns};
+use time::{precise_time_s, precise_time_ns, SteadyTime, Duration};
 use rand::random;
 use rustls::{ServerSession,Session};
 use nom::{HexDisplay,IResult};
+use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
@@ -63,11 +64,13 @@ pub struct TlsClient {
   pub metrics:        SessionMetrics,
   pub app_id:         Option<String>,
   sticky_name:        String,
+  timeout:            Timeout,
+  last_event:         SteadyTime,
 }
 
 impl TlsClient {
   pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
-    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String) -> TlsClient {
+    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout) -> TlsClient {
     let state = if expect_proxy {
       trace!("starting in expect proxy state");
       Some(State::Expect(ExpectProxyProtocol::new(sock, token), ssl))
@@ -85,6 +88,8 @@ impl TlsClient {
       metrics:        SessionMetrics::new(),
       app_id:         None,
       sticky_name:    sticky_name,
+      timeout,
+      last_event:     SteadyTime::now(),
     };
     client.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
     client
@@ -415,6 +420,26 @@ impl ProxyClient for TlsClient {
     result
   }
 
+  fn timeout(&self, token: Token, timer: &mut Timer<Token>) -> ClientResult {
+    if self.frontend_token == token {
+      let dur = SteadyTime::now() - self.last_event;
+      let keepalive_timeout = Duration::seconds(60);
+      if dur < keepalive_timeout {
+        timer.set_timeout((keepalive_timeout - dur).to_std().unwrap(), token);
+        ClientResult::Continue
+      } else {
+        ClientResult::CloseClient
+      }
+    } else {
+      //invalid token, obsolete timeout triggered
+      ClientResult::Continue
+    }
+  }
+
+  fn cancel_timeouts(&self, timer: &mut Timer<Token>) {
+    timer.cancel_timeout(&self.timeout);
+  }
+
   fn close_backend(&mut self, _: Token, poll: &mut Poll) -> Option<(String,SocketAddr)> {
     let mut res = None;
     if let (Some(app_id), Some(addr)) = self.remove_backend() {
@@ -444,6 +469,7 @@ impl ProxyClient for TlsClient {
 
   fn process_events(&mut self, token: Token, events: Ready) {
     trace!("token {:?} got event {}", token, super::super::unix_ready_to_string(UnixReady::from(events)));
+    self.last_event = SteadyTime::now();
 
     if self.frontend_token == token {
       self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);

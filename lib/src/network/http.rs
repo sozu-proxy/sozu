@@ -17,6 +17,7 @@ use nom::{HexDisplay,IResult};
 use rand::random;
 use time::{SteadyTime,Duration};
 use slab::{Entry,VacantEntry,Slab};
+use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
@@ -66,11 +67,13 @@ pub struct Client {
   metrics:        SessionMetrics,
   pub app_id:     Option<String>,
   sticky_name:    String,
+  front_timeout:  Timeout,
+  last_event:     SteadyTime,
 }
 
 impl Client {
   pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
-    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String) -> Option<Client> {
+    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout) -> Option<Client> {
     let protocol = if let Some(pool) = pool.upgrade() {
       let mut p = pool.borrow_mut();
       if expect_proxy {
@@ -101,6 +104,8 @@ impl Client {
         metrics:        SessionMetrics::new(),
         app_id:         None,
         sticky_name:    sticky_name,
+        front_timeout:  timeout,
+        last_event:     SteadyTime::now(),
       };
 
       client.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
@@ -384,6 +389,26 @@ impl ProxyClient for Client {
     result
   }
 
+  fn timeout(&self, token: Token, timer: &mut Timer<Token>) -> ClientResult {
+    if self.frontend_token == token {
+      let dur = SteadyTime::now() - self.last_event;
+      let keepalive_timeout = Duration::seconds(60);
+      if dur < keepalive_timeout {
+        timer.set_timeout((keepalive_timeout - dur).to_std().unwrap(), token);
+        ClientResult::Continue
+      } else {
+        ClientResult::CloseClient
+      }
+    } else {
+      error!("invalid timeout token");
+      ClientResult::Continue
+    }
+  }
+
+  fn cancel_timeouts(&self, timer: &mut Timer<Token>) {
+    timer.cancel_timeout(&self.front_timeout);
+  }
+
   fn close_backend(&mut self, _: Token, poll: &mut Poll) -> Option<(String,SocketAddr)> {
     let mut res = None;
     if let (Some(app_id), Some(addr)) = self.remove_backend() {
@@ -413,6 +438,7 @@ impl ProxyClient for Client {
 
   fn process_events(&mut self, token: Token, events: Ready) {
     trace!("token {:?} got event {}", token, super::unix_ready_to_string(UnixReady::from(events)));
+    self.last_event = SteadyTime::now();
 
     if self.frontend_token == token {
       self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
@@ -1031,7 +1057,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token)
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<Client>>, bool), AcceptError> {
 
     if let Some(ref sock) = self.listener {
@@ -1046,7 +1072,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       }).and_then(|(frontend_sock, _)| {
         frontend_sock.set_nodelay(true);
         if let Some(c) = Client::new(frontend_sock, client_token, Rc::downgrade(&self.pool),
-          self.config.public_address, self.config.expect_proxy, self.config.sticky_name.clone()) {
+          self.config.public_address, self.config.expect_proxy, self.config.sticky_name.clone(), timeout) {
           poll.register(
             c.front_socket(),
             client_token,
@@ -1162,6 +1188,11 @@ pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel, max_buffers:
   {
     let entry = clients.vacant_entry().expect("client list should have enough room at startup");
     info!("taking token {:?} for channel", entry.index());
+    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+  }
+  {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    info!("taking token {:?} for timer", entry.index());
     entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
   }
   {

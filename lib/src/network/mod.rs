@@ -1,7 +1,7 @@
 #![allow(dead_code, unused_must_use, unused_variables, unused_imports)]
 
 use mio;
-use mio::{Poll,Ready};
+use mio::{Poll,Ready,Token};
 use mio::unix::UnixReady;
 use std::fmt;
 use std::str;
@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use slab::{Entry,VacantEntry};
 use time::{precise_time_ns,SteadyTime,Duration};
+use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::messages::{OrderMessage,OrderMessageAnswer,LoadBalancingParams};
 
@@ -35,8 +36,6 @@ pub mod https_openssl;
 
 pub mod https_rustls;
 
-use mio::Token;
-
 use self::retry::RetryPolicy;
 
 pub type AppId = String;
@@ -51,6 +50,7 @@ pub enum Protocol {
   TCPListen,
   Channel,
   Metrics,
+  Timer,
 }
 
 #[derive(Debug,Clone,Default)]
@@ -65,6 +65,8 @@ pub trait ProxyClient {
   fn process_events(&mut self, token: Token, events: Ready);
   fn close(&mut self, poll: &mut Poll) -> CloseResult;
   fn close_backend(&mut self, token: Token, poll: &mut Poll) -> Option<(String, SocketAddr)>;
+  fn timeout(&self, t: Token, timer: &mut Timer<Token>) -> ClientResult;
+  fn cancel_timeouts(&self, timer: &mut Timer<Token>);
 }
 
 #[derive(Clone,Copy,Debug,PartialEq)]
@@ -93,7 +95,7 @@ pub trait ProxyConfiguration<Client> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut Client,
     back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
-  fn accept(&mut self, token: ListenToken, event_loop: &mut Poll, client_token: Token)
+  fn accept(&mut self, token: ListenToken, event_loop: &mut Poll, client_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<Client>>, bool), AcceptError>;
   fn accept_flush(&mut self) -> usize;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);

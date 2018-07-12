@@ -21,6 +21,7 @@ use std::fmt::Debug;
 use time::precise_time_ns;
 use std::time::Duration;
 use rand::random;
+use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
@@ -101,6 +102,7 @@ pub struct Server {
   clients:         Slab<Rc<RefCell<ProxyClientCast>>,ClientToken>,
   max_connections: usize,
   nb_connections:  usize,
+  timer:           Timer<Token>,
 }
 
 impl Server {
@@ -128,6 +130,11 @@ impl Server {
       let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       trace!("taking token {:?} for channel", entry.index());
       entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::Channel })));
+    }
+    {
+      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+      trace!("taking token {:?} for metrics", entry.index());
+      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::Timer })));
     }
     {
       let entry = clients.vacant_entry().expect("client list should have enough room at startup");
@@ -205,9 +212,17 @@ impl Server {
       PollOpt::edge()
     ).expect("should register the channel");
 
+    let timer = Timer::default();
+    poll.register(
+      &timer,
+      Token(1),
+      Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+      PollOpt::edge()
+    ).expect("should register the timer");
+
     METRICS.with(|metrics| {
       if let Some(sock) = (*metrics.borrow()).socket() {
-        poll.register(sock, Token(1), Ready::writable(), PollOpt::edge()).expect("should register the metrics socket");
+        poll.register(sock, Token(2), Ready::writable(), PollOpt::edge()).expect("should register the metrics socket");
       }
     });
 
@@ -226,6 +241,7 @@ impl Server {
       clients:         clients,
       max_connections: max_connections,
       nb_connections:  0,
+      timer
     };
 
     // initialize the worker with the state we got from a file
@@ -365,6 +381,10 @@ impl Server {
           }
 
         } else if event.token() == Token(1) {
+          while let Some(t) = self.timer.poll() {
+            self.timeout(t);
+          }
+        } else if event.token() == Token(2) {
           METRICS.with(|metrics| {
             (*metrics.borrow_mut()).writable();
           });
@@ -591,6 +611,7 @@ impl Server {
   pub fn close_client(&mut self, token: ClientToken) {
     if self.clients.contains(token) {
       let client = self.clients.remove(token).expect("client shoud be there");
+      client.borrow().cancel_timeouts(&mut self.timer);
       let CloseResult { tokens, backends } = client.borrow_mut().close(&mut self.poll);
 
       for tk in tokens.into_iter() {
@@ -656,10 +677,11 @@ impl Server {
           Some(entry) => {
             let client_token = Token(entry.index().0 + add);
             let index = entry.index();
+            let timeout = self.timer.set_timeout(Duration::from_secs(60), client_token);
             match protocol {
               Protocol::TCPListen   => {
                 let mut tcp = self.tcp.take().expect("if we have a TCPListen, we should have a TCP configuration");
-                let res1 = tcp.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+                let res1 = tcp.accept(token, &mut self.poll, client_token, timeout).map(|(client, should_connect)| {
                   entry.insert(client);
                   (index, should_connect)
                 });
@@ -668,7 +690,7 @@ impl Server {
               },
               Protocol::HTTPListen  => {
                 let mut http = self.http.take().expect("if we have a HTTPListen, we should have a HTTP configuration");
-                let res1 = http.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+                let res1 = http.accept(token, &mut self.poll, client_token, timeout).map(|(client, should_connect)| {
                   entry.insert(client);
                   (index, should_connect)
                 });
@@ -677,7 +699,7 @@ impl Server {
               },
               Protocol::HTTPSListen => {
                 let mut https = self.https.take().expect("if we have a HTTPSListen, we should have a HTTPS configuration");
-                let res1 = https.accept(token, &mut self.poll, client_token).map(|(client, should_connect)| {
+                let res1 = https.accept(token, &mut self.poll, client_token, timeout).map(|(client, should_connect)| {
                   entry.insert(client);
                   (index, should_connect)
                 });
@@ -926,6 +948,16 @@ impl Server {
     }
   }
 
+  pub fn timeout(&mut self, token: Token) {
+    trace!("PROXY\t{:?} got timeout", token);
+
+    let client_token = ClientToken(token.0);
+    if self.clients.contains(client_token) {
+      let order = self.clients[client_token].borrow_mut().timeout(token, &mut self.timer);
+      self.interpret_client_order(client_token, order);
+    }
+  }
+
   pub fn handle_remaining_readiness(&mut self) {
     // try to accept again after handling all client events,
     // since we might have released a few client slots
@@ -988,6 +1020,15 @@ impl ProxyClient for ListenClient {
   fn close_backend(&mut self, token: Token, poll: &mut Poll) -> Option<(String, SocketAddr)> {
     None
   }
+
+  fn timeout(&self, token: Token, timer: &mut Timer<Token>) -> ClientResult {
+    unimplemented!();
+  }
+
+  fn cancel_timeouts(&self, timer: &mut Timer<Token>) {
+    unimplemented!();
+  }
+
 }
 
 #[cfg(feature = "use-openssl")]
@@ -1040,12 +1081,12 @@ impl HttpsProvider {
     }
   }
 
-  pub fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token) -> Result<(Rc<RefCell<ProxyClientCast>>,bool), AcceptError> {
+  pub fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<ProxyClientCast>>,bool), AcceptError> {
     match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.accept(token, poll, client_token).map(|(r,b)| {
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.accept(token, poll, client_token, timeout).map(|(r,b)| {
         (r as Rc<RefCell<ProxyClientCast>>, b)
       }),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.accept(token, poll, client_token).map(|(r,b)| {
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.accept(token, poll, client_token, timeout).map(|(r,b)| {
         (r as Rc<RefCell<ProxyClientCast>>, b)
       }),
     }
@@ -1109,9 +1150,9 @@ impl HttpsProvider {
     rustls.give_back_listener()
   }
 
-  pub fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token) -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
+  pub fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.accept(token, poll, client_token)
+    rustls.accept(token, poll, client_token, timeout)
   }
 
   pub fn close_backend(&mut self, app_id: AppId, addr: &SocketAddr) {

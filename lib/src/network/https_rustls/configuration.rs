@@ -20,6 +20,7 @@ use time::{precise_time_s, precise_time_ns};
 use rand::random;
 use rustls::{ServerConfig, ServerSession, NoClientAuth};
 use nom::IResult;
+use mio_extras::timer::Timeout;
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
@@ -314,7 +315,7 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token)
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
 
     if let Some(ref listener) = self.listener.as_ref() {
@@ -338,7 +339,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
         let session = ServerSession::new(&self.ssl_config);
         let c = TlsClient::new(session, frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address,
-          self.config.expect_proxy, self.config.sticky_name.clone());
+          self.config.expect_proxy, self.config.sticky_name.clone(), timeout);
 
         (Rc::new(RefCell::new(c)), false)
       })
@@ -657,6 +658,11 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
   {
     let entry = clients.vacant_entry().expect("client list should have enough room at startup");
     info!("taking token {:?} for channel", entry.index());
+    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+  }
+  {
+    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    info!("taking token {:?} for timer", entry.index());
     entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
   }
   {
