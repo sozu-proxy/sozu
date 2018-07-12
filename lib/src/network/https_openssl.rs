@@ -160,24 +160,26 @@ impl TlsClient {
       false
 
     } else if let State::Handshake(handshake) = protocol {
-      if let Some(pool) = self.pool.upgrade() {
-        let mut p = pool.borrow_mut();
+      let pool = self.pool.clone();
+      let readiness = handshake.readiness.clone();
+      let http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), pool,
+        self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
 
-        if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-          let mut http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), front_buf,
-            back_buf, self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS).unwrap();
+        http.readiness = readiness;
+        http.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+        State::Http(http)
+      });
 
-          http.readiness = handshake.readiness;
-          http.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-          self.ssl = handshake.ssl;
-          self.protocol = Some(State::Http(http));
-          return true;
-        } else {
-          error!("could not get buffers");
-          //FIXME: must return an error and stop the connection here
-        }
+      if http.is_none() {
+        error!("could not upgrade to HTTP");
+        //we cannot put back the protocol since we moved the stream
+        //self.protocol = Some(State::Handshake(handshake));
+        return false;
       }
-      false
+
+      self.ssl = handshake.ssl;
+      self.protocol = http;
+      return true;
     } else if let State::Http(http) = protocol {
       debug!("https switching to wss");
       let front_token = self.frontend_token;

@@ -74,21 +74,12 @@ pub struct Client {
 impl Client {
   pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
     public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout) -> Option<Client> {
-    let protocol = if let Some(pool) = pool.upgrade() {
-      let mut p = pool.borrow_mut();
-      if expect_proxy {
-        trace!("starting in expect proxy state");
-        Some(State::Expect(ExpectProxyProtocol::new(sock, token)))
-      } else {
-        if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-          let mut http = State::Http(Http::new(sock, token, front_buf, back_buf, public_address,
-            None, sticky_name.clone(),
-            Protocol::HTTP).expect("should create a HTTP state"));
-
-          Some(http)
-        } else { None }
-      }
-    } else { None };
+    let protocol = if expect_proxy {
+      trace!("starting in expect proxy state");
+      Some(State::Expect(ExpectProxyProtocol::new(sock, token)))
+    } else {
+      Http::new(sock, token, pool.clone(), public_address,None, sticky_name.clone(), Protocol::HTTP).map(|http| State::Http(http))
+    };
 
     protocol.map(|pr| {
       let request_id = Uuid::new_v4().hyphenated().to_string();
@@ -133,26 +124,31 @@ impl Client {
       true
     } else if let State::Expect(expect) = protocol {
       debug!("switching to HTTP");
-      if let Some(ref addresses) = expect.addresses {
-        if let (Some(public_address), Some(client_address)) = (addresses.destination(), addresses.source()) {
-          if let Some(pool) = self.pool.upgrade() {
-            let mut p = pool.borrow_mut();
-            if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-              let mut http = Http::new(expect.frontend, expect.frontend_token,
-                front_buf, back_buf, Some(public_address.ip()), Some(client_address),
-                self.sticky_name.clone(),
-                Protocol::HTTP).expect("should create a HTTP state");
+      let readiness = expect.readiness;
+      if let Some((Some(public_address), Some(client_address))) = expect.addresses.as_ref().map(|add| {
+        (add.destination().clone(), add.source().clone())
+      }) {
+        let http = Http::new(expect.frontend, expect.frontend_token,
+          self.pool.clone(), Some(public_address.ip()), Some(client_address),
+          self.sticky_name.clone(), Protocol::HTTP).map(|mut http| {
+            http.readiness.front_readiness = readiness.front_readiness;
+            http.readiness.back_readiness  = readiness.back_readiness;
 
-              http.readiness.front_readiness = expect.readiness.front_readiness;
-              http.readiness.back_readiness  = expect.readiness.back_readiness;
-              self.protocol = Some(State::Http(http));
-              return true;
-            }
-          }
+            State::Http(http)
+        });
+
+        if http.is_none() {
+          //we cannot put back the protocol since we moved the stream
+          //self.protocol = Some(State::Expect(expect));
+          return false;
         }
+
+        self.protocol = http;
+        return true;
       }
 
-      self.protocol = Some(State::Expect(expect));
+      //we cannot put back the protocol since we moved the stream
+      //self.protocol = Some(State::Expect(expect));
       false
     } else {
       self.protocol = Some(protocol);

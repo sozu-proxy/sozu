@@ -1,6 +1,7 @@
 use std::cmp::min;
 use std::io::Write;
-use std::rc::Rc;
+use std::rc::{Rc,Weak};
+use std::cell::RefCell;
 use std::net::{SocketAddr,IpAddr};
 use mio::*;
 use mio::unix::UnixReady;
@@ -73,47 +74,60 @@ pub struct Http<Front:SocketHandler> {
   pub sticky_name:    String,
   pub sticky_session: Option<StickySession>,
   pub protocol:       Protocol,
+  pool:               Weak<RefCell<Pool<BufferQueue>>>,
 }
 
 impl<Front:SocketHandler> Http<Front> {
-  pub fn new(sock: Front, token: Token, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>,
+  pub fn new(sock: Front, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
     public_address: Option<IpAddr>, client_address: Option<SocketAddr>, sticky_name: String,
     protocol: Protocol) -> Option<Http<Front>> {
 
-    let request_id = Uuid::new_v4().hyphenated().to_string();
-    let log_ctx    = format!("{} unknown\t", &request_id);
-    let mut client = Http {
-      frontend:           sock,
-      backend:            None,
-      frontend_token:     token,
-      backend_token:      None,
-      rx_count:           0,
-      tx_count:           0,
-      status:             ClientStatus::Normal,
-      state:              Some(HttpState::new()),
-      front_buf:          front_buf,
-      back_buf:           back_buf,
-      front_buf_position: 0,
-      back_buf_position:  0,
-      start:              precise_time_ns(),
-      req_size:           0,
-      res_size:           0,
-      app_id:             None,
-      request_id:         request_id,
-      readiness:          Readiness::new(),
-      log_ctx:            log_ctx,
-      public_address:     public_address,
-      client_address:     client_address,
-      sticky_name:        sticky_name,
-      sticky_session:     None,
-      protocol:           protocol,
+    let bufs = if let Some(pool) = pool.upgrade() {
+      let mut p = pool.borrow_mut();
+      (p.checkout(), p.checkout())
+    } else {
+      (None, None)
     };
-    let req_header = client.added_request_header(public_address, client_address);
-    let res_header = client.added_response_header();
-    client.state.as_mut().map(|ref mut state| state.added_req_header = req_header);
-    client.state.as_mut().map(|ref mut state| state.added_res_header = res_header);
 
-    Some(client)
+    if let (Some(front_buf), Some(back_buf)) = bufs {
+      let request_id = Uuid::new_v4().hyphenated().to_string();
+      let log_ctx    = format!("{} unknown\t", &request_id);
+      let mut client = Http {
+        frontend:           sock,
+        backend:            None,
+        frontend_token:     token,
+        backend_token:      None,
+        rx_count:           0,
+        tx_count:           0,
+        status:             ClientStatus::Normal,
+        state:              Some(HttpState::new()),
+        front_buf:          front_buf,
+        back_buf:           back_buf,
+        front_buf_position: 0,
+        back_buf_position:  0,
+        start:              precise_time_ns(),
+        req_size:           0,
+        res_size:           0,
+        app_id:             None,
+        request_id:         request_id,
+        readiness:          Readiness::new(),
+        log_ctx:            log_ctx,
+        public_address:     public_address,
+        client_address:     client_address,
+        sticky_name:        sticky_name,
+        sticky_session:     None,
+        protocol:           protocol,
+        pool,
+      };
+      let req_header = client.added_request_header(public_address, client_address);
+      let res_header = client.added_response_header();
+      client.state.as_mut().map(|ref mut state| state.added_req_header = req_header);
+      client.state.as_mut().map(|ref mut state| state.added_res_header = res_header);
+
+      Some(client)
+    } else {
+      None
+    }
   }
 
   pub fn reset(&mut self) {

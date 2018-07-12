@@ -308,6 +308,7 @@ impl Backend {
   }
 }
 
+#[derive(Clone)]
 pub struct Readiness {
   pub front_interest:  UnixReady,
   pub back_interest:   UnixReady,

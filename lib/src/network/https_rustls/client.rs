@@ -139,46 +139,43 @@ impl TlsClient {
       self.protocol = Some(State::Expect(expect, ssl));
       false
     } else if let State::Handshake(handshake) = protocol {
-      //info!("upgrading from handshake to HTTPS");
-      if let Some(pool) = self.pool.upgrade() {
-        let mut p = pool.borrow_mut();
+      let mut front_stream = FrontRustls {
+        stream:  handshake.stream,
+        session: handshake.session,
+      };
 
-        if let (Some(mut front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-          let mut front_stream = FrontRustls {
-            stream:  handshake.stream,
-            session: handshake.session,
-          };
+      let readiness = handshake.readiness.clone();
+      let http = Http::new(front_stream, self.frontend_token, self.pool.clone(),
+        self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
 
-          let res = front_stream.session.read(front_buf.buffer.space());
-          match res {
-            Ok(sz) =>{
-              //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
-              front_buf.buffer.fill(sz);
-              front_buf.sliced_input(sz);
-              count!("bytes_in", sz as i64);
-              self.metrics.bin += sz;
-            },
-            Err(e) => {
-              error!("read error: {:?}", e);
-            }
+        let res = http.frontend.session.read(http.front_buf.buffer.space());
+        match res {
+          Ok(sz) =>{
+            //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
+            http.front_buf.buffer.fill(sz);
+            http.front_buf.sliced_input(sz);
+            count!("bytes_in", sz as i64);
+            self.metrics.bin += sz;
+          },
+          Err(e) => {
+            error!("read error: {:?}", e);
           }
-
-          let mut http = Http::new(front_stream, self.frontend_token, front_buf,
-            back_buf, self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS).unwrap();
-
-          http.readiness = handshake.readiness;
-          http.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-          self.protocol = Some(State::Http(http));
-          return true;
-        } else {
-          error!("could not get buffers");
-          //FIXME: must return an error and stop the connection here
-
         }
+
+        http.readiness = readiness;
+        http.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+        State::Http(http)
+      });
+
+      if http.is_none() {
+        error!("could not upgrade to HTTP");
+        //we cannot put back the protocol since we moved the stream
+        //self.protocol = Some(State::Handshake(handshake));
+        return false;
       }
 
-      self.protocol = Some(State::Handshake(handshake));
-      false
+      self.protocol = http;
+      return true;
     } else if let State::Http(http) = protocol {
       debug!("https switching to wss");
       let front_token = self.frontend_token;
