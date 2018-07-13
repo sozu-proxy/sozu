@@ -713,11 +713,16 @@ impl<Front:SocketHandler> Http<Front> {
       self.readiness.front_interest.insert(Ready::readable());
       self.readiness.front_interest.remove(Ready::writable());
 
-      // we must now copy the body from front to back
-      trace!("100-Continue => copying {} of body from front to back", sz);
-      self.front_buf.as_mut().unwrap().slice_output(sz);
-      self.front_buf.as_mut().unwrap().consume_parsed_data(sz);
-      return ClientResult::Continue;
+      if self.front_buf.is_some() {
+        // we must now copy the body from front to back
+        trace!("100-Continue => copying {} of body from front to back", sz);
+        self.front_buf.as_mut().unwrap().slice_output(sz);
+        self.front_buf.as_mut().unwrap().consume_parsed_data(sz);
+        return ClientResult::Continue;
+      } else {
+        error!("got 100 continue but front buffer was already removed");
+        return ClientResult::CloseClient;
+      }
     }
 
 
@@ -850,8 +855,10 @@ impl<Front:SocketHandler> Http<Front> {
         Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
           // return the buffer to the pool
           // if there's still data in there, keep it for pipelining
-          if self.front_buf.as_ref().map(|buf| buf.empty()) == Some(true) {
-            self.front_buf = None;
+          if self.state.as_ref().map(|st| st.must_continue()).is_none() {
+            if self.front_buf.as_ref().map(|buf| buf.empty()) == Some(true) {
+              self.front_buf = None;
+            }
           }
           self.readiness.front_interest.remove(Ready::readable());
           self.readiness.back_interest.insert(Ready::readable());
