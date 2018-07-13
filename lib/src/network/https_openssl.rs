@@ -90,7 +90,6 @@ pub struct TlsClient {
 impl TlsClient {
   pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>,
     expect_proxy: bool, sticky_name: String, timeout: Timeout) -> TlsClient {
-    info!("TLS CLIENT NEW: expect_proxy = {}", expect_proxy);
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
       Some(State::Expect(ExpectProxyProtocol::new(sock, token), ssl))

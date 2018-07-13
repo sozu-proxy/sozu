@@ -38,7 +38,6 @@ pub struct ExpectProxyProtocol<Front:SocketHandler> {
 
 impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
   pub fn new(frontend: Front, frontend_token: Token) -> Self {
-    println!("expect starting, connection from {:?}", frontend.socket_ref().peer_addr());
     ExpectProxyProtocol {
       frontend,
       frontend_token,
