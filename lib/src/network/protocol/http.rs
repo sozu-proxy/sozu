@@ -844,9 +844,15 @@ impl<Front:SocketHandler> Http<Front> {
     // FIXME/ should read exactly as much data as needed
     if self.front_buf.as_ref().unwrap().can_restart_parsing() {
       match unwrap_msg!(self.state.as_ref()).request {
+        // the entire request was transmitted
         Some(RequestState::Request(_,_,_))                            |
         Some(RequestState::RequestWithBody(_,_,_,_))                  |
         Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
+          // return the buffer to the pool
+          // if there's still data in there, keep it for pipelining
+          if self.front_buf.as_ref().map(|buf| buf.empty()) == Some(true) {
+            self.front_buf = None;
+          }
           self.readiness.front_interest.remove(Ready::readable());
           self.readiness.back_interest.insert(Ready::readable());
           self.readiness.back_interest.remove(Ready::writable());
