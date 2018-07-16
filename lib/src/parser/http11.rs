@@ -1610,7 +1610,7 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
         if header_end.is_none() {
           match current_state {
             RequestState::Request(_,_,_) |
-            RequestState::RequestWithBodyChunks(_,_,_,Chunk::Initial=> {
+            RequestState::RequestWithBodyChunks(_,_,_,Chunk::Initial) => {
               //println!("FOUND HEADER END (advance):{}", buf.start_parsing_position);
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_req_header.as_bytes()));
