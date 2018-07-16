@@ -709,7 +709,7 @@ pub enum LengthInformation {
 #[derive(Debug,Clone,PartialEq)]
 pub enum Continue {
   None,
-  Expects,
+  Expects(usize),
 }
 /*
 #[derive(Debug,Clone,PartialEq)]
@@ -1084,18 +1084,12 @@ impl HttpState {
   }
 
   pub fn must_continue(&self) -> Option<usize> {
-    if self.request.as_ref().and_then(|r| r.get_keep_alive().map(|conn| conn.continues == Continue::Expects)).unwrap_or(false) &&
-        self.response.as_ref().and_then(|r| r.get_status_line().map(|st| st.status == 100)).unwrap_or(false) {
-
-      if let Some(&RequestState::RequestWithBody(_, _, _, sz)) = self.request.as_ref() {
-        Some(sz)
-      } else {
-        None
+    if let Some(Continue::Expects(sz)) = self.request.as_ref().and_then(|r| r.get_keep_alive().map(|conn| conn.continues)) {
+      if self.response.as_ref().and_then(|r| r.get_status_line().map(|st| st.status == 100)).unwrap_or(false) {
+        return Some(sz);
       }
-
-    } else {
-      None
     }
+    None
   }
   /*
   pub fn front_should_copy(&self) -> Option<usize> {
@@ -1223,7 +1217,7 @@ pub fn validate_request_header(state: RequestState, header: &Header, sticky_name
     },
     HeaderValue::ExpectContinue => {
       let mut conn = state.get_keep_alive().unwrap_or(Connection::new());
-      conn.continues = Continue::Expects;
+      conn.continues = Continue::Expects(0);
 
       match state {
         RequestState::HasRequestLine(rl, _)                 => RequestState::HasRequestLine(rl, conn),
@@ -1616,22 +1610,23 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
         if header_end.is_none() {
           match current_state {
             RequestState::Request(_,_,_) |
-            RequestState::RequestWithBodyChunks(_,_,_,Chunk::Initial) => {
+            RequestState::RequestWithBodyChunks(_,_,_,Chunk::Initial=> {
               //println!("FOUND HEADER END (advance):{}", buf.start_parsing_position);
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_req_header.as_bytes()));
               buf.slice_output(sz);
             },
-            RequestState::RequestWithBody(_,ref conn,_,content_length) => {
+            RequestState::RequestWithBody(_,ref mut conn,_,content_length) => {
               header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_req_header.as_bytes()));
 
               // If we got "Expects: 100-continue", the body will be sent later
-              if conn.continues == Continue::Expects {
-                buf.slice_output(sz);
-              } else {
+              if conn.continues == Continue::None {
                 buf.slice_output(sz+content_length);
                 buf.consume_parsed_data(content_length);
+              } else {
+                buf.slice_output(sz);
+                conn.continues = Continue::Expects(content_length);
               }
             },
             _ => {
@@ -1725,33 +1720,38 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
     match mv {
       BufferMove::Advance(sz) => {
         assert!(sz != 0, "buffer move should not be 0");
-        buf.consume_parsed_data(sz);
 
+        // header_end is some if we already parsed the headers
         if header_end.is_none() {
           match current_state {
             ResponseState::Response(_,_) |
             ResponseState::ResponseUpgrade(_,_,_) |
             ResponseState::ResponseWithBodyChunks(_,_,_) => {
-              header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
               add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session.clone());
+
+              buf.consume_parsed_data(sz);
+              header_end = Some(buf.start_parsing_position);
 
               buf.slice_output(sz);
             },
             ResponseState::ResponseWithBody(_,_,content_length) => {
-              header_end = Some(buf.start_parsing_position);
               buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
-
               add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session.clone());
+
+              buf.consume_parsed_data(sz);
+              header_end = Some(buf.start_parsing_position);
 
               buf.slice_output(sz+content_length);
               buf.consume_parsed_data(content_length);
             },
             _ => {
+              buf.consume_parsed_data(sz);
               buf.slice_output(sz);
             }
           }
         } else {
+          buf.consume_parsed_data(sz);
           buf.slice_output(sz);
         }
         //FIXME: if we add a slice here, we will get a first large slice, then a long list of buffer size slices added by the slice_input function

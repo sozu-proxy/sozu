@@ -709,7 +709,7 @@ impl<Front:SocketHandler> Http<Front> {
     }
 
     //handle this case separately as its cumbersome to do from the pattern match
-    if let Some(sz) = self.state.as_ref().map(|st| st.must_continue()).unwrap_or(None) {
+    if let Some(sz) = self.state.as_ref().and_then(|st| st.must_continue()) {
       self.readiness.front_interest.insert(Ready::readable());
       self.readiness.front_interest.remove(Ready::writable());
 
@@ -718,6 +718,11 @@ impl<Front:SocketHandler> Http<Front> {
         trace!("100-Continue => copying {} of body from front to back", sz);
         self.front_buf.as_mut().unwrap().slice_output(sz);
         self.front_buf.as_mut().unwrap().consume_parsed_data(sz);
+
+        self.state.as_mut().map(|ref mut st| {
+          st.response = Some(ResponseState::Initial);
+          st.res_header_end = None;
+        });
         return ClientResult::Continue;
       } else {
         error!("got 100 continue but front buffer was already removed");
@@ -865,6 +870,19 @@ impl<Front:SocketHandler> Http<Front> {
           self.readiness.back_interest.remove(Ready::writable());
           ClientResult::Continue
         },
+        Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Initial)) => {
+          if self.state.as_ref().map(|st| st.must_continue()).is_none() {
+            self.readiness.front_interest.insert(Ready::readable());
+            ClientResult::Continue
+          } else {
+            // wait for the 100 continue response from the backend
+            // keep the front buffer
+            self.readiness.front_interest.remove(Ready::readable());
+            self.readiness.back_interest.insert(Ready::readable());
+            self.readiness.back_interest.remove(Ready::writable());
+            ClientResult::Continue
+          }
+        }
         Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
           self.readiness.front_interest.insert(Ready::readable());
           ClientResult::Continue
