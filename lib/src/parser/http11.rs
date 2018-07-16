@@ -1084,8 +1084,8 @@ impl HttpState {
   }
 
   pub fn must_continue(&self) -> Option<usize> {
-    if self.request.as_ref().map(|r| r.get_keep_alive().map(|conn| conn.continues == Continue::Expects).unwrap_or(false)).unwrap_or(false) &&
-        self.response.as_ref().map(|r| r.get_status_line().map(|st| st.status == 100).unwrap_or(false)).unwrap_or(false) {
+    if self.request.as_ref().and_then(|r| r.get_keep_alive().map(|conn| conn.continues == Continue::Expects)).unwrap_or(false) &&
+        self.response.as_ref().and_then(|r| r.get_status_line().map(|st| st.status == 100)).unwrap_or(false) {
 
       if let Some(&RequestState::RequestWithBody(_, _, _, sz)) = self.request.as_ref() {
         Some(sz)
