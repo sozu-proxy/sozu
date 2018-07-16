@@ -722,6 +722,7 @@ impl<Front:SocketHandler> Http<Front> {
         self.state.as_mut().map(|ref mut st| {
           st.response = Some(ResponseState::Initial);
           st.res_header_end = None;
+          st.request.as_mut().map(|r| r.get_mut_connection().map(|conn| conn.continues = Continue::None));
         });
         return ClientResult::Continue;
       } else {
