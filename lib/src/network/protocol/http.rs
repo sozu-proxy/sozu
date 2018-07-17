@@ -985,6 +985,7 @@ impl<Front:SocketHandler> Http<Front> {
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
         metrics.service_stop();
+        error!("{}\tback read should have stopped on chunk ended\nstate: {:?}", self.log_ctx, self.state);
         self.log_request_error(metrics, "back read should have stopped on chunk ended");
         self.readiness.reset();
         (ProtocolResult::Continue, ClientResult::CloseClient)
