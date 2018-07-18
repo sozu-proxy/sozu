@@ -65,24 +65,34 @@ impl ConfigState {
     self.https_addresses.push((ip_address, port))
   }
 
-  pub fn handle_order(&mut self, order: &Order) {
+  /// returns true if the order modified something
+  pub fn handle_order(&mut self, order: &Order) -> bool {
     match order {
       &Order::AddApplication(ref application) => {
         let app = application.clone();
         self.applications.insert(app.app_id.clone(), app);
+        true
       },
       &Order::RemoveApplication(ref app_id) => {
-        self.applications.remove(app_id);
+        self.applications.remove(app_id).is_some()
       },
       &Order::AddHttpFront(ref front) => {
         let front_vec = self.http_fronts.entry(front.app_id.clone()).or_insert(vec!());
         if !front_vec.contains(front) {
           front_vec.push(front.clone());
+          true
+        } else {
+          false
         }
       },
       &Order::RemoveHttpFront(ref front) => {
         if let Some(front_list) = self.http_fronts.get_mut(&front.app_id) {
+          let len = front_list.len();
           front_list.retain(|el| el.hostname != front.hostname || el.path_begin != front.path_begin);
+
+          front_list.len() != len
+        } else {
+          false
         }
       },
       &Order::AddCertificate(ref add) => {
@@ -90,70 +100,98 @@ impl ConfigState {
           Some(f)  => CertFingerprint(f),
           None => {
             error!("cannot obtain the certificate's fingerprint");
-            return;
+            return false;
           }
         };
 
         if !self.certificates.contains_key(&fingerprint) {
           self.certificates.insert(fingerprint.clone(), (add.certificate.clone(), add.names.clone()));
+          true
+        } else {
+          false
         }
       },
       &Order::RemoveCertificate(ref remove) => {
-        self.certificates.remove(&remove.fingerprint);
+        self.certificates.remove(&remove.fingerprint).is_some()
       },
       &Order::ReplaceCertificate(ref replace) => {
-        self.certificates.remove(&replace.old_fingerprint);
+        let changed = self.certificates.remove(&replace.old_fingerprint).is_some();
 
         let fingerprint = match calculate_fingerprint(&replace.new_certificate.certificate.as_bytes()[..]) {
           Some(f)  => CertFingerprint(f),
           None => {
             error!("cannot obtain the certificate's fingerprint");
-            return;
+            return changed;
           }
         };
 
         if !self.certificates.contains_key(&fingerprint) {
           self.certificates.insert(fingerprint.clone(),
             (replace.new_certificate.clone(), replace.new_names.clone()));
+          true
+        } else {
+          changed
         }
       },
       &Order::AddHttpsFront(ref front) => {
         let front_vec = self.https_fronts.entry(front.app_id.clone()).or_insert(vec!());
         if !front_vec.contains(front) {
           front_vec.push(front.clone());
+          true
+        } else {
+          false
         }
       },
       &Order::RemoveHttpsFront(ref front) => {
         if let Some(front_list) = self.https_fronts.get_mut(&front.app_id) {
+          let len = front_list.len();
           front_list.retain(|el| el.hostname != front.hostname || el.path_begin != front.path_begin);
+          front_list.len() != len
+        } else {
+          false
         }
       },
       &Order::AddTcpFront(ref front) => {
         let front_vec = self.tcp_fronts.entry(front.app_id.clone()).or_insert(vec!());
         if !front_vec.contains(front) {
           front_vec.push(front.clone());
+          true
+        } else {
+          false
         }
       },
       &Order::RemoveTcpFront(ref front) => {
         if let Some(front_list) = self.tcp_fronts.get_mut(&front.app_id) {
+          let len = front_list.len();
           front_list.retain(|el| el.ip_address != front.ip_address || el.port != front.port);
+          front_list.len() != len
+        } else {
+          false
         }
       },
       &Order::AddBackend(ref backend)  => {
         let backend_vec = self.backends.entry(backend.app_id.clone()).or_insert(vec!());
         if !backend_vec.contains(&backend) {
           backend_vec.push(backend.clone());
+          true
+        } else {
+          false
         }
       },
       &Order::RemoveBackend(ref backend) => {
         if let Some(backend_list) = self.backends.get_mut(&backend.app_id) {
+          let len = backend_list.len();
           backend_list.retain(|el| el.ip_address != backend.ip_address || el.port != backend.port);
+          backend_list.len() != len
+        } else {
+          false
         }
       },
       // This is to avoid the error message
-      &Order::Logging(_) | &Order::Status => {},
+      &Order::Logging(_) | &Order::Status => {false},
       o => {
         error!("state cannot handle order message: {:#?}", o);
+        false
       }
     }
   }
