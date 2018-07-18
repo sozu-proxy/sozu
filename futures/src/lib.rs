@@ -92,7 +92,7 @@ impl SozuCommandClient {
         }
     }
 
-    pub fn send(&mut self, message: ConfigMessage)  -> Box<Future<Item = ConfigMessageAnswer, Error = io::Error>> {
+    pub fn send(&mut self, message: ConfigMessage)  -> Box<Future<Item = ConfigMessageAnswer, Error = io::Error> + Send + 'static> {
         trace!("will send message: {:?}", message);
         let tr  = self.transport.clone();
         let tr2 = self.transport.clone();
