@@ -153,7 +153,7 @@ pub enum Order {
 
 
 //FIXME: make fixed size depending on hash algorithm
-#[derive(Clone,PartialEq,Eq,Hash)]
+#[derive(Clone,PartialEq,Eq,Hash,PartialOrd,Ord)]
 pub struct CertFingerprint(pub Vec<u8>);
 
 impl fmt::Debug for CertFingerprint {
@@ -212,7 +212,7 @@ pub struct Application {
     pub load_balancing_policy: LoadBalancingAlgorithms,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
 pub struct HttpFront {
     pub app_id:         String,
     pub hostname:       String,
@@ -254,7 +254,7 @@ pub struct ReplaceCertificate {
     pub new_names: Vec<String>,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
 pub struct HttpsFront {
     pub app_id:         String,
     pub hostname:       String,
@@ -262,14 +262,14 @@ pub struct HttpsFront {
     pub fingerprint:    CertFingerprint,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
 pub struct TcpFront {
     pub app_id:     String,
     pub ip_address: String,
     pub port:       u16,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
 pub struct Backend {
     pub app_id:      String,
     pub backend_id:  String,
@@ -290,7 +290,7 @@ pub struct RemoveBackend {
     pub port:        u16,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
 pub struct LoadBalancingParams {
     pub weight: u8,
 }

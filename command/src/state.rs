@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap,HashMap,HashSet};
+use std::collections::{BTreeMap,HashMap,HashSet,BTreeSet};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
@@ -342,13 +342,13 @@ impl ConfigState {
   }
 
   pub fn hash_state(&self) -> BTreeMap<AppId, u64> {
-    self.backends.keys().map(|app_id| {
+    self.applications.keys().map(|app_id| {
       let mut s = DefaultHasher::new();
       self.applications.get(app_id).hash(&mut s);
-      self.backends.get(app_id).hash(&mut s);
-      self.http_fronts.get(app_id).hash(&mut s);
-      self.https_fronts.get(app_id).hash(&mut s);
-      self.tcp_fronts.get(app_id).hash(&mut s);
+      self.backends.get(app_id).map(|ref v| v.iter().collect::<BTreeSet<_>>().hash(&mut s));
+      self.http_fronts.get(app_id).map(|ref v| v.iter().collect::<BTreeSet<_>>().hash(&mut s));
+      self.https_fronts.get(app_id).map(|ref v| v.iter().collect::<BTreeSet<_>>().hash(&mut s));
+      self.tcp_fronts.get(app_id).map(|ref v| v.iter().collect::<BTreeSet<_>>().hash(&mut s));
 
       (app_id.to_string(), s.finish())
 
