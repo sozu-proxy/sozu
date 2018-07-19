@@ -105,6 +105,8 @@ impl<V:Debug> TrieNode<V> {
               return InsertResult::Existing;
             } else {
               child.key_value = Some((key.clone(), value));
+              self.keys.push(child_key);
+              self.children.push(child);
               return InsertResult::Ok;
             }
           } else {
