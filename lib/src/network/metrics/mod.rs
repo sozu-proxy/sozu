@@ -210,12 +210,12 @@ pub fn udp_bind() -> UdpSocket {
 
 #[macro_export]
 macro_rules! count (
-  ($key:expr, $value: expr) => {
+  ($key:expr, $value: expr) => ({
     let v = $value;
     $crate::network::metrics::METRICS.with(|metrics| {
       (*metrics.borrow_mut()).count_add($key, v);
     });
-  }
+  })
 );
 
 #[macro_export]
