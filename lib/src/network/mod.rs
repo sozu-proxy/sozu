@@ -228,7 +228,7 @@ pub struct Backend {
 
 impl Backend {
   pub fn new(backend_id: &str, addr: SocketAddr, sticky_id: Option<String>, load_balancing_parameters: Option<LoadBalancingParams>) -> Backend {
-    let desired_policy = retry::ExponentialBackoffPolicy::new(10);
+    let desired_policy = retry::ExponentialBackoffPolicy::new(6);
     Backend {
       sticky_id:          sticky_id,
       backend_id:         backend_id.to_string(),

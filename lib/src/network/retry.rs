@@ -78,7 +78,8 @@ impl RetryPolicy for ExponentialBackoffPolicy {
 
         self.wait = time::Duration::from_secs(wait);
         self.last_try = time::Instant::now();
-        self.current_tries += 1;
+        self.current_tries = cmp::min(self.current_tries + 1, self.max_tries);
+
     }
 
     fn succeed(&mut self) {
@@ -88,9 +89,6 @@ impl RetryPolicy for ExponentialBackoffPolicy {
     }
 
     fn can_try(&self) -> Option<RetryAction> {
-        if self.current_tries() >= self.max_tries() {
-            return None;
-        }
 
         let action = if self.last_try.elapsed().gt(&self.wait) {
             RetryAction::OKAY
