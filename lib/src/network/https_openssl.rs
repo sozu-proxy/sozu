@@ -27,6 +27,7 @@ use openssl::pkey::PKey;
 use openssl::hash::MessageDigest;
 use openssl::nid;
 use openssl::error::ErrorStack;
+use openssl::ssl::SslVersion;
 use nom::IResult;
 use mio_extras::timer::{Timer,Timeout};
 
@@ -161,6 +162,16 @@ impl TlsClient {
     } else if let State::Handshake(handshake) = protocol {
       let pool = self.pool.clone();
       let readiness = handshake.readiness.clone();
+
+      handshake.stream.as_ref().map(|s| {
+        let ssl = s.ssl();
+        ssl.version2().map(|version| {
+          incr!(version_str(version));
+        })
+        //FIXME: we cannot use the name as a key in metrics since it requires a 'static str
+        //ssl.current_cipher().map(|c| incr!(c.name())));
+      });
+
       let http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), pool,
         self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
 
@@ -1652,5 +1663,28 @@ mod tests {
     let frontend5 = server_config.frontend_from_request("domain", "/");
     assert_eq!(frontend5, None);
    // assert!(false);
+  }
+}
+
+#[cfg(not(ossl111))]
+fn version_str(version: SslVersion) -> &'static str {
+  match version {
+    SslVersion::SSL3 => "tls.version.SSLv3",
+    SslVersion::TLS1 => "tls.version.TLSv1_0",
+    SslVersion::TLS1_1 => "tls.version.TLSv1_1",
+    SslVersion::TLS1_2 => "tls.version.TLSv1_2",
+    _ => "tls.version.Unknown",
+  }
+}
+
+#[cfg(ossl111)]
+fn version_str(version: SslVersion) -> &'static str {
+  match version {
+    SslVersion::SSL3 => "tls.version.SSLv3",
+    SslVersion::TLS1 => "tls.version.TLSv1_0",
+    SslVersion::TLS1_1 => "tls.version.TLSv1_1",
+    SslVersion::TLS1_2 => "tls.version.TLSv1_2",
+    SslVersion::TLS1_3 => "tls.version.TLSv1_3",
+    _ => "tls.version.Unknown",
   }
 }

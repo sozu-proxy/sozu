@@ -18,7 +18,7 @@ use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{precise_time_s, precise_time_ns, SteadyTime, Duration};
 use rand::random;
-use rustls::{ServerSession,Session};
+use rustls::{ServerSession,Session,ProtocolVersion,SupportedCipherSuite,CipherSuite};
 use nom::{HexDisplay,IResult};
 use mio_extras::timer::{Timer, Timeout};
 
@@ -144,6 +144,13 @@ impl TlsClient {
         self.protocol = Some(State::Handshake(handshake));
         return false;
       }
+
+      handshake.session.get_protocol_version().map(|version| {
+        incr!(version_str(version));
+      });
+      handshake.session.get_negotiated_ciphersuite().map(|cipher| {
+        incr!(ciphersuite_str(cipher));
+      });
 
       let mut front_stream = FrontRustls {
         stream:  handshake.stream,
@@ -634,3 +641,29 @@ impl ProxyClient for TlsClient {
   }
 }
 
+fn version_str(version: ProtocolVersion) -> &'static str {
+  match version {
+    ProtocolVersion::SSLv2 => "tls.version.SSLv2",
+    ProtocolVersion::SSLv3 => "tls.version.SSLv3",
+    ProtocolVersion::TLSv1_0 => "tls.version.TLSv1_0",
+    ProtocolVersion::TLSv1_1 => "tls.version.TLSv1_1",
+    ProtocolVersion::TLSv1_2 => "tls.version.TLSv1_2",
+    ProtocolVersion::TLSv1_3 => "tls.version.TLSv1_3",
+    ProtocolVersion::Unknown(_) => "tls.version.Unknown",
+  }
+}
+
+fn ciphersuite_str(cipher: &'static SupportedCipherSuite) -> &'static str {
+  match cipher.suite {
+    CipherSuite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 => "tls.cipher.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+    CipherSuite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 => "tls.cipher.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+    CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 => "tls.cipher.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+    CipherSuite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 => "tls.cipher.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+    CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 => "tls.cipher.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA25.",
+    CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 => "tls.cipher.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+    CipherSuite::TLS13_CHACHA20_POLY1305_SHA256 => "tls.cipher.TLS13_CHACHA20_POLY1305_SHA256",
+    CipherSuite::TLS13_AES_256_GCM_SHA384 => "tls.cipher.TLS13_AES_256_GCM_SHA384",
+    CipherSuite::TLS13_AES_128_GCM_SHA256 => "tls.cipher.TLS13_AES_128_GCM_SHA256",
+    _ => "tls.cipher.Unsupported",
+  }
+}
