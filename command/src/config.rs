@@ -135,7 +135,7 @@ impl ProxyConfig {
     };
 
     let versions = match self.tls_versions {
-      None    => vec!(TlsVersion::TLSv1_2),
+      None    => vec!(TlsVersion::TLSv1_1, TlsVersion::TLSv1_2),
       Some(ref v) => v.clone(),
     };
 
