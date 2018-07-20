@@ -365,6 +365,7 @@ pub struct HttpsProxyConfiguration {
     pub answer_503:                String,
     pub versions:                  Vec<TlsVersion>,
     pub cipher_list:               String,
+    pub rustls_cipher_list:        Vec<String>,
     pub default_name:              Option<String>,
     pub default_app_id:            Option<String>,
     pub default_certificate:       Option<Vec<u8>>,
@@ -399,6 +400,7 @@ impl Default for HttpsProxyConfiguration {
         ECDHE-RSA-DES-CBC3-SHA:EDH-RSA-DES-CBC3-SHA:\
         AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:\
         AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:!DSS"),
+      rustls_cipher_list:  vec!(),
       versions:            vec!(TlsVersion::TLSv1_2),
       default_name:        Some(String::from("lolcatho.st")),
       default_app_id:      None,

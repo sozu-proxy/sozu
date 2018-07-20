@@ -26,6 +26,7 @@ pub struct ProxyConfig {
   pub answer_404:                Option<String>,
   pub answer_503:                Option<String>,
   pub cipher_list:               Option<String>,
+  pub rustls_cipher_list:        Option<Vec<String>>,
   pub default_name:              Option<String>,
   pub default_app_id:            Option<String>,
   pub default_certificate:       Option<String>,
@@ -106,6 +107,24 @@ impl ProxyConfig {
         ECDHE-RSA-DES-CBC3-SHA:EDH-RSA-DES-CBC3-SHA:\
         AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:\
         AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:!DSS"));
+
+    let supported_ciphersuites: HashSet<&str> = ["TLS13_CHACHA20_POLY1305_SHA256", "TLS13_AES_256_GCM_SHA384",
+     "TLS13_AES_128_GCM_SHA256", "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+     "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+     "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+     "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+     "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+     "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"].iter().cloned().collect();
+
+    if let Some(ref list) = self.rustls_cipher_list {
+      for cipher in list.iter() {
+        if !supported_ciphersuites.contains(cipher.as_str()) {
+          error!("unknown rustls ciphersuite: {}", cipher);
+        }
+      }
+    }
+
+    let rustls_cipher_list = self.rustls_cipher_list.clone();
 
     let tls_proxy_configuration = match address.parse() {
       Ok(addr) => Some(addr),
@@ -752,6 +771,7 @@ mod tests {
       public_address: None,
       tls_versions: None,
       cipher_list: None,
+      rustls_cipher_list: None,
       default_app_id: None,
       default_certificate: None,
       default_certificate_chain: None,
@@ -770,6 +790,7 @@ mod tests {
       public_address: None,
       tls_versions: None,
       cipher_list: None,
+      rustls_cipher_list: None,
       default_app_id: None,
       default_certificate: None,
       default_certificate_chain: None,
