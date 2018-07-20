@@ -124,7 +124,7 @@ impl ProxyConfig {
       }
     }
 
-    let rustls_cipher_list = self.rustls_cipher_list.clone();
+    let rustls_cipher_list = self.rustls_cipher_list.clone().unwrap_or(Vec::new());
 
     let tls_proxy_configuration = match address.parse() {
       Ok(addr) => Some(addr),
@@ -155,6 +155,7 @@ impl ProxyConfig {
         versions:        versions,
         expect_proxy:    expect_proxy,
         sticky_name:     self.sticky_name.clone(),
+        rustls_cipher_list,
         ..Default::default()
       };
 
