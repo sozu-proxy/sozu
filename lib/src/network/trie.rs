@@ -364,6 +364,7 @@ impl<V:Debug> TrieNode<V> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::collections::HashMap;
 
   #[test]
   fn insert() {
@@ -480,4 +481,55 @@ mod tests {
     assert_eq!(root.domain_lookup(&b"blah.test.alldomains.org"[..]), None);
   }
 
+  fn hm_insert(h: HashMap<String, u32>) -> bool {
+    let mut root: TrieNode<u32> = TrieNode::root();
+
+    for (k, v) in h.iter() {
+      if k.is_empty() {
+        continue;
+      }
+
+      //println!("inserting key: '{}', value: '{}'", k, v);
+      //assert_eq!(root.domain_insert(Vec::from(k.as_bytes()), *v), InsertResult::Ok);
+      assert_eq!(root.insert(Vec::from(k.as_bytes()), *v), InsertResult::Ok, "could not insert ({}, {})", k, v);
+      //root.print();
+    }
+
+    //root.print();
+    for (k, v) in h.iter() {
+      if k.is_empty() {
+        continue;
+      }
+
+      //match root.domain_lookup(k.as_bytes()) {
+      match root.lookup(k.as_bytes()) {
+        None => {
+          println!("did not find key '{}'", k);
+          return false;
+        }
+        Some(&(ref k1,v1)) => if k.as_bytes() != &k1[..] || *v != v1 {
+          println!("request ({}, {}), got ({}, {})", k, v, str::from_utf8(&k1[..]).unwrap(), v1);
+          return false;
+        }
+      }
+    }
+
+    true
+  }
+
+  quickcheck! {
+    fn qc_insert(h: HashMap<String, u32>) -> bool {
+      hm_insert(h)
+    }
+  }
+
+  #[test]
+  fn insert_disappearing_tree() {
+    let h: HashMap<String, u32> = [
+      (String::from("\n\u{3}"), 0),
+      (String::from("\n\u{0}"), 1),
+      (String::from("\n"), 2)
+    ].iter().cloned().collect();
+    assert!(hm_insert(h));
+  }
 }
