@@ -23,7 +23,7 @@ include = [
 [lib]
 
 [dependencies]
-rand = "^0.4"
+rand = "^0.5"
 nom = "^2.0"
 url = "^1.5"
 log = "^0.4"
@@ -35,8 +35,8 @@ libc = "^0.2"
 slab = "^0.3.0"
 pool = "^0.1"
 openssl = {version="^0.10", features= ["v102"], optional = true}
-rustls = "^0.12"
-webpki = "0.18.0-alpha"
+rustls = "^0.13"
+webpki = "^0.18.1"
 hdrhistogram = "^6.0"
 sozu-command-lib = { version = "^0.7", path = "../command" }
 idna = "^0.1"
