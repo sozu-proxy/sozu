@@ -35,8 +35,9 @@ use sozu_command::config::LoadBalancingAlgorithms;
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
-use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,Order,HttpsFront,HttpsProxyConfiguration,OrderMessage,
-  OrderMessageAnswer,OrderMessageStatus,LoadBalancingParams};
+use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,
+  Order,HttpsFront,HttpsProxyConfiguration,OrderMessage, OrderMessageAnswer,
+  OrderMessageStatus,LoadBalancingParams,TlsVersion};
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::pool::{Pool,Checkout};
@@ -741,13 +742,13 @@ impl ServerConfiguration {
       ssl::SslOptions::NO_TLSV1_1 | ssl::SslOptions::NO_TLSV1_2;
 
     for version in config.versions.iter() {
-      match version.as_str() {
-        "SSLv2"   => versions.remove(ssl::SslOptions::NO_SSLV2),
-        "SSLv3"   => versions.remove(ssl::SslOptions::NO_SSLV3),
-        "TLSv1"   => versions.remove(ssl::SslOptions::NO_TLSV1),
-        "TLSv1.1" => versions.remove(ssl::SslOptions::NO_TLSV1_1),
-        "TLSv1.2" => versions.remove(ssl::SslOptions::NO_TLSV1_2),
-        s         => error!("unrecognized TLS version: {}", s)
+      match version {
+        TlsVersion::SSLv2   => versions.remove(ssl::SslOptions::NO_SSLV2),
+        TlsVersion::SSLv3   => versions.remove(ssl::SslOptions::NO_SSLV3),
+        TlsVersion::TLSv1_0 => versions.remove(ssl::SslOptions::NO_TLSV1),
+        TlsVersion::TLSv1_1 => versions.remove(ssl::SslOptions::NO_TLSV1_1),
+        TlsVersion::TLSv1_2 => versions.remove(ssl::SslOptions::NO_TLSV1_2),
+        s         => error!("unrecognized TLS version: {:?}", s)
       };
     }
 

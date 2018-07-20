@@ -344,12 +344,26 @@ impl Default for TlsProvider {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub enum TlsVersion {
+  SSLv2,
+  SSLv3,
+  #[serde(rename = "TLSv1")]
+  TLSv1_0,
+  #[serde(rename = "TLSv1.1")]
+  TLSv1_1,
+  #[serde(rename = "TLSv1.2")]
+  TLSv1_2,
+  #[serde(rename = "TLSv1.3")]
+  TLSv1_3,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpsProxyConfiguration {
     pub front:                     SocketAddr,
     pub public_address:            Option<IpAddr>,
     pub answer_404:                String,
     pub answer_503:                String,
-    pub versions:                  Vec<String>,
+    pub versions:                  Vec<TlsVersion>,
     pub cipher_list:               String,
     pub default_name:              Option<String>,
     pub default_app_id:            Option<String>,
@@ -385,7 +399,7 @@ impl Default for HttpsProxyConfiguration {
         ECDHE-RSA-DES-CBC3-SHA:EDH-RSA-DES-CBC3-SHA:\
         AES128-GCM-SHA256:AES256-GCM-SHA384:AES128-SHA256:\
         AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:!DSS"),
-      versions:            vec!(String::from("TLSv1.2")),
+      versions:            vec!(TlsVersion::TLSv1_2),
       default_name:        Some(String::from("lolcatho.st")),
       default_app_id:      None,
 

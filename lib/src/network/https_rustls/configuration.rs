@@ -18,7 +18,7 @@ use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{precise_time_s, precise_time_ns};
 use rand::random;
-use rustls::{ServerConfig, ServerSession, NoClientAuth};
+use rustls::{ServerConfig, ServerSession, NoClientAuth, ProtocolVersion};
 use nom::IResult;
 use mio_extras::timer::Timeout;
 
@@ -27,7 +27,8 @@ use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,
   Order,HttpsFront,HttpsProxyConfiguration,OrderMessage, OrderMessageAnswer,
-  OrderMessageStatus,AddCertificate,RemoveCertificate,ReplaceCertificate, LoadBalancingParams};
+  OrderMessageStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
+LoadBalancingParams, TlsVersion};
 use sozu_command::certificate::split_certificate_chain;
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
@@ -97,6 +98,17 @@ impl ServerConfiguration {
     };
 
     let mut server_config = ServerConfig::new(NoClientAuth::new());
+    server_config.versions = config.versions.iter().map(|version| {
+      match version {
+        TlsVersion::SSLv2   => ProtocolVersion::SSLv2,
+        TlsVersion::SSLv3   => ProtocolVersion::SSLv3,
+        TlsVersion::TLSv1_0 => ProtocolVersion::TLSv1_0,
+        TlsVersion::TLSv1_1 => ProtocolVersion::TLSv1_1,
+        TlsVersion::TLSv1_2 => ProtocolVersion::TLSv1_2,
+        TlsVersion::TLSv1_3 => ProtocolVersion::TLSv1_3,
+      }
+    }).collect();
+
     let resolver = Arc::new(CertificateResolverWrapper::new());
     server_config.cert_resolver = resolver.clone();
 

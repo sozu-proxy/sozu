@@ -11,9 +11,9 @@ use std::io::{self,Error,ErrorKind,Read};
 use certificate::{calculate_fingerprint,split_certificate_chain};
 use toml;
 
-use messages::Application;
 use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,TcpFront,Backend,
-  HttpProxyConfiguration,HttpsProxyConfiguration,AddCertificate,TlsProvider,LoadBalancingParams};
+  HttpProxyConfiguration,HttpsProxyConfiguration,AddCertificate,TlsProvider,LoadBalancingParams,
+  Application, TlsVersion};
 
 use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
 
@@ -31,7 +31,7 @@ pub struct ProxyConfig {
   pub default_certificate:       Option<String>,
   pub default_certificate_chain: Option<String>,
   pub default_key:               Option<String>,
-  pub tls_versions:              Option<Vec<String>>,
+  pub tls_versions:              Option<Vec<TlsVersion>>,
   pub tls_provider:              Option<TlsProvider>,
   pub expect_proxy:              Option<bool>,
   #[serde(default = "default_sticky_name")]
@@ -116,17 +116,8 @@ impl ProxyConfig {
     };
 
     let versions = match self.tls_versions {
-      None    => vec!(String::from("TLSv1.2")),
-      Some(ref v) => {
-        for version in v.iter() {
-          match version.as_str() {
-            "SSLv2" | "SSLv3" | "TLSv1" | "TLSv1.1" | "TLSv1.2" => (),
-            s => error!("unrecognized TLS version: {}", s)
-          };
-        }
-
-        v.clone()
-      }
+      None    => vec!(TlsVersion::TLSv1_2),
+      Some(ref v) => v.clone(),
     };
 
     let expect_proxy = self.expect_proxy.unwrap_or(false);
