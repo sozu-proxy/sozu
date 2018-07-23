@@ -44,7 +44,8 @@ fn main() {
     ip_address:  String::from("127.0.0.1"),
     port:        1026,
     load_balancing_parameters: Some(LoadBalancingParams::default()),
-    sticky_id: None,
+    sticky_id:   None,
+    backup:      None,
   };
 
   command.write_message(&messages::OrderMessage {

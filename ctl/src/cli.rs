@@ -139,6 +139,8 @@ pub enum BackendCmd {
     port: u16,
     #[structopt(short = "s", long = "sticky-id", help = "value for the sticky session cookie")]
     sticky_id: Option<String>,
+    #[structopt(short = "b", long = "backup", help = "set backend as a backup backend")]
+    backup: Option<bool>,
   },
 }
 

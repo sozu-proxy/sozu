@@ -490,6 +490,7 @@ mod tests {
                   port: 8080,
                   load_balancing_parameters: Some(LoadBalancingParams{ weight: 0 }),
                   sticky_id: Some(String::from("xxx-0")),
+                  backup: Some(false),
       })),
       proxy_id: None
     });

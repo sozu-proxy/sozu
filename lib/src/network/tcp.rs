@@ -869,7 +869,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       Order::AddBackend(backend) => {
         let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let addr = addr_string.parse().unwrap();
-        let new_backend = Backend::new(&backend.backend_id, addr, backend.sticky_id.clone(), backend.load_balancing_parameters);
+        let new_backend = Backend::new(&backend.backend_id, addr, backend.sticky_id.clone(), backend.load_balancing_parameters, backend.backup);
         if let Some(token) = self.add_backend(&backend.app_id, new_backend, event_loop) {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
         } else {
@@ -1199,6 +1199,7 @@ mod tests {
         port: 5678,
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         sticky_id: None,
+        backup: None,
       };
 
       command.write_message(&OrderMessage { id: String::from("ID_YOLO1"), order: Order::AddTcpFront(front) });
@@ -1217,6 +1218,7 @@ mod tests {
         port: 5678,
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         sticky_id: None,
+        backup: None,
       };
       command.write_message(&OrderMessage { id: String::from("ID_YOLO3"), order: Order::AddTcpFront(front) });
       command.write_message(&OrderMessage { id: String::from("ID_YOLO4"), order: Order::AddBackend(backend) });

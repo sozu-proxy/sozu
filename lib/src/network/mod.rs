@@ -224,10 +224,11 @@ pub struct Backend {
   pub active_connections:        usize,
   pub failures:                  usize,
   pub load_balancing_parameters: Option<LoadBalancingParams>,
+  pub backup:                    bool,
 }
 
 impl Backend {
-  pub fn new(backend_id: &str, addr: SocketAddr, sticky_id: Option<String>, load_balancing_parameters: Option<LoadBalancingParams>) -> Backend {
+  pub fn new(backend_id: &str, addr: SocketAddr, sticky_id: Option<String>, load_balancing_parameters: Option<LoadBalancingParams>, backup: Option<bool>) -> Backend {
     let desired_policy = retry::ExponentialBackoffPolicy::new(6);
     Backend {
       sticky_id:          sticky_id,
@@ -238,6 +239,7 @@ impl Backend {
       active_connections: 0,
       failures:           0,
       load_balancing_parameters,
+      backup: backup.unwrap_or(false),
     }
   }
 

@@ -858,7 +858,7 @@ pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>,
 }
 
 
-pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, backend_id: &str, ip: &str, port: u16, sticky_id: Option<String>) {
+pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, backend_id: &str, ip: &str, port: u16, sticky_id: Option<String>, backup: Option<bool>) {
   order_command(channel, timeout, Order::AddBackend(Backend {
       app_id: String::from(app_id),
       backend_id: String::from(backend_id),
@@ -866,6 +866,7 @@ pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout:
       port: port,
       load_balancing_parameters: Some(LoadBalancingParams::default()),
       sticky_id: sticky_id,
+      backup:    backup
     }));
 }
 

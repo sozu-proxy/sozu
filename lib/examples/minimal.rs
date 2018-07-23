@@ -46,6 +46,7 @@ fn main() {
     port:                      8000,
     load_balancing_parameters: Some(LoadBalancingParams::default()),
     sticky_id:                 None,
+    backup:                    None,
   };
 
   command.write_message(&messages::OrderMessage {

@@ -82,6 +82,7 @@ mod test {
       active_connections: connections.unwrap_or(0),
       failures: 0,
       load_balancing_parameters: None,
+      backup: false,
     }
   }
 

@@ -12,7 +12,8 @@
       "sticky_id": "xxx-0",
       "load_balancing_parameters": {
         "weight": 0
-      }
+      },
+      "backup": false
     }
   }
 }

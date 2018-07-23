@@ -297,6 +297,7 @@ pub struct BackendConfig {
   pub address: SocketAddr,
   pub weight: Option<u8>,
   pub sticky_id: Option<String>,
+  pub backup: Option<bool>,
 }
 
 impl FileAppConfig {
@@ -446,6 +447,7 @@ impl HttpAppConfig {
           port:       port,
           load_balancing_parameters,
           sticky_id:  backend.sticky_id.clone(),
+          backup:     backend.backup.clone(),
         }));
 
         backend_count += 1;
@@ -500,6 +502,7 @@ impl TcpAppConfig {
         port:       port,
         load_balancing_parameters,
         sticky_id:  backend.sticky_id.clone(),
+        backup:     backend.backup.clone(),
       }));
 
       backend_count += 1;

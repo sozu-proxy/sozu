@@ -280,6 +280,8 @@ pub struct Backend {
     #[serde(default)]
     #[serde(skip_serializing_if="Option::is_none")]
     pub load_balancing_parameters: Option<LoadBalancingParams>,
+    #[serde(default)]
+    pub backup:      Option<bool>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -546,6 +548,7 @@ mod tests {
       port: 8080,
       sticky_id: None,
       load_balancing_parameters: Some(LoadBalancingParams{ weight: 0 }),
+      backup: None,
     }));
   }
 
