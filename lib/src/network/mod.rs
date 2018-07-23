@@ -207,14 +207,14 @@ pub enum SocketType {
   FrontClient
 }
 
-#[derive(Debug,PartialEq,Eq)]
+#[derive(Debug,PartialEq,Eq,Clone)]
 pub enum BackendStatus {
   Normal,
   Closing,
   Closed,
 }
 
-#[derive(Debug,PartialEq,Eq)]
+#[derive(Debug,PartialEq,Eq,Clone)]
 pub struct Backend {
   pub sticky_id:                 Option<String>,
   pub backend_id:                String,

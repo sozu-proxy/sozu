@@ -238,9 +238,8 @@ impl ServerConfiguration {
     (*self.resolver).add_certificate(add);
   }
 
-  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr, sticky_id: Option<String>,
-    load_balancing_parameters: Option<LoadBalancingParams>,  event_loop: &mut Poll) {
-    self.backends.add_backend(app_id, backend_id, backend_address, sticky_id, load_balancing_parameters);
+  pub fn add_backend(&mut self, app_id: &str, backend: Backend,  event_loop: &mut Poll) {
+    self.backends.add_backend(app_id, backend);
   }
 
   pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
@@ -607,7 +606,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
-          self.add_backend(&backend.app_id, &backend.backend_id, &addr, backend.sticky_id.clone(), backend.load_balancing_parameters, event_loop);
+          let new_backend = Backend::new(&backend.backend_id, addr, backend.sticky_id.clone(), backend.load_balancing_parameters);
+          self.add_backend(&backend.app_id, new_backend, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }

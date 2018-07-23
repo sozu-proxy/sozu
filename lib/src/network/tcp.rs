@@ -745,22 +745,21 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_backend(&mut self, app_id: &str, backend_id: &str, backend_address: &SocketAddr,
-    sticky_id: Option<String>, load_balancing_parameters: Option<LoadBalancingParams>, event_loop: &mut Poll) -> Option<ListenToken> {
+  pub fn add_backend(&mut self, app_id: &str, backend: Backend, event_loop: &mut Poll) -> Option<ListenToken> {
     use std::borrow::BorrowMut;
-    self.backends.add_backend(app_id, backend_id, backend_address, sticky_id, load_balancing_parameters);
+    self.backends.add_backend(app_id, backend.clone());
 
     let opt_tok = self.fronts.get(app_id).clone();
     if let Some(tok) = opt_tok {
       self.listeners.get_mut(&tok).map(|listener| {
-        listener.back_addresses.push(*backend_address);
+        listener.back_addresses.push(backend.address);
       });
       //let application_listener = &mut self.listeners[&tok];
 
       //application_listener.back_addresses.push(*backend_address);
       Some(ListenToken(tok.0))
     } else {
-      error!("No front for backend {} in app {}", backend_id, app_id);
+      error!("No front for backend {} in app {}", backend.backend_id, app_id);
       None
     }
   }
@@ -869,8 +868,9 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       },
       Order::AddBackend(backend) => {
         let addr_string = backend.ip_address + ":" + &backend.port.to_string();
-        let addr = &addr_string.parse().unwrap();
-        if let Some(token) = self.add_backend(&backend.app_id, &backend.backend_id, addr, backend.sticky_id.clone(), backend.load_balancing_parameters, event_loop) {
+        let addr = addr_string.parse().unwrap();
+        let new_backend = Backend::new(&backend.backend_id, addr, backend.sticky_id.clone(), backend.load_balancing_parameters);
+        if let Some(token) = self.add_backend(&backend.app_id, new_backend, event_loop) {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
         } else {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot add tcp backend")), data: None}
