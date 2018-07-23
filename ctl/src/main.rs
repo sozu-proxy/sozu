@@ -62,7 +62,7 @@ fn main() {
     },
     SubCmd::Backend{ cmd } => {
       match cmd {
-        BackendCmd::Add{ id, backend_id, ip, port, sticky_id } => add_backend(channel, timeout, &id, &backend_id, &ip, port, sticky_id),
+        BackendCmd::Add{ id, backend_id, ip, port, sticky_id, backup } => add_backend(channel, timeout, &id, &backend_id, &ip, port, sticky_id, backup),
         BackendCmd::Remove{ id, backend_id, ip, port } => remove_backend(channel, timeout, &id, &backend_id, &ip, port),
       }
     },

@@ -1012,7 +1012,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let parsed:Option<SocketAddr> = addr_string.parse().ok();
         if let Some(addr) = parsed {
-          let new_backend = Backend::new(&backend.backend_id, addr, backend.sticky_id.clone(), backend.load_balancing_parameters);
+          let new_backend = Backend::new(&backend.backend_id, addr, backend.sticky_id.clone(), backend.load_balancing_parameters, backend.backup);
           self.add_backend(&backend.app_id, new_backend, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
@@ -1282,7 +1282,7 @@ mod tests {
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
-    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1025, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None };
+    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1025, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1339,7 +1339,7 @@ mod tests {
 
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
-    let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1028, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None };
+    let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1028, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1419,7 +1419,7 @@ mod tests {
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddApplication(application) });
     let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddHttpFront(front) });
-    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1040, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None };
+    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1040, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&OrderMessage { id: String::from("ID_IJKL"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());

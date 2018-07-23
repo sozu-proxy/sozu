@@ -162,7 +162,7 @@ impl BackendList {
       let addr_string = backend.ip_address.to_string() + ":" + &backend.port.to_string();
       let parsed:Option<SocketAddr> = addr_string.parse().ok();
       if let Some(addr) = parsed {
-        let backend = Backend::new(&backend.backend_id, addr, backend.sticky_id.clone(), backend.load_balancing_parameters.clone());
+        let backend = Backend::new(&backend.backend_id, addr, backend.sticky_id.clone(), backend.load_balancing_parameters.clone(), backend.backup);
         list.add_backend(backend);
       }
     }
@@ -202,15 +202,19 @@ impl BackendList {
       })
   }
 
-  pub fn available_backends(&mut self) -> Vec<Rc<RefCell<Backend>>> {
+  pub fn available_backends(&mut self, backup: bool) -> Vec<Rc<RefCell<Backend>>> {
     self.backends.iter()
-      .filter(|backend| (*backend.borrow()).can_open())
+      .filter(|backend| (*backend.borrow()).backup == backup && (*backend.borrow()).can_open())
       .map(|backend| (*backend).clone())
       .collect()
   }
 
   pub fn next_available_backend(&mut self) -> Option<Rc<RefCell<Backend>>> {
-    let backends = self.available_backends();
+    let mut backends = self.available_backends(false);
+
+    if backends.len() == 0 {
+      backends = self.available_backends(true);
+    }
 
     if backends.len() == 0 {
       None
@@ -261,7 +265,7 @@ mod backends_test {
     let (sender, receiver) = channel();
     run_mock_tcp_server(backend_addr, receiver);
 
-    backend_map.add_backend(app_id, Backend::new(&format!("{}-1", app_id), backend_addr.parse().unwrap(), None, None));
+    backend_map.add_backend(app_id, Backend::new(&format!("{}-1", app_id), backend_addr.parse().unwrap(), None, None, None));
 
     assert!(backend_map.backend_from_app_id(app_id).is_ok());
     sender.send(());
@@ -271,7 +275,7 @@ mod backends_test {
   fn it_should_not_retrieve_a_backend_from_app_id_when_backend_has_not_been_recorded() {
     let mut backend_map = BackendMap::new();
     let app_not_recorded = "not";
-    backend_map.add_backend("foo", Backend::new("foo-1", "127.0.0.1:9001".parse().unwrap(), None, None));
+    backend_map.add_backend("foo", Backend::new("foo-1", "127.0.0.1:9001".parse().unwrap(), None, None, None));
 
     assert!(backend_map.backend_from_app_id(app_not_recorded).is_err());
   }
@@ -293,10 +297,10 @@ mod backends_test {
     let (sender, receiver) = channel();
     run_mock_tcp_server(backend_addr, receiver);
 
-    backend_map.add_backend(app_id, Backend::new(&format!("{}-1", app_id), "127.0.0.1:9001".parse().unwrap(), Some("server-1".to_string()), None));
-    backend_map.add_backend(app_id, Backend::new(&format!("{}-2", app_id), "127.0.0.1:9000".parse().unwrap(), Some("server-2".to_string()), None));
+    backend_map.add_backend(app_id, Backend::new(&format!("{}-1", app_id), "127.0.0.1:9001".parse().unwrap(), Some("server-1".to_string()), None, None));
+    backend_map.add_backend(app_id, Backend::new(&format!("{}-2", app_id), "127.0.0.1:9000".parse().unwrap(), Some("server-2".to_string()), None, None));
     // sticky backend
-    backend_map.add_backend(app_id, Backend::new(&format!("{}-3", app_id), backend_addr.parse().unwrap(), Some("server-3".to_string()), None));
+    backend_map.add_backend(app_id, Backend::new(&format!("{}-3", app_id), backend_addr.parse().unwrap(), Some("server-3".to_string()), None, None));
 
     assert!(backend_map.backend_from_sticky_session(app_id, sticky_session).is_ok());
     sender.send(());
@@ -324,7 +328,7 @@ mod backends_test {
   fn it_should_add_a_backend_when_he_doesnt_already_exist() {
     let backend_id = "myback";
     let mut backends_list = BackendList::new();
-    backends_list.add_backend(Backend::new(backend_id, "127.0.0.1:80".parse().unwrap(), None, None));
+    backends_list.add_backend(Backend::new(backend_id, "127.0.0.1:80".parse().unwrap(), None, None, None));
 
     assert_eq!(1, backends_list.backends.len());
   }
@@ -333,10 +337,10 @@ mod backends_test {
   fn it_should_not_add_a_backend_when_he_already_exist() {
     let backend_id = "myback";
     let mut backends_list = BackendList::new();
-    backends_list.add_backend(Backend::new(backend_id, "127.0.0.1:80".parse().unwrap(), None, None));
+    backends_list.add_backend(Backend::new(backend_id, "127.0.0.1:80".parse().unwrap(), None, None, None));
 
     //same backend id
-    backends_list.add_backend(Backend::new(backend_id, "127.0.0.1:80".parse().unwrap(), None, None));
+    backends_list.add_backend(Backend::new(backend_id, "127.0.0.1:80".parse().unwrap(), None, None, None));
 
     assert_eq!(1, backends_list.backends.len());
   }
