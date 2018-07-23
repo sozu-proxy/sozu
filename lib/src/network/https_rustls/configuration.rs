@@ -110,8 +110,6 @@ impl ServerConfiguration {
       }
     }).collect();
 
-    //let cipher:SupportedCipherSuite = rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256;
-
     let resolver = Arc::new(CertificateResolverWrapper::new());
     server_config.cert_resolver = resolver.clone();
 
