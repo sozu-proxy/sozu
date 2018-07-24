@@ -18,7 +18,7 @@ pub struct RoundRobinAlgorithm {
 impl LoadBalancingAlgorithm for RoundRobinAlgorithm {
 
   fn next_available_backend(&mut self , backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
-    let res = backends.get(self.next_backend as usize)
+    let res = backends.get(self.next_backend as usize % backends.len())
                       .map(|backend| (*backend).clone());
 
     self.next_backend = (self.next_backend + 1) % backends.len() as u32;
@@ -111,5 +111,23 @@ mod test {
 
     let backend = least_connection_algorithm.next_available_backend(&backends);
     assert!(backend.is_none());
+  }
+
+  #[test]
+  fn it_should_find_backend_with_roundrobin_when_some_backends_were_removed() {
+    let mut backends = vec![
+      Rc::new(RefCell::new(create_backend("toto".to_string(), None))),
+      Rc::new(RefCell::new(create_backend("voto".to_string(), None))),
+      Rc::new(RefCell::new(create_backend("yoto".to_string(), None)))
+    ];
+
+    let mut roundrobin = RoundRobinAlgorithm { next_backend: 1 };
+    let backend = roundrobin.next_available_backend(&backends);
+    assert_eq!(backend.as_ref(), backends.get(1));
+
+    backends.remove(1);
+
+    let backend2 = roundrobin.next_available_backend(&backends);
+    assert_eq!(backend2.as_ref(),  backends.get(0));
   }
 }
