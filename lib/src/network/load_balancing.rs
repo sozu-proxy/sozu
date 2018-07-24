@@ -72,42 +72,26 @@ mod test {
   use network::BackendStatus;
   use network::retry::{RetryPolicyWrapper, ExponentialBackoffPolicy};
 
-  #[test]
-  fn it_should_find_the_backend_with_least_connections() {
-    let least_active_connections = 1;
-
-    let backend_with_least_connection = Rc::new(RefCell::new(Backend {
+  fn create_backend(id: String, connections: Option<usize>) -> Backend {
+    Backend {
       sticky_id: None,
-      backend_id: "yolo".to_string(),
+      backend_id: id,
       address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
       status: BackendStatus::Normal,
       retry_policy: RetryPolicyWrapper::ExponentialBackoff(ExponentialBackoffPolicy::new(1)),
-      active_connections: least_active_connections,
+      active_connections: connections.unwrap_or(0),
       failures: 0,
       load_balancing_parameters: None,
-    }));
+    }
+  }
+
+  #[test]
+  fn it_should_find_the_backend_with_least_connections() {
+    let backend_with_least_connection = Rc::new(RefCell::new(create_backend("yolo".to_string(), Some(1))));
 
     let backends = vec![
-      Rc::new(RefCell::new(Backend {
-        sticky_id: None,
-        backend_id: "nolo".to_string(),
-        address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-        status: BackendStatus::Normal,
-        retry_policy: RetryPolicyWrapper::ExponentialBackoff(ExponentialBackoffPolicy::new(1)),
-        active_connections: 10,
-        failures: 0,
-        load_balancing_parameters: None,
-      })),
-      Rc::new(RefCell::new(Backend {
-        sticky_id: None,
-        backend_id: "philo".to_string(),
-        address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-        status: BackendStatus::Normal,
-        retry_policy: RetryPolicyWrapper::ExponentialBackoff(ExponentialBackoffPolicy::new(1)),
-        active_connections: 20,
-        failures: 0,
-        load_balancing_parameters: None,
-      })),
+      Rc::new(RefCell::new(create_backend("nolo".to_string(), Some(10)))),
+      Rc::new(RefCell::new(create_backend("philo".to_string(), Some(20)))),
       backend_with_least_connection.clone(),
     ];
 
