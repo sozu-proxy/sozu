@@ -145,21 +145,18 @@ Furthermore, we can enable it, so that it is activated by default on future boot
 
 ## PROXY Protocol
 
-Sōzu use its own layer 3 and 4 information to get connected on remote servers. Because of this, we lose the initial L3/4 client connection information (like source and destination IP and port) which can be use by upstream proxy/server to configure a website, basic IP-level security, logging/metrics purposes...
+When a network stream goes through a proxy, the backend server will only see the IP address and port used by the proxy as client address. The real source IP address and port will only be seen by the proxy. Since this information is useful for logging, security, etc, the [PROXY protocol](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt) was developed to transmit it to backend servers. With this protocol, after connecting to the backend server, the proxy will first send a small header indicating the client IP address and port, and the proxy's receiving IP address and port, and then it will send the stream from the client.
 
-Sōzu support the *version 2* of the `PROXY protocol` to solve the problem of L3/4 connection parameters being lost when relaying L3/4 connections through proxies. Thanks to that, Sōzu will informs the other end about the L3/4 addresses of the incoming connection before any byte is exchange from the socket. Furthermore, Sōzu can forward to the upstream service this client connection information sent by downstream proxy servers and load balancers.
-
-The information L3/4 passed via the `PROXY protocol` is:
- - the client IP address
- - the proxy server IP address
- - both port numbers.
+Sōzu support the *version 2* of the `PROXY protocol` in three configurations:
+- "send" protocol: Sōzu, in TCP proxy mode, will send the header to the backend server
+- "expect" protocol: Sōzu receives the header from a proxy, and interprets it for its own logging and metrics, and uses it in HTTP forwarding headers
+- "relay" protocol: Sōzu, in TCP proxy mode, can reveice the header, and transmit it to a backend server
 
 More infos here: [proxy-protocol spec](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt)
 
+### Configuring Sōzu to *expect* a PROXY Protocol header
 
-### Configuring Sōzu to *expect* a PROXY Protocol
-
-Configures the client-facing connection to receive a PROXY protocol header before any byte is read from the socket.
+Configures the client-facing connection to receive a PROXY protocol header before any byte sent by the client is read from the socket.
 
 ```
                             send PROXY               expect PROXY
@@ -173,15 +170,26 @@ Configures the client-facing connection to receive a PROXY protocol header befor
 ```
 
 *Configuration:*
+
+For the HTTP and HTTPS proxies, it affects all the applications, since they listen on the same TCP socket:
+
+```toml
+[http]
+address = "0.0.0.0"
+port = 80
+expect_proxy = true
+```
+
+TCP applications will each have their own listen socket, so this is configurable per application:
+
 ```toml
 [applications.NameOfYourApp]
 expect_proxy = true
 ```
 
-### Configuring Sōzu to *send* a PROXY Protocol to an upstream backend
+### Configuring Sōzu to *send* a PROXY Protocol header to an upstream backend
 
 Send a PROXY protocol header over any connection established to the backends declared in the application.
-The PROXY protocol informs the upstream backend about the L3/4 addresses of the incoming connection.
 
 ```
                                 send PROXY
@@ -199,11 +207,11 @@ The PROXY protocol informs the upstream backend about the L3/4 addresses of the 
 send_proxy = true
 ```
 
-NOTE: Currently supported only for `tcp` applications.
+NOTE: Only for TCP applications (HTTP and HTTPS proxies will use the forwarding headers).
 
 ### Configuring Sōzu to *relay* a PROXY Protocol header to an upstream
 
-Expect the client-facing connection to receive a PROXY protocol header, check its validity and then forward it to an upstream backend. This enable to chain proxies / reverse-proxies without losing the client connection information.
+Sōzu will receive a PROXY protocol header from the client connection, check its validity and then forward it to an upstream backend. This allows chains of reverse-proxies without losing the client connection information.
 
 ```
                                  send PROXY           expect PROXY    send PROXY
@@ -217,6 +225,9 @@ Expect the client-facing connection to receive a PROXY protocol header, check it
 ```
 
 *Configuration:*
+
+This only concerns TCP applications (HTTP and HTTPS proxies can work directly in expect mode, and will use the forwarding headers).
+
 ```toml
 [applications.NameOfYourApp]
 send_proxy = true
