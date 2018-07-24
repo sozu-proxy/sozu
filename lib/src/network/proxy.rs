@@ -744,6 +744,11 @@ impl Server {
   }
 
   pub fn connect_to_backend(&mut self, token: ClientToken) {
+    if ! self.clients.contains(token) {
+      error!("invalid token in connect_to_backend");
+      return;
+    }
+
     let (protocol, res) = {
       let cl = self.clients[token].clone();
       let cl2: Rc<RefCell<ProxyClientCast>> = self.clients[token].clone();
