@@ -28,12 +28,12 @@ pub trait RetryPolicy: Debug + PartialEq + Eq {
     fn is_down(&self) -> bool;
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub enum RetryPolicyWrapper {
     ExponentialBackoff(ExponentialBackoffPolicy)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 pub struct ExponentialBackoffPolicy {
     max_tries: usize,
     current_tries: usize,
