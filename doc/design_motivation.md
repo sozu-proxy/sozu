@@ -48,7 +48,7 @@ existing connections.
 ### Never ending software
 
 Once you started sōzu, it should be able to serve traffic indefinitely. If issues
-happen that cause a failure, it should not bing down the whole proxy, and it should
+happen that cause a failure, it should not bring down the whole proxy, and it should
 be able to go back to handling traffic automatically.
 
 Side effect of this approach: a binary upgrade should not result in lost traffic.
@@ -59,19 +59,19 @@ This is the main driver behind the current multiprocess architecture.
 
 ### Security
 
-Since sōzu will likely see the traffic for a lot of client connections, and the private
+Since sōzu will likely see the traffic from a lot of client connections, and the private
 keys to their TLS certificates, it should be safe enough to protect its memory.
 
-To that end we chose Rust for its memory safety features.
+To that end, we chose Rust for its memory safety features.
 
 ### Predictability
 
 Sōzu should have a very predictable behaviour in its memory usage and its latency.
 Any irregularity should be observed and removed.
 
-It drove various decision:
+It drove various decisions:
 - Rust allowed us to avoid garbage collection pauses
-- memory and object pooling to avoid some allocations in the hot path
+- preallocations and pooling to avoid some allocations in the hot path
 - single threaded, shared nothing architecture to avoid synchronization between cores
 
 ### The configuration intelligence should be in tools, not inside sōzu
