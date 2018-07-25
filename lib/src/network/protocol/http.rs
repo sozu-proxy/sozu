@@ -981,9 +981,10 @@ impl<Front:SocketHandler> Http<Front> {
 
     match unwrap_msg!(self.state.as_ref()).response {
       Some(ResponseState::Response(_,_)) => {
-        error!("{}\tshould not go back in back_readable if the whole response was parsed", self.log_ctx);
-        self.readiness.back_interest.remove(Ready::readable());
-        (ProtocolResult::Continue, ClientResult::Continue)
+        metrics.service_stop();
+        self.log_request_error(metrics, "should not go back in back_readable if the whole response was parsed");
+        self.readiness.reset();
+        (ProtocolResult::Continue, ClientResult::CloseClient)
       },
       Some(ResponseState::ResponseWithBody(_,_,_)) => {
         self.readiness.front_interest.insert(Ready::writable());
@@ -993,9 +994,10 @@ impl<Front:SocketHandler> Http<Front> {
         (ProtocolResult::Continue, ClientResult::Continue)
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
-        error!("{}\tback read should have stopped on chunk ended", self.log_ctx);
-        self.readiness.back_interest.remove(Ready::readable());
-        (ProtocolResult::Continue, ClientResult::Continue)
+        metrics.service_stop();
+        self.log_request_error(metrics, "back read should have stopped on chunk ended");
+        self.readiness.reset();
+        (ProtocolResult::Continue, ClientResult::CloseClient)
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Error)) => {
         metrics.service_stop();
