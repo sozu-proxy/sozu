@@ -854,7 +854,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       },
       Err(ConnectionError::NoBackendAvailable) => Err(ConnectionError::NoBackendAvailable),
       Err(e) => {
-        panic!(format!("tcp connect_to_backend: unexpected error: {:?}", e));
+        panic!("tcp connect_to_backend: unexpected error: {:?}", e);
       }
     }
   }

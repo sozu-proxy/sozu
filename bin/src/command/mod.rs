@@ -214,7 +214,7 @@ impl CommandServer {
     loop {
       if current_poll_errors == max_poll_errors {
         error!("Something is going very wrong. Last {} poll() calls failed, crashing..", current_poll_errors);
-        panic!(format!("poll() calls failed {} times in a row", current_poll_errors));
+        panic!("poll() calls failed {} times in a row", current_poll_errors);
       }
 
       if let Err(error) = self.poll.poll(&mut events, poll_timeout) {
