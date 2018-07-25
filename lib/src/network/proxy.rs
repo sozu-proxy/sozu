@@ -395,6 +395,7 @@ impl Server {
 
       self.handle_remaining_readiness();
 
+      gauge!("slab.count", self.clients.len());
       METRICS.with(|metrics| {
         (*metrics.borrow_mut()).send_data();
       });
