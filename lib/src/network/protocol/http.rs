@@ -998,6 +998,7 @@ impl<Front:SocketHandler> Http<Front> {
         (ProtocolResult::Continue, ClientResult::Continue)
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Error)) => {
+        metrics.service_stop();
         self.log_request_error(metrics, "back read should have stopped on chunk error");
         self.readiness.reset();
         (ProtocolResult::Continue, ClientResult::CloseClient)
