@@ -17,6 +17,7 @@ use rand::{thread_rng, Rng};
 use prettytable::Table;
 use prettytable::row::Row;
 use super::create_channel;
+use rand::distributions::Alphanumeric;
 
 
 // Used to display the JSON response of the status command
@@ -27,12 +28,12 @@ struct WorkerStatus<'a> {
 }
 
 fn generate_id() -> String {
-  let s: String = thread_rng().gen_ascii_chars().take(6).collect();
+  let s: String = thread_rng().sample_iter(&Alphanumeric).take(6).collect();
   format!("ID-{}", s)
 }
 
 fn generate_tagged_id(tag: &str) -> String {
-  let s: String = thread_rng().gen_ascii_chars().take(6).collect();
+  let s: String = thread_rng().sample_iter(&Alphanumeric).take(6).collect();
   format!("{}-{}", tag, s)
 }
 
