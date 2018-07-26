@@ -6,6 +6,7 @@ use rand::{Rng,thread_rng};
 use mio_uds::UnixDatagram;
 use std::net::{TcpStream,UdpSocket,ToSocketAddrs};
 use sozu::logging::{Logger,LoggerBackend};
+use rand::distributions::Alphanumeric;
 
 pub fn setup(tag: String, level: &str, target: &str, access_target: Option<&str>) {
   let backend = target_to_backend(target);
@@ -53,7 +54,7 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
       LoggerBackend::Stdout(stdout())
     } else {
       let mut dir = env::temp_dir();
-      let s: String = thread_rng().gen_ascii_chars().take(12).collect();
+      let s: String = thread_rng().sample_iter(&Alphanumeric).take(12).collect();
       dir.push(s);
       let socket = UnixDatagram::bind(dir).unwrap();
       socket.connect(path).unwrap();
