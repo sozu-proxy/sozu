@@ -19,6 +19,7 @@ use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::messages::{Order,OrderMessage,Query};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
+use sozu_command::logging;
 
 use super::{CommandServer,FrontToken,Worker};
 use super::client::parse;
@@ -450,8 +451,8 @@ impl CommandServer {
 
     if let &Order::Logging(ref logging_filter) = &order {
       debug!("Changing master log level to {}", logging_filter);
-      ::sozu::logging::LOGGER.with(|l| {
-        let directives = ::sozu::logging::parse_logging_spec(&logging_filter);
+      logging::LOGGER.with(|l| {
+        let directives = logging::parse_logging_spec(&logging_filter);
         l.borrow_mut().set_directives(directives);
       });
       // also change / set the content of RUST_LOG so future workers / main thread

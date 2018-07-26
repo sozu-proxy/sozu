@@ -11,7 +11,7 @@ extern crate rand;
 extern crate nix;
 extern crate tempfile;
 #[macro_use] extern crate sozu_lib as sozu;
-extern crate sozu_command_lib as sozu_command;
+#[macro_use] extern crate sozu_command_lib as sozu_command;
 
 #[cfg(target_os = "linux")]
 extern crate num_cpus;

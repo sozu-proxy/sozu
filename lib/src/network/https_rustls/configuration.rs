@@ -31,6 +31,7 @@ use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,
   OrderMessageStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
 LoadBalancingParams, TlsVersion};
 use sozu_command::certificate::split_certificate_chain;
+use sozu_command::logging;
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::buffer_queue::BufferQueue;
@@ -653,8 +654,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Order::Logging(logging_filter) => {
         debug!("{} changing logging filter to {}", message.id, logging_filter);
-        ::logging::LOGGER.with(|l| {
-          let directives = ::logging::parse_logging_spec(&logging_filter);
+        logging::LOGGER.with(|l| {
+          let directives = logging::parse_logging_spec(&logging_filter);
           l.borrow_mut().set_directives(directives);
         });
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
