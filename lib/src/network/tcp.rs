@@ -25,6 +25,7 @@ use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
 use sozu_command::messages::{self,TcpFront,Order,OrderMessage,OrderMessageAnswer,OrderMessageStatus,LoadBalancingParams};
+use sozu_command::logging;
 
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
@@ -907,8 +908,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       },
       Order::Logging(logging_filter) => {
         info!("{} changing logging filter to {}", message.id, logging_filter);
-        ::logging::LOGGER.with(|l| {
-          let directives = ::logging::parse_logging_spec(&logging_filter);
+        logging::LOGGER.with(|l| {
+          let directives = logging::parse_logging_spec(&logging_filter);
           l.borrow_mut().set_directives(directives);
         });
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }

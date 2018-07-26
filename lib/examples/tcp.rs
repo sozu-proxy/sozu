@@ -1,6 +1,6 @@
 #![allow(unused_variables,unused_must_use)]
-#[macro_use] extern crate sozu_lib as sozu;
-extern crate sozu_command_lib as sozu_command;
+extern crate sozu_lib as sozu;
+#[macro_use] extern crate sozu_command_lib as sozu_command;
 extern crate time;
 
 use std::thread;
@@ -9,7 +9,7 @@ use sozu::network;
 use sozu_command::messages;
 use sozu_command::messages::LoadBalancingParams;
 use sozu_command::channel::Channel;
-use sozu::logging::{Logger,LoggerBackend};
+use sozu_command::logging::{Logger,LoggerBackend};
 
 fn main() {
   /*

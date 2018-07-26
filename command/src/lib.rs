@@ -1,4 +1,4 @@
-#[macro_use] extern crate log;
+extern crate log;
 #[macro_use] extern crate serde_derive;
 
 extern crate hex;
@@ -11,7 +11,10 @@ extern crate sha2;
 extern crate serde;
 extern crate serde_json;
 extern crate mio_uds;
+extern crate libc;
+extern crate time;
 
+#[macro_use] pub mod logging;
 pub mod certificate;
 pub mod config;
 pub mod data;
