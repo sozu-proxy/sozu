@@ -1876,7 +1876,7 @@ mod tests {
         value: "Aéo".as_bytes()
       };
 
-      assert_eq!(result, Error(error_position!(ErrorKind::Tag, input.as_bytes())));
+      assert_eq!(result, Error(error_position!(ErrorKind::Tag, "éo\r\n".as_bytes())));
   }
 
   #[test]
