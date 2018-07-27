@@ -648,7 +648,7 @@ pub struct ServerConfiguration {
   backends:        BackendMap,
   fronts:          TrieNode<Vec<TlsApp>>,
   domains:         Arc<Mutex<TrieNode<CertFingerprint>>>,
-  default_context: TlsData,
+  default_context: SslContext,
   contexts:        Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   answers:         DefaultAnswers,
@@ -662,30 +662,15 @@ impl ServerConfiguration {
       -> io::Result<(ServerConfiguration, HashSet<Token>)> {
 
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
-    let     domains  = TrieNode::root();
-    let mut fronts   = TrieNode::root();
+    let domains      = TrieNode::root();
+    let fronts       = TrieNode::root();
     let rc_ctx       = Arc::new(Mutex::new(contexts));
     let ref_ctx      = rc_ctx.clone();
     let rc_domains   = Arc::new(Mutex::new(domains));
     let ref_domains  = rc_domains.clone();
-    let default_name = config.default_name.as_ref().map(|name| name.clone()).unwrap_or(String::new());
 
-    let (fingerprint, tls_data, names, ssl_options):(CertFingerprint,TlsData, Vec<String>, SslOptions) =
-      Self::create_default_context(&config, ref_ctx, ref_domains, default_name).expect("could not create default context");
-    let cert = try!(X509::from_pem(&tls_data.certificate));
-
-    let common_name: Option<String> = get_cert_common_name(&cert);
-    debug!("got common name for default cert: {:?}", common_name);
-
-    let app = TlsApp {
-      app_id:           config.default_app_id.clone().unwrap_or(String::new()),
-      hostname:         config.default_name.clone().unwrap_or(String::new()),
-      path_begin:       String::new(),
-      cert_fingerprint: fingerprint,
-    };
-    if let Some(ref name) = config.default_name {
-      fronts.domain_insert(name.clone().into(), vec![app]);
-    }
+    let (default_context, ssl_options):(SslContext, SslOptions) =
+      Self::create_default_context(&config, ref_ctx, ref_domains).expect("could not create default context");
 
     let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
        error!("could not create listener {:?}: {:?}", fronts, e);
@@ -712,7 +697,7 @@ impl ServerConfiguration {
       backends:        BackendMap::new(),
       fronts:          fronts,
       domains:         rc_domains,
-      default_context: tls_data,
+      default_context: default_context,
       contexts:        rc_ctx,
       pool:            pool,
       answers:         default,
@@ -721,10 +706,10 @@ impl ServerConfiguration {
     }, listeners))
   }
 
-  pub fn create_default_context(config: &HttpsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>, ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>, default_name: String) -> Option<(CertFingerprint,TlsData,Vec<String>, SslOptions)> {
+  pub fn create_default_context(config: &HttpsProxyConfiguration, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
+    ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>) -> Option<(SslContext, SslOptions)> {
     let ctx = SslContext::builder(SslMethod::tls());
     if let Err(e) = ctx {
-      //return Err(io::Error::new(io::ErrorKind::Other, e.description()));
       return None
     }
 
@@ -763,88 +748,39 @@ impl ServerConfiguration {
       error!("could not setup curves for openssl");
     }
 
-    //FIXME: get the default cert and key from the configuration
-    let cert_read = config.default_certificate.as_ref().map(|vec| &vec[..]).unwrap_or(&include_bytes!("../../assets/certificate.pem")[..]);
-    let key_read = config.default_key.as_ref().map(|vec| &vec[..]).unwrap_or(&include_bytes!("../../assets/key.pem")[..]);
-    if let Some(path) = config.default_certificate_chain.as_ref() {
-      context.set_certificate_chain_file(path);
-    }
+    context.set_servername_callback(move |ssl: &mut SslRef, alert: &mut SslAlert| {
+      let contexts = unwrap_msg!(ref_ctx.lock());
+      let domains  = unwrap_msg!(ref_domains.lock());
 
-    if let (Ok(cert), Ok(key)) = (X509::from_pem(&cert_read[..]), PKey::private_key_from_pem(&key_read[..])) {
-      if let Ok(fingerprint) = cert.fingerprint(MessageDigest::sha256()).map(|v| CertFingerprint(v)) {
-        context.set_certificate(&cert);
-        context.set_private_key(&key);
-
-
-        let mut names: Vec<String> = cert.subject_alt_names().map(|names| {
-          names.iter().filter_map(|general_name|
-            general_name.dnsname().map(|name| String::from(name))
-          ).collect()
-        }).unwrap_or(vec!());
-
-        debug!("got subject alt names: {:?}", names);
-        {
-          let mut domains = unwrap_msg!(ref_domains.lock());
-          for name in &names {
-            domains.domain_insert(name.clone().into_bytes(), fingerprint.clone());
-          }
-        }
-
-        if let Some(common_name) = get_cert_common_name(&cert) {
-        debug!("got common name: {:?}", common_name);
-          names.push(common_name);
-        }
-
-        context.set_servername_callback(move |ssl: &mut SslRef, alert: &mut SslAlert| {
-          let contexts = unwrap_msg!(ref_ctx.lock());
-          let domains  = unwrap_msg!(ref_domains.lock());
-
-          trace!("ref: {:?}", ssl);
-          if let Some(servername) = ssl.servername(NameType::HOST_NAME).map(|s| s.to_string()) {
-            debug!("checking servername: {}", servername);
-            if &servername == &default_name {
+      trace!("ref: {:?}", ssl);
+      if let Some(servername) = ssl.servername(NameType::HOST_NAME).map(|s| s.to_string()) {
+        debug!("looking for fingerprint for {:?}", servername);
+        if let Some(kv) = domains.domain_lookup(servername.as_bytes()) {
+          debug!("looking for context for {:?} with fingerprint {:?}", servername, kv.1);
+          if let Some(ref tls_data) = contexts.get(&kv.1) {
+            debug!("found context for {:?}", servername);
+            if !tls_data.initialized {
+              //FIXME: couldn't we skip to the next cert?
+              error!("no application is using that certificate (looking up {})", servername);
+              *alert = SslAlert::UNRECOGNIZED_NAME;
+              return Err(SniError::ALERT_FATAL);
+            }
+            let context: &SslContext = &tls_data.context;
+            if let Ok(()) = ssl.set_ssl_context(context) {
+              debug!("servername is now {:?}", ssl.servername(NameType::HOST_NAME));
               return Ok(());
+            } else {
+              error!("no context found for {:?}", servername);
+              *alert = SslAlert::UNRECOGNIZED_NAME;
             }
-            debug!("looking for fingerprint for {:?}", servername);
-            if let Some(kv) = domains.domain_lookup(servername.as_bytes()) {
-              debug!("looking for context for {:?} with fingerprint {:?}", servername, kv.1);
-              if let Some(ref tls_data) = contexts.get(&kv.1) {
-                debug!("found context for {:?}", servername);
-                if !tls_data.initialized {
-                  //FIXME: couldn't we skip to the next cert?
-                  error!("no application is using that certificate (looking up {})", servername);
-                  return Ok(());
-                }
-                let context: &SslContext = &tls_data.context;
-                if let Ok(()) = ssl.set_ssl_context(context) {
-                  debug!("servername is now {:?}", ssl.servername(NameType::HOST_NAME));
-                  return Ok(());
-                } else {
-                  error!("no context found for {:?}", servername);
-                  *alert = SslAlert::UNRECOGNIZED_NAME;
-                }
-              }
-            }
-          } else {
-            error!("got no server name from ssl, answering with default one");
           }
-          //answer ok because we use the default certificate
-          Ok(())
-        });
-
-        let tls_data = TlsData {
-          context:     context.build(),
-          certificate: cert_read.to_vec(),
-          refcount:    1,
-          initialized: true,
-        };
-        Some((fingerprint, tls_data, names, ssl_options))
-      } else {
-        None
+        }
       }
-    } else {
-      None
-    }
+      *alert = SslAlert::UNRECOGNIZED_NAME;
+      return Err(SniError::ALERT_FATAL);
+    });
+
+    Some((context.build(), ssl_options))
   }
 
   pub fn give_back_listener(&mut self) -> Option<TcpListener> {
@@ -1156,7 +1092,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         }
       }).and_then(|(frontend_sock, _)| {
         frontend_sock.set_nodelay(true);
-        if let Ok(ssl) = Ssl::new(&self.default_context.context) {
+        if let Ok(ssl) = Ssl::new(&self.default_context) {
           poll.register(
             &frontend_sock,
             client_token,

@@ -133,17 +133,6 @@ tls_versions = ["TLSv1.2"]
 # ciphersuites names, specified in https://docs.rs/rustls/0.13.0/rustls/static.ALL_CIPHERSUITES.html
 # defaults to all supported ciphersuites
 #rustls_cipher_list = ["TLS13_CHACHA20_POLY1305_SHA256"]
-
-# application whose certificate will be used by default by  OpenSSL
-default_app_id = "MyApp"
-
-# default certificate used by OpenSSL
-#default_certificate = "../lib/assets/cert_test.pem"
-# default certificate chain used by OpenSSL
-#default_certificate_chain = "../lib/assets/cert__chain_test.pem"
-# default key used by OpenSSL
-#default_key = "../lib/assets/key_test.pem"
-
 # options specific to the TCP proxy
 #
 # there is nothing here for now, but to activate the TCP proxy,

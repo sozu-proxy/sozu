@@ -27,11 +27,6 @@ pub struct ProxyConfig {
   pub answer_503:                Option<String>,
   pub cipher_list:               Option<String>,
   pub rustls_cipher_list:        Option<Vec<String>>,
-  pub default_name:              Option<String>,
-  pub default_app_id:            Option<String>,
-  pub default_certificate:       Option<String>,
-  pub default_certificate_chain: Option<String>,
-  pub default_key:               Option<String>,
   pub tls_versions:              Option<Vec<TlsVersion>>,
   pub tls_provider:              Option<TlsProvider>,
   pub expect_proxy:              Option<bool>,
@@ -175,20 +170,6 @@ impl ProxyConfig {
       }
       if let Some(cipher_list) = self.cipher_list.as_ref() {
         configuration.cipher_list = cipher_list.clone();
-      }
-      let mut default_cert: Vec<u8> = vec!();
-      if self.default_certificate.as_ref().and_then(|path| File::open(path).ok())
-        .and_then(|mut file| file.read_to_end(&mut default_cert).ok()).is_some() {
-        configuration.default_certificate = Some(default_cert);
-      }
-
-      configuration.default_app_id            = self.default_app_id.clone();
-      configuration.default_certificate_chain = self.default_certificate_chain.clone();
-
-      let mut default_key: Vec<u8> = vec!();
-      if self.default_key.as_ref().and_then(|path| File::open(path).ok())
-        .and_then(|mut file| file.read_to_end(&mut default_key).ok()).is_some() {
-        configuration.default_key = Some(default_key);
       }
 
       configuration.tls_provider = tls_provider;
@@ -776,11 +757,6 @@ mod tests {
       tls_versions: None,
       cipher_list: None,
       rustls_cipher_list: None,
-      default_app_id: None,
-      default_certificate: None,
-      default_certificate_chain: None,
-      default_key: None,
-      default_name: None,
       tls_provider: None,
       expect_proxy: None,
       sticky_name: "SOZUBALANCEID".to_string(),
@@ -795,11 +771,6 @@ mod tests {
       tls_versions: None,
       cipher_list: None,
       rustls_cipher_list: None,
-      default_app_id: None,
-      default_certificate: None,
-      default_certificate_chain: None,
-      default_key: None,
-      default_name: None,
       tls_provider: None,
       expect_proxy: None,
       sticky_name: "SOZUBALANCEID".to_string(),

@@ -368,11 +368,6 @@ pub struct HttpsProxyConfiguration {
     pub versions:                  Vec<TlsVersion>,
     pub cipher_list:               String,
     pub rustls_cipher_list:        Vec<String>,
-    pub default_name:              Option<String>,
-    pub default_app_id:            Option<String>,
-    pub default_certificate:       Option<Vec<u8>>,
-    pub default_key:               Option<Vec<u8>>,
-    pub default_certificate_chain: Option<String>,
     #[serde(default)]
     pub tls_provider:              TlsProvider,
     #[serde(default)]
@@ -404,12 +399,6 @@ impl Default for HttpsProxyConfiguration {
         AES256-SHA256:AES128-SHA:AES256-SHA:DES-CBC3-SHA:!DSS"),
       rustls_cipher_list:  vec!(),
       versions:            vec!(TlsVersion::TLSv1_2),
-      default_name:        Some(String::from("lolcatho.st")),
-      default_app_id:      None,
-
-      default_certificate: Some(Vec::from(&include_bytes!("../assets/certificate.pem")[..])),
-      default_key:         Some(Vec::from(&include_bytes!("../assets/key.pem")[..])),
-      default_certificate_chain: None,
       tls_provider:        TlsProvider::Rustls,
       expect_proxy:        false,
       sticky_name:     String::from("SOZUBALANCEID"),
