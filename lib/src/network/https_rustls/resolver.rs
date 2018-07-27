@@ -155,20 +155,22 @@ impl ResolvesServerCert for CertificateResolverWrapper {
         server_name: Option<webpki::DNSNameRef>,
         sigschemes: &[SignatureScheme]
     ) -> Option<CertifiedKey> {
+    if server_name.is_none() {
+      error!("cannot look up certificate: no SNI from session");
+      return None;
+    }
+    let name: &str = server_name.unwrap().into();
 
-    trace!("trying to resolve name: {:?} for signature scheme: {:?}", server_name, sigschemes);
+    trace!("trying to resolve name: {:?} for signature scheme: {:?}", name, sigschemes);
     if let Ok(ref mut resolver) = self.0.try_lock() {
-      if let Some(name) = server_name {
-        //resolver.domains.print();
-        let s: &str = name.into();
-        if let Some(kv) = resolver.domains.domain_lookup(s.as_bytes()) {
-           trace!("looking for certificate for {:?} with fingerprint {:?}", s, kv.1);
-           return resolver.certificates.get(&kv.1).as_ref().map(|data| data.cert.clone());
-        }
+      //resolver.domains.print();
+      if let Some(kv) = resolver.domains.domain_lookup(name.as_bytes()) {
+         trace!("looking for certificate for {:?} with fingerprint {:?}", name, kv.1);
+         return resolver.certificates.get(&kv.1).as_ref().map(|data| data.cert.clone());
       }
     }
 
-
+    error!("could not look up a certificate for server name '{}'", name);
     None
   }
 }
