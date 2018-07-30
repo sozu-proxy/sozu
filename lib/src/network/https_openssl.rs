@@ -1555,13 +1555,6 @@ mod tests {
 
     let context    = SslContext::builder(SslMethod::tls()).expect("could not create a SslContextBuilder");
 
-    let tls_data = TlsData {
-      context:     context.build(),
-      certificate: vec!(),
-      refcount:    0,
-      initialized: false,
-    };
-
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1032").expect("test address 127.0.0.1:1032 should be parsed");
     let listener = net::TcpListener::bind(&front).expect("test address 127.0.0.1:1032 should be available");
     let server_config = ServerConfiguration {
@@ -1571,7 +1564,7 @@ mod tests {
       backends: BackendMap::new(),
       fronts:    fronts,
       domains:   rc_domains,
-      default_context: tls_data,
+      default_context: context.build(),
       contexts: rc_ctx,
       pool:      Rc::new(RefCell::new(Pool::with_capacity(1, 0, || BufferQueue::with_capacity(16384)))),
       answers:   DefaultAnswers {
