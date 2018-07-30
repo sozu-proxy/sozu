@@ -230,22 +230,22 @@ macro_rules! decr (
 
 #[macro_export]
 macro_rules! gauge (
-  ($key:expr, $value: expr) => {
+  ($key:expr, $value: expr) => ({
     let v = $value;
     $crate::network::metrics::METRICS.with(|metrics| {
       (*metrics.borrow_mut()).set_gauge($key, v);
     });
-  }
+  })
 );
 
 #[macro_export]
 macro_rules! gauge_add (
-  ($key:expr, $value: expr) => {
+  ($key:expr, $value: expr) => ({
     let v = $value;
     $crate::network::metrics::METRICS.with(|metrics| {
       (*metrics.borrow_mut()).gauge_add($key, v);
     });
-  }
+  })
 );
 
 #[macro_export]
