@@ -450,10 +450,10 @@ impl ProxyClient for TlsClient {
     }
 
     match self.protocol {
-      State::Expect(_) => gauge_add!("protocol.proxy.expect", -1),
-      State::Handshake(_) => gauge_add!("protocol.tls.handshake", -1),
-      State::Http(_) => gauge_add!("protocol.https", -1),
-      State::WebSocket(_) => gauge_add!("protocol.wss", -1),
+      Some(State::Expect(_,_)) => gauge_add!("protocol.proxy.expect", -1),
+      Some(State::Handshake(_)) => gauge_add!("protocol.tls.handshake", -1),
+      Some(State::Http(_)) => gauge_add!("protocol.https", -1),
+      Some(State::WebSocket(_)) => gauge_add!("protocol.wss", -1),
       None => {}
     }
 
