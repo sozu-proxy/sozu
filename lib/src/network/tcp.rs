@@ -100,19 +100,25 @@ impl Client {
       let protocol = match proxy_protocol {
       Some(ProxyProtocolConfig::RelayHeader) => {
         backend_buffer = Some(back_buf);
+        gauge_add!("protocol.proxy.relay", 1);
         Some(State::RelayProxyProtocol(RelayProxyProtocol::new(s, frontend_token, None, front_buf)))
       },
       Some(ProxyProtocolConfig::ExpectHeader) => {
         frontend_buffer = Some(front_buf);
         backend_buffer = Some(back_buf);
+        gauge_add!("protocol.proxy.expect", 1);
         Some(State::ExpectProxyProtocol(ExpectProxyProtocol::new(s, frontend_token)))
       },
       Some(ProxyProtocolConfig::SendHeader) => {
         frontend_buffer = Some(front_buf);
         backend_buffer = Some(back_buf);
+        gauge_add!("protocol.proxy.send", 1);
         Some(State::SendProxyProtocol(SendProxyProtocol::new(s, frontend_token, None)))
       },
-      None => Some(State::Pipe(Pipe::new(s, frontend_token, None, front_buf, back_buf, addr)))
+      None => {
+        gauge_add!("protocol.tcp", 1);
+        Some(State::Pipe(Pipe::new(s, frontend_token, None, front_buf, back_buf, addr)))
+      }
     };
 
     Client {
@@ -286,6 +292,8 @@ impl Client {
         self.protocol = Some(
           State::Pipe(pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap()))
         );
+        gauge_add!("protocol.proxy.send", -1);
+        gauge_add!("protocol.tcp", 1);
         UpgradeResult::Continue
       } else {
         error!("Missing the frontend or backend buffer queue, we can't switch to a pipe");
@@ -296,6 +304,8 @@ impl Client {
         self.protocol = Some(
           State::Pipe(pp.into_pipe(self.back_buf.take().unwrap()))
         );
+        gauge_add!("protocol.proxy.relay", -1);
+        gauge_add!("protocol.tcp", 1);
         UpgradeResult::Continue
       } else {
         error!("Missing the backend buffer queue, we can't switch to a pipe");
@@ -306,6 +316,8 @@ impl Client {
         self.protocol = Some(
           State::Pipe(pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap(), None, None))
         );
+        gauge_add!("protocol.proxy.expect", -1);
+        gauge_add!("protocol.tcp", 1);
         UpgradeResult::ConnectBackend
       } else {
         error!("Missing the backend buffer queue, we can't switch to a pipe");
@@ -423,6 +435,14 @@ impl ProxyClient for Client {
     }
 
     self.set_back_connected(BackendConnectionStatus::NotConnected);
+
+    match self.protocol {
+      Some(State::Pipe(_)) => gauge_add!("protocol.tcp", -1),
+      Some(State::SendProxyProtocol(_)) => gauge_add!("protocol.proxy.send", -1),
+      Some(State::RelayProxyProtocol(_)) => gauge_add!("protocol.proxy.relay", -1),
+      Some(State::ExpectProxyProtocol(_)) => gauge_add!("protocol.proxy.expect", -1),
+      None => {},
+    }
 
     result.tokens.push(self.frontend_token);
 

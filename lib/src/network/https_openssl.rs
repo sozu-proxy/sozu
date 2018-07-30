@@ -94,8 +94,10 @@ impl TlsClient {
     expect_proxy: bool, sticky_name: String, timeout: Timeout) -> TlsClient {
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
+      gauge_add!("protocol.proxy.expect", 1);
       Some(State::Expect(ExpectProxyProtocol::new(sock, token), ssl))
     } else {
+      gauge_add!("protocol.tls.handshake", 1);
       Some(State::Handshake(TlsHandshake::new(ssl, sock)))
     };
 
@@ -151,6 +153,8 @@ impl TlsClient {
           tls.readiness.front_readiness = readiness.front_readiness;
           tls.readiness.back_readiness  = readiness.back_readiness;
 
+          gauge_add!("protocol.proxy.expect", -1);
+          gauge_add!("protocol.tls.handshake", 1);
           self.protocol = Some(State::Handshake(tls));
           return true;
         }
@@ -187,6 +191,8 @@ impl TlsClient {
         //self.protocol = Some(State::Handshake(handshake));
         return false;
       }
+      gauge_add!("protocol.tls.handshake", -1);
+      gauge_add!("protocol.https", 1);
 
       self.ssl = handshake.ssl;
       self.protocol = http;
@@ -220,6 +226,9 @@ impl TlsClient {
           return false;
         }
       };
+
+      gauge_add!("protocol.https", -1);
+      gauge_add!("protocol.wss", 1);
 
       let mut pipe = Pipe::new(http.frontend, front_token, Some(unwrap_msg!(http.backend)),
         front_buf, back_buf, http.public_address);
@@ -437,6 +446,14 @@ impl ProxyClient for TlsClient {
       if unwrap_msg!(http.state.as_ref()).request != Some(RequestState::Initial) {
         gauge_add!("http.active_requests", -1);
       }
+    }
+
+    match self.protocol {
+      State::Expect(_) => gauge_add!("protocol.proxy.expect", -1),
+      State::Handshake(_) => gauge_add!("protocol.tls.handshake", -1),
+      State::Http(_) => gauge_add!("protocol.https", -1),
+      State::WebSocket(_) => gauge_add!("protocol.wss", -1),
+      None => {}
     }
 
     result.tokens.push(self.frontend_token);

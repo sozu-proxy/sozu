@@ -76,8 +76,10 @@ impl Client {
     public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout) -> Option<Client> {
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
+      gauge_add!("protocol.proxy.expect", 1);
       Some(State::Expect(ExpectProxyProtocol::new(sock, token)))
     } else {
+      gauge_add!("protocol.http", 1);
       Http::new(sock, token, pool.clone(), public_address,None, sticky_name.clone(), Protocol::HTTP).map(|http| State::Http(http))
     };
 
@@ -139,6 +141,8 @@ impl Client {
         }
       };
 
+      gauge_add!("protocol.http", -1);
+      gauge_add!("protocol.ws", 1);
       let mut pipe = Pipe::new(http.frontend, front_token, Some(unwrap_msg!(http.backend)),
         front_buf, back_buf, http.public_address);
 
@@ -169,6 +173,8 @@ impl Client {
           return false;
         }
 
+        gauge_add!("protocol.proxy.expect", -1);
+        gauge_add!("protocol.http", 1);
         self.protocol = http;
         return true;
       }
@@ -404,6 +410,13 @@ impl ProxyClient for Client {
       if unwrap_msg!(http.state.as_ref()).request != Some(RequestState::Initial) {
         gauge_add!("http.active_requests", -1);
       }
+    }
+
+    match self.protocol {
+      Some(State::Expect(_)) => gauge_add!("protocol.proxy.expect", -1),
+      Some(State::Http(_)) => gauge_add!("protocol.http", -1),
+      Some(State::WebSocket(_)) => gauge_add!("protocol.ws", -1),
+      None => {},
     }
 
     result.tokens.push(self.frontend_token);

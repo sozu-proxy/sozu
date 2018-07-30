@@ -73,8 +73,10 @@ impl TlsClient {
     public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout) -> TlsClient {
     let state = if expect_proxy {
       trace!("starting in expect proxy state");
+      gauge_add!("protocol.proxy.expect", 1);
       Some(State::Expect(ExpectProxyProtocol::new(sock, token), ssl))
     } else {
+      gauge_add!("protocol.tls.handshake", 1);
       Some(State::Handshake(TlsHandshake::new(ssl, sock)))
     };
 
@@ -130,6 +132,8 @@ impl TlsClient {
           tls.readiness.back_readiness  = readiness.back_readiness;
           tls.readiness.front_readiness.insert(Ready::readable());
 
+          gauge_add!("protocol.proxy.expect", -1);
+          gauge_add!("protocol.tls.handshake", 1);
           self.protocol = Some(State::Handshake(tls));
           return true;
         }
@@ -175,6 +179,9 @@ impl TlsClient {
           }
         }
 
+
+        gauge_add!("protocol.tls.handshake", -1);
+        gauge_add!("protocol.https", 1);
         http.front_buf = front_buf;
         http.readiness = readiness;
         http.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
@@ -228,6 +235,8 @@ impl TlsClient {
       pipe.readiness.back_readiness  = http.readiness.back_readiness;
       pipe.set_back_token(back_token);
 
+      gauge_add!("protocol.https", -1);
+      gauge_add!("protocol.wss", 1);
       self.protocol = Some(State::WebSocket(pipe));
       true
     } else {
@@ -450,6 +459,14 @@ impl ProxyClient for TlsClient {
       if unwrap_msg!(http.state.as_ref()).request != Some(RequestState::Initial) {
         gauge_add!("http.active_requests", -1);
       }
+    }
+
+    match self.protocol {
+      Some(State::Expect(_,_)) => gauge_add!("protocol.proxy.expect", -1),
+      Some(State::Handshake(_)) => gauge_add!("protocol.tls.handshake", -1),
+      Some(State::Http(_)) => gauge_add!("protocol.https", -1),
+      Some(State::WebSocket(_)) => gauge_add!("protocol.wss", -1),
+      None => {},
     }
 
     result.tokens.push(self.frontend_token);
