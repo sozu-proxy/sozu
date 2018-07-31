@@ -41,7 +41,7 @@ protocol = "http"
 #https_redirect = false
 frontends = [
   { address = "0.0.0.0", port = 80, hostname = "lolcatho.st" },
-  { address = "0.0.0.0", port = 443, hostname = "lolcatho.st", certificate = "./certificate.pem", key = "./key.pem" }
+  { address = "0.0.0.0", port = 443, hostname = "lolcatho.st", certificate = "./assets/certificate.pem", key = "./assets/key.pem" }
 ]
 backends = [
   { address = "127.0.0.1:1026", weight = 100, sticky_id = "backend-1026" },
@@ -51,7 +51,7 @@ backends = [
 [applications.example_com]
 protocol = "http"
 frontends = [
-  { address = "0.0.0.0", port = 80, hostname = "example.com" }
+  { address = "0.0.0.0", port = 81, hostname = "example.com" }
 ]
 backends = [
   { address = "127.0.0.1:1028", weight = 100 }

@@ -310,7 +310,7 @@ impl FileAppFrontendConfig {
   }
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[derive(Debug,Clone,Copy,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(deny_unknown_fields, rename_all="lowercase")]
 pub enum FileListenerProtocolConfig {
   Http,
@@ -721,22 +721,42 @@ impl FileConfig {
     let mut http_listeners = Vec::new();
     let mut https_listeners = Vec::new();
     let mut tcp_listeners = Vec::new();
+    let mut known_addresses = HashMap::new();
 
     if let Some(listeners) = self.listeners {
       for listener in listeners.iter() {
-        if let Some(l) = listener.to_tls() {
-          https_listeners.push(l);
-        } else if let Some(l) = listener.to_http() {
-          http_listeners.push(l);
-        } else if let Some(l) = listener.to_tcp() {
-          tcp_listeners.push(l)
-        } else {
-          error!("invalid listener");
+        if known_addresses.contains_key(&(listener.address.clone(), listener.port)) {
+          panic!("there's already a listener for address {} and port {}", listener.address, listener.port);
+        }
+
+        known_addresses.insert((listener.address.clone(), listener.port), listener.protocol);
+
+        match listener.protocol {
+          FileListenerProtocolConfig::Https => {
+            if let Some(l) = listener.to_tls() {
+              https_listeners.push(l);
+            } else {
+              panic!("invalid listener");
+            }
+          },
+          FileListenerProtocolConfig::Http => {
+            if let Some(l) = listener.to_http() {
+              http_listeners.push(l);
+            } else {
+              panic!("invalid listener");
+            }
+          },
+          FileListenerProtocolConfig::Tcp => {
+            if let Some(l) = listener.to_tcp() {
+              tcp_listeners.push(l);
+            } else {
+              panic!("invalid listener");
+            }
+          },
         }
       }
     }
 
-    /*
     if let Some(mut apps) = self.applications {
       for (id, app) in apps.drain() {
         match app.to_app_config(id.as_str()) {
@@ -744,19 +764,57 @@ impl FileConfig {
             match app_config {
               AppConfig::Http(ref http) => {
                 for frontend in http.frontends.iter() {
-                  if ! self.listeners.iter().find(|l| {
-                    l.address == frontend.ip_address && l.port == frontend.port
-                  }) {
-                    let listener = Listener::new(frontend.ip_address.clone(), frontend.port);
-                    if frontend.certificate.is_some() {
-                      https_listeners.push(listener.to_tls().unwrap());
-                    } else {
-                      http_listeners.push(listener.to_http().unwrap());
-                    }
+                  match known_addresses.get(&(frontend.ip_address.clone(), frontend.port)) {
+                    Some(FileListenerProtocolConfig::Tcp) => {
+                      panic!("cannot set up a HTTP or HTTPS frontend on a TCP listener");
+                    },
+                    Some(FileListenerProtocolConfig::Http) => {
+                      if frontend.certificate.is_some() {
+                        panic!("cannot set up a HTTPS frontend on a HTTP listener");
+                      }
+                    },
+                    Some(FileListenerProtocolConfig::Https) => {
+                      if frontend.certificate.is_none() {
+                        println!("known addresses: {:#?}", known_addresses);
+                        println!("frontend: {:#?}", frontend);
+                        panic!("cannot set up a HTTP frontend on a HTTPS listener");
+                      }
+                    },
+                    None => {
+                      // create a default listener for that front
+                      let p = if frontend.certificate.is_some() {
+                        let listener = Listener::new(frontend.ip_address.clone(), frontend.port, FileListenerProtocolConfig::Https);
+                        https_listeners.push(listener.to_tls().unwrap());
+
+                        FileListenerProtocolConfig::Https
+                      } else {
+                        let listener = Listener::new(frontend.ip_address.clone(), frontend.port, FileListenerProtocolConfig::Http);
+                        http_listeners.push(listener.to_http().unwrap());
+
+                        FileListenerProtocolConfig::Http
+                      };
+                      known_addresses.insert((frontend.ip_address.clone(), frontend.port), p);
+                    },
                   }
                 }
               },
-              _ => unimplemented!(),
+              AppConfig::Tcp(ref tcp) => {
+                //FIXME: verify that different TCP apps do not request the same address
+                for frontend in tcp.frontends.iter() {
+                  match known_addresses.get(&(frontend.ip_address.clone(), frontend.port)) {
+                    Some(FileListenerProtocolConfig::Http) | Some(FileListenerProtocolConfig::Https) => {
+                      panic!("cannot set up a TCP frontend on a HTTP listener");
+                    },
+                    Some(FileListenerProtocolConfig::Tcp) => {},
+                    None => {
+                      // create a default listener for that front
+                      let listener = Listener::new(frontend.ip_address.clone(), frontend.port, FileListenerProtocolConfig::Tcp);
+                      tcp_listeners.push(listener.to_tcp().unwrap());
+                      known_addresses.insert((frontend.ip_address.clone(), frontend.port), FileListenerProtocolConfig::Tcp);
+                    },
+                  }
+                }
+              },
             }
 
             applications.insert(id, app_config);
@@ -767,7 +825,6 @@ impl FileConfig {
         }
       }
     }
-    */
 
     Config {
       config_path:    config_path.to_string(),
