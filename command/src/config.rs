@@ -887,6 +887,27 @@ impl Config {
     let mut v = Vec::new();
     let mut count = 0u8;
 
+    for listener in self.http_listeners.iter() {
+      v.push(ConfigMessage {
+        id:       format!("CONFIG-{}", count),
+        version:  PROTOCOL_VERSION,
+        proxy_id: None,
+        data:     ConfigCommand::ProxyConfiguration(Order::AddHttpListener(listener.clone())),
+      });
+      count += 1;
+    }
+
+    for listener in self.https_listeners.iter() {
+      v.push(ConfigMessage {
+        id:       format!("CONFIG-{}", count),
+        version:  PROTOCOL_VERSION,
+        proxy_id: None,
+        data:     ConfigCommand::ProxyConfiguration(Order::AddHttpsListener(listener.clone())),
+      });
+      count += 1;
+    }
+    //FIXME: generate TCP listeners
+
     for ref app in self.applications.values() {
       let mut orders = app.generate_orders();
       for order in orders.drain(..) {
