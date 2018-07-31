@@ -136,8 +136,11 @@ pub enum Order {
     AddBackend(Backend),
     RemoveBackend(RemoveBackend),
 
-    HttpProxy(HttpProxyConfiguration),
-    HttpsProxy(HttpsProxyConfiguration),
+    AddHttpListener(HttpListener),
+    AddHttpsListener(HttpsListener),
+
+    RemoveHttpListener(SocketAddr),
+    RemoveHttpsListener(SocketAddr),
 
     Query(Query),
 
@@ -214,9 +217,11 @@ pub struct Application {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
 pub struct HttpFront {
-    pub app_id:         String,
-    pub hostname:       String,
-    pub path_begin:     String,
+    pub app_id:     String,
+    pub ip_address: String,
+    pub port:       u16,
+    pub hostname:   String,
+    pub path_begin: String,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -256,10 +261,12 @@ pub struct ReplaceCertificate {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
 pub struct HttpsFront {
-    pub app_id:         String,
-    pub hostname:       String,
-    pub path_begin:     String,
-    pub fingerprint:    CertFingerprint,
+    pub app_id:      String,
+    pub ip_address:  String,
+    pub port:        u16,
+    pub hostname:    String,
+    pub path_begin:  String,
+    pub fingerprint: CertFingerprint,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
@@ -310,7 +317,7 @@ pub fn default_sticky_name() -> String {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct HttpProxyConfiguration {
+pub struct HttpListener {
     pub front:           SocketAddr,
     pub public_address:  Option<IpAddr>,
     pub answer_404:      String,
@@ -321,9 +328,9 @@ pub struct HttpProxyConfiguration {
     pub sticky_name:     String,
 }
 
-impl Default for HttpProxyConfiguration {
-  fn default() -> HttpProxyConfiguration {
-    HttpProxyConfiguration {
+impl Default for HttpListener {
+  fn default() -> HttpListener {
+    HttpListener {
       front:           "127.0.0.1:8080".parse().expect("could not parse address"),
       public_address:  None,
       answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
@@ -360,7 +367,7 @@ pub enum TlsVersion {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct HttpsProxyConfiguration {
+pub struct HttpsListener {
     pub front:                     SocketAddr,
     pub public_address:            Option<IpAddr>,
     pub answer_404:                String,
@@ -376,9 +383,9 @@ pub struct HttpsProxyConfiguration {
     pub sticky_name:               String,
 }
 
-impl Default for HttpsProxyConfiguration {
-  fn default() -> HttpsProxyConfiguration {
-    HttpsProxyConfiguration {
+impl Default for HttpsListener {
+  fn default() -> HttpsListener {
+    HttpsListener {
       front:           "127.0.0.1:8443".parse().expect("could not parse address"),
       public_address:  None,
       answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
@@ -404,6 +411,14 @@ impl Default for HttpsProxyConfiguration {
       sticky_name:     String::from("SOZUBALANCEID"),
     }
   }
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct TcpListener {
+  pub front:          SocketAddr,
+  pub public_address: Option<IpAddr>,
+  #[serde(default)]
+  pub expect_proxy:   bool,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -462,28 +477,30 @@ impl Default for QueryAnswerApplication {
 impl Order {
   pub fn get_topics(&self) -> HashSet<Topic> {
     match *self {
-      Order::AddApplication(_)    => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::RemoveApplication(_) => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::AddHttpFront(_)      => [Topic::HttpProxyConfig].iter().cloned().collect(),
-      Order::RemoveHttpFront(_)   => [Topic::HttpProxyConfig].iter().cloned().collect(),
-      Order::AddHttpsFront(_)     => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      Order::RemoveHttpsFront(_)  => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      Order::AddCertificate(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      Order::ReplaceCertificate(_)=> [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      Order::RemoveCertificate(_) => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      Order::AddTcpFront(_)       => [Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::RemoveTcpFront(_)    => [Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::AddBackend(_)        => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::RemoveBackend(_)     => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::HttpProxy(_)         => [Topic::HttpProxyConfig].iter().cloned().collect(),
-      Order::HttpsProxy(_)        => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      Order::Query(_)             => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::SoftStop             => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::HardStop             => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::Status               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::Metrics              => HashSet::new(),
-      Order::Logging(_)           => [Topic::HttpsProxyConfig, Topic::HttpProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::ReturnListenSockets  => HashSet::new(),
+      Order::AddApplication(_)      => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::RemoveApplication(_)   => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::AddHttpFront(_)        => [Topic::HttpProxyConfig].iter().cloned().collect(),
+      Order::RemoveHttpFront(_)     => [Topic::HttpProxyConfig].iter().cloned().collect(),
+      Order::AddHttpsFront(_)       => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::RemoveHttpsFront(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::AddCertificate(_)      => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::ReplaceCertificate(_)  => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::RemoveCertificate(_)   => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::AddTcpFront(_)         => [Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::RemoveTcpFront(_)      => [Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::AddBackend(_)          => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::RemoveBackend(_)       => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::AddHttpListener(_)     => [Topic::HttpProxyConfig].iter().cloned().collect(),
+      Order::AddHttpsListener(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::RemoveHttpListener(_)  => [Topic::HttpProxyConfig].iter().cloned().collect(),
+      Order::RemoveHttpsListener(_) => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::Query(_)               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::SoftStop               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::HardStop               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::Status                 => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::Metrics                => HashSet::new(),
+      Order::Logging(_)             => [Topic::HttpsProxyConfig, Topic::HttpProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::ReturnListenSockets    => HashSet::new(),
     }
   }
 }
@@ -501,26 +518,30 @@ mod tests {
   use serde_json;
 
   #[test]
-  fn add_acl_test() {
-    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242, "sticky_session": false}}"#;
+  fn add_front_test() {
+    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "ip_address": "127.0.0.1", "port": 4242, "sticky_session": false}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
+      ip_address: String::from("127.0.0.1"),
+      port: 4242,
     }));
   }
 
   #[test]
-  fn remove_acl_test() {
-    let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "port": 4242}}"#;
+  fn remove_front_test() {
+    let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "ip_address": "127.0.0.1", "port": 4242}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::RemoveHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
+      ip_address: String::from("127.0.0.1"),
+      port: 4242,
     }));
   }
 
@@ -556,25 +577,29 @@ mod tests {
 
   #[test]
   fn http_front_crash_test() {
-    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "aa", "hostname": "cltdl.fr", "path_begin": ""}}"#;
+    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "aa", "hostname": "cltdl.fr", "path_begin": "", "ip_address": "127.0.0.1", "port": 4242}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::AddHttpFront(HttpFront{
       app_id: String::from("aa"),
       hostname: String::from("cltdl.fr"),
       path_begin: String::from(""),
+      ip_address: String::from("127.0.0.1"),
+      port: 4242,
     }));
   }
 
   #[test]
   fn http_front_crash_test2() {
-    let raw_json = r#"{"app_id": "aa", "hostname": "cltdl.fr", "path_begin": ""}"#;
+    let raw_json = r#"{"app_id": "aa", "hostname": "cltdl.fr", "path_begin": "", "ip_address": "127.0.0.1", "port": 4242 }"#;
     let front: HttpFront = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}",front);
     assert!(front == HttpFront{
       app_id: String::from("aa"),
       hostname: String::from("cltdl.fr"),
       path_begin: String::from(""),
+      ip_address: String::from("127.0.0.1"),
+      port: 4242,
     });
   }
 }

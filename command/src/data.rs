@@ -332,13 +332,15 @@ mod tests {
 
   #[test]
   fn config_message_test() {
-    let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx"}} }"#;
+    let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "ip_address": "0.0.0.0", "port": 8080}} }"#;
     let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", message);
     assert_eq!(message.data, ConfigCommand::ProxyConfiguration(Order::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
+      ip_address: String::from("0.0.0.0"),
+      port: 8080,
     })));
   }
 
@@ -413,6 +415,8 @@ mod tests {
                   app_id: String::from("xxx"),
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
+                  ip_address: String::from("0.0.0.0"),
+                  port: 8080,
       })),
       proxy_id: None
     });
@@ -424,6 +428,8 @@ mod tests {
                   app_id: String::from("xxx"),
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
+                  ip_address: String::from("0.0.0.0"),
+                  port: 8080,
       })),
       proxy_id: None
     });
@@ -436,6 +442,8 @@ mod tests {
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
                   fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
+                  ip_address: String::from("0.0.0.0"),
+                  port: 8443,
       })),
       proxy_id: None
     });
@@ -448,6 +456,8 @@ mod tests {
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
                   fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
+                  ip_address: String::from("0.0.0.0"),
+                  port: 8443,
       })),
       proxy_id: None
     });

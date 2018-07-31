@@ -1,0 +1,72 @@
+saved_state = "./state.json"
+log_level = "info"
+log_target = "stdout"
+command_socket = "/Users/geal/dev/rust/projects/yxorp/bin/command_folder/sock"
+command_buffer_size = 16384
+max_command_buffer_size = 163840
+worker_count = 1
+max_connections = 20000
+max_buffers = 1000
+buffer_size = 16384
+
+[[listeners]]
+address = "0.0.0.0"
+port = 80
+protocol = "http"
+answer_404 = "./404.html"
+#expect_proxy = true
+
+[[listeners]]
+address = "0.0.0.0"
+port = 443
+protocol = "https"
+answer_404 = "./404.html"
+#tls_provider = "rustls"
+tls_provider = "openssl"
+tls_versions = ["TLSv1.2"]
+# cipher combinations used by OpenSSL
+#cipher_list = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256"
+#expect_proxy = true
+
+[[listeners]]
+address = "0.0.0.0"
+port = 1234
+protocol = "tcp"
+expect_proxy = true
+
+[applications]
+[applications.MyApp]
+protocol = "http"
+#sticky_session = false
+#https_redirect = false
+frontends = [
+  { address = "0.0.0.0", port = 80, hostname = "lolcatho.st" },
+  { address = "0.0.0.0", port = 443, hostname = "lolcatho.st", certificate = "./certificate.pem", key = "./key.pem" }
+]
+backends = [
+  { address = "127.0.0.1:1026", weight = 100, sticky_id = "backend-1026" },
+  { address = "127.0.0.1:1027", weight = 100, sticky_id = "backend-1027" }
+]
+
+[applications.example_com]
+protocol = "http"
+frontends = [
+  { address = "0.0.0.0", port = 80, hostname = "example.com" }
+]
+backends = [
+  { address = "127.0.0.1:1028", weight = 100 }
+]
+
+[applications.TcpApp]
+protocol = "tcp"
+#send_proxy = false
+frontends = [
+  { address = "0.0.0.0", port = 8080 },
+  { address = "0.0.0.0", port = 8081 }
+]
+backends = [
+  { address = "127.0.0.1:1029", weight = 100 },
+  { address = "127.0.0.1:1030", weight = 100 }
+]
+
+
