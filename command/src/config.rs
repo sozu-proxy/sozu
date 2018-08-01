@@ -920,7 +920,16 @@ impl Config {
       });
       count += 1;
     }
-    //FIXME: generate TCP listeners
+
+    for listener in self.tcp_listeners.iter() {
+      v.push(ConfigMessage {
+        id:       format!("CONFIG-{}", count),
+        version:  PROTOCOL_VERSION,
+        proxy_id: None,
+        data:     ConfigCommand::ProxyConfiguration(Order::AddTcpListener(listener.clone())),
+      });
+      count += 1;
+    }
 
     for ref app in self.applications.values() {
       let mut orders = app.generate_orders();
