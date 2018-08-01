@@ -607,6 +607,17 @@ macro_rules! trace {
     )
 }
 
+
+#[macro_export]
+macro_rules! fixme {
+    () => {
+        log!($crate::logging::LogLevel::Info, "FIXME: {}:{} in {}", "INFO", file!(), line!(), module_path!());
+    };
+    ($($arg:tt)*) => {
+        log!($crate::logging::LogLevel::Info, "FIXME: {}:{} in {}: {}", "INFO", file!(), line!(), module_path!(), $($arg)*);
+    };
+}
+
 use log;
 struct CompatLogger;
 
