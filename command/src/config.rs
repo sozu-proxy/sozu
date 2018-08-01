@@ -30,7 +30,6 @@ pub struct Listener {
   pub cipher_list:        Option<String>,
   pub rustls_cipher_list: Option<Vec<String>>,
   pub tls_versions:       Option<Vec<TlsVersion>>,
-  pub tls_provider:       Option<TlsProvider>,
   pub expect_proxy:       Option<bool>,
   #[serde(default = "default_sticky_name")]
   pub sticky_name:        String,
@@ -52,7 +51,6 @@ impl Listener {
       cipher_list:        None,
       rustls_cipher_list: None,
       tls_versions:       None,
-      tls_provider:       None,
       expect_proxy:       None,
       sticky_name:        String::from("SOZUBALANCEID"),
     }
@@ -164,11 +162,6 @@ impl Listener {
     };
 
     let expect_proxy = self.expect_proxy.unwrap_or(false);
-    let tls_provider = self.tls_provider.unwrap_or(if cfg!(use_openssl) {
-      TlsProvider::Openssl
-    } else {
-      TlsProvider::Rustls
-    });
 
 
     tls_proxy_configuration.map(|addr| {
@@ -200,8 +193,6 @@ impl Listener {
       if let Some(cipher_list) = self.cipher_list.as_ref() {
         configuration.cipher_list = cipher_list.clone();
       }
-
-      configuration.tls_provider = tls_provider;
 
       configuration
     })
@@ -662,6 +653,7 @@ pub struct FileConfig {
   pub handle_process_affinity:  Option<bool>,
   pub ctl_command_timeout:      Option<u64>,
   pub pid_file_path:            Option<String>,
+  pub tls_provider:             Option<TlsProvider>,
 }
 
 
@@ -832,6 +824,12 @@ impl FileConfig {
       }
     }
 
+    let tls_provider = self.tls_provider.unwrap_or(if cfg!(use_openssl) {
+      TlsProvider::Openssl
+    } else {
+      TlsProvider::Rustls
+    });
+
     Config {
       config_path:    config_path.to_string(),
       command_socket: self.command_socket,
@@ -853,7 +851,8 @@ impl FileConfig {
       applications: applications,
       handle_process_affinity: self.handle_process_affinity.unwrap_or(false),
       ctl_command_timeout: self.ctl_command_timeout.unwrap_or(1_000),
-      pid_file_path: self.pid_file_path
+      pid_file_path: self.pid_file_path,
+      tls_provider,
     }
   }
 }
@@ -882,6 +881,7 @@ pub struct Config {
   pub handle_process_affinity:  bool,
   pub ctl_command_timeout:      u64,
   pub pid_file_path:            Option<String>,
+  pub tls_provider:             TlsProvider,
 }
 
 impl Config {
@@ -1010,7 +1010,6 @@ mod tests {
       tls_versions: None,
       cipher_list: None,
       rustls_cipher_list: None,
-      tls_provider: None,
       expect_proxy: None,
       sticky_name: "SOZUBALANCEID".to_string(),
     };
@@ -1025,7 +1024,6 @@ mod tests {
       tls_versions: None,
       cipher_list: None,
       rustls_cipher_list: None,
-      tls_provider: None,
       expect_proxy: None,
       sticky_name: "SOZUBALANCEID".to_string(),
     };
@@ -1058,7 +1056,8 @@ mod tests {
       listeners: Some(listeners),
       applications: None,
       ctl_command_timeout: None,
-      pid_file_path: None
+      pid_file_path: None,
+      tls_provider: None,
     };
 
     println!("config: {:?}", to_string(&config));
