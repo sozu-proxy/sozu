@@ -138,9 +138,11 @@ pub enum Order {
 
     AddHttpListener(HttpListener),
     AddHttpsListener(HttpsListener),
+    AddTcpListener(TcpListener),
 
     RemoveHttpListener(SocketAddr),
     RemoveHttpsListener(SocketAddr),
+    RemoveTcpListener(SocketAddr),
 
     Query(Query),
 
@@ -492,8 +494,10 @@ impl Order {
       Order::RemoveBackend(_)       => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::AddHttpListener(_)     => [Topic::HttpProxyConfig].iter().cloned().collect(),
       Order::AddHttpsListener(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::AddTcpListener(_)      => [Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::RemoveHttpListener(_)  => [Topic::HttpProxyConfig].iter().cloned().collect(),
       Order::RemoveHttpsListener(_) => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      Order::RemoveTcpListener(_)   => [Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::Query(_)               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::SoftStop               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::HardStop               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),

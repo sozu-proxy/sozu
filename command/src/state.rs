@@ -1,13 +1,14 @@
 use std::collections::{BTreeMap,HashMap,HashSet,BTreeSet};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-
+use std::net::SocketAddr;
 use std::iter::FromIterator;
 use certificate::calculate_fingerprint;
 
 use messages::{Application,CertFingerprint,CertificateAndKey,Order,
   HttpFront,HttpsFront,TcpFront,Backend,QueryAnswerApplication,
-  AddCertificate, RemoveCertificate, RemoveBackend};
+  AddCertificate, RemoveCertificate, RemoveBackend,
+  HttpListener,HttpsListener,TcpListener};
 
 pub type AppId = String;
 
@@ -32,6 +33,9 @@ pub struct HttpsProxy {
 pub struct ConfigState {
   pub applications:    HashMap<AppId, Application>,
   pub backends:        HashMap<AppId, Vec<Backend>>,
+  pub http_listeners:  HashMap<SocketAddr, HttpListener>,
+  pub https_listeners: HashMap<SocketAddr, HttpsListener>,
+  pub tcp_listeners:   HashMap<SocketAddr, TcpListener>,
   pub http_fronts:     HashMap<AppId, Vec<HttpFront>>,
   pub https_fronts:    HashMap<AppId, Vec<HttpsFront>>,
   pub tcp_fronts:      HashMap<AppId, Vec<TcpFront>>,
@@ -48,6 +52,9 @@ impl ConfigState {
     ConfigState {
       applications:    HashMap::new(),
       backends:        HashMap::new(),
+      http_listeners:  HashMap::new(),
+      https_listeners: HashMap::new(),
+      tcp_listeners:   HashMap::new(),
       http_fronts:     HashMap::new(),
       https_fronts:    HashMap::new(),
       tcp_fronts:      HashMap::new(),
@@ -75,6 +82,39 @@ impl ConfigState {
       },
       &Order::RemoveApplication(ref app_id) => {
         self.applications.remove(app_id).is_some()
+      },
+      &Order::AddHttpListener(ref listener) => {
+        if self.http_listeners.contains_key(&listener.front) {
+          false
+        } else {
+          self.http_listeners.insert(listener.front.clone(), listener.clone());
+          true
+        }
+      },
+      &Order::AddHttpsListener(ref listener) => {
+        if self.https_listeners.contains_key(&listener.front) {
+          false
+        } else {
+          self.https_listeners.insert(listener.front.clone(), listener.clone());
+          true
+        }
+      },
+      &Order::AddTcpListener(ref listener) => {
+        if self.tcp_listeners.contains_key(&listener.front) {
+          false
+        } else {
+          self.tcp_listeners.insert(listener.front.clone(), listener.clone());
+          true
+        }
+      },
+      &Order::RemoveHttpListener(ref addr) => {
+        self.http_listeners.remove(addr).is_some()
+      },
+      &Order::RemoveHttpsListener(ref addr) => {
+        self.https_listeners.remove(addr).is_some()
+      },
+      &Order::RemoveTcpListener(ref addr) => {
+        self.tcp_listeners.remove(addr).is_some()
       },
       &Order::AddHttpFront(ref front) => {
         let front_vec = self.http_fronts.entry(front.app_id.clone()).or_insert(vec!());
