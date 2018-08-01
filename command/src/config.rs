@@ -465,16 +465,6 @@ impl HttpFrontendConfig {
   pub fn generate_orders(&self, app_id: &str) -> Vec<Order> {
     let mut v = Vec::new();
 
-    //create the front both for HTTP and HTTPS if possible
-    v.push(Order::AddHttpFront(HttpFront {
-      app_id:     app_id.clone().to_string(),
-      ip_address: self.ip_address.clone(),
-      port:       self.port,
-      hostname:   self.hostname.clone(),
-      path_begin: self.path_begin.clone(),
-    }));
-
-
     if self.key.is_some() && self.certificate.is_some() {
       let mut address = self.ip_address.clone();
       address.push(':');
@@ -504,6 +494,15 @@ impl HttpFrontendConfig {
       } else {
         error!("cannot obtain the certificate's fingerprint");
       }
+    } else {
+      //create the front both for HTTP and HTTPS if possible
+      v.push(Order::AddHttpFront(HttpFront {
+        app_id:     app_id.clone().to_string(),
+        ip_address: self.ip_address.clone(),
+        port:       self.port,
+        hostname:   self.hostname.clone(),
+        path_begin: self.path_begin.clone(),
+      }));
     }
 
     v
