@@ -284,9 +284,18 @@ impl FileAppFrontendConfig {
       return Err(String::from("HTTP frontend should have a 'hostname' field"));
     }
 
-    let key_opt         = self.key.as_ref().and_then(|path| Config::load_file(&path).ok());
-    let certificate_opt = self.certificate.as_ref().and_then(|path| Config::load_file(&path).ok());
-    let chain_opt       = self.certificate_chain.as_ref().and_then(|path| Config::load_file(&path).ok())
+    let key_opt         = self.key.as_ref().and_then(|path| Config::load_file(&path).map_err(|e| {
+      error!("cannot load key at path '{}': {:?}", path, e);
+      e
+    }).ok());
+    let certificate_opt = self.certificate.as_ref().and_then(|path| Config::load_file(&path).map_err(|e| {
+      error!("cannot load certificate at path '{}': {:?}", path, e);
+      e
+    }).ok());
+    let chain_opt       = self.certificate_chain.as_ref().and_then(|path| Config::load_file(&path).map_err(|e| {
+      error!("cannot load certificate chain at path '{}': {:?}", path, e);
+      e
+    }).ok())
       .map(split_certificate_chain);
 
     Ok(HttpFrontendConfig {
