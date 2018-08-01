@@ -235,6 +235,7 @@ pub struct CertificateAndKey {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct AddCertificate {
+    pub front:       SocketAddr,
     pub certificate: CertificateAndKey,
     #[serde(default)]
     #[serde(skip_serializing_if="Vec::is_empty")]
@@ -243,6 +244,7 @@ pub struct AddCertificate {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct RemoveCertificate {
+    pub front:       SocketAddr,
     pub fingerprint: CertFingerprint,
     #[serde(default)]
     #[serde(skip_serializing_if="Vec::is_empty")]
@@ -251,6 +253,7 @@ pub struct RemoveCertificate {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct ReplaceCertificate {
+    pub front:           SocketAddr,
     pub new_certificate: CertificateAndKey,
     pub old_fingerprint: CertFingerprint,
     #[serde(default)]

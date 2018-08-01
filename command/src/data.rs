@@ -470,6 +470,7 @@ mod tests {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     ConfigCommand::ProxyConfiguration(Order::AddCertificate( AddCertificate{
+        front: "0.0.0.0:443".parse().unwrap(),
         certificate: CertificateAndKey {
                   certificate: String::from(CERTIFICATE),
                   certificate_chain: split_certificate_chain(String::from(CHAIN)),
@@ -484,6 +485,7 @@ mod tests {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     ConfigCommand::ProxyConfiguration(Order::RemoveCertificate(RemoveCertificate {
+          front: "0.0.0.0:443".parse().unwrap(),
           fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
           names: Vec::new(),
       })),

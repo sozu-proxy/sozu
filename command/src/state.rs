@@ -2,7 +2,7 @@ use std::collections::{BTreeMap,HashMap,HashSet,BTreeSet};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
-use std::iter::FromIterator;
+use std::iter::{repeat,FromIterator};
 use certificate::calculate_fingerprint;
 
 use messages::{Application,CertFingerprint,CertificateAndKey,Order,
@@ -40,7 +40,7 @@ pub struct ConfigState {
   pub https_fronts:    HashMap<AppId, Vec<HttpsFront>>,
   pub tcp_fronts:      HashMap<AppId, Vec<TcpFront>>,
   // certificate and names
-  pub certificates:    HashMap<CertFingerprint, (CertificateAndKey, Vec<String>)>,
+  pub certificates:    HashMap<SocketAddr, HashMap<CertFingerprint, (CertificateAndKey, Vec<String>)>>,
   //ip, port
   pub http_addresses:  Vec<(String, u16)>,
   pub https_addresses: Vec<(String, u16)>,
@@ -144,18 +144,21 @@ impl ConfigState {
           }
         };
 
-        if !self.certificates.contains_key(&fingerprint) {
-          self.certificates.insert(fingerprint.clone(), (add.certificate.clone(), add.names.clone()));
+        if !self.certificates.contains_key(&add.front) {
+          self.certificates.insert(add.front.clone(), HashMap::new());
+        }
+        if !self.certificates.get(&add.front).unwrap().contains_key(&fingerprint) {
+          self.certificates.get_mut(&add.front).unwrap().insert(fingerprint.clone(), (add.certificate.clone(), add.names.clone()));
           true
         } else {
           false
         }
       },
       &Order::RemoveCertificate(ref remove) => {
-        self.certificates.remove(&remove.fingerprint).is_some()
+        self.certificates.get_mut(&remove.front).and_then(|certs| certs.remove(&remove.fingerprint)).is_some()
       },
       &Order::ReplaceCertificate(ref replace) => {
-        let changed = self.certificates.remove(&replace.old_fingerprint).is_some();
+        let changed = self.certificates.get_mut(&replace.front).and_then(|certs| certs.remove(&replace.old_fingerprint)).is_some();
 
         let fingerprint = match calculate_fingerprint(&replace.new_certificate.certificate.as_bytes()[..]) {
           Some(f)  => CertFingerprint(f),
@@ -165,9 +168,9 @@ impl ConfigState {
           }
         };
 
-        if !self.certificates.contains_key(&fingerprint) {
-          self.certificates.insert(fingerprint.clone(),
-            (replace.new_certificate.clone(), replace.new_names.clone()));
+        if !self.certificates.get(&replace.front).unwrap().contains_key(&fingerprint) {
+          self.certificates.get_mut(&replace.front).map(|certs| certs.insert(fingerprint.clone(),
+            (replace.new_certificate.clone(), replace.new_names.clone())));
           true
         } else {
           changed
@@ -249,11 +252,14 @@ impl ConfigState {
       }
     }
 
-    for &(ref certificate_and_key, ref names) in self.certificates.values() {
-      v.push(Order::AddCertificate(AddCertificate{
-        certificate: certificate_and_key.clone(),
-        names: names.clone(),
-      }));
+    for (ref front, ref certs) in self.certificates.iter() {
+      for &(ref certificate_and_key, ref names) in certs.values() {
+        v.push(Order::AddCertificate(AddCertificate{
+          front: *front.clone(),
+          certificate: certificate_and_key.clone(),
+          names: names.clone(),
+        }));
+      }
     }
 
     for front_list in self.https_fronts.values() {
@@ -348,10 +354,14 @@ impl ConfigState {
     let removed_backends = my_backends.difference(&their_backends);
     let added_backends   = their_backends.difference(&my_backends);
 
-    let my_certificates:    HashSet<(&CertFingerprint, &(CertificateAndKey, Vec<String>))> =
-      HashSet::from_iter(self.certificates.iter());
-    let their_certificates: HashSet<(&CertFingerprint, &(CertificateAndKey, Vec<String>))> =
-      HashSet::from_iter(other.certificates.iter());
+    let my_certificates:    HashSet<(SocketAddr, &CertFingerprint, &(CertificateAndKey, Vec<String>))> =
+      HashSet::from_iter(self.certificates.iter().flat_map(|(addr, certs)| {
+        certs.iter().zip(repeat(addr.clone())).map(|((k, v), addr)| (addr, k, v))
+      }));
+    let their_certificates: HashSet<(SocketAddr, &CertFingerprint, &(CertificateAndKey, Vec<String>))> =
+      HashSet::from_iter(other.certificates.iter().flat_map(|(addr, certs)| {
+        certs.iter().zip(repeat(addr.clone())).map(|((k, v), addr)| (addr, k, v))
+      }));
 
     let removed_certificates = my_certificates.difference(&their_certificates);
     let added_certificates   = their_certificates.difference(&my_certificates);
@@ -366,8 +376,9 @@ impl ConfigState {
       v.push(Order::AddApplication(app.clone()));
     }
 
-    for &(_, &(ref certificate_and_key, ref names)) in added_certificates {
+    for &(front, _, &(ref certificate_and_key, ref names)) in added_certificates {
       v.push(Order::AddCertificate(AddCertificate{
+        front: front.clone(),
         certificate: certificate_and_key.clone(),
         names: names.clone(),
       }));
@@ -410,8 +421,9 @@ impl ConfigState {
       v.push(Order::AddTcpFront(front.clone()));
     }
 
-    for  &(fingerprint, _) in removed_certificates {
+    for  &(front, fingerprint, _) in removed_certificates {
       v.push(Order::RemoveCertificate(RemoveCertificate {
+        front: front.clone(),
         fingerprint: fingerprint.clone(),
         names: Vec::new(),
       }));

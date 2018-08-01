@@ -476,8 +476,14 @@ impl HttpFrontendConfig {
 
 
     if self.key.is_some() && self.certificate.is_some() {
+      let mut address = self.ip_address.clone();
+      address.push(':');
+      address.push_str(&self.port.to_string());
+      let address: SocketAddr = address.parse().expect("invalid frontend address");
+
 
       v.push(Order::AddCertificate(AddCertificate{
+        front: address.clone(),
         certificate: CertificateAndKey {
           key:               self.key.clone().unwrap(),
           certificate:       self.certificate.clone().unwrap(),
