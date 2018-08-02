@@ -1646,12 +1646,9 @@ mod tests {
     let context    = SslContext::builder(SslMethod::tls()).expect("could not create a SslContextBuilder");
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1032").expect("test address 127.0.0.1:1032 should be parsed");
-    let listener = net::TcpListener::bind(&front).expect("test address 127.0.0.1:1032 should be available");
-    let server_config = ServerConfiguration {
-      listener:  Some(listener),
+    let listener = Listener {
+      listener:  None,
       address:   front,
-      applications: HashMap::new(),
-      backends: BackendMap::new(),
       fronts:    fronts,
       domains:   rc_domains,
       default_context: context.build(),
@@ -1665,22 +1662,24 @@ mod tests {
       config: Default::default(),
       ssl_options: ssl::SslOptions::CIPHER_SERVER_PREFERENCE | ssl::SslOptions::NO_COMPRESSION | ssl::SslOptions::NO_TICKET |
         ssl::SslOptions::NO_SSLV2 | ssl::SslOptions::NO_SSLV3 | ssl::SslOptions::NO_TLSV1 | ssl::SslOptions::NO_TLSV1_1,
+      token: Token(0),
     };
 
+
     println!("TEST {}", line!());
-    let frontend1 = server_config.frontend_from_request("lolcatho.st", "/");
+    let frontend1 = listener.frontend_from_request("lolcatho.st", "/");
     assert_eq!(frontend1.expect("should find a frontend").app_id, "app_1");
     println!("TEST {}", line!());
-    let frontend2 = server_config.frontend_from_request("lolcatho.st", "/test");
+    let frontend2 = listener.frontend_from_request("lolcatho.st", "/test");
     assert_eq!(frontend2.expect("should find a frontend").app_id, "app_1");
     println!("TEST {}", line!());
-    let frontend3 = server_config.frontend_from_request("lolcatho.st", "/yolo/test");
+    let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test");
     assert_eq!(frontend3.expect("should find a frontend").app_id, "app_2");
     println!("TEST {}", line!());
-    let frontend4 = server_config.frontend_from_request("lolcatho.st", "/yolo/swag");
+    let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag");
     assert_eq!(frontend4.expect("should find a frontend").app_id, "app_3");
     println!("TEST {}", line!());
-    let frontend5 = server_config.frontend_from_request("domain", "/");
+    let frontend5 = listener.frontend_from_request("domain", "/");
     assert_eq!(frontend5, None);
    // assert!(false);
   }

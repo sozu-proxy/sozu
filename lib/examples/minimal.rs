@@ -21,7 +21,7 @@ fn main() {
 
   info!("starting up");
 
-  let config = messages::HttpProxyConfiguration {
+  let config = messages::HttpListener {
     front: "127.0.0.1:8080".parse().expect("could not parse address"),
     ..Default::default()
   };
@@ -36,14 +36,14 @@ fn main() {
 
   let http_front = messages::HttpFront {
     app_id:     String::from("test"),
+    address:    "127.0.0.1:8080".parse().unwrap(),
     hostname:   String::from("example.com"),
     path_begin: String::from("/"),
   };
   let http_backend = messages::Backend {
     app_id:                    String::from("test"),
     backend_id:                String::from("test-0"),
-    ip_address:                String::from("127.0.0.1"),
-    port:                      8000,
+    address:                   "127.0.0.1:8000".parse().unwrap(),
     load_balancing_parameters: Some(LoadBalancingParams::default()),
     sticky_id:                 None,
     backup:                    None,

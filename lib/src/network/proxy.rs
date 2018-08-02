@@ -108,7 +108,7 @@ pub struct Server {
 
 impl Server {
   pub fn new_from_config(channel: ProxyChannel, scm: ScmSocket, config: Config, config_state: ConfigState) -> Self {
-    let mut event_loop  = Poll::new().expect("could not create event loop");
+    let event_loop  = Poll::new().expect("could not create event loop");
     let pool = Rc::new(RefCell::new(
       Pool::with_capacity(2*config.max_buffers, 0, || BufferQueue::with_capacity(config.buffer_size))
     ));

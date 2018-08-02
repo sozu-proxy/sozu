@@ -22,10 +22,10 @@ fn main() {
 
   info!("MAIN\tstarting up");
 
-  network::metrics::setup("127.0.0.1", 8125, "main", false, None);
+  network::metrics::setup(&"127.0.0.1:8125".parse().unwrap(), "main", false, None);
   gauge!("sozu.TEST", 42);
 
-  let config = messages::HttpProxyConfiguration {
+  let config = messages::HttpListener {
     front: "127.0.0.1:8080".parse().expect("could not parse address"),
     ..Default::default()
   };
@@ -39,6 +39,7 @@ fn main() {
 
   let http_front = messages::HttpFront {
     app_id:     String::from("app_1"),
+    address:    "127.0.0.1:8080".parse().unwrap(),
     hostname:   String::from("lolcatho.st"),
     path_begin: String::from("/")
   };
@@ -47,8 +48,7 @@ fn main() {
     app_id:      String::from("app_1"),
     backend_id:  String::from("app_1-0"),
     sticky_id:   None,
-    ip_address:  String::from("127.0.0.1"),
-    port:        1026,
+    address:     "127.0.0.1:1026".parse().unwrap(),
     load_balancing_parameters: Some(LoadBalancingParams::default()),
     backup:      None,
   };
@@ -67,7 +67,7 @@ fn main() {
   info!("MAIN\tHTTP -> {:?}", command.read_message());
 
 
-  let config = messages::HttpsProxyConfiguration {
+  let config = messages::HttpsListener {
     front: "127.0.0.1:8443".parse().expect("could not parse address"),
     cipher_list: String::from("ECDHE-ECDSA-CHACHA20-POLY1305:\
     ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:\
@@ -104,6 +104,7 @@ fn main() {
   command2.write_message(&messages::OrderMessage {
     id:    String::from("ID_IJKL1"),
     order: messages::Order::AddCertificate(messages::AddCertificate{
+      front: "127.0.0.1:8443".parse().unwrap(),
       certificate: certificate_and_key,
       names: Vec::new(),
     })
@@ -111,6 +112,7 @@ fn main() {
 
   let tls_front = messages::HttpsFront {
     app_id:      String::from("app_1"),
+    address:     "127.0.0.1:8443".parse().unwrap(),
     hostname:    String::from("lolcatho.st"),
     path_begin:  String::from("/"),
     fingerprint: messages::CertFingerprint(hex::FromHex::from_hex("AB2618B674E15243FD02A5618C66509E4840BA60E7D64CEBEC84CDBFECEEE0C5").unwrap()),
@@ -124,8 +126,7 @@ fn main() {
     app_id:      String::from("app_1"),
     backend_id:  String::from("app_1-0"),
     sticky_id:   None,
-    ip_address:  String::from("127.0.0.1"),
-    port:        1026,
+    address:     "127.0.0.1:1026".parse().unwrap(),
     load_balancing_parameters: Some(LoadBalancingParams::default()),
     backup:      None,
   };
@@ -147,6 +148,7 @@ fn main() {
   command2.write_message(&messages::OrderMessage {
     id:    String::from("ID_QRST1"),
     order: messages::Order::AddCertificate(messages::AddCertificate {
+      front: "127.0.0.1:8443".parse().unwrap(),
       certificate: certificate_and_key2,
       names: Vec::new(),
     })
@@ -154,6 +156,7 @@ fn main() {
 
   let tls_front2 = messages::HttpsFront {
     app_id:      String::from("app_2"),
+    address:     "127.0.0.1:8443".parse().unwrap(),
     hostname:    String::from("test.local"),
     path_begin:  String::from("/"),
     fingerprint: messages::CertFingerprint(hex::FromHex::from_hex("7E8EBF9AD0645AB755A2E51EB3734B91D4ACACEF1F28AD9D96D9385487FAE6E6").unwrap()),
@@ -168,8 +171,7 @@ fn main() {
     app_id:      String::from("app_2"),
     backend_id:  String::from("app_2-0"),
     sticky_id:   None,
-    ip_address:  String::from("127.0.0.1"),
-    port:        1026,
+    address:     "127.0.0.1:1026".parse().unwrap(),
     load_balancing_parameters: Some(LoadBalancingParams::default()),
     backup:      None,
   };

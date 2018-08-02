@@ -713,7 +713,7 @@ impl ServerConfiguration {
   }
 
   pub fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, event_loop: &mut Poll) -> bool {
-    if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == *front) {
+    if let Some(listener) = self.listeners.values_mut().find(|l| l.address == *front) {
       self.fronts.insert(app_id.to_string(), listener.token);
       info!("add_tcp_front: fronts are now: {:?}", self.fronts);
       listener.app_id = Some(app_id.to_string());
@@ -724,7 +724,7 @@ impl ServerConfiguration {
   }
 
   pub fn remove_tcp_front(&mut self, front: SocketAddr, event_loop: &mut Poll) -> bool {
-    if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front) {
+    if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front) {
       if let Some(app_id) = listener.app_id.take() {
         self.fronts.remove(&app_id);
       }
@@ -1129,10 +1129,22 @@ mod tests {
         entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
       }
 
-      let (configuration, tokens) = ServerConfiguration::new(&mut poll, pool, Vec::new(), vec!());
+      let mut configuration = ServerConfiguration::new();
+      let listener_config = TcpListenerConfig {
+        front: "127.0.0.1:1234".parse().unwrap(),
+        public_address: None,
+        expect_proxy: false,
+      };
+
+      {
+        let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+        let _ = configuration.add_listener(listener_config, &mut poll, pool.clone(), None, Token(entry.index().0));
+        entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::TCPListen })));
+      }
+
       let (scm_server, scm_client) = UnixStream::pair().unwrap();
       let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()),
-        clients, None, None, Some(configuration), None, max_buffers);
+        clients, pool, None, None, Some(configuration), None, max_buffers);
       info!("will run");
       s.run();
       info!("ending event loop");
@@ -1142,14 +1154,12 @@ mod tests {
     {
       let front = TcpFront {
         app_id: String::from("yolo"),
-        ip_address: String::from("127.0.0.1"),
-        port: 1234,
+        address: "127.0.0.1:1234".parse().unwrap(),
       };
       let backend = messages::Backend {
         app_id: String::from("yolo"),
         backend_id: String::from("yolo-0"),
-        ip_address: String::from("127.0.0.1"),
-        port: 5678,
+        address: "127.0.0.1:5678".parse().unwrap(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         sticky_id: None,
         backup: None,
@@ -1161,14 +1171,12 @@ mod tests {
     {
       let front = TcpFront {
         app_id: String::from("yolo"),
-        ip_address: String::from("127.0.0.1"),
-        port: 1235,
+        address: "127.0.0.1:1235".parse().unwrap(),
       };
       let backend = messages::Backend {
         app_id: String::from("yolo"),
         backend_id: String::from("yolo-0"),
-        ip_address: String::from("127.0.0.1"),
-        port: 5678,
+        address: "127.0.0.1:5678".parse().unwrap(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         sticky_id: None,
         backup: None,
@@ -1183,44 +1191,5 @@ mod tests {
     println!("read_message: {:?}", command.read_message().unwrap());
 
     command
-  }
-  #[test]
-  fn it_should_remove_the_backend_address_in_app_listener() {
-    let mut application_listener  = ApplicationListener {
-      app_id:         "".to_string(),
-      sock:           None,
-      token:          None,
-      front_address:  SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0000),
-      back_addresses: vec![
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3000),
-      ],
-    };
-
-    let back_address_to_remove = &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080);
-
-    application_listener.remove_backend_address(back_address_to_remove);
-
-    assert!(vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3000)] == application_listener.back_addresses)
-  }
-
-  #[test]
-  fn it_should_not_remove_a_backend_address_in_app_listener_when_he_is_not_there() {
-    let mut application_listener  = ApplicationListener {
-      app_id:         "".to_string(),
-      sock:           None,
-      token:          None,
-      front_address:  SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0000),
-      back_addresses: vec![
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 3000),
-      ],
-    };
-
-    let back_address_to_remove = &SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 0, 1)), 4040);
-
-    application_listener.remove_backend_address(back_address_to_remove);
-
-    assert!(2 == application_listener.back_addresses.len())
   }
 }

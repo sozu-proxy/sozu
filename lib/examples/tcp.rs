@@ -7,7 +7,7 @@ use std::thread;
 use std::io::stdout;
 use sozu::network;
 use sozu_command::messages;
-use sozu_command::messages::LoadBalancingParams;
+use sozu_command::messages::{TcpListener, LoadBalancingParams};
 use sozu_command::channel::Channel;
 use sozu_command::logging::{Logger,LoggerBackend};
 
@@ -29,20 +29,23 @@ fn main() {
     let max_listeners = 500;
     let max_buffers   = 500;
     let buffer_size   = 16384;
+    let listener = TcpListener {
+      front: "127.0.0.1:8080".parse().unwrap(),
+      public_address: None,
+      expect_proxy: false,
+    };
     Logger::init("TCP".to_string(), "debug", LoggerBackend::Stdout(stdout()), None);
-    network::tcp::start(max_buffers, buffer_size, channel);
+    network::tcp::start(listener, max_buffers, buffer_size, channel);
   });
 
   let tcp_front = messages::TcpFront {
-    app_id:     String::from("test"),
-    ip_address: String::from("127.0.0.1"),
-    port:       8080,
+    app_id:  String::from("test"),
+    address: "127.0.0.1:8080".parse().unwrap(),
   };
   let tcp_backend = messages::Backend {
-    app_id:      String::from("test"),
-    backend_id:  String::from("test-0"),
-    ip_address:  String::from("127.0.0.1"),
-    port:        1026,
+    app_id:     String::from("test"),
+    backend_id: String::from("test-0"),
+    address:    "127.0.0.1:1026".parse().unwrap(),
     load_balancing_parameters: Some(LoadBalancingParams::default()),
     sticky_id:   None,
     backup:      None,

@@ -1332,7 +1332,7 @@ mod tests {
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
-  use sozu_command::messages::{Order,HttpFront,Backend,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer, LoadBalancingParams};
+  use sozu_command::messages::{Order,HttpFront,Backend,HttpListener,OrderMessage,OrderMessageAnswer, LoadBalancingParams};
   use network::buffer_queue::BufferQueue;
   use network::pool::Pool;
   use sozu_command::config::LoadBalancingAlgorithms;
@@ -1346,7 +1346,7 @@ mod tests {
     barrier.wait();
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
-    let config = HttpProxyConfiguration {
+    let config = HttpListener {
       front: front,
       ..Default::default()
     };
@@ -1357,9 +1357,9 @@ mod tests {
       start(config, channel, 10, 16384);
     });
 
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
+    let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1024".parse().unwrap(), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
-    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1025, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
+    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), address: "127.0.0.1:1025".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1403,7 +1403,7 @@ mod tests {
     barrier.wait();
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1031").expect("could not parse address");
-    let config = HttpProxyConfiguration {
+    let config = HttpListener {
       front: front,
       ..Default::default()
     };
@@ -1414,9 +1414,9 @@ mod tests {
       start(config, channel, 10, 16384);
     });
 
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
+    let front = HttpFront { app_id: String::from("app_1"), address: "137.0.0.1:1031".parse().unwrap(), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
-    let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1028, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
+    let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1481,7 +1481,7 @@ mod tests {
   fn https_redirect() {
     setup_test_logger!();
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1041").expect("could not parse address");
-    let config = HttpProxyConfiguration {
+    let config = HttpListener {
       front: front,
       ..Default::default()
     };
@@ -1494,9 +1494,9 @@ mod tests {
 
     let application = Application { app_id: String::from("app_1"), sticky_session: false, https_redirect: true, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::default() };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddApplication(application) });
-    let front = HttpFront { app_id: String::from("app_1"), hostname: String::from("localhost"), path_begin: String::from("/") };
+    let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1041".parse().unwrap(), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddHttpFront(front) });
-    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1040, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
+    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), address: "127.0.0.1:1040".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&OrderMessage { id: String::from("ID_IJKL"), order: Order::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1574,22 +1574,19 @@ mod tests {
 
     let mut fronts = TrieNode::root();
     fronts.domain_insert(Vec::from(&b"lolcatho.st"[..]), vec![
-      HttpFront { app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1 },
-      HttpFront { app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2 },
-      HttpFront { app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3 }
+      HttpFront { app_id: app_id1, address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(), path_begin: uri1 },
+      HttpFront { app_id: app_id2, address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(), path_begin: uri2 },
+      HttpFront { app_id: app_id3, address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(), path_begin: uri3 }
     ]);
     fronts.domain_insert(Vec::from(&b"other.domain"[..]), vec![
-      HttpFront { app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned() },
+      HttpFront { app_id: "app_1".to_owned(), address: "0.0.0.0:80".parse().unwrap(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned() },
     ]);
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
-    let listener = net::TcpListener::bind(&front).expect("should bind TCP socket");
-    let server_config = ServerConfiguration {
-      listener:  Some(listener),
-      address:   front,
-      applications: HashMap::new(),
-      backends:  BackendMap::new(),
-      fronts:    fronts,
+    let listener = Listener {
+      listener: None,
+      address:  front,
+      fronts,
       pool:      Rc::new(RefCell::new(Pool::with_capacity(1,0, || BufferQueue::with_capacity(16384)))),
       answers:   DefaultAnswers {
         NotFound: Rc::new(Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..])),
@@ -1599,13 +1596,14 @@ mod tests {
         )),
       },
       config: Default::default(),
+      token: Token(0),
     };
 
-    let frontend1 = server_config.frontend_from_request("lolcatho.st", "/");
-    let frontend2 = server_config.frontend_from_request("lolcatho.st", "/test");
-    let frontend3 = server_config.frontend_from_request("lolcatho.st", "/yolo/test");
-    let frontend4 = server_config.frontend_from_request("lolcatho.st", "/yolo/swag");
-    let frontend5 = server_config.frontend_from_request("domain", "/");
+    let frontend1 = listener.frontend_from_request("lolcatho.st", "/");
+    let frontend2 = listener.frontend_from_request("lolcatho.st", "/test");
+    let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test");
+    let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag");
+    let frontend5 = listener.frontend_from_request("domain", "/");
     assert_eq!(frontend1.expect("should find frontend").app_id, "app_1");
     assert_eq!(frontend2.expect("should find frontend").app_id, "app_1");
     assert_eq!(frontend3.expect("should find frontend").app_id, "app_2");
