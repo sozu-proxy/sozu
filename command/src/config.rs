@@ -21,8 +21,7 @@ use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Listener {
-  pub address:            String,
-  pub port:               u16,
+  pub address:            SocketAddr,
   pub protocol:           FileListenerProtocolConfig,
   pub public_address:     Option<String>,
   pub answer_404:         Option<String>,
@@ -40,10 +39,9 @@ fn default_sticky_name() -> String {
 }
 
 impl Listener {
-  pub fn new(address: String, port: u16, protocol: FileListenerProtocolConfig) -> Listener {
+  pub fn new(address: SocketAddr, protocol: FileListenerProtocolConfig) -> Listener {
     Listener {
       address,
-      port,
       protocol,
       public_address:     None,
       answer_404:         None,
@@ -62,11 +60,11 @@ impl Listener {
       return None;
     }
 
+    /*FIXME
     let mut address = self.address.clone();
     address.push(':');
     address.push_str(&self.port.to_string());
 
-    let public_address = self.public_address.as_ref().and_then(|addr| FromStr::from_str(&addr).ok());
     let http_proxy_configuration = match address.parse() {
       Ok(addr) => Some(addr),
       Err(err) => {
@@ -74,6 +72,9 @@ impl Listener {
         None
       }
     };
+    */
+    let public_address = self.public_address.as_ref().and_then(|addr| FromStr::from_str(&addr).ok());
+    let http_proxy_configuration = Some(self.address.clone());
 
     http_proxy_configuration.map(|addr| {
       let mut configuration = HttpListener {
@@ -108,10 +109,6 @@ impl Listener {
       error!("cannot convert listener to HTTPS");
       return None;
     }
-
-    let mut address = self.address.clone();
-    address.push(':');
-    address.push_str(&self.port.to_string());
 
     let public_address     = self.public_address.as_ref().and_then(|addr| FromStr::from_str(&addr).ok());
     let cipher_list:String = self.cipher_list.clone().unwrap_or(
@@ -148,13 +145,8 @@ impl Listener {
 
     let rustls_cipher_list = self.rustls_cipher_list.clone().unwrap_or(Vec::new());
 
-    let tls_proxy_configuration = match address.parse() {
-      Ok(addr) => Some(addr),
-      Err(err) => {
-        error!("Couldn't parse address of TLS proxy: {}", err);
-        None
-      }
-    };
+    //FIXME
+    let tls_proxy_configuration = Some(self.address.clone());
 
     let versions = match self.tls_versions {
       None    => vec!(TlsVersion::TLSv1_1, TlsVersion::TLSv1_2),
@@ -199,18 +191,21 @@ impl Listener {
   }
 
   pub fn to_tcp(&self) -> Option<TcpListener> {
-    let mut address = self.address.clone();
+    /*let mut address = self.address.clone();
     address.push(':');
     address.push_str(&self.port.to_string());
+    */
 
     let public_address = self.public_address.as_ref().and_then(|addr| FromStr::from_str(&addr).ok());
-    let addr_parsed = match address.parse() {
+    /*let addr_parsed = match address.parse() {
       Ok(addr) => Some(addr),
       Err(err) => {
         error!("Couldn't parse address of HTTP proxy: {}", err);
         None
       }
     };
+    */
+    let addr_parsed = Some(self.address.clone());
 
     addr_parsed.map(|addr| {
       TcpListener {
@@ -227,8 +222,7 @@ impl Listener {
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
-  pub address:        String,
-  pub port:           u16,
+  pub address:        SocketAddr,
   #[serde(default)]
   pub tagged_metrics: bool,
   #[serde(default)]
@@ -246,8 +240,7 @@ pub enum ProxyProtocolConfig {
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileAppFrontendConfig {
-  pub address:           String,
-  pub port:              u16,
+  pub address:           SocketAddr,
   pub hostname:          Option<String>,
   pub path_begin:        Option<String>,
   pub certificate:       Option<String>,
@@ -274,8 +267,7 @@ impl FileAppFrontendConfig {
     }
 
     Ok(TcpFrontendConfig {
-      ip_address: self.address.clone(),
-      port: self.port,
+      address: self.address.clone(),
     })
   }
 
@@ -299,8 +291,7 @@ impl FileAppFrontendConfig {
       .map(split_certificate_chain);
 
     Ok(HttpFrontendConfig {
-      ip_address:        self.address.clone(),
-      port:              self.port,
+      address:           self.address.clone(),
       hostname:          self.hostname.clone().unwrap(),
       path_begin:        self.path_begin.clone().unwrap_or(String::new()),
       certificate:       certificate_opt,
@@ -452,8 +443,7 @@ impl FileAppConfig {
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpFrontendConfig {
-  pub ip_address:        String,
-  pub port:              u16,
+  pub address:           SocketAddr,
   pub hostname:          String,
   pub path_begin:        String,
   pub certificate:       Option<String>,
@@ -466,14 +456,9 @@ impl HttpFrontendConfig {
     let mut v = Vec::new();
 
     if self.key.is_some() && self.certificate.is_some() {
-      let mut address = self.ip_address.clone();
-      address.push(':');
-      address.push_str(&self.port.to_string());
-      let address: SocketAddr = address.parse().expect("invalid frontend address");
-
 
       v.push(Order::AddCertificate(AddCertificate{
-        front: address.clone(),
+        front: self.address.clone(),
         certificate: CertificateAndKey {
           key:               self.key.clone().unwrap(),
           certificate:       self.certificate.clone().unwrap(),
@@ -485,8 +470,7 @@ impl HttpFrontendConfig {
       if let Some(f) = calculate_fingerprint(&self.certificate.as_ref().unwrap().as_bytes()[..]) {
         v.push(Order::AddHttpsFront(HttpsFront {
           app_id:      app_id.clone().to_string(),
-          ip_address:  self.ip_address.clone(),
-          port:        self.port,
+          address:     self.address.clone(),
           hostname:    self.hostname.clone(),
           path_begin:  self.path_begin.clone(),
           fingerprint: CertFingerprint(f),
@@ -498,8 +482,7 @@ impl HttpFrontendConfig {
       //create the front both for HTTP and HTTPS if possible
       v.push(Order::AddHttpFront(HttpFront {
         app_id:     app_id.clone().to_string(),
-        ip_address: self.ip_address.clone(),
-        port:       self.port,
+        address:    self.address.clone(),
         hostname:   self.hostname.clone(),
         path_begin: self.path_begin.clone(),
       }));
@@ -539,9 +522,6 @@ impl HttpAppConfig {
 
     let mut backend_count = 0usize;
     for backend in self.backends.iter() {
-        let ip   = format!("{}", backend.address.ip());
-        let port = backend.address.port();
-
         let load_balancing_parameters = Some(LoadBalancingParams {
           weight: backend.weight.unwrap_or(100),
         });
@@ -549,8 +529,7 @@ impl HttpAppConfig {
         v.push(Order::AddBackend(Backend {
           app_id:     self.app_id.clone(),
           backend_id:  format!("{}-{}", self.app_id, backend_count),
-          ip_address: ip,
-          port:       port,
+          address:    backend.address.clone(),
           load_balancing_parameters,
           sticky_id:  backend.sticky_id.clone(),
           backup:     backend.backup.clone(),
@@ -565,8 +544,7 @@ impl HttpAppConfig {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct TcpFrontendConfig {
-  pub ip_address:        String,
-  pub port:              u16,
+  pub address: SocketAddr,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
@@ -593,17 +571,13 @@ impl TcpAppConfig {
 
     for frontend in self.frontends.iter() {
       v.push(Order::AddTcpFront(TcpFront {
-        app_id:         self.app_id.clone(),
-        ip_address:     frontend.ip_address.clone(),
-        port:           frontend.port,
+        app_id:  self.app_id.clone(),
+        address: frontend.address.clone(),
       }));
     }
 
     let mut backend_count = 0usize;
     for backend in self.backends.iter() {
-      let ip   = format!("{}", backend.address.ip());
-      let port = backend.address.port();
-
       let load_balancing_parameters = Some(LoadBalancingParams {
         weight: backend.weight.unwrap_or(100),
       });
@@ -611,8 +585,7 @@ impl TcpAppConfig {
       v.push(Order::AddBackend(Backend {
         app_id:     self.app_id.clone(),
         backend_id: format!("{}-{}", self.app_id, backend_count),
-        ip_address: ip,
-        port:       port,
+        address:    backend.address.clone(),
         load_balancing_parameters,
         sticky_id:  backend.sticky_id.clone(),
         backup:     backend.backup.clone(),
@@ -679,19 +652,18 @@ impl FileConfig {
       }
       Ok(config) => {
         let config: FileConfig = config;
-        let mut reserved_address: HashSet<(String,u16)> = HashSet::new();
+        let mut reserved_address: HashSet<SocketAddr> = HashSet::new();
 
 
         if let Some(l) = config.listeners.as_ref() {
           for listener in l.iter() {
-            let address = (listener.address.clone(), listener.port);
-            if reserved_address.contains(&address) {
-              println!("listening address ( {}:{} ) is already used in the configuration", address.0, address.1);
+            if reserved_address.contains(&listener.address) {
+              println!("listening address {:?} is already used in the configuration", listener.address);
               return Err(Error::new(
                 ErrorKind::InvalidData,
-                format!("listening address ( {}:{} ) is already used in the configuration", address.0, address.1)));
+                format!("listening address {:?} is already used in the configuration", listener.address)));
             } else {
-              reserved_address.insert(address);
+              reserved_address.insert(listener.address.clone());
             }
           }
         }
@@ -731,11 +703,11 @@ impl FileConfig {
 
     if let Some(listeners) = self.listeners {
       for listener in listeners.iter() {
-        if known_addresses.contains_key(&(listener.address.clone(), listener.port)) {
-          panic!("there's already a listener for address {} and port {}", listener.address, listener.port);
+        if known_addresses.contains_key(&listener.address) {
+          panic!("there's already a listener for address {:?}", listener.address);
         }
 
-        known_addresses.insert((listener.address.clone(), listener.port), listener.protocol);
+        known_addresses.insert(listener.address.clone(), listener.protocol);
 
         match listener.protocol {
           FileListenerProtocolConfig::Https => {
@@ -770,7 +742,7 @@ impl FileConfig {
             match app_config {
               AppConfig::Http(ref http) => {
                 for frontend in http.frontends.iter() {
-                  match known_addresses.get(&(frontend.ip_address.clone(), frontend.port)) {
+                  match known_addresses.get(&frontend.address.clone()) {
                     Some(FileListenerProtocolConfig::Tcp) => {
                       panic!("cannot set up a HTTP or HTTPS frontend on a TCP listener");
                     },
@@ -789,17 +761,17 @@ impl FileConfig {
                     None => {
                       // create a default listener for that front
                       let p = if frontend.certificate.is_some() {
-                        let listener = Listener::new(frontend.ip_address.clone(), frontend.port, FileListenerProtocolConfig::Https);
+                        let listener = Listener::new(frontend.address.clone(), FileListenerProtocolConfig::Https);
                         https_listeners.push(listener.to_tls().unwrap());
 
                         FileListenerProtocolConfig::Https
                       } else {
-                        let listener = Listener::new(frontend.ip_address.clone(), frontend.port, FileListenerProtocolConfig::Http);
+                        let listener = Listener::new(frontend.address.clone(), FileListenerProtocolConfig::Http);
                         http_listeners.push(listener.to_http().unwrap());
 
                         FileListenerProtocolConfig::Http
                       };
-                      known_addresses.insert((frontend.ip_address.clone(), frontend.port), p);
+                      known_addresses.insert(frontend.address.clone(), p);
                     },
                   }
                 }
@@ -807,16 +779,16 @@ impl FileConfig {
               AppConfig::Tcp(ref tcp) => {
                 //FIXME: verify that different TCP apps do not request the same address
                 for frontend in tcp.frontends.iter() {
-                  match known_addresses.get(&(frontend.ip_address.clone(), frontend.port)) {
+                  match known_addresses.get(&frontend.address) {
                     Some(FileListenerProtocolConfig::Http) | Some(FileListenerProtocolConfig::Https) => {
                       panic!("cannot set up a TCP frontend on a HTTP listener");
                     },
                     Some(FileListenerProtocolConfig::Tcp) => {},
                     None => {
                       // create a default listener for that front
-                      let listener = Listener::new(frontend.ip_address.clone(), frontend.port, FileListenerProtocolConfig::Tcp);
+                      let listener = Listener::new(frontend.address.clone(), FileListenerProtocolConfig::Tcp);
                       tcp_listeners.push(listener.to_tcp().unwrap());
-                      known_addresses.insert((frontend.ip_address.clone(), frontend.port), FileListenerProtocolConfig::Tcp);
+                      known_addresses.insert(frontend.address.clone(), FileListenerProtocolConfig::Tcp);
                     },
                   }
                 }
@@ -1018,8 +990,7 @@ mod tests {
   #[test]
   fn serialize() {
     let http = Listener {
-      address: String::from("127.0.0.1"),
-      port: 8080,
+      address: "127.0.0.1:8080".parse().unwrap(),
       protocol: FileListenerProtocolConfig::Http,
       answer_404: Some(String::from("404.html")),
       answer_503: None,
@@ -1032,8 +1003,7 @@ mod tests {
     };
     println!("http: {:?}", to_string(&http));
     let https = Listener {
-      address: String::from("127.0.0.1"),
-      port: 8443,
+      address: "127.0.0.1:8443".parse().unwrap(),
       protocol: FileListenerProtocolConfig::Https,
       answer_404: Some(String::from("404.html")),
       answer_503: None,
@@ -1065,8 +1035,7 @@ mod tests {
       log_target: None,
       log_access_target: None,
       metrics: Some(MetricsConfig {
-        address: String::from("192.168.59.103"),
-        port:    8125,
+        address: "127.0.0.1:8125".parse().unwrap(),
         tagged_metrics: false,
         prefix: Some(String::from("sozu-metrics")),
       }),

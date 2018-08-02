@@ -14,16 +14,14 @@ pub type AppId = String;
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
 pub struct HttpProxy {
-  ip_address: String,
-  port:       u16,
-  fronts:     HashMap<AppId, Vec<HttpFront>>,
-  backends:   HashMap<AppId, Vec<Backend>>,
+  address:  SocketAddr,
+  fronts:   HashMap<AppId, Vec<HttpFront>>,
+  backends: HashMap<AppId, Vec<Backend>>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize, Deserialize)]
 pub struct HttpsProxy {
-  ip_address:   String,
-  port:         u16,
+  address:      SocketAddr,
   certificates: HashMap<CertFingerprint, CertificateAndKey>,
   fronts:       HashMap<AppId, Vec<HttpsFront>>,
   backends:     HashMap<AppId, Vec<Backend>>,
@@ -42,8 +40,8 @@ pub struct ConfigState {
   // certificate and names
   pub certificates:    HashMap<SocketAddr, HashMap<CertFingerprint, (CertificateAndKey, Vec<String>)>>,
   //ip, port
-  pub http_addresses:  Vec<(String, u16)>,
-  pub https_addresses: Vec<(String, u16)>,
+  pub http_addresses:  Vec<SocketAddr>,
+  pub https_addresses: Vec<SocketAddr>,
   //tcp:
 }
 
@@ -64,12 +62,12 @@ impl ConfigState {
     }
   }
 
-  pub fn add_http_address(&mut self, ip_address: String, port: u16) {
-    self.http_addresses.push((ip_address, port))
+  pub fn add_http_address(&mut self, address: SocketAddr) {
+    self.http_addresses.push(address)
   }
 
-  pub fn add_https_address(&mut self, ip_address: String, port: u16) {
-    self.https_addresses.push((ip_address, port))
+  pub fn add_https_address(&mut self, address: SocketAddr) {
+    self.https_addresses.push(address)
   }
 
   /// returns true if the order modified something
@@ -206,7 +204,7 @@ impl ConfigState {
       &Order::RemoveTcpFront(ref front) => {
         if let Some(front_list) = self.tcp_fronts.get_mut(&front.app_id) {
           let len = front_list.len();
-          front_list.retain(|el| el.ip_address != front.ip_address || el.port != front.port);
+          front_list.retain(|el| el.address != front.address);
           front_list.len() != len
         } else {
           false
@@ -224,7 +222,7 @@ impl ConfigState {
       &Order::RemoveBackend(ref backend) => {
         if let Some(backend_list) = self.backends.get_mut(&backend.app_id) {
           let len = backend_list.len();
-          backend_list.retain(|el| el.ip_address != backend.ip_address || el.port != backend.port);
+          backend_list.retain(|el| el.address != backend.address);
           backend_list.len() != len
         } else {
           false
@@ -404,8 +402,7 @@ impl ConfigState {
       v.push(Order::RemoveBackend(RemoveBackend{
         app_id: backend.app_id.clone(),
         backend_id: backend.backend_id.clone(),
-        ip_address: backend.ip_address.clone(),
-        port: backend.port,
+        address:    backend.address.clone(),
       }));
     }
 
@@ -509,13 +506,13 @@ mod tests {
   #[test]
   fn serialize() {
     let mut state:ConfigState = Default::default();
-    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), ip_address: String::from("0.0.0.0"), port: 8080 }));
-    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc"), ip_address: String::from("0.0.0.0"), port: 8080 }));
-    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1026, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
-    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-1"), ip_address: String::from("127.0.0.2"), port: 1027, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
-    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_2"), backend_id: String::from("app_2-0"), ip_address: String::from("192.167.1.2"), port: 1026, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
-    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-3"),ip_address: String::from("192.168.1.3"), port: 1027, load_balancing_parameters: Some(LoadBalancingParams::default()) , sticky_id: None, backup: None }));
-    state.handle_order(&Order::RemoveBackend(RemoveBackend { app_id: String::from("app_1"), backend_id: String::from("app_1-3"), ip_address: String::from("192.168.1.3"), port: 1027 }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), address: "0.0.0.0:8080".parse().unwrap() }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc"), address: "0.0.0.0:8080".parse().unwrap() }));
+    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
+    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-1"), address: "127.0.0.2:1027".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
+    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_2"), backend_id: String::from("app_2-0"), address: "192.167.1.2:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
+    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-3"), address: "192.168.1.3:1027".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()) , sticky_id: None, backup: None }));
+    state.handle_order(&Order::RemoveBackend(RemoveBackend { app_id: String::from("app_1"), backend_id: String::from("app_1-3"), address: "192.168.1.3:1027".parse().unwrap() }));
 
     /*
     let encoded = state.encode();
@@ -531,24 +528,24 @@ mod tests {
   #[test]
   fn diff() {
     let mut state:ConfigState = Default::default();
-    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), ip_address: String::from("0.0.0.0"), port: 8080 }));
-    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc"), ip_address: String::from("0.0.0.0"), port: 8080 }));
-    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1026, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
-    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-1"), ip_address: String::from("127.0.0.2"), port: 1027, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
-    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_2"), backend_id: String::from("app_2-0"), ip_address: String::from("192.167.1.2"), port: 1026, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), address: "0.0.0.0:8080".parse().unwrap() }));
+    state.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc"), address: "0.0.0.0:8080".parse().unwrap() }));
+    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
+    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-1"), address: "127.0.0.2:1027".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
+    state.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_2"), backend_id: String::from("app_2-0"), address: "192.167.1.2:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state.handle_order(&Order::AddApplication(Application { app_id: String::from("app_2"), sticky_session: true, https_redirect: true, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::RoundRobin }));
 
     let mut state2:ConfigState = Default::default();
-    state2.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), ip_address: String::from("0.0.0.0"), port: 8080 }));
-    state2.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), ip_address: String::from("127.0.0.1"), port: 1026, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
-    state2.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-1"), ip_address: String::from("127.0.0.2"), port: 1027, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
-    state2.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-2"), ip_address: String::from("127.0.0.2"), port: 1028, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
+    state2.handle_order(&Order::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path_begin: String::from("/"), address: "0.0.0.0:8080".parse().unwrap() }));
+    state2.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
+    state2.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-1"), address: "127.0.0.2:1027".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
+    state2.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-2"), address: "127.0.0.2:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state2.handle_order(&Order::AddApplication(Application { app_id: String::from("app_3"), sticky_session: false, https_redirect: false, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::RoundRobin }));
 
    let e = vec!(
-     Order::RemoveHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc"), ip_address: String::from("0.0.0.0"), port: 8080 }),
-     Order::RemoveBackend(RemoveBackend { app_id: String::from("app_2"), backend_id: String::from("app_2-0"), ip_address: String::from("192.167.1.2"), port: 1026 }),
-     Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-2"), ip_address: String::from("127.0.0.2"), port: 1028, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None }),
+     Order::RemoveHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path_begin: String::from("/abc"), address: "0.0.0.0:8080".parse().unwrap() }),
+     Order::RemoveBackend(RemoveBackend { app_id: String::from("app_2"), backend_id: String::from("app_2-0"), address: "192.167.1.2:1026".parse().unwrap() }),
+     Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-2"), address: "127.0.0.2:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None }),
      Order::RemoveApplication(String::from("app_2")),
      Order::AddApplication(Application { app_id: String::from("app_3"), sticky_session: false, https_redirect: false, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::RoundRobin }),
    );
@@ -562,7 +559,7 @@ mod tests {
    let hash1 = state.hash_state();
    let hash2 = state2.hash_state();
    let mut state3 = state.clone();
-   state3.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-2"), ip_address: String::from("127.0.0.2"), port: 1028, load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None }));
+   state3.handle_order(&Order::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-2"), address: "127.0.0.2:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None }));
    let hash3 = state3.hash_state();
    println!("state 1 hashes: {:#?}", hash1);
    println!("state 2 hashes: {:#?}", hash2);
@@ -578,8 +575,7 @@ mod tests {
       app_id: String::from("MyApp_1"),
       hostname: String::from("lolcatho.st"),
       path_begin: String::from(""),
-      ip_address: String::from("0.0.0.0"),
-      port: 8080,
+      address: "0.0.0.0:8080".parse().unwrap(),
     };
 
     let https_front_app1 = HttpsFront {
@@ -587,16 +583,14 @@ mod tests {
       hostname: String::from("lolcatho.st"),
       path_begin: String::from(""),
       fingerprint: CertFingerprint(vec!(0x00)),
-      ip_address: String::from("0.0.0.0"),
-      port: 8443,
+      address: "0.0.0.0:8443".parse().unwrap(),
     };
 
     let http_front_app2 = HttpFront {
       app_id: String::from("MyApp_2"),
       hostname: String::from("lolcatho.st"),
       path_begin: String::from("/api"),
-      ip_address: String::from("0.0.0.0"),
-      port: 8080,
+      address: "0.0.0.0:8080".parse().unwrap(),
     };
 
     let https_front_app2 = HttpsFront {
@@ -604,8 +598,7 @@ mod tests {
       hostname: String::from("lolcatho.st"),
       path_begin: String::from("/api"),
       fingerprint: CertFingerprint(vec!(0x00)),
-      ip_address: String::from("0.0.0.0"),
-      port: 8443,
+      address: "0.0.0.0:8443".parse().unwrap(),
     };
 
     let add_http_front_order_app1 = Order::AddHttpFront(http_front_app1);

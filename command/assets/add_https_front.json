@@ -6,8 +6,7 @@
     "type": "ADD_HTTPS_FRONT",
     "data": {
       "app_id": "xxx",
-      "ip_address": "0.0.0.0",
-      "port": 8443,
+      "address": "0.0.0.0:8443",
       "hostname": "yyy",
       "path_begin": "xxx",
       "fingerprint": "ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5"

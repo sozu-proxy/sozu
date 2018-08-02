@@ -159,12 +159,8 @@ impl BackendList {
   pub fn import_configuration_state(backend_vec: &Vec<messages::Backend>) -> BackendList {
     let mut list = BackendList::new();
     for ref backend in backend_vec {
-      let addr_string = backend.ip_address.to_string() + ":" + &backend.port.to_string();
-      let parsed:Option<SocketAddr> = addr_string.parse().ok();
-      if let Some(addr) = parsed {
-        let backend = Backend::new(&backend.backend_id, addr, backend.sticky_id.clone(), backend.load_balancing_parameters.clone(), backend.backup);
-        list.add_backend(backend);
-      }
+      let backend = Backend::new(&backend.backend_id, backend.address.clone(), backend.sticky_id.clone(), backend.load_balancing_parameters.clone(), backend.backup);
+      list.add_backend(backend);
     }
 
     list

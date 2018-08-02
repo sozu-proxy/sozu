@@ -162,6 +162,10 @@ pub enum FrontendCmd {
 pub enum HttpFrontendCmd {
   #[structopt(name = "add")]
   Add {
+    #[structopt(short = "i", long = "listener-ip")]
+    listener_ip: String,
+    #[structopt(short = "p", long = "listener-port")]
+    listener_port: u16,
     #[structopt(short = "i", long = "id", help = "app id of the frontend")]
     id: String,
     #[structopt(short = "host", long = "hostname")]
@@ -173,6 +177,10 @@ pub enum HttpFrontendCmd {
   },
   #[structopt(name = "remove")]
   Remove {
+    #[structopt(short = "i", long = "listener-ip")]
+    listener_ip: String,
+    #[structopt(short = "p", long = "listener-port")]
+    listener_port: u16,
     #[structopt(short = "i", long = "id", help = "app id of the frontend")]
     id: String,
     #[structopt(short = "host", long = "hostname")]
@@ -210,6 +218,10 @@ pub enum TcpFrontendCmd {
 pub enum CertificateCmd {
   #[structopt(name = "add")]
   Add {
+    #[structopt(short = "i", long = "listener-ip")]
+    listener_ip: String,
+    #[structopt(short = "p", long = "listener-port")]
+    listener_port: u16,
     #[structopt(long = "certificate", help = "path to the certificate")]
     certificate: String,
     #[structopt(long = "certificate-chain", help = "path to the certificate chain")]
@@ -219,11 +231,19 @@ pub enum CertificateCmd {
   },
   #[structopt(name = "remove")]
   Remove {
+    #[structopt(short = "i", long = "listener-ip")]
+    listener_ip: String,
+    #[structopt(short = "p", long = "listener-port")]
+    listener_port: u16,
     #[structopt(short = "cert", long = "certificate", help = "path to the certificate")]
     certificate: String,
   },
   #[structopt(name = "replace")]
   Replace {
+    #[structopt(short = "i", long = "listener-ip")]
+    listener_ip: String,
+    #[structopt(short = "p", long = "listener-port")]
+    listener_port: u16,
     #[structopt(long = "new-certificate", help = "path to the new certificate")]
     certificate: String,
     #[structopt(long = "new-certificate-chain", help = "path to the new certificate chain")]

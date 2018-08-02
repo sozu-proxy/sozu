@@ -78,7 +78,7 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
   command.readiness.insert(Ready::readable());
 
   if let Some(ref metrics) = proxy_config.metrics.as_ref() {
-    metrics::setup(&metrics.address, metrics.port, worker_id, metrics.tagged_metrics, metrics.prefix.clone());
+    metrics::setup(&metrics.address, worker_id, metrics.tagged_metrics, metrics.prefix.clone());
   }
 
   let mut server = Server::new_from_config(command, ScmSocket::new(scm), proxy_config, config_state);

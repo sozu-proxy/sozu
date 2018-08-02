@@ -11,6 +11,7 @@ mod command;
 mod cli;
 
 use std::io;
+use std::net::SocketAddr;
 use structopt::StructOpt;
 
 use sozu_command::config::Config;
@@ -69,10 +70,14 @@ fn main() {
     SubCmd::Frontend{ cmd } => {
       match cmd {
         FrontendCmd::Http{ cmd } => match cmd {
-          HttpFrontendCmd::Add{ id, hostname, path_begin, path_to_certificate } =>
-            add_http_frontend(channel, timeout, &id, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate),
-          HttpFrontendCmd::Remove{ id, hostname, path_begin, path_to_certificate } =>
-            remove_http_frontend(channel, timeout, &id, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate),
+          HttpFrontendCmd::Add{ id, hostname, path_begin, path_to_certificate, listener_ip, listener_port } => {
+            let address: SocketAddr = (format!("{}:{}", listener_ip, listener_port)).parse().expect("could not parse listener address");
+            add_http_frontend(channel, timeout, &id, address, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate)
+          },
+          HttpFrontendCmd::Remove{ id, hostname, path_begin, path_to_certificate, listener_ip, listener_port } => {
+            let address: SocketAddr = (format!("{}:{}", listener_ip, listener_port)).parse().expect("could not parse listener address");
+            remove_http_frontend(channel, timeout, &id, address, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate)
+          },
         },
         FrontendCmd::Tcp { cmd } => match cmd {
           TcpFrontendCmd::Add{ id, ip_address, port } =>
@@ -84,9 +89,18 @@ fn main() {
     },
     SubCmd::Certificate{ cmd } => {
       match cmd {
-        CertificateCmd::Add{ certificate, chain, key } => add_certificate(channel, timeout, &certificate, &chain, key.unwrap_or("missing key path".to_string()).as_str()),
-        CertificateCmd::Remove{ certificate } => remove_certificate(channel, timeout, &certificate),
-        CertificateCmd::Replace{ certificate, chain, key, old_certificate } => replace_certificate(channel, timeout, &certificate, &chain, &key.unwrap_or("missing key path".to_string()).as_str(), &old_certificate)
+        CertificateCmd::Add{ certificate, chain, key, listener_ip, listener_port } => {
+          let address: SocketAddr = (format!("{}:{}", listener_ip, listener_port)).parse().expect("could not parse listener address");
+          add_certificate(channel, timeout, address, &certificate, &chain, key.unwrap_or("missing key path".to_string()).as_str())
+        },
+        CertificateCmd::Remove{ certificate, listener_ip, listener_port } => {
+          let address: SocketAddr = (format!("{}:{}", listener_ip, listener_port)).parse().expect("could not parse listener address");
+          remove_certificate(channel, timeout, address, &certificate)
+        },
+        CertificateCmd::Replace{ certificate, chain, key, old_certificate,  listener_ip, listener_port } => {
+          let address: SocketAddr = (format!("{}:{}", listener_ip, listener_port)).parse().expect("could not parse listener address");
+          replace_certificate(channel, timeout, address, &certificate, &chain, &key.unwrap_or("missing key path".to_string()).as_str(), &old_certificate)
+        },
       }
     },
     SubCmd::Query{ cmd, json } => {

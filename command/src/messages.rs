@@ -1,11 +1,13 @@
 use serde;
 use serde::de::{self, Visitor};
 use hex::{self,FromHex};
+use std::fmt;
+use std::cmp::Ordering;
+use std::convert::From;
+use std::default::Default;
 use std::net::{IpAddr,SocketAddr};
 use std::collections::{BTreeMap,HashSet};
-use std::default::Default;
-use std::convert::From;
-use std::fmt;
+
 
 use config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
 
@@ -217,13 +219,31 @@ pub struct Application {
     pub load_balancing_policy: LoadBalancingAlgorithms,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
+fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {
+  a.ip().cmp(&b.ip()).then(a.port().cmp(&b.port()))
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpFront {
     pub app_id:     String,
-    pub ip_address: String,
-    pub port:       u16,
+    pub address:    SocketAddr,
     pub hostname:   String,
     pub path_begin: String,
+}
+
+impl Ord for HttpFront {
+  fn cmp(&self, o: &HttpFront) -> Ordering {
+    self.app_id.cmp(&o.app_id)
+      .then(self.hostname.cmp(&o.hostname))
+      .then(self.path_begin.cmp(&o.path_begin))
+      .then(socketaddr_cmp(&self.address, &o.address))
+  }
+}
+
+impl PartialOrd for HttpFront {
+  fn partial_cmp(&self, other: &HttpFront) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -264,44 +284,87 @@ pub struct ReplaceCertificate {
     pub new_names: Vec<String>,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpsFront {
     pub app_id:      String,
-    pub ip_address:  String,
-    pub port:        u16,
+    pub address:    SocketAddr,
     pub hostname:    String,
     pub path_begin:  String,
     pub fingerprint: CertFingerprint,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
-pub struct TcpFront {
-    pub app_id:     String,
-    pub ip_address: String,
-    pub port:       u16,
+impl Ord for HttpsFront {
+  fn cmp(&self, o: &HttpsFront) -> Ordering {
+    self.app_id.cmp(&o.app_id)
+      .then(self.hostname.cmp(&o.hostname))
+      .then(self.path_begin.cmp(&o.path_begin))
+      .then(self.fingerprint.cmp(&o.fingerprint))
+      .then(socketaddr_cmp(&self.address, &o.address))
+  }
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
+impl PartialOrd for HttpsFront {
+  fn partial_cmp(&self, other: &HttpsFront) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct TcpFront {
+    pub app_id:  String,
+    pub address: SocketAddr,
+}
+
+impl Ord for TcpFront {
+  fn cmp(&self, o: &TcpFront) -> Ordering {
+    self.app_id.cmp(&o.app_id)
+      .then(socketaddr_cmp(&self.address, &o.address))
+  }
+}
+
+impl PartialOrd for TcpFront {
+  fn partial_cmp(&self, other: &TcpFront) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
+}
+
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct Backend {
-    pub app_id:      String,
-    pub backend_id:  String,
-    pub ip_address:  String,
-    pub port:        u16,
+    pub app_id:     String,
+    pub backend_id: String,
+    pub address:    SocketAddr,
     #[serde(default)]
-    pub sticky_id:   Option<String>,
+    pub sticky_id:  Option<String>,
     #[serde(default)]
     #[serde(skip_serializing_if="Option::is_none")]
     pub load_balancing_parameters: Option<LoadBalancingParams>,
     #[serde(default)]
-    pub backup:      Option<bool>,
+    pub backup:     Option<bool>,
+}
+
+impl Ord for Backend {
+  fn cmp(&self, o: &Backend) -> Ordering {
+    self.app_id.cmp(&o.app_id)
+      .then(self.backend_id.cmp(&o.backend_id))
+      .then(self.sticky_id.cmp(&o.sticky_id))
+      .then(self.load_balancing_parameters.cmp(&o.load_balancing_parameters))
+      .then(self.backup.cmp(&o.backup))
+      .then(socketaddr_cmp(&self.address, &o.address))
+  }
+}
+
+impl PartialOrd for Backend {
+  fn partial_cmp(&self, other: &Backend) -> Option<Ordering> {
+    Some(self.cmp(other))
+  }
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct RemoveBackend {
-    pub app_id:      String,
-    pub backend_id:  String,
-    pub ip_address:  String,
-    pub port:        u16,
+    pub app_id:     String,
+    pub backend_id: String,
+    pub address:    SocketAddr,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,PartialOrd,Ord, Serialize, Deserialize)]
@@ -526,43 +589,40 @@ mod tests {
 
   #[test]
   fn add_front_test() {
-    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "ip_address": "127.0.0.1", "port": 4242, "sticky_session": false}}"#;
+    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "address": "127.0.0.1:4242", "sticky_session": false}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
-      ip_address: String::from("127.0.0.1"),
-      port: 4242,
+      address: "127.0.0.1:4242".parse().unwrap(),
     }));
   }
 
   #[test]
   fn remove_front_test() {
-    let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "ip_address": "127.0.0.1", "port": 4242}}"#;
+    let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "address": "127.0.0.1:4242"}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::RemoveHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
-      ip_address: String::from("127.0.0.1"),
-      port: 4242,
+      address: "127.0.0.1:4242".parse().unwrap(),
     }));
   }
 
 
   #[test]
   fn add_backend_test() {
-    let raw_json = r#"{"type": "ADD_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "ip_address": "yyy", "port": 8080, "load_balancing_parameters": { "weight": 0 }}}"#;
+    let raw_json = r#"{"type": "ADD_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080", "load_balancing_parameters": { "weight": 0 }}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::AddBackend(Backend{
       app_id: String::from("xxx"),
       backend_id: String::from("xxx-0"),
-      ip_address: String::from("yyy"),
-      port: 8080,
+      address: "0.0.0.0:8080".parse().unwrap(),
       sticky_id: None,
       load_balancing_parameters: Some(LoadBalancingParams{ weight: 0 }),
       backup: None,
@@ -571,42 +631,39 @@ mod tests {
 
   #[test]
   fn remove_backend_test() {
-    let raw_json = r#"{"type": "REMOVE_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "ip_address": "yyy", "port": 8080}}"#;
+    let raw_json = r#"{"type": "REMOVE_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080"}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::RemoveBackend(RemoveBackend {
       app_id: String::from("xxx"),
       backend_id: String::from("xxx-0"),
-      ip_address: String::from("yyy"),
-      port: 8080,
+      address: "0.0.0.0:8080".parse().unwrap(),
     }));
   }
 
   #[test]
   fn http_front_crash_test() {
-    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "aa", "hostname": "cltdl.fr", "path_begin": "", "ip_address": "127.0.0.1", "port": 4242}}"#;
+    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "aa", "hostname": "cltdl.fr", "path_begin": "", "address": "127.0.0.1:4242"}}"#;
     let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == Order::AddHttpFront(HttpFront{
       app_id: String::from("aa"),
       hostname: String::from("cltdl.fr"),
       path_begin: String::from(""),
-      ip_address: String::from("127.0.0.1"),
-      port: 4242,
+      address: "127.0.0.1:4242".parse().unwrap(),
     }));
   }
 
   #[test]
   fn http_front_crash_test2() {
-    let raw_json = r#"{"app_id": "aa", "hostname": "cltdl.fr", "path_begin": "", "ip_address": "127.0.0.1", "port": 4242 }"#;
+    let raw_json = r#"{"app_id": "aa", "hostname": "cltdl.fr", "path_begin": "", "address": "127.0.0.1:4242" }"#;
     let front: HttpFront = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}",front);
     assert!(front == HttpFront{
       app_id: String::from("aa"),
       hostname: String::from("cltdl.fr"),
       path_begin: String::from(""),
-      ip_address: String::from("127.0.0.1"),
-      port: 4242,
+      address: "127.0.0.1:4242".parse().unwrap(),
     });
   }
 }

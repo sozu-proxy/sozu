@@ -13,6 +13,7 @@ use std::thread;
 use std::sync::{Arc,Mutex};
 use std::time::Duration;
 use std::sync::mpsc;
+use std::net::SocketAddr;
 use rand::{thread_rng, Rng};
 use prettytable::Table;
 use prettytable::row::Row;
@@ -804,7 +805,8 @@ pub fn remove_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, t
   order_command(channel, timeout, Order::RemoveApplication(String::from(app_id)));
 }
 
-pub fn add_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
+pub fn add_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
+  address: SocketAddr, hostname: &str, path_begin: &str, certificate: Option<String>) {
   if let Some(certificate_path) = certificate {
     match Config::load_file_bytes(&certificate_path) {
       Ok(data) => {
@@ -813,6 +815,7 @@ pub fn add_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, ti
           Some(fingerprint) => {
             order_command(channel, timeout, Order::AddHttpsFront(HttpsFront {
               app_id: String::from(app_id),
+              address,
               hostname: String::from(hostname),
               path_begin: String::from(path_begin),
               fingerprint: CertFingerprint(fingerprint),
@@ -825,13 +828,15 @@ pub fn add_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, ti
   } else {
     order_command(channel, timeout, Order::AddHttpFront(HttpFront {
       app_id: String::from(app_id),
+      address,
       hostname: String::from(hostname),
       path_begin: String::from(path_begin),
     }));
   }
 }
 
-pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, hostname: &str, path_begin: &str, certificate: Option<String>) {
+pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
+  address: SocketAddr, hostname: &str, path_begin: &str, certificate: Option<String>) {
   if let Some(certificate_path) = certificate {
     match Config::load_file_bytes(&certificate_path) {
       Ok(data) => {
@@ -840,6 +845,7 @@ pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>,
           Some(fingerprint) => {
             order_command(channel, timeout, Order::RemoveHttpsFront(HttpsFront {
               app_id: String::from(app_id),
+              address,
               hostname: String::from(hostname),
               path_begin: String::from(path_begin),
               fingerprint: CertFingerprint(fingerprint),
@@ -852,6 +858,7 @@ pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>,
   } else {
     order_command(channel, timeout, Order::RemoveHttpFront(HttpFront {
       app_id: String::from(app_id),
+      address,
       hostname: String::from(hostname),
       path_begin: String::from(path_begin),
     }));
@@ -859,51 +866,58 @@ pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>,
 }
 
 
-pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, backend_id: &str, ip: &str, port: u16, sticky_id: Option<String>, backup: Option<bool>) {
+pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
+  backend_id: &str, ip: &str, port: u16, sticky_id: Option<String>, backup: Option<bool>) {
+  let mut address = format!("{}:{}", ip, port);
   order_command(channel, timeout, Order::AddBackend(Backend {
       app_id: String::from(app_id),
+      address: address.parse().expect("could not parse network address"),
       backend_id: String::from(backend_id),
-      ip_address: String::from(ip),
-      port: port,
       load_balancing_parameters: Some(LoadBalancingParams::default()),
       sticky_id: sticky_id,
       backup:    backup
     }));
 }
 
-pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, backend_id: &str, ip: &str, port: u16) {
-    order_command(channel, timeout, Order::RemoveBackend(RemoveBackend {
-      app_id: String::from(app_id),
-      backend_id: String::from(backend_id),
-      ip_address: String::from(ip),
-      port: port,
-    }));
+pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
+  backend_id: &str, ip: &str, port: u16) {
+  let mut address = format!("{}:{}", ip, port);
+  order_command(channel, timeout, Order::RemoveBackend(RemoveBackend {
+    app_id: String::from(app_id),
+    address: address.parse().expect("could not parse network address"),
+    backend_id: String::from(backend_id),
+  }));
 }
 
-pub fn add_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, certificate_path: &str, certificate_chain_path: &str, key_path: &str) {
+pub fn add_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, address: SocketAddr,
+  certificate_path: &str, certificate_chain_path: &str, key_path: &str) {
   if let Some(new_certificate) = load_full_certificate(certificate_path, certificate_chain_path, key_path) {
     order_command(channel, timeout, Order::AddCertificate(AddCertificate {
+      front: address,
       certificate: new_certificate,
       names: Vec::new(),
     }));
   }
 }
 
-pub fn remove_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, certificate_path: &str) {
+pub fn remove_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, address: SocketAddr,
+  certificate_path: &str) {
   if let Some(fingerprint) = get_certificate_fingerprint(certificate_path) {
     order_command(channel, timeout, Order::RemoveCertificate(RemoveCertificate {
+      front: address,
       fingerprint: fingerprint,
       names: Vec::new(),
     }));
   }
 }
 
-pub fn replace_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, new_certificate_path: &str,
-                           new_certificate_chain_path: &str, new_key_path: &str, old_certificate_path: &str)
+pub fn replace_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, address: SocketAddr,
+  new_certificate_path: &str, new_certificate_chain_path: &str, new_key_path: &str, old_certificate_path: &str)
 {
   if let Some(new_certificate) = load_full_certificate(new_certificate_path, new_certificate_chain_path, new_key_path) {
     if let Some(old_fingerprint) = get_certificate_fingerprint(old_certificate_path) {
       order_command(channel, timeout, Order::ReplaceCertificate(ReplaceCertificate {
+        front: address,
         new_certificate,
         old_fingerprint,
         new_names: Vec::new(),
@@ -913,19 +927,21 @@ pub fn replace_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, 
   }
 }
 
-pub fn add_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, ip_address: &str, port: u16) {
+pub fn add_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
+  ip_address: &str, port: u16) {
+  let address: SocketAddr = (format!("{}:{}", ip_address, port)).parse().expect("could not parse listener address");
   order_command(channel, timeout, Order::AddTcpFront(TcpFront {
     app_id: String::from(app_id),
-    ip_address: String::from(ip_address),
-    port: port,
+    address,
   }));
 }
 
-pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, ip_address: &str, port: u16) {
+pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
+  ip_address: &str, port: u16) {
+  let address: SocketAddr = (format!("{}:{}", ip_address, port)).parse().expect("could not parse listener address");
   order_command(channel, timeout, Order::RemoveTcpFront(TcpFront {
     app_id: String::from(app_id),
-    ip_address: String::from(ip_address),
-    port: port,
+    address,
   }));
 }
 
@@ -1132,8 +1148,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
               for (ref key, ref values) in backend_data.iter() {
                 let mut row = Vec::new();
                 row.push(cell!(key.backend_id));
-                row.push(cell!(key.ip_address));
-                row.push(cell!(format!("{}", key.port)));
+                row.push(cell!(format!("{}", key.address)));
 
                 for val in values.iter() {
                   if keys.contains(val) {

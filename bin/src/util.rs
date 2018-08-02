@@ -41,7 +41,7 @@ pub fn setup_logging(config: &Config) {
 
 pub fn setup_metrics(config: &Config) {
   if let Some(ref metrics) = config.metrics.as_ref() {
-    metrics::setup(&metrics.address, metrics.port, "MASTER", metrics.tagged_metrics, metrics.prefix.clone());
+    metrics::setup(&metrics.address, "MASTER", metrics.tagged_metrics, metrics.prefix.clone());
   }
 }
 

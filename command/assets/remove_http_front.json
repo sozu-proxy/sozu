@@ -6,8 +6,7 @@
     "type": "REMOVE_HTTP_FRONT",
     "data": {
       "app_id": "xxx",
-      "ip_address": "0.0.0.0",
-      "port": 8080,
+      "address": "0.0.0.0:8080",
       "hostname": "yyy",
       "path_begin": "xxx"
     }

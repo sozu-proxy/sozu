@@ -81,18 +81,17 @@ impl StoredMetricData {
   }
 }
 
-pub fn setup<H: AsRef<str>, O: Into<String>>(host: H, port: u16, origin: O, use_tagged_metrics: bool, prefix: Option<String>) {
+pub fn setup<O: Into<String>>(metrics_host: &SocketAddr, origin: O, use_tagged_metrics: bool, prefix: Option<String>) {
   use std::net::ToSocketAddrs;
   let metrics_socket = udp_bind();
 
   debug!("setting up metrics: local address = {:#?}", metrics_socket.local_addr());
-  let metrics_host   = (host.as_ref(), port).to_socket_addrs().expect("could not parse address").next().expect("could not get first address");
 
   METRICS.with(|metrics| {
     if let Some(p) = prefix {
       (*metrics.borrow_mut()).set_up_prefix(p);
     }
-    (*metrics.borrow_mut()).set_up_remote(metrics_socket, metrics_host);
+    (*metrics.borrow_mut()).set_up_remote(metrics_socket, metrics_host.clone());
     (*metrics.borrow_mut()).set_up_origin(origin.into());
     (*metrics.borrow_mut()).set_up_tagged_metrics(use_tagged_metrics);
   });

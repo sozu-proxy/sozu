@@ -625,9 +625,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Order::AddHttpsFront(front) => {
         //info!("HTTPS\t{} add front {:?}", id, front);
-        let addr_string = front.ip_address.clone() + ":" + &front.port.to_string();
-        let parsed: SocketAddr = addr_string.parse().ok().expect("should parse address");
-        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == parsed) {
+        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
           listener.add_https_front(front, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
@@ -636,9 +634,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Order::RemoveHttpsFront(front) => {
         //info!("HTTPS\t{} remove front {:?}", id, front);
-        let addr_string = front.ip_address.clone() + ":" + &front.port.to_string();
-        let parsed: SocketAddr = addr_string.parse().ok().expect("should parse address");
-        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == parsed) {
+        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
           listener.remove_https_front(front, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
@@ -673,26 +669,14 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Order::AddBackend(backend) => {
         debug!("{} add backend {:?}", message.id, backend);
-        let addr_string = backend.ip_address + ":" + &backend.port.to_string();
-        let parsed:Option<SocketAddr> = addr_string.parse().ok();
-        if let Some(addr) = parsed {
-          let new_backend = Backend::new(&backend.backend_id, addr, backend.sticky_id.clone(), backend.load_balancing_parameters, backend.backup);
-          self.add_backend(&backend.app_id, new_backend, event_loop);
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
-        } else {
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }
-        }
+        let new_backend = Backend::new(&backend.backend_id, backend.address.clone(), backend.sticky_id.clone(), backend.load_balancing_parameters, backend.backup);
+        self.add_backend(&backend.app_id, new_backend, event_loop);
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::RemoveBackend(backend) => {
         debug!("{} remove backend {:?}", message.id, backend);
-        let addr_string = backend.ip_address + ":" + &backend.port.to_string();
-        let parsed:Option<SocketAddr> = addr_string.parse().ok();
-        if let Some(addr) = parsed {
-          self.remove_backend(&backend.app_id, &addr, event_loop);
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
-        } else {
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }
-        }
+        self.remove_backend(&backend.app_id, &backend.address, event_loop);
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::RemoveHttpsListener(addr) => {
         info!("removing https listener att address: {:?}", addr);

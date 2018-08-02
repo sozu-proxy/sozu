@@ -819,29 +819,21 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
     match message.order {
       Order::AddTcpFront(front) => {
-        let addr_string = front.ip_address + ":" + &front.port.to_string();
-        let addr = addr_string.parse().unwrap();
-        let _ = self.add_tcp_front(&front.app_id, &addr, event_loop);
+        let _ = self.add_tcp_front(&front.app_id, &front.address, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
       },
       Order::RemoveTcpFront(front) => {
-        let addr_string = front.ip_address + ":" + &front.port.to_string();
-        let addr = addr_string.parse().unwrap();
-        let _ = self.remove_tcp_front(addr, event_loop);
+        let _ = self.remove_tcp_front(front.address.clone(), event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
       },
       Order::AddBackend(backend) => {
-        let addr_string = backend.ip_address + ":" + &backend.port.to_string();
-        let addr = addr_string.parse().unwrap();
-        let new_backend = Backend::new(&backend.backend_id, addr, backend.sticky_id.clone(), backend.load_balancing_parameters, backend.backup);
+        let new_backend = Backend::new(&backend.backend_id, backend.address.clone(), backend.sticky_id.clone(), backend.load_balancing_parameters, backend.backup);
         self.add_backend(&backend.app_id, new_backend, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
       },
       Order::RemoveBackend(backend) => {
         trace!("{:?}", backend);
-        let addr_string = backend.ip_address + ":" + &backend.port.to_string();
-        let addr = &addr_string.parse().unwrap();
-        self.remove_backend(&backend.app_id, addr, event_loop);
+        self.remove_backend(&backend.app_id, &backend.address, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
       },
       Order::SoftStop => {
