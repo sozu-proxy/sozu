@@ -578,6 +578,11 @@ impl ProxyClient for TlsClient {
         break;
       }
 
+      if self.readiness().back_readiness.is_hup() && self.readiness().front_interest.is_writable() &&
+        ! self.readiness().front_readiness.is_writable() {
+        break;
+      }
+
       if front_interest.is_readable() {
         let order = self.readable();
         trace!("front readable\tinterpreting client order {:?}", order);
@@ -615,12 +620,7 @@ impl ProxyClient for TlsClient {
           ClientResult::CloseClient => {
             return order;
           },
-          ClientResult::Continue => {
-            self.readiness().front_interest.insert(Ready::writable());
-            if ! self.readiness().front_readiness.is_writable() {
-              break;
-            }
-          },
+          ClientResult::Continue => {},
           _ => {
             self.readiness().back_readiness.remove(UnixReady::hup());
             return order;

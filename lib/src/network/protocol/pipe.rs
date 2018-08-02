@@ -113,8 +113,18 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   pub fn back_hup(&mut self) -> ClientResult {
     if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
-      ClientResult::CloseClient
+      if self.readiness.back_readiness.is_readable() {
+        self.readiness().back_interest.insert(Ready::readable());
+        error!("Pipe::back_hup: backend connection closed but the kernel still holds some data. readiness: {:?}", self.readiness);
+        ClientResult::Continue
+      } else {
+        ClientResult::CloseClient
+      }
     } else {
+      self.readiness().front_interest.insert(Ready::writable());
+      if self.readiness.back_readiness.is_readable() {
+        self.readiness.back_interest.insert(Ready::readable());
+      }
       ClientResult::Continue
     }
   }

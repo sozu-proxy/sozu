@@ -257,11 +257,20 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn back_hup(&mut self) -> ClientResult {
-    if let Some(ref buf) = self.back_buf {
+    if let Some(ref mut buf) = self.back_buf {
       //FIXME: closing the client might not be a good idea if we do keep alive on the front here?
       if buf.output_data_size() == 0 || buf.next_output_data().len() == 0 {
-        ClientResult::CloseClient
+        if self.readiness.back_readiness.is_readable() {
+          self.readiness.back_interest.insert(Ready::readable());
+          ClientResult::Continue
+        } else {
+          ClientResult::CloseClient
+        }
       } else {
+        self.readiness.front_interest.insert(Ready::writable());
+        if self.readiness.back_readiness.is_readable() {
+          self.readiness.back_interest.insert(Ready::readable());
+        }
         ClientResult::Continue
       }
     } else {
