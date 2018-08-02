@@ -22,7 +22,7 @@ use mio_extras::timer::{Timer, Timeout};
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::scm_socket::ScmSocket;
-use sozu_command::messages::{self,Application,Order,HttpFront,HttpProxyConfiguration,OrderMessage,OrderMessageAnswer,OrderMessageStatus, LoadBalancingParams};
+use sozu_command::messages::{self,Application,Order,HttpFront,HttpListener,OrderMessage,OrderMessageAnswer,OrderMessageStatus, LoadBalancingParams};
 use sozu_command::logging;
 
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
@@ -70,11 +70,13 @@ pub struct Client {
   sticky_name:    String,
   front_timeout:  Timeout,
   last_event:     SteadyTime,
+  pub listen_token: Token,
 }
 
 impl Client {
   pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
-    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout) -> Option<Client> {
+    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout,
+    listen_token: Token) -> Option<Client> {
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);
@@ -100,6 +102,7 @@ impl Client {
         sticky_name:    sticky_name,
         front_timeout:  timeout,
         last_event:     SteadyTime::now(),
+        listen_token,
       };
 
       client.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
@@ -618,56 +621,41 @@ pub struct DefaultAnswers {
 
 pub type Hostname = String;
 
+pub struct Listener {
+  listener:     Option<TcpListener>,
+  pub address:  SocketAddr,
+  fronts:       TrieNode<Vec<HttpFront>>,
+  pool:         Rc<RefCell<Pool<BufferQueue>>>,
+  answers:      DefaultAnswers,
+  config:       HttpListener,
+  pub token:    Token,
+}
+
 pub struct ServerConfiguration {
-  listener:        Option<TcpListener>,
-  address:         SocketAddr,
-  backends:        BackendMap,
-  fronts:          TrieNode<Vec<HttpFront>>,
-  applications:    HashMap<AppId, Application>,
-  pool:            Rc<RefCell<Pool<BufferQueue>>>,
-  answers:         DefaultAnswers,
-  config:          HttpProxyConfiguration,
+  listeners:    HashMap<Token,Listener>,
+  backends:     BackendMap,
+  applications: HashMap<AppId, Application>,
+  pool:         Rc<RefCell<Pool<BufferQueue>>>,
 }
 
 impl ServerConfiguration {
-  pub fn new(config: HttpProxyConfiguration, event_loop: &mut Poll,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> (ServerConfiguration,HashSet<Token>) {
-
-    let front = config.front;
-
-    let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
-      error!("could not create listener {:?}: {:?}", front, e);
-   }).ok());
-
-    let mut listeners = HashSet::new();
-    if let Some(ref sock) = listener {
-      event_loop.register(sock, token, Ready::readable(), PollOpt::edge());
-      listeners.insert(token);
+  pub fn new(pool: Rc<RefCell<Pool<BufferQueue>>>) -> ServerConfiguration {
+      ServerConfiguration {
+      listeners:    HashMap::new(),
+      backends:     BackendMap::new(),
+      applications: HashMap::new(),
+      pool,
     }
-
-
-    let default = DefaultAnswers {
-      NotFound: Rc::new(Vec::from(config.answer_404.as_bytes())),
-      ServiceUnavailable: Rc::new(Vec::from(config.answer_503.as_bytes())),
-      BadRequest: Rc::new(Vec::from(
-                  &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-                )),
-    };
-
-    (ServerConfiguration {
-      listener:       listener,
-      address:        config.front,
-      applications:   HashMap::new(),
-      backends:       BackendMap::new(),
-      fronts:         TrieNode::root(),
-      pool:           pool,
-      answers:        default,
-      config:         config,
-    }, listeners)
   }
 
-  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
-    self.listener.take()
+  pub fn add_listener(&mut self, config: HttpListener, event_loop: &mut Poll,
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> Option<Token> {
+    if let Some(listener) = Listener::new(config, event_loop, pool, tcp_listener, token) {
+      self.listeners.insert(listener.token.clone(), listener);
+      Some(token)
+    } else {
+      None
+    }
   }
 
   pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
@@ -680,6 +668,108 @@ impl ServerConfiguration {
 
   pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
     self.applications.remove(app_id);
+  }
+
+  pub fn add_backend(&mut self, app_id: &str, backend: Backend, event_loop: &mut Poll) {
+    self.backends.add_backend(app_id, backend);
+  }
+
+  pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
+    self.backends.remove_backend(app_id, backend_address);
+  }
+
+  pub fn backend_from_app_id(&mut self, client: &mut Client, app_id: &str, front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
+    client.http().map(|h| h.set_app_id(String::from(app_id)));
+
+    match self.backends.backend_from_app_id(app_id) {
+      Err(e) => {
+        let answer = self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
+        client.set_answer(DefaultAnswerStatus::Answer503, answer);
+        Err(e)
+      },
+      Ok((backend, conn))  => {
+        client.back_connected = BackendConnectionStatus::Connecting;
+        if front_should_stick {
+          let sticky_name =  self.listeners[&client.listen_token].config.sticky_name.clone();
+          client.http().map(|http| {
+            http.sticky_session =
+              Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or(backend.borrow().backend_id.clone())));
+            http.sticky_name = sticky_name;
+          });
+        }
+        client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
+        client.metrics.backend_start();
+        client.backend = Some(backend);
+
+        Ok(conn)
+      }
+    }
+  }
+
+  pub fn backend_from_sticky_session(&mut self, client: &mut Client, app_id: &str, sticky_session: String) -> Result<TcpStream,ConnectionError> {
+    client.http().map(|h| h.set_app_id(String::from(app_id)));
+
+    match self.backends.backend_from_sticky_session(app_id, &sticky_session) {
+      Err(e) => {
+        debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
+        let answer = self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
+        client.set_answer(DefaultAnswerStatus::Answer503, answer);
+        Err(e)
+      },
+      Ok((backend, conn))  => {
+        client.back_connected = BackendConnectionStatus::Connecting;
+        let sticky_name =  self.listeners[&client.listen_token].config.sticky_name.clone();
+        client.http().map(|http| {
+          http.sticky_session = Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or(sticky_session.clone())));
+          http.sticky_name = sticky_name;
+        });
+        client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
+        client.metrics.backend_start();
+        client.backend = Some(backend);
+
+        Ok(conn)
+      }
+    }
+  }
+}
+
+impl Listener {
+  pub fn new(config: HttpListener, event_loop: &mut Poll,
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> Option<Listener> {
+
+    let front = config.front;
+
+    let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
+      error!("could not create listener {:?}: {:?}", front, e);
+   }).ok());
+
+    if let Some(ref sock) = listener {
+      event_loop.register(sock, token, Ready::readable(), PollOpt::edge());
+    } else {
+      return None;
+    }
+
+    let default = DefaultAnswers {
+      NotFound: Rc::new(Vec::from(config.answer_404.as_bytes())),
+      ServiceUnavailable: Rc::new(Vec::from(config.answer_503.as_bytes())),
+      BadRequest: Rc::new(Vec::from(
+                  &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+                )),
+    };
+
+    Some(Listener {
+      listener,
+      address: config.front,
+      fronts:  TrieNode::root(),
+      pool,
+      answers: default,
+      config,
+      token,
+    })
+  }
+
+  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
+    self.listener.take()
   }
 
   pub fn add_http_front(&mut self, mut http_front: HttpFront, event_loop: &mut Poll) -> Result<(), String> {
@@ -732,14 +822,6 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_backend(&mut self, app_id: &str, backend: Backend, event_loop: &mut Poll) {
-    self.backends.add_backend(app_id, backend);
-  }
-
-  pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
-    self.backends.remove_backend(app_id, backend_address);
-  }
-
   pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&HttpFront> {
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
@@ -783,54 +865,49 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn backend_from_app_id(&mut self, client: &mut Client, app_id: &str, front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
-    client.http().map(|h| h.set_app_id(String::from(app_id)));
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
+    -> Result<(Rc<RefCell<Client>>, bool), AcceptError> {
 
-    match self.backends.backend_from_app_id(app_id) {
-      Err(e) => {
-        client.set_answer(DefaultAnswerStatus::Answer503, self.answers.ServiceUnavailable.clone());
-        Err(e)
-      },
-      Ok((backend, conn))  => {
-        client.back_connected = BackendConnectionStatus::Connecting;
-        if front_should_stick {
-          client.http().map(|http| {
-            http.sticky_session =
-              Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or(backend.borrow().backend_id.clone())));
-            http.sticky_name = self.config.sticky_name.clone();
-          });
+    if let Some(ref sock) = self.listener {
+      sock.accept().map_err(|e| {
+        match e.kind() {
+          ErrorKind::WouldBlock => AcceptError::WouldBlock,
+          other => {
+            error!("accept() IO error: {:?}", e);
+            AcceptError::IoError
+          }
         }
-        client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
-        client.metrics.backend_start();
-        client.backend = Some(backend);
+      }).and_then(|(frontend_sock, _)| {
+        frontend_sock.set_nodelay(true);
+        if let Some(c) = Client::new(frontend_sock, client_token, Rc::downgrade(&self.pool),
+          self.config.public_address, self.config.expect_proxy, self.config.sticky_name.clone(), timeout,
+          self.token) {
+          poll.register(
+            c.front_socket(),
+            client_token,
+            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+            PollOpt::edge()
+          );
 
-        Ok(conn)
-      }
+          Ok((Rc::new(RefCell::new(c)), false))
+        } else {
+          Err(AcceptError::TooManyClients)
+        }
+      })
+    } else {
+      error!("cannot accept connections, no listening socket available");
+      Err(AcceptError::IoError)
     }
   }
 
-  pub fn backend_from_sticky_session(&mut self, client: &mut Client, app_id: &str, sticky_session: String) -> Result<TcpStream,ConnectionError> {
-    client.http().map(|h| h.set_app_id(String::from(app_id)));
-
-    match self.backends.backend_from_sticky_session(app_id, &sticky_session) {
-      Err(e) => {
-        debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
-        client.set_answer(DefaultAnswerStatus::Answer503, self.answers.ServiceUnavailable.clone());
-        Err(e)
-      },
-      Ok((backend, conn))  => {
-        client.back_connected = BackendConnectionStatus::Connecting;
-        client.http().map(|http| {
-          http.sticky_session = Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or(sticky_session.clone())));
-          http.sticky_name = self.config.sticky_name.clone();
-        });
-        client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
-        client.metrics.backend_start();
-        client.backend = Some(backend);
-
-        Ok(conn)
+  fn accept_flush(&mut self) -> usize {
+    let mut counter = 0;
+    if let Some(ref sock) = self.listener {
+      while sock.accept().is_ok() {
+        counter += 1;
       }
     }
+    counter
   }
 }
 
@@ -841,7 +918,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
-        client.set_answer(DefaultAnswerStatus::Answer400, self.answers.BadRequest.clone());
+        let answer = self.listeners[&client.listen_token].answers.BadRequest.clone();
+        client.set_answer(DefaultAnswerStatus::Answer400, answer);
         return Err(ConnectionError::InvalidHost);
       }
 
@@ -857,7 +935,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       }
     } else {
       error!("hostname parsing failed for: '{}'", h);
-      client.set_answer(DefaultAnswerStatus::Answer400, self.answers.BadRequest.clone());
+      let answer = self.listeners[&client.listen_token].answers.BadRequest.clone();
+      client.set_answer(DefaultAnswerStatus::Answer400, answer);
       return Err(ConnectionError::InvalidHost);
     };
 
@@ -865,7 +944,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
     //FIXME: too many unwraps here
     let rl     = try!(client.http().unwrap().state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-    if let Some(app_id) = self.frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
+    if let Some(app_id) = self.listeners[&client.listen_token].frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
 
       let front_should_redirect_https = self.applications.get(&app_id).map(|ref app| app.https_redirect).unwrap_or(false);
       if front_should_redirect_https {
@@ -978,17 +1057,20 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           //Ok(())
         },
         Err(ConnectionError::NoBackendAvailable) => {
-          client.set_answer(DefaultAnswerStatus::Answer503, self.answers.ServiceUnavailable.clone());
+          let answer =  self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
+          client.set_answer(DefaultAnswerStatus::Answer503, answer);
           Err(ConnectionError::NoBackendAvailable)
         }
         Err(ConnectionError::HostNotFound) => {
-          client.set_answer(DefaultAnswerStatus::Answer404, self.answers.NotFound.clone());
+          let answer = self.listeners[&client.listen_token].answers.NotFound.clone();
+          client.set_answer(DefaultAnswerStatus::Answer404, answer);
           Err(ConnectionError::HostNotFound)
         }
         e => panic!(e)
       }
     } else {
-      client.set_answer(DefaultAnswerStatus::Answer404, self.answers.NotFound.clone());
+      let answer = self.listeners[&client.listen_token].answers.NotFound.clone();
+      client.set_answer(DefaultAnswerStatus::Answer404, answer);
       Err(ConnectionError::HostNotFound)
     }
   }
@@ -1009,16 +1091,31 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       },
       Order::AddHttpFront(front) => {
         debug!("{} add front {:?}", message.id, front);
-        match self.add_http_front(front, event_loop) {
-          Ok(_) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None },
-          Err(err) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(err), data: None }
+        let addr_string = front.ip_address.clone() + ":" + &front.port.to_string();
+        let parsed: SocketAddr = addr_string.parse().ok().expect("should parse address");
+        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == parsed) {
+          match listener.add_http_front(front, event_loop) {
+            Ok(_) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None },
+            Err(err) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(err), data: None }
+          }
+        } else {
+          panic!("no HTTP listener found for front: {:?}", front);
+
+          //let (listener, tokens) = Listener::new(HttpListener::default(), event_loop,
+          //  self.pool.clone(), None, token: Token) -> (Listener,HashSet<Token>
         }
       },
       Order::RemoveHttpFront(front) => {
         debug!("{} front {:?}", message.id, front);
-        match self.remove_http_front(front, event_loop) {
-          Ok(_) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None },
-          Err(err) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(err), data: None }
+        let addr_string = front.ip_address.clone() + ":" + &front.port.to_string();
+        let parsed: SocketAddr = addr_string.parse().ok().expect("should parse address");
+        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == parsed) {
+          match (*listener).remove_http_front(front, event_loop) {
+            Ok(_) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None },
+            Err(err) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(err), data: None }
+          }
+        } else {
+          panic!("trying to remove front from non existing listener");
         }
       },
       Order::AddBackend(backend) => {
@@ -1044,33 +1141,31 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }
         }
       },
-      Order::HttpProxy(configuration) => {
-        debug!("{} modifying proxy configuration: {:?}", message.id, configuration);
-        self.answers = DefaultAnswers {
-          NotFound:           Rc::new(configuration.answer_404.into_bytes()),
-          ServiceUnavailable: Rc::new(configuration.answer_503.into_bytes()),
-          BadRequest: Rc::new(Vec::from(
-            &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-          )),
-        };
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+      Order::RemoveHttpListener(addr) => {
+        info!("removing http listener at address {:?}", addr);
+        fixme!();
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unimplemented")), data: None }
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
+        fixme!();
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        if let Some(ref sock) = self.listener {
+        /*if let Some(ref sock) = self.listener {
           event_loop.deregister(sock);
         }
+        */
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None }
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
+        fixme!();
         //FIXME: handle shutdown
         //event_loop.shutdown();
-        if let Some(ref sock) = self.listener {
+        /*if let Some(ref sock) = self.listener {
           event_loop.deregister(sock);
         }
+        */
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::Status => {
@@ -1095,45 +1190,21 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<Client>>, bool), AcceptError> {
 
-    if let Some(ref sock) = self.listener {
-      sock.accept().map_err(|e| {
-        match e.kind() {
-          ErrorKind::WouldBlock => AcceptError::WouldBlock,
-          other => {
-            error!("accept() IO error: {:?}", e);
-            AcceptError::IoError
-          }
-        }
-      }).and_then(|(frontend_sock, _)| {
-        frontend_sock.set_nodelay(true);
-        if let Some(c) = Client::new(frontend_sock, client_token, Rc::downgrade(&self.pool),
-          self.config.public_address, self.config.expect_proxy, self.config.sticky_name.clone(), timeout) {
-          poll.register(
-            c.front_socket(),
-            client_token,
-            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-            PollOpt::edge()
-          );
-
-          Ok((Rc::new(RefCell::new(c)), false))
-        } else {
-          Err(AcceptError::TooManyClients)
-        }
-      })
-    } else {
-      error!("cannot accept connections, no listening socket available");
-      Err(AcceptError::IoError)
-    }
+    self.listeners.get_mut(&Token(token.0)).unwrap().accept(token, poll, client_token, timeout)
   }
 
   fn accept_flush(&mut self) -> usize {
-    let mut counter = 0;
+    fixme!();
+    let token = Token(0);
+    self.listeners.get_mut(&token).unwrap().accept_flush()
+    /*let mut counter = 0;
     if let Some(ref sock) = self.listener {
       while sock.accept().is_ok() {
         counter += 1;
       }
     }
     counter
+      */
   }
 
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {
@@ -1141,7 +1212,11 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   }
 
   fn listen_port_state(&self, port: &u16) -> ListenPortState {
-    if port == &self.address.port() { ListenPortState::InUse } else { ListenPortState::Available }
+    //FIXME TOKEN
+    fixme!();
+    ListenPortState::Available
+    //let token = Token(0);
+    //if port == &self.listeners[&token].address.port() { ListenPortState::InUse } else { ListenPortState::Available }
   }
 }
 
@@ -1150,11 +1225,11 @@ pub struct InitialServerConfiguration {
   fronts:          TrieNode<Vec<HttpFront>>,
   applications:    HashMap<AppId, Application>,
   answers:         DefaultAnswers,
-  config:          HttpProxyConfiguration,
+  config:          HttpListener,
 }
 
 impl InitialServerConfiguration {
-  pub fn new(config: HttpProxyConfiguration, state: &ConfigState) -> InitialServerConfiguration {
+  pub fn new(config: HttpListener, state: &ConfigState) -> InitialServerConfiguration {
 
     let answers = DefaultAnswers {
       NotFound: Rc::new(Vec::from(config.answer_404.as_bytes())),
@@ -1184,6 +1259,8 @@ impl InitialServerConfiguration {
 
   pub fn start_listening(self, event_loop: &mut Poll, start_at:usize, pool: Rc<RefCell<Pool<BufferQueue>>>) -> io::Result<ServerConfiguration> {
 
+    unimplemented!()
+/*
     let front = self.config.front;
     match server_bind(&front) {
       Ok(sock) => {
@@ -1207,11 +1284,12 @@ impl InitialServerConfiguration {
       }
     }
 
+*/
   }
 }
 
 
-pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
+pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
   use network::proxy::ProxyClientCast;
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_listeners   = 1;
@@ -1241,11 +1319,12 @@ pub fn start(config: HttpProxyConfiguration, channel: ProxyChannel, max_buffers:
     let e = entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
     Token(e.index().0)
   };
-  let (configuration, listeners) = ServerConfiguration::new(config, &mut event_loop, pool, None, token);
+  let mut configuration = ServerConfiguration::new(pool.clone());
+  let listeners = configuration.add_listener(config, &mut event_loop, pool.clone(), None, token);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
 
   let mut server    = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-    clients, Some(configuration), None, None, None, max_buffers);
+    clients, pool, Some(configuration), None, None, None, max_buffers);
 
   println!("starting event loop");
   server.run();

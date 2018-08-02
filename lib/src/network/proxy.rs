@@ -30,11 +30,11 @@ use sozu_command::state::{ConfigState,get_application_ids_by_domain};
 use sozu_command::messages::{self,TcpFront,Order,Backend,MessageId,OrderMessageAnswer,
   OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer,
   QueryApplicationType,TlsProvider};
-use sozu_command::messages::HttpsProxyConfiguration;
+use sozu_command::messages::HttpsListener;
 
 use network::buffer_queue::BufferQueue;
-use network::{ClientResult,ConnectionError,Protocol,RequiredEvents,ProxyClient,ProxyConfiguration,
-  CloseResult,AcceptError,BackendConnectAction};
+use network::{ClientResult,ConnectionError,Protocol,RequiredEvents,ProxyClient,
+  CloseResult,AcceptError,BackendConnectAction,ProxyConfiguration};
 use network::{http,tcp,AppId};
 use network::pool::Pool;
 use network::metrics::METRICS;
@@ -94,15 +94,16 @@ pub struct Server {
   can_accept:      bool,
   channel:         ProxyChannel,
   queue:           VecDeque<OrderMessageAnswer>,
-  http:            Option<http::ServerConfiguration>,
-  https:           Option<HttpsProvider>,
-  tcp:             Option<tcp::ServerConfiguration>,
+  http:            http::ServerConfiguration,
+  https:           HttpsProvider,
+  tcp:             tcp::ServerConfiguration,
   config_state:    ConfigState,
   scm:             ScmSocket,
   clients:         Slab<Rc<RefCell<ProxyClientCast>>,ClientToken>,
   max_connections: usize,
   nb_connections:  usize,
   timer:           Timer<Token>,
+  pool:            Rc<RefCell<Pool<BufferQueue>>>,
 }
 
 impl Server {
@@ -142,7 +143,7 @@ impl Server {
       entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::Metrics })));
     }
 
-    let http_session = config.http.and_then(|conf| conf.to_http()).map(|http_conf| {
+    /*let http_session = config.http.and_then(|conf| conf.to_http()).map(|http_conf| {
       let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       let token = Token(entry.index().0);
       let (configuration, listener_tokens) = http::ServerConfiguration::new(http_conf, &mut event_loop,
@@ -153,9 +154,9 @@ impl Server {
         trace!("inserting http listener at token: {:?}", e.index());
       }
       configuration
-    });
+    });*/
 
-    let https_session = config.https.and_then(|conf| conf.to_tls()).and_then(|https_conf| {
+    /*let https_session = config.https.and_then(|conf| conf.to_tls()).and_then(|https_conf| {
       let entry = clients.vacant_entry().expect("client list should have enough room at startup");
       let token = Token(entry.index().0);
       HttpsProvider::new(https_conf, &mut event_loop, pool.clone(),
@@ -181,8 +182,9 @@ impl Server {
     }
 
     let tcp_tokens: HashSet<Token> = tokens.iter().cloned().collect();
+    */
 
-    let tcp_session = config.tcp.map(|conf| {
+    /*let tcp_session = config.tcp.map(|conf| {
       let (configuration, listener_tokens) = tcp::ServerConfiguration::new(&mut event_loop,
         pool.clone(), tcp_listeners, tokens);
 
@@ -191,15 +193,19 @@ impl Server {
         clients.remove(ClientToken(token.0));
       }
       configuration
-    });
+    });*/
 
-    Server::new(event_loop, channel, scm, clients, http_session, https_session, tcp_session, Some(config_state),
+    let use_openssl = config.tls_provider == TlsProvider::Openssl;
+    let https = HttpsProvider::new(use_openssl, pool.clone());
+
+    Server::new(event_loop, channel, scm, clients, pool, None, Some(https), None, Some(config_state),
       config.max_connections)
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
     clients: Slab<Rc<RefCell<ProxyClientCast>>,ClientToken>,
-    http:  Option<http::ServerConfiguration>,
+    pool: Rc<RefCell<Pool<BufferQueue>>>,
+    http: Option<http::ServerConfiguration>,
     https: Option<HttpsProvider>,
     tcp:  Option<tcp::ServerConfiguration>,
     config_state: Option<ConfigState>,
@@ -233,15 +239,16 @@ impl Server {
       can_accept:      true,
       channel:         channel,
       queue:           VecDeque::new(),
-      http:            http,
-      https:           https,
-      tcp:             tcp,
+      http:            http.unwrap_or(http::ServerConfiguration::new(pool.clone())),
+      https:           https.unwrap_or(HttpsProvider::new(false, pool.clone())),
+      tcp:             tcp.unwrap_or(tcp::ServerConfiguration::new()),
       config_state:    ConfigState::new(),
       scm:             scm,
       clients:         clients,
       max_connections: max_connections,
       nb_connections:  0,
-      timer
+      timer,
+      pool,
     };
 
     // initialize the worker with the state we got from a file
@@ -267,8 +274,6 @@ impl Server {
     server
   }
 }
-
-//type Timeout = usize;
 
 impl Server {
   pub fn run(&mut self) {
@@ -469,101 +474,141 @@ impl Server {
     let topics = message.order.get_topics();
 
     if topics.contains(&Topic::HttpProxyConfig) {
-      if let Some(mut http) = self.http.take() {
-        self.queue.push_back(http.notify(&mut self.poll, message.clone()));
-        self.http = Some(http);
-      } else {
-        match message.clone() {
-          OrderMessage{ id, order: Order::AddHttpFront(http_front) } => {
-            warn!("No HTTP proxy configured to handle {:?}", message);
-            let status = OrderMessageStatus::Error(String::from("No HTTP proxy configured"));
-            self.queue.push_back(OrderMessageAnswer{ id: id.clone(), status, data: None });
-          },
-          _ => {}
-        }
+      match message {
+        // special case for AddHttpListener because we need to register a listener
+        OrderMessage { ref id, order: Order::AddHttpListener(ref listener) } => {
+          /*FIXME
+          if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
+            error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
+            self.queue.push_back(OrderMessageAnswer {
+              id,
+              status: OrderMessageStatus::Error(String::from("Couldn't add TCP front: port already in use")),
+              data: None
+            });
+            return;
+          }*/
+
+          let entry = self.clients.vacant_entry();
+
+          if entry.is_none() {
+            self.queue.push_back(OrderMessageAnswer {
+              id: id.to_string(),
+              status: OrderMessageStatus::Error(String::from("client list is full, cannot add a listener")),
+              data: None
+            });
+            return;
+          }
+
+          let entry = entry.unwrap();
+
+          let token = Token(entry.index().0);
+
+          let status = if let Some(token) = self.http.add_listener(listener.clone(), &mut self.poll, self.pool.clone(), None, token) {
+            entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+            OrderMessageStatus::Ok
+          } else {
+            error!("Couldn't add HTTP listener");
+            OrderMessageStatus::Error(String::from("cannot add HTTP listener"))
+          };
+
+          let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
+          self.queue.push_back(answer);
+        },
+        ref m => self.queue.push_back(self.http.notify(&mut self.poll, m.clone())),
       }
     }
     if topics.contains(&Topic::HttpsProxyConfig) {
-      if let Some(mut https) = self.https.take() {
-        self.queue.push_back(https.notify(&mut self.poll, message.clone()));
-        self.https = Some(https);
-      } else {
-        match message.clone() {
-          OrderMessage{ id, order: Order::AddHttpsFront(https_front) } => {
-            warn!("No HTTPS proxy configured to handle {:?}", message);
-            let status = OrderMessageStatus::Error(String::from("No HTTPS proxy configured"));
-            self.queue.push_back(OrderMessageAnswer{ id: id.clone(), status, data: None });
-          },
-          _ => {}
-        }
+      match message {
+        // special case for AddHttpListener because we need to register a listener
+        OrderMessage { ref id, order: Order::AddHttpsListener(ref listener) } => {
+          /*FIXME
+          if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
+            error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
+            self.queue.push_back(OrderMessageAnswer {
+              id,
+              status: OrderMessageStatus::Error(String::from("Couldn't add TCP front: port already in use")),
+              data: None
+            });
+            return;
+          }*/
+
+          let entry = self.clients.vacant_entry();
+
+          if entry.is_none() {
+            self.queue.push_back(OrderMessageAnswer {
+              id: id.to_string(),
+              status: OrderMessageStatus::Error(String::from("client list is full, cannot add a listener")),
+              data: None
+            });
+            return;
+          }
+
+          let entry = entry.unwrap();
+
+          let token = Token(entry.index().0);
+
+          let status = if let Some(token) = self.https.add_listener(listener.clone(), &mut self.poll, self.pool.clone(), None, token) {
+            entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPSListen })));
+            OrderMessageStatus::Ok
+          } else {
+            error!("Couldn't add HTTPS listener");
+            OrderMessageStatus::Error(String::from("cannot add HTTPS listener"))
+          };
+
+          let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
+          self.queue.push_back(answer);
+        },
+        ref m => self.queue.push_back(self.https.notify(&mut self.poll, m.clone())),
       }
     }
     if topics.contains(&Topic::TcpProxyConfig) {
-      if let Some(mut tcp) = self.tcp.take() {
-        match message {
-          // special case for AddTcpFront because we need to register a listener
-          OrderMessage { id, order: Order::AddTcpFront(tcp_front) } => {
-            if self.listen_port_state(&tcp_front.port, &tcp) == ListenPortState::InUse {
-              error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
-              self.queue.push_back(OrderMessageAnswer {
-                id,
-                status: OrderMessageStatus::Error(String::from("Couldn't add TCP front: port already in use")),
-                data: None
-              });
-              self.tcp = Some(tcp);
-              return;
-            }
+      match message {
+        // special case for AddTcpFront because we need to register a listener
+        OrderMessage { id, order: Order::AddTcpListener(listener) } => {
+          /*if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
+            error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
+            self.queue.push_back(OrderMessageAnswer {
+              id,
+              status: OrderMessageStatus::Error(String::from("Couldn't add TCP front: port already in use")),
+              data: None
+            });
+            return;
+          }
+          */
 
-            let entry = self.clients.vacant_entry();
+          let entry = self.clients.vacant_entry();
 
-            if entry.is_none() {
-              self.queue.push_back(OrderMessageAnswer {
-                id,
-                status: OrderMessageStatus::Error(String::from("client list is full, cannot add a listener")),
-                data: None
-              });
-              self.tcp = Some(tcp);
-              return;
-            }
+          if entry.is_none() {
+            self.queue.push_back(OrderMessageAnswer {
+              id,
+              status: OrderMessageStatus::Error(String::from("client list is full, cannot add a listener")),
+              data: None
+            });
+            return;
+          }
 
-            let entry = entry.unwrap();
+          let entry = entry.unwrap();
 
-            let token = Token(entry.index().0);
+          let token = Token(entry.index().0);
+
+          let status = if let Some(token) = self.tcp.add_listener(listener.clone(), &mut self.poll, self.pool.clone(), None, token) {
             entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::TCPListen })));
-
-            let addr_string = tcp_front.ip_address + ":" + &tcp_front.port.to_string();
-
-            let status = if let Ok(front) = addr_string.parse() {
-              if let Some(token) = tcp.add_tcp_front(&tcp_front.app_id, &front, &mut self.poll, token) {
-                OrderMessageStatus::Ok
-              } else {
-                error!("Couldn't add tcp front");
-                OrderMessageStatus::Error(String::from("cannot add tcp front"))
-              }
-            } else {
-              error!("Couldn't parse tcp front address");
-              OrderMessageStatus::Error(String::from("cannot parse the address"))
-            };
-            let answer = OrderMessageAnswer { id, status, data: None };
-            self.queue.push_back(answer);
-          },
-          m => self.queue.push_back(tcp.notify(&mut self.poll, m)),
-        }
-        self.tcp = Some(tcp);
-      } else {
-        match message.clone() {
-          OrderMessage { id, order: Order::AddTcpFront(tcp_front) } => {
-            warn!("No TCP proxy configured to handle {:?}", message);
-            let status = OrderMessageStatus::Error(String::from("No TCP proxy configured"));
-            self.queue.push_back(OrderMessageAnswer{ id, status, data: None });
-          },
-          _ => {}
-        }
+            OrderMessageStatus::Ok
+          } else {
+            error!("Couldn't add tcp front");
+            OrderMessageStatus::Error(String::from("cannot add tcp front"))
+          };
+          let answer = OrderMessageAnswer { id, status, data: None };
+          self.queue.push_back(answer);
+        },
+        m => self.queue.push_back(self.tcp.notify(&mut self.poll, m)),
       }
     }
   }
 
   pub fn return_listen_sockets(&mut self) {
+    unimplemented!()
+    /*
     self.scm.set_blocking(false);
 
     let http_listener = self.http.as_mut()
@@ -594,7 +639,7 @@ impl Server {
     self.scm.set_blocking(true);
 
     info!("sent default listeners: {:?}", res);
-
+    */
   }
 
   pub fn to_client(&self, token: Token) -> ClientToken {
@@ -620,25 +665,19 @@ impl Server {
 
       match protocol {
         Protocol::TCP   => {
-          self.tcp.as_mut().map(|tcp| {
-            for (app_id, address) in backends.into_iter() {
-              tcp.close_backend(app_id, &address);
-            }
-          });
+          for (app_id, address) in backends.into_iter() {
+            self.tcp.close_backend(app_id, &address);
+          }
         },
         Protocol::HTTP   => {
-          self.http.as_mut().map(|http| {
-            for (app_id, address) in backends.into_iter() {
-              http.close_backend(app_id, &address);
-            }
-          });
+          for (app_id, address) in backends.into_iter() {
+            self.http.close_backend(app_id, &address);
+          }
         },
         Protocol::HTTPS   => {
-          self.https.as_mut().map(|https| {
-            for (app_id, address) in backends.into_iter() {
-              https.close_backend(app_id, &address);
-            }
-          });
+          for (app_id, address) in backends.into_iter() {
+            self.https.close_backend(app_id, &address);
+          }
         },
         _ => {}
       }
@@ -676,30 +715,24 @@ impl Server {
             let timeout = self.timer.set_timeout(Duration::from_secs(60), client_token);
             match protocol {
               Protocol::TCPListen   => {
-                let mut tcp = self.tcp.take().expect("if we have a TCPListen, we should have a TCP configuration");
-                let res1 = tcp.accept(token, &mut self.poll, client_token, timeout).map(|(client, should_connect)| {
+                let res1 = self.tcp.accept(token, &mut self.poll, client_token, timeout).map(|(client, should_connect)| {
                   entry.insert(client);
                   (index, should_connect)
                 });
-                self.tcp = Some(tcp);
                 res1
               },
               Protocol::HTTPListen  => {
-                let mut http = self.http.take().expect("if we have a HTTPListen, we should have a HTTP configuration");
-                let res1 = http.accept(token, &mut self.poll, client_token, timeout).map(|(client, should_connect)| {
+                let res1 = self.http.accept(token, &mut self.poll, client_token, timeout).map(|(client, should_connect)| {
                   entry.insert(client);
                   (index, should_connect)
                 });
-                self.http = Some(http);
                 res1
               },
               Protocol::HTTPSListen => {
-                let mut https = self.https.take().expect("if we have a HTTPSListen, we should have a HTTPS configuration");
-                let res1 = https.accept(token, &mut self.poll, client_token, timeout).map(|(client, should_connect)| {
+                let res1 = self.https.accept(token, &mut self.poll, client_token, timeout).map(|(client, should_connect)| {
                   entry.insert(client);
                   (index, should_connect)
                 });
-                self.https = Some(https);
                 res1
               },
               _ => panic!("should not call accept() on a HTTP, HTTPS or TCP client"),
@@ -738,9 +771,9 @@ impl Server {
   }
 
   pub fn accept_flush(&mut self) {
-    let mut counter = self.tcp.as_mut().map(|tcp| tcp.accept_flush()).unwrap_or(0);
-    counter += self.http.as_mut().map(|http| http.accept_flush()).unwrap_or(0);
-    counter += self.https.as_mut().map(|https| https.accept_flush()).unwrap_or(0);
+    let mut counter = self.tcp.accept_flush();
+    counter += self.http.accept_flush();
+    counter += self.https.accept_flush();
     error!("flushed {} new connections", counter);
   }
 
@@ -765,36 +798,24 @@ impl Server {
 
       let (protocol, res) = match protocol {
         Protocol::TCP   => {
-          let r = if let Some(mut tcp) = self.tcp.take() {
-            let mut b = cl2.borrow_mut();
-            let client: &mut tcp::Client = b.as_tcp() ;
-            let r = tcp.connect_to_backend(&mut self.poll, client, back_token);
-            self.tcp = Some(tcp);
-            r
-          } else {
-            Err(ConnectionError::HostNotFound)
-          };
+          let mut b = cl2.borrow_mut();
+          let client: &mut tcp::Client = b.as_tcp() ;
+          let r = self.tcp.connect_to_backend(&mut self.poll, client, back_token);
 
           (Protocol::TCP, r)
         },
         Protocol::HTTP  => {
-          (Protocol::HTTP, if let Some(mut http) = self.http.take() {
+          (Protocol::HTTP, {
             let mut b = cl2.borrow_mut();
             let client: &mut http::Client = b.as_http() ;
-            let r = http.connect_to_backend(&mut self.poll, client, back_token);
-            self.http = Some(http);
+            let r = self.http.connect_to_backend(&mut self.poll, client, back_token);
             r
-          } else {
-            Err(ConnectionError::HostNotFound)
           })
         },
         Protocol::HTTPS => {
-          (Protocol::HTTPS, if let Some(mut https) = self.https.take() {
-            let r = https.connect_to_backend(&mut self.poll, cl2, back_token);
-            self.https = Some(https);
+          (Protocol::HTTPS, {
+            let r = self.https.connect_to_backend(&mut self.poll, cl2, back_token);
             r
-          } else {
-            Err(ConnectionError::HostNotFound)
           })
         },
         _ => {
@@ -838,15 +859,15 @@ impl Server {
             let res = client.borrow_mut().close_backend(token, &mut self.poll);
             if let Some((app_id, address)) = res {
               match protocol {
-                Protocol::TCP   => self.tcp.as_mut().map(|c| {
-                  c.close_backend(app_id, &address);
-                }),
-                Protocol::HTTP  => self.http.as_mut().map(|c| {
-                  c.close_backend(app_id, &address);
-                }),
-                Protocol::HTTPS => self.https.as_mut().map(|c| {
-                  c.close_backend(app_id, &address);
-                }),
+                Protocol::TCP   => {
+                  Some(self.tcp.close_backend(app_id, &address))
+                },
+                Protocol::HTTP  => {
+                  Some(self.http.close_backend(app_id, &address))
+                },
+                Protocol::HTTPS => {
+                  Some(self.https.close_backend(app_id, &address))
+                },
                 _ => {
                   panic!("should not call interpret_client_order on a listen socket");
                 }
@@ -978,19 +999,18 @@ impl Server {
     }
   }
 
-  fn listen_port_state(&self, port: &u16, tcp_proxy: &tcp::ServerConfiguration) -> ListenPortState {
-    let http_binded = self.http.as_ref().map(|http| http.listen_port_state(&port)).unwrap_or(ListenPortState::Available);
+  fn listen_port_state(&self, port: &u16) -> ListenPortState {
+    let http_bound = self.http.listen_port_state(&port);
 
-    if http_binded == ListenPortState::Available {
-      let https_binded = match self.https.as_ref() {
+    if http_bound == ListenPortState::Available {
+      let https_bound = match self.https {
         #[cfg(feature = "use-openssl")]
-        Some(&HttpsProvider::Openssl(ref openssl)) => openssl.listen_port_state(&port),
-        Some(&HttpsProvider::Rustls(ref rustls)) => rustls.listen_port_state(&port),
-        None => ListenPortState::Available
+        HttpsProvider::Openssl(ref openssl) => openssl.listen_port_state(&port),
+        HttpsProvider::Rustls(ref rustls) => rustls.listen_port_state(&port),
       };
 
-      if https_binded == ListenPortState::Available {
-        return tcp_proxy.listen_port_state(&port);
+      if https_bound == ListenPortState::Available {
+        return self.tcp.listen_port_state(&port);
       }
     }
 
@@ -1049,21 +1069,11 @@ pub enum HttpsProvider {
 
 #[cfg(feature = "use-openssl")]
 impl HttpsProvider {
-  pub fn new(config: HttpsProxyConfiguration, event_loop: &mut Poll,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> io::Result<(HttpsProvider, HashSet<Token>)> {
-    match config.tls_provider {
-      TlsProvider::Openssl => {
-        https_openssl::ServerConfiguration::new(config, event_loop, pool,
-        tcp_listener, token).map(|(conf, set)| {
-          (HttpsProvider::Openssl(conf), set)
-        })
-      },
-      TlsProvider::Rustls => {
-        https_rustls::configuration::ServerConfiguration::new(config, event_loop, pool,
-        tcp_listener, token).map(|(conf, set)| {
-          (HttpsProvider::Rustls(conf), set)
-        })
-      }
+  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>) -> HttpsProvider {
+    if use_openssl {
+      HttpsProvider::Openssl(https_openssl::ServerConfiguration::new(pool))
+    } else {
+      HttpsProvider::Rustls(https_rustls::configuration::ServerConfiguration::new(pool))
     }
   }
 
@@ -1074,11 +1084,21 @@ impl HttpsProvider {
     }
   }
 
-  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
+  pub fn add_listener(&mut self, config: HttpsListener, event_loop: &mut Poll,
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> Option<Token> {
+
     match self {
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.add_listener(config, event_loop, pool, tcp_listener, token),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.add_listener(config, event_loop, pool, tcp_listener, token),
+    }
+  }
+
+  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
+    unimplemented!()
+    /*match self {
       &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.give_back_listener(),
       &mut HttpsProvider::Openssl(ref mut openssl) => openssl.give_back_listener(),
-    }
+    }*/
   }
 
   pub fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<ProxyClientCast>>,bool), AcceptError> {
@@ -1128,16 +1148,13 @@ impl HttpsProvider {
 use network::https_rustls::client::TlsClient;
 #[cfg(not(feature = "use-openssl"))]
 impl HttpsProvider {
-  pub fn new(config: HttpsProxyConfiguration, event_loop: &mut Poll,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> io::Result<(HttpsProvider, HashSet<Token>)> {
-    if config.tls_provider == TlsProvider::Openssl {
+  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>) -> HttpsProvider {
+    if use_openssl {
       error!("the openssl provider is not compiled, continuing with the rustls provider");
     }
 
-    https_rustls::configuration::ServerConfiguration::new(config, event_loop, pool,
-      tcp_listener, token).map(|(conf, set)| {
-        (HttpsProvider::Rustls(conf), set)
-    })
+    let mut configuration = https_rustls::configuration::ServerConfiguration::new(pool);
+    HttpsProvider::Rustls(configuration)
   }
 
   pub fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
@@ -1145,9 +1162,19 @@ impl HttpsProvider {
     rustls.notify(event_loop, message)
   }
 
+  pub fn add_listener(&mut self, config: HttpsListener, event_loop: &mut Poll,
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> Option<Token> {
+
+    let &mut HttpsProvider::Rustls(ref mut rustls) = self;
+    rustls.add_listener(config, event_loop, pool, tcp_listener, token)
+  }
+
   pub fn give_back_listener(&mut self) -> Option<TcpListener> {
+    unimplemented!();
+    /*
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
     rustls.give_back_listener()
+    */
   }
 
   pub fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {

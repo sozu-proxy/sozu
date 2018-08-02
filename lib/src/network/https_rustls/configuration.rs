@@ -27,9 +27,9 @@ use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,
-  Order,HttpsFront,HttpsProxyConfiguration,OrderMessage, OrderMessageAnswer,
+  Order,HttpsFront,HttpsListener,OrderMessage,OrderMessageAnswer,
   OrderMessageStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
-LoadBalancingParams, TlsVersion};
+  LoadBalancingParams, TlsVersion};
 use sozu_command::certificate::split_certificate_chain;
 use sozu_command::logging;
 
@@ -62,31 +62,30 @@ pub struct TlsApp {
 pub type HostName  = String;
 pub type PathBegin = String;
 
-pub struct ServerConfiguration {
-  listener:        Option<TcpListener>,
-  address:         SocketAddr,
-  applications:    HashMap<AppId, Application>,
-  backends:        BackendMap,
-  fronts:          TrieNode<Vec<TlsApp>>,
-  pool:            Rc<RefCell<Pool<BufferQueue>>>,
-  answers:         DefaultAnswers,
-  config:          HttpsProxyConfiguration,
-  ssl_config:      Arc<ServerConfig>,
-  resolver:        Arc<CertificateResolverWrapper>,
+pub struct Listener {
+  listener:   Option<TcpListener>,
+  address:    SocketAddr,
+  fronts:     TrieNode<Vec<TlsApp>>,
+  pool:       Rc<RefCell<Pool<BufferQueue>>>,
+  answers:    DefaultAnswers,
+  config:     HttpsListener,
+  ssl_config: Arc<ServerConfig>,
+  resolver:   Arc<CertificateResolverWrapper>,
+  pub token:  Token,
 }
 
-impl ServerConfiguration {
-  pub fn new(config: HttpsProxyConfiguration, event_loop: &mut Poll,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> io::Result<(ServerConfiguration, HashSet<Token>)> {
+impl Listener {
+  pub fn new(config: HttpsListener, event_loop: &mut Poll,
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> Option<Listener> {
 
     let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
       error!("could not create listener {:?}: {:?}", config.front, e);
     }).ok());
 
-    let mut listeners = HashSet::new();
     if let Some(ref sock) = listener {
       event_loop.register(sock, token, Ready::readable(), PollOpt::edge());
-      listeners.insert(token);
+    } else {
+      return None;
     }
 
     let default = DefaultAnswers {
@@ -133,34 +132,17 @@ impl ServerConfiguration {
       server_config.ciphersuites = ciphers;
     }
 
-    Ok((ServerConfiguration {
-      listener:        listener,
-      address:         config.front.clone(),
-      applications:    HashMap::new(),
-      backends:        BackendMap::new(),
-      fronts:          TrieNode::root(),
-      pool:            pool,
-      answers:         default,
-      config:          config,
-      ssl_config:      Arc::new(server_config),
-      resolver:        resolver,
-    }, listeners))
-  }
-
-  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
-    self.listener.take()
-  }
-
-  pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
-    let app_id = &application.app_id.clone();
-    let lb_alg = application.load_balancing_policy;
-
-    self.applications.insert(application.app_id.clone(), application);
-    self.backends.set_load_balancing_policy_for_app(app_id, lb_alg);
-  }
-
-  pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
-    self.applications.remove(app_id);
+    Some(Listener {
+      address:    config.front.clone(),
+      fronts:     TrieNode::root(),
+      answers:    default,
+      ssl_config: Arc::new(server_config),
+      listener,
+      pool,
+      config,
+      resolver,
+      token,
+    })
   }
 
   pub fn add_https_front(&mut self, tls_front: HttpsFront, event_loop: &mut Poll) -> bool {
@@ -222,12 +204,14 @@ impl ServerConfiguration {
 
   pub fn replace_certificate(&mut self, replace_certificate: ReplaceCertificate, event_loop: &mut Poll) {
     debug!("replacing certificate {:?}", replace_certificate);
-    let ReplaceCertificate { new_certificate, old_fingerprint, old_names, new_names } = replace_certificate;
+    let ReplaceCertificate { front, new_certificate, old_fingerprint, old_names, new_names } = replace_certificate;
     let remove = RemoveCertificate {
+      front,
       fingerprint: old_fingerprint,
       names: old_names,
     };
     let add = AddCertificate {
+      front,
       certificate: new_certificate,
       names: new_names,
     };
@@ -237,12 +221,41 @@ impl ServerConfiguration {
     (*self.resolver).add_certificate(add);
   }
 
-  pub fn add_backend(&mut self, app_id: &str, backend: Backend,  event_loop: &mut Poll) {
-    self.backends.add_backend(app_id, backend);
+  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
+    self.listener.take()
   }
 
-  pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
-    self.backends.remove_backend(app_id, backend_address);
+  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
+    -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
+
+    if let Some(ref listener) = self.listener.as_ref() {
+      listener.accept().map_err(|e| {
+        match e.kind() {
+          ErrorKind::WouldBlock => AcceptError::WouldBlock,
+          other => {
+            error!("accept() IO error: {:?}", e);
+            AcceptError::IoError
+          }
+        }
+      }).map(|(frontend_sock, _)| {
+        frontend_sock.set_nodelay(true);
+
+        poll.register(
+          &frontend_sock,
+          client_token,
+          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+          PollOpt::edge()
+        );
+
+        let session = ServerSession::new(&self.ssl_config);
+        let c = TlsClient::new(session, frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address,
+          self.config.expect_proxy, self.config.sticky_name.clone(), timeout, Token(token.0));
+
+        (Rc::new(RefCell::new(c)), false)
+      })
+    } else {
+      Err(AcceptError::IoError)
+    }
   }
 
   // ToDo factor out with http.rs
@@ -283,6 +296,57 @@ impl ServerConfiguration {
     }
   }
 
+}
+
+pub struct ServerConfiguration {
+  listeners:    HashMap<Token, Listener>,
+  applications: HashMap<AppId, Application>,
+  backends:     BackendMap,
+  pool:         Rc<RefCell<Pool<BufferQueue>>>,
+}
+
+impl ServerConfiguration {
+  pub fn new(pool: Rc<RefCell<Pool<BufferQueue>>>) -> ServerConfiguration {
+    ServerConfiguration {
+      listeners : HashMap::new(),
+      applications: HashMap::new(),
+      backends: BackendMap::new(),
+      pool,
+    }
+  }
+
+  pub fn add_listener(&mut self, config: HttpsListener, event_loop: &mut Poll,
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> Option<Token> {
+
+    match Listener::new(config, event_loop, pool, tcp_listener, token) {
+      None => None,
+      Some(listener) => {
+        self.listeners.insert(token, listener);
+        Some(token)
+      }
+    }
+  }
+
+  pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
+    let app_id = &application.app_id.clone();
+    let lb_alg = application.load_balancing_policy;
+
+    self.applications.insert(application.app_id.clone(), application);
+    self.backends.set_load_balancing_policy_for_app(app_id, lb_alg);
+  }
+
+  pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
+    self.applications.remove(app_id);
+  }
+
+  pub fn add_backend(&mut self, app_id: &str, backend: Backend,  event_loop: &mut Poll) {
+    self.backends.add_backend(app_id, backend);
+  }
+
+  pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
+    self.backends.remove_backend(app_id, backend_address);
+  }
+
   pub fn backend_from_request(&mut self, client: &mut TlsClient, host: &str, uri: &str, front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
     trace!("looking for backend for host: {}", host);
     let real_host = if let Some(h) = host.split(":").next() {
@@ -292,21 +356,23 @@ impl ServerConfiguration {
     };
     trace!("looking for backend for real host: {}", real_host);
 
-    if let Some(app_id) = self.frontend_from_request(real_host, uri).map(|ref front| front.app_id.clone()) {
+    if let Some(app_id) = self.listeners[&client.listen_token].frontend_from_request(real_host, uri).map(|ref front| front.app_id.clone()) {
       client.http().map(|h| h.set_app_id(app_id.clone()));
 
       match self.backends.backend_from_app_id(&app_id) {
         Err(e) => {
-          client.set_answer(DefaultAnswerStatus::Answer503, self.answers.ServiceUnavailable.clone());
+          let answer = self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
+          client.set_answer(DefaultAnswerStatus::Answer503, answer);
           Err(e)
         },
         Ok((backend, conn))  => {
           client.back_connected = BackendConnectionStatus::Connecting;
           if front_should_stick {
+            let sticky_name = self.listeners[&client.listen_token].config.sticky_name.clone();
             client.http().map(|http| {
               http.sticky_session =
                 Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or(backend.borrow().backend_id.clone())));
-              http.sticky_name = self.config.sticky_name.clone();
+              http.sticky_name = sticky_name;
             });
           }
           client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
@@ -327,14 +393,16 @@ impl ServerConfiguration {
     match self.backends.backend_from_sticky_session(app_id, &sticky_session) {
       Err(e) => {
         debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
-        client.set_answer(DefaultAnswerStatus::Answer503, self.answers.ServiceUnavailable.clone());
+        let answer = self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
+        client.set_answer(DefaultAnswerStatus::Answer503, answer);
         Err(e)
       },
       Ok((backend, conn))  => {
         client.back_connected = BackendConnectionStatus::Connecting;
+        let sticky_name = self.listeners[&client.listen_token].config.sticky_name.clone();
         client.http().map(|http| {
           http.sticky_session = Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or(sticky_session.clone())));
-          http.sticky_name = self.config.sticky_name.clone();
+          http.sticky_name = sticky_name;
         });
         client.metrics.backend_id = Some(backend.borrow().backend_id.clone());
         client.metrics.backend_start();
@@ -350,44 +418,19 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
 
-    if let Some(ref listener) = self.listener.as_ref() {
-      listener.accept().map_err(|e| {
-        match e.kind() {
-          ErrorKind::WouldBlock => AcceptError::WouldBlock,
-          other => {
-            error!("accept() IO error: {:?}", e);
-            AcceptError::IoError
-          }
-        }
-      }).map(|(frontend_sock, _)| {
-        frontend_sock.set_nodelay(true);
-
-        poll.register(
-          &frontend_sock,
-          client_token,
-          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-          PollOpt::edge()
-        );
-
-        let session = ServerSession::new(&self.ssl_config);
-        let c = TlsClient::new(session, frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address,
-          self.config.expect_proxy, self.config.sticky_name.clone(), timeout);
-
-        (Rc::new(RefCell::new(c)), false)
-      })
-    } else {
-      Err(AcceptError::IoError)
-    }
+    self.listeners.get_mut(&Token(token.0)).unwrap().accept(token, poll, client_token, timeout)
   }
 
   fn accept_flush(&mut self) -> usize {
+    unimplemented!()
+      /*
     let mut counter = 0;
     if let Some(ref sock) = self.listener {
       while sock.accept().is_ok() {
         counter += 1;
       }
     }
-    counter
+    counter*/
   }
 
   fn connect_to_backend(&mut self, poll: &mut Poll,  client: &mut TlsClient, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
@@ -396,7 +439,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("invalid remaining chars after hostname");
-        client.set_answer(DefaultAnswerStatus::Answer400, self.answers.BadRequest.clone());
+        let answer = self.listeners[&client.listen_token].answers.BadRequest.clone();
+        client.set_answer(DefaultAnswerStatus::Answer400, answer);
         return Err(ConnectionError::InvalidHost);
       }
 
@@ -409,7 +453,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       let servername: Option<String> = unwrap_msg!(client.http()).frontend.session.get_sni_hostname().map(|s| s.to_string());
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
         error!("TLS SNI hostname '{:?}' and Host header '{}' don't match", servername, hostname_str);
-        unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, self.answers.NotFound.clone());
+        let answer = self.listeners[&client.listen_token].answers.NotFound.clone();
+        unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, answer);
         return Err(ConnectionError::HostNotFound);
       }
 
@@ -422,12 +467,13 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       }
     } else {
       error!("hostname parsing failed");
-      client.set_answer(DefaultAnswerStatus::Answer400, self.answers.BadRequest.clone());
+      let answer = self.listeners[&client.listen_token].answers.BadRequest.clone();
+      client.set_answer(DefaultAnswerStatus::Answer400, answer);
       return Err(ConnectionError::InvalidHost);
     };
 
     let rl:RRequestLine = try!(unwrap_msg!(client.http()).state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-    if let Some(app_id) = self.frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
+    if let Some(app_id) = self.listeners[&client.listen_token].frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
 
       let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
 
@@ -546,17 +592,20 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           }
         },
         Err(ConnectionError::NoBackendAvailable) => {
-          unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer503, self.answers.ServiceUnavailable.clone());
+          let answer = self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
+          unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer503, answer);
           Err(ConnectionError::NoBackendAvailable)
         },
         Err(ConnectionError::HostNotFound) => {
-          unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, self.answers.NotFound.clone());
+          let answer = self.listeners[&client.listen_token].answers.NotFound.clone();
+          unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, answer);
           Err(ConnectionError::HostNotFound)
         },
         e => panic!(e)
       }
     } else {
-      unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, self.answers.NotFound.clone());
+      let answer = self.listeners[&client.listen_token].answers.NotFound.clone();
+      unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, answer);
       Err(ConnectionError::HostNotFound)
     }
   }
@@ -576,29 +625,51 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Order::AddHttpsFront(front) => {
         //info!("HTTPS\t{} add front {:?}", id, front);
-        self.add_https_front(front, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        let addr_string = front.ip_address.clone() + ":" + &front.port.to_string();
+        let parsed: SocketAddr = addr_string.parse().ok().expect("should parse address");
+        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == parsed) {
+          listener.add_https_front(front, event_loop);
+          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        } else {
+          panic!()
+        }
       },
       Order::RemoveHttpsFront(front) => {
         //info!("HTTPS\t{} remove front {:?}", id, front);
-        self.remove_https_front(front, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        let addr_string = front.ip_address.clone() + ":" + &front.port.to_string();
+        let parsed: SocketAddr = addr_string.parse().ok().expect("should parse address");
+        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == parsed) {
+          listener.remove_https_front(front, event_loop);
+          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        } else {
+          panic!()
+        }
       },
       Order::AddCertificate(add_certificate) => {
-        self.add_certificate(add_certificate, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == add_certificate.front) {
+          listener.add_certificate(add_certificate, event_loop);
+          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        } else {
+          panic!()
+        }
       },
       Order::RemoveCertificate(remove_certificate) => {
-        //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
-        self.remove_certificate(remove_certificate, event_loop);
         //FIXME: should return an error if certificate still has fronts referencing it
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == remove_certificate.front) {
+          listener.remove_certificate(remove_certificate, event_loop);
+          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        } else {
+          panic!()
+        }
       },
       Order::ReplaceCertificate(replace_certificate) => {
-        //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
-        self.replace_certificate(replace_certificate, event_loop);
         //FIXME: should return an error if certificate still has fronts referencing it
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == replace_certificate.front) {
+          listener.replace_certificate(replace_certificate, event_loop);
+          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        } else {
+          panic!()
+        }
       },
       Order::AddBackend(backend) => {
         debug!("{} add backend {:?}", message.id, backend);
@@ -623,30 +694,30 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot parse the address")), data: None }
         }
       },
-      Order::HttpProxy(configuration) => {
-        debug!("{} modifying proxy configuration: {:?}", message.id, configuration);
-        self.answers = DefaultAnswers {
-          NotFound:           Rc::new(configuration.answer_404.into_bytes()),
-          ServiceUnavailable: Rc::new(configuration.answer_503.into_bytes()),
-          BadRequest: Rc::new(Vec::from(
-            &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-          )),
-        };
+      Order::RemoveHttpsListener(addr) => {
+        info!("removing https listener att address: {:?}", addr);
+        fixme!();
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
+        panic!();
+        /*
         self.listener.as_ref().map(|sock| {
           event_loop.deregister(sock);
         });
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None }
+        */
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
+        panic!();
+        /*
         self.listener.as_ref().map(|sock| {
           event_loop.deregister(sock);
         });
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        */
       },
       Order::Status => {
         debug!("{} status", message.id);
@@ -672,12 +743,14 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   }
 
   fn listen_port_state(&self, port: &u16) -> ListenPortState {
-    if port == &self.address.port() { ListenPortState::InUse } else { ListenPortState::Available }
+    fixme!();
+    ListenPortState::Available
+    //if port == &self.address.port() { ListenPortState::InUse } else { ListenPortState::Available }
   }
 }
 
 use network::proxy::HttpsProvider;
-pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
+pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
   use network::proxy::ProxyClientCast;
 
   let mut event_loop  = Poll::new().expect("could not create event loop");
@@ -710,10 +783,11 @@ pub fn start(config: HttpsProxyConfiguration, channel: ProxyChannel, max_buffers
     Token(e.index().0)
   };
 
-  if let Ok((configuration, listeners)) = ServerConfiguration::new(config, &mut event_loop, pool, None, token) {
+  let mut configuration = ServerConfiguration::new(pool.clone());
+  if configuration.add_listener(config, &mut event_loop, pool.clone(), None, token).is_some() {
     let (scm_server, scm_client) = UnixStream::pair().unwrap();
     let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      clients, None, Some(HttpsProvider::Rustls(configuration)), None, None, max_buffers);
+      clients, pool, None, Some(HttpsProvider::Rustls(configuration)), None, None, max_buffers);
 
     info!("starting event loop");
     server.run();

@@ -24,8 +24,8 @@ use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
-use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,Order,HttpsFront,HttpsProxyConfiguration,OrderMessage,
-  OrderMessageAnswer,OrderMessageStatus};
+use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,Order,HttpsFront,
+  HttpsListener,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::pool::{Pool,Checkout};
@@ -66,11 +66,12 @@ pub struct TlsClient {
   sticky_name:        String,
   timeout:            Timeout,
   last_event:         SteadyTime,
+  pub listen_token:   Token,
 }
 
 impl TlsClient {
   pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
-    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout) -> TlsClient {
+    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout, listen_token: Token) -> TlsClient {
     let state = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);
@@ -92,6 +93,7 @@ impl TlsClient {
       sticky_name:    sticky_name,
       timeout,
       last_event:     SteadyTime::now(),
+      listen_token,
     };
     client.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
     client

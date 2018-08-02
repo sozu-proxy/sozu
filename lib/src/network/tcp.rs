@@ -25,6 +25,7 @@ use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
 use sozu_command::messages::{self,TcpFront,Order,OrderMessage,OrderMessageAnswer,OrderMessageStatus,LoadBalancingParams};
+use sozu_command::messages::TcpListener as TcpListenerConfig;
 use sozu_command::logging;
 
 use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
@@ -632,23 +633,39 @@ impl ProxyClient for Client {
   }
 }
 
-pub struct ApplicationListener {
-  app_id:         String,
-  sock:           Option<TcpListener>,
-  token:          Option<Token>,
-  front_address:  SocketAddr,
-  back_addresses: Vec<SocketAddr>,
+pub struct Listener {
+  app_id:         Option<String>,
+  listener:       Option<TcpListener>,
+  token:          Token,
+  address:        SocketAddr,
+  pool:           Rc<RefCell<Pool<BufferQueue>>>,
+  config:         TcpListenerConfig,
 }
 
-impl ApplicationListener {
+impl Listener {
+  fn new(config: TcpListenerConfig, event_loop: &mut Poll,
+    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> Option<Listener> {
 
-  fn remove_backend_address(&mut self, backend_address: &SocketAddr) {
-    self.back_addresses
-        .iter()
-        .position(|back_addr| *back_addr == *backend_address)
-        .map(|i| self.back_addresses.remove(i));
+    let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
+      error!("could not create listener {:?}: {:?}", config.front, e);
+    }).ok());
+
+
+    if let Some(ref sock) = listener {
+      event_loop.register(sock, token, Ready::readable(), PollOpt::edge());
+    } else {
+      return None;
+    }
+
+    Some(Listener {
+      app_id: None,
+      listener,
+      token,
+      address: config.front,
+      pool,
+      config,
+    })
   }
-
 }
 
 #[derive(Debug)]
@@ -658,148 +675,71 @@ pub struct ApplicationConfiguration {
 }
 
 pub struct ServerConfiguration {
-  fronts:          HashMap<String, Token>,
-  backends:        BackendMap,
-  listeners:       HashMap<Token, ApplicationListener>,
-  configs:         HashMap<AppId, ApplicationConfiguration>,
-  pool:            Rc<RefCell<Pool<BufferQueue>>>,
+  fronts:    HashMap<String, Token>,
+  backends:  BackendMap,
+  listeners: HashMap<Token, Listener>,
+  configs:   HashMap<AppId, ApplicationConfiguration>,
 }
 
 impl ServerConfiguration {
-  pub fn new(event_loop: &mut Poll, pool: Rc<RefCell<Pool<BufferQueue>>>,
-    mut tcp_listener: Vec<(AppId, TcpListener)>, mut tokens: Vec<Token>) -> (ServerConfiguration, HashSet<Token>) {
+  pub fn new() -> ServerConfiguration {
 
-    let mut configuration = ServerConfiguration {
-      backends:      BackendMap::new(),
-      listeners:     HashMap::new(),
-      configs:       HashMap::new(),
-      fronts:        HashMap::new(),
-      pool:          pool,
-    };
-
-    let mut listener_tokens = HashSet::new();
-
-    for ((app_id, listener), token) in tcp_listener.drain(..).zip(tokens.drain(..)) {
-      if let Ok(front) = listener.local_addr() {
-        let al = ApplicationListener {
-          app_id:         app_id.clone(),
-          sock:           Some(listener),
-          token:          None,
-          front_address:  front,
-          back_addresses: Vec::new(),
-        };
-        if let Some(_) = configuration.add_application_listener(&app_id, al, event_loop, token) {
-          listener_tokens.insert(token);
-        }
-      }
+    ServerConfiguration {
+      backends:  BackendMap::new(),
+      listeners: HashMap::new(),
+      configs:   HashMap::new(),
+      fronts:    HashMap::new(),
     }
+  }
 
-    (configuration, listener_tokens)
+  pub fn add_listener(&mut self, config: TcpListenerConfig, event_loop: &mut Poll, pool: Rc<RefCell<Pool<BufferQueue>>>,
+    tcp_listener: Option<TcpListener>, token: Token) -> Option<Token> {
+
+    if let Some(listener) = Listener::new(config, event_loop, pool, tcp_listener, token) {
+      self.listeners.insert(listener.token.clone(), listener);
+      Some(token)
+    } else {
+      None
+    }
   }
 
   pub fn give_back_listeners(&mut self) -> Vec<(String, TcpListener)> {
     let res = self.listeners.values_mut()
-      .filter(|app_listener| app_listener.sock.is_some())
-      .map(|app_listener| (app_listener.app_id.clone(), app_listener.sock.take().unwrap()))
+      .filter(|app_listener| app_listener.app_id.is_some() && app_listener.listener.is_some())
+      .map(|app_listener| (app_listener.app_id.clone().unwrap(), app_listener.listener.take().unwrap()))
       .collect();
     self.listeners.clear();
     res
   }
 
-  fn add_application_listener(&mut self, app_id: &str, al: ApplicationListener, event_loop: &mut Poll, token: Token) -> Option<ListenToken> {
-    let front = al.front_address.clone();
-    self.listeners.insert(token, al);
-    self.fronts.insert(String::from(app_id), token);
-    if let Some(ref sock) = self.listeners[&token].sock {
-      event_loop.register(sock, token, Ready::readable(), PollOpt::edge());
-    }
-    info!("started TCP listener for app {} on port {}", app_id, front.port());
-    Some(ListenToken(token.0))
-  }
-
-  pub fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, event_loop: &mut Poll, token: Token) -> Option<ListenToken> {
-    if self.fronts.contains_key(app_id) {
-      error!("TCP front already exists for app_id {}", app_id);
-      return None;
-    }
-
-    if let Ok(listener) = server_bind(front) {
-      let addresses: Vec<SocketAddr> = if let Some(backend_list) = self.backends.backends.get(app_id) {
-        let v: Vec<SocketAddr> = backend_list.backends.iter().map(|backend| (*backend.borrow_mut()).address).collect();
-        v
-      } else {
-        Vec::new()
-      };
-
-      let al = ApplicationListener {
-        app_id:         String::from(app_id),
-        sock:           Some(listener),
-        token:          Some(token),
-        front_address:  *front,
-        back_addresses: addresses,
-      };
-
-      self.add_application_listener(app_id, al, event_loop, token)
+  pub fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, event_loop: &mut Poll) -> bool {
+    if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == *front) {
+      self.fronts.insert(app_id.to_string(), listener.token);
+      info!("add_tcp_front: fronts are now: {:?}", self.fronts);
+      listener.app_id = Some(app_id.to_string());
+      true
     } else {
-      error!("could not declare listener for app {} on port {}", app_id, front.port());
-      None
+      false
     }
   }
 
-  pub fn remove_tcp_front(&mut self, app_id: String, event_loop: &mut Poll) -> Option<ListenToken>{
-    info!("removing tcp_front {:?}", app_id);
-    // ToDo
-    // Removes all listeners for the given app_id
-    // an app can't have two listeners. Is this a problem?
-    if let Some(&tok) = self.fronts.get(&app_id) {
-      if self.listeners.contains_key(&tok) {
-        self.listeners[&tok].sock.as_ref().map(|sock| event_loop.deregister(sock));
-        self.listeners.remove(&tok);
-        warn!("removed server {:?}", tok);
-        //self.listeners[tok].sock.shutdown(Shutdown::Both);
-        Some(ListenToken(tok.0))
-      } else {
-        None
+  pub fn remove_tcp_front(&mut self, front: SocketAddr, event_loop: &mut Poll) -> bool {
+    if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front) {
+      if let Some(app_id) = listener.app_id.take() {
+        self.fronts.remove(&app_id);
       }
+      true
     } else {
-      None
+      false
     }
   }
 
-  pub fn add_backend(&mut self, app_id: &str, backend: Backend, event_loop: &mut Poll) -> Option<ListenToken> {
-    use std::borrow::BorrowMut;
+  pub fn add_backend(&mut self, app_id: &str, backend: Backend, event_loop: &mut Poll) {
     self.backends.add_backend(app_id, backend.clone());
-
-    let opt_tok = self.fronts.get(app_id).clone();
-    if let Some(tok) = opt_tok {
-      self.listeners.get_mut(&tok).map(|listener| {
-        listener.back_addresses.push(backend.address);
-      });
-      //let application_listener = &mut self.listeners[&tok];
-
-      //application_listener.back_addresses.push(*backend_address);
-      Some(ListenToken(tok.0))
-    } else {
-      error!("No front for backend {} in app {}", backend.backend_id, app_id);
-      None
-    }
   }
 
-  pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) -> Option<ListenToken>{
+  pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
     let backend = self.backends.remove_backend(app_id, backend_address);
-
-    let front_token = self.fronts.get(app_id);
-
-    if let Some(f_token) = front_token {
-      if let Some(app_listener) = self.listeners.get_mut(&f_token) {
-        app_listener.remove_backend_address(backend_address);
-      }
-
-      return Some(ListenToken(f_token.0))
-    }
-
-    error!("Can't find a front to remove for the backend {} in app {}", backend_address, app_id);
-    None
   }
 
   fn backend_from_app_id(&mut self, client: &mut Client, app_id: &str) -> Result<TcpStream,ConnectionError> {
@@ -818,18 +758,14 @@ impl ServerConfiguration {
 impl ProxyConfiguration<Client> for ServerConfiguration {
 
   fn connect_to_backend(&mut self, poll: &mut Poll, client: &mut Client, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
-    let len = self.listeners[&client.accept_token].back_addresses.len();
-
-    if len == 0 {
-      error!("no backend available");
-      return Err(ConnectionError::NoBackendAvailable);
+    if self.listeners[&client.accept_token].app_id.is_none() {
+      error!("no TCP application corresponds to that front address");
+      return Err(ConnectionError::HostNotFound);
     }
 
-    let rnd = random::<usize>();
-    let idx = rnd % len;
-
     let app_id = self.listeners[&client.accept_token].app_id.clone();
-    client.app_id = Some(app_id.clone());
+    client.app_id = app_id.clone();
+    let app_id = app_id.unwrap();
 
     // Circuit breaker
     if client.back_connected == BackendConnectionStatus::Connecting {
@@ -882,43 +818,43 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
     match message.order {
+      Order::AddTcpFront(front) => {
+        let addr_string = front.ip_address + ":" + &front.port.to_string();
+        let addr = addr_string.parse().unwrap();
+        let _ = self.add_tcp_front(&front.app_id, &addr, event_loop);
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
+      },
       Order::RemoveTcpFront(front) => {
-        trace!("{:?}", front);
-        let _ = self.remove_tcp_front(front.app_id, event_loop);
+        let addr_string = front.ip_address + ":" + &front.port.to_string();
+        let addr = addr_string.parse().unwrap();
+        let _ = self.remove_tcp_front(addr, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
       },
       Order::AddBackend(backend) => {
         let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let addr = addr_string.parse().unwrap();
         let new_backend = Backend::new(&backend.backend_id, addr, backend.sticky_id.clone(), backend.load_balancing_parameters, backend.backup);
-        if let Some(token) = self.add_backend(&backend.app_id, new_backend, event_loop) {
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
-        } else {
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot add tcp backend")), data: None}
-        }
+        self.add_backend(&backend.app_id, new_backend, event_loop);
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
       },
       Order::RemoveBackend(backend) => {
         trace!("{:?}", backend);
         let addr_string = backend.ip_address + ":" + &backend.port.to_string();
         let addr = &addr_string.parse().unwrap();
-        if let Some(token) = self.remove_backend(&backend.app_id, addr, event_loop) {
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
-        } else {
-          error!("Couldn't remove tcp backend");
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("cannot remove tcp backend")), data: None}
-        }
+        self.remove_backend(&backend.app_id, addr, event_loop);
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
-        for listener in self.listeners.values() {
-          listener.sock.as_ref().map(|sock| event_loop.deregister(sock));
+        for l in self.listeners.values() {
+          l.listener.as_ref().map(|sock| event_loop.deregister(sock));
         }
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None}
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
-        for listener in self.listeners.values() {
-          listener.sock.as_ref().map(|sock| event_loop.deregister(sock));
+        for l in self.listeners.values() {
+          l.listener.as_ref().map(|sock| event_loop.deregister(sock));
         }
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
       },
@@ -947,6 +883,10 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       Order::RemoveApplication(_) => {
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
+      Order::RemoveTcpListener(addr) => {
+        fixme!();
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unimplemented")), data: None }
+      },
       command => {
         error!("{} unsupported message, ignoring {:?}", message.id, command);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message")), data: None}
@@ -956,19 +896,17 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
   fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<Client>>, bool), AcceptError> {
+    let internal_token = Token(token.0);
+    if let Some(listener) = self.listeners.get_mut(&internal_token) {
+      let mut p = (*listener.pool).borrow_mut();
 
-    let mut p = (*self.pool).borrow_mut();
-
-    if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-      let internal_token = Token(token.0);//FIXME: ListenToken(token.0 - 2 - self.base_token);
-      if self.listeners.contains_key(&internal_token) {
-
+      if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
         let proxy_protocol = self.configs
-                                .get(&self.listeners[&internal_token].app_id)
+                                .get(listener.app_id.as_ref().unwrap())
                                 .and_then(|c| c.proxy_protocol.clone());
 
-        if let Some(ref listener) = self.listeners[&internal_token].sock.as_ref() {
-          listener.accept().map(|(frontend_sock, _)| {
+        if let Some(ref tcp_listener) = listener.listener.as_ref() {
+          tcp_listener.accept().map(|(frontend_sock, _)| {
             frontend_sock.set_nodelay(true);
             let c = Client::new(frontend_sock, client_token, internal_token, front_buf, back_buf, proxy_protocol.clone(),
               timeout);
@@ -996,18 +934,18 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           Err(AcceptError::IoError)
         }
       } else {
-        Err(AcceptError::IoError)
+        error!("could not get buffers from pool");
+        Err(AcceptError::TooManyClients)
       }
     } else {
-      error!("could not get buffers from pool");
-      Err(AcceptError::TooManyClients)
+      Err(AcceptError::IoError)
     }
   }
 
   fn accept_flush(&mut self) -> usize {
     let mut counter = 0;
-    for ref listener in self.listeners.values() {
-      if let Some(ref sock) = listener.sock.as_ref() {
+    for ref l in self.listeners.values() {
+      if let Some(ref sock) = l.listener.as_ref() {
         while sock.accept().is_ok() {
           counter += 1;
         }
@@ -1021,7 +959,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   }
 
   fn listen_port_state(&self, port: &u16) -> ListenPortState {
-    match self.listeners.values().find(|listener| &listener.front_address.port() == port) {
+    match self.listeners.values().find(|listener| &listener.address.port() == port) {
       Some(_) => ListenPortState::InUse,
       None => ListenPortState::Available
     }
@@ -1029,7 +967,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 }
 
 
-pub fn start(max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
+pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
   use network::proxy::ProxyClientCast;
 
   let mut poll          = Poll::new().expect("could not create event loop");
@@ -1060,9 +998,11 @@ pub fn start(max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
     Token(e.index().0)
   };
 
-  let (configuration, tokens) = ServerConfiguration::new(&mut poll, pool, Vec::new(), vec!(token));
+  let mut configuration = ServerConfiguration::new();
+  let _ = configuration.add_listener(config, &mut poll, pool.clone(), None, token);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
-  let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), clients, None, None, Some(configuration), None, max_buffers);
+  let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), clients,
+    pool, None ,None, Some(configuration), None, max_buffers);
 
   info!("starting event loop");
   server.run();
