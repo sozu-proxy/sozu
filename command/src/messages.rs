@@ -142,9 +142,10 @@ pub enum Order {
     AddHttpsListener(HttpsListener),
     AddTcpListener(TcpListener),
 
-    RemoveHttpListener(SocketAddr),
-    RemoveHttpsListener(SocketAddr),
-    RemoveTcpListener(SocketAddr),
+    RemoveListener(RemoveListener),
+
+    ActivateListener(ActivateListener),
+    DeactivateListener(DeactivateListener),
 
     Query(Query),
 
@@ -385,15 +386,43 @@ pub fn default_sticky_name() -> String {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ListenerType {
+  HTTP,
+  HTTPS,
+  TCP,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct RemoveListener {
+  pub front: SocketAddr,
+  pub proxy: ListenerType,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct ActivateListener {
+  pub front:    SocketAddr,
+  pub proxy:    ListenerType,
+  pub from_scm: bool,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub struct DeactivateListener {
+  pub front:  SocketAddr,
+  pub proxy:  ListenerType,
+  pub to_scm: bool,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpListener {
-    pub front:           SocketAddr,
-    pub public_address:  Option<IpAddr>,
-    pub answer_404:      String,
-    pub answer_503:      String,
+    pub front:          SocketAddr,
+    pub public_address: Option<IpAddr>,
+    pub answer_404:     String,
+    pub answer_503:     String,
     #[serde(default)]
-    pub expect_proxy:    bool,
+    pub expect_proxy:   bool,
     #[serde(default = "default_sticky_name")]
-    pub sticky_name:     String,
+    pub sticky_name:    String,
 }
 
 impl Default for HttpListener {
@@ -436,19 +465,19 @@ pub enum TlsVersion {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpsListener {
-    pub front:                     SocketAddr,
-    pub public_address:            Option<IpAddr>,
-    pub answer_404:                String,
-    pub answer_503:                String,
-    pub versions:                  Vec<TlsVersion>,
-    pub cipher_list:               String,
-    pub rustls_cipher_list:        Vec<String>,
+    pub front:              SocketAddr,
+    pub public_address:     Option<IpAddr>,
+    pub answer_404:         String,
+    pub answer_503:         String,
+    pub versions:           Vec<TlsVersion>,
+    pub cipher_list:        String,
+    pub rustls_cipher_list: Vec<String>,
     #[serde(default)]
-    pub tls_provider:              TlsProvider,
+    pub tls_provider:       TlsProvider,
     #[serde(default)]
-    pub expect_proxy:              bool,
+    pub expect_proxy:       bool,
     #[serde(default = "default_sticky_name")]
-    pub sticky_name:               String,
+    pub sticky_name:        String,
 }
 
 impl Default for HttpsListener {
@@ -561,9 +590,9 @@ impl Order {
       Order::AddHttpListener(_)     => [Topic::HttpProxyConfig].iter().cloned().collect(),
       Order::AddHttpsListener(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
       Order::AddTcpListener(_)      => [Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::RemoveHttpListener(_)  => [Topic::HttpProxyConfig].iter().cloned().collect(),
-      Order::RemoveHttpsListener(_) => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      Order::RemoveTcpListener(_)   => [Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::RemoveListener(_)      => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::ActivateListener(_)    => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      Order::DeactivateListener(_)  => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::Query(_)               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::SoftStop               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       Order::HardStop               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),

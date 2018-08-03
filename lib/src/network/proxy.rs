@@ -29,7 +29,7 @@ use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::state::{ConfigState,get_application_ids_by_domain};
 use sozu_command::messages::{self,TcpFront,Order,Backend,MessageId,OrderMessageAnswer,
   OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer,
-  QueryApplicationType,TlsProvider};
+  QueryApplicationType,TlsProvider,ListenerType};
 use sozu_command::messages::HttpsListener;
 
 use network::buffer_queue::BufferQueue;
@@ -503,7 +503,8 @@ impl Server {
 
           let token = Token(entry.index().0);
 
-          let status = if let Some(token) = self.http.add_listener(listener.clone(), &mut self.poll, self.pool.clone(), None, token) {
+          let front = listener.front.clone();
+          let status = if let Some(token) = self.http.add_listener(listener.clone(), self.pool.clone(), token) {
             entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
             OrderMessageStatus::Ok
           } else {
@@ -513,6 +514,27 @@ impl Server {
 
           let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
           self.queue.push_back(answer);
+        },
+        OrderMessage { ref id, order: Order::RemoveListener(ref remove) } => {
+          if remove.proxy == ListenerType::HTTP {
+            self.queue.push_back(self.http.notify(&mut self.poll, OrderMessage {
+              id: id.to_string(),
+              order: Order::RemoveListener(remove.clone())
+            }));
+          }
+        },
+        OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
+          if activate.proxy == ListenerType::HTTP {
+            let status = if self.http.activate_listener(&mut self.poll, &activate.front, None).is_some() {
+              OrderMessageStatus::Ok
+            } else {
+              error!("Couldn't activate HTTP listener");
+              OrderMessageStatus::Error(String::from("cannot activate HTTP listener"))
+            };
+
+            let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
+            self.queue.push_back(answer);
+          }
         },
         ref m => self.queue.push_back(self.http.notify(&mut self.poll, m.clone())),
       }
@@ -547,7 +569,8 @@ impl Server {
 
           let token = Token(entry.index().0);
 
-          let status = if let Some(token) = self.https.add_listener(listener.clone(), &mut self.poll, self.pool.clone(), None, token) {
+          let front = listener.front.clone();
+          let status = if let Some(token) = self.https.add_listener(listener.clone(), self.pool.clone(), token) {
             entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPSListen })));
             OrderMessageStatus::Ok
           } else {
@@ -557,6 +580,27 @@ impl Server {
 
           let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
           self.queue.push_back(answer);
+        },
+        OrderMessage { ref id, order: Order::RemoveListener(ref remove) } => {
+          if remove.proxy == ListenerType::HTTPS {
+            self.queue.push_back(self.https.notify(&mut self.poll, OrderMessage {
+              id: id.to_string(),
+              order: Order::RemoveListener(remove.clone())
+            }));
+          }
+        },
+        OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
+          if activate.proxy == ListenerType::HTTPS {
+            let status = if self.https.activate_listener(&mut self.poll, &activate.front, None).is_some() {
+              OrderMessageStatus::Ok
+            } else {
+              error!("Couldn't activate HTTPS listener");
+              OrderMessageStatus::Error(String::from("cannot activate HTTPS listener"))
+            };
+
+            let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
+            self.queue.push_back(answer);
+          }
         },
         ref m => self.queue.push_back(self.https.notify(&mut self.poll, m.clone())),
       }
@@ -591,15 +635,37 @@ impl Server {
 
           let token = Token(entry.index().0);
 
-          let status = if let Some(token) = self.tcp.add_listener(listener.clone(), &mut self.poll, self.pool.clone(), None, token) {
+          let front = listener.front.clone();
+          let status = if let Some(token) = self.tcp.add_listener(listener.clone(), self.pool.clone(), token) {
             entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::TCPListen })));
             OrderMessageStatus::Ok
           } else {
-            error!("Couldn't add tcp front");
-            OrderMessageStatus::Error(String::from("cannot add tcp front"))
+            error!("Couldn't add TCP listener");
+            OrderMessageStatus::Error(String::from("cannot add TCP listener"))
           };
           let answer = OrderMessageAnswer { id, status, data: None };
           self.queue.push_back(answer);
+        },
+        OrderMessage { ref id, order: Order::RemoveListener(ref remove) } => {
+          if remove.proxy == ListenerType::TCP {
+            self.queue.push_back(self.tcp.notify(&mut self.poll, OrderMessage {
+              id: id.to_string(),
+              order: Order::RemoveListener(remove.clone())
+            }));
+          }
+        },
+        OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
+          if activate.proxy == ListenerType::TCP {
+            let status = if self.tcp.activate_listener(&mut self.poll, &activate.front, None).is_some() {
+              OrderMessageStatus::Ok
+            } else {
+              error!("Couldn't activate TCP listener");
+              OrderMessageStatus::Error(String::from("cannot activate TCP listener"))
+            };
+
+            let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
+            self.queue.push_back(answer);
+          }
         },
         m => self.queue.push_back(self.tcp.notify(&mut self.poll, m)),
       }
@@ -1084,12 +1150,19 @@ impl HttpsProvider {
     }
   }
 
-  pub fn add_listener(&mut self, config: HttpsListener, event_loop: &mut Poll,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> Option<Token> {
+  pub fn add_listener(&mut self, config: HttpsListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
 
     match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.add_listener(config, event_loop, pool, tcp_listener, token),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.add_listener(config, event_loop, pool, tcp_listener, token),
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.add_listener(config, pool, token),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.add_listener(config, pool, token),
+    }
+  }
+
+  pub fn activate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr, tcp_listener: Option<TcpListener>) -> Option<Token> {
+
+    match self {
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.activate_listener(event_loop, addr, tcp_listener),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.activate_listener(event_loop, addr, tcp_listener),
     }
   }
 
@@ -1162,12 +1235,17 @@ impl HttpsProvider {
     rustls.notify(event_loop, message)
   }
 
-  pub fn add_listener(&mut self, config: HttpsListener, event_loop: &mut Poll,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> Option<Token> {
-
+  pub fn add_listener(&mut self, config: HttpsListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.add_listener(config, event_loop, pool, tcp_listener, token)
+    rustls.add_listener(config, pool, token)
   }
+
+  pub fn activate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr, tcp_listener: Option<TcpListener>) -> Option<Token> {
+    let &mut HttpsProvider::Rustls(ref mut rustls) = self;
+
+    rustls.activate_listener(event_loop, addr, tcp_listener)
+  }
+
 
   pub fn give_back_listener(&mut self) -> Option<TcpListener> {
     unimplemented!();

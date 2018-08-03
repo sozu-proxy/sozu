@@ -8,7 +8,8 @@ use certificate::calculate_fingerprint;
 use messages::{Application,CertFingerprint,CertificateAndKey,Order,
   HttpFront,HttpsFront,TcpFront,Backend,QueryAnswerApplication,
   AddCertificate, RemoveCertificate, RemoveBackend,
-  HttpListener,HttpsListener,TcpListener};
+  HttpListener,HttpsListener,TcpListener,ListenerType,
+  ActivateListener,DeactivateListener};
 
 pub type AppId = String;
 
@@ -105,14 +106,20 @@ impl ConfigState {
           true
         }
       },
-      &Order::RemoveHttpListener(ref addr) => {
-        self.http_listeners.remove(addr).is_some()
+      &Order::RemoveListener(ref remove) => {
+        match remove.proxy {
+          ListenerType::HTTP =>  self.http_listeners.remove(&remove.front).is_some(),
+          ListenerType::HTTPS => self.https_listeners.remove(&remove.front).is_some(),
+          ListenerType::TCP =>   self.tcp_listeners.remove(&remove.front).is_some(),
+        }
       },
-      &Order::RemoveHttpsListener(ref addr) => {
-        self.https_listeners.remove(addr).is_some()
+      &Order::ActivateListener(ref activate) => {
+        fixme!();
+        false
       },
-      &Order::RemoveTcpListener(ref addr) => {
-        self.tcp_listeners.remove(addr).is_some()
+      &Order::DeactivateListener(ref deactivate) => {
+        fixme!();
+        false
       },
       &Order::AddHttpFront(ref front) => {
         let front_vec = self.http_fronts.entry(front.app_id.clone()).or_insert(vec!());

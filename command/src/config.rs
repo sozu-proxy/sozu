@@ -13,7 +13,7 @@ use toml;
 
 use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,TcpFront,Backend,
   HttpListener,HttpsListener,TcpListener,AddCertificate,TlsProvider,LoadBalancingParams,
-  Application, TlsVersion};
+  Application, TlsVersion,ActivateListener,ListenerType};
 
 use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
 
@@ -635,6 +635,7 @@ pub struct FileConfig {
   pub ctl_command_timeout:      Option<u64>,
   pub pid_file_path:            Option<String>,
   pub tls_provider:             Option<TlsProvider>,
+  pub activate_listeners:       Option<bool>,
 }
 
 
@@ -833,6 +834,7 @@ impl FileConfig {
       ctl_command_timeout: self.ctl_command_timeout.unwrap_or(1_000),
       pid_file_path: self.pid_file_path,
       tls_provider,
+      activate_listeners: self.activate_listeners.unwrap_or(true),
     }
   }
 }
@@ -862,6 +864,7 @@ pub struct Config {
   pub ctl_command_timeout:      u64,
   pub pid_file_path:            Option<String>,
   pub tls_provider:             TlsProvider,
+  pub activate_listeners:       bool,
 }
 
 impl Config {
@@ -911,6 +914,50 @@ impl Config {
           version:  PROTOCOL_VERSION,
           proxy_id: None,
           data:     ConfigCommand::ProxyConfiguration(order),
+        });
+        count += 1;
+      }
+    }
+
+    if self.activate_listeners {
+      for listener in self.http_listeners.iter() {
+        v.push(ConfigMessage {
+          id:       format!("CONFIG-{}", count),
+          version:  PROTOCOL_VERSION,
+          proxy_id: None,
+          data:     ConfigCommand::ProxyConfiguration(Order::ActivateListener(ActivateListener{
+            front:    listener.front.clone(),
+            proxy:    ListenerType::HTTP,
+            from_scm: false,
+          })),
+        });
+        count += 1;
+      }
+
+      for listener in self.https_listeners.iter() {
+        v.push(ConfigMessage {
+          id:       format!("CONFIG-{}", count),
+          version:  PROTOCOL_VERSION,
+          proxy_id: None,
+          data:     ConfigCommand::ProxyConfiguration(Order::ActivateListener(ActivateListener{
+            front:    listener.front.clone(),
+            proxy:    ListenerType::HTTPS,
+            from_scm: false,
+          })),
+        });
+        count += 1;
+      }
+
+      for listener in self.tcp_listeners.iter() {
+        v.push(ConfigMessage {
+          id:       format!("CONFIG-{}", count),
+          version:  PROTOCOL_VERSION,
+          proxy_id: None,
+          data:     ConfigCommand::ProxyConfiguration(Order::ActivateListener(ActivateListener{
+            front:    listener.front.clone(),
+            proxy:    ListenerType::TCP,
+            from_scm: false,
+          })),
         });
         count += 1;
       }
@@ -1044,6 +1091,7 @@ mod tests {
       ctl_command_timeout: None,
       pid_file_path: None,
       tls_provider: None,
+      activate_listeners: None,
     };
 
     println!("config: {:?}", to_string(&config));

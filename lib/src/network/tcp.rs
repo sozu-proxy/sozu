@@ -634,37 +634,47 @@ impl ProxyClient for Client {
 }
 
 pub struct Listener {
-  app_id:         Option<String>,
-  listener:       Option<TcpListener>,
-  token:          Token,
-  address:        SocketAddr,
-  pool:           Rc<RefCell<Pool<BufferQueue>>>,
-  config:         TcpListenerConfig,
+  app_id:   Option<String>,
+  listener: Option<TcpListener>,
+  token:    Token,
+  address:  SocketAddr,
+  pool:     Rc<RefCell<Pool<BufferQueue>>>,
+  config:   TcpListenerConfig,
+  active:   bool,
 }
 
 impl Listener {
-  fn new(config: TcpListenerConfig, event_loop: &mut Poll,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> Option<Listener> {
-
-    let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
-      error!("could not create listener {:?}: {:?}", config.front, e);
-    }).ok());
-
-
-    if let Some(ref sock) = listener {
-      event_loop.register(sock, token, Ready::readable(), PollOpt::edge());
-    } else {
-      return None;
-    }
-
-    Some(Listener {
+  fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Listener {
+    Listener {
       app_id: None,
-      listener,
+      listener: None,
       token,
       address: config.front,
       pool,
       config,
-    })
+      active: false,
+    }
+  }
+
+  pub fn activate(&mut self, event_loop: &mut Poll, tcp_listener: Option<TcpListener>) -> Option<Token> {
+    if self.active {
+      return None;
+    }
+
+    let listener = tcp_listener.or_else(|| server_bind(&self.config.front).map_err(|e| {
+      error!("could not create listener {:?}: {:?}", self.config.front, e);
+    }).ok());
+
+
+    if let Some(ref sock) = listener {
+      event_loop.register(sock, self.token, Ready::readable(), PollOpt::edge());
+    } else {
+      return None;
+    }
+
+    self.listener = listener;
+    self.active = true;
+    Some(self.token)
   }
 }
 
@@ -692,15 +702,23 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_listener(&mut self, config: TcpListenerConfig, event_loop: &mut Poll, pool: Rc<RefCell<Pool<BufferQueue>>>,
-    tcp_listener: Option<TcpListener>, token: Token) -> Option<Token> {
-
-    if let Some(listener) = Listener::new(config, event_loop, pool, tcp_listener, token) {
+  pub fn add_listener(&mut self, config: TcpListenerConfig, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
+    if self.listeners.contains_key(&token) {
+      None
+    } else {
+      let listener = Listener::new(config, pool, token);
       self.listeners.insert(listener.token.clone(), listener);
       Some(token)
-    } else {
-      None
     }
+  }
+
+  pub fn activate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr, tcp_listener: Option<TcpListener>) -> Option<Token> {
+    for listener in self.listeners.values_mut() {
+      if &listener.address == addr {
+        return listener.activate(event_loop, tcp_listener);
+      }
+    }
+    None
   }
 
   pub fn give_back_listeners(&mut self) -> Vec<(String, TcpListener)> {
@@ -875,7 +893,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       Order::RemoveApplication(_) => {
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
-      Order::RemoveTcpListener(addr) => {
+      Order::RemoveListener(remove) => {
         fixme!();
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unimplemented")), data: None }
       },
@@ -990,8 +1008,10 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
     Token(e.index().0)
   };
 
+  let front = config.front.clone();
   let mut configuration = ServerConfiguration::new();
-  let _ = configuration.add_listener(config, &mut poll, pool.clone(), None, token);
+  let _ = configuration.add_listener(config, pool.clone(), token);
+  let _ = configuration.activate_listener(&mut poll, &front, None);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
   let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), clients,
     pool, None ,None, Some(configuration), None, max_buffers);
@@ -1137,8 +1157,10 @@ mod tests {
       };
 
       {
+        let front = listener_config.front.clone();
         let entry = clients.vacant_entry().expect("client list should have enough room at startup");
-        let _ = configuration.add_listener(listener_config, &mut poll, pool.clone(), None, Token(entry.index().0));
+        let _ = configuration.add_listener(listener_config, pool.clone(), Token(entry.index().0));
+        let _ = configuration.activate_listener(&mut poll, &front, None);
         entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::TCPListen })));
       }
 

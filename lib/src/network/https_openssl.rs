@@ -672,12 +672,11 @@ pub struct Listener {
   config:          HttpsListener,
   ssl_options:     SslOptions,
   pub token:       Token,
+  active:          bool,
 }
 
 impl Listener {
-  pub fn new(config: HttpsListener, event_loop: &mut Poll,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token)
-      -> Option<Listener> {
+  pub fn new(config: HttpsListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Listener {
 
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let domains      = TrieNode::root();
@@ -690,16 +689,6 @@ impl Listener {
     let (default_context, ssl_options):(SslContext, SslOptions) =
       Self::create_default_context(&config, ref_ctx, ref_domains).expect("could not create default context");
 
-    let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
-       error!("could not create listener {:?}: {:?}", fronts, e);
-    }).ok());
-
-    if let Some(ref sock) = listener {
-      event_loop.register(sock, token, Ready::readable(), PollOpt::edge());
-    } else {
-      return None;
-    }
-
     let default = DefaultAnswers {
       NotFound: Rc::new(Vec::from(config.answer_404.as_bytes())),
       ServiceUnavailable: Rc::new(Vec::from(config.answer_503.as_bytes())),
@@ -708,19 +697,41 @@ impl Listener {
       )),
     };
 
-    Some(Listener {
-      listener,
+    Listener {
+      listener:        None,
       address:         config.front.clone(),
-      fronts,
       domains:         rc_domains,
       default_context: default_context,
       contexts:        rc_ctx,
       answers:         default,
+      active:          false,
+      fronts,
       pool,
       config,
       ssl_options,
       token,
-    })
+    }
+  }
+
+  pub fn activate(&mut self, event_loop: &mut Poll, tcp_listener: Option<TcpListener>) -> Option<Token> {
+    if self.active {
+      return None;
+    }
+
+    let listener = tcp_listener.or_else(|| server_bind(&self.config.front).map_err(|e| {
+      error!("could not create listener {:?}: {:?}", self.config.front, e);
+    }).ok());
+
+
+    if let Some(ref sock) = listener {
+      event_loop.register(sock, self.token, Ready::readable(), PollOpt::edge());
+    } else {
+      return None;
+    }
+
+    self.listener = listener;
+    self.active = true;
+    Some(self.token)
   }
 
   pub fn create_default_context(config: &HttpsListener, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
@@ -1072,16 +1083,23 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_listener(&mut self, config: HttpsListener, event_loop: &mut Poll,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> Option<Token> {
+  pub fn add_listener(&mut self, config: HttpsListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
+    if self.listeners.contains_key(&token) {
+      None
+    } else {
+      let listener = Listener::new(config, pool, token);
+      self.listeners.insert(listener.token.clone(), listener);
+      Some(token)
+    }
+  }
 
-    match Listener::new(config, event_loop, pool, tcp_listener, token) {
-      None => None,
-      Some(listener) => {
-        self.listeners.insert(token, listener);
-        Some(token)
+  pub fn activate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr, tcp_listener: Option<TcpListener>) -> Option<Token> {
+    for listener in self.listeners.values_mut() {
+      if &listener.address == addr {
+        return listener.activate(event_loop, tcp_listener);
       }
     }
+    None
   }
 
   pub fn give_back_listener(&mut self) -> Option<TcpListener> {
@@ -1448,8 +1466,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         self.remove_backend(&backend.app_id, &backend.address, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
-      Order::RemoveHttpsListener(addr) => {
-        info!("removing https listener att address: {:?}", addr);
+      Order::RemoveListener(remove) => {
+        info!("removing https listener att address: {:?}", remove.front);
         fixme!();
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
@@ -1569,15 +1587,18 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
   };
 
   let mut configuration = ServerConfiguration::new(pool.clone());
-  if configuration.add_listener(config, &mut event_loop, pool.clone(), None, token).is_some() {
+  let front = config.front.clone();
+  if configuration.add_listener(config, pool.clone(), token).is_some() {
+    if configuration.activate_listener(&mut event_loop, &front, None).is_some() {
 
-    let (scm_server, scm_client) = UnixStream::pair().unwrap();
-    let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-      clients, pool, None, Some(HttpsProvider::Openssl(configuration)), None, None, max_buffers);
+      let (scm_server, scm_client) = UnixStream::pair().unwrap();
+      let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
+        clients, pool, None, Some(HttpsProvider::Openssl(configuration)), None, None, max_buffers);
 
-    info!("starting event loop");
-    server.run();
-    info!("ending event loop");
+      info!("starting event loop");
+      server.run();
+      info!("ending event loop");
+    }
   }
 }
 
@@ -1663,6 +1684,7 @@ mod tests {
       ssl_options: ssl::SslOptions::CIPHER_SERVER_PREFERENCE | ssl::SslOptions::NO_COMPRESSION | ssl::SslOptions::NO_TICKET |
         ssl::SslOptions::NO_SSLV2 | ssl::SslOptions::NO_SSLV3 | ssl::SslOptions::NO_TLSV1 | ssl::SslOptions::NO_TLSV1_1,
       token: Token(0),
+      active: true,
     };
 
 

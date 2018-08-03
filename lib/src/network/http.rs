@@ -629,6 +629,7 @@ pub struct Listener {
   answers:      DefaultAnswers,
   config:       HttpListener,
   pub token:    Token,
+  pub active:   bool,
 }
 
 pub struct ServerConfiguration {
@@ -648,14 +649,23 @@ impl ServerConfiguration {
     }
   }
 
-  pub fn add_listener(&mut self, config: HttpListener, event_loop: &mut Poll,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> Option<Token> {
-    if let Some(listener) = Listener::new(config, event_loop, pool, tcp_listener, token) {
+  pub fn add_listener(&mut self, config: HttpListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
+    if self.listeners.contains_key(&token) {
+      None
+    } else {
+     let listener = Listener::new(config, pool, token);
       self.listeners.insert(listener.token.clone(), listener);
       Some(token)
-    } else {
-      None
     }
+  }
+
+  pub fn activate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr, tcp_listener: Option<TcpListener>) -> Option<Token> {
+    for listener in self.listeners.values_mut() {
+      if &listener.address == addr {
+        return listener.activate(event_loop, tcp_listener);
+      }
+    }
+    None
   }
 
   pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
@@ -734,38 +744,48 @@ impl ServerConfiguration {
 }
 
 impl Listener {
-  pub fn new(config: HttpListener, event_loop: &mut Poll,
-    pool: Rc<RefCell<Pool<BufferQueue>>>, tcp_listener: Option<TcpListener>, token: Token) -> Option<Listener> {
+  pub fn new(config: HttpListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Listener {
 
     let front = config.front;
-
-    let listener = tcp_listener.or_else(|| server_bind(&config.front).map_err(|e| {
-      error!("could not create listener {:?}: {:?}", front, e);
-   }).ok());
-
-    if let Some(ref sock) = listener {
-      event_loop.register(sock, token, Ready::readable(), PollOpt::edge());
-    } else {
-      return None;
-    }
 
     let default = DefaultAnswers {
       NotFound: Rc::new(Vec::from(config.answer_404.as_bytes())),
       ServiceUnavailable: Rc::new(Vec::from(config.answer_503.as_bytes())),
       BadRequest: Rc::new(Vec::from(
-                  &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-                )),
+          &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+        )),
     };
 
-    Some(Listener {
-      listener,
+    Listener {
+      listener: None,
       address: config.front,
       fronts:  TrieNode::root(),
       pool,
       answers: default,
       config,
       token,
-    })
+      active: false,
+    }
+  }
+
+  pub fn activate(&mut self, event_loop: &mut Poll, tcp_listener: Option<TcpListener>) -> Option<Token> {
+    if self.active {
+      return None;
+    }
+
+    let listener = tcp_listener.or_else(|| server_bind(&self.config.front).map_err(|e| {
+      error!("could not create listener {:?}: {:?}", self.config.front, e);
+    }).ok());
+
+    if let Some(ref sock) = listener {
+      event_loop.register(sock, self.token, Ready::readable(), PollOpt::edge());
+    } else {
+      return None;
+    }
+
+    self.listener = listener;
+    self.active = true;
+    Some(self.token)
   }
 
   pub fn give_back_listener(&mut self) -> Option<TcpListener> {
@@ -1125,8 +1145,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         self.remove_backend(&backend.app_id, &backend.address, event_loop);
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
       },
-      Order::RemoveHttpListener(addr) => {
-        info!("removing http listener at address {:?}", addr);
+      Order::RemoveListener(remove) => {
+        info!("removing http listener at address {:?}", remove.front);
         fixme!();
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unimplemented")), data: None }
       },
@@ -1303,8 +1323,11 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
     let e = entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
     Token(e.index().0)
   };
+
+  let front = config.front.clone();
   let mut configuration = ServerConfiguration::new(pool.clone());
-  let listeners = configuration.add_listener(config, &mut event_loop, pool.clone(), None, token);
+  let _ = configuration.add_listener(config, pool.clone(), token);
+  let _ = configuration.activate_listener(&mut event_loop, &front, None);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
 
   let mut server    = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
@@ -1597,6 +1620,7 @@ mod tests {
       },
       config: Default::default(),
       token: Token(0),
+      active: true,
     };
 
     let frontend1 = listener.frontend_from_request("lolcatho.st", "/");
