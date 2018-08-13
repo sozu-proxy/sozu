@@ -75,45 +75,34 @@ impl<Front:SocketHandler> Http<Front> {
     public_address: Option<IpAddr>, client_address: Option<SocketAddr>, sticky_name: String,
     protocol: Protocol) -> Option<Http<Front>> {
 
-    let bufs = if let Some(pool) = pool.upgrade() {
-      let mut p = pool.borrow_mut();
-      (p.checkout(), p.checkout())
-    } else {
-      (None, None)
+    let request_id = Uuid::new_v4().hyphenated().to_string();
+    let log_ctx    = format!("{} unknown\t", &request_id);
+    let mut client = Http {
+      frontend:           sock,
+      backend:            None,
+      frontend_token:     token,
+      backend_token:      None,
+      status:             ClientStatus::Normal,
+      state:              Some(HttpState::new()),
+      front_buf:          None,
+      back_buf:           None,
+      app_id:             None,
+      request_id:         request_id,
+      readiness:          Readiness::new(),
+      log_ctx:            log_ctx,
+      public_address:     public_address,
+      client_address:     client_address,
+      sticky_name:        sticky_name,
+      sticky_session:     None,
+      protocol:           protocol,
+      pool,
     };
+    let req_header = client.added_request_header(public_address, client_address);
+    let res_header = client.added_response_header();
+    client.state.as_mut().map(|ref mut state| state.added_req_header = req_header);
+    client.state.as_mut().map(|ref mut state| state.added_res_header = res_header);
 
-    if let (Some(front_buf), Some(back_buf)) = bufs {
-      let request_id = Uuid::new_v4().hyphenated().to_string();
-      let log_ctx    = format!("{} unknown\t", &request_id);
-      let mut client = Http {
-        frontend:           sock,
-        backend:            None,
-        frontend_token:     token,
-        backend_token:      None,
-        status:             ClientStatus::Normal,
-        state:              Some(HttpState::new()),
-        front_buf:          None,
-        back_buf:           None,
-        app_id:             None,
-        request_id:         request_id,
-        readiness:          Readiness::new(),
-        log_ctx:            log_ctx,
-        public_address:     public_address,
-        client_address:     client_address,
-        sticky_name:        sticky_name,
-        sticky_session:     None,
-        protocol:           protocol,
-        pool,
-      };
-      let req_header = client.added_request_header(public_address, client_address);
-      let res_header = client.added_response_header();
-      client.state.as_mut().map(|ref mut state| state.added_req_header = req_header);
-      client.state.as_mut().map(|ref mut state| state.added_res_header = res_header);
-
-      Some(client)
-    } else {
-      None
-    }
+    Some(client)
   }
 
   pub fn reset(&mut self) {
