@@ -173,9 +173,8 @@ impl TlsClient {
         let ssl = s.ssl();
         ssl.version2().map(|version| {
           incr!(version_str(version));
-        })
-        //FIXME: we cannot use the name as a key in metrics since it requires a 'static str
-        //ssl.current_cipher().map(|c| incr!(c.name())));
+        });
+        ssl.current_cipher().map(|c| incr!(c.name()));
       });
 
       let http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), pool,
