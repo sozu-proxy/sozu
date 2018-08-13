@@ -1212,9 +1212,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
           let already_unavailable = backend.retry_policy.is_down();
           backend.retry_policy.fail();
-          count!("backend.connections.error", 1);
+          incr!("backend.connections.error");
           if !already_unavailable && backend.retry_policy.is_down() {
-            count!("backend.down", 1);
+            incr!("backend.down");
           }
         });
 
