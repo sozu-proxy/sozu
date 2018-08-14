@@ -32,9 +32,9 @@ pub struct HttpsProxy {
 pub struct ConfigState {
   pub applications:    HashMap<AppId, Application>,
   pub backends:        HashMap<AppId, Vec<Backend>>,
-  pub http_listeners:  HashMap<SocketAddr, HttpListener>,
-  pub https_listeners: HashMap<SocketAddr, HttpsListener>,
-  pub tcp_listeners:   HashMap<SocketAddr, TcpListener>,
+  pub http_listeners:  HashMap<SocketAddr, (HttpListener, bool)>,
+  pub https_listeners: HashMap<SocketAddr, (HttpsListener, bool)>,
+  pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
   pub http_fronts:     HashMap<AppId, Vec<HttpFront>>,
   pub https_fronts:    HashMap<AppId, Vec<HttpsFront>>,
   pub tcp_fronts:      HashMap<AppId, Vec<TcpFront>>,
@@ -86,7 +86,7 @@ impl ConfigState {
         if self.http_listeners.contains_key(&listener.front) {
           false
         } else {
-          self.http_listeners.insert(listener.front.clone(), listener.clone());
+          self.http_listeners.insert(listener.front.clone(), (listener.clone(), false));
           true
         }
       },
@@ -94,7 +94,7 @@ impl ConfigState {
         if self.https_listeners.contains_key(&listener.front) {
           false
         } else {
-          self.https_listeners.insert(listener.front.clone(), listener.clone());
+          self.https_listeners.insert(listener.front.clone(), (listener.clone(), false));
           true
         }
       },
@@ -102,7 +102,7 @@ impl ConfigState {
         if self.tcp_listeners.contains_key(&listener.front) {
           false
         } else {
-          self.tcp_listeners.insert(listener.front.clone(), listener.clone());
+          self.tcp_listeners.insert(listener.front.clone(), (listener.clone(), false));
           true
         }
       },
@@ -114,12 +114,18 @@ impl ConfigState {
         }
       },
       &Order::ActivateListener(ref activate) => {
-        fixme!();
-        false
+        match activate.proxy {
+          ListenerType::HTTP =>  self.http_listeners.get_mut(&activate.front).map(|t| t.1 = true).is_some(),
+          ListenerType::HTTPS => self.https_listeners.get_mut(&activate.front).map(|t| t.1 = true).is_some(),
+          ListenerType::TCP =>   self.tcp_listeners.get_mut(&activate.front).map(|t| t.1 = true).is_some(),
+        }
       },
       &Order::DeactivateListener(ref deactivate) => {
-        fixme!();
-        false
+        match deactivate.proxy {
+          ListenerType::HTTP =>  self.http_listeners.get_mut(&deactivate.front).map(|t| t.1 = false).is_some(),
+          ListenerType::HTTPS => self.https_listeners.get_mut(&deactivate.front).map(|t| t.1 = false).is_some(),
+          ListenerType::TCP =>   self.tcp_listeners.get_mut(&deactivate.front).map(|t| t.1 = false).is_some(),
+        }
       },
       &Order::AddHttpFront(ref front) => {
         let front_vec = self.http_fronts.entry(front.app_id.clone()).or_insert(vec!());
@@ -247,6 +253,18 @@ impl ConfigState {
   pub fn generate_orders(&self) -> Vec<Order> {
     let mut v = Vec::new();
 
+    for &(ref listener, _) in self.http_listeners.values() {
+      v.push(Order::AddHttpListener(listener.clone()));
+    }
+
+    for &(ref listener, _) in self.https_listeners.values() {
+      v.push(Order::AddHttpsListener(listener.clone()));
+    }
+
+    for &(ref listener, _) in self.tcp_listeners.values() {
+      v.push(Order::AddTcpListener(listener.clone()));
+    }
+
     for app in self.applications.values() {
       v.push(Order::AddApplication(app.clone()));
     }
@@ -283,6 +301,33 @@ impl ConfigState {
       for backend in backend_list {
         v.push(Order::AddBackend(backend.clone()));
       }
+    }
+
+    for app in self.applications.values() {
+      v.push(Order::AddApplication(app.clone()));
+    }
+
+    for addr in self.http_listeners.iter().filter(|(_,t)| t.1).map(|(k,v)| k) {
+      v.push(Order::ActivateListener(ActivateListener {
+        front: addr.clone(),
+        proxy: ListenerType::HTTP,
+        from_scm: false,
+      }));
+    }
+
+    for addr in self.https_listeners.iter().filter(|(_,t)| t.1).map(|(k,v)| k) {
+      v.push(Order::ActivateListener(ActivateListener {
+        front: addr.clone(),
+        proxy: ListenerType::HTTPS,
+        from_scm: false,
+      }));
+    }
+    for addr in self.tcp_listeners.iter().filter(|(_,t)| t.1).map(|(k,v)| k) {
+      v.push(Order::ActivateListener(ActivateListener {
+        front: addr.clone(),
+        proxy: ListenerType::TCP,
+        from_scm: false,
+      }));
     }
 
     v

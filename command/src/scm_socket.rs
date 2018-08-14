@@ -2,10 +2,12 @@ use nix::sys::socket;
 use nix::sys::uio;
 use nix::Result as NixResult;
 use std::iter::repeat;
+use std::net::SocketAddr;
 use std::str::from_utf8;
 use std::os::unix::net;
 use std::os::unix::io::{RawFd, FromRawFd, IntoRawFd};
 use serde_json;
+use messages::ListenerType;
 
 pub const MAX_FDS_OUT: usize = 200;
 pub const MAX_BYTES_OUT: usize = 4096;
@@ -48,21 +50,17 @@ impl ScmSocket {
 
   pub fn send_listeners(&self, listeners: Listeners) -> NixResult<()> {
     let listeners_count = ListenersCount {
-      http: listeners.http.is_some(),
-      tls:  listeners.tls.is_some(),
+      http: listeners.http.iter().map(|t| t.0.clone()).collect(),
+      tls:  listeners.tls.iter().map(|t| t.0.clone()).collect(),
       tcp:  listeners.tcp.iter().map(|t| t.0.clone()).collect(),
     };
 
     let message = serde_json::to_string(&listeners_count).map(|s| s.into_bytes()).unwrap_or(vec!());
 
     let mut v: Vec<RawFd> = Vec::new();
-    if let Some(fd) = listeners.http {
-      v.push(fd);
-    }
-    if let Some(fd) = listeners.tls {
-      v.push(fd);
-    }
 
+    v.extend(listeners.http.iter().map(|t| t.1));
+    v.extend(listeners.tls.iter().map(|t| t.1));
     v.extend(listeners.tcp.iter().map(|t| t.1));
 
     self.send_msg(&message, &v)
@@ -74,9 +72,9 @@ impl ScmSocket {
 
     let mut received_fds: [RawFd; MAX_FDS_OUT] = [0; MAX_FDS_OUT];
     let default = Listeners {
-      http: None,
-      tls:  None,
-      tcp:  Vec::new()
+      http: Vec::new(),
+      tls:  Vec::new(),
+      tcp:  Vec::new(),
     };
 
     match self.rcv_msg(&mut buf, &mut received_fds) {
@@ -85,7 +83,7 @@ impl ScmSocket {
         None
       },
       Ok((sz, fds_len)) => {
-        println!("{} received :{:?}", self.fd, (sz, fds_len));
+        //println!("{} received :{:?}", self.fd, (sz, fds_len));
         match from_utf8(&buf[..sz]) {
           Ok(s) => match serde_json::from_str::<ListenersCount>(s) {
             Err(e) => {
@@ -94,21 +92,18 @@ impl ScmSocket {
             },
             Ok(mut listeners_count) => {
               let mut index = 0;
-              let http = if listeners_count.http {
-                index = 1;
-                Some(received_fds[0])
-              } else {
-                None
-              };
+              let len = listeners_count.http.len();
+              let mut http = Vec::new();
+              http.extend(listeners_count.http.drain(..)
+                         .zip((&received_fds[index..index+len]).iter().cloned()));
 
-              let tls = if listeners_count.tls {
-                let fd = received_fds[index];
-                index += 1;
-                Some(fd)
-              } else {
-                None
-              };
+              index += len;
+              let len = listeners_count.tls.len();
+              let mut tls = Vec::new();
+              tls.extend(listeners_count.tls.drain(..)
+                         .zip((&received_fds[index..index+len]).iter().cloned()));
 
+              index += len;
               let mut tcp = Vec::new();
               tcp.extend(listeners_count.tcp.drain(..)
                          .zip((&received_fds[index..fds_len]).iter().cloned()));
@@ -175,15 +170,40 @@ impl ScmSocket {
 
 #[derive(Clone,Debug,Serialize,Deserialize)]
 pub struct Listeners {
-  pub http: Option<RawFd>,
-  pub tls:  Option<RawFd>,
-  //app_id, fd
-  pub tcp:  Vec<(String, RawFd)>,
+  pub http: Vec<(SocketAddr, RawFd)>,
+  pub tls:  Vec<(SocketAddr, RawFd)>,
+  pub tcp:  Vec<(SocketAddr, RawFd)>,
 }
 
 #[derive(Clone,Debug,Serialize,Deserialize)]
 pub struct ListenersCount {
-  pub http: bool,
-  pub tls:  bool,
-  pub tcp:  Vec<String>,
+  pub http: Vec<SocketAddr>,
+  pub tls:  Vec<SocketAddr>,
+  pub tcp:  Vec<SocketAddr>,
+}
+
+impl Listeners {
+  pub fn get_http(&mut self, addr: &SocketAddr) -> Option<RawFd> {
+    if let Some(pos) = self.http.iter().position(|(front, _)| front == addr) {
+      Some(self.http.remove(pos).1)
+    } else {
+      None
+    }
+  }
+
+  pub fn get_https(&mut self, addr: &SocketAddr) -> Option<RawFd> {
+    if let Some(pos) = self.tls.iter().position(|(front, _)| front == addr) {
+      Some(self.tls.remove(pos).1)
+    } else {
+      None
+    }
+  }
+
+  pub fn get_tcp(&mut self, addr: &SocketAddr) -> Option<RawFd> {
+    if let Some(pos) = self.tcp.iter().position(|(front, _)| front == addr) {
+      Some(self.tcp.remove(pos).1)
+    } else {
+      None
+    }
+  }
 }

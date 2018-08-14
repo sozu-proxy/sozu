@@ -721,12 +721,11 @@ impl ServerConfiguration {
     None
   }
 
-  pub fn give_back_listeners(&mut self) -> Vec<(String, TcpListener)> {
+  pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
     let res = self.listeners.values_mut()
-      .filter(|app_listener| app_listener.app_id.is_some() && app_listener.listener.is_some())
-      .map(|app_listener| (app_listener.app_id.clone().unwrap(), app_listener.listener.take().unwrap()))
+      .filter(|app_listener| app_listener.listener.is_some())
+      .map(|app_listener| (app_listener.address.clone(), app_listener.listener.take().unwrap()))
       .collect();
-    self.listeners.clear();
     res
   }
 

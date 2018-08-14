@@ -233,10 +233,6 @@ impl Listener {
     (*self.resolver).add_certificate(add);
   }
 
-  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
-    self.listener.take()
-  }
-
   fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
 
@@ -346,6 +342,11 @@ impl ServerConfiguration {
     None
   }
 
+  pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
+    self.listeners.values_mut().filter(|l| l.listener.is_some()).map(|l| {
+      (l.address.clone(), l.listener.take().unwrap())
+    }).collect()
+  }
 
   pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
     let app_id = &application.app_id.clone();

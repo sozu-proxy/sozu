@@ -323,7 +323,7 @@ impl CommandServer {
       let mut counter   = 0;
 
       loop {
-        worker.scm.set_blocking(false);
+        worker.scm.set_blocking(true);
         if let Some(l) = worker.scm.receive_listeners() {
           listeners = Some(l);
           break;

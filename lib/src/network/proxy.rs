@@ -10,7 +10,7 @@ use mio::*;
 use mio::unix::UnixReady;
 use std::collections::{HashSet,HashMap,VecDeque};
 use std::io::{self,Read,ErrorKind};
-use std::os::unix::io::{AsRawFd,FromRawFd};
+use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd};
 use nom::HexDisplay;
 use std::error::Error;
 use slab::Slab;
@@ -104,6 +104,7 @@ pub struct Server {
   nb_connections:  usize,
   timer:           Timer<Token>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
+  scm_listeners:   Listeners,
 }
 
 impl Server {
@@ -112,17 +113,6 @@ impl Server {
     let pool = Rc::new(RefCell::new(
       Pool::with_capacity(2*config.max_buffers, 0, || BufferQueue::with_capacity(config.buffer_size))
     ));
-
-    info!("will try to receive listeners");
-    scm.set_blocking(false);
-    let listeners = scm.receive_listeners();
-    scm.set_blocking(true);
-    info!("received listeners: {:#?}", listeners);
-    let mut listeners = listeners.unwrap_or(Listeners {
-      http: None,
-      tls:  None,
-      tcp:  Vec::new(),
-    });
 
     //FIXME: we will use a few entries for the channel, metrics socket and the listeners
     //FIXME: for HTTP/2, we will have more than 2 entries per client
@@ -211,6 +201,17 @@ impl Server {
     config_state: Option<ConfigState>,
     max_connections: usize) -> Self {
 
+    info!("will try to receive listeners");
+    scm.set_blocking(false);
+    let listeners = scm.receive_listeners();
+    scm.set_blocking(true);
+    info!("received listeners: {:?}", listeners);
+    let scm_listeners = listeners.unwrap_or(Listeners {
+      http: Vec::new(),
+      tls:  Vec::new(),
+      tcp:  Vec::new(),
+    });
+
     poll.register(
       &channel,
       Token(0),
@@ -249,6 +250,7 @@ impl Server {
       nb_connections:  0,
       timer,
       pool,
+      scm_listeners,
     };
 
     // initialize the worker with the state we got from a file
@@ -525,7 +527,8 @@ impl Server {
         },
         OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
           if activate.proxy == ListenerType::HTTP {
-            let status = if self.http.activate_listener(&mut self.poll, &activate.front, None).is_some() {
+            let listener = self.scm_listeners.get_http(&activate.front).map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
+            let status = if self.http.activate_listener(&mut self.poll, &activate.front, listener).is_some() {
               OrderMessageStatus::Ok
             } else {
               error!("Couldn't activate HTTP listener");
@@ -591,7 +594,8 @@ impl Server {
         },
         OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
           if activate.proxy == ListenerType::HTTPS {
-            let status = if self.https.activate_listener(&mut self.poll, &activate.front, None).is_some() {
+            let listener = self.scm_listeners.get_https(&activate.front).map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
+            let status = if self.https.activate_listener(&mut self.poll, &activate.front, listener).is_some() {
               OrderMessageStatus::Ok
             } else {
               error!("Couldn't activate HTTPS listener");
@@ -656,7 +660,8 @@ impl Server {
         },
         OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
           if activate.proxy == ListenerType::TCP {
-            let status = if self.tcp.activate_listener(&mut self.poll, &activate.front, None).is_some() {
+            let listener = self.scm_listeners.get_tcp(&activate.front).map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
+            let status = if self.tcp.activate_listener(&mut self.poll, &activate.front, listener).is_some() {
               OrderMessageStatus::Ok
             } else {
               error!("Couldn't activate TCP listener");
@@ -673,39 +678,34 @@ impl Server {
   }
 
   pub fn return_listen_sockets(&mut self) {
-    unimplemented!()
-    /*
     self.scm.set_blocking(false);
 
-    let http_listener = self.http.as_mut()
-      .and_then(|http| http.give_back_listener());
-    if let Some(ref sock) = http_listener {
+    let http_listeners = self.http.give_back_listeners();
+    for &(_, ref sock) in http_listeners.iter() {
       self.poll.deregister(sock);
     }
 
-    let https_listener = self.https.as_mut()
-      .and_then(|https| https.give_back_listener());
-    if let Some(ref sock) = https_listener {
+    let https_listeners = self.https.give_back_listeners();
+    for &(_, ref sock) in https_listeners.iter() {
       self.poll.deregister(sock);
     }
 
-    let tcp_listeners = self.tcp.as_mut()
-      .map(|tcp| tcp.give_back_listeners()).unwrap_or(Vec::new());
-
+    let tcp_listeners = self.tcp.give_back_listeners();
     for &(_, ref sock) in tcp_listeners.iter() {
       self.poll.deregister(sock);
     }
 
-    let res = self.scm.send_listeners(Listeners {
-      http: http_listener.map(|listener| listener.as_raw_fd()),
-      tls:  https_listener.map(|listener| listener.as_raw_fd()),
-      tcp:  tcp_listeners.into_iter().map(|(app_id, listener)| (app_id, listener.as_raw_fd())).collect(),
-    });
+    let listeners = Listeners {
+      http: http_listeners.into_iter().map(|(addr, listener)|  (addr, listener.into_raw_fd())).collect(),
+      tls:  https_listeners.into_iter().map(|(addr, listener)| (addr, listener.into_raw_fd())).collect(),
+      tcp:  tcp_listeners.into_iter().map(|(addr, listener)|   (addr, listener.into_raw_fd())).collect(),
+    };
+    info!("sending default listeners: {:?}", listeners);
+    let res = self.scm.send_listeners(listeners);
 
     self.scm.set_blocking(true);
 
     info!("sent default listeners: {:?}", res);
-    */
   }
 
   pub fn to_client(&self, token: Token) -> ClientToken {
@@ -1166,12 +1166,11 @@ impl HttpsProvider {
     }
   }
 
-  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
-    unimplemented!()
-    /*match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.give_back_listener(),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.give_back_listener(),
-    }*/
+  pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr,TcpListener)> {
+    match self {
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.give_back_listeners(),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.give_back_listeners(),
+    }
   }
 
   pub fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<ProxyClientCast>>,bool), AcceptError> {
@@ -1247,12 +1246,9 @@ impl HttpsProvider {
   }
 
 
-  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
-    unimplemented!();
-    /*
+  pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.give_back_listener()
-    */
+    rustls.give_back_listeners()
   }
 
   pub fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {

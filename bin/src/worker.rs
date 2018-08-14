@@ -121,17 +121,18 @@ pub fn start_worker_process(id: &str, config: &Config, executable_path: String, 
       command.set_nonblocking(true);
 
       let res = if let Some(l) = listeners {
-        info!("sending listeners to new worker: {:#?}", l);
+        info!("sending listeners to new worker: {:?}", l);
         scm_server.send_listeners(l)
       } else {
         scm_server.send_listeners(Listeners {
-          http: None,
-          tls:  None,
+          http: Vec::new(),
+          tls:  Vec::new(),
           tcp:  Vec::new(),
 
         })
       };
       info!("sent listeners from master: {:?}", res);
+      util::disable_close_on_exec(scm_server.fd);
 
       let command: Channel<OrderMessage,OrderMessageAnswer> = command.into();
       Ok((child.into(), command, scm_server))

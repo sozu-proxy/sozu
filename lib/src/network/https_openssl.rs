@@ -1102,9 +1102,10 @@ impl ServerConfiguration {
     None
   }
 
-  pub fn give_back_listener(&mut self) -> Option<TcpListener> {
-    unimplemented!()
-    //self.listener.take()
+  pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
+    self.listeners.values_mut().filter(|l| l.listener.is_some()).map(|l| {
+      (l.address.clone(), l.listener.take().unwrap())
+    }).collect()
   }
 
   pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
