@@ -856,15 +856,15 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
-        for l in self.listeners.values() {
-          l.listener.as_ref().map(|sock| event_loop.deregister(sock));
+        for (_, mut l) in self.listeners.drain() {
+          l.listener.take().map(|sock| event_loop.deregister(&sock));
         }
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None}
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
-        for l in self.listeners.values() {
-          l.listener.as_ref().map(|sock| event_loop.deregister(sock));
+        for (_, mut l) in self.listeners.drain() {
+          l.listener.take().map(|sock| event_loop.deregister(&sock));
         }
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
       },

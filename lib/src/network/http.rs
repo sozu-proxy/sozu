@@ -1152,25 +1152,21 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
-        fixme!();
-        //FIXME: handle shutdown
-        //event_loop.shutdown();
-        /*if let Some(ref sock) = self.listener {
-          event_loop.deregister(sock);
-        }
-        */
+        self.listeners.drain().map(|(token, mut l)| {
+          l.listener.take().map(|sock| {
+            event_loop.deregister(&sock);
+          })
+        });
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None }
       },
       Order::HardStop => {
         info!("{} hard shutdown", message.id);
-        fixme!();
-        //FIXME: handle shutdown
-        //event_loop.shutdown();
-        /*if let Some(ref sock) = self.listener {
-          event_loop.deregister(sock);
-        }
-        */
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        self.listeners.drain().map(|(token, mut l)| {
+          l.listener.take().map(|sock| {
+            event_loop.deregister(&sock);
+          })
+        });
+        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None }
       },
       Order::Status => {
         debug!("{} status", message.id);
