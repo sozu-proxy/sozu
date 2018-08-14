@@ -133,58 +133,6 @@ impl Server {
       entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::Metrics })));
     }
 
-    /*let http_session = config.http.and_then(|conf| conf.to_http()).map(|http_conf| {
-      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
-      let token = Token(entry.index().0);
-      let (configuration, listener_tokens) = http::ServerConfiguration::new(http_conf, &mut event_loop,
-        pool.clone(), listeners.http.map(|fd| unsafe { TcpListener::from_raw_fd(fd) }), token);
-
-      if listener_tokens.len() == 1 {
-        let e = entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
-        trace!("inserting http listener at token: {:?}", e.index());
-      }
-      configuration
-    });*/
-
-    /*let https_session = config.https.and_then(|conf| conf.to_tls()).and_then(|https_conf| {
-      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
-      let token = Token(entry.index().0);
-      HttpsProvider::new(https_conf, &mut event_loop, pool.clone(),
-      listeners.tls.map(|fd| unsafe { TcpListener::from_raw_fd(fd) }), token
-      ).map(|(configuration, listener_tokens)| {
-        if listener_tokens.len() == 1 {
-          entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPSListen })));
-        }
-        configuration
-      }).ok()
-    });
-
-    let tcp_listeners: Vec<(String, TcpListener)> = listeners.tcp.drain(..).map(|(app_id, fd)| {
-      (app_id, unsafe { TcpListener::from_raw_fd(fd) })
-    }).collect();
-
-    let mut tokens = Vec::new();
-    for _ in 0..tcp_listeners.len() {
-      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
-      let token = Token(entry.index().0);
-      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::TCPListen })));
-      tokens.push(token);
-    }
-
-    let tcp_tokens: HashSet<Token> = tokens.iter().cloned().collect();
-    */
-
-    /*let tcp_session = config.tcp.map(|conf| {
-      let (configuration, listener_tokens) = tcp::ServerConfiguration::new(&mut event_loop,
-        pool.clone(), tcp_listeners, tokens);
-
-      let to_remove:Vec<Token> = tcp_tokens.difference(&listener_tokens).cloned().collect();
-      for token in to_remove.into_iter() {
-        clients.remove(ClientToken(token.0));
-      }
-      configuration
-    });*/
-
     let use_openssl = config.tls_provider == TlsProvider::Openssl;
     let https = HttpsProvider::new(use_openssl, pool.clone());
 
