@@ -162,9 +162,9 @@ pub enum FrontendCmd {
 pub enum HttpFrontendCmd {
   #[structopt(name = "add")]
   Add {
-    #[structopt(short = "i", long = "listener-ip")]
+    #[structopt(long = "listener-ip")]
     listener_ip: String,
-    #[structopt(short = "p", long = "listener-port")]
+    #[structopt(long = "listener-port")]
     listener_port: u16,
     #[structopt(short = "i", long = "id", help = "app id of the frontend")]
     id: String,
@@ -177,9 +177,9 @@ pub enum HttpFrontendCmd {
   },
   #[structopt(name = "remove")]
   Remove {
-    #[structopt(short = "i", long = "listener-ip")]
+    #[structopt(long = "listener-ip")]
     listener_ip: String,
-    #[structopt(short = "p", long = "listener-port")]
+    #[structopt(long = "listener-port")]
     listener_port: u16,
     #[structopt(short = "i", long = "id", help = "app id of the frontend")]
     id: String,
