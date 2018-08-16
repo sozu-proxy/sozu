@@ -1,5 +1,5 @@
 //! parsing data from the configuration file
-use std::{error, fmt};
+use std::{error, fmt, env};
 use std::fs::File;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -626,12 +626,12 @@ impl AppConfig {
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 pub struct FileConfig {
-  pub command_socket:           String,
+  pub command_socket:           Option<String>,
   pub command_buffer_size:      Option<usize>,
   pub max_command_buffer_size:  Option<usize>,
-  pub max_connections:          usize,
-  pub max_buffers:              usize,
-  pub buffer_size:              usize,
+  pub max_connections:          Option<usize>,
+  pub max_buffers:              Option<usize>,
+  pub buffer_size:              Option<usize>,
   pub saved_state:              Option<String>,
   pub log_level:                Option<String>,
   pub log_target:               Option<String>,
@@ -826,14 +826,20 @@ impl FileConfig {
       TlsProvider::Rustls
     });
 
+    let command_socket_path = self.command_socket.unwrap_or({
+      let mut path = env::current_dir().unwrap();
+      path.push("sozu.sock");
+      path.to_str().map(|s| s.to_string()).unwrap()
+    });
+
     Config {
       config_path:    config_path.to_string(),
-      command_socket: self.command_socket,
+      command_socket: command_socket_path,
       command_buffer_size: self.command_buffer_size.unwrap_or(1_000_000),
       max_command_buffer_size: self.max_command_buffer_size.unwrap_or( self.command_buffer_size.unwrap_or(1_000_000) * 2),
-      max_connections: self.max_connections,
-      max_buffers: self.max_buffers,
-      buffer_size: self.buffer_size,
+      max_connections: self.max_connections.unwrap_or(10000),
+      max_buffers: self.max_buffers.unwrap_or(1000),
+      buffer_size: self.buffer_size.unwrap_or(16384),
       saved_state: self.saved_state,
       log_level: self.log_level.unwrap_or(String::from("info")),
       log_target: self.log_target.unwrap_or(String::from("stdout")),
@@ -1083,15 +1089,15 @@ mod tests {
     listeners.push(https);
 
     let config = FileConfig {
-      command_socket: String::from("./command_folder/sock"),
+      command_socket: Some(String::from("./command_folder/sock")),
       saved_state: None,
       worker_count: Some(2),
       worker_automatic_restart: Some(true),
       handle_process_affinity: None,
       command_buffer_size: None,
-      max_connections: 500,
-      max_buffers: 500,
-      buffer_size: 16384,
+      max_connections: Some(500),
+      max_buffers: Some(500),
+      buffer_size: Some(16384),
       max_command_buffer_size: None,
       log_level:  None,
       log_target: None,

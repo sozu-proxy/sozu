@@ -30,6 +30,7 @@ log_target = "stdout"
 # log_access_target = "file:///var/logs/sozu-access.log"
 
 # path to the unix socket file used to send commands to sozu
+# default value points to "sozu.sock" file in the current directory
 command_socket = "./command_folder/sock"
 
 # size in bytes of the buffer used by the command socket protocol. If the message
@@ -42,6 +43,7 @@ command_buffer_size = 16384
 max_command_buffer_size = 163840
 
 # the number of worker processes that will handle traffic
+# defaults to 2 workers
 worker_count = 2
 
 # indicates if workers should be automatically restarted if they crash / hang
@@ -57,11 +59,13 @@ handle_process_affinity = false
 # maximum number of connections to a worker. If it reached that number and
 # there are new connections available, the worker will accept and close them
 # immediately to indicate it is too busy to handle traffic
+# defaults to 10000 maximum connections
 max_connections = 500
 
 # maximum number of buffers used by the protocol implementations for active
 # connections (ie currently serving a request). For now, you should estimate
 # that max_buffers = number of concurrent requests * 2
+# defaults to 1000
 max_buffers = 500
 
 # size of the buffers used by the protocol implementations. Each worker will
@@ -69,6 +73,7 @@ max_buffers = 500
 # memory usage. If you plan to use sozu's runtime upgrade feature, you should
 # leave enough memory for one more worker (also for the kernel, etc), so total
 # RAM should be larger than (worker count + 1) * max_buffers * 2 * buffer_size bytes
+# defaults to 16384
 buffer_size = 16384
 
 # how much time (in milliseconds) sozuctl will wait for a command to complete.
