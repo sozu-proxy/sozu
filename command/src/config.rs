@@ -326,9 +326,6 @@ pub struct FileAppConfig {
   pub https_redirect:        Option<bool>,
   #[serde(default)]
   pub send_proxy:            Option<bool>,
-  //FIXME: remove expect_proxy
-  #[serde(default)]
-  pub expect_proxy:          Option<bool>,
   #[serde(default)]
   pub load_balancing_policy: LoadBalancingAlgorithms,
 }
@@ -389,20 +386,34 @@ pub struct BackendConfig {
 }
 
 impl FileAppConfig {
-  pub fn to_app_config(self, app_id: &str) -> Result<AppConfig, String> {
-    let send_proxy = self.send_proxy.unwrap_or(false);
-    let expect_proxy = self.expect_proxy.unwrap_or(false);
-
+  pub fn to_app_config(self, app_id: &str, expect_proxy: &HashSet<SocketAddr>) -> Result<AppConfig, String> {
     match self.protocol {
       FileAppProtocolConfig::Tcp => {
+        let mut has_expect_proxy = None;
         let mut frontends = Vec::new();
         for f in self.frontends {
+          if expect_proxy.contains(&f.address) {
+            match has_expect_proxy {
+              Some(true) => {},
+              Some(false) => return Err(format!("all the listeners for application {} should have the same expect_proxy option", app_id)),
+              None => has_expect_proxy = Some(true),
+            }
+          } else {
+            match has_expect_proxy {
+              Some(false) => {},
+              Some(true) => return Err(format!("all the listeners for application {} should have the same expect_proxy option", app_id)),
+              None => has_expect_proxy = Some(false),
+            }
+          }
           match f.to_tcp_front(app_id) {
             Ok(frontend) => frontends.push(frontend),
             Err(e) => return Err(e),
           }
         }
 
+
+        let send_proxy = self.send_proxy.unwrap_or(false);
+        let expect_proxy = has_expect_proxy.unwrap_or(false);
         let proxy_protocol = match (send_proxy, expect_proxy) {
           (true, true)  => Some(ProxyProtocolConfig::RelayHeader),
           (true, false) => Some(ProxyProtocolConfig::SendHeader),
@@ -701,6 +712,7 @@ impl FileConfig {
     let mut https_listeners = Vec::new();
     let mut tcp_listeners = Vec::new();
     let mut known_addresses = HashMap::new();
+    let mut expect_proxy = HashSet::new();
 
     if let Some(listeners) = self.listeners {
       for listener in listeners.iter() {
@@ -709,6 +721,9 @@ impl FileConfig {
         }
 
         known_addresses.insert(listener.address.clone(), listener.protocol);
+        if listener.expect_proxy == Some(true) {
+          expect_proxy.insert(listener.address.clone());
+        }
 
         match listener.protocol {
           FileListenerProtocolConfig::Https => {
@@ -738,7 +753,7 @@ impl FileConfig {
 
     if let Some(mut apps) = self.applications {
       for (id, app) in apps.drain() {
-        match app.to_app_config(id.as_str()) {
+        match app.to_app_config(id.as_str(), &expect_proxy) {
           Ok(app_config) => {
             match app_config {
               AppConfig::Http(ref http) => {
