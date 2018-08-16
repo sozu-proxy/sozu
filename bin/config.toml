@@ -81,22 +81,33 @@ buffer_size = 16384
 # is set or if SOZU_PID_FILE_PATH environment variable was defined at build time.
 # pid_file_path = "/run/sozu/sozu.pid"
 
+# defines how the TLS protocol will be handled by sozu. Possible values
+# are "openssl" or "rustls". The "openssl" option will only work if sozu
+# was built with the "use-openssl" feature.
+tls_provider = "rustls"
+
 # various statistics can be sent to a server that supports the statsd protocol
 # You can see those statistics with sozuctl, like this: `sozuctl metrics` or
 # `sozuctl metrics --json` for machine consumption
 #
 #[metrics]
-# address = "127.0.0.1"
-# port = 8125
+# address = "127.0.0.1:8125"
 # use InfluxDB's statsd protocol flavor to add tags
 # tagged_metrics = false
+# metrics key prefix
+# prefix = "sozu"
 
-# options specific to the HTTP (plaintext) proxy
-[http]
-# listening IP
-address = "127.0.0.1"
-# listening port
-port = 8080
+# Listeners
+# configuration options specific to a TCP listen socket
+
+# Example for a HTTP (plaintext) listener
+[[listeners]]
+protocol = "http"
+# listening address
+address = "0.0.0.0:8080"
+
+# specify a different IP than the one the socket sees, for logs and forwarded headers
+# public_address = "1.2.3.4:80"
 
 # path to custom 404 and 503 answers
 # a 404 response is sent when sozu does not know about the requested domain or path
@@ -107,20 +118,25 @@ port = 8080
 # defines the sticky session cookie's name, if `sticky_session` is activated for
 # an application. Defaults to "SOZUBALANCEID"
 # sticky_name = "SOZUBALANCEID"
+#
+# Configures the client socket to receive a PROXY protocol header
+# expect_proxy = false
 
-# options specific to the HTTPS (OpenSSL basedor rustls based) proxy
-[https]
-address = "127.0.0.1"
-port = 8443
+# Example for a HTTPS (OpenSSL based or rustls based) listener
+[[listeners]]
+protocol = "https"
+# listening address
+address = "0.0.0.0:8443"
+
+# specify a different IP than the one the socket sees, for logs and forwarded headers
+# public_address = "1.2.3.4:80"
 
 #answer_404 = "../lib/assets/404.html"
 #answer_503 = "../lib/assets/503.html"
 # sticky_name = "SOZUBALANCEID"
 
-# defines how the TLS protocol will be handled by sozu. Possible values
-# are "openssl" or "rustls". The "openssl" option will only work if sozu
-# was built with the "use-openssl" feature.
-# tls_provider = "rustls"
+# Configures the client socket to receive a PROXY protocol header
+# expect_proxy = false
 
 # supported TLS versions. Possible values are "SSLv2", "SSLv3", "TLSv1",
 # "TLSv1.1", "TLSv1.2", "TLSv1.3". Defaults to "TLSv1.2"
@@ -133,11 +149,16 @@ tls_versions = ["TLSv1.2"]
 # ciphersuites names, specified in https://docs.rs/rustls/0.13.0/rustls/static.ALL_CIPHERSUITES.html
 # defaults to all supported ciphersuites
 #rustls_cipher_list = ["TLS13_CHACHA20_POLY1305_SHA256"]
-# options specific to the TCP proxy
-#
-# there is nothing here for now, but to activate the TCP proxy,
-# uncomment that section
-# [tcp]
+
+
+# options specific to a TCP proxy listener
+#[[listeners]]
+# protocol = "tcp"
+# address = "127.0.0.1:8081"
+# specify a different IP than the one the socket sees, for logs and forwarded headers
+# public_address = "1.2.3.4:81"
+# Configures the client socket to receive a PROXY protocol header
+# expect_proxy = false
 
 # static configuration for applications
 #
@@ -148,58 +169,50 @@ tls_versions = ["TLSv1.2"]
 # this is an example of a routing configuration for the HTTP and HTTPS proxies
 [applications.MyApp]
 
+# the protocol option indicates if we will use HTTP or TCP proxying
+# possible options are "hhtp" or "tcp"
+protocol = "http"
+
 # per application load balancing algorithm. The possible values are
 # "roundrobin" and "random". Defaults to "roundrobin"
 # load_balancing_policy="roundrobin"
 
-# host name of the application
-hostname = "lolcatho.st"
+# frontends configuration
+# this specifies which listeners; domains, certificates that will be configured for an application
+# each element of the array must be specified on one line (toml format limitation)
+# possible frontend options:
+# - address: TCP listener
+# - hostname: host name of the application
+# - path_begin = "/api" # optional. an application can receive requests going to a hostname and path prefix
+# - sticky_session = false # activates sticky sessions for this application
+# - https_redirect = false #  activates automatic redirection to HTTPS for this application
+frontends = [
+  { address = "0.0.0.0:8080", hostname = "lolcatho.st" },
+  { address = "0.0.0.0:8443", hostname = "lolcatho.st", certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" }
+]
 
-# an application can receive requests going to a hostname and path prefix
-#path_begin = "/api" # optional
-
-# activates sticky sessions for this application
-#sticky_session = false
-#
-# activates automatic redirection to HTTPS for this application
-#https_redirect = false
-
-# TLS related options for the application. If those are active and the HTTPS
-# proxy is activated too, the application will be reachable through TLS
-#
-# certificate for this application
-certificate = "../lib/assets/certificate.pem" # optional
-# key for this application
-key = "../lib/assets/key.pem" # optional
-# certificate chain for this application
-certificate_chain = "../lib/assets/certificate_chain.pem" # optional
-
-# list of backend servers for this application
-[[applications.MyApp.backends]]
-address = "127.0.0.1:1026"
-# used as load balancing parameter
-weight = 100
-# value of the sticky session cookie
-# sticky_id = "backend-1026"
+# backends configuration
+# this indicates the backend servers used by the application
+# possible options:
+# - address: IP and port of the backend server
+# - weight: weight used by the load balancing algorithm
+# - sticky-id: sticky session identifier
+backends = [
+  { address = "127.0.0.1:1026" }
+]
 
 # this is an example of a routing configuration for the TCP proxy
 [applications.TcpTest]
-# IP address for the listener
-ip_address = "127.0.0.1"
-# port for the listener
-port = 8081
+protocol = "tcp"
+
+frontends = [
+  { address = "0.0.0.0:8081" }
+]
 
 # activates the proxy protocol to send IP information to the backend
 # send_proxy = false
 
-# Configures the client-facing connection to receive a PROXY protocol header
-# expect_proxy = false
-
-[[applications.TcpTest.backends]]
-address = "127.0.0.1:4001"
-weight = 100
-
-[[applications.TcpTest.backends]]
-address = "127.0.0.1:4000"
-weight = 50
-
+backends = [
+  { address = "127.0.0.1:4000", weight = 100 },
+  { address = "127.0.0.1:4001", weight = 50 }
+]
