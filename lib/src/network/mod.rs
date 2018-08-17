@@ -67,6 +67,9 @@ pub trait ProxyClient {
   fn close_backend(&mut self, token: Token, poll: &mut Poll) -> Option<(String, SocketAddr)>;
   fn timeout(&self, t: Token, timer: &mut Timer<Token>) -> ClientResult;
   fn cancel_timeouts(&self, timer: &mut Timer<Token>);
+  fn last_event(&self) -> SteadyTime;
+  fn print_state(&self);
+  fn tokens(&self) -> Vec<Token>;
 }
 
 #[derive(Clone,Copy,Debug,PartialEq)]

@@ -18,7 +18,7 @@ use std::io::Write;
 use std::str::FromStr;
 use std::marker::PhantomData;
 use std::fmt::Debug;
-use time::precise_time_ns;
+use time::{self, SteadyTime, precise_time_ns};
 use std::time::Duration;
 use rand::random;
 use mio_extras::timer::{Timer, Timeout};
@@ -232,6 +232,8 @@ impl Server {
     let poll_timeout = Some(Duration::from_millis(1000));
     let max_poll_errors = 10000;
     let mut current_poll_errors = 0;
+    let mut last_zombie_check = SteadyTime::now();
+
     loop {
       if current_poll_errors == max_poll_errors {
         error!("Something is going very wrong. Last {} poll() calls failed, crashing..", current_poll_errors);
@@ -349,6 +351,51 @@ impl Server {
       }
 
       self.handle_remaining_readiness();
+
+      let now = SteadyTime::now();
+      let dur = time::Duration::minutes(10);
+      if now - last_zombie_check > dur {
+        info!("zombie check");
+        last_zombie_check = now;
+
+        let mut tokens = HashSet::new();
+        let mut frontend_tokens = HashSet::new();
+
+        let mut count = 0;
+        for client in self.clients.iter_mut().filter(|c| {
+          now - c.borrow().last_event() > dur
+        }) {
+          let t = client.borrow().tokens();
+          if !frontend_tokens.contains(&t[0]) {
+            client.borrow().print_state();
+
+            frontend_tokens.insert(t[0]);
+            for tk in t.into_iter() {
+              tokens.insert(tk);
+            }
+
+            count += 1;
+          }
+        }
+
+        for tk in frontend_tokens.iter() {
+          let cl = self.to_client(*tk);
+          self.close_client(cl);
+        }
+
+        if count > 0 {
+          count!("zombies", count);
+
+          let mut remaining = 0;
+          for tk in tokens.into_iter() {
+            let cl = self.to_client(tk);
+            if self.clients.remove(cl).is_some() {
+              remaining += 1;
+            }
+          }
+          info!("removing {} zombies ({} remaining tokens after close)", count, remaining);
+        }
+      }
 
       gauge!("slab.count", self.clients.len());
       METRICS.with(|metrics| {
@@ -1037,6 +1084,16 @@ pub struct ListenClient {
 }
 
 impl ProxyClient for ListenClient {
+  fn last_event(&self) -> SteadyTime {
+    SteadyTime::now()
+  }
+
+  fn print_state(&self) {}
+
+  fn tokens(&self) -> Vec<Token> {
+    Vec::new()
+  }
+
   fn protocol(&self) -> Protocol {
     self.protocol
   }

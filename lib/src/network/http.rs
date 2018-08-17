@@ -610,6 +610,37 @@ impl ProxyClient for Client {
 
     ClientResult::Continue
   }
+
+  fn last_event(&self) -> SteadyTime {
+    self.last_event
+  }
+
+  fn print_state(&self) {
+    let p:String = match &self.protocol {
+      Some(State::Expect(_))    => String::from("Expect"),
+      Some(State::Http(h))      => format!("HTTPS: {:?}", h.state),
+      Some(State::WebSocket(_)) => String::from("WTTP"),
+      None                      => String::from("None"),
+    };
+
+    let r = match *unwrap_msg!(self.protocol.as_ref()) {
+      State::Expect(ref expect)  => &expect.readiness,
+      State::Http(ref http)      => &http.readiness,
+      State::WebSocket(ref pipe) => &pipe.readiness,
+    };
+
+    error!("zombie client[{:?} => {:?}], state => readiness: {:?}, protocol: {}, app_id: {:?}, back_connected: {:?}, metrics: {:?}",
+      self.frontend_token, self.back_token(), r, p, self.app_id, self.back_connected, self.metrics);
+  }
+
+  fn tokens(&self) -> Vec<Token> {
+    let mut v = vec![self.frontend_token];
+    if let Some(tk) = self.back_token() {
+      v.push(tk)
+    }
+
+    v
+  }
 }
 
 #[allow(non_snake_case)]

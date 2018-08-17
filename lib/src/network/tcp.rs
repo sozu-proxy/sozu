@@ -631,6 +631,40 @@ impl ProxyClient for Client {
 
     ClientResult::Continue
   }
+
+  fn last_event(&self) -> SteadyTime {
+    self.last_event
+  }
+
+  fn print_state(&self) {
+    let p:String = match &self.protocol {
+      Some(State::ExpectProxyProtocol(_)) => String::from("Expect"),
+      Some(State::SendProxyProtocol(_))   => String::from("Send"),
+      Some(State::RelayProxyProtocol(_))  => String::from("Relay"),
+      Some(State::Pipe(_))                => String::from("TCP"),
+      None                                => String::from("None"),
+    };
+
+    let r = match *unwrap_msg!(self.protocol.as_ref()) {
+      State::ExpectProxyProtocol(ref expect) => &expect.readiness,
+      State::SendProxyProtocol(ref send)     => &send.readiness,
+      State::RelayProxyProtocol(ref relay)   => &relay.readiness,
+      State::Pipe(ref pipe)                  => &pipe.readiness,
+    };
+
+    error!("zombie client[{:?} => {:?}], state => readiness: {:?}, protocol: {}, app_id: {:?}, back_connected: {:?}, metrics: {:?}",
+      self.frontend_token, self.back_token(), r, p, self.app_id, self.back_connected, self.metrics);
+  }
+
+  fn tokens(&self) -> Vec<Token> {
+    let mut v = vec![self.frontend_token];
+    if let Some(tk) = self.back_token() {
+      v.push(tk)
+    }
+
+    v
+  }
+
 }
 
 pub struct Listener {

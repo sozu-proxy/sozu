@@ -651,6 +651,39 @@ impl ProxyClient for TlsClient {
 
     ClientResult::Continue
   }
+
+  fn last_event(&self) -> SteadyTime {
+    self.last_event
+  }
+
+  fn print_state(&self) {
+    let p:String = match &self.protocol {
+      Some(State::Expect(_,_))  => String::from("Expect"),
+      Some(State::Handshake(_)) => String::from("Handshake"),
+      Some(State::Http(h))      => format!("HTTPS: {:?}", h.state),
+      Some(State::WebSocket(_)) => String::from("WSS"),
+      None                      => String::from("None"),
+    };
+
+    let r = match *unwrap_msg!(self.protocol.as_ref()) {
+      State::Expect(ref expect, _)    => &expect.readiness,
+      State::Handshake(ref handshake) => &handshake.readiness,
+      State::Http(ref http)           => &http.readiness,
+      State::WebSocket(ref pipe)      => &pipe.readiness,
+    };
+
+    error!("zombie client[{:?} => {:?}], state => readiness: {:?}, protocol: {}, app_id: {:?}, back_connected: {:?}, metrics: {:?}",
+      self.frontend_token, self.back_token(), r, p, self.app_id, self.back_connected, self.metrics);
+  }
+
+  fn tokens(&self) -> Vec<Token> {
+    let mut v = vec![self.frontend_token];
+    if let Some(tk) = self.back_token() {
+      v.push(tk)
+    }
+
+    v
+  }
 }
 
 fn get_cert_common_name(cert: &X509) -> Option<String> {
