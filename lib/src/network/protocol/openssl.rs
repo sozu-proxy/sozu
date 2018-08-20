@@ -58,7 +58,18 @@ impl TlsHandshake {
             return (ProtocolResult::Continue, ClientResult::CloseClient);
           },
           Err(HandshakeError::Failure(e)) => {
-            error!("accept: handshake failed: {:?}", e);
+            {
+              if let Some(error_stack) = e.error().ssl_error() {
+                let errors = error_stack.errors();
+                if errors.len() == 2 && errors[0].code() == 0x1412E0E2 && errors[1].code() == 0x1408A0E3 {
+                  incr!("openssl_sni_error");
+                } else {
+                  error!("accept: handshake failed: {:?}", e);
+                }
+              } else {
+                error!("accept: handshake failed: {:?}", e);
+              }
+            }
             self.state = TlsState::Error(HandshakeError::Failure(e));
             return (ProtocolResult::Continue, ClientResult::CloseClient);
           },
