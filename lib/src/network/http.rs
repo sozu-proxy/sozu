@@ -147,6 +147,7 @@ impl Client {
 
       gauge_add!("protocol.http", -1);
       gauge_add!("protocol.ws", 1);
+      gauge_add!("http.active_requests", -1);
       let mut pipe = Pipe::new(http.frontend, front_token, Some(unwrap_msg!(http.backend)),
         front_buf, back_buf, http.public_address);
 

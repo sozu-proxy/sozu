@@ -239,6 +239,7 @@ impl TlsClient {
 
       gauge_add!("protocol.https", -1);
       gauge_add!("protocol.wss", 1);
+      gauge_add!("http.active_requests", -1);
       self.protocol = Some(State::WebSocket(pipe));
       true
     } else {
