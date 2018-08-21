@@ -356,10 +356,11 @@ impl TlsClient {
   }
 
   fn back_token(&self)   -> Option<Token> {
-    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
-      http.back_token()
-    } else {
-      None
+    match unwrap_msg!(self.protocol.as_ref()) {
+      &State::Expect(_,_)         => None,
+      &State::Handshake(_)        => None,
+      &State::Http(ref http)      => http.back_token(),
+      &State::WebSocket(ref pipe) => pipe.back_token(),
     }
   }
 
