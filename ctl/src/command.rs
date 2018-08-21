@@ -871,7 +871,7 @@ pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>,
 
 pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
   backend_id: &str, ip: &str, port: u16, sticky_id: Option<String>, backup: Option<bool>) {
-  let mut address = format!("{}:{}", ip, port);
+  let address = format!("{}:{}", ip, port);
   order_command(channel, timeout, Order::AddBackend(Backend {
       app_id: String::from(app_id),
       address: address.parse().expect("could not parse network address"),
@@ -884,7 +884,7 @@ pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout:
 
 pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
   backend_id: &str, ip: &str, port: u16) {
-  let mut address = format!("{}:{}", ip, port);
+  let address = format!("{}:{}", ip, port);
   order_command(channel, timeout, Order::RemoveBackend(RemoveBackend {
     app_id: String::from(app_id),
     address: address.parse().expect("could not parse network address"),

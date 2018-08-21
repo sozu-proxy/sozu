@@ -1230,7 +1230,7 @@ impl HttpsProvider {
       error!("the openssl provider is not compiled, continuing with the rustls provider");
     }
 
-    let mut configuration = https_rustls::configuration::ServerConfiguration::new(pool);
+    let configuration = https_rustls::configuration::ServerConfiguration::new(pool);
     HttpsProvider::Rustls(configuration)
   }
 

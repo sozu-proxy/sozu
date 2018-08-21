@@ -9,7 +9,7 @@ use messages::{Application,CertFingerprint,CertificateAndKey,Order,
   HttpFront,HttpsFront,TcpFront,Backend,QueryAnswerApplication,
   AddCertificate, RemoveCertificate, RemoveBackend,
   HttpListener,HttpsListener,TcpListener,ListenerType,
-  ActivateListener,DeactivateListener};
+  ActivateListener};
 
 pub type AppId = String;
 
@@ -307,7 +307,7 @@ impl ConfigState {
       v.push(Order::AddApplication(app.clone()));
     }
 
-    for addr in self.http_listeners.iter().filter(|(_,t)| t.1).map(|(k,v)| k) {
+    for addr in self.http_listeners.iter().filter(|(_,t)| t.1).map(|(k,_)| k) {
       v.push(Order::ActivateListener(ActivateListener {
         front: addr.clone(),
         proxy: ListenerType::HTTP,
@@ -315,14 +315,14 @@ impl ConfigState {
       }));
     }
 
-    for addr in self.https_listeners.iter().filter(|(_,t)| t.1).map(|(k,v)| k) {
+    for addr in self.https_listeners.iter().filter(|(_,t)| t.1).map(|(k,_)| k) {
       v.push(Order::ActivateListener(ActivateListener {
         front: addr.clone(),
         proxy: ListenerType::HTTPS,
         from_scm: false,
       }));
     }
-    for addr in self.tcp_listeners.iter().filter(|(_,t)| t.1).map(|(k,v)| k) {
+    for addr in self.tcp_listeners.iter().filter(|(_,t)| t.1).map(|(k,_)| k) {
       v.push(Order::ActivateListener(ActivateListener {
         front: addr.clone(),
         proxy: ListenerType::TCP,

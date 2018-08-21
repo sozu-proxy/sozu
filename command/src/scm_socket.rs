@@ -7,7 +7,6 @@ use std::str::from_utf8;
 use std::os::unix::net;
 use std::os::unix::io::{RawFd, FromRawFd, IntoRawFd};
 use serde_json;
-use messages::ListenerType;
 
 pub const MAX_FDS_OUT: usize = 200;
 pub const MAX_BYTES_OUT: usize = 4096;
@@ -71,11 +70,6 @@ impl ScmSocket {
     buf.extend(repeat(0).take(MAX_BYTES_OUT));
 
     let mut received_fds: [RawFd; MAX_FDS_OUT] = [0; MAX_FDS_OUT];
-    let default = Listeners {
-      http: Vec::new(),
-      tls:  Vec::new(),
-      tcp:  Vec::new(),
-    };
 
     match self.rcv_msg(&mut buf, &mut received_fds) {
       Err(e) => {
