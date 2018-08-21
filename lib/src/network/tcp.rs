@@ -345,7 +345,7 @@ impl Client {
       Some(State::Pipe(ref pipe)) => pipe.back_token(),
       Some(State::SendProxyProtocol(ref pp)) => pp.back_token(),
       Some(State::RelayProxyProtocol(ref pp)) => pp.back_token(),
-      Some(State::ExpectProxyProtocol(_)) => self.back_token(),
+      Some(State::ExpectProxyProtocol(_)) => None,
       _ => unreachable!()
     }
   }
