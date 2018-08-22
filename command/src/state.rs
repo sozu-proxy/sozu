@@ -278,7 +278,7 @@ impl ConfigState {
     for (ref front, ref certs) in self.certificates.iter() {
       for &(ref certificate_and_key, ref names) in certs.values() {
         v.push(Order::AddCertificate(AddCertificate{
-          front: *front.clone(),
+          front: (*front).clone(),
           certificate: certificate_and_key.clone(),
           names: names.clone(),
         }));

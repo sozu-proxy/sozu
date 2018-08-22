@@ -1062,21 +1062,21 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
                 if let &QueryAnswer::Applications(ref apps) = *metrics {
                   for app in apps.iter() {
                     let mut entry = application_data.entry(app).or_insert(Vec::new());
-                    entry.push(key.clone());
+                    entry.push((*key).clone());
 
                     for frontend in app.http_frontends.iter() {
                       let mut entry = frontend_data.entry(frontend).or_insert(Vec::new());
-                      entry.push(key.clone());
+                      entry.push((*key).clone());
                     }
 
                     for frontend in app.https_frontends.iter() {
                       let mut entry = https_frontend_data.entry(frontend).or_insert(Vec::new());
-                      entry.push(key.clone());
+                      entry.push((*key).clone());
                     }
 
                     for backend in app.backends.iter() {
                       let mut entry = backend_data.entry(backend).or_insert(Vec::new());
-                      entry.push(key.clone());
+                      entry.push((*key).clone());
                     }
                   }
                 }
@@ -1183,7 +1183,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
                 //let m: u8 = metrics;
                 if let &QueryAnswer::ApplicationsHashes(ref apps) = *metrics {
                   for (ref key, ref value) in apps.iter() {
-                    (*(query_data.entry(key.clone()).or_insert(Vec::new()))).push(value.clone());
+                    (*(query_data.entry((*key).clone()).or_insert(Vec::new()))).push(*value);
                   }
                 }
               }

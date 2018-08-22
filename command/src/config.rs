@@ -480,7 +480,7 @@ impl HttpFrontendConfig {
 
       if let Some(f) = calculate_fingerprint(&self.certificate.as_ref().unwrap().as_bytes()[..]) {
         v.push(Order::AddHttpsFront(HttpsFront {
-          app_id:      app_id.clone().to_string(),
+          app_id:      app_id.to_string(),
           address:     self.address.clone(),
           hostname:    self.hostname.clone(),
           path_begin:  self.path_begin.clone(),
@@ -492,7 +492,7 @@ impl HttpFrontendConfig {
     } else {
       //create the front both for HTTP and HTTPS if possible
       v.push(Order::AddHttpFront(HttpFront {
-        app_id:     app_id.clone().to_string(),
+        app_id:     app_id.to_string(),
         address:    self.address.clone(),
         hostname:   self.hostname.clone(),
         path_begin: self.path_begin.clone(),
