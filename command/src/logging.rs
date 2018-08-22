@@ -44,7 +44,7 @@ impl Logger {
   pub fn init(tag: String, spec: &str, backend: LoggerBackend, access_backend: Option<LoggerBackend>) {
     let directives = parse_logging_spec(spec);
     LOGGER.with(|l| {
-      let ref mut logger = *l.borrow_mut();
+      let logger = &mut (*l.borrow_mut());
       if !logger.initialized {
         logger.set_directives(directives);
         logger.backend        = backend;
@@ -60,7 +60,7 @@ impl Logger {
 
   }
 
-  pub fn log<'a>(&mut self, meta: &Metadata, args: Arguments) {
+  pub fn log(&mut self, meta: &Metadata, args: Arguments) {
     if self.enabled(meta) {
       match self.backend {
         LoggerBackend::Stdout(ref mut stdout) => {
@@ -92,7 +92,7 @@ impl Logger {
     }
   }
 
-  pub fn log_access<'a>(&mut self, meta: &Metadata, args: Arguments) {
+  pub fn log_access(&mut self, meta: &Metadata, args: Arguments) {
     if self.enabled(meta) {
       let backend = self.access_backend.as_mut().unwrap_or(&mut self.backend);
       match *backend {
@@ -125,7 +125,7 @@ impl Logger {
     }
   }
 
-  pub fn compat_log<'a>(&mut self, meta: &log::Metadata, args: Arguments) {
+  pub fn compat_log(&mut self, meta: &log::Metadata, args: Arguments) {
     if self.compat_enabled(meta) {
       match self.backend {
         LoggerBackend::Stdout(ref mut stdout) => {
@@ -287,8 +287,8 @@ impl LogLevel {
 
     /// Converts the `LogLevel` to the equivalent `LogLevelFilter`.
     #[inline]
-    pub fn to_log_level_filter(&self) -> LogLevelFilter {
-        LogLevelFilter::from_usize(*self as usize).unwrap()
+    pub fn to_log_level_filter(self) -> LogLevelFilter {
+        LogLevelFilter::from_usize(self as usize).unwrap()
     }
 }
 
@@ -376,8 +376,8 @@ impl LogLevelFilter {
     ///
     /// Returns `None` if `self` is `LogLevelFilter::Off`.
     #[inline]
-    pub fn to_log_level(&self) -> Option<LogLevel> {
-        LogLevel::from_usize(*self as usize)
+    pub fn to_log_level(self) -> Option<LogLevel> {
+        LogLevel::from_usize(self as usize)
     }
 }
 
@@ -411,7 +411,7 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
         return dirs;
     }
     mods.map(|m| { for s in m.split(',') {
-        if s.len() == 0 { continue }
+        if s.is_empty() { continue }
         let mut parts = s.split('=');
         let (log_level, name) = match (parts.next(), parts.next().map(|s| s.trim()), parts.next()) {
             (Some(part0), None, None) => {
@@ -445,7 +445,7 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
         });
     }});
 
-    return dirs;
+    dirs
 }
 
 #[macro_export]

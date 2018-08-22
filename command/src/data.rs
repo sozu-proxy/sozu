@@ -34,10 +34,10 @@ pub struct ConfigMessage {
 impl ConfigMessage {
   pub fn new(id: String, data: ConfigCommand, proxy_id: Option<u32>) -> ConfigMessage {
     ConfigMessage {
-      id:       id,
       version:  PROTOCOL_VERSION,
-      data:     data,
-      proxy_id: proxy_id,
+      id,
+      data,
+      proxy_id,
     }
   }
 }
@@ -71,11 +71,11 @@ pub struct ConfigMessageAnswer {
 impl ConfigMessageAnswer {
   pub fn new(id: String, status: ConfigMessageStatus, message: String, data: Option<AnswerData>) -> ConfigMessageAnswer {
     ConfigMessageAnswer {
-      id:      id,
       version: PROTOCOL_VERSION,
-      status:  status,
-      message: message,
-      data:    data,
+      id,
+      status,
+      message,
+      data,
     }
   }
 }
@@ -185,53 +185,53 @@ impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
       None => return Err(serde::de::Error::missing_field("version")),
     };
 
-    let data = if &config_type == "PROXY" {
+    let data = if config_type == "PROXY" {
       let data = match data {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
-      let command = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("proxy configuration command"))));
+      let command = try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("proxy configuration command"))));
       ConfigCommand::ProxyConfiguration(command)
-    } else if &config_type == &"SAVE_STATE" {
+    } else if config_type == "SAVE_STATE" {
       let data = match data {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
-      let state: SaveStateData = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("save state"))));
+      let state: SaveStateData = try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("save state"))));
       ConfigCommand::SaveState(state.path)
-    } else if &config_type == &"DUMP_STATE" {
+    } else if config_type == "DUMP_STATE" {
       ConfigCommand::DumpState
-    } else if &config_type == &"LOAD_STATE" {
+    } else if config_type == "LOAD_STATE" {
       let data = match data {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
-      let state: SaveStateData = try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("save state"))));
+      let state: SaveStateData = try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("save state"))));
       ConfigCommand::LoadState(state.path)
-    } else if &config_type == &"LIST_WORKERS" {
+    } else if config_type == "LIST_WORKERS" {
       ConfigCommand::ListWorkers
-    } else if &config_type == &"LAUNCH_WORKER" {
+    } else if config_type == "LAUNCH_WORKER" {
       let data = match data {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
-      ConfigCommand::LaunchWorker(try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("launch worker")))))
-    } else if &config_type == &"UPGRADE_MASTER" {
+      ConfigCommand::LaunchWorker(try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("launch worker")))))
+    } else if config_type == "UPGRADE_MASTER" {
       ConfigCommand::UpgradeMaster
-    } else if &config_type == &"UPGRADE_WORKER" {
+    } else if config_type == "UPGRADE_WORKER" {
       let data = match data {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
-      ConfigCommand::UpgradeWorker(try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("upgrade worker")))))
-    } else if &config_type == &"METRICS" {
+      ConfigCommand::UpgradeWorker(try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("upgrade worker")))))
+    } else if config_type == "METRICS" {
       ConfigCommand::Metrics
-    } else if &config_type == &"QUERY" {
+    } else if config_type == "QUERY" {
       let data = match data {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
-      ConfigCommand::Query(try!(serde_json::from_value(data).or(Err(serde::de::Error::custom("launch worker")))))
+      ConfigCommand::Query(try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("launch worker")))))
     } else {
       return Err(serde::de::Error::custom("unrecognized command"));
     };

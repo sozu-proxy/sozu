@@ -74,12 +74,12 @@ impl Listener {
     };
     */
     let public_address = self.public_address.as_ref().and_then(|addr| FromStr::from_str(&addr).ok());
-    let http_proxy_configuration = Some(self.address.clone());
+    let http_proxy_configuration = Some(self.address);
 
     http_proxy_configuration.map(|addr| {
       let mut configuration = HttpListener {
         front:          addr,
-        public_address: public_address,
+        public_address,
         expect_proxy:   self.expect_proxy.unwrap_or(false),
         sticky_name:    self.sticky_name.clone(),
         ..Default::default()
@@ -111,7 +111,7 @@ impl Listener {
     }
 
     let public_address     = self.public_address.as_ref().and_then(|addr| FromStr::from_str(&addr).ok());
-    let cipher_list:String = self.cipher_list.clone().unwrap_or(
+    let cipher_list:String = self.cipher_list.clone().unwrap_or_else(||
       String::from(
         "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:\
@@ -143,10 +143,10 @@ impl Listener {
       }
     }
 
-    let rustls_cipher_list = self.rustls_cipher_list.clone().unwrap_or(Vec::new());
+    let rustls_cipher_list = self.rustls_cipher_list.clone().unwrap_or_default();
 
     //FIXME
-    let tls_proxy_configuration = Some(self.address.clone());
+    let tls_proxy_configuration = Some(self.address);
 
     let versions = match self.tls_versions {
       None    => vec!(TlsVersion::TLSv1_1, TlsVersion::TLSv1_2),
@@ -159,11 +159,11 @@ impl Listener {
     tls_proxy_configuration.map(|addr| {
       let mut configuration = HttpsListener {
         front:           addr,
-        public_address:  public_address,
-        cipher_list:     cipher_list,
-        versions:        versions,
-        expect_proxy:    expect_proxy,
         sticky_name:     self.sticky_name.clone(),
+        public_address,
+        cipher_list,
+        versions,
+        expect_proxy,
         rustls_cipher_list,
         ..Default::default()
       };
@@ -205,12 +205,12 @@ impl Listener {
       }
     };
     */
-    let addr_parsed = Some(self.address.clone());
+    let addr_parsed = Some(self.address);
 
     addr_parsed.map(|addr| {
       TcpListener {
         front:          addr,
-        public_address: public_address,
+        public_address,
         expect_proxy:   self.expect_proxy.unwrap_or(false),
       }
     })
@@ -249,7 +249,7 @@ pub struct FileAppFrontendConfig {
 }
 
 impl FileAppFrontendConfig {
-  pub fn to_tcp_front(&self, app_id: &str) -> Result<TcpFrontendConfig, String> {
+  pub fn to_tcp_front(&self) -> Result<TcpFrontendConfig, String> {
     if self.hostname.is_some() {
       return Err(String::from("invalid 'hostname' field for TCP frontend"));
     }
@@ -267,7 +267,7 @@ impl FileAppFrontendConfig {
     }
 
     Ok(TcpFrontendConfig {
-      address: self.address.clone(),
+      address: self.address,
     })
   }
 
@@ -293,7 +293,7 @@ impl FileAppFrontendConfig {
     Ok(HttpFrontendConfig {
       address:           self.address.clone(),
       hostname:          self.hostname.clone().unwrap(),
-      path_begin:        self.path_begin.clone().unwrap_or(String::new()),
+      path_begin:        self.path_begin.clone().unwrap_or_default(),
       certificate:       certificate_opt,
       key:               key_opt,
       certificate_chain: chain_opt,
@@ -405,7 +405,7 @@ impl FileAppConfig {
               None => has_expect_proxy = Some(false),
             }
           }
-          match f.to_tcp_front(app_id) {
+          match f.to_tcp_front() {
             Ok(frontend) => frontends.push(frontend),
             Err(e) => return Err(e),
           }
@@ -423,7 +423,7 @@ impl FileAppConfig {
 
         Ok(AppConfig::Tcp(TcpAppConfig {
           app_id:         app_id.to_string(),
-          frontends:      frontends,
+          frontends,
           backends:       self.backends,
           proxy_protocol,
           load_balancing_policy: self.load_balancing_policy,
@@ -440,7 +440,7 @@ impl FileAppConfig {
 
         Ok(AppConfig::Http(HttpAppConfig {
           app_id:            app_id.to_string(),
-          frontends:         frontends,
+          frontends,
           backends:          self.backends,
           sticky_session:    self.sticky_session.unwrap_or(false),
           https_redirect:    self.https_redirect.unwrap_or(false),
@@ -469,11 +469,11 @@ impl HttpFrontendConfig {
     if self.key.is_some() && self.certificate.is_some() {
 
       v.push(Order::AddCertificate(AddCertificate{
-        front: self.address.clone(),
+        front: self.address,
         certificate: CertificateAndKey {
           key:               self.key.clone().unwrap(),
           certificate:       self.certificate.clone().unwrap(),
-          certificate_chain: self.certificate_chain.clone().unwrap_or(vec!()),
+          certificate_chain: self.certificate_chain.clone().unwrap_or_default(),
         },
         names: vec!(self.hostname.clone()),
       }));
@@ -481,7 +481,7 @@ impl HttpFrontendConfig {
       if let Some(f) = calculate_fingerprint(&self.certificate.as_ref().unwrap().as_bytes()[..]) {
         v.push(Order::AddHttpsFront(HttpsFront {
           app_id:      app_id.to_string(),
-          address:     self.address.clone(),
+          address:     self.address,
           hostname:    self.hostname.clone(),
           path_begin:  self.path_begin.clone(),
           fingerprint: CertFingerprint(f),
@@ -493,7 +493,7 @@ impl HttpFrontendConfig {
       //create the front both for HTTP and HTTPS if possible
       v.push(Order::AddHttpFront(HttpFront {
         app_id:     app_id.to_string(),
-        address:    self.address.clone(),
+        address:    self.address,
         hostname:   self.hostname.clone(),
         path_begin: self.path_begin.clone(),
       }));
@@ -520,19 +520,19 @@ impl HttpAppConfig {
 
     v.push(Order::AddApplication(Application {
       app_id: self.app_id.clone(),
-      sticky_session: self.sticky_session.clone(),
-      https_redirect: self.https_redirect.clone(),
+      sticky_session: self.sticky_session,
+      https_redirect: self.https_redirect,
       proxy_protocol: None,
       load_balancing_policy: self.load_balancing_policy,
     }));
 
-    for frontend in self.frontends.iter() {
+    for frontend in &self.frontends {
       let mut orders = frontend.generate_orders(&self.app_id);
       v.extend(orders.drain(..));
     }
 
     let mut backend_count = 0usize;
-    for backend in self.backends.iter() {
+    for backend in &self.backends {
         let load_balancing_parameters = Some(LoadBalancingParams {
           weight: backend.weight.unwrap_or(100),
         });
@@ -540,10 +540,10 @@ impl HttpAppConfig {
         v.push(Order::AddBackend(Backend {
           app_id:     self.app_id.clone(),
           backend_id:  format!("{}-{}", self.app_id, backend_count),
-          address:    backend.address.clone(),
+          address:    backend.address,
           load_balancing_parameters,
           sticky_id:  backend.sticky_id.clone(),
-          backup:     backend.backup.clone(),
+          backup:     backend.backup,
         }));
 
         backend_count += 1;
@@ -580,15 +580,15 @@ impl TcpAppConfig {
       load_balancing_policy: self.load_balancing_policy,
     }));
 
-    for frontend in self.frontends.iter() {
+    for frontend in &self.frontends {
       v.push(Order::AddTcpFront(TcpFront {
         app_id:  self.app_id.clone(),
-        address: frontend.address.clone(),
+        address: frontend.address,
       }));
     }
 
     let mut backend_count = 0usize;
-    for backend in self.backends.iter() {
+    for backend in &self.backends {
       let load_balancing_parameters = Some(LoadBalancingParams {
         weight: backend.weight.unwrap_or(100),
       });
@@ -596,10 +596,10 @@ impl TcpAppConfig {
       v.push(Order::AddBackend(Backend {
         app_id:     self.app_id.clone(),
         backend_id: format!("{}-{}", self.app_id, backend_count),
-        address:    backend.address.clone(),
+        address:    backend.address,
         load_balancing_parameters,
         sticky_id:  backend.sticky_id.clone(),
-        backup:     backend.backup.clone(),
+        backup:     backend.backup,
       }));
 
       backend_count += 1;
@@ -617,9 +617,9 @@ pub enum AppConfig {
 
 impl AppConfig {
   pub fn generate_orders(&self) -> Vec<Order> {
-    match self {
-      &AppConfig::Http(ref http) => http.generate_orders(),
-      &AppConfig::Tcp(ref tcp)   => tcp.generate_orders(),
+    match *self {
+      AppConfig::Http(ref http) => http.generate_orders(),
+      AppConfig::Tcp(ref tcp)   => tcp.generate_orders(),
     }
   }
 }
@@ -675,7 +675,7 @@ impl FileConfig {
                 ErrorKind::InvalidData,
                 format!("listening address {:?} is already used in the configuration", listener.address)));
             } else {
-              reserved_address.insert(listener.address.clone());
+              reserved_address.insert(listener.address);
             }
           }
         }
@@ -720,9 +720,9 @@ impl FileConfig {
           panic!("there's already a listener for address {:?}", listener.address);
         }
 
-        known_addresses.insert(listener.address.clone(), listener.protocol);
+        known_addresses.insert(listener.address, listener.protocol);
         if listener.expect_proxy == Some(true) {
-          expect_proxy.insert(listener.address.clone());
+          expect_proxy.insert(listener.address);
         }
 
         match listener.protocol {
@@ -758,7 +758,7 @@ impl FileConfig {
             match app_config {
               AppConfig::Http(ref http) => {
                 for frontend in http.frontends.iter() {
-                  match known_addresses.get(&frontend.address.clone()) {
+                  match known_addresses.get(&frontend.address) {
                     Some(FileListenerProtocolConfig::Tcp) => {
                       panic!("cannot set up a HTTP or HTTPS frontend on a TCP listener");
                     },
@@ -777,24 +777,24 @@ impl FileConfig {
                     None => {
                       // create a default listener for that front
                       let p = if frontend.certificate.is_some() {
-                        let listener = Listener::new(frontend.address.clone(), FileListenerProtocolConfig::Https);
+                        let listener = Listener::new(frontend.address, FileListenerProtocolConfig::Https);
                         https_listeners.push(listener.to_tls().unwrap());
 
                         FileListenerProtocolConfig::Https
                       } else {
-                        let listener = Listener::new(frontend.address.clone(), FileListenerProtocolConfig::Http);
+                        let listener = Listener::new(frontend.address, FileListenerProtocolConfig::Http);
                         http_listeners.push(listener.to_http().unwrap());
 
                         FileListenerProtocolConfig::Http
                       };
-                      known_addresses.insert(frontend.address.clone(), p);
+                      known_addresses.insert(frontend.address, p);
                     },
                   }
                 }
               },
               AppConfig::Tcp(ref tcp) => {
                 //FIXME: verify that different TCP apps do not request the same address
-                for frontend in tcp.frontends.iter() {
+                for frontend in &tcp.frontends {
                   match known_addresses.get(&frontend.address) {
                     Some(FileListenerProtocolConfig::Http) | Some(FileListenerProtocolConfig::Https) => {
                       panic!("cannot set up a TCP frontend on a HTTP listener");
@@ -802,9 +802,9 @@ impl FileConfig {
                     Some(FileListenerProtocolConfig::Tcp) => {},
                     None => {
                       // create a default listener for that front
-                      let listener = Listener::new(frontend.address.clone(), FileListenerProtocolConfig::Tcp);
+                      let listener = Listener::new(frontend.address, FileListenerProtocolConfig::Tcp);
                       tcp_listeners.push(listener.to_tcp().unwrap());
-                      known_addresses.insert(frontend.address.clone(), FileListenerProtocolConfig::Tcp);
+                      known_addresses.insert(frontend.address, FileListenerProtocolConfig::Tcp);
                     },
                   }
                 }
@@ -841,8 +841,8 @@ impl FileConfig {
       max_buffers: self.max_buffers.unwrap_or(1000),
       buffer_size: self.buffer_size.unwrap_or(16384),
       saved_state: self.saved_state,
-      log_level: self.log_level.unwrap_or(String::from("info")),
-      log_target: self.log_target.unwrap_or(String::from("stdout")),
+      log_level: self.log_level.unwrap_or_else(|| String::from("info")),
+      log_target: self.log_target.unwrap_or_else(|| String::from("stdout")),
       log_access_target: self.log_access_target,
       worker_count: self.worker_count.unwrap_or(2),
       worker_automatic_restart: self.worker_automatic_restart.unwrap_or(true),
@@ -850,7 +850,7 @@ impl FileConfig {
       http_listeners,
       https_listeners,
       tcp_listeners,
-      applications: applications,
+      applications,
       handle_process_affinity: self.handle_process_affinity.unwrap_or(false),
       ctl_command_timeout: self.ctl_command_timeout.unwrap_or(1_000),
       pid_file_path: self.pid_file_path,
@@ -897,7 +897,7 @@ impl Config {
     let mut v = Vec::new();
     let mut count = 0u8;
 
-    for listener in self.http_listeners.iter() {
+    for listener in &self.http_listeners {
       v.push(ConfigMessage {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
@@ -907,7 +907,7 @@ impl Config {
       count += 1;
     }
 
-    for listener in self.https_listeners.iter() {
+    for listener in &self.https_listeners {
       v.push(ConfigMessage {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
@@ -917,7 +917,7 @@ impl Config {
       count += 1;
     }
 
-    for listener in self.tcp_listeners.iter() {
+    for listener in &self.tcp_listeners {
       v.push(ConfigMessage {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
@@ -927,7 +927,7 @@ impl Config {
       count += 1;
     }
 
-    for ref app in self.applications.values() {
+    for app in self.applications.values() {
       let mut orders = app.generate_orders();
       for order in orders.drain(..) {
         v.push(ConfigMessage {
@@ -941,13 +941,13 @@ impl Config {
     }
 
     if self.activate_listeners {
-      for listener in self.http_listeners.iter() {
+      for listener in &self.http_listeners {
         v.push(ConfigMessage {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           proxy_id: None,
           data:     ConfigCommand::ProxyConfiguration(Order::ActivateListener(ActivateListener{
-            front:    listener.front.clone(),
+            front:    listener.front,
             proxy:    ListenerType::HTTP,
             from_scm: false,
           })),
@@ -955,13 +955,13 @@ impl Config {
         count += 1;
       }
 
-      for listener in self.https_listeners.iter() {
+      for listener in &self.https_listeners {
         v.push(ConfigMessage {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           proxy_id: None,
           data:     ConfigCommand::ProxyConfiguration(Order::ActivateListener(ActivateListener{
-            front:    listener.front.clone(),
+            front:    listener.front,
             proxy:    ListenerType::HTTPS,
             from_scm: false,
           })),
@@ -969,13 +969,13 @@ impl Config {
         count += 1;
       }
 
-      for listener in self.tcp_listeners.iter() {
+      for listener in &self.tcp_listeners {
         v.push(ConfigMessage {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           proxy_id: None,
           data:     ConfigCommand::ProxyConfiguration(Order::ActivateListener(ActivateListener{
-            front:    listener.front.clone(),
+            front:    listener.front,
             proxy:    ListenerType::TCP,
             from_scm: false,
           })),
