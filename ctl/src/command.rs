@@ -344,70 +344,7 @@ pub fn upgrade_master(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
               println!("Upgrading worker {} (of {})", i+1, running_count);
 
               channel = upgrade_worker(channel, 1000, worker.id);
-
-              /*
-              let id = generate_tagged_id("LAUNCH-WORKER");
-              let msg = ConfigMessage::new(
-                id.clone(),
-                ConfigCommand::LaunchWorker("BLAH".to_string()),
-                None,
-              );
-              channel.write_message(&msg);
-
-              loop {
-                match channel.read_message() {
-                  None          => {
-                    println!("Error: the proxy didn't launch a new worker");
-                    return;
-                  },
-                  Some(message) => {
-                    if &id != &message.id {
-                      println!("Error: received unexpected message: {:?}", message);
-                      return;
-                    }
-                    match message.status {
-                      ConfigMessageStatus::Processing => {},
-                      ConfigMessageStatus::Error => {
-                        println!("Error: failed to launch a new worker: {}", message.message);
-                        return;
-                      },
-                      ConfigMessageStatus::Ok => break,
-                    }
-                  }
-                }
-              }
-
-              // Stop the old worker
-              let id = generate_tagged_id("SOFT-STOP-WORKER");
-              let msg = ConfigMessage::new(
-                id.clone(),
-                ConfigCommand::ProxyConfiguration(Order::SoftStop),
-                Some(worker.id),
-              );
-              channel.write_message(&msg);
-
-              loop {
-                match channel.read_message() {
-                  None          => {
-                    println!("Error: the proxy didn't stop the old worker");
-                    return;
-                  }
-                  Some(message) => {
-                    if &id != &message.id {
-                      println!("Error: received unexpected message: {:?}", message);
-                      return;
-                    }
-                    match message.status {
-                      ConfigMessageStatus::Processing => {},
-                      ConfigMessageStatus::Error => {
-                        println!("Error: failed to stop old worker: {}", message.message);
-                        return;
-                      },
-                      ConfigMessageStatus::Ok => break,
-                    }
-                  }
-                }
-              }*/
+              thread::sleep(Duration::from_millis(1000));
             }
 
             println!("Proxy successfully upgraded!");
