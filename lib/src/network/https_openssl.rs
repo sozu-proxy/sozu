@@ -924,7 +924,7 @@ impl Listener {
     let mut ctx = c.expect("should have built a correct SSL context");
     let opt = ctx.set_options(self.ssl_options);
 
-    ctx.set_cipher_list(&config.cipher_list);
+    ctx.set_cipher_list(&self.config.cipher_list);
 
     if let Err(e) = setup_curves(&mut ctx) {
       error!("could not setup curves for openssl");
