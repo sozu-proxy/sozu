@@ -523,11 +523,15 @@ impl Server {
         OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
           if activate.proxy == ListenerType::HTTP {
             let listener = self.scm_listeners.get_http(&activate.front).map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
-            let status = if self.http.activate_listener(&mut self.poll, &activate.front, listener).is_some() {
-              OrderMessageStatus::Ok
-            } else {
-              error!("Couldn't activate HTTP listener");
-              OrderMessageStatus::Error(String::from("cannot activate HTTP listener"))
+            let status = match self.http.activate_listener(&mut self.poll, &activate.front, listener) {
+              Some(token) => {
+                self.accept(ListenToken(token.0), Protocol::HTTPListen);
+                OrderMessageStatus::Ok
+              },
+              None => {
+                error!("Couldn't activate HTTP listener");
+                OrderMessageStatus::Error(String::from("cannot activate HTTP listener"))
+              }
             };
 
             let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
@@ -590,11 +594,15 @@ impl Server {
         OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
           if activate.proxy == ListenerType::HTTPS {
             let listener = self.scm_listeners.get_https(&activate.front).map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
-            let status = if self.https.activate_listener(&mut self.poll, &activate.front, listener).is_some() {
-              OrderMessageStatus::Ok
-            } else {
-              error!("Couldn't activate HTTPS listener");
-              OrderMessageStatus::Error(String::from("cannot activate HTTPS listener"))
+            let status = match self.https.activate_listener(&mut self.poll, &activate.front, listener) {
+              Some(token) => {
+                self.accept(ListenToken(token.0), Protocol::HTTPSListen);
+                OrderMessageStatus::Ok
+              },
+              None => {
+                error!("Couldn't activate HTTPS listener");
+                OrderMessageStatus::Error(String::from("cannot activate HTTPS listener"))
+              }
             };
 
             let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
@@ -656,11 +664,15 @@ impl Server {
         OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
           if activate.proxy == ListenerType::TCP {
             let listener = self.scm_listeners.get_tcp(&activate.front).map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
-            let status = if self.tcp.activate_listener(&mut self.poll, &activate.front, listener).is_some() {
-              OrderMessageStatus::Ok
-            } else {
-              error!("Couldn't activate TCP listener");
-              OrderMessageStatus::Error(String::from("cannot activate TCP listener"))
+            let status = match self.tcp.activate_listener(&mut self.poll, &activate.front, listener) {
+              Some(token) => {
+                self.accept(ListenToken(token.0), Protocol::TCPListen);
+                OrderMessageStatus::Ok
+              },
+              None => {
+                error!("Couldn't activate TCP listener");
+                OrderMessageStatus::Error(String::from("cannot activate TCP listener"))
+              }
             };
 
             let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
