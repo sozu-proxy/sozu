@@ -307,6 +307,11 @@ impl ConfigState {
       v.push(Order::AddApplication(app.clone()));
     }
 
+    v
+  }
+
+  pub fn generate_activate_orders(&self) -> Vec<Order> {
+    let mut v = Vec::new();
     for addr in self.http_listeners.iter().filter(|(_,t)| t.1).map(|(k,_)| k) {
       v.push(Order::ActivateListener(ActivateListener {
         front: addr.clone(),

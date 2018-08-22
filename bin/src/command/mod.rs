@@ -20,7 +20,7 @@ use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
 use sozu_command::messages::{OrderMessage,OrderMessageAnswer,OrderMessageStatus};
-use sozu_command::scm_socket::ScmSocket;
+use sozu_command::scm_socket::{Listeners,ScmSocket};
 
 pub mod orders;
 pub mod client;
@@ -598,7 +598,13 @@ impl CommandServer {
     incr!("worker_restart");
 
     let id = self.next_id;
-    if let Ok(mut worker) = start_worker(id, &self.config, self.executable_path.clone(), &self.state, None) {
+    let listeners = Some(Listeners {
+      http: Vec::new(),
+      tls:  Vec::new(),
+      tcp:  Vec::new(),
+    });
+
+    if let Ok(mut worker) = start_worker(id, &self.config, self.executable_path.clone(), &self.state, listeners) {
       info!("created new worker: {}", id);
       self.next_id += 1;
       let worker_token = self.token_count + 1;

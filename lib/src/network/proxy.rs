@@ -104,7 +104,7 @@ pub struct Server {
   nb_connections:  usize,
   timer:           Timer<Token>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
-  scm_listeners:   Listeners,
+  scm_listeners:   Option<Listeners>,
 }
 
 impl Server {
@@ -149,17 +149,6 @@ impl Server {
     config_state: Option<ConfigState>,
     max_connections: usize) -> Self {
 
-    info!("will try to receive listeners");
-    scm.set_blocking(false);
-    let listeners = scm.receive_listeners();
-    scm.set_blocking(true);
-    info!("received listeners: {:?}", listeners);
-    let scm_listeners = listeners.unwrap_or(Listeners {
-      http: Vec::new(),
-      tls:  Vec::new(),
-      tcp:  Vec::new(),
-    });
-
     poll.register(
       &channel,
       Token(0),
@@ -182,23 +171,23 @@ impl Server {
     });
 
     let mut server = Server {
-      poll:            poll,
+      poll,
       shutting_down:   None,
       accept_ready:    HashSet::new(),
       can_accept:      true,
-      channel:         channel,
+      channel,
       queue:           VecDeque::new(),
       http:            http.unwrap_or(http::ServerConfiguration::new(pool.clone())),
       https:           https.unwrap_or(HttpsProvider::new(false, pool.clone())),
       tcp:             tcp.unwrap_or(tcp::ServerConfiguration::new()),
       config_state:    ConfigState::new(),
-      scm:             scm,
-      clients:         clients,
-      max_connections: max_connections,
+      scm,
+      clients,
+      max_connections,
       nb_connections:  0,
+      scm_listeners:   None,
       timer,
       pool,
-      scm_listeners,
     };
 
     // initialize the worker with the state we got from a file
@@ -220,6 +209,13 @@ impl Server {
       // do not send back answers to the initialization messages
       server.queue.clear();
     }
+
+    info!("will try to receive listeners");
+    server.scm.set_blocking(true);
+    let listeners = server.scm.receive_listeners();
+    server.scm.set_blocking(false);
+    info!("received listeners: {:?}", listeners);
+    server.scm_listeners = listeners;
 
     server
   }
@@ -474,6 +470,7 @@ impl Server {
       match message {
         // special case for AddHttpListener because we need to register a listener
         OrderMessage { ref id, order: Order::AddHttpListener(ref listener) } => {
+          debug!("{} add http listener {:?}", id, listener);
           /*FIXME
           if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
             error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
@@ -514,6 +511,7 @@ impl Server {
         },
         OrderMessage { ref id, order: Order::RemoveListener(ref remove) } => {
           if remove.proxy == ListenerType::HTTP {
+            debug!("{} remove http listener {:?}", id, remove);
             self.queue.push_back(self.http.notify(&mut self.poll, OrderMessage {
               id: id.to_string(),
               order: Order::RemoveListener(remove.clone())
@@ -522,7 +520,9 @@ impl Server {
         },
         OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
           if activate.proxy == ListenerType::HTTP {
-            let listener = self.scm_listeners.get_http(&activate.front).map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
+            debug!("{} activate http listener {:?}", id, activate);
+            let listener = self.scm_listeners.as_mut().and_then(|s| s.get_http(&activate.front))
+              .map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
             let status = match self.http.activate_listener(&mut self.poll, &activate.front, listener) {
               Some(token) => {
                 self.accept(ListenToken(token.0), Protocol::HTTPListen);
@@ -545,6 +545,7 @@ impl Server {
       match message {
         // special case for AddHttpListener because we need to register a listener
         OrderMessage { ref id, order: Order::AddHttpsListener(ref listener) } => {
+          debug!("{} add https listener {:?}", id, listener);
           /*FIXME
           if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
             error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
@@ -585,6 +586,7 @@ impl Server {
         },
         OrderMessage { ref id, order: Order::RemoveListener(ref remove) } => {
           if remove.proxy == ListenerType::HTTPS {
+            debug!("{} remove https listener {:?}", id, remove);
             self.queue.push_back(self.https.notify(&mut self.poll, OrderMessage {
               id: id.to_string(),
               order: Order::RemoveListener(remove.clone())
@@ -593,7 +595,9 @@ impl Server {
         },
         OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
           if activate.proxy == ListenerType::HTTPS {
-            let listener = self.scm_listeners.get_https(&activate.front).map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
+            debug!("{} activate https listener {:?}", id, activate);
+            let listener = self.scm_listeners.as_mut().and_then(|s| s.get_https(&activate.front))
+              .map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
             let status = match self.https.activate_listener(&mut self.poll, &activate.front, listener) {
               Some(token) => {
                 self.accept(ListenToken(token.0), Protocol::HTTPSListen);
@@ -616,6 +620,7 @@ impl Server {
       match message {
         // special case for AddTcpFront because we need to register a listener
         OrderMessage { id, order: Order::AddTcpListener(listener) } => {
+          debug!("{} add tcp listener {:?}", id, listener);
           /*if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
             error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
             self.queue.push_back(OrderMessageAnswer {
@@ -655,6 +660,7 @@ impl Server {
         },
         OrderMessage { ref id, order: Order::RemoveListener(ref remove) } => {
           if remove.proxy == ListenerType::TCP {
+            debug!("{} remove tcp listener {:?}", id, remove);
             self.queue.push_back(self.tcp.notify(&mut self.poll, OrderMessage {
               id: id.to_string(),
               order: Order::RemoveListener(remove.clone())
@@ -663,7 +669,9 @@ impl Server {
         },
         OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
           if activate.proxy == ListenerType::TCP {
-            let listener = self.scm_listeners.get_tcp(&activate.front).map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
+            debug!("{} activate tcp listener {:?}", id, activate);
+            let listener = self.scm_listeners.as_mut().and_then(|s| s.get_tcp(&activate.front))
+              .map(|fd| unsafe { TcpListener::from_raw_fd(fd) });
             let status = match self.tcp.activate_listener(&mut self.poll, &activate.front, listener) {
               Some(token) => {
                 self.accept(ListenToken(token.0), Protocol::TCPListen);

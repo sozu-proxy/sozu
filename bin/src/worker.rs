@@ -30,7 +30,12 @@ pub fn start_workers(executable_path: String, config: &Config) -> nix::Result<Ve
   let state = ConfigState::new();
   let mut workers = Vec::new();
   for index in 0..config.worker_count {
-    match start_worker_process(&index.to_string(), config, executable_path.clone(), &state, None) {
+    let listeners = Some(Listeners {
+      http: Vec::new(),
+      tls:  Vec::new(),
+      tcp:  Vec::new(),
+    });
+    match start_worker_process(&index.to_string(), config, executable_path.clone(), &state, listeners) {
       Ok((pid, command, scm)) => {
         let w =  Worker::new(index as u32, pid, command, scm, config);
         workers.push(w);
@@ -44,7 +49,7 @@ pub fn start_workers(executable_path: String, config: &Config) -> nix::Result<Ve
 pub fn start_worker(id: u32, config: &Config, executable_path: String, state: &ConfigState, listeners: Option<Listeners>) -> nix::Result<Worker> {
   match start_worker_process(&id.to_string(), config, executable_path, state, listeners) {
     Ok((pid, command, scm)) => {
-      let w = Worker::new(id, pid, command,  scm, config);
+      let w = Worker::new(id, pid, command, scm, config);
       Ok(w)
     },
     Err(e) => Err(e)
@@ -120,18 +125,11 @@ pub fn start_worker_process(id: &str, config: &Config, executable_path: String, 
       command.write_message(config);
       command.set_nonblocking(true);
 
-      let res = if let Some(l) = listeners {
+      if let Some(l) = listeners {
         info!("sending listeners to new worker: {:?}", l);
-        scm_server.send_listeners(l)
-      } else {
-        scm_server.send_listeners(Listeners {
-          http: Vec::new(),
-          tls:  Vec::new(),
-          tcp:  Vec::new(),
-
-        })
+        let res = scm_server.send_listeners(l);
+        info!("sent listeners from master: {:?}", res);
       };
-      info!("sent listeners from master: {:?}", res);
       util::disable_close_on_exec(scm_server.fd);
 
       let command: Channel<OrderMessage,OrderMessageAnswer> = command.into();

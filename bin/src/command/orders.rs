@@ -16,7 +16,7 @@ use nom::{HexDisplay,IResult,Offset};
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
-use sozu_command::scm_socket::ScmSocket;
+use sozu_command::scm_socket::{Listeners, ScmSocket};
 use sozu_command::messages::{Order,OrderMessage,Query};
 use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
 use sozu_command::logging;
@@ -294,6 +294,23 @@ impl CommandServer {
         Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
         PollOpt::edge()).unwrap();
       worker.token = Some(Token(worker_token));
+
+      info!("sending listeners: to the new worker: {:?}", worker.scm.send_listeners(Listeners {
+        http: Vec::new(),
+        tls:  Vec::new(),
+        tcp:  Vec::new(),
+      }));
+
+      let activate_orders = self.state.generate_activate_orders();
+      let mut count = 0;
+      for order in activate_orders.into_iter() {
+        worker.push_message(OrderMessage {
+          id: format!("{}-ACTIVATE-{}", id, count),
+          order
+        });
+        count += 1;
+      }
+
       self.proxies.insert(Token(worker_token), worker);
 
       self.answer_success(token, message.id.as_str(), "", None);
@@ -304,6 +321,36 @@ impl CommandServer {
 
   pub fn upgrade_worker(&mut self, token: FrontToken, message_id: &str, id: u32) {
     info!("client[{}] msg {} wants to upgrade worker {}", token.0, message_id, id);
+
+    // same as launch_worker
+    let next_id = self.next_id;
+    let worker_token = self.token_count + 1;
+    let mut worker = if let Ok(mut worker) = start_worker(next_id, &self.config, self.executable_path.clone(), &self.state, None) {
+      self.clients[token].push_message(ConfigMessageAnswer::new(
+          String::from(message_id),
+          ConfigMessageStatus::Processing,
+          "sending configuration orders".to_string(),
+          None
+          ));
+      info!("created new worker: {}", next_id);
+
+      self.next_id += 1;
+
+      self.token_count = worker_token;
+      worker.token     = Some(Token(worker_token));
+
+      debug!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
+      worker_token, "upgrade", worker.id, worker.channel.sock.take_error());
+      self.poll.register(&worker.channel.sock, Token(worker_token),
+        Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
+        PollOpt::edge()).unwrap();
+      worker.token = Some(Token(worker_token));
+
+      worker
+    } else {
+      return self.answer_error(token, message_id, "failed creating worker", None);
+    };
+
     if self.proxies.values().find(|worker| {
       worker.id == id && worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
     }).is_none() {
@@ -313,18 +360,18 @@ impl CommandServer {
 
     let mut listeners = None;
     let old_worker_token = {
-      let worker = self.proxies.values_mut().filter(|worker| worker.id == id).next().unwrap();
+      let old_worker = self.proxies.values_mut().filter(|worker| worker.id == id).next().unwrap();
 
-      worker.channel.set_blocking(true);
-      worker.channel.write_message(&OrderMessage { id: String::from(message_id), order: Order::ReturnListenSockets });
+      old_worker.channel.set_blocking(true);
+      old_worker.channel.write_message(&OrderMessage { id: String::from(message_id), order: Order::ReturnListenSockets });
       info!("sent returnlistensockets message to worker");
-      worker.channel.set_blocking(false);
+      old_worker.channel.set_blocking(false);
 
       let mut counter   = 0;
 
       loop {
-        worker.scm.set_blocking(true);
-        if let Some(l) = worker.scm.receive_listeners() {
+        old_worker.scm.set_blocking(true);
+        if let Some(l) = old_worker.scm.receive_listeners() {
           listeners = Some(l);
           break;
         } else {
@@ -335,50 +382,34 @@ impl CommandServer {
           sleep(Duration::from_millis(100));
         }
       }
-      worker.run_state = RunState::Stopping;
-      worker.push_message(OrderMessage { id: String::from(message_id), order: Order::SoftStop });
+      old_worker.run_state = RunState::Stopping;
+      old_worker.push_message(OrderMessage { id: String::from(message_id), order: Order::SoftStop });
 
-      worker.token.expect("worker should have a valid token")
+      old_worker.token.expect("worker should have a valid token")
     };
-
-    if listeners.is_none() {
-      error!("could not get the list of listeners from the previous worker");
-    }
 
     self.order_state.insert_task(message_id, MessageType::StopWorker, Some(token));
     self.order_state.insert_worker_message(message_id, message_id, old_worker_token);
     trace!("sending to {:?}, inflight is now {:#?}", old_worker_token.0, self.order_state);
 
-
-    // same as launch_worker
-    let id = self.next_id;
-    if let Ok(mut worker) = start_worker(id, &self.config, self.executable_path.clone(), &self.state, listeners) {
-      self.clients[token].push_message(ConfigMessageAnswer::new(
-          String::from(message_id),
-          ConfigMessageStatus::Processing,
-          "sending configuration orders".to_string(),
-          None
-          ));
-      info!("created new worker: {}", id);
-
-      self.next_id += 1;
-
-      let worker_token = self.token_count + 1;
-      self.token_count = worker_token;
-      worker.token     = Some(Token(worker_token));
-
-      debug!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
-      worker_token, "upgrade", worker.id, worker.channel.sock.take_error());
-      self.poll.register(&worker.channel.sock, Token(worker_token),
-        Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
-        PollOpt::edge()).unwrap();
-      worker.token = Some(Token(worker_token));
-      self.proxies.insert(Token(worker_token), worker);
-
-      self.answer_success(token, message_id, "", None);
-    } else {
-      self.answer_error(token, message_id, "failed creating worker", None);
+    match listeners {
+      Some(l) => {
+        info!("sending listeners: to the new worker: {:?}", worker.scm.send_listeners(l))
+      },
+      None => error!("could not get the list of listeners from the previous worker"),
+    };
+    let activate_orders = self.state.generate_activate_orders();
+    let mut count = 0;
+    for order in activate_orders.into_iter() {
+      worker.push_message(OrderMessage {
+        id: format!("{}-ACTIVATE-{}", message_id, count),
+        order
+      });
+      count += 1;
     }
+    self.proxies.insert(Token(worker_token), worker);
+
+    self.answer_success(token, message_id, "", None);
   }
 
   pub fn upgrade_master(&mut self, token: FrontToken, message_id: &str) {
