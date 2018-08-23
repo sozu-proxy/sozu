@@ -1063,6 +1063,8 @@ mod tests {
   use std::{thread,str};
   use std::sync::{Arc, Barrier};
   use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
+  use sozu_command::scm_socket::Listeners;
+  use std::os::unix::io::IntoRawFd;
   static TEST_FINISHED: AtomicBool = ATOMIC_BOOL_INIT;
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
@@ -1197,7 +1199,13 @@ mod tests {
       }
 
       let (scm_server, scm_client) = UnixStream::pair().unwrap();
-      let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()),
+      let scm = ScmSocket::new(scm_client.into_raw_fd());
+      scm.send_listeners(Listeners {
+        http: Vec::new(),
+        tls:  Vec::new(),
+        tcp:  Vec::new(),
+      });
+      let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.into_raw_fd()),
         clients, pool, None, None, Some(configuration), None, max_buffers, 60, 1800);
       info!("will run");
       s.run();
