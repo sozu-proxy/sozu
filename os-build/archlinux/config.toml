@@ -182,7 +182,7 @@ tls_versions = ["TLSv1.2", "TLSv1.3"]
 [applications.MyApp]
 
 # the protocol option indicates if we will use HTTP or TCP proxying
-# possible options are "hhtp" or "tcp"
+# possible options are "http" or "tcp"
 protocol = "http"
 
 # per application load balancing algorithm. The possible values are
