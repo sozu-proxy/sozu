@@ -649,6 +649,8 @@ pub struct FileConfig {
   pub activate_listeners:       Option<bool>,
   #[serde(default)]
   pub front_timeout:            Option<u32>,
+  #[serde(default)]
+  pub zombie_check_interval:    Option<u32>,
 }
 
 
@@ -859,6 +861,9 @@ impl FileConfig {
       tls_provider,
       activate_listeners: self.activate_listeners.unwrap_or(true),
       front_timeout: self.front_timeout.unwrap_or(60),
+      //defaults to 30mn
+      zombie_check_interval: self.front_timeout.unwrap_or(30 * 60),
+
     }
   }
 }
@@ -891,10 +896,17 @@ pub struct Config {
   pub activate_listeners:       bool,
   #[serde(default = "default_front_timeout")]
   pub front_timeout:            u32,
+  #[serde(default = "default_zombie_check_interval")]
+  pub zombie_check_interval:    u32,
 }
 
 fn default_front_timeout() -> u32 {
   60
+}
+
+//defaults to 30mn
+fn default_zombie_check_interval() -> u32 {
+  30*60
 }
 
 impl Config {

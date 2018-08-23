@@ -106,6 +106,7 @@ pub struct Server {
   timer:           Timer<Token>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   scm_listeners:   Option<Listeners>,
+  zombie_check_interval: time::Duration,
 }
 
 impl Server {
@@ -138,7 +139,7 @@ impl Server {
     let https = HttpsProvider::new(use_openssl, pool.clone());
 
     Server::new(event_loop, channel, scm, clients, pool, None, Some(https), None, Some(config_state),
-      config.max_connections, config.front_timeout)
+      config.max_connections, config.front_timeout, config.zombie_check_interval)
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
@@ -149,7 +150,8 @@ impl Server {
     tcp:  Option<tcp::ServerConfiguration>,
     config_state: Option<ConfigState>,
     max_connections: usize,
-    front_timeout: u32) -> Self {
+    front_timeout: u32,
+    zombie_check_interval: u32) -> Self {
 
     poll.register(
       &channel,
@@ -191,6 +193,7 @@ impl Server {
       timer,
       pool,
       front_timeout: time::Duration::seconds(i64::from(front_timeout)),
+      zombie_check_interval: time::Duration::seconds(i64::from(zombie_check_interval)),
     };
 
     // initialize the worker with the state we got from a file
@@ -352,8 +355,7 @@ impl Server {
       self.handle_remaining_readiness();
 
       let now = SteadyTime::now();
-      let dur = time::Duration::minutes(10);
-      if now - last_zombie_check > dur {
+      if now - last_zombie_check > self.zombie_check_interval {
         info!("zombie check");
         last_zombie_check = now;
 
@@ -361,8 +363,9 @@ impl Server {
         let mut frontend_tokens = HashSet::new();
 
         let mut count = 0;
+        let duration = self.zombie_check_interval.clone();
         for client in self.clients.iter_mut().filter(|c| {
-          now - c.borrow().last_event() > dur
+          now - c.borrow().last_event() > duration
         }) {
           let t = client.borrow().tokens();
           if !frontend_tokens.contains(&t[0]) {

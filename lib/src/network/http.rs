@@ -1360,7 +1360,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
 
   let mut server    = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-    clients, pool, Some(configuration), None, None, None, max_buffers, 60);
+    clients, pool, Some(configuration), None, None, None, max_buffers, 60, 1800);
 
   println!("starting event loop");
   server.run();
