@@ -1198,7 +1198,7 @@ mod tests {
 
       let (scm_server, scm_client) = UnixStream::pair().unwrap();
       let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()),
-        clients, pool, None, None, Some(configuration), None, max_buffers);
+        clients, pool, None, None, Some(configuration), None, max_buffers, 60, 1800);
       info!("will run");
       s.run();
       info!("ending event loop");
