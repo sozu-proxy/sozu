@@ -12,7 +12,7 @@ use serde_json;
 use mio::unix::UnixReady;
 use mio_uds::{UnixListener,UnixStream};
 use mio::{Poll,PollOpt,Ready,Token};
-use nom::{HexDisplay,IResult,Offset};
+use nom::{Err,HexDisplay,Offset};
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
@@ -174,7 +174,7 @@ impl CommandServer {
 
           let mut offset = 0;
           match parse(buffer.data()) {
-            IResult::Done(i, orders) => {
+            Ok((i, orders)) => {
               if i.len() > 0 {
                 //info!("could not parse {} bytes", i.len());
                 if previous == buffer.available_data() {
@@ -220,13 +220,13 @@ impl CommandServer {
                 }
               }
             },
-            IResult::Incomplete(_) => {
+            Err(Err::Incomplete(_)) => {
               if buffer.available_data() == buffer.capacity() {
                 error!("message too big, stopping parsing:\n{}", buffer.data().to_hex(16));
                 break;
               }
             }
-            IResult::Error(e) => {
+            Err(e) => {
               error!("saved state parse error: {:?}", e);
               break;
             },

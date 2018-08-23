@@ -6,10 +6,9 @@ use network::buffer_queue::BufferQueue;
 use network::protocol::StickySession;
 use parser::cookies::{RequestCookie, parse_request_cookies};
 
-use nom::{HexDisplay,IResult,Offset};
-use nom::IResult::*;
+use nom::{digit, HexDisplay,IResult,Offset};
 
-use nom::{digit,is_alphanumeric,is_space,space};
+use nom::{AsChar, is_alphanumeric,is_space,space};
 
 use url::Url;
 
@@ -34,9 +33,6 @@ named!(pub status_token, take_while!(is_status_token_char));
 fn is_ws(i: u8) -> bool {
   i == ' ' as u8 && i == '\t' as u8
 }
-
-named!(pub repeated_ws, take_while!(is_ws));
-named!(pub obsolete_ws, chain!(repeated_ws?, || { &b" "[..] }));
 
 named!(pub sp<char>, char!(' '));
 named!(pub crlf, tag!("\r\n"));
@@ -64,6 +60,7 @@ fn is_header_value_char(i: u8) -> bool {
 named!(pub vchar_1, take_while!(is_vchar));
 named!(pub vchar_ws_1, take_while!(is_vchar_or_ws));
 
+named!(digit_complete, take_while1_complete!(|item:u8| item.is_dec_digit()));
 
 #[derive(PartialEq,Debug)]
 pub struct RequestLine<'a> {
@@ -150,49 +147,47 @@ impl RStatusLine {
 }
 
 named!(pub http_version<[&[u8];2]>,
-       chain!(
-        tag!("HTTP/") ~
-        major: digit ~
-        tag!(".") ~
-        minor: digit, || {
-            [major, minor] // ToDo do we need it?
-        }
-       )
+do_parse!(
+  tag!("HTTP/") >>
+  major: digit >>
+  tag!(".") >>
+  minor: digit >> (
+    [major, minor] // ToDo do we need it?
+  )
+)
 );
 
 named!(pub request_line<RequestLine>,
-       chain!(
-        method: token ~
-        sp ~
-        uri: vchar_1 ~ // ToDo proper URI parsing?
-        sp ~
-        version: http_version ~
-        crlf, || {
-            RequestLine {
-              method: method,
-              uri: uri,
-              version: version
-            }
-        }
-       )
+do_parse!(
+  method: token >>
+  sp >>
+  uri: vchar_1 >> // ToDo proper URI parsing?
+  sp >>
+  version: http_version >>
+  crlf >> (
+    RequestLine {
+      method: method,
+      uri: uri,
+      version: version
+    }
+  )
+)
 );
 
 named!(pub status_line<StatusLine>,
-  chain!(
-    version: http_version ~
-             sp           ~
-    status:  take!(3)     ~
-             sp           ~
-    reason:  status_token ~
-             crlf         ,
-    || {
-      StatusLine {
-        version: version,
-        status: status,
-        reason: reason,
-      }
-    }
-  )
+do_parse!(
+  version: http_version >>
+           sp           >>
+  status:  take!(3)     >>
+           sp           >>
+  reason:  status_token >>
+           crlf         >>
+  (StatusLine {
+    version: version,
+    status: status,
+    reason: reason,
+  })
+)
 );
 
 #[derive(PartialEq,Debug)]
@@ -202,18 +197,18 @@ pub struct Header<'a> {
 }
 
 named!(pub message_header<Header>,
-       chain!(
-         name: token ~
-         tag!(":")   ~
-         opt!(take_while!(is_space))    ~
-         value: take_while!(is_header_value_char) ~ // ToDo handle folding?
-         crlf, || {
-           Header {
-            name: name,
-            value: value
-           }
-         }
-       )
+do_parse!(
+  name: token >>
+  tag!(":")   >>
+  opt!(take_while!(is_space))    >>
+  value: take_while!(is_header_value_char) >> // ToDo handle folding?
+  crlf >> (
+    Header {
+      name: name,
+      value: value
+    }
+  )
+)
 );
 
 //not a space nor a comma
@@ -232,11 +227,19 @@ fn is_single_header_value_char(i: u8) -> bool {
   i > 33 && i <= 126 && i != 44
 }
 
-named!(pub single_header_value, take_while!(is_single_header_value_char));
+named!(pub single_header_value, take_while1_complete!(is_single_header_value_char));
 
 pub fn comma_separated_header_values(input:&[u8]) -> Option<Vec<&[u8]>> {
-  let res: IResult<&[u8], Vec<&[u8]>> = separated_list!(input, delimited!(opt!(sp),char!(','),opt!(sp)), single_header_value);
-  if let IResult::Done(_,o) = res {
+  let res: IResult<&[u8], Vec<&[u8]>> =
+    separated_list!(input,
+      delimited!(
+        opt!(complete!(sp)),
+        complete!(char!(',')),
+        opt!(sp)
+      ),
+      single_header_value
+    );
+  if let Ok((_,o)) = res {
     Some(o)
   } else {
     None
@@ -274,13 +277,13 @@ fn is_hostname_char(i: u8) -> bool {
 named!(pub hostname_and_port<(&[u8],Option<&[u8]>)>,
   terminated!(
     pair!(
-      take_while!(is_hostname_char),
+      take_while1_complete!(is_hostname_char),
       opt!(complete!(preceded!(
         tag!(":"),
-        digit
+        digit_complete
       )))
     ),
-    eof!()
+    empty!()
   )
 );
 
@@ -295,11 +298,11 @@ pub fn is_hex_digit(chr: u8) -> bool {
 pub fn chunk_size(input: &[u8]) -> IResult<&[u8], usize> {
   let (i, s) = try_parse!(input, map_res!(take_while!(is_hex_digit), from_utf8));
   if i.len() == 0 {
-    return IResult::Incomplete(Needed::Unknown);
+    return Err(Err::Incomplete(Needed::Unknown));
   }
   match usize::from_str_radix(s, 16) {
-    Ok(sz) => IResult::Done(i, sz),
-    Err(_) => IResult::Error(error_code!(::nom::ErrorKind::MapRes))
+    Ok(sz) => Ok((i, sz)),
+    Err(_) => Err(Err::Error(error_position!(input, ::nom::ErrorKind::MapRes)))
   }
 }
 
@@ -345,7 +348,7 @@ impl Chunk {
       // we parse the first header, and advance the position to the end of chunk
       Chunk::Initial => {
         match chunk_header(buf) {
-          IResult::Done(i, sz_str) => {
+          Ok((i, sz_str)) => {
             let sz = usize::from(sz_str);
             if sz == 0 {
               // size of header + 0 data
@@ -355,14 +358,14 @@ impl Chunk {
               (buf.offset(i) + sz, Chunk::Copying)
             }
           },
-          IResult::Incomplete(_) => (0, Chunk::Initial),
-          IResult::Error(_)      => (0, Chunk::Error)
+          Err(Err::Incomplete(_)) => (0, Chunk::Initial),
+          Err(_)     => (0, Chunk::Error)
         }
       },
       // we parse a crlf then a header, and advance the position to the end of chunk
       Chunk::Copying => {
         match end_of_chunk_and_header(buf) {
-          IResult::Done(i, sz_str) => {
+          Ok((i, sz_str)) => {
             let sz = usize::from(sz_str);
             if sz == 0 {
               // data to copy + size of header + 0 data
@@ -372,18 +375,18 @@ impl Chunk {
               (buf.offset(i)+sz, Chunk::Copying)
             }
           },
-          IResult::Incomplete(_) => (0, Chunk::Copying),
-          IResult::Error(_)      => (0, Chunk::Error)
+          Err(Err::Incomplete(_)) => (0, Chunk::Copying),
+          Err(_) => (0, Chunk::Error)
         }
       },
       // we parse a crlf then stop
       Chunk::CopyingLastHeader => {
         match crlf(buf) {
-          IResult::Done(i, _) => {
+          Ok((i, _)) => {
             (buf.offset(i), Chunk::Ended)
           },
-          IResult::Incomplete(_) => (0, Chunk::CopyingLastHeader),
-          IResult::Error(_)      => (0, Chunk::Error)
+          Err(Err::Incomplete(_)) => (0, Chunk::CopyingLastHeader),
+          Err(_) => (0, Chunk::Error)
         }
       },
       _ => { (0, Chunk::Error) }
@@ -430,16 +433,16 @@ pub struct Request<'a> {
 }
 
 named!(pub request_head<Request>,
-       chain!(
-        rl: request_line ~
-        hs: many0!(message_header) ~
-        crlf, || {
-          Request {
-            request_line: rl,
-            headers: hs
-          }
-        }
-       )
+  do_parse!(
+    rl: request_line >>
+    hs: many0!(message_header) >>
+    crlf >> (
+      Request {
+        request_line: rl,
+        headers: hs
+      }
+    )
+  )
 );
 
 #[derive(PartialEq,Debug)]
@@ -449,16 +452,16 @@ pub struct Response<'a> {
 }
 
 named!(pub response_head<Response>,
-       chain!(
-        sl: status_line            ~
-        hs: many0!(message_header) ~
-        crlf, || {
-          Response {
-            status_line: sl,
-            headers: hs
-          }
-        }
-       )
+  do_parse!(
+    sl: status_line >>
+    hs: many0!(message_header) >>
+    crlf >> (
+      Response {
+        status_line: sl,
+        headers: hs
+      }
+    )
+  )
 );
 
 #[derive(PartialEq,Debug)]
@@ -613,8 +616,8 @@ impl<'a> Header<'a> {
         let header_length = self.name.len() + 1;
         // we calculate how much chars there is between the : and the first cookie
         let length_until_value = match take_while!(&buf[header_length..buf.len()], is_space) {
-          IResult::Done(_, spaces) => spaces,
-          IResult::Incomplete(_) | IResult::Error(_) => {
+          Ok((_, spaces)) => spaces,
+          Err(_) => {
             // if there is not enough data or an error, we completely remove the header.
             return vec![BufferMove::Advance(offset)];
           }
@@ -1161,8 +1164,8 @@ pub enum BufferMove {
 
 pub fn default_request_result<O>(state: RequestState, res: IResult<&[u8], O>) -> (BufferMove, RequestState) {
   match res {
-    IResult::Error(_)      => (BufferMove::None, state.into_error()),
-    IResult::Incomplete(_) => (BufferMove::None, state),
+    Err(Err::Error(_)) | Err(Err::Failure(_)) => (BufferMove::None, state.into_error()),
+    Err(Err::Incomplete(_)) => (BufferMove::None, state),
     _                      => unreachable!()
   }
 }
@@ -1263,9 +1266,8 @@ pub fn validate_request_header(state: RequestState, header: &Header, sticky_name
 
 pub fn parse_header<'a>(buf: &'a mut Buffer, state: RequestState, sticky_name: &str) -> IResult<&'a [u8], RequestState> {
   match message_header(buf.data()) {
-    IResult::Incomplete(i)   => IResult::Incomplete(i),
-    IResult::Error(e)        => IResult::Error(e),
-    IResult::Done(i, header) => IResult::Done(i, validate_request_header(state, &header, sticky_name))
+    Ok((i, header)) => Ok((i, validate_request_header(state, &header, sticky_name))),
+    Err(e) => Err(e),
   }
 }
 
@@ -1273,7 +1275,7 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
   match state {
     RequestState::Initial => {
       match request_line(buf) {
-        IResult::Done(i, r)    => {
+        Ok((i, r))    => {
           if let Some(rl) = RRequestLine::from_request_line(r) {
 
             let conn = Connection::new();
@@ -1303,7 +1305,7 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
     },
     RequestState::HasRequestLine(rl, conn) => {
       match message_header(buf) {
-        IResult::Done(i, header) => {
+        Ok((i, header)) => {
           if header.should_delete(&conn, sticky_name) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header, sticky_name))
           } else if header.must_mutate() {
@@ -1317,7 +1319,7 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
     },
     RequestState::HasHost(rl, conn, h) => {
       match message_header(buf) {
-        IResult::Done(i, header) => {
+        Ok((i, header)) => {
           if header.should_delete(&conn, sticky_name) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header, sticky_name))
           } else if header.must_mutate() {
@@ -1326,10 +1328,10 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header, sticky_name))
           }
         },
-        IResult::Incomplete(_) => (BufferMove::None, RequestState::HasHost(rl, conn, h)),
-        IResult::Error(_)      => {
+        Err(Err::Incomplete(_)) => (BufferMove::None, RequestState::HasHost(rl, conn, h)),
+        Err(_) => {
           match crlf(buf) {
-            IResult::Done(i, _) => {
+            Ok((i, _)) => {
               (BufferMove::Advance(buf.offset(i)), RequestState::Request(rl, conn, h))
             },
             res => {
@@ -1342,7 +1344,7 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
     },
     RequestState::HasLength(rl, conn, l) => {
       match message_header(buf) {
-        IResult::Done(i, header) => {
+        Ok((i, header)) => {
           if header.should_delete(&conn, sticky_name) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasLength(rl, conn, l), &header, sticky_name))
           } else if header.must_mutate() {
@@ -1356,7 +1358,7 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
     },
     RequestState::HasHostAndLength(rl, conn, h, l) => {
       match message_header(buf) {
-        IResult::Done(i, header) => {
+        Ok((i, header)) => {
           if header.should_delete(&conn, sticky_name) {
             (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header, sticky_name))
           } else if header.must_mutate() {
@@ -1365,10 +1367,10 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
             (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header, sticky_name))
           }
         },
-        IResult::Incomplete(_) => (BufferMove::None, RequestState::HasHostAndLength(rl, conn, h, l)),
-        IResult::Error(_)      => {
+        Err(Err::Incomplete(_)) => (BufferMove::None, RequestState::HasHostAndLength(rl, conn, h, l)),
+        Err(_) => {
           match crlf(buf) {
-            IResult::Done(i, _) => {
+            Ok((i, _)) => {
               debug!("PARSER\theaders parsed, stopping");
                 match l {
                   LengthInformation::Chunked    => (BufferMove::Advance(buf.offset(i)), RequestState::RequestWithBodyChunks(rl, conn, h, Chunk::Initial)),
@@ -1397,8 +1399,8 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
 
 pub fn default_response_result<O>(state: ResponseState, res: IResult<&[u8], O>) -> (BufferMove, ResponseState) {
   match res {
-    IResult::Error(_)      => (BufferMove::None, state.into_error()),
-    IResult::Incomplete(_) => (BufferMove::None, state),
+    Err(Err::Error(_)) | Err(Err::Failure(_)) => (BufferMove::None, state.into_error()),
+    Err(Err::Incomplete(_)) => (BufferMove::None, state),
     _                      => unreachable!()
   }
 }
@@ -1487,7 +1489,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
   match state {
     ResponseState::Initial => {
       match status_line(buf) {
-        IResult::Done(i, r)    => {
+        Ok((i, r))    => {
           if let Some(rl) = RStatusLine::from_status_line(r) {
             let conn = Connection::new();
             /*let conn = if rl.version == "11" {
@@ -1507,17 +1509,17 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
     },
     ResponseState::HasStatusLine(sl, conn) => {
       match message_header(buf) {
-        IResult::Done(i, header) => {
+        Ok((i, header)) => {
           if header.should_delete(&conn, sticky_name) {
             (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header, is_head))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header, is_head))
           }
         },
-        IResult::Incomplete(_) => (BufferMove::None, ResponseState::HasStatusLine(sl, conn)),
-        IResult::Error(_)      => {
+        Err(Err::Incomplete(_)) => (BufferMove::None, ResponseState::HasStatusLine(sl, conn)),
+        Err(_)      => {
           match crlf(buf) {
-            IResult::Done(i, _) => {
+            Ok((i, _)) => {
               debug!("PARSER\theaders parsed, stopping");
               (BufferMove::Advance(buf.offset(i)), ResponseState::Response(sl, conn))
             },
@@ -1531,17 +1533,17 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
     },
     ResponseState::HasLength(sl, conn, length) => {
       match message_header(buf) {
-        IResult::Done(i, header) => {
+        Ok((i, header)) => {
           if header.should_delete(&conn, sticky_name) {
             (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header, is_head))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header, is_head))
           }
         },
-        IResult::Incomplete(_) => (BufferMove::None, ResponseState::HasLength(sl, conn, length)),
-        IResult::Error(_)      => {
+        Err(Err::Incomplete(_)) => (BufferMove::None, ResponseState::HasLength(sl, conn, length)),
+        Err(_)      => {
           match crlf(buf) {
-            IResult::Done(i, _) => {
+            Ok((i, _)) => {
               debug!("PARSER\theaders parsed, stopping");
                 match length {
                   LengthInformation::Chunked    => (BufferMove::Advance(buf.offset(i)), ResponseState::ResponseWithBodyChunks(sl, conn, Chunk::Initial)),
@@ -1558,17 +1560,17 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
     },
     ResponseState::HasUpgrade(sl, conn, protocol) => {
       match message_header(buf) {
-        IResult::Done(i, header) => {
+        Ok((i, header)) => {
           if header.should_delete(&conn, sticky_name) {
             (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasUpgrade(sl, conn, protocol), &header, is_head))
           } else {
             (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasUpgrade(sl, conn, protocol), &header, is_head))
           }
         },
-        IResult::Incomplete(_) => (BufferMove::None, ResponseState::HasUpgrade(sl, conn, protocol)),
-        IResult::Error(_)      => {
+        Err(Err::Incomplete(_)) => (BufferMove::None, ResponseState::HasUpgrade(sl, conn, protocol)),
+        Err(_)      => {
           match crlf(buf) {
-            IResult::Done(i, _) => {
+            Ok((i, _)) => {
               debug!("PARSER\theaders parsed, stopping");
               (BufferMove::Advance(buf.offset(i)), ResponseState::ResponseUpgrade(sl, conn, protocol))
             },
@@ -1833,7 +1835,7 @@ fn add_sticky_session_to_response(rs: &mut HttpState, buf: &mut BufferQueue, sti
 #[allow(unused_must_use)]
 mod tests {
   use super::*;
-  use nom::IResult::*;
+  use nom::Err;
   use nom::HexDisplay;
   use sozu_command::buffer::Buffer;
   use network::buffer_queue::{BufferQueue,OutputElement};
@@ -1851,7 +1853,7 @@ mod tests {
         version: [b"1", b"1"]
       };
 
-      assert_eq!(result, Done(&[][..], expected));
+      assert_eq!(result, Ok((&[][..], expected)));
   }
 
   #[test]
@@ -1863,7 +1865,7 @@ mod tests {
         value: b"*/*"
       };
 
-      assert_eq!(result, Done(&b""[..], expected))
+      assert_eq!(result, Ok((&b""[..], expected)))
   }
 
   #[test]
@@ -1876,7 +1878,7 @@ mod tests {
         value: "Aéo".as_bytes()
       };
 
-      assert_eq!(result, Error(error_position!(ErrorKind::Tag, "éo\r\n".as_bytes())));
+      assert_eq!(result, Err(Err::Error(error_position!("éo\r\n".as_bytes(), ErrorKind::Tag))));
   }
 
   #[test]
@@ -1889,7 +1891,7 @@ mod tests {
         value: "Aéo".as_bytes()
       };
 
-      assert_eq!(result, Done(&b""[..], expected))
+      assert_eq!(result, Ok((&b""[..], expected)))
   }
 
   #[test]
@@ -1901,7 +1903,7 @@ mod tests {
         value: b"localhost"
       };
 
-      assert_eq!(result, Done(&b""[..], expected))
+      assert_eq!(result, Ok((&b""[..], expected)))
   }
 
   #[test]
@@ -1935,7 +1937,7 @@ mod tests {
         )
       };
 
-      assert_eq!(result, Done(&b""[..], expected))
+      assert_eq!(result, Ok((&b""[..], expected)))
   }
 
   #[test]
@@ -1974,7 +1976,7 @@ mod tests {
         )
       };
 
-      assert_eq!(result, Done(&b""[..], expected));
+      assert_eq!(result, Ok((&b""[..], expected)));
   }
 
   #[test]
@@ -1984,10 +1986,10 @@ mod tests {
       let result = message_header(input);
       assert_eq!(
         result,
-        Done(&b""[..], Header {
+        Ok((&b""[..], Header {
           name: b"User-Agent",
           value: b"Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:44.0) Gecko/20100101 Firefox/44.0"
-        })
+        }))
       );
   }
 
@@ -3027,17 +3029,17 @@ mod tests {
   fn hostname_parsing_test() {
     assert_eq!(
       hostname_and_port(&b"rust-test.cleverapps.io"[..]),
-      Done(&b""[..], (&b"rust-test.cleverapps.io"[..], None))
+      Ok((&b""[..], (&b"rust-test.cleverapps.io"[..], None)))
     );
 
     assert_eq!(
       hostname_and_port(&b"localhost"[..]),
-      Done(&b""[..], (&b"localhost"[..], None))
+      Ok((&b""[..], (&b"localhost"[..], None)))
     );
 
     assert_eq!(
       hostname_and_port(&b"example.com:8080"[..]),
-      Done(&b""[..], (&b"example.com"[..], Some(&b"8080"[..])))
+      Ok((&b""[..], (&b"example.com"[..], Some(&b"8080"[..]))))
     );
   }
 
@@ -3047,7 +3049,7 @@ mod tests {
   fn hostname_parsing_underscore_test() {
     assert_eq!(
       hostname_and_port(&b"test_example.com"[..]),
-      Error(error_position!(ErrorKind::Eof, &b"_example.com"[..]))
+       Err(Err::Error(error_position!(&b"_example.com"[..], ErrorKind::Eof)))
     );
   }
 
@@ -3056,7 +3058,7 @@ mod tests {
   fn hostname_parsing_underscore_test() {
     assert_eq!(
       hostname_and_port(&b"test_example.com"[..]),
-      Done(&b""[..], (&b"test_example.com"[..], None))
+      Ok((&b""[..], (&b"test_example.com"[..], None)))
     );
   }
 
@@ -3179,17 +3181,17 @@ mod tests {
     let header_line3 = b"Cookie: FOO=BAR; BAR=FOO\r\n";
 
     let header1 = match message_header(header_line1) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 
     let header2 = match message_header(header_line2) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 
     let header3 = match message_header(header_line3) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 
@@ -3211,12 +3213,12 @@ mod tests {
     let header_line2 = b"Cookie: SOZUBALANCEID=0;  \r\n";
 
     let header1 = match message_header(header_line1) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 
     let header2 = match message_header(header_line2) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 
@@ -3236,17 +3238,17 @@ mod tests {
     let header_line3 = b"Cookie: SOZUBALANCEID=0; FOO=BAR\r\n";
 
     let header1 = match message_header(header_line1) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 
     let header2 = match message_header(header_line2) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 
     let header3 = match message_header(header_line3) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 
@@ -3269,17 +3271,17 @@ mod tests {
     let header_line3 = b"Cookie: BAR=FOO; SOZUBALANCEID=0; FOO=BAR\r\n";
 
     let header1 = match message_header(header_line1) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 
     let header2 = match message_header(header_line2) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 
     let header3 = match message_header(header_line3) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 
@@ -3303,22 +3305,22 @@ mod tests {
     let header_line4 = b"Cookie: BAR=FOO; SOZUBALANCEID=0\r\n";
 
     let header1 = match message_header(header_line1) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 
     let header2 = match message_header(header_line2) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 
     let header3 = match message_header(header_line3) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 
     let header4 = match message_header(header_line4) {
-      IResult::Done(_, header) => header,
+      Ok((_, header)) => header,
       _ => panic!()
     };
 

@@ -28,7 +28,6 @@ use openssl::hash::MessageDigest;
 use openssl::nid;
 use openssl::error::ErrorStack;
 use openssl::ssl::SslVersion;
-use nom::IResult;
 use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::config::LoadBalancingAlgorithms;
@@ -1025,7 +1024,7 @@ impl Listener {
 
   // ToDo factor out with http.rs
   pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&TlsApp> {
-    let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(host.as_bytes()) {
+    let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
         error!("frontend_from_request: invalid remaining chars after hostname. Host: {}", host);
         return None;
@@ -1262,7 +1261,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   fn connect_to_backend(&mut self, poll: &mut Poll,  client: &mut TlsClient, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let h = try!(unwrap_msg!(client.http()).state().get_host().ok_or(ConnectionError::NoHostGiven));
 
-    let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
+    let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
         let answer = self.listeners[&client.listen_token].answers.BadRequest.clone();

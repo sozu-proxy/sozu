@@ -5,8 +5,7 @@ use std::io::Read;
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
-use nom::IResult::*;
-use nom::Offset;
+use nom::{Err,Offset};
 use network::protocol::proxy_protocol::header;
 use network::{Protocol, ClientResult};
 use network::Readiness;
@@ -89,12 +88,12 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
     }
 
     match parse_v2_header(&self.buf[..self.index]) {
-      Done(rest, header) => {
+      Ok((rest, header)) => {
         trace!("got expect header: {:?}, rest.len() = {}", header, rest.len());
         self.addresses = Some(header.addr);
         return (ProtocolResult::Upgrade, ClientResult::Continue);
       },
-      Incomplete(_) => {
+      Err(Err::Incomplete(_)) => {
         match self.header_len {
           HeaderLen::V4 => if self.index == 28 {
             self.header_len = HeaderLen::V6;
@@ -112,7 +111,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
         };
         return (ProtocolResult::Continue, ClientResult::Continue)
       },
-      Error(e) => {
+      Err(e) => {
         error!("[{:?}] front socket parse error, closing the connection: {:?}", self.frontend_token, e);
         metrics.service_stop();
         incr!("proxy_protocol.errors");
@@ -163,7 +162,6 @@ mod expect_test {
  use super::*;
 
   use parser::proxy_protocol::parse_v2_header;
-  use nom::IResult::Done;
   use network::pool::Pool;
 
   use std::{sync::{Arc, Barrier}, thread::{self, JoinHandle}, time::Duration, net::{SocketAddr, IpAddr, Ipv4Addr}};

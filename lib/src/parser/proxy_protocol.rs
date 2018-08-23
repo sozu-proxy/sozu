@@ -89,8 +89,8 @@ pub fn slice_to_ipv6(sl: &[u8]) -> Ipv6Addr {
 mod test {
 
   use super::*;
-  use nom::IResult::*;
   use std::net::{IpAddr, SocketAddr};
+  use nom::Err;
   use nom::Needed::Size;
 
   #[test]
@@ -110,7 +110,7 @@ mod test {
     let dst_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200);
     let expected = HeaderV2::new(Command::Local, src_addr, dst_addr);
 
-    assert_eq!(Done(&[][..], expected), parse_v2_header(input));
+    assert_eq!(Ok((&[][..], expected)), parse_v2_header(input));
   }
 
   #[test]
@@ -130,7 +130,7 @@ mod test {
     let dst_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 4, 5, 8)), 4200);
     let expected = HeaderV2::new(Command::Proxy, src_addr, dst_addr);
 
-    assert_eq!(Done(&[][..], expected), parse_v2_header(input));
+    assert_eq!(Ok((&[][..], expected)), parse_v2_header(input));
   }
 
   #[test]
@@ -150,7 +150,7 @@ mod test {
     let dst_addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 2)), 4200);
     let expected = HeaderV2::new(Command::Local, src_addr, dst_addr);
 
-    assert_eq!(Done(&[][..], expected), parse_v2_header(input));
+    assert_eq!(Ok((&[][..], expected)), parse_v2_header(input));
   }
 
   #[test]
@@ -168,7 +168,7 @@ mod test {
                     addr: ProxyAddr::AfUnspec,
                   };
 
-    assert_eq!(Done(&[][..], expected), parse_v2_header(input));
+    assert_eq!(Ok((&[][..], expected)), parse_v2_header(input));
   }
 
   #[test]
@@ -227,7 +227,7 @@ mod test {
       0x11,                                                                   // family AF_UNIX with IPv4
     ];
 
-    assert_eq!(Incomplete(Size(16)), parse_v2_header(input));
+    assert_eq!(Err(Err::Incomplete(Size(2))), parse_v2_header(input));
   }
 
   #[test]
@@ -243,6 +243,6 @@ mod test {
       0x10, 0x68,                                                                                     // destination port
     ];
 
-    assert_eq!(Incomplete(Size(48)), parse_v2_header(input));
+    assert_eq!(Err(Err::Incomplete(Size(16))), parse_v2_header(input));
   }
 }

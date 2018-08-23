@@ -5,8 +5,7 @@ use std::io::Read;
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
-use nom::IResult::*;
-use nom::Offset;
+use nom::{Err,Offset};
 use network::protocol::proxy_protocol::header;
 use network::{Protocol, ClientResult};
 use network::Readiness;
@@ -73,15 +72,15 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
       }
 
       let read_sz = match parse_v2_header(self.front_buf.unparsed_data()) {
-        Done(rest, header) => {
+        Ok((rest, header)) => {
           self.readiness.front_interest.remove(Ready::readable());
           self.readiness.back_interest.insert(Ready::writable());
           self.front_buf.next_output_data().offset(rest)
         },
-        Incomplete(_) => {
+        Err(Err::Incomplete(_)) => {
           return ClientResult::Continue
         },
-        Error(e) => {
+        Err(e) => {
           return ClientResult::CloseClient
         }
       };

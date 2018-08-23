@@ -25,9 +25,9 @@ pub fn is_cookie_value_char(chr: u8) -> bool {
 named!(pub single_request_cookie<RequestCookie>,
   do_parse!(
     name: take_until_and_consume!("=") >>
-    value: take_while!(is_cookie_value_char) >>
+    value: take_while_complete!(is_cookie_value_char) >>
     semicolon: opt!(complete!(tag!(";"))) >>
-    spaces: complete!(take_while!(is_space)) >>
+    spaces: take_while_complete!(is_space) >>
     (RequestCookie {
       name: name,
       value: value,
@@ -38,9 +38,9 @@ named!(pub single_request_cookie<RequestCookie>,
 );
 
 pub fn parse_request_cookies(input: &[u8]) -> Option<Vec<RequestCookie>> {
-  let res: IResult<&[u8], Vec<RequestCookie>> = many0!(input, single_request_cookie);
+  let res: IResult<&[u8], Vec<RequestCookie>> = many0!(input, complete!(single_request_cookie));
 
-  if let IResult::Done(_, o) = res {
+  if let Ok((_, o)) = res {
     Some(o)
   } else {
     None

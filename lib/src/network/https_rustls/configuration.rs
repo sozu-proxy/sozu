@@ -20,7 +20,6 @@ use time::{precise_time_s, precise_time_ns};
 use rand::random;
 use rustls::{self, ServerConfig, ServerSession, NoClientAuth, ProtocolVersion,
   SupportedCipherSuite, ALL_CIPHERSUITES};
-use nom::IResult;
 use mio_extras::timer::Timeout;
 
 use sozu_command::buffer::Buffer;
@@ -268,7 +267,7 @@ impl Listener {
 
   // ToDo factor out with http.rs
   pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&TlsApp> {
-    let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(host.as_bytes()) {
+    let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
         error!("invalid remaining chars after hostname");
         return None;
@@ -457,7 +456,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
   fn connect_to_backend(&mut self, poll: &mut Poll,  client: &mut TlsClient, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let h = try!(unwrap_msg!(client.http()).state().get_host().ok_or(ConnectionError::NoHostGiven));
 
-    let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
+    let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("invalid remaining chars after hostname");
         let answer = self.listeners[&client.listen_token].answers.BadRequest.clone();

@@ -13,7 +13,7 @@ use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
 use uuid::Uuid;
-use nom::{HexDisplay,IResult};
+use nom::HexDisplay;
 use rand::random;
 use time::{SteadyTime,Duration};
 use slab::{Entry,VacantEntry,Slab};
@@ -876,7 +876,7 @@ impl Listener {
   }
 
   pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&HttpFront> {
-    let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(host.as_bytes()) {
+    let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
         error!("frontend_from_request: invalid remaining chars after hostname. Host: {}", host);
         return None;
@@ -968,7 +968,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
   fn connect_to_backend(&mut self, poll: &mut Poll, client: &mut Client, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let h = try!(client.http().unwrap().state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
 
-    let host: &str = if let IResult::Done(i, (hostname, port)) = hostname_and_port(h.as_bytes()) {
+    let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
         let answer = self.listeners[&client.listen_token].answers.BadRequest.clone();

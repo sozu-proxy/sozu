@@ -162,7 +162,6 @@ mod send_test {
   use super::*;
 
   use parser::proxy_protocol::parse_v2_header;
-  use nom::IResult::Done;
 
   use std::{sync::{Arc, Barrier}, thread::{self, JoinHandle}, time::Duration, net::SocketAddr};
   use mio::net::{TcpListener, TcpStream};
@@ -266,7 +265,7 @@ mod send_test {
       }
 
       match parse_v2_header(&buf) {
-        Done(_,_) => println!("complete header received"),
+        Ok((_,_)) => println!("complete header received"),
         err => {
           end_barrier.wait();
           panic!("incorrect proxy protocol header received: {:?}", err);
