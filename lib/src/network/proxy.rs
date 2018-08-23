@@ -102,6 +102,7 @@ pub struct Server {
   clients:         Slab<Rc<RefCell<ProxyClientCast>>,ClientToken>,
   max_connections: usize,
   nb_connections:  usize,
+  front_timeout:   time::Duration,
   timer:           Timer<Token>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   scm_listeners:   Option<Listeners>,
@@ -137,7 +138,7 @@ impl Server {
     let https = HttpsProvider::new(use_openssl, pool.clone());
 
     Server::new(event_loop, channel, scm, clients, pool, None, Some(https), None, Some(config_state),
-      config.max_connections)
+      config.max_connections, config.front_timeout)
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
@@ -147,7 +148,8 @@ impl Server {
     https: Option<HttpsProvider>,
     tcp:  Option<tcp::ServerConfiguration>,
     config_state: Option<ConfigState>,
-    max_connections: usize) -> Self {
+    max_connections: usize,
+    front_timeout: u32) -> Self {
 
     poll.register(
       &channel,
@@ -188,6 +190,7 @@ impl Server {
       scm_listeners:   None,
       timer,
       pool,
+      front_timeout: time::Duration::seconds(i64::from(front_timeout)),
     };
 
     // initialize the worker with the state we got from a file
@@ -793,7 +796,7 @@ impl Server {
           Some(entry) => {
             let client_token = Token(entry.index().0);
             let index = entry.index();
-            let timeout = self.timer.set_timeout(Duration::from_secs(60), client_token);
+            let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), client_token);
             match protocol {
               Protocol::TCPListen   => {
                 let res1 = self.tcp.accept(token, &mut self.poll, client_token, timeout).map(|(client, should_connect)| {
@@ -1055,7 +1058,7 @@ impl Server {
 
     let client_token = ClientToken(token.0);
     if self.clients.contains(client_token) {
-      let order = self.clients[client_token].borrow_mut().timeout(token, &mut self.timer);
+      let order = self.clients[client_token].borrow_mut().timeout(token, &mut self.timer, &self.front_timeout);
       self.interpret_client_order(client_token, order);
     }
   }
@@ -1132,7 +1135,7 @@ impl ProxyClient for ListenClient {
     None
   }
 
-  fn timeout(&self, token: Token, timer: &mut Timer<Token>) -> ClientResult {
+  fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &time::Duration) -> ClientResult {
     unimplemented!();
   }
 

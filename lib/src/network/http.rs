@@ -429,12 +429,11 @@ impl ProxyClient for Client {
     result
   }
 
-  fn timeout(&self, token: Token, timer: &mut Timer<Token>) -> ClientResult {
+  fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> ClientResult {
     if self.frontend_token == token {
       let dur = SteadyTime::now() - self.last_event;
-      let keepalive_timeout = Duration::seconds(60);
-      if dur < keepalive_timeout {
-        timer.set_timeout((keepalive_timeout - dur).to_std().unwrap(), token);
+      if dur < *front_timeout {
+        timer.set_timeout((*front_timeout - dur).to_std().unwrap(), token);
         ClientResult::Continue
       } else {
         ClientResult::CloseClient
@@ -1361,7 +1360,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
 
   let mut server    = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-    clients, pool, Some(configuration), None, None, None, max_buffers);
+    clients, pool, Some(configuration), None, None, None, max_buffers, 60);
 
   println!("starting event loop");
   server.run();

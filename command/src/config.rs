@@ -647,6 +647,8 @@ pub struct FileConfig {
   pub pid_file_path:            Option<String>,
   pub tls_provider:             Option<TlsProvider>,
   pub activate_listeners:       Option<bool>,
+  #[serde(default)]
+  pub front_timeout:            Option<u32>,
 }
 
 
@@ -856,6 +858,7 @@ impl FileConfig {
       pid_file_path: self.pid_file_path,
       tls_provider,
       activate_listeners: self.activate_listeners.unwrap_or(true),
+      front_timeout: self.front_timeout.unwrap_or(60),
     }
   }
 }
@@ -886,6 +889,12 @@ pub struct Config {
   pub pid_file_path:            Option<String>,
   pub tls_provider:             TlsProvider,
   pub activate_listeners:       bool,
+  #[serde(default = "default_front_timeout")]
+  pub front_timeout:            u32,
+}
+
+fn default_front_timeout() -> u32 {
+  60
 }
 
 impl Config {
@@ -1113,6 +1122,7 @@ mod tests {
       pid_file_path: None,
       tls_provider: None,
       activate_listeners: None,
+      front_timeout: None,
     };
 
     println!("config: {:?}", to_string(&config));

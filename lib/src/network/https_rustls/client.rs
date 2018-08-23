@@ -477,12 +477,11 @@ impl ProxyClient for TlsClient {
     result
   }
 
-  fn timeout(&self, token: Token, timer: &mut Timer<Token>) -> ClientResult {
+  fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> ClientResult {
     if self.frontend_token == token {
       let dur = SteadyTime::now() - self.last_event;
-      let keepalive_timeout = Duration::seconds(60);
-      if dur < keepalive_timeout {
-        timer.set_timeout((keepalive_timeout - dur).to_std().unwrap(), token);
+      if dur < *front_timeout {
+        timer.set_timeout((*front_timeout - dur).to_std().unwrap(), token);
         ClientResult::Continue
       } else {
         ClientResult::CloseClient

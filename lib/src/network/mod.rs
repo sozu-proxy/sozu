@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use slab::{Entry,VacantEntry};
 use time::{precise_time_ns,SteadyTime,Duration};
+use std::time;
 use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::messages::{OrderMessage,OrderMessageAnswer,LoadBalancingParams};
@@ -65,7 +66,7 @@ pub trait ProxyClient {
   fn process_events(&mut self, token: Token, events: Ready);
   fn close(&mut self, poll: &mut Poll) -> CloseResult;
   fn close_backend(&mut self, token: Token, poll: &mut Poll) -> Option<(String, SocketAddr)>;
-  fn timeout(&self, t: Token, timer: &mut Timer<Token>) -> ClientResult;
+  fn timeout(&self, t: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> ClientResult;
   fn cancel_timeouts(&self, timer: &mut Timer<Token>);
   fn last_event(&self) -> SteadyTime;
   fn print_state(&self);
