@@ -4,7 +4,7 @@ use std::rc::{Rc,Weak};
 use std::cell::RefCell;
 use std::thread::{self,Thread,Builder};
 use std::os::unix::io::RawFd;
-use std::os::unix::io::{FromRawFd,AsRawFd};
+use std::os::unix::io::{FromRawFd,AsRawFd,IntoRawFd};
 use std::sync::mpsc::{self,channel,Receiver};
 use std::net::{SocketAddr,IpAddr,Shutdown};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
@@ -21,7 +21,7 @@ use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
-use sozu_command::scm_socket::ScmSocket;
+use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::messages::{self,Application,Order,HttpFront,HttpListener,OrderMessage,OrderMessageAnswer,OrderMessageStatus, LoadBalancingParams};
 use sozu_command::logging;
 
@@ -1358,8 +1358,14 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
   let _ = configuration.add_listener(config, pool.clone(), token);
   let _ = configuration.activate_listener(&mut event_loop, &front, None);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
+  let scm = ScmSocket::new(scm_client.into_raw_fd());
+  scm.send_listeners(Listeners {
+    http: Vec::new(),
+    tls:  Vec::new(),
+    tcp:  Vec::new(),
+  });
 
-  let mut server    = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
+  let mut server    = Server::new(event_loop, channel, ScmSocket::new(scm_server.into_raw_fd()),
     clients, pool, Some(configuration), None, None, None, max_buffers, 60, 1800);
 
   println!("starting event loop");
@@ -1466,7 +1472,7 @@ mod tests {
       start(config, channel, 10, 16384);
     });
 
-    let front = HttpFront { app_id: String::from("app_1"), address: "137.0.0.1:1031".parse().unwrap(), hostname: String::from("localhost"), path_begin: String::from("/") };
+    let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1031".parse().unwrap(), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
     let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddBackend(backend) });
