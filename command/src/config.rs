@@ -1135,6 +1135,7 @@ mod tests {
       tls_provider: None,
       activate_listeners: None,
       front_timeout: None,
+      zombie_check_interval: None,
     };
 
     println!("config: {:?}", to_string(&config));
