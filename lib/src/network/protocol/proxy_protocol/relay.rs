@@ -24,7 +24,8 @@ pub struct RelayProxyProtocol<Front:SocketHandler> {
   pub frontend_token: Token,
   pub backend_token:  Option<Token>,
   pub front_buf:      Checkout<BufferQueue>,
-  pub readiness:      Readiness,
+  pub front_readiness:Readiness,
+  pub back_readiness: Readiness,
   cursor_header:      usize,
 }
 
@@ -37,11 +38,13 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
       frontend_token,
       backend_token:  None,
       front_buf,
-      readiness: Readiness {
-        front_interest:  UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
-        back_interest:   UnixReady::hup() | UnixReady::error(),
-        front_readiness: UnixReady::from(Ready::empty()),
-        back_readiness:  UnixReady::from(Ready::empty()),
+      front_readiness: Readiness {
+        interest: UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
+        event:    UnixReady::from(Ready::empty()),
+      },
+      back_readiness: Readiness {
+        interest: UnixReady::hup() | UnixReady::error(),
+        event:    UnixReady::from(Ready::empty()),
       },
       cursor_header: 0,
     }
@@ -63,18 +66,19 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
         error!("[{:?}] front socket error, closing the connection", self.frontend_token);
         metrics.service_stop();
         incr!("proxy_protocol.errors");
-        self.readiness.reset();
+        self.front_readiness.reset();
+        self.back_readiness.reset();
         return ClientResult::CloseClient;
       }
 
       if res == SocketResult::WouldBlock {
-        self.readiness.front_readiness.remove(Ready::readable());
+        self.front_readiness.event.remove(Ready::readable());
       }
 
       let read_sz = match parse_v2_header(self.front_buf.unparsed_data()) {
         Ok((rest, header)) => {
-          self.readiness.front_interest.remove(Ready::readable());
-          self.readiness.back_interest.insert(Ready::writable());
+          self.front_readiness.interest.remove(Ready::readable());
+          self.back_readiness.interest.insert(Ready::writable());
           self.front_buf.next_output_data().offset(rest)
         },
         Err(Err::Incomplete(_)) => {
@@ -117,7 +121,8 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
             Err(e) => {
               metrics.service_stop();
               incr!("proxy_protocol.errors");
-              self.readiness.reset();
+              self.front_readiness.reset();
+              self.back_readiness.reset();
               debug!("PROXY PROTOCOL {}", e);
               break;
             },
@@ -148,8 +153,12 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
     self.backend_token = Some(token);
   }
 
-  pub fn readiness(&mut self) -> &mut Readiness {
-    &mut self.readiness
+  pub fn front_readiness(&mut self) -> &mut Readiness {
+    &mut self.front_readiness
+  }
+
+  pub fn back_readiness(&mut self) -> &mut Readiness {
+    &mut self.back_readiness
   }
 
   pub fn into_pipe(mut self, back_buf: Checkout<BufferQueue>) -> Pipe<Front> {
@@ -165,8 +174,8 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
       addr,
     );
 
-    pipe.readiness.front_readiness = self.readiness.front_readiness;
-    pipe.readiness.back_readiness  = self.readiness.back_readiness;
+    pipe.front_readiness.event = self.front_readiness.event;
+    pipe.back_readiness.event  = self.back_readiness.event;
 
     if let Some(back_token) = self.backend_token {
       pipe.set_back_token(back_token);

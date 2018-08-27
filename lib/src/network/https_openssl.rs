@@ -117,7 +117,7 @@ impl TlsClient {
       last_event:     SteadyTime::now(),
       listen_token,
     };
-    client.readiness().front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+    client.front_readiness().interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
 
     client
   }
@@ -152,8 +152,7 @@ impl TlsClient {
           let ExpectProxyProtocol {
             frontend, frontend_token, readiness, .. } = expect;
           let mut tls = TlsHandshake::new(ssl, frontend);
-          tls.readiness.front_readiness = readiness.front_readiness;
-          tls.readiness.back_readiness  = readiness.back_readiness;
+          tls.readiness.event = readiness.event;
 
           gauge_add!("protocol.proxy.expect", -1);
           gauge_add!("protocol.tls.handshake", 1);
@@ -181,8 +180,8 @@ impl TlsClient {
       let http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), pool,
         self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
 
-        http.readiness = readiness;
-        http.readiness.front_interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+        http.front_readiness = readiness;
+        http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
         State::Http(http)
       });
 
@@ -235,8 +234,8 @@ impl TlsClient {
       let mut pipe = Pipe::new(http.frontend, front_token, Some(unwrap_msg!(http.backend)),
         front_buf, back_buf, http.public_address);
 
-      pipe.readiness.front_readiness = http.readiness.front_readiness;
-      pipe.readiness.back_readiness  = http.readiness.back_readiness;
+      pipe.front_readiness.event = http.front_readiness.event;
+      pipe.back_readiness.event  = http.back_readiness.event;
       pipe.set_back_token(back_token);
 
       self.protocol = Some(State::WebSocket(pipe));
@@ -397,12 +396,22 @@ impl TlsClient {
     (self.app_id.clone(), addr)
   }
 
-  fn readiness(&mut self)      -> &mut Readiness {
+  fn front_readiness(&mut self)      -> &mut Readiness {
     let r = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Expect(ref mut expect, _)    => &mut expect.readiness,
       State::Handshake(ref mut handshake) => &mut handshake.readiness,
-      State::Http(ref mut http)           => http.readiness(),
-      State::WebSocket(ref mut pipe)      => &mut pipe.readiness,
+      State::Http(ref mut http)           => http.front_readiness(),
+      State::WebSocket(ref mut pipe)      => &mut pipe.front_readiness,
+    };
+    //info!("current readiness: {:?}", r);
+    r
+  }
+
+  fn back_readiness(&mut self)      -> Option<&mut Readiness> {
+    let r = match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Http(ref mut http)           => Some(http.back_readiness()),
+      State::WebSocket(ref mut pipe)      => Some(&mut pipe.back_readiness),
+      _ => None,
     };
     //info!("current readiness: {:?}", r);
     r
@@ -515,9 +524,9 @@ impl ProxyClient for TlsClient {
     self.last_event = SteadyTime::now();
 
     if self.frontend_token == token {
-      self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
+      self.front_readiness().event = self.front_readiness().event | UnixReady::from(events);
     } else if self.back_token() == Some(token) {
-      self.readiness().back_readiness = self.readiness().back_readiness | UnixReady::from(events);
+      self.back_readiness().map(|r| r.event = r.event | UnixReady::from(events));
     }
   }
 
@@ -528,7 +537,7 @@ impl ProxyClient for TlsClient {
     self.metrics().service_start();
 
     if self.back_connected() == BackendConnectionStatus::Connecting {
-      if self.readiness().back_readiness.is_hup() {
+      if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) {
         //retry connecting the backend
         //FIXME: there should probably be a circuit breaker per client too
         error!("{} error connecting to backend, trying again", self.log_context());
@@ -536,19 +545,19 @@ impl ProxyClient for TlsClient {
         let backend_token = self.back_token();
         self.http().map(|h| h.remove_backend());
         return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
-      } else if self.readiness().back_readiness != UnixReady::from(Ready::empty()) {
+      } else if self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
         self.set_back_connected(BackendConnectionStatus::Connected);
       }
     }
 
-    if self.readiness().front_readiness.is_hup() {
+    if self.front_readiness().event.is_hup() {
       let order = self.front_hup();
       match order {
         ClientResult::CloseClient => {
           return order;
         },
         _ => {
-          self.readiness().front_readiness.remove(UnixReady::hup());
+          self.front_readiness().event.remove(UnixReady::hup());
           return order;
         }
       }
@@ -556,17 +565,17 @@ impl ProxyClient for TlsClient {
 
     let token = self.frontend_token.clone();
     while counter < max_loop_iterations {
-      let front_interest = self.readiness().front_interest & self.readiness().front_readiness;
-      let back_interest  = self.readiness().back_interest & self.readiness().back_readiness;
+      let front_interest = self.front_readiness().interest & self.front_readiness().event;
+      let back_interest  = self.back_readiness().map(|r| r.interest & r.event).unwrap_or(UnixReady::from(Ready::empty()));
 
-      trace!("PROXY\t{} {:?} {:?}", self.log_context(), token, self.readiness());
+      trace!("PROXY\t{} {:?} {:?} -> {:?}", self.log_context(), token, self.front_readiness().clone(), self.back_readiness());
 
       if front_interest == UnixReady::from(Ready::empty()) && back_interest == UnixReady::from(Ready::empty()) {
         break;
       }
 
-      if self.readiness().back_readiness.is_hup() && self.readiness().front_interest.is_writable() &&
-        ! self.readiness().front_readiness.is_writable() {
+      if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) && self.front_readiness().interest.is_writable() &&
+        ! self.front_readiness().event.is_writable() {
         break;
       }
 
@@ -608,14 +617,14 @@ impl ProxyClient for TlsClient {
             return order;
           },
           ClientResult::Continue => {
-            /*self.readiness().front_interest.insert(Ready::writable());
-            if ! self.readiness().front_readiness.is_writable() {
+            /*self.front_readiness().interest.insert(Ready::writable());
+            if ! self.front_readiness().event.is_writable() {
               error!("got back socket HUP but there's still data, and front is not writable yet(openssl)[{:?} => {:?}]", self.frontend_token, self.back_token());
               break;
             }*/
           },
           _ => {
-            self.readiness().back_readiness.remove(UnixReady::hup());
+            self.back_readiness().map(|r| r.event.remove(UnixReady::hup()));
             return order;
           }
         };
@@ -628,8 +637,8 @@ impl ProxyClient for TlsClient {
           error!("PROXY client {:?} back error, disconnecting", self.frontend_token);
         }
 
-        self.readiness().front_interest = UnixReady::from(Ready::empty());
-        self.readiness().back_interest  = UnixReady::from(Ready::empty());
+        self.front_readiness().interest = UnixReady::from(Ready::empty());
+        self.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::empty()));
         return ClientResult::CloseClient;
       }
 
@@ -639,12 +648,13 @@ impl ProxyClient for TlsClient {
     if counter == max_loop_iterations {
       error!("PROXY\thandling client {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
 
-      let front_interest = self.readiness().front_interest & self.readiness().front_readiness;
-      let back_interest  = self.readiness().back_interest & self.readiness().back_readiness;
+      let front_interest = self.front_readiness().interest & self.front_readiness().event;
+      let back_interest  = self.back_readiness().map(|r| r.interest & r.event);
 
       let token = self.frontend_token.clone();
-      error!("PROXY\t{:?} readiness: {:?} | front: {:?} | back: {:?} ", token,
-        self.readiness(), front_interest, back_interest);
+      let back = self.back_readiness().cloned();
+      error!("PROXY\t{:?} readiness: {:?} -> {:?} | front: {:?} | back: {:?} ", token,
+        self.front_readiness(), back, front_interest, back_interest);
 
       return ClientResult::CloseClient;
     }
@@ -665,15 +675,20 @@ impl ProxyClient for TlsClient {
       None                      => String::from("None"),
     };
 
-    let r = match *unwrap_msg!(self.protocol.as_ref()) {
+    let rf = match *unwrap_msg!(self.protocol.as_ref()) {
       State::Expect(ref expect, _)    => &expect.readiness,
       State::Handshake(ref handshake) => &handshake.readiness,
-      State::Http(ref http)           => &http.readiness,
-      State::WebSocket(ref pipe)      => &pipe.readiness,
+      State::Http(ref http)           => &http.front_readiness,
+      State::WebSocket(ref pipe)      => &pipe.front_readiness,
+    };
+    let rb = match *unwrap_msg!(self.protocol.as_ref()) {
+      State::Http(ref http)           => Some(&http.back_readiness),
+      State::WebSocket(ref pipe)      => Some(&pipe.back_readiness),
+      _ => None,
     };
 
-    error!("zombie client[{:?} => {:?}], state => readiness: {:?}, protocol: {}, app_id: {:?}, back_connected: {:?}, metrics: {:?}",
-      self.frontend_token, self.back_token(), r, p, self.app_id, self.back_connected, self.metrics);
+    error!("zombie client[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, app_id: {:?}, back_connected: {:?}, metrics: {:?}",
+      self.frontend_token, self.back_token(), rf, rb, p, self.app_id, self.back_connected, self.metrics);
   }
 
   fn tokens(&self) -> Vec<Token> {
@@ -1314,8 +1329,8 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         } else {
           client.backend = None;
           client.back_connected = BackendConnectionStatus::NotConnected;
-          //client.readiness().back_interest  = UnixReady::from(Ready::empty());
-          client.readiness().back_readiness = UnixReady::from(Ready::empty());
+          //client.back_readiness().interest  = UnixReady::from(Ready::empty());
+          client.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
           client.back_socket().as_ref().map(|sock| {
             poll.deregister(*sock);
             sock.shutdown(Shutdown::Both);
@@ -1340,8 +1355,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
         client.backend = None;
         client.back_connected = BackendConnectionStatus::NotConnected;
-        client.readiness().back_interest  = UnixReady::from(Ready::empty());
-        client.readiness().back_readiness = UnixReady::from(Ready::empty());
+        client.back_readiness().map(|r| {
+          r.interest  = UnixReady::from(Ready::empty());
+          r.event = UnixReady::from(Ready::empty());
+        });
         client.back_socket().as_ref().map(|sock| {
           poll.deregister(*sock);
           sock.shutdown(Shutdown::Both);
@@ -1366,7 +1383,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           if old_app_id.is_some() && old_app_id != new_app_id {
             client.backend = None;
             client.back_connected = BackendConnectionStatus::NotConnected;
-            client.readiness().back_readiness = UnixReady::from(Ready::empty());
+            client.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
             client.back_socket().as_ref().map(|sock| {
               poll.deregister(*sock);
               sock.shutdown(Shutdown::Both);
@@ -1374,7 +1391,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           }
 
           // we still want to use the new socket
-          client.readiness().back_interest  = UnixReady::from(Ready::writable());
+          client.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::writable()));
 
           let req_state = unwrap_msg!(client.http()).state().request.clone();
           let req_header_end = unwrap_msg!(client.http()).state().req_header_end;

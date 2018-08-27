@@ -27,11 +27,9 @@ impl TlsHandshake {
       stream:   stream,
       session:   session,
       readiness: Readiness {
-        front_interest:  UnixReady::from(Ready::readable())
+        interest:  UnixReady::from(Ready::readable())
                            | UnixReady::hup() | UnixReady::error(),
-        back_interest:   UnixReady::from(Ready::empty()),
-        front_readiness: UnixReady::from(Ready::empty()),
-        back_readiness:  UnixReady::from(Ready::empty()),
+        event: UnixReady::from(Ready::empty()),
       },
     }
   }
@@ -54,7 +52,7 @@ impl TlsHandshake {
           },
           Err(e) => match e.kind() {
             ErrorKind::WouldBlock => {
-              self.readiness.front_readiness.remove(Ready::readable());
+              self.readiness.event.remove(Ready::readable());
               can_read = false
             },
             _ => {
@@ -76,11 +74,11 @@ impl TlsHandshake {
     }
 
     if !self.session.wants_read() {
-      self.readiness.front_interest.remove(Ready::readable());
+      self.readiness.interest.remove(Ready::readable());
     }
 
     if self.session.wants_write() {
-      self.readiness.front_interest.insert(Ready::writable());
+      self.readiness.interest.insert(Ready::writable());
     }
 
     if self.session.is_handshaking() {
@@ -90,9 +88,9 @@ impl TlsHandshake {
       if self.session.wants_write() {
         (ProtocolResult::Continue, ClientResult::Continue)
       } else {
-        self.readiness.front_interest.insert(Ready::readable());
-        self.readiness.front_readiness.insert(Ready::readable());
-        self.readiness.front_interest.insert(Ready::writable());
+        self.readiness.interest.insert(Ready::readable());
+        self.readiness.event.insert(Ready::readable());
+        self.readiness.interest.insert(Ready::writable());
         (ProtocolResult::Upgrade, ClientResult::Continue)
       }
     }
@@ -111,7 +109,7 @@ impl TlsHandshake {
           Ok(_) => {},
           Err(e) => match e.kind() {
             ErrorKind::WouldBlock => {
-              self.readiness.front_readiness.remove(Ready::writable());
+              self.readiness.event.remove(Ready::writable());
               can_write = false
             },
             _ => {
@@ -133,11 +131,11 @@ impl TlsHandshake {
     }
 
     if !self.session.wants_write() {
-      self.readiness.front_interest.remove(Ready::writable());
+      self.readiness.interest.remove(Ready::writable());
     }
 
     if self.session.wants_read() {
-      self.readiness.front_interest.insert(Ready::readable());
+      self.readiness.interest.insert(Ready::readable());
     }
 
     if self.session.is_handshaking() {
@@ -146,8 +144,8 @@ impl TlsHandshake {
       if self.session.wants_read() {
         (ProtocolResult::Continue, ClientResult::Continue)
       } else {
-        self.readiness.front_interest.insert(Ready::writable());
-        self.readiness.front_interest.insert(Ready::readable());
+        self.readiness.interest.insert(Ready::writable());
+        self.readiness.interest.insert(Ready::readable());
         (ProtocolResult::Upgrade, ClientResult::Continue)
       }
     }

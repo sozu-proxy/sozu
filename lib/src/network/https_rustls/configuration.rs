@@ -510,7 +510,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           client.backend = None;
           client.back_connected = BackendConnectionStatus::NotConnected;
           //client.readiness().back_interest  = UnixReady::from(Ready::empty());
-          client.readiness().back_readiness = UnixReady::from(Ready::empty());
+          client.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
           client.back_socket().as_ref().map(|sock| {
             poll.deregister(*sock);
             sock.shutdown(Shutdown::Both);
@@ -535,8 +535,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
         client.backend = None;
         client.back_connected = BackendConnectionStatus::NotConnected;
-        client.readiness().back_interest  = UnixReady::from(Ready::empty());
-        client.readiness().back_readiness = UnixReady::from(Ready::empty());
+        client.back_readiness().map(|r| {
+          r.interest  = UnixReady::from(Ready::empty());
+          r.event = UnixReady::from(Ready::empty());
+        });
         client.back_socket().as_ref().map(|sock| {
           poll.deregister(*sock);
           sock.shutdown(Shutdown::Both);
@@ -561,7 +563,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           if old_app_id.is_some() && old_app_id != new_app_id {
             client.backend = None;
             client.back_connected = BackendConnectionStatus::NotConnected;
-            client.readiness().back_readiness = UnixReady::from(Ready::empty());
+            client.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
             client.back_socket().as_ref().map(|sock| {
               poll.deregister(*sock);
               sock.shutdown(Shutdown::Both);
@@ -569,7 +571,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           }
 
           // we still want to use the new socket
-          client.readiness().back_interest  = UnixReady::from(Ready::writable());
+          client.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::writable()));
 
           let req_state = unwrap_msg!(client.http()).state().request.clone();
           let req_header_end = unwrap_msg!(client.http()).state().req_header_end;

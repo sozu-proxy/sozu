@@ -31,7 +31,8 @@ pub struct Pipe<Front:SocketHandler> {
   back_buf_position:  usize,
   pub app_id:         Option<String>,
   pub request_id:     String,
-  pub readiness:      Readiness,
+  pub front_readiness:Readiness,
+  pub back_readiness: Readiness,
   pub log_ctx:        String,
   public_address:     Option<IpAddr>,
 }
@@ -51,11 +52,13 @@ impl<Front:SocketHandler> Pipe<Front> {
       back_buf_position:  0,
       app_id:             None,
       request_id:         request_id,
-      readiness:          Readiness {
-                            front_interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
-                            back_interest:   UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
-                            front_readiness: UnixReady::from(Ready::empty()),
-                            back_readiness:  UnixReady::from(Ready::empty()),
+      front_readiness:    Readiness {
+                            interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
+                            event: UnixReady::from(Ready::empty()),
+      },
+      back_readiness:    Readiness {
+                            interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
+                            event: UnixReady::from(Ready::empty()),
       },
       log_ctx:            log_ctx,
       public_address:     public_address,
@@ -103,8 +106,12 @@ impl<Front:SocketHandler> Pipe<Front> {
     self.backend_token = Some(token);
   }
 
-  pub fn readiness(&mut self) -> &mut Readiness {
-    &mut self.readiness
+  pub fn front_readiness(&mut self) -> &mut Readiness {
+    &mut self.front_readiness
+  }
+
+  pub fn back_readiness(&mut self) -> &mut Readiness {
+    &mut self.back_readiness
   }
 
   pub fn front_hup(&mut self) -> ClientResult {
@@ -113,17 +120,17 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   pub fn back_hup(&mut self) -> ClientResult {
     if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
-      if self.readiness.back_readiness.is_readable() {
-        self.readiness().back_interest.insert(Ready::readable());
-        error!("Pipe::back_hup: backend connection closed but the kernel still holds some data. readiness: {:?}", self.readiness);
+      if self.back_readiness.event.is_readable() {
+        self.back_readiness().interest.insert(Ready::readable());
+        error!("Pipe::back_hup: backend connection closed but the kernel still holds some data. readiness: {:?} -> {:?}", self.front_readiness, self.back_readiness);
         ClientResult::Continue
       } else {
         ClientResult::CloseClient
       }
     } else {
-      self.readiness().front_interest.insert(Ready::writable());
-      if self.readiness.back_readiness.is_readable() {
-        self.readiness.back_interest.insert(Ready::readable());
+      self.front_readiness().interest.insert(Ready::writable());
+      if self.back_readiness.event.is_readable() {
+        self.back_readiness.interest.insert(Ready::readable());
       }
       ClientResult::Continue
     }
@@ -133,8 +140,8 @@ impl<Front:SocketHandler> Pipe<Front> {
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
     trace!("pipe readable");
     if self.front_buf.buffer.available_space() == 0 {
-      self.readiness.front_interest.remove(Ready::readable());
-      self.readiness.back_interest.insert(Ready::writable());
+      self.front_readiness.interest.remove(Ready::readable());
+      self.back_readiness.interest.insert(Ready::writable());
       return ClientResult::Continue;
     }
 
@@ -152,11 +159,11 @@ impl<Front:SocketHandler> Pipe<Front> {
       metrics.bin += sz;
 
       if self.front_buf.buffer.available_space() == 0 {
-        self.readiness.front_interest.remove(Ready::readable());
+        self.front_readiness.interest.remove(Ready::readable());
       }
-      self.readiness.back_interest.insert(Ready::writable());
+      self.back_readiness.interest.insert(Ready::writable());
     } else {
-      self.readiness.front_readiness.remove(Ready::readable());
+      self.front_readiness.event.remove(Ready::readable());
     }
 
     match res {
@@ -164,21 +171,23 @@ impl<Front:SocketHandler> Pipe<Front> {
         error!("{}\t[{:?}] front socket error, closing the connection", self.log_ctx, self.frontend_token);
         metrics.service_stop();
         incr!("pipe.errors");
-        self.readiness.reset();
+        self.front_readiness.reset();
+        self.back_readiness.reset();
         return ClientResult::CloseClient;
       },
       SocketResult::Closed => {
         metrics.service_stop();
-        self.readiness.reset();
+        self.front_readiness.reset();
+        self.back_readiness.reset();
         return ClientResult::CloseClient;
       },
       SocketResult::WouldBlock => {
-        self.readiness.front_readiness.remove(Ready::readable());
+        self.front_readiness.event.remove(Ready::readable());
       },
       SocketResult::Continue => {}
     };
 
-    self.readiness.back_interest.insert(Ready::writable());
+    self.back_readiness.interest.insert(Ready::writable());
     ClientResult::Continue
   }
 
@@ -186,8 +195,8 @@ impl<Front:SocketHandler> Pipe<Front> {
   pub fn writable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
     trace!("pipe writable");
     if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
-      self.readiness.back_interest.insert(Ready::readable());
-      self.readiness.front_interest.remove(Ready::writable());
+      self.back_readiness.interest.insert(Ready::readable());
+      self.front_readiness.interest.remove(Ready::writable());
       return ClientResult::Continue;
     }
 
@@ -196,8 +205,8 @@ impl<Front:SocketHandler> Pipe<Front> {
     while res == SocketResult::Continue && self.back_buf.output_data_size() > 0 {
       // no more data in buffer, stop here
       if self.back_buf.next_output_data().len() == 0 {
-        self.readiness.back_interest.insert(Ready::readable());
-        self.readiness.front_interest.remove(Ready::writable());
+        self.back_readiness.interest.insert(Ready::readable());
+        self.front_readiness.interest.remove(Ready::writable());
         return ClientResult::Continue;
       }
       let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
@@ -209,7 +218,7 @@ impl<Front:SocketHandler> Pipe<Front> {
 
     if sz > 0 {
       count!("bytes_out", sz as i64);
-      self.readiness.back_interest.insert(Ready::readable());
+      self.back_readiness.interest.insert(Ready::readable());
       metrics.bout += sz;
     }
 
@@ -224,11 +233,12 @@ impl<Front:SocketHandler> Pipe<Front> {
         error!("{}\t[{:?}] error writing to front socket, closing", self.log_ctx, self.frontend_token);
         incr!("pipe.errors");
         metrics.service_stop();
-        self.readiness.reset();
+        self.front_readiness.reset();
+        self.back_readiness.reset();
         return ClientResult::CloseClient;
       },
       SocketResult::WouldBlock => {
-        self.readiness.front_readiness.remove(Ready::writable());
+        self.front_readiness.event.remove(Ready::writable());
       },
       SocketResult::Continue => {},
     }
@@ -240,8 +250,8 @@ impl<Front:SocketHandler> Pipe<Front> {
   pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
     trace!("pipe back_writable");
     if self.front_buf.output_data_size() == 0 || self.front_buf.next_output_data().len() == 0 {
-      self.readiness.front_interest.insert(Ready::readable());
-      self.readiness.back_interest.remove(Ready::writable());
+      self.front_readiness.interest.insert(Ready::readable());
+      self.back_readiness.interest.remove(Ready::writable());
       return ClientResult::Continue;
     }
 
@@ -255,8 +265,8 @@ impl<Front:SocketHandler> Pipe<Front> {
       while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
         // no more data in buffer, stop here
         if self.front_buf.next_output_data().len() == 0 {
-          self.readiness.front_interest.insert(Ready::readable());
-          self.readiness.back_interest.remove(Ready::writable());
+          self.front_readiness.interest.insert(Ready::readable());
+          self.back_readiness.interest.remove(Ready::writable());
           return ClientResult::Continue;
         }
 
@@ -278,11 +288,12 @@ impl<Front:SocketHandler> Pipe<Front> {
         error!("{}\tback socket write error, closing connection", self.log_ctx);
         metrics.service_stop();
         incr!("pipe.errors");
-        self.readiness.reset();
+        self.front_readiness.reset();
+        self.back_readiness.reset();
         return ClientResult::CloseClient;
       },
       SocketResult::WouldBlock => {
-        self.readiness.back_readiness.remove(Ready::writable());
+        self.back_readiness.event.remove(Ready::writable());
 
       },
       SocketResult::Continue => {}
@@ -294,7 +305,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
     trace!("pipe back_readable");
     if self.back_buf.buffer.available_space() == 0 {
-      self.readiness.back_interest.remove(Ready::readable());
+      self.back_readiness.interest.remove(Ready::readable());
       return ClientResult::Continue;
     }
 
@@ -312,10 +323,10 @@ impl<Front:SocketHandler> Pipe<Front> {
       }
 
       if r != SocketResult::Continue || sz == 0 {
-        self.readiness.back_readiness.remove(Ready::readable());
+        self.back_readiness.event.remove(Ready::readable());
       }
       if sz > 0 {
-        self.readiness.front_interest.insert(Ready::writable());
+        self.front_readiness.interest.insert(Ready::writable());
         metrics.backend_bin += sz;
       }
 
@@ -324,16 +335,18 @@ impl<Front:SocketHandler> Pipe<Front> {
           error!("{}\tback socket read error, closing connection", self.log_ctx);
           metrics.service_stop();
           incr!("pipe.errors");
-          self.readiness.reset();
+          self.front_readiness.reset();
+          self.back_readiness.reset();
           return ClientResult::CloseClient;
         },
         SocketResult::Closed => {
           metrics.service_stop();
-          self.readiness.reset();
+          self.front_readiness.reset();
+          self.back_readiness.reset();
           return ClientResult::CloseClient;
         },
         SocketResult::WouldBlock => {
-          self.readiness.back_readiness.remove(Ready::readable());
+          self.back_readiness.event.remove(Ready::readable());
         },
         SocketResult::Continue => {}
       }

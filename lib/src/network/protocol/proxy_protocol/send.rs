@@ -37,10 +37,8 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
       frontend_token,
       backend_token:  None,
       readiness: Readiness {
-        front_interest:  UnixReady::hup() | UnixReady::error(),
-        back_interest:   UnixReady::hup() | UnixReady::error(),
-        front_readiness: UnixReady::from(Ready::empty()),
-        back_readiness:  UnixReady::from(Ready::empty()),
+        interest: UnixReady::hup() | UnixReady::error(),
+        event:    UnixReady::from(Ready::empty()),
       },
       cursor_header: 0,
     }
@@ -66,7 +64,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
             },
             Err(e) => match e.kind() {
               ErrorKind::WouldBlock => {
-                self.readiness.back_readiness.remove(Ready::writable());
+                self.readiness.event.remove(Ready::writable());
                 return (ProtocolResult::Continue, ClientResult::Continue);
               },
               e => {
@@ -107,7 +105,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
   pub fn set_back_connected(&mut self, status: BackendConnectionStatus) {
     if status == BackendConnectionStatus::Connected {
       self.gen_proxy_protocol_header();
-      self.readiness.back_interest.insert(UnixReady::from(Ready::writable()));
+      self.readiness.interest.insert(UnixReady::from(Ready::writable()));
     }
   }
 
@@ -145,8 +143,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
       addr,
     );
 
-    pipe.readiness.front_readiness = self.readiness.front_readiness;
-    pipe.readiness.back_readiness  = self.readiness.back_readiness;
+    pipe.back_readiness.event  = self.readiness.event;
 
     if let Some(back_token) = self.backend_token {
       pipe.set_back_token(back_token);

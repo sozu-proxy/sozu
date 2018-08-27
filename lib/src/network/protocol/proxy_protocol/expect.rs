@@ -44,10 +44,8 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       index: 0,
       header_len: HeaderLen::V4,
       readiness: Readiness {
-        front_interest:  UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
-        back_interest:   UnixReady::hup() | UnixReady::error(),
-        front_readiness: UnixReady::from(Ready::empty()),
-        back_readiness:  UnixReady::from(Ready::empty()),
+        interest:  UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
+        event: UnixReady::from(Ready::empty()),
       },
       addresses: None,
     }
@@ -71,7 +69,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       metrics.bin += sz;
 
       if self.index == self.buf.len() {
-        self.readiness.front_interest.remove(Ready::readable());
+        self.readiness.interest.remove(Ready::readable());
       }
     }
 
@@ -84,7 +82,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
     }
 
     if res == SocketResult::WouldBlock {
-      self.readiness.front_readiness.remove(Ready::readable());
+      self.readiness.event.remove(Ready::readable());
     }
 
     match parse_v2_header(&self.buf[..self.index]) {
@@ -145,8 +143,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       addr,
     );
 
-    pipe.readiness.front_readiness = self.readiness.front_readiness;
-    pipe.readiness.back_readiness  = self.readiness.back_readiness;
+    pipe.front_readiness.event = self.readiness.event;
 
     if let Some(backend_token) = backend_token {
       pipe.set_back_token(backend_token);

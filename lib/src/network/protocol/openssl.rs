@@ -32,10 +32,8 @@ impl TlsHandshake {
       stream:         None,
       state:          TlsState::Initial,
       readiness:      Readiness {
-                        front_interest:  UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
-                        back_interest:   UnixReady::from(Ready::empty()),
-                        front_readiness: UnixReady::from(Ready::empty()),
-                        back_readiness:  UnixReady::from(Ready::empty()),
+                        interest: UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
+                        event:    UnixReady::from(Ready::empty()),
       },
     }
   }
@@ -76,7 +74,7 @@ impl TlsHandshake {
           Err(HandshakeError::WouldBlock(mid)) => {
             self.state = TlsState::Handshake;
             self.mid = Some(mid);
-            self.readiness.front_readiness.remove(Ready::readable());
+            self.readiness.event.remove(Ready::readable());
             return (ProtocolResult::Continue, ClientResult::Continue);
           }
         }
@@ -102,7 +100,7 @@ impl TlsHandshake {
           Err(HandshakeError::WouldBlock(new_mid)) => {
             self.state = TlsState::Handshake;
             self.mid = Some(new_mid);
-            self.readiness.front_readiness.remove(Ready::readable());
+            self.readiness.event.remove(Ready::readable());
             return (ProtocolResult::Continue, ClientResult::Continue);
           }
         }

@@ -330,13 +330,22 @@ impl Client {
     }
   }
 
-  fn readiness(&mut self) -> &mut Readiness {
+  fn front_readiness(&mut self) -> &mut Readiness {
     match self.protocol {
-      Some(State::Pipe(ref mut pipe)) => pipe.readiness(),
-      Some(State::SendProxyProtocol(ref mut pp)) => pp.readiness(),
-      Some(State::RelayProxyProtocol(ref mut pp)) => pp.readiness(),
+      Some(State::Pipe(ref mut pipe)) => pipe.front_readiness(),
+      Some(State::SendProxyProtocol(ref mut pp)) => panic!(),
+      Some(State::RelayProxyProtocol(ref mut pp)) => pp.front_readiness(),
       Some(State::ExpectProxyProtocol(ref mut pp)) => pp.readiness(),
       _ => unreachable!(),
+    }
+  }
+
+  fn back_readiness(&mut self) -> Option<&mut Readiness> {
+    match self.protocol {
+      Some(State::Pipe(ref mut pipe)) => Some(pipe.back_readiness()),
+      Some(State::SendProxyProtocol(ref mut pp)) => Some(pp.readiness()),
+      Some(State::RelayProxyProtocol(ref mut pp)) => Some(pp.back_readiness()),
+      _ => None,
     }
   }
 
@@ -502,9 +511,9 @@ impl ProxyClient for Client {
     self.last_event = SteadyTime::now();
 
     if self.frontend_token == token {
-      self.readiness().front_readiness = self.readiness().front_readiness | UnixReady::from(events);
+      self.front_readiness().event = self.front_readiness().event | UnixReady::from(events);
     } else if self.backend_token == Some(token) {
-      self.readiness().back_readiness = self.readiness().back_readiness | UnixReady::from(events);
+      self.back_readiness().map(|r| r.event = r.event | UnixReady::from(events));
     }
   }
 
@@ -515,26 +524,26 @@ impl ProxyClient for Client {
     self.metrics().service_start();
 
     if self.back_connected() == BackendConnectionStatus::Connecting {
-      if self.readiness().back_readiness.is_hup() {
+      if self.back_readiness().unwrap().event.is_hup() {
         //retry connecting the backend
         //FIXME: there should probably be a circuit breaker per client too
         error!("error connecting to backend, trying again");
         self.metrics().service_stop();
         let backend_token = self.backend_token.take();
         return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
-      } else if self.readiness().back_readiness != UnixReady::from(Ready::empty()) {
+      } else if self.back_readiness().unwrap().event != UnixReady::from(Ready::empty()) {
         self.set_back_connected(BackendConnectionStatus::Connected);
       }
     }
 
-    if self.readiness().front_readiness.is_hup() {
+    if self.front_readiness().event.is_hup() {
       let order = self.front_hup();
       match order {
         ClientResult::CloseClient => {
           return order;
         },
         _ => {
-          self.readiness().front_readiness.remove(UnixReady::hup());
+          self.front_readiness().event.remove(UnixReady::hup());
           return order;
         }
       }
@@ -542,17 +551,17 @@ impl ProxyClient for Client {
 
     let token = self.frontend_token;
     while counter < max_loop_iterations {
-      let front_interest = self.readiness().front_interest & self.readiness().front_readiness;
-      let back_interest  = self.readiness().back_interest & self.readiness().back_readiness;
+      let front_interest = self.front_readiness().interest & self.front_readiness().event;
+      let back_interest  = self.back_readiness().map(|r| r.interest & r.event).unwrap_or(UnixReady::from(Ready::empty()));
 
-      trace!("PROXY\t{} {:?} {:?}", self.log_context(), token, self.readiness());
+      trace!("PROXY\t{} {:?} {:?} -> {:?}", self.log_context(), token, self.front_readiness().clone(), self.back_readiness());
 
       if front_interest == UnixReady::from(Ready::empty()) && back_interest == UnixReady::from(Ready::empty()) {
         break;
       }
 
-      if self.readiness().back_readiness.is_hup() && self.readiness().front_interest.is_writable() &&
-        ! self.readiness().front_readiness.is_writable() {
+      if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) && self.front_readiness().interest.is_writable() &&
+        ! self.front_readiness().event.is_writable() {
         break;
       }
 
@@ -595,7 +604,7 @@ impl ProxyClient for Client {
           },
           ClientResult::Continue => {},
           _ => {
-            self.readiness().back_readiness.remove(UnixReady::hup());
+            self.back_readiness().map(|r| r.event.remove(UnixReady::hup()));
             return order;
           }
         };
@@ -608,8 +617,8 @@ impl ProxyClient for Client {
           error!("PROXY client {:?} back error, disconnecting", self.frontend_token);
         }
 
-        self.readiness().front_interest = UnixReady::from(Ready::empty());
-        self.readiness().back_interest  = UnixReady::from(Ready::empty());
+        self.front_readiness().interest = UnixReady::from(Ready::empty());
+        self.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::empty()));
         return ClientResult::CloseClient;
       }
 
@@ -619,11 +628,12 @@ impl ProxyClient for Client {
     if counter == max_loop_iterations {
       error!("PROXY\thandling client {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
 
-      let front_interest = self.readiness().front_interest & self.readiness().front_readiness;
-      let back_interest  = self.readiness().back_interest & self.readiness().back_readiness;
+      let front_interest = self.front_readiness().interest & self.front_readiness().event;
+      let back_interest  = self.back_readiness().map(|r| r.interest & r.event).unwrap_or(UnixReady::from(Ready::empty()));
 
-      error!("PROXY\t{:?} readiness: {:?} | front: {:?} | back: {:?} ", self.frontend_token.clone(),
-        self.readiness(), front_interest, back_interest);
+      let back = self.back_readiness().cloned();
+      error!("PROXY\t{:?} readiness: front {:?} / back {:?} | front: {:?} | back: {:?} ", self.frontend_token.clone(),
+        self.front_readiness(), back, front_interest, back_interest);
 
       return ClientResult::CloseClient;
     }
@@ -644,15 +654,21 @@ impl ProxyClient for Client {
       None                                => String::from("None"),
     };
 
-    let r = match *unwrap_msg!(self.protocol.as_ref()) {
+    let rf = match *unwrap_msg!(self.protocol.as_ref()) {
       State::ExpectProxyProtocol(ref expect) => &expect.readiness,
       State::SendProxyProtocol(ref send)     => &send.readiness,
-      State::RelayProxyProtocol(ref relay)   => &relay.readiness,
-      State::Pipe(ref pipe)                  => &pipe.readiness,
+      State::RelayProxyProtocol(ref relay)   => &relay.front_readiness,
+      State::Pipe(ref pipe)                  => &pipe.front_readiness,
     };
 
-    error!("zombie client[{:?} => {:?}], state => readiness: {:?}, protocol: {}, app_id: {:?}, back_connected: {:?}, metrics: {:?}",
-      self.frontend_token, self.back_token(), r, p, self.app_id, self.back_connected, self.metrics);
+    let rb = match *unwrap_msg!(self.protocol.as_ref()) {
+      State::RelayProxyProtocol(ref relay)   => Some(&relay.back_readiness),
+      State::Pipe(ref pipe)                  => Some(&pipe.back_readiness),
+      _ => None,
+    };
+
+    error!("zombie client[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, app_id: {:?}, back_connected: {:?}, metrics: {:?}",
+      self.frontend_token, self.back_token(), rf, rb, p, self.app_id, self.back_connected, self.metrics);
   }
 
   fn tokens(&self) -> Vec<Token> {
@@ -835,8 +851,10 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       //deregister back socket if it is the wrong one or if it was not connecting
       client.backend = None;
       client.back_connected = BackendConnectionStatus::NotConnected;
-      client.readiness().back_interest  = UnixReady::from(Ready::empty());
-      client.readiness().back_readiness = UnixReady::from(Ready::empty());
+      client.back_readiness().map(|r| {
+        r.interest = UnixReady::from(Ready::empty());
+        r.event = UnixReady::from(Ready::empty());
+      });
       client.back_socket().as_ref().map(|sock| {
         poll.deregister(*sock);
         sock.shutdown(Shutdown::Both);

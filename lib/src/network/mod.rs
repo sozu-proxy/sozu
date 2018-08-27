@@ -316,27 +316,21 @@ impl Backend {
 
 #[derive(Clone)]
 pub struct Readiness {
-  pub front_interest:  UnixReady,
-  pub back_interest:   UnixReady,
-  pub front_readiness: UnixReady,
-  pub back_readiness:  UnixReady,
+  pub event:    UnixReady,
+  pub interest: UnixReady,
 }
 
 impl Readiness {
   pub fn new() -> Readiness {
     Readiness {
-      front_interest:  UnixReady::from(Ready::empty()),
-      back_interest:   UnixReady::from(Ready::empty()),
-      front_readiness: UnixReady::from(Ready::empty()),
-      back_readiness:  UnixReady::from(Ready::empty()),
+      event:    UnixReady::from(Ready::empty()),
+      interest: UnixReady::from(Ready::empty()),
     }
   }
 
   pub fn reset(&mut self) {
-    self.front_interest  = UnixReady::from(Ready::empty());
-    self.back_interest   = UnixReady::from(Ready::empty());
-    self.front_readiness = UnixReady::from(Ready::empty());
-    self.back_readiness  = UnixReady::from(Ready::empty());
+    self.event =  UnixReady::from(Ready::empty());
+    self.interest  = UnixReady::from(Ready::empty());
   }
 }
 
@@ -364,28 +358,18 @@ pub fn unix_ready_to_string(readiness: UnixReady) -> String {
 impl fmt::Debug for Readiness {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 
-    let front_i = &mut [b'-'; 4];
-    let front_r = &mut [b'-'; 4];
-    let back_i  = &mut [b'-'; 4];
-    let back_r  = &mut [b'-'; 4];
-    let front   = &mut [b'-'; 4];
-    let back    = &mut [b'-'; 4];
+    let i = &mut [b'-'; 4];
+    let r = &mut [b'-'; 4];
+    let mixed = &mut [b'-'; 4];
 
-    display_unix_ready(front_i, self.front_interest);
-    display_unix_ready(front_r, self.front_readiness);
-    display_unix_ready(back_i, self.back_interest);
-    display_unix_ready(back_r, self.back_readiness);
-    display_unix_ready(front, self.front_interest & self.front_readiness);
-    display_unix_ready(back, self.back_interest & self.back_readiness);
+    display_unix_ready(i, self.interest);
+    display_unix_ready(r, self.event);
+    display_unix_ready(mixed, self.interest & self.event);
 
-    write!(f, "Readiness {{ front_interest: {}, front_readiness: {}, back_interest: {}, back_readiness: {} }} | front: {}, back: {}",
-      str::from_utf8(front_i).unwrap(),
-      str::from_utf8(front_r).unwrap(),
-      str::from_utf8(back_i).unwrap(),
-      str::from_utf8(back_r).unwrap(),
-      str::from_utf8(front).unwrap(),
-      str::from_utf8(back).unwrap())
-
+    write!(f, "Readiness {{ interest: {}, readiness: {}, mixed: {} }}",
+      str::from_utf8(i).unwrap(),
+      str::from_utf8(r).unwrap(),
+      str::from_utf8(mixed).unwrap())
   }
 }
 
