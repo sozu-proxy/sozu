@@ -781,79 +781,174 @@ impl Server {
     }
   }
 
-  pub fn accept(&mut self, token: ListenToken, protocol: Protocol) -> bool {
-    let res = {
-
+  pub fn accept_tcp(&mut self, token: ListenToken) {
+    let mut to_connect = Vec::new();
+    let should_flush = loop {
       if self.nb_connections == self.max_connections {
         error!("max number of client connection reached, flushing the accept queue");
-        Err(AcceptError::TooManyClients)
-      } else {
-        //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
-        match self.clients.vacant_entry() {
-          None => {
-            error!("not enough memory to accept another client, flushing the accept queue");
-            error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
-            //FIXME: should accept in a loop and close connections here instead of letting them wait
-            Err(AcceptError::TooManyClients)
-          },
-          Some(entry) => {
-            let client_token = Token(entry.index().0);
-            let index = entry.index();
-            let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), client_token);
-            match protocol {
-              Protocol::TCPListen   => {
-                let res1 = self.tcp.accept(token, &mut self.poll, client_token, timeout).map(|(client, should_connect)| {
-                  entry.insert(client);
-                  (index, should_connect)
-                });
-                res1
-              },
-              Protocol::HTTPListen  => {
-                let res1 = self.http.accept(token, &mut self.poll, client_token, timeout).map(|(client, should_connect)| {
-                  entry.insert(client);
-                  (index, should_connect)
-                });
-                res1
-              },
-              Protocol::HTTPSListen => {
-                let res1 = self.https.accept(token, &mut self.poll, client_token, timeout).map(|(client, should_connect)| {
-                  entry.insert(client);
-                  (index, should_connect)
-                });
-                res1
-              },
-              _ => panic!("should not call accept() on a HTTP, HTTPS or TCP client"),
+        self.can_accept = false;
+        break true;
+      }
+
+      //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
+      match self.clients.vacant_entry() {
+        None => {
+          error!("not enough memory to accept another client, flushing the accept queue");
+          error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
+          self.can_accept = false;
+          break true;
+        },
+        Some(entry) => {
+          let client_token = Token(entry.index().0);
+          let index = entry.index();
+          let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), client_token);
+          match self.tcp.accept(token, &mut self.poll, client_token, timeout) {
+            Ok((client, should_connect)) => {
+              entry.insert(client);
+              self.nb_connections += 1;
+              assert!(self.nb_connections <= self.max_connections);
+              gauge!("client.connections", self.nb_connections);
+
+              if should_connect {
+                to_connect.push(index);
+              }
+            },
+            Err(AcceptError::IoError) => {
+              //FIXME: do we stop accepting?
+              break false;
+            },
+            Err(AcceptError::WouldBlock) => {
+              self.accept_ready.remove(&token);
+              break false;
+            },
+            Err(AcceptError::TooManyClients) => {
+              error!("max number of client connection reached, flushing the accept queue");
+              self.can_accept = false;
+              break true;
             }
           }
         }
       }
     };
 
-    match res {
-      Err(AcceptError::IoError) => {
-        //FIXME: do we stop accepting?
-        false
-      },
-      Err(AcceptError::TooManyClients) => {
-        self.accept_flush();
+    if should_flush {
+      self.accept_flush();
+    }
+    for index in to_connect.drain(..) {
+      self.connect_to_backend(index);
+    }
+  }
+
+  pub fn accept_http(&mut self, token: ListenToken) {
+    loop {
+      if self.nb_connections == self.max_connections {
+        error!("max number of client connection reached, flushing the accept queue");
         self.can_accept = false;
-        false
-      },
-      Err(AcceptError::WouldBlock) => {
-        self.accept_ready.remove(&token);
-        false
-      },
-      Ok((client_token, should_connect)) => {
-        self.nb_connections += 1;
-        assert!(self.nb_connections <= self.max_connections);
-        gauge!("client.connections", self.nb_connections);
-
-        if should_connect {
-           self.connect_to_backend(client_token);
-        }
-
-        true
+        break;
       }
+
+      //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
+      match self.clients.vacant_entry() {
+        None => {
+          error!("not enough memory to accept another client, flushing the accept queue");
+          error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
+          self.can_accept = false;
+          break;
+        },
+        Some(entry) => {
+          let client_token = Token(entry.index().0);
+          let index = entry.index();
+          let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), client_token);
+          match self.http.accept(token, &mut self.poll, client_token, timeout) {
+            Ok((client, should_connect)) => {
+              entry.insert(client);
+              self.nb_connections += 1;
+              assert!(self.nb_connections <= self.max_connections);
+              gauge!("client.connections", self.nb_connections);
+            },
+            Err(AcceptError::IoError) => {
+              //FIXME: do we stop accepting?
+              return;
+            },
+            Err(AcceptError::WouldBlock) => {
+              self.accept_ready.remove(&token);
+              return;
+            },
+            Err(AcceptError::TooManyClients) => {
+              error!("max number of client connection reached, flushing the accept queue");
+              self.can_accept = false;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    //normal bejaviour would do an early return, errors break out of the loop and reach here
+    self.accept_flush();
+  }
+
+  pub fn accept_https(&mut self, token: ListenToken) {
+    loop {
+      if self.nb_connections == self.max_connections {
+        error!("max number of client connection reached, flushing the accept queue");
+        self.can_accept = false;
+        break;
+      }
+
+      //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
+      match self.clients.vacant_entry() {
+        None => {
+          error!("not enough memory to accept another client, flushing the accept queue");
+          error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
+          self.can_accept = false;
+          break;
+        },
+        Some(entry) => {
+          let client_token = Token(entry.index().0);
+          let index = entry.index();
+          let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), client_token);
+          match self.https.accept(token, &mut self.poll, client_token, timeout) {
+            Ok((client, should_connect)) => {
+              entry.insert(client);
+              self.nb_connections += 1;
+              assert!(self.nb_connections <= self.max_connections);
+              gauge!("client.connections", self.nb_connections);
+            },
+            Err(AcceptError::IoError) => {
+              //FIXME: do we stop accepting?
+              return;
+            },
+            Err(AcceptError::WouldBlock) => {
+              self.accept_ready.remove(&token);
+              return;
+            },
+            Err(AcceptError::TooManyClients) => {
+              error!("max number of client connection reached, flushing the accept queue");
+              self.can_accept = false;
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    //normal bejaviour would do an early return, errors break out of the loop and reach here
+    self.accept_flush();
+  }
+
+  pub fn accept(&mut self, token: ListenToken, protocol: Protocol) {
+    match protocol {
+      Protocol::TCPListen   => {
+        self.accept_tcp(token);
+      },
+      Protocol::HTTPListen  => {
+        self.accept_http(token);
+      },
+      Protocol::HTTPSListen => {
+        self.accept_https(token);
+      },
+      _ => panic!("should not call accept() on a HTTP, HTTPS or TCP client"),
     }
   }
 
@@ -993,12 +1088,7 @@ impl Server {
           if events.is_readable() {
             self.accept_ready.insert(ListenToken(token.0));
             if self.can_accept {
-              loop {
-                //info!("will accept");
-                if !self.accept(ListenToken(token.0), protocol) {
-                  break;
-                }
-              }
+              self.accept(ListenToken(token.0), protocol);
             }
             return;
           }
@@ -1073,10 +1163,9 @@ impl Server {
       loop {
         if let Some(token) = self.accept_ready.iter().next().map(|token| ListenToken(token.0)) {
           let protocol = self.clients[ClientToken(token.0)].borrow().protocol();
-          if !self.accept(token, protocol) {
-            if !self.can_accept || self.accept_ready.is_empty() {
-              break;
-            }
+          self.accept(token, protocol);
+          if !self.can_accept || self.accept_ready.is_empty() {
+            break;
           }
         } else {
           // we don't have any more elements to loop over
