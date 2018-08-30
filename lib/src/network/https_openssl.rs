@@ -970,6 +970,41 @@ impl Listener {
         ctx.add_extra_chain_cert(cert);
       }
 
+      let ref_ctx = self.contexts.clone();
+      let ref_domains = self.domains.clone();
+      ctx.set_servername_callback(move |ssl: &mut SslRef, alert: &mut SslAlert| {
+        let contexts = unwrap_msg!(ref_ctx.lock());
+        let domains  = unwrap_msg!(ref_domains.lock());
+
+        trace!("ref: {:?}", ssl);
+        if let Some(servername) = ssl.servername(NameType::HOST_NAME).map(|s| s.to_string()) {
+          debug!("looking for fingerprint for {:?}", servername);
+          if let Some(kv) = domains.domain_lookup(servername.as_bytes()) {
+            debug!("looking for context for {:?} with fingerprint {:?}", servername, kv.1);
+            if let Some(ref tls_data) = contexts.get(&kv.1) {
+              debug!("found context for {:?}", servername);
+              if !tls_data.initialized {
+                //FIXME: couldn't we skip to the next cert?
+                error!("no application is using that certificate (looking up {})", servername);
+                *alert = SslAlert::UNRECOGNIZED_NAME;
+                return Err(SniError::ALERT_FATAL);
+              }
+              let context: &SslContext = &tls_data.context;
+              if let Ok(()) = ssl.set_ssl_context(context) {
+                debug!("servername is now {:?}", ssl.servername(NameType::HOST_NAME));
+                return Ok(());
+              } else {
+                error!("no context found for {:?}", servername);
+                *alert = SslAlert::UNRECOGNIZED_NAME;
+              }
+            }
+          }
+        }
+        *alert = SslAlert::UNRECOGNIZED_NAME;
+        return Err(SniError::ALERT_FATAL);
+      });
+
+
       let tls_data = TlsData {
         context:     ctx.build(),
         certificate: cert_read.to_vec(),
