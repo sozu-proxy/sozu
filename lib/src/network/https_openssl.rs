@@ -1636,6 +1636,7 @@ fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
 
 #[cfg(all(not(ossl101), not(ossl102), not(ossl110)))]
 fn setup_curves(_: &mut SslContextBuilder) -> Result<(), ErrorStack> {
+  compile_error!("unsupported openssl version, please open an issue");
   Ok(())
 }
 
