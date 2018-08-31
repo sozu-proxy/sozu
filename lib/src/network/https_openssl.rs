@@ -824,11 +824,16 @@ impl Listener {
 
     let opt = context.set_options(ssl_options);
 
-    context.set_cipher_list(&config.cipher_list);
 
     if let Err(e) = setup_curves(&mut context) {
-      error!("could not setup curves for openssl");
+      error!("could not setup curves for openssl: {:?}", e);
     }
+
+    if let Err(e) = setup_dh(&mut context) {
+      error!("could not setup DH for openssl: {:?}", e);
+    }
+
+    context.set_cipher_list(&config.cipher_list);
 
     context.set_servername_callback(move |ssl: &mut SslRef, alert: &mut SslAlert| {
       let contexts = unwrap_msg!(ref_ctx.lock());
@@ -937,11 +942,15 @@ impl Listener {
     let mut ctx = c.expect("should have built a correct SSL context");
     let opt = ctx.set_options(self.ssl_options);
 
-    ctx.set_cipher_list(&self.config.cipher_list);
-
     if let Err(e) = setup_curves(&mut ctx) {
-      error!("could not setup curves for openssl");
+      error!("could not setup curves for openssl: {:?}", e);
     }
+
+    if let Err(e) = setup_dh(&mut ctx) {
+      error!("could not setup DH for openssl: {:?}", e);
+    }
+
+    ctx.set_cipher_list(&self.config.cipher_list);
 
     let mut cert_read  = &certificate_and_key.certificate.as_bytes()[..];
     let mut key_read   = &certificate_and_key.key.as_bytes()[..];
@@ -1638,6 +1647,22 @@ fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
 fn setup_curves(_: &mut SslContextBuilder) -> Result<(), ErrorStack> {
   compile_error!("unsupported openssl version, please open an issue");
   Ok(())
+}
+
+fn setup_dh(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
+  let dh = Dh::params_from_pem(
+b"
+-----BEGIN DH PARAMETERS-----
+MIIBCAKCAQEAm7EQIiluUX20jnC3NGhikNVGH7MSlRIgTpkUlCyWrmlJci+Pu54Q
+YzOZw3tw4g84+ipTzpdGuUvZxNd4Y4ZUp/XsdZgnWMfV+y9OuyYAKWGPTtEO/HUy
+6buhvi5qahIXdxUm0dReFuOTrDOphNjHXggU8Iwey3U54aL+KVqLMAP+Tev8jrQN
+A0mv4X8dmdvCv7LEZPVYFJb3Uprwd60ThSl3NKNTMDnwnRtXpIrSZIZcJh5IER7S
+/IexUuBsopcTVIcHfLyaECIbMKnZfyrkAJfHqRWEpPOzk1euVw0hw3SkDJREfB21
+yD0TrUjkXyjV/zczIYiYSROg9OE5UgYqswIBAg==
+-----END DH PARAMETERS-----
+",
+      )?;
+  ctx.set_tmp_dh(&dh)
 }
 
 use network::proxy::HttpsProvider;
