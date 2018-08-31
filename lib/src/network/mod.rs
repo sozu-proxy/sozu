@@ -3,6 +3,7 @@
 use mio;
 use mio::{Poll,Ready,Token};
 use mio::unix::UnixReady;
+use mio::net::TcpStream;
 use std::fmt;
 use std::str;
 use std::net::SocketAddr;
@@ -99,9 +100,9 @@ pub trait ProxyConfiguration<Client> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut Client,
     back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
-  fn accept(&mut self, token: ListenToken, event_loop: &mut Poll, client_token: Token, timeout: Timeout)
+  fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
+  fn create_client(&mut self, socket: TcpStream, token: ListenToken, event_loop: &mut Poll, client_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<Client>>, bool), AcceptError>;
-  fn accept_flush(&mut self) -> usize;
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
   fn listen_port_state(&self, port: &u16) -> ListenPortState;
 }

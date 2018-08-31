@@ -232,8 +232,7 @@ impl Listener {
     (*self.resolver).add_certificate(add);
   }
 
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
-    -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
+  fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
 
     if let Some(ref listener) = self.listener.as_ref() {
       listener.accept().map_err(|e| {
@@ -244,22 +243,7 @@ impl Listener {
             AcceptError::IoError
           }
         }
-      }).map(|(frontend_sock, _)| {
-        frontend_sock.set_nodelay(true);
-
-        poll.register(
-          &frontend_sock,
-          client_token,
-          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-          PollOpt::edge()
-        );
-
-        let session = ServerSession::new(&self.ssl_config);
-        let c = TlsClient::new(session, frontend_sock, client_token, Rc::downgrade(&self.pool), self.config.public_address,
-          self.config.expect_proxy, self.config.sticky_name.clone(), timeout, Token(token.0));
-
-        (Rc::new(RefCell::new(c)), false)
-      })
+      }).map(|(frontend_sock, _)| frontend_sock)
     } else {
       Err(AcceptError::IoError)
     }
@@ -435,23 +419,32 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
-    -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
-
-    self.listeners.get_mut(&Token(token.0)).unwrap().accept(token, poll, client_token, timeout)
+  fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
+    self.listeners.get_mut(&Token(token.0)).unwrap().accept(token)
   }
 
-  fn accept_flush(&mut self) -> usize {
-    unimplemented!()
-      /*
-    let mut counter = 0;
-    if let Some(ref sock) = self.listener {
-      while sock.accept().is_ok() {
-        counter += 1;
+  fn create_client(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
+    -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
+      if let Some(ref listener) = self.listeners.get(&Token(token.0)) {
+        frontend_sock.set_nodelay(true);
+
+        poll.register(
+          &frontend_sock,
+          client_token,
+          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+          PollOpt::edge()
+        );
+
+        let session = ServerSession::new(&listener.ssl_config);
+        let c = TlsClient::new(session, frontend_sock, client_token, Rc::downgrade(&self.pool), listener.config.public_address,
+          listener.config.expect_proxy, listener.config.sticky_name.clone(), timeout, Token(token.0));
+
+        Ok((Rc::new(RefCell::new(c)), false))
+      } else {
+        //FIXME
+        Err(AcceptError::IoError)
       }
     }
-    counter*/
-  }
 
   fn connect_to_backend(&mut self, poll: &mut Poll,  client: &mut TlsClient, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let h = try!(unwrap_msg!(client.http()).state().get_host().ok_or(ConnectionError::NoHostGiven));

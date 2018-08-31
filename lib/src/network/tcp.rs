@@ -954,7 +954,28 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
+  fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
+    let internal_token = Token(token.0);
+    if let Some(listener) = self.listeners.get_mut(&internal_token) {
+      if let Some(ref tcp_listener) = listener.listener.as_ref() {
+        tcp_listener.accept().map(|(frontend_sock, _)| frontend_sock).map_err(|e| {
+          match e.kind() {
+            ErrorKind::WouldBlock => AcceptError::WouldBlock,
+            other => {
+              error!("accept() IO error: {:?}", e);
+              AcceptError::IoError
+            }
+          }
+        })
+      } else {
+        Err(AcceptError::IoError)
+      }
+    } else {
+      Err(AcceptError::IoError)
+    }
+  }
+
+  fn create_client(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<Client>>, bool), AcceptError> {
     let internal_token = Token(token.0);
     if let Some(listener) = self.listeners.get_mut(&internal_token) {
@@ -965,34 +986,20 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
                                 .get(listener.app_id.as_ref().unwrap())
                                 .and_then(|c| c.proxy_protocol.clone());
 
-        if let Some(ref tcp_listener) = listener.listener.as_ref() {
-          tcp_listener.accept().map(|(frontend_sock, _)| {
-            frontend_sock.set_nodelay(true);
-            let c = Client::new(frontend_sock, client_token, internal_token, front_buf, back_buf, proxy_protocol.clone(),
-              timeout);
-            incr!("tcp.requests");
+        frontend_sock.set_nodelay(true);
+        let c = Client::new(frontend_sock, client_token, internal_token, front_buf, back_buf, proxy_protocol.clone(),
+        timeout);
+        incr!("tcp.requests");
 
-            poll.register(
-              c.front_socket(),
-              client_token,
-              Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-              PollOpt::edge()
-            );
+        poll.register(
+          c.front_socket(),
+          client_token,
+          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+          PollOpt::edge()
+          );
 
-            let should_connect_backend = proxy_protocol != Some(ProxyProtocolConfig::ExpectHeader);
-            (Rc::new(RefCell::new(c)), should_connect_backend)
-          }).map_err(|e| {
-            match e.kind() {
-              ErrorKind::WouldBlock => AcceptError::WouldBlock,
-              other => {
-                error!("accept() IO error: {:?}", e);
-                AcceptError::IoError
-              }
-            }
-          })
-        } else {
-          Err(AcceptError::IoError)
-        }
+        let should_connect_backend = proxy_protocol != Some(ProxyProtocolConfig::ExpectHeader);
+        Ok((Rc::new(RefCell::new(c)), should_connect_backend))
       } else {
         error!("could not get buffers from pool");
         Err(AcceptError::TooManyClients)
@@ -1000,18 +1007,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     } else {
       Err(AcceptError::IoError)
     }
-  }
-
-  fn accept_flush(&mut self) -> usize {
-    let mut counter = 0;
-    for ref l in self.listeners.values() {
-      if let Some(ref sock) = l.listener.as_ref() {
-        while sock.accept().is_ok() {
-          counter += 1;
-        }
-      }
-    }
-    counter
   }
 
   fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {

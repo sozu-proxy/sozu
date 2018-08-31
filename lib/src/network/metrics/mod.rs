@@ -255,7 +255,6 @@ macro_rules! time (
     let v = $value;
     $crate::network::metrics::METRICS.with(|metrics| {
       let ref mut m = *metrics.borrow_mut();
-      let app: &str = $app_id;
 
       m.receive_metric($key, None, None, MetricData::Time($value as usize));
     });

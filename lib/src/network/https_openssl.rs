@@ -1110,8 +1110,7 @@ impl Listener {
     }
   }
 
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
-    -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
+  fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
     if let Some(ref sock) = self.listener {
       sock.accept().map_err(|e| {
         match e.kind() {
@@ -1121,24 +1120,7 @@ impl Listener {
             AcceptError::IoError
           }
         }
-      }).and_then(|(frontend_sock, _)| {
-        frontend_sock.set_nodelay(true);
-        if let Ok(ssl) = Ssl::new(&self.default_context) {
-          poll.register(
-            &frontend_sock,
-            client_token,
-            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-            PollOpt::edge()
-          );
-          let c = TlsClient::new(ssl, frontend_sock, client_token, Rc::downgrade(&self.pool),
-            self.config.public_address, self.config.expect_proxy, self.config.sticky_name.clone(), timeout, Token(token.0));
-
-          Ok((Rc::new(RefCell::new(c)), false))
-        } else {
-          error!("could not create ssl context");
-          Err(AcceptError::IoError)
-        }
-      })
+      }).map(|(sock,_)| sock)
     } else {
       error!("cannot accept connections, no listening socket available");
       Err(AcceptError::IoError)
@@ -1289,23 +1271,32 @@ impl ServerConfiguration {
 }
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
-  fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
-    -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
-
-    self.listeners.get_mut(&Token(token.0)).unwrap().accept(token, poll, client_token, timeout)
+  fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
+    self.listeners.get_mut(&Token(token.0)).unwrap().accept(token)
   }
 
-  fn accept_flush(&mut self) -> usize {
-    unimplemented!()
-    /*
-    let mut counter = 0;
-    if let Some(ref sock) = self.listener {
-      while sock.accept().is_ok() {
-        counter += 1;
+  fn create_client(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
+    -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
+    if let Some(ref listener) = self.listeners.get(&Token(token.0)) {
+      frontend_sock.set_nodelay(true);
+      if let Ok(ssl) = Ssl::new(&listener.default_context) {
+        poll.register(
+          &frontend_sock,
+          client_token,
+          Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+          PollOpt::edge()
+          );
+        let c = TlsClient::new(ssl, frontend_sock, client_token, Rc::downgrade(&self.pool),
+        listener.config.public_address, listener.config.expect_proxy, listener.config.sticky_name.clone(), timeout, Token(token.0));
+
+        Ok((Rc::new(RefCell::new(c)), false))
+      } else {
+        error!("could not create ssl context");
+        Err(AcceptError::IoError)
       }
+    } else {
+      Err(AcceptError::IoError)
     }
-    counter
-      */
   }
 
   fn connect_to_backend(&mut self, poll: &mut Poll,  client: &mut TlsClient, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {

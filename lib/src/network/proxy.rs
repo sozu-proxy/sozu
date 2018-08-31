@@ -107,6 +107,7 @@ pub struct Server {
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
   scm_listeners:   Option<Listeners>,
   zombie_check_interval: time::Duration,
+  accept_queue:    VecDeque<(TcpStream, ListenToken, Protocol, SteadyTime)>,
 }
 
 impl Server {
@@ -194,6 +195,7 @@ impl Server {
       pool,
       front_timeout: time::Duration::seconds(i64::from(front_timeout)),
       zombie_check_interval: time::Duration::seconds(i64::from(zombie_check_interval)),
+      accept_queue:    VecDeque::new(),
     };
 
     // initialize the worker with the state we got from a file
@@ -353,6 +355,7 @@ impl Server {
       }
 
       self.handle_remaining_readiness();
+      self.create_clients();
 
       let now = SteadyTime::now();
       if now - last_zombie_check > self.zombie_check_interval {
@@ -781,182 +784,240 @@ impl Server {
     }
   }
 
-  pub fn accept_tcp(&mut self, token: ListenToken) {
-    let mut to_connect = Vec::new();
-    let should_flush = loop {
-      if self.nb_connections == self.max_connections {
-        error!("max number of client connection reached, flushing the accept queue");
+  pub fn create_client_tcp(&mut self, token: ListenToken, socket: TcpStream) -> bool {
+    if self.nb_connections == self.max_connections {
+      error!("max number of client connection reached, flushing the accept queue");
+      self.can_accept = false;
+      return false;
+    }
+
+    //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
+    let index = match self.clients.vacant_entry() {
+      None => {
+        error!("not enough memory to accept another client, flushing the accept queue");
+        error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
         self.can_accept = false;
-        break true;
-      }
 
-      //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
-      match self.clients.vacant_entry() {
-        None => {
-          error!("not enough memory to accept another client, flushing the accept queue");
-          error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
-          self.can_accept = false;
-          break true;
-        },
-        Some(entry) => {
-          let client_token = Token(entry.index().0);
-          let index = entry.index();
-          let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), client_token);
-          match self.tcp.accept(token, &mut self.poll, client_token, timeout) {
-            Ok((client, should_connect)) => {
-              entry.insert(client);
-              self.nb_connections += 1;
-              assert!(self.nb_connections <= self.max_connections);
-              gauge!("client.connections", self.nb_connections);
+        return false;
+      },
+      Some(entry) => {
+        let client_token = Token(entry.index().0);
+        let index = entry.index();
+        let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), client_token);
+        match self.tcp.create_client(socket, token, &mut self.poll, client_token, timeout) {
+          Ok((client, should_connect)) => {
+            entry.insert(client);
+            self.nb_connections += 1;
+            assert!(self.nb_connections <= self.max_connections);
+            gauge!("client.connections", self.nb_connections);
 
-              if should_connect {
-                to_connect.push(index);
-              }
-            },
-            Err(AcceptError::IoError) => {
-              //FIXME: do we stop accepting?
-              break false;
-            },
-            Err(AcceptError::WouldBlock) => {
-              self.accept_ready.remove(&token);
-              break false;
-            },
-            Err(AcceptError::TooManyClients) => {
-              error!("max number of client connection reached, flushing the accept queue");
-              self.can_accept = false;
-              break true;
+            if should_connect {
+              index
+            } else {
+              return true;
             }
+          },
+          Err(AcceptError::IoError) => {
+            //FIXME: do we stop accepting?
+            return false;
+          },
+          Err(AcceptError::WouldBlock) => {
+            self.accept_ready.remove(&token);
+            return false;
+          },
+          Err(AcceptError::TooManyClients) => {
+            error!("max number of client connection reached, flushing the accept queue");
+            self.can_accept = false;
+            return false;
           }
         }
       }
     };
 
-    if should_flush {
-      self.accept_flush();
-    }
-    for index in to_connect.drain(..) {
-      self.connect_to_backend(index);
-    }
+    self.connect_to_backend(index);
+    true
   }
 
-  pub fn accept_http(&mut self, token: ListenToken) {
-    loop {
-      if self.nb_connections == self.max_connections {
-        error!("max number of client connection reached, flushing the accept queue");
-        self.can_accept = false;
-        break;
-      }
+  pub fn create_client_http(&mut self, token: ListenToken, socket: TcpStream) -> bool {
+    if self.nb_connections == self.max_connections {
+      error!("max number of client connection reached, flushing the accept queue");
+      self.can_accept = false;
+      return false;
+    }
 
-      //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
-      match self.clients.vacant_entry() {
-        None => {
-          error!("not enough memory to accept another client, flushing the accept queue");
-          error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
-          self.can_accept = false;
-          break;
-        },
-        Some(entry) => {
-          let client_token = Token(entry.index().0);
-          let index = entry.index();
-          let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), client_token);
-          match self.http.accept(token, &mut self.poll, client_token, timeout) {
-            Ok((client, should_connect)) => {
-              entry.insert(client);
-              self.nb_connections += 1;
-              assert!(self.nb_connections <= self.max_connections);
-              gauge!("client.connections", self.nb_connections);
-            },
-            Err(AcceptError::IoError) => {
-              //FIXME: do we stop accepting?
-              return;
-            },
-            Err(AcceptError::WouldBlock) => {
-              self.accept_ready.remove(&token);
-              return;
-            },
-            Err(AcceptError::TooManyClients) => {
-              error!("max number of client connection reached, flushing the accept queue");
-              self.can_accept = false;
-              break;
-            }
+    //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
+    match self.clients.vacant_entry() {
+      None => {
+        error!("not enough memory to accept another client, flushing the accept queue");
+        error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
+        self.can_accept = false;
+        return false;
+      },
+      Some(entry) => {
+        let client_token = Token(entry.index().0);
+        let index = entry.index();
+        let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), client_token);
+        match self.http.create_client(socket, token, &mut self.poll, client_token, timeout) {
+          Ok((client, should_connect)) => {
+            entry.insert(client);
+            self.nb_connections += 1;
+            assert!(self.nb_connections <= self.max_connections);
+            gauge!("client.connections", self.nb_connections);
+            true
+          },
+          Err(AcceptError::IoError) => {
+            //FIXME: do we stop accepting?
+            false
+          },
+          Err(AcceptError::WouldBlock) => {
+            self.accept_ready.remove(&token);
+            false
+          },
+          Err(AcceptError::TooManyClients) => {
+            error!("max number of client connection reached, flushing the accept queue");
+            self.can_accept = false;
+            false
           }
         }
       }
     }
-
-    //normal bejaviour would do an early return, errors break out of the loop and reach here
-    self.accept_flush();
   }
 
-  pub fn accept_https(&mut self, token: ListenToken) {
-    loop {
-      if self.nb_connections == self.max_connections {
-        error!("max number of client connection reached, flushing the accept queue");
-        self.can_accept = false;
-        break;
-      }
+  pub fn create_client_https(&mut self, token: ListenToken, socket: TcpStream) -> bool {
+    if self.nb_connections == self.max_connections {
+      error!("max number of client connection reached, flushing the accept queue");
+      self.can_accept = false;
+      return false;
+    }
 
-      //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
-      match self.clients.vacant_entry() {
-        None => {
-          error!("not enough memory to accept another client, flushing the accept queue");
-          error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
-          self.can_accept = false;
-          break;
-        },
-        Some(entry) => {
-          let client_token = Token(entry.index().0);
-          let index = entry.index();
-          let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), client_token);
-          match self.https.accept(token, &mut self.poll, client_token, timeout) {
-            Ok((client, should_connect)) => {
-              entry.insert(client);
-              self.nb_connections += 1;
-              assert!(self.nb_connections <= self.max_connections);
-              gauge!("client.connections", self.nb_connections);
-            },
-            Err(AcceptError::IoError) => {
-              //FIXME: do we stop accepting?
-              return;
-            },
-            Err(AcceptError::WouldBlock) => {
-              self.accept_ready.remove(&token);
-              return;
-            },
-            Err(AcceptError::TooManyClients) => {
-              error!("max number of client connection reached, flushing the accept queue");
-              self.can_accept = false;
-              break;
-            }
+    //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
+    match self.clients.vacant_entry() {
+      None => {
+        error!("not enough memory to accept another client, flushing the accept queue");
+        error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
+        self.can_accept = false;
+        false
+      },
+      Some(entry) => {
+        let client_token = Token(entry.index().0);
+        let index = entry.index();
+        let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), client_token);
+        match self.https.create_client(socket, token, &mut self.poll, client_token, timeout) {
+          Ok((client, should_connect)) => {
+            entry.insert(client);
+            self.nb_connections += 1;
+            assert!(self.nb_connections <= self.max_connections);
+            gauge!("client.connections", self.nb_connections);
+            true
+          },
+          Err(AcceptError::IoError) => {
+            //FIXME: do we stop accepting?
+            false
+          },
+          Err(AcceptError::WouldBlock) => {
+            self.accept_ready.remove(&token);
+            false
+          },
+          Err(AcceptError::TooManyClients) => {
+            error!("max number of client connection reached, flushing the accept queue");
+            self.can_accept = false;
+            false
           }
         }
       }
     }
-
-    //normal bejaviour would do an early return, errors break out of the loop and reach here
-    self.accept_flush();
   }
 
   pub fn accept(&mut self, token: ListenToken, protocol: Protocol) {
     match protocol {
       Protocol::TCPListen   => {
-        self.accept_tcp(token);
+        loop {
+          match self.tcp.accept(token) {
+            Ok(sock) => self.accept_queue.push_back((sock, token, Protocol::TCPListen, SteadyTime::now())),
+            Err(AcceptError::WouldBlock) => {
+              self.accept_ready.remove(&token);
+              break
+            },
+            Err(other) => {
+              error!("error accepting TCP sockets: {:?}", other);
+              self.accept_ready.remove(&token);
+              break;
+            }
+          }
+        }
       },
       Protocol::HTTPListen  => {
-        self.accept_http(token);
+        loop {
+          match self.http.accept(token) {
+            Ok(sock) => self.accept_queue.push_back((sock, token, Protocol::HTTPListen, SteadyTime::now())),
+            Err(AcceptError::WouldBlock) => {
+              self.accept_ready.remove(&token);
+              break
+            },
+            Err(other) => {
+              error!("error accepting HTTP sockets: {:?}", other);
+              self.accept_ready.remove(&token);
+              break;
+            }
+          }
+        }
       },
       Protocol::HTTPSListen => {
-        self.accept_https(token);
+        loop {
+          match self.https.accept(token) {
+            Ok(sock) => self.accept_queue.push_back((sock, token, Protocol::HTTPSListen, SteadyTime::now())),
+            Err(AcceptError::WouldBlock) => {
+              self.accept_ready.remove(&token);
+              break
+            },
+            Err(other) => {
+              error!("error accepting HTTPS sockets: {:?}", other);
+              self.accept_ready.remove(&token);
+              break;
+            }
+          }
+        }
       },
       _ => panic!("should not call accept() on a HTTP, HTTPS or TCP client"),
     }
+
+    gauge!("accept_queue.count", self.accept_queue.len());
   }
 
-  pub fn accept_flush(&mut self) {
-    let mut counter = self.tcp.accept_flush();
-    counter += self.http.accept_flush();
-    counter += self.https.accept_flush();
-    error!("flushed {} new connections", counter);
+  pub fn create_clients(&mut self) {
+    loop {
+      if let Some((sock, token, protocol, timestamp)) = self.accept_queue.pop_back() {
+        let delay = SteadyTime::now() - timestamp;
+        if delay > time::Duration::seconds(60) {
+          incr!("accept_queue.timeout");
+          time!("accept_queue.wait_time", delay.num_milliseconds());
+          continue;
+        }
+        //FIXME: check the timestamp
+        match protocol {
+          Protocol::TCPListen   => {
+            if !self.create_client_tcp(token, sock) {
+              break;
+            }
+          },
+          Protocol::HTTPListen  => {
+            if !self.create_client_http(token, sock) {
+              break;
+            }
+          },
+          Protocol::HTTPSListen => {
+            if !self.create_client_https(token, sock) {
+              break;
+            }
+          },
+          _ => panic!("should not call accept() on a HTTP, HTTPS or TCP client"),
+        }
+      } else {
+        break;
+      }
+    }
+
+    gauge!("accept_queue.count", self.accept_queue.len());
   }
 
   pub fn connect_to_backend(&mut self, token: ClientToken) {
@@ -1293,12 +1354,19 @@ impl HttpsProvider {
     }
   }
 
-  pub fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<ProxyClientCast>>,bool), AcceptError> {
+  pub fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
     match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.accept(token, poll, client_token, timeout).map(|(r,b)| {
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.accept(token),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.accept(token),
+    }
+  }
+
+  pub fn create_client(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<ProxyClientCast>>,bool), AcceptError> {
+    match self {
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.create_client(frontend_sock, token, poll, client_token, timeout).map(|(r,b)| {
         (r as Rc<RefCell<ProxyClientCast>>, b)
       }),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.accept(token, poll, client_token, timeout).map(|(r,b)| {
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.create_client(frontend_sock, token, poll, client_token, timeout).map(|(r,b)| {
         (r as Rc<RefCell<ProxyClientCast>>, b)
       }),
     }
@@ -1308,13 +1376,6 @@ impl HttpsProvider {
     match self {
       &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.close_backend(app_id, addr),
       &mut HttpsProvider::Openssl(ref mut openssl) => openssl.close_backend(app_id, addr),
-    }
-  }
-
-  pub fn accept_flush(&mut self) -> usize {
-    match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.accept_flush(),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.accept_flush(),
     }
   }
 
@@ -1371,19 +1432,19 @@ impl HttpsProvider {
     rustls.give_back_listeners()
   }
 
-  pub fn accept(&mut self, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
+  pub fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.accept(token, poll, client_token, timeout)
+    rustls.accept(token)
+  }
+
+  pub fn create_client(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
+    let &mut HttpsProvider::Rustls(ref mut rustls) = self;
+    rustls.create_client(frontend_sock, token, poll, client_token, timeout)
   }
 
   pub fn close_backend(&mut self, app_id: AppId, addr: &SocketAddr) {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
     rustls.close_backend(app_id, addr);
-  }
-
-  pub fn accept_flush(&mut self) -> usize {
-    let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.accept_flush()
   }
 
   pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_client: Rc<RefCell<ProxyClientCast>>, back_token: Token)
