@@ -988,9 +988,9 @@ impl Server {
     loop {
       if let Some((sock, token, protocol, timestamp)) = self.accept_queue.pop_back() {
         let delay = SteadyTime::now() - timestamp;
+        time!("accept_queue.wait_time", delay.num_milliseconds());
         if delay > time::Duration::seconds(60) {
           incr!("accept_queue.timeout");
-          time!("accept_queue.wait_time", delay.num_milliseconds());
           continue;
         }
         //FIXME: check the timestamp
