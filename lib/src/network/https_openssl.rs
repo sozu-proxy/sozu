@@ -1626,8 +1626,12 @@ fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
 }
 
 #[cfg(ossl110)]
-fn setup_curves(_: &mut SslContextBuilder) -> Result<(), ErrorStack> {
-  Ok(())
+fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
+  use openssl::ec::EcKey;
+  use openssl::nid;
+
+  let curve = try!(EcKey::from_curve_name(nid::Nid::X9_62_PRIME256V1));
+  ctx.set_tmp_ecdh(&curve)
 }
 
 #[cfg(all(not(ossl101), not(ossl102), not(ossl110)))]
