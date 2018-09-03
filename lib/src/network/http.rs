@@ -1365,7 +1365,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
   });
 
   let mut server    = Server::new(event_loop, channel, ScmSocket::new(scm_server.into_raw_fd()),
-    clients, pool, Some(configuration), None, None, None, max_buffers, 60, 1800);
+    clients, pool, Some(configuration), None, None, None, max_buffers, 60, 1800, 60);
 
   println!("starting event loop");
   server.run();

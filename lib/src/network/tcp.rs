@@ -1059,7 +1059,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
   let _ = configuration.activate_listener(&mut poll, &front, None);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
   let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), clients,
-    pool, None ,None, Some(configuration), None, max_buffers, 60, 1800);
+    pool, None ,None, Some(configuration), None, max_buffers, 60, 1800, 60);
 
   info!("starting event loop");
   server.run();
@@ -1219,7 +1219,7 @@ mod tests {
         tcp:  Vec::new(),
       });
       let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.into_raw_fd()),
-        clients, pool, None, None, Some(configuration), None, max_buffers, 60, 1800);
+        clients, pool, None, None, Some(configuration), None, max_buffers, 60, 1800, 60);
       info!("will run");
       s.run();
       info!("ending event loop");
