@@ -111,6 +111,7 @@ pub struct Server {
   scm_listeners:   Option<Listeners>,
   zombie_check_interval: time::Duration,
   accept_queue:    VecDeque<(TcpStream, ListenToken, Protocol, SteadyTime)>,
+  accept_queue_timeout: time::Duration,
 }
 
 impl Server {
@@ -143,7 +144,7 @@ impl Server {
     let https = HttpsProvider::new(use_openssl, pool.clone());
 
     Server::new(event_loop, channel, scm, clients, pool, None, Some(https), None, Some(config_state),
-      config.max_connections, config.front_timeout, config.zombie_check_interval)
+      config.max_connections, config.front_timeout, config.zombie_check_interval, config.accept_queue_timeout)
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
@@ -155,7 +156,8 @@ impl Server {
     config_state: Option<ConfigState>,
     max_connections: usize,
     front_timeout: u32,
-    zombie_check_interval: u32) -> Self {
+    zombie_check_interval: u32,
+    accept_queue_timeout: u32,) -> Self {
 
     poll.register(
       &channel,
@@ -199,6 +201,7 @@ impl Server {
       front_timeout: time::Duration::seconds(i64::from(front_timeout)),
       zombie_check_interval: time::Duration::seconds(i64::from(zombie_check_interval)),
       accept_queue:    VecDeque::new(),
+      accept_queue_timeout: time::Duration::seconds(i64::from(accept_queue_timeout)),
     };
 
     // initialize the worker with the state we got from a file
@@ -993,7 +996,7 @@ impl Server {
       if let Some((sock, token, protocol, timestamp)) = self.accept_queue.pop_back() {
         let delay = SteadyTime::now() - timestamp;
         time!("accept_queue.wait_time", delay.num_milliseconds());
-        if delay > time::Duration::seconds(60) {
+        if delay > self.accept_queue_timeout {
           incr!("accept_queue.timeout");
           continue;
         }

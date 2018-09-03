@@ -651,6 +651,8 @@ pub struct FileConfig {
   pub front_timeout:            Option<u32>,
   #[serde(default)]
   pub zombie_check_interval:    Option<u32>,
+  #[serde(default)]
+  pub accept_queue_timeout:     Option<u32>,
 }
 
 
@@ -863,7 +865,7 @@ impl FileConfig {
       front_timeout: self.front_timeout.unwrap_or(60),
       //defaults to 30mn
       zombie_check_interval: self.front_timeout.unwrap_or(30 * 60),
-
+      accept_queue_timeout: self.accept_queue_timeout.unwrap_or(60),
     }
   }
 }
@@ -898,6 +900,8 @@ pub struct Config {
   pub front_timeout:            u32,
   #[serde(default = "default_zombie_check_interval")]
   pub zombie_check_interval:    u32,
+  #[serde(default = "default_accept_queue_timeout")]
+  pub accept_queue_timeout:     u32,
 }
 
 fn default_front_timeout() -> u32 {
@@ -907,6 +911,10 @@ fn default_front_timeout() -> u32 {
 //defaults to 30mn
 fn default_zombie_check_interval() -> u32 {
   30*60
+}
+
+fn default_accept_queue_timeout() -> u32 {
+  60
 }
 
 impl Config {
@@ -1136,6 +1144,7 @@ mod tests {
       activate_listeners: None,
       front_timeout: None,
       zombie_check_interval: None,
+      accept_queue_timeout: None,
     };
 
     println!("config: {:?}", to_string(&config));
