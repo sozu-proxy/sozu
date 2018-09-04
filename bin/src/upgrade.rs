@@ -53,7 +53,6 @@ pub struct UpgradeData {
   pub state:       ConfigState,
   pub next_id:     u32,
   pub token_count: usize,
-  //pub order_state: HashMap<String, HashSet<usize>>,
 }
 
 pub fn start_new_master_process(executable_path: String, upgrade_data: UpgradeData) -> (pid_t, Channel<(),bool>) {

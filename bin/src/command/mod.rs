@@ -19,16 +19,16 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
-use sozu_command::messages::{OrderMessage,OrderMessageAnswer,OrderMessageStatus};
+use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 
+pub mod executor;
 pub mod orders;
 pub mod client;
-pub mod state;
 
 use worker::{start_worker, get_executable_path};
 use self::client::CommandClient;
-use self::state::MessageType;
+use self::executor::{Executor, StateChange};
 
 const SERVER: Token = Token(0);
 const HALF_USIZE: usize = 0x8000000000000000usize;
@@ -105,7 +105,6 @@ pub struct CommandServer {
   pub poll:        Poll,
   config:          Config,
   token_count:     usize,
-  order_state:     state::OrderState,
   must_stop:       bool,
   executable_path: String,
   //caching the number of backends instead of going through the whole state.backends hashmap
@@ -187,7 +186,6 @@ impl CommandServer {
       poll:            poll,
       config:          config,
       token_count:     token_count,
-      order_state:     state::OrderState::new(),
       must_stop:       false,
       executable_path: path,
       backends_count:  backends_count,
@@ -275,6 +273,8 @@ impl CommandServer {
         }
       }
 
+      self.run_executor();
+
       METRICS.with(|metrics| {
         (*metrics.borrow_mut()).send_data();
       });
@@ -331,6 +331,29 @@ impl CommandServer {
       }
     }
     //trace!("ready end: {:?} -> {:?}", token, events);
+  }
+
+  pub fn run_executor(&mut self) {
+    Executor::run();
+
+    while let Some((client_token, answer)) = Executor::get_client_message() {
+      self.clients.get_mut(client_token).map(|cl| cl.push_message(answer));
+    }
+
+    while let Some((worker_token, message)) = Executor::get_worker_message() {
+      self.proxies.get_mut(&worker_token).map(|w| w.push_message(message));
+    }
+
+    while let Some(state_change) = Executor::get_state_change() {
+      match state_change {
+        StateChange::StopWorker(token) => {
+          self.proxies.get_mut(&token).map(|w| w.run_state = RunState::Stopped);
+        },
+        StateChange::StopMaster => {
+          self.must_stop = true;
+        }
+      }
+    }
   }
 
   pub fn handle_worker_events(&mut self, token: Token) {
@@ -496,72 +519,9 @@ impl CommandServer {
   }
 
   fn handle_worker_message(&mut self, token: Token, msg: OrderMessageAnswer) {
-    trace!("worker handle message: token {:?} got answer msg: {:?}", token, msg);
-    if msg.status != OrderMessageStatus::Processing {
+    Executor::handle_message(token, msg);
 
-      let tag = self.proxies.get(&token).map(|worker| worker.id.to_string()).unwrap_or(String::from(""));
-
-      match msg.status {
-        OrderMessageStatus::Processing => {
-          //FIXME: right now, do nothing with the curent tasks
-        },
-        OrderMessageStatus::Error(s) => {
-          if let Some(task) = self.order_state.error(&msg.id, token, tag, msg.data) {
-            let opt_token = task.client.clone();
-            let id        = task.id.clone();
-            let ok = task.ok.len();
-            let failures = task.error.clone();
-            let answer = ConfigMessageAnswer::new(
-              id,
-              ConfigMessageStatus::Error,
-              format!("ok: {} messages, error: {:?}, message: {}", ok, &failures, s.clone()),
-              task.generate_data(&self.state),
-            );
-            error!("{}: {} successful messages, failures: {:?}, reason: {}", msg.id, ok, &failures, s.clone());
-
-            if let Some(client_token) = opt_token {
-              self.clients.get_mut(client_token).map(|cl| cl.push_message(answer));
-            }
-          }
-        },
-        OrderMessageStatus::Ok => {
-          if let Some(task) = self.order_state.ok(&msg.id, token, tag, msg.data) {
-            let opt_token = task.client.clone();
-            let id        = task.id.clone();
-            let answer = if task.error.is_empty() {
-              if task.message_type == MessageType::Stop {
-                self.must_stop = true;
-              }
-
-              if task.message_type == MessageType::Stop || task.message_type == MessageType::StopWorker {
-                let ref mut proxy = self.proxies.get_mut(&token).expect("there should be a worker at that token");
-                proxy.run_state = RunState::Stopped;
-              }
-
-              ConfigMessageAnswer::new(
-                id,
-                ConfigMessageStatus::Ok,
-                format!("ok: {} messages, error: {:#?}", task.ok.len(), task.error),
-                task.generate_data(&self.state),
-              )
-            } else {
-              error!("{}: {} successful messages, failures: {:?}", msg.id, task.ok.len(), task.error);
-
-              ConfigMessageAnswer::new(
-                id,
-                ConfigMessageStatus::Error,
-                format!("ok: {:#?}, error: {:#?}", task.ok, task.error),
-                None,
-              )
-            };
-
-            if let Some(client_token) = opt_token {
-              self.clients.get_mut(client_token).map(|cl| cl.push_message(answer));
-            }
-          }
-        }
-      }
-    }
+    self.run_executor();
   }
 
   pub fn check_worker_status(&mut self, token: Token) {
