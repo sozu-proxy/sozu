@@ -43,6 +43,9 @@ const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
 const DEFAULT_BACK_TIMEOUT:  u64 = 50000;
 
+// Number of retries to perform on a server after a connection failure
+pub const CONN_RETRIES: u8 = 3;
+
 pub type ProxyChannel = Channel<OrderMessageAnswer,OrderMessage>;
 
 #[derive(Debug,Clone,PartialEq)]
