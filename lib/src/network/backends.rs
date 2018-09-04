@@ -59,40 +59,35 @@ impl BackendMap {
 
   pub fn backend_from_app_id(&mut self, app_id: &str) -> Result<(Rc<RefCell<Backend>>,TcpStream),ConnectionError> {
     if let Some(ref mut app_backends) = self.backends.get_mut(app_id) {
-      if app_backends.backends.len() == 0 {
+      if app_backends.backends.is_empty() {
         self.available = false;
         return Err(ConnectionError::NoBackendAvailable);
       }
 
-      for _ in 0..self.max_failures {
-        if let Some(ref mut b) = app_backends.next_available_backend() {
-          let ref mut backend = *b.borrow_mut();
+      if let Some(ref mut b) = app_backends.next_available_backend() {
+        let ref mut backend = *b.borrow_mut();
 
-          debug!("Connecting {} -> {:?}", app_id, (backend.address, backend.active_connections, backend.failures));
-          let conn = backend.try_connect();
-          if backend.failures >= MAX_FAILURES_PER_BACKEND {
-            error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
-          }
+        debug!("Connecting {} -> {:?}", app_id, (backend.address, backend.active_connections, backend.failures));
+        let conn = backend.try_connect();
 
-          let res = conn.map(|c| {
-            (b.clone(), c)
-          }).map_err(|e| {
-            error!("could not connect {} to {:?} ({} failures)", app_id, backend.address, backend.failures);
-            e
-          });
+        let res = conn.map(|c| {
+          (b.clone(), c)
+        }).map_err(|e| {
+          error!("could not connect {} to {:?} ({} failures)", app_id, backend.address, backend.failures);
+          e
+        });
 
-          if res.is_ok() {
-            self.available = true;
-          }
-
-          return res;
-        } else {
-          if self.available {
-            error!("no more available backends for app {}", app_id);
-            self.available = false;
-          }
-          return Err(ConnectionError::NoBackendAvailable);
+        if res.is_ok() {
+          self.available = true;
         }
+
+        return res;
+      } else {
+        if self.available {
+          error!("no more available backends for app {}", app_id);
+          self.available = false;
+        }
+        return Err(ConnectionError::NoBackendAvailable);
       }
       Err(ConnectionError::NoBackendAvailable)
     } else {
@@ -107,9 +102,6 @@ impl BackendMap {
       .map(|b| {
         let ref mut backend = *b.borrow_mut();
         let conn = backend.try_connect();
-        if backend.failures >= MAX_FAILURES_PER_BACKEND {
-          error!("backend {:?} connections failed {} times, disabling it", (backend.address, backend.active_connections), backend.failures);
-        }
 
         conn.map(|c| (b.clone(), c)).map_err(|e| {
           error!("could not connect {} to {:?} using session {} ({} failures)",
@@ -137,8 +129,6 @@ impl BackendMap {
     self.backends.entry(app_id.to_string()).or_insert(BackendList::new())
   }
 }
-
-const MAX_FAILURES_PER_BACKEND: usize = 10;
 
 #[derive(Debug)]
 pub struct BackendList {
@@ -208,11 +198,11 @@ impl BackendList {
   pub fn next_available_backend(&mut self) -> Option<Rc<RefCell<Backend>>> {
     let mut backends = self.available_backends(false);
 
-    if backends.len() == 0 {
+    if backends.is_empty() {
       backends = self.available_backends(true);
     }
 
-    if backends.len() == 0 {
+    if backends.is_empty() {
       None
     } else {
       self.load_balancing.next_available_backend(&backends)
