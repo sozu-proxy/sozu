@@ -1,6 +1,6 @@
 use mio_uds::UnixStream;
 use mio::Ready;
-use libc::pid_t;
+use libc::{self,pid_t};
 use std::io::{Seek,SeekFrom};
 use std::fs::File;
 use std::process::Command;
