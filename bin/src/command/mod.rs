@@ -575,7 +575,7 @@ impl CommandServer {
           if let Err(e) = kill(Pid::from_raw(proxy.pid), Signal::SIGKILL) {
             error!("failed to kill the worker process: {:?}", e);
           } else {
-            proxy.run_state == RunState::Stopped;
+            proxy.run_state = RunState::Stopped;
           }
         } else {
           return;
