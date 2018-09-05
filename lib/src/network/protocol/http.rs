@@ -1016,13 +1016,18 @@ impl<Front:SocketHandler> Http<Front> {
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
         use nom::HexDisplay;
-        metrics.service_stop();
-        error!("{}\tback read should have stopped on chunk ended\nstate: {:?}\ndata:{}", self.log_ctx, self.state,
-          self.back_buf.as_ref().unwrap().unparsed_data().to_hex(16));
-        self.log_request_error(metrics, "back read should have stopped on chunk ended");
-        self.front_readiness.reset();
-        self.back_readiness.reset();
-        (ProtocolResult::Continue, ClientResult::CloseClient)
+        self.back_readiness.interest.remove(Ready::readable());
+        if sz == 0 {
+          (ProtocolResult::Continue, ClientResult::Continue)
+        } else {
+          metrics.service_stop();
+          error!("{}\tback read should have stopped on chunk ended\nstate: {:?}\ndata:{}", self.log_ctx, self.state,
+            self.back_buf.as_ref().unwrap().unparsed_data().to_hex(16));
+          self.log_request_error(metrics, "back read should have stopped on chunk ended");
+          self.front_readiness.reset();
+          self.back_readiness.reset();
+          (ProtocolResult::Continue, ClientResult::CloseClient)
+        }
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Error)) => {
         metrics.service_stop();
