@@ -644,7 +644,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           listener.add_https_front(front, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
-          panic!()
+          panic!("unknown listener: {:?}", front.address)
         }
       },
       Order::RemoveHttpsFront(front) => {
@@ -653,7 +653,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           listener.remove_https_front(front, event_loop);
           OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
         } else {
-          panic!()
+          panic!("unknown listener: {:?}", front.address)
         }
       },
       Order::AddCertificate(add_certificate) => {
