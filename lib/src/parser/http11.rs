@@ -1873,10 +1873,6 @@ mod tests {
   fn header_iso_8859_1_test() {
       let input = "Test: Aéo\r\n";
       let result = message_header(input.as_bytes());
-      let expected = Header {
-        name: b"Test",
-        value: "Aéo".as_bytes()
-      };
 
       assert_eq!(result, Err(Err::Error(error_position!("éo\r\n".as_bytes(), ErrorKind::Tag))));
   }

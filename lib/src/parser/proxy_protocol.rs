@@ -16,7 +16,7 @@ named!(parse_command<Command>,
 
 named!(pub parse_v2_header<HeaderV2>,
   do_parse!(
-    signature: tag!(&PROTOCOL_SIGNATURE_V2) >>
+    tag!(&PROTOCOL_SIGNATURE_V2) >>
     command: parse_command >>
     family: be_u8 >>
     len: be_u16 >>

@@ -185,12 +185,12 @@ mod send_test {
   fn start_middleware(addr_client: SocketAddr, addr_backend: SocketAddr, barrier: Arc<Barrier>) {
     let client_listener = TcpListener::bind(&addr_client).expect("could not accept client connection");
 
-    let mut client_stream = None;
+    let client_stream;
     barrier.wait();
 
     loop {
       if let Ok((stream, _addr)) = client_listener.accept() {
-        client_stream = Some(stream);
+        client_stream = stream;
         break;
       }
     }
@@ -200,7 +200,7 @@ mod send_test {
     let fd = backend_stream.into_raw_fd();
     let backend_stream = unsafe { TcpStream::from_raw_fd(fd) };
 
-    let mut send_pp = SendProxyProtocol::new(client_stream.unwrap(), Token(0), Some(backend_stream));
+    let mut send_pp = SendProxyProtocol::new(client_stream, Token(0), Some(backend_stream));
     let mut session_metrics = SessionMetrics::new();
 
     send_pp.set_back_connected(BackendConnectionStatus::Connected);
