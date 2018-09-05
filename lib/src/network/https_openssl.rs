@@ -962,7 +962,7 @@ impl Listener {
       //FIXME: would need more logs here
 
       //FIXME
-      let fingerprint = CertFingerprint(unwrap_msg!(cert.fingerprint(MessageDigest::sha256())));
+      let fingerprint = CertFingerprint(unwrap_msg!(cert.digest(MessageDigest::sha256()).map(|d| d.to_vec())));
       let common_name: Option<String> = get_cert_common_name(&cert);
       debug!("got common name: {:?}", common_name);
 
