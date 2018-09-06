@@ -14,7 +14,7 @@ use nix::unistd::*;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 #[cfg(target_os = "macos")]
-use libc::{self,c_char,uint32_t,int32_t};
+use libc::{c_char,uint32_t,int32_t};
 #[cfg(target_os = "macos")]
 use std::iter::repeat;
 #[cfg(target_os = "macos")]
