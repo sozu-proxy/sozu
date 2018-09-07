@@ -236,6 +236,10 @@ impl<Front:SocketHandler> Http<Front> {
     self.backend_token = Some(token);
   }
 
+  pub fn clear_back_token(&mut self) {
+    self.backend_token = None;
+  }
+
   pub fn front_readiness(&mut self) -> &mut Readiness {
     &mut self.front_readiness
   }

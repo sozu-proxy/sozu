@@ -553,6 +553,7 @@ impl ProxyClient for TlsClient {
         //FIXME: there should probably be a circuit breaker per client too
         error!("{} error connecting to backend, trying again", self.log_context());
         let backend_token = self.back_token();
+        self.http().map(|h| h.clear_back_token());
         self.http().map(|h| h.remove_backend());
         self.metrics().service_stop();
         return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
