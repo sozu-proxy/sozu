@@ -780,7 +780,7 @@ impl<Front:SocketHandler> Http<Front> {
           self.reset();
           self.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
           self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
-          ClientResult::CloseBackend(self.backend_token.clone())
+          ClientResult::CloseBackend(self.backend_token.take())
         } else {
           debug!("{} no keep alive", self.log_ctx);
           self.front_readiness.reset();
