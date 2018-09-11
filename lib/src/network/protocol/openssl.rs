@@ -61,19 +61,19 @@ impl TlsHandshake {
                 let errors = error_stack.errors();
                 if errors.len() == 1 {
                   if errors[0].code() == 0x140A1175 {
-                    incr!("openssl_inappropriate_fallback_error");
+                    incr!("openssl.inappropriate_fallback.error");
                   } else if errors[0].code() == 0x1408A10B {
-                    incr!("openssl_wrong_version_number_error");
+                    incr!("openssl.wrong_version_number.error");
                   } else if errors[0].code() == 0x140760FC {
-                    incr!("openssl_unknown_protocol_error");
+                    incr!("openssl.unknown_protocol.error");
                   } else if errors[0].code() == 0x1407609C {
                     //someone tried to connect in plain HTTP to a TLS server
-                    incr!("openssl_http_request_error");
+                    incr!("openssl.http_request.error");
                   } else {
                     error!("accept: handshake failed: {:?}", e);
                   }
                 } else if errors.len() == 2 && errors[0].code() == 0x1412E0E2 && errors[1].code() == 0x1408A0E3 {
-                  incr!("openssl_sni_error");
+                  incr!("openssl.sni.error");
                 } else {
                   error!("accept: handshake failed: {:?}", e);
                 }
