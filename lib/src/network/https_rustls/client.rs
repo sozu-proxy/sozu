@@ -522,6 +522,8 @@ impl ProxyClient for TlsClient {
     }
 
     self.set_back_connected(BackendConnectionStatus::NotConnected);
+    self.http().map(|h| h.clear_back_token());
+    self.http().map(|h| h.remove_backend());
 
     res
   }

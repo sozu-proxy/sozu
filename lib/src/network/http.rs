@@ -475,6 +475,8 @@ impl ProxyClient for Client {
 
     self.set_back_connected(BackendConnectionStatus::NotConnected);
 
+    self.http().map(|h| h.clear_back_token());
+    self.http().map(|h| h.remove_backend());
     res
   }
 
@@ -508,6 +510,7 @@ impl ProxyClient for Client {
 
         let backend_token = self.back_token();
         self.http().map(|h| h.clear_back_token());
+        self.http().map(|h| h.remove_backend());
         return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
         self.set_back_connected(BackendConnectionStatus::Connected);
@@ -995,6 +998,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       }
 
       let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
+      let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
+      let old_back_token = client.back_token();
 
       if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
         if client.backend.as_ref().map(|backend| {
@@ -1006,15 +1011,12 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           client.metrics.backend_start();
           return Ok(BackendConnectAction::Reuse);
         } else {
-
-          client.backend = None;
-          client.back_connected = BackendConnectionStatus::NotConnected;
-          //client.back_readiness().interest  = UnixReady::from(Ready::empty());
-          client.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
-          client.back_socket().as_ref().map(|sock| {
-            poll.deregister(*sock);
-            sock.shutdown(Shutdown::Both);
-          });
+          if let Some(token) = client.back_token() {
+            let addr = client.close_backend(token, poll);
+            if let Some((app_id, address)) = addr {
+              self.close_backend(app_id, &address);
+            }
+          }
         }
       }
 
@@ -1034,19 +1036,14 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         });
 
         //deregister back socket if it is the wrong one or if it was not connecting
-        client.backend = None;
-        client.back_connected = BackendConnectionStatus::NotConnected;
-        client.back_readiness().map(|r| {
-          r.interest  = UnixReady::from(Ready::empty());
-          r.event = UnixReady::from(Ready::empty());
-        });
-        client.back_socket().as_ref().map(|sock| {
-          poll.deregister(*sock);
-          sock.shutdown(Shutdown::Both);
-        });
+        if let Some(token) = client.back_token() {
+          let addr = client.close_backend(token, poll);
+          if let Some((app_id, address)) = addr {
+            self.close_backend(app_id, &address);
+          }
+        }
       }
 
-      let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
       client.app_id = Some(app_id.clone());
 
       let conn = match (front_should_stick, sticky_session) {
@@ -1057,15 +1054,15 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       match conn {
         Ok(socket) => {
           let new_app_id = client.http().and_then(|ref http| http.app_id.clone());
+          let replacing_connection = old_app_id.is_some() && old_app_id != new_app_id;
 
-          if old_app_id.is_some() && old_app_id != new_app_id {
-            client.backend = None;
-            client.back_connected = BackendConnectionStatus::NotConnected;
-            client.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
-            client.back_socket().as_ref().map(|sock| {
-              poll.deregister(*sock);
-              sock.shutdown(Shutdown::Both);
-            });
+          if replacing_connection {
+            if let Some(token) = client.back_token() {
+              let addr = client.close_backend(token, poll);
+              if let Some((app_id, address)) = addr {
+                self.close_backend(app_id, &address);
+              }
+            }
           }
 
           // we still want to use the new socket
@@ -1078,7 +1075,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
             r.interest.insert(UnixReady::hup());
             r.interest.insert(UnixReady::error());
           });
-          if client.back_token().is_some() {
+          if replacing_connection {
+            client.set_back_token(old_back_token.expect("FIXME"));
             poll.register(
               &socket,
               client.back_token().expect("FIXME"),
