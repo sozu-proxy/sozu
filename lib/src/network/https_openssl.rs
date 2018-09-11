@@ -1392,12 +1392,14 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           }
         });
 
-        if let Some(token) = client.back_token() {
-          let addr = client.close_backend(token, poll);
-          if let Some((app_id, address)) = addr {
-             self.close_backend(app_id, &address);
-          }
-        }
+        //manually close the connection here because the back token was removed elsewhere
+        client.backend = None;
+        client.back_connected = BackendConnectionStatus::NotConnected;
+        client.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
+        client.back_socket().as_ref().map(|sock| {
+          poll.deregister(*sock);
+          sock.shutdown(Shutdown::Both);
+        });
       }
 
       client.app_id = Some(app_id.clone());
