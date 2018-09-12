@@ -405,6 +405,7 @@ impl Server {
         }
       }
 
+      gauge!("client.connections", self.nb_connections);
       gauge!("slab.count", self.clients.len());
       METRICS.with(|metrics| {
         (*metrics.borrow_mut()).send_data();

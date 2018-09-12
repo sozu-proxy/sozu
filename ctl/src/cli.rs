@@ -14,7 +14,7 @@ pub struct App {
 pub enum SubCmd {
   #[structopt(name = "shutdown", about = "shuts down the proxy without waiting for connections to finish")]
   Shutdown {
-    #[structopt(short = "h", long = "hard")]
+    #[structopt(long = "hard")]
     hard: bool
   },
   #[structopt(name = "upgrade", about = "upgrade the proxy")]

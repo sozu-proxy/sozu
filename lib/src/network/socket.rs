@@ -88,13 +88,20 @@ impl SocketHandler for SslStream<TcpStream> {
             ErrorCode::WANT_READ  => return (size, SocketResult::WouldBlock),
             ErrorCode::WANT_WRITE => return (size, SocketResult::WouldBlock),
             ErrorCode::SSL        => {
-              error!("SOCKET-TLS\treadable TLS socket err");
+              error!("SOCKET-TLS\treadable TLS socket SSL error: {:?}", e);
+              return (size, SocketResult::Error)
+            },
+            ErrorCode::SYSCALL    => {
+              error!("SOCKET-TLS\treadable TLS socket syscall error: {:?}", e);
               return (size, SocketResult::Error)
             },
             ErrorCode::ZERO_RETURN => {
               return (size, SocketResult::Closed)
             },
-            _ => return (size, SocketResult::Error)
+            err => {
+              error!("SOCKET-TLS\treadable TLS socket error={:?}", e);
+              return (size, SocketResult::Error)
+            }
           }
         }
       }
@@ -115,14 +122,18 @@ impl SocketHandler for SslStream<TcpStream> {
             ErrorCode::WANT_READ  => return (size, SocketResult::WouldBlock),
             ErrorCode::WANT_WRITE => return (size, SocketResult::WouldBlock),
             ErrorCode::SSL        => {
-              error!("SOCKET-TLS\twritable TLS socket err");
+              error!("SOCKET-TLS\twritable TLS socket SSL error: {:?}", e);
+              return (size, SocketResult::Error)
+            },
+            ErrorCode::SYSCALL        => {
+              error!("SOCKET-TLS\twritable TLS socket syscall error: {:?}", e);
               return (size, SocketResult::Error)
             },
             ErrorCode::ZERO_RETURN => {
               return (size, SocketResult::Closed)
             },
             err => {
-              error!("SOCKET-TLS\twritable TLS socket err={:?}", err);
+              error!("SOCKET-TLS\twritable TLS socket error={:?}", e);
               return (size, SocketResult::Error)
             }
           }

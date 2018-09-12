@@ -187,19 +187,19 @@ mod expect_test {
   // Accept connection from an upfront proxy and expect to read a proxy protocol header in this stream.
   fn start_middleware(middleware_addr: SocketAddr, barrier: Arc<Barrier>) {
     let upfront_middleware_conn_listener = TcpListener::bind(&middleware_addr).expect("could not accept upfront middleware connection");
-    let mut client_stream: Option<TcpStream> = None;
+    let client_stream;
     barrier.wait();
 
     // mio::TcpListener use a nonblocking mode so we have to loop on accept
     loop {
       if let Ok((stream, _addr)) = upfront_middleware_conn_listener.accept() {
-        client_stream = Some(stream);
+        client_stream = stream;
         break;
       }
     }
 
     let mut session_metrics = SessionMetrics::new();
-    let mut expect_pp = ExpectProxyProtocol::new(client_stream.unwrap(), Token(0));
+    let mut expect_pp = ExpectProxyProtocol::new(client_stream, Token(0));
 
     let mut res = (ProtocolResult::Continue, ClientResult::Continue);
     while res == (ProtocolResult::Continue, ClientResult::Continue) {

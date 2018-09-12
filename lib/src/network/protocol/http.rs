@@ -149,6 +149,14 @@ impl<Front:SocketHandler> Http<Front> {
     self.front_buf = None;
     self.back_buf = None;
 
+    match answer {
+      DefaultAnswerStatus::Answer301 => incr!("http.301.redirection"),
+      DefaultAnswerStatus::Answer400 => incr!("http.400.errors"),
+      DefaultAnswerStatus::Answer404 => incr!("http.404.errors"),
+      DefaultAnswerStatus::Answer413 => incr!("http.413.errors"),
+      DefaultAnswerStatus::Answer503 => incr!("http.503.errors"),
+    };
+
     self.status = ClientStatus::DefaultAnswer(answer, buf, 0);
     self.front_readiness.interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
     self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
@@ -234,6 +242,10 @@ impl<Front:SocketHandler> Http<Front> {
 
   pub fn set_back_token(&mut self, token: Token) {
     self.backend_token = Some(token);
+  }
+
+  pub fn clear_back_token(&mut self) {
+    self.backend_token = None;
   }
 
   pub fn front_readiness(&mut self) -> &mut Readiness {
@@ -776,7 +788,7 @@ impl<Front:SocketHandler> Http<Front> {
           self.reset();
           self.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
           self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
-          ClientResult::CloseBackend(self.backend_token.clone())
+          ClientResult::CloseBackend(self.backend_token.take())
         } else {
           debug!("{} no keep alive", self.log_ctx);
           self.front_readiness.reset();
@@ -1015,12 +1027,19 @@ impl<Front:SocketHandler> Http<Front> {
         (ProtocolResult::Continue, ClientResult::Continue)
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
-        metrics.service_stop();
-        error!("{}\tback read should have stopped on chunk ended\nstate: {:?}", self.log_ctx, self.state);
-        self.log_request_error(metrics, "back read should have stopped on chunk ended");
-        self.front_readiness.reset();
-        self.back_readiness.reset();
-        (ProtocolResult::Continue, ClientResult::CloseClient)
+        use nom::HexDisplay;
+        self.back_readiness.interest.remove(Ready::readable());
+        if sz == 0 {
+          (ProtocolResult::Continue, ClientResult::Continue)
+        } else {
+          metrics.service_stop();
+          error!("{}\tback read should have stopped on chunk ended\nstate: {:?}\ndata:{}", self.log_ctx, self.state,
+            self.back_buf.as_ref().unwrap().unparsed_data().to_hex(16));
+          self.log_request_error(metrics, "back read should have stopped on chunk ended");
+          self.front_readiness.reset();
+          self.back_readiness.reset();
+          (ProtocolResult::Continue, ClientResult::CloseClient)
+        }
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Error)) => {
         metrics.service_stop();

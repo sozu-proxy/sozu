@@ -59,7 +59,6 @@ pub enum State {
 
 pub struct Client {
   frontend_token:     Token,
-  backend_token:      Option<Token>,
   backend:            Option<Rc<RefCell<Backend>>>,
   back_connected:     BackendConnectionStatus,
   protocol:           Option<State>,
@@ -88,10 +87,9 @@ impl Client {
     };
 
     protocol.map(|pr| {
-      let request_id =      Uuid::new_v4().hyphenated().to_string();
-      let log_ctx    =      format!("{}\tunknown\t", &request_id);
-      let mut client =      Client {
-        backend_token:      None,
+      let request_id =  Uuid::new_v4().hyphenated().to_string();
+      let log_ctx    =  format!("{}\tunknown\t", &request_id);
+      let mut client =  Client {
         backend:            None,
         back_connected:     BackendConnectionStatus::NotConnected,
         protocol:           Some(pr),
@@ -315,7 +313,11 @@ impl Client {
   }
 
   fn back_token(&self)   -> Option<Token> {
-    self.backend_token
+    match *unwrap_msg!(self.protocol.as_ref()) {
+      State::Http(ref http)      => http.back_token(),
+      State::WebSocket(ref pipe) => pipe.back_token(),
+      State::Expect(_)           => None,
+    }
   }
 
   fn set_back_socket(&mut self, socket: TcpStream) {
@@ -327,7 +329,6 @@ impl Client {
   }
 
   fn set_back_token(&mut self, token: Token) {
-    self.backend_token = Some(token);
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.set_back_token(token),
       State::WebSocket(ref mut pipe) => pipe.set_back_token(token),
@@ -359,12 +360,12 @@ impl Client {
   fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
     debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND",
       self.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), self.frontend_token.0,
-      self.backend_token.map(|t| format!("{}", t.0)).unwrap_or("-".to_string()));
+      self.back_token().map(|t| format!("{}", t.0)).unwrap_or("-".to_string()));
 
     let backend = self.backend.take();
     if backend.is_some() {
       let addr:Option<SocketAddr> = self.back_socket().and_then(|sock| sock.peer_addr().ok());
-      self.backend_token = None;
+      self.http().map(|h| h.clear_back_token());
 
       (self.app_id.clone(), addr)
     } else {
@@ -401,7 +402,7 @@ impl ProxyClient for Client {
 
     let mut result = CloseResult::default();
 
-    if let Some(tk) = self.backend_token {
+    if let Some(tk) = self.back_token() {
       result.tokens.push(tk)
     }
 
@@ -480,6 +481,8 @@ impl ProxyClient for Client {
 
     self.set_back_connected(BackendConnectionStatus::NotConnected);
 
+    self.http().map(|h| h.clear_back_token());
+    self.http().map(|h| h.remove_backend());
     res
   }
 
@@ -493,7 +496,7 @@ impl ProxyClient for Client {
 
     if self.frontend_token == token {
       self.front_readiness().event = self.front_readiness().event | UnixReady::from(events);
-    } else if self.backend_token == Some(token) {
+    } else if self.back_token() == Some(token) {
       self.back_readiness().map(|r| r.event = r.event | UnixReady::from(events));
     }
   }
@@ -510,7 +513,11 @@ impl ProxyClient for Client {
         error!("{} error connecting to backend, trying again", self.log_context());
         self.metrics().service_stop();
         self.connection_attempt += 1;
-        let backend_token = self.backend_token.take();
+
+        let backend_token = self.back_token();
+        self.http().map(|h| h.clear_back_token());
+        self.http().map(|h| h.remove_backend());
+
         return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
         self.reset_connection_attempt();
@@ -999,6 +1006,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       }
 
       let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
+      let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
+      let old_back_token = client.back_token();
 
       if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
         if client.backend.as_ref().map(|backend| {
@@ -1010,15 +1019,12 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           client.metrics.backend_start();
           return Ok(BackendConnectAction::Reuse);
         } else {
-
-          client.backend = None;
-          client.back_connected = BackendConnectionStatus::NotConnected;
-          //client.back_readiness().interest  = UnixReady::from(Ready::empty());
-          client.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
-          client.back_socket().as_ref().map(|sock| {
-            poll.deregister(*sock);
-            sock.shutdown(Shutdown::Both);
-          });
+          if let Some(token) = client.back_token() {
+            let addr = client.close_backend(token, poll);
+            if let Some((app_id, address)) = addr {
+              self.close_backend(app_id, &address);
+            }
+          }
         }
       }
 
@@ -1037,13 +1043,11 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           }
         });
 
-        //deregister back socket if it is the wrong one or if it was not connecting
+
+        //manually close the connection here because the back token was removed elsewhere
         client.backend = None;
         client.back_connected = BackendConnectionStatus::NotConnected;
-        client.back_readiness().map(|r| {
-          r.interest  = UnixReady::from(Ready::empty());
-          r.event = UnixReady::from(Ready::empty());
-        });
+        client.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
         client.back_socket().as_ref().map(|sock| {
           poll.deregister(*sock);
           sock.shutdown(Shutdown::Both);
@@ -1056,7 +1060,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         }
       }
 
-      let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
       client.app_id = Some(app_id.clone());
 
       let conn = match (front_should_stick, sticky_session) {
@@ -1067,15 +1070,15 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       match conn {
         Ok(socket) => {
           let new_app_id = client.http().and_then(|ref http| http.app_id.clone());
+          let replacing_connection = old_app_id.is_some() && old_app_id != new_app_id;
 
-          if old_app_id.is_some() && old_app_id != new_app_id {
-            client.backend = None;
-            client.back_connected = BackendConnectionStatus::NotConnected;
-            client.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
-            client.back_socket().as_ref().map(|sock| {
-              poll.deregister(*sock);
-              sock.shutdown(Shutdown::Both);
-            });
+          if replacing_connection {
+            if let Some(token) = client.back_token() {
+              let addr = client.close_backend(token, poll);
+              if let Some((app_id, address)) = addr {
+                self.close_backend(app_id, &address);
+              }
+            }
           }
 
           // we still want to use the new socket
@@ -1088,7 +1091,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
             r.interest.insert(UnixReady::hup());
             r.interest.insert(UnixReady::error());
           });
-          if client.back_token().is_some() {
+          if replacing_connection {
+            client.set_back_token(old_back_token.expect("FIXME"));
             poll.register(
               &socket,
               client.back_token().expect("FIXME"),

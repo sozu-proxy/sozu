@@ -1,11 +1,8 @@
 use mio_uds::UnixStream;
 use mio::Ready;
-use libc::{self,c_char,uint32_t,int32_t,pid_t};
+use libc::{self,pid_t};
 use std::io::{Seek,SeekFrom};
 use std::fs::File;
-use std::ffi::CString;
-use std::iter::repeat;
-use std::ptr::null_mut;
 use std::process::Command;
 use std::os::unix::process::CommandExt;
 use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd};
@@ -13,6 +10,15 @@ use tempfile::tempfile;
 use serde_json;
 use nix;
 use nix::unistd::*;
+
+#[cfg(target_os = "macos")]
+use std::ffi::CString;
+#[cfg(target_os = "macos")]
+use libc::{c_char,uint32_t,int32_t};
+#[cfg(target_os = "macos")]
+use std::iter::repeat;
+#[cfg(target_os = "macos")]
+use std::ptr::null_mut;
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;

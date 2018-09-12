@@ -48,6 +48,13 @@ script:
   - cd $ROOT_PATH/bin     && cargo build --verbose --features "use-openssl"
   - cd $ROOT_PATH/ctl     && cargo build --verbose
 
+cache:
+  directories:
+    - /home/travis/.cargo
+
+before_cache:
+  - rm -rf /home/travis/.cargo/registry
+
 notifications:
   webhooks:
     urls:
