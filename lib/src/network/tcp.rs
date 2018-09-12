@@ -32,7 +32,7 @@ use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use network::backends::BackendMap;
-use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,ClientToken,ListenClient};
+use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,ClientToken,ListenClient, CONN_RETRIES};
 use network::pool::{Pool,Checkout,Reset};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -72,23 +72,24 @@ pub enum State {
 }
 
 pub struct Client {
-  sock:           TcpStream,
-  backend:        Option<Rc<RefCell<Backend>>>,
-  frontend_token: Token,
-  backend_token:  Option<Token>,
-  back_connected: BackendConnectionStatus,
-  accept_token:   Token,
-  status:         ConnectionStatus,
-  rx_count:       usize,
-  tx_count:       usize,
-  app_id:         Option<String>,
-  request_id:     String,
-  metrics:        SessionMetrics,
-  protocol:       Option<State>,
-  front_buf:      Option<Checkout<BufferQueue>>,
-  back_buf:       Option<Checkout<BufferQueue>>,
-  timeout:        Timeout,
-  last_event:     SteadyTime,
+  sock:               TcpStream,
+  backend:            Option<Rc<RefCell<Backend>>>,
+  frontend_token:     Token,
+  backend_token:      Option<Token>,
+  back_connected:     BackendConnectionStatus,
+  accept_token:       Token,
+  status:             ConnectionStatus,
+  rx_count:           usize,
+  tx_count:           usize,
+  app_id:             Option<String>,
+  request_id:         String,
+  metrics:            SessionMetrics,
+  protocol:           Option<State>,
+  front_buf:          Option<Checkout<BufferQueue>>,
+  back_buf:           Option<Checkout<BufferQueue>>,
+  timeout:            Timeout,
+  last_event:         SteadyTime,
+  connection_attempt: u8,
 }
 
 impl Client {
@@ -124,23 +125,24 @@ impl Client {
     };
 
     Client {
-      sock:           sock,
-      backend:        None,
-      frontend_token: frontend_token,
-      backend_token:  None,
-      back_connected: BackendConnectionStatus::NotConnected,
-      accept_token:   accept_token,
-      status:         ConnectionStatus::Connected,
-      rx_count:       0,
-      tx_count:       0,
-      app_id:         None,
-      request_id:     Uuid::new_v4().hyphenated().to_string(),
-      metrics:        SessionMetrics::new(),
+      sock:               sock,
+      backend:            None,
+      frontend_token:     frontend_token,
+      backend_token:      None,
+      back_connected:     BackendConnectionStatus::NotConnected,
+      accept_token:       accept_token,
+      status:             ConnectionStatus::Connected,
+      rx_count:           0,
+      tx_count:           0,
+      app_id:             None,
+      request_id:         Uuid::new_v4().hyphenated().to_string(),
+      metrics:            SessionMetrics::new(),
       protocol,
-      front_buf: frontend_buffer,
-      back_buf: backend_buffer,
+      front_buf:          frontend_buffer,
+      back_buf:           backend_buffer,
       timeout,
-      last_event:     SteadyTime::now(),
+      last_event:         SteadyTime::now(),
+      connection_attempt: 0,
     }
   }
 
@@ -415,6 +417,9 @@ impl Client {
     (self.app_id.clone(), addr)
   }
 
+    fn reset_connection_attempt(&mut self) {
+      self.connection_attempt = 0;
+    }
 }
 
 impl ProxyClient for Client {
@@ -526,12 +531,13 @@ impl ProxyClient for Client {
     if self.back_connected() == BackendConnectionStatus::Connecting {
       if self.back_readiness().unwrap().event.is_hup() {
         //retry connecting the backend
-        //FIXME: there should probably be a circuit breaker per client too
         error!("error connecting to backend, trying again");
         self.metrics().service_stop();
+        self.connection_attempt += 1;
         let backend_token = self.backend_token.take();
         return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.back_readiness().unwrap().event != UnixReady::from(Ready::empty()) {
+        self.reset_connection_attempt();
         self.set_back_connected(BackendConnectionStatus::Connected);
       }
     }
@@ -859,6 +865,11 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         poll.deregister(*sock);
         sock.shutdown(Shutdown::Both);
       });
+
+      if client.connection_attempt == CONN_RETRIES {
+        error!("{} max connection attempt reached", client.log_context());
+        return Err(ConnectionError::NoBackendAvailable)
+      }
     }
 
     let conn = self.backend_from_app_id(client, &app_id);

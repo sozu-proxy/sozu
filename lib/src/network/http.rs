@@ -34,7 +34,7 @@ use network::buffer_queue::BufferQueue;
 use network::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
 use network::protocol::http::DefaultAnswerStatus;
 use network::protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,ClientToken,ListenClient};
+use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,ClientToken,ListenClient, CONN_RETRIES};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::retry::RetryPolicy;
 use parser::http11::{hostname_and_port, RequestState};
@@ -58,18 +58,19 @@ pub enum State {
 }
 
 pub struct Client {
-  frontend_token: Token,
-  backend:        Option<Rc<RefCell<Backend>>>,
-  back_connected: BackendConnectionStatus,
-  protocol:       Option<State>,
-  pool:           Weak<RefCell<Pool<BufferQueue>>>,
-  sticky_session: bool,
-  metrics:        SessionMetrics,
-  pub app_id:     Option<String>,
-  sticky_name:    String,
-  front_timeout:  Timeout,
-  last_event:     SteadyTime,
-  pub listen_token: Token,
+  frontend_token:     Token,
+  backend:            Option<Rc<RefCell<Backend>>>,
+  back_connected:     BackendConnectionStatus,
+  protocol:           Option<State>,
+  pool:               Weak<RefCell<Pool<BufferQueue>>>,
+  sticky_session:     bool,
+  metrics:            SessionMetrics,
+  pub app_id:         Option<String>,
+  sticky_name:        String,
+  front_timeout:      Timeout,
+  last_event:         SteadyTime,
+  pub listen_token:   Token,
+  connection_attempt: u8,
 }
 
 impl Client {
@@ -86,21 +87,22 @@ impl Client {
     };
 
     protocol.map(|pr| {
-      let request_id = Uuid::new_v4().hyphenated().to_string();
-      let log_ctx    = format!("{}\tunknown\t", &request_id);
-      let mut client = Client {
-        backend:        None,
-        back_connected: BackendConnectionStatus::NotConnected,
-        protocol:       Some(pr),
-        frontend_token: token,
-        pool:           pool,
-        sticky_session: false,
-        metrics:        SessionMetrics::new(),
-        app_id:         None,
-        sticky_name:    sticky_name,
-        front_timeout:  timeout,
-        last_event:     SteadyTime::now(),
+      let request_id =  Uuid::new_v4().hyphenated().to_string();
+      let log_ctx    =  format!("{}\tunknown\t", &request_id);
+      let mut client =  Client {
+        backend:            None,
+        back_connected:     BackendConnectionStatus::NotConnected,
+        protocol:           Some(pr),
+        frontend_token:     token,
+        pool:               pool,
+        sticky_session:     false,
+        metrics:            SessionMetrics::new(),
+        app_id:             None,
+        sticky_name:        sticky_name,
+        front_timeout:      timeout,
+        last_event:         SteadyTime::now(),
         listen_token,
+        connection_attempt: 0,
       };
 
       client.front_readiness().interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
@@ -386,6 +388,10 @@ impl Client {
       _ => None,
     }
   }
+
+  fn reset_connection_attempt(&mut self) {
+    self.connection_attempt = 0;
+  }
 }
 
 impl ProxyClient for Client {
@@ -504,15 +510,17 @@ impl ProxyClient for Client {
     if self.back_connected() == BackendConnectionStatus::Connecting {
       if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) {
         //retry connecting the backend
-        //FIXME: there should probably be a circuit breaker per client too
         error!("{} error connecting to backend, trying again", self.log_context());
         self.metrics().service_stop();
+        self.connection_attempt += 1;
 
         let backend_token = self.back_token();
         self.http().map(|h| h.clear_back_token());
         self.http().map(|h| h.remove_backend());
+
         return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
+        self.reset_connection_attempt();
         self.set_back_connected(BackendConnectionStatus::Connected);
       }
     }
@@ -1044,6 +1052,12 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           poll.deregister(*sock);
           sock.shutdown(Shutdown::Both);
         });
+
+        if client.connection_attempt == CONN_RETRIES {
+          error!("{} max connection attempt reached", client.log_context());
+          let answer = self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
+          client.set_answer(DefaultAnswerStatus::Answer503, answer);
+        }
       }
 
       client.app_id = Some(app_id.clone());

@@ -46,7 +46,7 @@ use network::{AppId,Backend,ClientResult,ConnectionError,Protocol,Readiness,Sess
   ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use network::backends::BackendMap;
-use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,ClientToken,ListenClient};
+use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,ClientToken,ListenClient, CONN_RETRIES};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
@@ -76,18 +76,19 @@ pub enum State {
 
 pub struct TlsClient {
   frontend_token: Token,
-  backend:          Option<Rc<RefCell<Backend>>>,
-  back_connected:   BackendConnectionStatus,
-  protocol:         Option<State>,
-  public_address:   Option<IpAddr>,
-  ssl:              Option<Ssl>,
-  pool:             Weak<RefCell<Pool<BufferQueue>>>,
-  sticky_name:      String,
-  metrics:          SessionMetrics,
-  pub app_id:       Option<String>,
-  timeout:          Timeout,
-  last_event:       SteadyTime,
-  pub listen_token: Token,
+  backend:            Option<Rc<RefCell<Backend>>>,
+  back_connected:     BackendConnectionStatus,
+  protocol:           Option<State>,
+  public_address:     Option<IpAddr>,
+  ssl:                Option<Ssl>,
+  pool:               Weak<RefCell<Pool<BufferQueue>>>,
+  sticky_name:        String,
+  metrics:            SessionMetrics,
+  pub app_id:         Option<String>,
+  timeout:            Timeout,
+  last_event:         SteadyTime,
+  pub listen_token:   Token,
+  connection_attempt: u8,
 }
 
 impl TlsClient {
@@ -103,19 +104,20 @@ impl TlsClient {
     };
 
     let mut client = TlsClient {
-      frontend_token: token,
-      backend:        None,
-      back_connected: BackendConnectionStatus::NotConnected,
-      protocol:       protocol,
-      public_address: public_address,
-      ssl:            None,
-      pool:           pool,
-      sticky_name:    sticky_name,
-      metrics:        SessionMetrics::new(),
-      app_id:         None,
+      frontend_token:     token,
+      backend:            None,
+      back_connected:     BackendConnectionStatus::NotConnected,
+      protocol:           protocol,
+      public_address:     public_address,
+      ssl:                None,
+      pool:               pool,
+      sticky_name:        sticky_name,
+      metrics:            SessionMetrics::new(),
+      app_id:             None,
       timeout,
-      last_event:     SteadyTime::now(),
+      last_event:         SteadyTime::now(),
       listen_token,
+      connection_attempt: 0,
     };
     client.front_readiness().interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
 
@@ -416,6 +418,10 @@ impl TlsClient {
     //info!("current readiness: {:?}", r);
     r
   }
+
+  fn reset_connection_attempt(&mut self) {
+    self.connection_attempt = 0;
+  }
 }
 
 impl ProxyClient for TlsClient {
@@ -542,14 +548,15 @@ impl ProxyClient for TlsClient {
     if self.back_connected() == BackendConnectionStatus::Connecting {
       if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) {
         //retry connecting the backend
-        //FIXME: there should probably be a circuit breaker per client too
         error!("{} error connecting to backend, trying again", self.log_context());
         self.metrics().service_stop();
+        self.connection_attempt += 1;
         let backend_token = self.back_token();
         self.http().map(|h| h.clear_back_token());
         self.http().map(|h| h.remove_backend());
         return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
+        self.reset_connection_attempt();
         self.set_back_connected(BackendConnectionStatus::Connected);
       }
     }
@@ -1400,6 +1407,12 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
           poll.deregister(*sock);
           sock.shutdown(Shutdown::Both);
         });
+
+        if client.connection_attempt == CONN_RETRIES {
+          error!("{} max connection attempt reached", client.log_context());
+          let answer = self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
+          client.set_answer(DefaultAnswerStatus::Answer503, answer);
+        }
       }
 
       client.app_id = Some(app_id.clone());
