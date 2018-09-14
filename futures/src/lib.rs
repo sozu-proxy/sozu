@@ -1,6 +1,6 @@
 #[macro_use] extern crate log;
 extern crate futures;
-extern crate tokio_io;
+extern crate tokio_codec;
 extern crate tokio_uds;
 extern crate bytes;
 extern crate serde;
@@ -14,8 +14,7 @@ use std::sync::{Arc,Mutex};
 use std::collections::hash_map::HashMap;
 use futures::{Async, Sink, Stream, Future, future};
 use tokio_uds::UnixStream;
-use tokio_io::AsyncRead;
-use tokio_io::codec::{Decoder, Encoder, Framed};
+use tokio_codec::{Decoder, Encoder, Framed};
 use std::str::from_utf8;
 use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
 
@@ -74,7 +73,7 @@ pub struct SozuCommandTransport {
 impl SozuCommandTransport {
     pub fn new(stream: UnixStream) -> SozuCommandTransport {
         SozuCommandTransport {
-            upstream: stream.framed(CommandCodec),
+            upstream: CommandCodec.framed(stream),
             received: HashMap::new(),
         }
     }
