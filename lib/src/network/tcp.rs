@@ -917,7 +917,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
-        for (_, mut l) in self.listeners.drain() {
+        for (_, l) in self.listeners.iter_mut() {
           l.listener.take().map(|sock| event_loop.deregister(&sock));
         }
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None}

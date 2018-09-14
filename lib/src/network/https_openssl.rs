@@ -1582,7 +1582,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       },
       Order::SoftStop => {
         info!("{} processing soft shutdown", message.id);
-        self.listeners.drain().map(|(token, mut l)| {
+        self.listeners.iter_mut().map(|(token, l)| {
           l.listener.take().map(|sock| {
             event_loop.deregister(&sock);
           })
