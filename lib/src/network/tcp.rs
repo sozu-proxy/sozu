@@ -335,7 +335,7 @@ impl Client {
   fn front_readiness(&mut self) -> &mut Readiness {
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.front_readiness(),
-      Some(State::SendProxyProtocol(ref mut pp)) => panic!(),
+      Some(State::SendProxyProtocol(ref mut pp)) => pp.front_readiness(),
       Some(State::RelayProxyProtocol(ref mut pp)) => pp.front_readiness(),
       Some(State::ExpectProxyProtocol(ref mut pp)) => pp.readiness(),
       _ => unreachable!(),
@@ -345,7 +345,7 @@ impl Client {
   fn back_readiness(&mut self) -> Option<&mut Readiness> {
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => Some(pipe.back_readiness()),
-      Some(State::SendProxyProtocol(ref mut pp)) => Some(pp.readiness()),
+      Some(State::SendProxyProtocol(ref mut pp)) => Some(pp.back_readiness()),
       Some(State::RelayProxyProtocol(ref mut pp)) => Some(pp.back_readiness()),
       _ => None,
     }
@@ -662,12 +662,13 @@ impl ProxyClient for Client {
 
     let rf = match *unwrap_msg!(self.protocol.as_ref()) {
       State::ExpectProxyProtocol(ref expect) => &expect.readiness,
-      State::SendProxyProtocol(ref send)     => &send.readiness,
+      State::SendProxyProtocol(ref send)     => &send.front_readiness,
       State::RelayProxyProtocol(ref relay)   => &relay.front_readiness,
       State::Pipe(ref pipe)                  => &pipe.front_readiness,
     };
 
     let rb = match *unwrap_msg!(self.protocol.as_ref()) {
+      State::SendProxyProtocol(ref send)     => Some(&send.back_readiness),
       State::RelayProxyProtocol(ref relay)   => Some(&relay.back_readiness),
       State::Pipe(ref pipe)                  => Some(&pipe.back_readiness),
       _ => None,
