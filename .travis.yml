@@ -20,7 +20,7 @@ before_script:
 
 matrix:
   include:
-    - rust: stable
+    - rust: nightly
       before_script:
         - which cargo-tarpaulin || `RUSTFLAGS="--cfg procmacro2_semver_exempt" cargo install cargo-tarpaulin`
       script:
