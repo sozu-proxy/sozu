@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use slab::Slab;
 use std::collections::{HashSet, VecDeque};
-use sozu_command::messages::{OrderMessage, OrderMessageAnswer, OrderMessageStatus};
-use sozu_command::data::ConfigMessageAnswer;
+use sozu_command::messages::{Order, OrderMessage, OrderMessageAnswer, OrderMessageStatus};
+use sozu_command::data::{ConfigMessageAnswer, ConfigMessageStatus};
 use super::FrontToken;
 
 lazy_static! {
