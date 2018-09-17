@@ -805,7 +805,8 @@ impl ServerConfiguration {
   }
 
   fn app_id_from_request(&mut self, client: &mut Client) -> Result<String, ConnectionError> {
-    let h = try!(client.http().unwrap().state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
+    let h = client.http().and_then(|h| h.state.as_ref())
+      .and_then(|s| s.get_host()).ok_or(ConnectionError::NoHostGiven)?;
 
     let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
@@ -832,10 +833,12 @@ impl ServerConfiguration {
       return Err(ConnectionError::InvalidHost);
     };
 
-    //FIXME: too many unwraps here
-    let rl     = try!(client.http().unwrap().state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
+    let rl = client.http().and_then(|h| h.state.as_ref())
+      .and_then(|s| s.get_request_line()).ok_or(ConnectionError::NoRequestLineGiven)?;
 
-    let app_id = match self.listeners[&client.listen_token].frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
+    let app_id = match self.listeners.get(&client.listen_token).as_ref()
+      .and_then(|l| l.frontend_from_request(&host, &rl.uri))
+      .map(|ref front| front.app_id.clone()) {
       Some(app_id) => app_id,
       None => {
         let answer = self.listeners[&client.listen_token].answers.NotFound.clone();

@@ -406,7 +406,7 @@ impl ServerConfiguration {
   }
 
   fn app_id_from_request(&mut self, client: &mut TlsClient) -> Result<String, ConnectionError> {
-    let h = try!(unwrap_msg!(client.http()).state().get_host().ok_or(ConnectionError::NoHostGiven));
+    let h = client.http().and_then(|h| h.state().get_host()).ok_or(ConnectionError::NoHostGiven)?;
 
     let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
@@ -422,7 +422,8 @@ impl ServerConfiguration {
       let hostname_str =  unsafe { from_utf8_unchecked(hostname) };
 
       //FIXME: what if we don't use SNI?
-      let servername: Option<String> = unwrap_msg!(client.http()).frontend.session.get_sni_hostname().map(|s| s.to_string());
+      let servername: Option<String> = client.http()
+        .and_then(|h| h.frontend.session.get_sni_hostname()).map(|s| s.to_string());
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
         error!("TLS SNI hostname '{:?}' and Host header '{}' don't match", servername, hostname_str);
         let answer = self.listeners[&client.listen_token].answers.NotFound.clone();
@@ -444,8 +445,11 @@ impl ServerConfiguration {
       return Err(ConnectionError::InvalidHost);
     };
 
-    let rl:RRequestLine = try!(unwrap_msg!(client.http()).state().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-    match self.listeners[&client.listen_token].frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
+    let rl:RRequestLine = client.http()
+      .and_then(|h| h.state().get_request_line()).ok_or(ConnectionError::NoRequestLineGiven)?;
+    match self.listeners.get(&client.listen_token).as_ref()
+      .and_then(|l| l.frontend_from_request(&host, &rl.uri))
+      .map(|ref front| front.app_id.clone()) {
       Some(app_id) => Ok(app_id),
       None => {
         let answer = self.listeners[&client.listen_token].answers.NotFound.clone();
