@@ -803,6 +803,56 @@ impl ServerConfiguration {
       }
     }
   }
+
+  fn app_id_from_request(&mut self, client: &mut Client) -> Result<String, ConnectionError> {
+    let h = try!(client.http().unwrap().state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
+
+    let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
+      if i != &b""[..] {
+        error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
+        let answer = self.listeners[&client.listen_token].answers.BadRequest.clone();
+        client.set_answer(DefaultAnswerStatus::Answer400, answer);
+        return Err(ConnectionError::InvalidHost);
+      }
+
+      //FIXME: we should check that the port is right too
+
+      if port == Some(&b"80"[..]) {
+      // it is alright to call from_utf8_unchecked,
+      // we already verified that there are only ascii
+      // chars in there
+        unsafe { from_utf8_unchecked(hostname) }
+      } else {
+        &h
+      }
+    } else {
+      error!("hostname parsing failed for: '{}'", h);
+      let answer = self.listeners[&client.listen_token].answers.BadRequest.clone();
+      client.set_answer(DefaultAnswerStatus::Answer400, answer);
+      return Err(ConnectionError::InvalidHost);
+    };
+
+    //FIXME: too many unwraps here
+    let rl     = try!(client.http().unwrap().state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
+
+    let app_id = match self.listeners[&client.listen_token].frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
+      Some(app_id) => app_id,
+      None => {
+        let answer = self.listeners[&client.listen_token].answers.NotFound.clone();
+        client.set_answer(DefaultAnswerStatus::Answer404, answer);
+        return Err(ConnectionError::HostNotFound);
+      }
+    };
+
+    let front_should_redirect_https = self.applications.get(&app_id).map(|ref app| app.https_redirect).unwrap_or(false);
+    if front_should_redirect_https {
+      let answer = format!("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://{}{}\r\n\r\n", host, rl.uri);
+      client.set_answer(DefaultAnswerStatus::Answer301, Rc::new(answer.into_bytes()));
+      return Err(ConnectionError::HttpsRedirect);
+    }
+
+    Ok(app_id)
+  }
 }
 
 impl Listener {
@@ -964,60 +1014,78 @@ impl Listener {
 
 impl ProxyConfiguration<Client> for ServerConfiguration {
   fn connect_to_backend(&mut self, poll: &mut Poll, client: &mut Client, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
-    let h = try!(client.http().unwrap().state.as_ref().unwrap().get_host().ok_or(ConnectionError::NoHostGiven));
-
-    let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
-      if i != &b""[..] {
-        error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
-        let answer = self.listeners[&client.listen_token].answers.BadRequest.clone();
-        client.set_answer(DefaultAnswerStatus::Answer400, answer);
-        return Err(ConnectionError::InvalidHost);
-      }
-
-      //FIXME: we should check that the port is right too
-
-      if port == Some(&b"80"[..]) {
-      // it is alright to call from_utf8_unchecked,
-      // we already verified that there are only ascii
-      // chars in there
-        unsafe { from_utf8_unchecked(hostname) }
-      } else {
-        &h
-      }
-    } else {
-      error!("hostname parsing failed for: '{}'", h);
-      let answer = self.listeners[&client.listen_token].answers.BadRequest.clone();
-      client.set_answer(DefaultAnswerStatus::Answer400, answer);
-      return Err(ConnectionError::InvalidHost);
-    };
-
+    let app_id = self.app_id_from_request(client)?;
     let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();
 
-    //FIXME: too many unwraps here
-    let rl     = try!(client.http().unwrap().state.as_ref().unwrap().get_request_line().ok_or(ConnectionError::NoRequestLineGiven));
-    if let Some(app_id) = self.listeners[&client.listen_token].frontend_from_request(&host, &rl.uri).map(|ref front| front.app_id.clone()) {
 
-      let front_should_redirect_https = self.applications.get(&app_id).map(|ref app| app.https_redirect).unwrap_or(false);
-      if front_should_redirect_https {
-        let answer = format!("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://{}{}\r\n\r\n", host, rl.uri);
-        client.set_answer(DefaultAnswerStatus::Answer301, Rc::new(answer.into_bytes()));
-        return Err(ConnectionError::HttpsRedirect);
+    let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
+    let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
+    let old_back_token = client.back_token();
+
+    if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
+      if client.backend.as_ref().map(|backend| {
+        let ref backend = *backend.borrow();
+        self.backends.has_backend(&app_id, backend)
+      }).unwrap_or(false) {
+        //matched on keepalive
+        client.metrics.backend_id = client.backend.as_ref().map(|i| i.borrow().backend_id.clone());
+        client.metrics.backend_start();
+        return Ok(BackendConnectAction::Reuse);
+      } else {
+        if let Some(token) = client.back_token() {
+          let addr = client.close_backend(token, poll);
+          if let Some((app_id, address)) = addr {
+            self.close_backend(app_id, &address);
+          }
+        }
       }
+    }
 
-      let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
-      let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
-      let old_back_token = client.back_token();
+    // circuit breaker
+    if client.back_connected == BackendConnectionStatus::Connecting {
+      client.backend.as_ref().map(|backend| {
+        let ref mut backend = *backend.borrow_mut();
+        backend.dec_connections();
+        backend.failures += 1;
 
-      if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
-        if client.backend.as_ref().map(|backend| {
-          let ref backend = *backend.borrow();
-          self.backends.has_backend(&app_id, backend)
-        }).unwrap_or(false) {
-          //matched on keepalive
-          client.metrics.backend_id = client.backend.as_ref().map(|i| i.borrow().backend_id.clone());
-          client.metrics.backend_start();
-          return Ok(BackendConnectAction::Reuse);
-        } else {
+        let already_unavailable = backend.retry_policy.is_down();
+        backend.retry_policy.fail();
+        incr!("backend.connections.error");
+        if !already_unavailable && backend.retry_policy.is_down() {
+          incr!("backend.down");
+        }
+      });
+
+
+      //manually close the connection here because the back token was removed elsewhere
+      client.backend = None;
+      client.back_connected = BackendConnectionStatus::NotConnected;
+      client.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
+      client.back_socket().as_ref().map(|sock| {
+        poll.deregister(*sock);
+        sock.shutdown(Shutdown::Both);
+      });
+
+      if client.connection_attempt == CONN_RETRIES {
+        error!("{} max connection attempt reached", client.log_context());
+        let answer = self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
+        client.set_answer(DefaultAnswerStatus::Answer503, answer);
+      }
+    }
+
+    client.app_id = Some(app_id.clone());
+
+    let conn = match (front_should_stick, sticky_session) {
+      (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session),
+      _ => self.backend_from_app_id(client, &app_id, front_should_stick),
+    };
+
+    match conn {
+      Ok(socket) => {
+        let new_app_id = client.http().and_then(|ref http| http.app_id.clone());
+        let replacing_connection = old_app_id.is_some() && old_app_id != new_app_id;
+
+        if replacing_connection {
           if let Some(token) = client.back_token() {
             let addr = client.close_backend(token, poll);
             if let Some((app_id, address)) = addr {
@@ -1025,111 +1093,52 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
             }
           }
         }
-      }
 
-      // circuit breaker
-      if client.back_connected == BackendConnectionStatus::Connecting {
-        client.backend.as_ref().map(|backend| {
-          let ref mut backend = *backend.borrow_mut();
-          backend.dec_connections();
-          backend.failures += 1;
+        // we still want to use the new socket
+        client.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::writable()));
 
-          let already_unavailable = backend.retry_policy.is_down();
-          backend.retry_policy.fail();
-          incr!("backend.connections.error");
-          if !already_unavailable && backend.retry_policy.is_down() {
-            incr!("backend.down");
-          }
+
+        socket.set_nodelay(true);
+        client.back_readiness().map(|r| {
+          r.interest.insert(Ready::writable());
+          r.interest.insert(UnixReady::hup());
+          r.interest.insert(UnixReady::error());
         });
+        if replacing_connection {
+          client.set_back_token(old_back_token.expect("FIXME"));
+          poll.register(
+            &socket,
+            client.back_token().expect("FIXME"),
+            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+            PollOpt::edge()
+          );
+          client.set_back_socket(socket);
+          Ok(BackendConnectAction::Replace)
+        } else {
+          poll.register(
+            &socket,
+            back_token,
+            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+            PollOpt::edge()
+          );
 
-
-        //manually close the connection here because the back token was removed elsewhere
-        client.backend = None;
-        client.back_connected = BackendConnectionStatus::NotConnected;
-        client.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
-        client.back_socket().as_ref().map(|sock| {
-          poll.deregister(*sock);
-          sock.shutdown(Shutdown::Both);
-        });
-
-        if client.connection_attempt == CONN_RETRIES {
-          error!("{} max connection attempt reached", client.log_context());
-          let answer = self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
-          client.set_answer(DefaultAnswerStatus::Answer503, answer);
+          client.set_back_socket(socket);
+          client.set_back_token(back_token);
+          Ok(BackendConnectAction::New)
         }
+        //Ok(())
+      },
+      Err(ConnectionError::NoBackendAvailable) => {
+        let answer =  self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
+        client.set_answer(DefaultAnswerStatus::Answer503, answer);
+        Err(ConnectionError::NoBackendAvailable)
       }
-
-      client.app_id = Some(app_id.clone());
-
-      let conn = match (front_should_stick, sticky_session) {
-        (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session),
-        _ => self.backend_from_app_id(client, &app_id, front_should_stick),
-      };
-
-      match conn {
-        Ok(socket) => {
-          let new_app_id = client.http().and_then(|ref http| http.app_id.clone());
-          let replacing_connection = old_app_id.is_some() && old_app_id != new_app_id;
-
-          if replacing_connection {
-            if let Some(token) = client.back_token() {
-              let addr = client.close_backend(token, poll);
-              if let Some((app_id, address)) = addr {
-                self.close_backend(app_id, &address);
-              }
-            }
-          }
-
-          // we still want to use the new socket
-          client.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::writable()));
-
-
-          socket.set_nodelay(true);
-          client.back_readiness().map(|r| {
-            r.interest.insert(Ready::writable());
-            r.interest.insert(UnixReady::hup());
-            r.interest.insert(UnixReady::error());
-          });
-          if replacing_connection {
-            client.set_back_token(old_back_token.expect("FIXME"));
-            poll.register(
-              &socket,
-              client.back_token().expect("FIXME"),
-              Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-              PollOpt::edge()
-            );
-            client.set_back_socket(socket);
-            Ok(BackendConnectAction::Replace)
-          } else {
-            poll.register(
-              &socket,
-              back_token,
-              Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-              PollOpt::edge()
-            );
-
-            client.set_back_socket(socket);
-            client.set_back_token(back_token);
-            Ok(BackendConnectAction::New)
-          }
-          //Ok(())
-        },
-        Err(ConnectionError::NoBackendAvailable) => {
-          let answer =  self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
-          client.set_answer(DefaultAnswerStatus::Answer503, answer);
-          Err(ConnectionError::NoBackendAvailable)
-        }
-        Err(ConnectionError::HostNotFound) => {
-          let answer = self.listeners[&client.listen_token].answers.NotFound.clone();
-          client.set_answer(DefaultAnswerStatus::Answer404, answer);
-          Err(ConnectionError::HostNotFound)
-        }
-        e => panic!(e)
+      Err(ConnectionError::HostNotFound) => {
+        let answer = self.listeners[&client.listen_token].answers.NotFound.clone();
+        client.set_answer(DefaultAnswerStatus::Answer404, answer);
+        Err(ConnectionError::HostNotFound)
       }
-    } else {
-      let answer = self.listeners[&client.listen_token].answers.NotFound.clone();
-      client.set_answer(DefaultAnswerStatus::Answer404, answer);
-      Err(ConnectionError::HostNotFound)
+      e => panic!(e)
     }
   }
 
