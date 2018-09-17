@@ -67,6 +67,7 @@ pub struct TlsClient {
   timeout:            Timeout,
   last_event:         SteadyTime,
   pub listen_token:   Token,
+  pub connection_attempt: u8,
 }
 
 impl TlsClient {
@@ -94,6 +95,7 @@ impl TlsClient {
       timeout,
       last_event:     SteadyTime::now(),
       listen_token,
+      connection_attempt: 0,
     };
     client.front_readiness().interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
     client
@@ -266,7 +268,7 @@ impl TlsClient {
     }
   }
 
-  fn log_context(&self)  -> String {
+  pub fn log_context(&self)  -> String {
     if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
       http.log_context()
     } else {
@@ -430,6 +432,10 @@ impl TlsClient {
     };
     r
   }
+
+  fn reset_connection_attempt(&mut self) {
+    self.connection_attempt = 0;
+  }
 }
 
 impl ProxyClient for TlsClient {
@@ -554,12 +560,14 @@ impl ProxyClient for TlsClient {
         //retry connecting the backend
         //FIXME: there should probably be a circuit breaker per client too
         error!("{} error connecting to backend, trying again", self.log_context());
+        self.connection_attempt += 1;
         let backend_token = self.back_token();
         self.http().map(|h| h.clear_back_token());
         self.http().map(|h| h.remove_backend());
         self.metrics().service_stop();
         return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
+        self.reset_connection_attempt();
         self.set_back_connected(BackendConnectionStatus::Connected);
       }
     }

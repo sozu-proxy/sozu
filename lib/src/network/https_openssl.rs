@@ -1332,6 +1332,42 @@ impl ServerConfiguration {
       }
     }
   }
+
+  fn check_circuit_breaker(&mut self, poll: &mut Poll, client: &mut TlsClient) -> Result<(), ConnectionError> {
+    // circuit breaker
+    if client.back_connected == BackendConnectionStatus::Connecting {
+      client.backend.as_ref().map(|backend| {
+        let ref mut backend = *backend.borrow_mut();
+        backend.dec_connections();
+        backend.failures += 1;
+
+        let already_unavailable = backend.retry_policy.is_down();
+        backend.retry_policy.fail();
+        incr!("backend.connections.error");
+        if !already_unavailable && backend.retry_policy.is_down() {
+          incr!("backend.down");
+        }
+      });
+
+      //manually close the connection here because the back token was removed elsewhere
+      client.backend = None;
+      client.back_connected = BackendConnectionStatus::NotConnected;
+      client.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
+      client.back_socket().as_ref().map(|sock| {
+        poll.deregister(*sock);
+        sock.shutdown(Shutdown::Both);
+      });
+
+      if client.connection_attempt == CONN_RETRIES {
+        error!("{} max connection attempt reached", client.log_context());
+        let answer = self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
+        client.set_answer(DefaultAnswerStatus::Answer503, answer);
+        return Err(ConnectionError::NoBackendAvailable);
+      }
+    }
+
+    Ok(())
+  }
 }
 
 impl ProxyConfiguration<TlsClient> for ServerConfiguration {
@@ -1365,6 +1401,9 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
   fn connect_to_backend(&mut self, poll: &mut Poll,  client: &mut TlsClient, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
+
+    self.check_circuit_breaker(poll, client)?;
+
     let app_id = self.app_id_from_request(client)?;
 
     let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
@@ -1386,37 +1425,6 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
              self.close_backend(app_id, &address);
           }
         }
-      }
-    }
-
-    // circuit breaker
-    if client.back_connected == BackendConnectionStatus::Connecting {
-      client.backend.as_ref().map(|backend| {
-        let ref mut backend = *backend.borrow_mut();
-        backend.dec_connections();
-        backend.failures += 1;
-
-        let already_unavailable = backend.retry_policy.is_down();
-        backend.retry_policy.fail();
-        incr!("backend.connections.error");
-        if !already_unavailable && backend.retry_policy.is_down() {
-          incr!("backend.down");
-        }
-      });
-
-      //manually close the connection here because the back token was removed elsewhere
-      client.backend = None;
-      client.back_connected = BackendConnectionStatus::NotConnected;
-      client.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
-      client.back_socket().as_ref().map(|sock| {
-        poll.deregister(*sock);
-        sock.shutdown(Shutdown::Both);
-      });
-
-      if client.connection_attempt == CONN_RETRIES {
-        error!("{} max connection attempt reached", client.log_context());
-        let answer = self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
-        client.set_answer(DefaultAnswerStatus::Answer503, answer);
       }
     }
 
