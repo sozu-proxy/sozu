@@ -1017,12 +1017,12 @@ impl Listener {
 
 impl ProxyConfiguration<Client> for ServerConfiguration {
   fn connect_to_backend(&mut self, poll: &mut Poll, client: &mut Client, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
+    let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
     let app_id = self.app_id_from_request(client)?;
     let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();
 
 
     let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
-    let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
     let old_back_token = client.back_token();
 
     if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
