@@ -24,7 +24,8 @@ pub struct SendProxyProtocol<Front:SocketHandler> {
   pub backend:        Option<TcpStream>,
   pub frontend_token: Token,
   pub backend_token:  Option<Token>,
-  pub readiness:      Readiness,
+  pub front_readiness:Readiness,
+  pub back_readiness: Readiness,
   cursor_header:      usize,
 }
 
@@ -36,7 +37,11 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
       backend,
       frontend_token,
       backend_token:  None,
-      readiness: Readiness {
+      front_readiness: Readiness {
+        interest: UnixReady::hup() | UnixReady::error(),
+        event:    UnixReady::from(Ready::empty()),
+      },
+      back_readiness: Readiness {
         interest: UnixReady::hup() | UnixReady::error(),
         event:    UnixReady::from(Ready::empty()),
       },
@@ -64,7 +69,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
             },
             Err(e) => match e.kind() {
               ErrorKind::WouldBlock => {
-                self.readiness.event.remove(Ready::writable());
+                self.back_readiness.event.remove(Ready::writable());
                 return (ProtocolResult::Continue, ClientResult::Continue);
               },
               e => {
@@ -105,12 +110,16 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
   pub fn set_back_connected(&mut self, status: BackendConnectionStatus) {
     if status == BackendConnectionStatus::Connected {
       self.gen_proxy_protocol_header();
-      self.readiness.interest.insert(UnixReady::from(Ready::writable()));
+      self.back_readiness.interest.insert(UnixReady::from(Ready::writable()));
     }
   }
 
-  pub fn readiness(&mut self) -> &mut Readiness {
-    &mut self.readiness
+  pub fn front_readiness(&mut self) -> &mut Readiness {
+    &mut self.front_readiness
+  }
+
+  pub fn back_readiness(&mut self) -> &mut Readiness {
+    &mut self.back_readiness
   }
 
   fn gen_proxy_protocol_header(&mut self) {
@@ -143,7 +152,11 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
       addr,
     );
 
-    pipe.back_readiness.event  = self.readiness.event;
+    pipe.front_readiness = self.front_readiness;
+    pipe.back_readiness  = self.back_readiness;
+
+    pipe.front_readiness.interest.insert(UnixReady::from(Ready::readable()));
+    pipe.back_readiness.interest.insert(UnixReady::from(Ready::readable()));
 
     if let Some(back_token) = self.backend_token {
       pipe.set_back_token(back_token);
