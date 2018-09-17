@@ -36,11 +36,11 @@ fn main() {
   let timeout: u64 = matches.timeout.unwrap_or(config.ctl_command_timeout);
 
   match matches.cmd {
-    SubCmd::Shutdown{ hard } => {
+    SubCmd::Shutdown{ hard, worker} => {
       if hard {
-        hard_stop(channel, timeout);
+        hard_stop(channel, worker, timeout);
       } else {
-        soft_stop(channel);
+        soft_stop(channel, worker);
       }
     },
     SubCmd::Upgrade { worker: None } => upgrade_master(channel, &config.command_socket_path()),

@@ -188,14 +188,13 @@ pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
   });
 }
 
-pub fn soft_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
+pub fn soft_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, proxy_id: Option<u32>) {
   println!("shutting down proxy");
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
     ConfigCommand::ProxyConfiguration(Order::SoftStop),
-    //FIXME: we should be able to soft stop one specific worker
-    None,
+    proxy_id,
   ));
 
   loop {
@@ -223,14 +222,13 @@ pub fn soft_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>) {
   }
 }
 
-pub fn hard_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64) {
+pub fn hard_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, proxy_id: Option<u32>, timeout: u64) {
   println!("shutting down proxy");
   let id = generate_id();
   channel.write_message(&ConfigMessage::new(
     id.clone(),
     ConfigCommand::ProxyConfiguration(Order::HardStop),
-    //FIXME: we should be able to soft stop one specific worker
-    None,
+    proxy_id,
   ));
 
   command_timeout!(timeout,

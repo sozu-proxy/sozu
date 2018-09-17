@@ -12,10 +12,12 @@ pub struct App {
 
 #[derive(StructOpt, PartialEq, Debug)]
 pub enum SubCmd {
-  #[structopt(name = "shutdown", about = "shuts down the proxy without waiting for connections to finish")]
+  #[structopt(name = "shutdown", about = "shuts down the proxy")]
   Shutdown {
-    #[structopt(long = "hard")]
-    hard: bool
+    #[structopt(long = "hard", help = "do not wait for connections to finish")]
+    hard: bool,
+    #[structopt(short = "w", long = "worker", help = "shuts down the worker with this id")]
+    worker: Option<u32>,
   },
   #[structopt(name = "upgrade", about = "upgrade the proxy")]
   Upgrade {
