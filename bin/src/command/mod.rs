@@ -268,12 +268,12 @@ impl CommandServer {
           }
         }
 
+        self.run_executor();
         if ! did_something {
           break;
         }
       }
 
-      self.run_executor();
 
       METRICS.with(|metrics| {
         (*metrics.borrow_mut()).send_data();
@@ -512,6 +512,8 @@ impl CommandServer {
                 break;
               }
             }
+
+            self.run_executor();
           }
         }
       }
