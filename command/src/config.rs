@@ -328,6 +328,7 @@ pub struct FileAppConfig {
   pub send_proxy:            Option<bool>,
   #[serde(default)]
   pub load_balancing_policy: LoadBalancingAlgorithms,
+  pub answer_503:            Option<String>,
 }
 
 #[derive(Debug,Copy,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -438,6 +439,11 @@ impl FileAppConfig {
           }
         }
 
+        let answer_503 = self.answer_503.as_ref().and_then(|path| Config::load_file(&path).map_err(|e| {
+          error!("cannot load 503 error page at path '{}': {:?}", path, e);
+          e
+        }).ok());
+
         Ok(AppConfig::Http(HttpAppConfig {
           app_id:            app_id.to_string(),
           frontends,
@@ -445,6 +451,7 @@ impl FileAppConfig {
           sticky_session:    self.sticky_session.unwrap_or(false),
           https_redirect:    self.https_redirect.unwrap_or(false),
           load_balancing_policy: self.load_balancing_policy,
+          answer_503,
         }))
       }
     }
@@ -512,6 +519,7 @@ pub struct HttpAppConfig {
   pub sticky_session:    bool,
   pub https_redirect:    bool,
   pub load_balancing_policy: LoadBalancingAlgorithms,
+  pub answer_503:        Option<String>,
 }
 
 impl HttpAppConfig {
@@ -524,6 +532,7 @@ impl HttpAppConfig {
       https_redirect: self.https_redirect,
       proxy_protocol: None,
       load_balancing_policy: self.load_balancing_policy,
+      answer_503: self.answer_503.clone(),
     }));
 
     for frontend in &self.frontends {
@@ -578,6 +587,7 @@ impl TcpAppConfig {
       https_redirect: false,
       proxy_protocol: self.proxy_protocol.clone(),
       load_balancing_policy: self.load_balancing_policy,
+      answer_503: None,
     }));
 
     for frontend in &self.frontends {

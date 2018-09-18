@@ -47,7 +47,7 @@ use network::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,Ses
   CloseResult};
 use network::backends::BackendMap;
 use network::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
-use network::http::{self,DefaultAnswers};
+use network::http::{self,DefaultAnswers, CustomAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::trie::*;
 use network::protocol::{ProtocolResult,Http,Pipe,StickySession};
@@ -1163,10 +1163,11 @@ impl Listener {
 }
 
 pub struct Proxy {
-  listeners:    HashMap<Token, Listener>,
-  applications: HashMap<AppId, Application>,
-  backends:     BackendMap,
-  pool:         Rc<RefCell<Pool<BufferQueue>>>,
+  listeners:      HashMap<Token, Listener>,
+  applications:   HashMap<AppId, Application>,
+  custom_answers: HashMap<AppId, CustomAnswers>,
+  backends:       BackendMap,
+  pool:           Rc<RefCell<Pool<BufferQueue>>>,
 }
 
 impl Proxy {
@@ -1174,6 +1175,7 @@ impl Proxy {
     Proxy {
       listeners : HashMap::new(),
       applications: HashMap::new(),
+      custom_answers: HashMap::new(),
       backends: BackendMap::new(),
       pool,
     }
@@ -1204,9 +1206,16 @@ impl Proxy {
     }).collect()
   }
 
-  pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
+  pub fn add_application(&mut self, mut application: Application, event_loop: &mut Poll) {
     let app_id = &application.app_id.clone();
     let lb_alg = application.load_balancing_policy;
+
+    if let Some(answer_503) = application.answer_503.take() {
+      self.custom_answers
+        .entry(application.app_id.clone())
+        .and_modify(|c| c.ServiceUnavailable = Some(Rc::new(answer_503.clone().into_bytes())))
+        .or_insert(CustomAnswers{ ServiceUnavailable: Some(Rc::new(answer_503.into_bytes())) });
+    }
 
     self.applications.insert(application.app_id.clone(), application);
     self.backends.set_load_balancing_policy_for_app(app_id, lb_alg);
@@ -1214,6 +1223,7 @@ impl Proxy {
 
   pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
     self.applications.remove(app_id);
+    self.custom_answers.remove(app_id);
   }
 
 
@@ -1231,7 +1241,7 @@ impl Proxy {
 
     match self.backends.backend_from_app_id(&app_id) {
       Err(e) => {
-        let answer = self.listeners[&session.listen_token].answers.ServiceUnavailable.clone();
+        let answer = self.get_service_unavailable_answer(Some(app_id), &session.listen_token);
         session.set_answer(DefaultAnswerStatus::Answer503, answer);
         Err(e)
       },
@@ -1259,7 +1269,7 @@ impl Proxy {
     match self.backends.backend_from_sticky_session(app_id, &sticky_session) {
       Err(e) => {
         debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
-        let answer = self.listeners[&session.listen_token].answers.ServiceUnavailable.clone();
+        let answer = self.get_service_unavailable_answer(Some(app_id), &session.listen_token);
         session.set_answer(DefaultAnswerStatus::Answer503, answer);
         Err(e)
       },
@@ -1337,11 +1347,19 @@ impl Proxy {
   fn check_circuit_breaker(&mut self, session: &mut Session) -> Result<(), ConnectionError> {
     if session.connection_attempt == CONN_RETRIES {
       error!("{} max connection attempt reached", session.log_context());
-      let answer = self.listeners[&session.listen_token].answers.ServiceUnavailable.clone();
+      let answer = self.get_service_unavailable_answer(session.app_id.as_ref().map(|app_id| app_id.as_str()), &session.listen_token);
       session.set_answer(DefaultAnswerStatus::Answer503, answer);
       Err(ConnectionError::NoBackendAvailable)
     } else {
       Ok(())
+    }
+  }
+
+  fn get_service_unavailable_answer(&self, app_id: Option<&str>, listen_token: &Token) -> Rc<Vec<u8>> {
+    if let Some(answer_service_unavailable) = app_id.and_then(|app_id| self.custom_answers.get(app_id).and_then(|c| c.ServiceUnavailable.as_ref())) {
+      answer_service_unavailable.clone()
+    } else {
+      self.listeners[&listen_token].answers.ServiceUnavailable.clone()
     }
   }
 }
