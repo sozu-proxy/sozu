@@ -329,7 +329,6 @@ pub struct FileAppConfig {
   #[serde(default)]
   pub load_balancing_policy: LoadBalancingAlgorithms,
   pub answer_503:            Option<String>,
-  pub maintenance_page:      Option<String>,
 }
 
 #[derive(Debug,Copy,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -448,7 +447,6 @@ impl FileAppConfig {
           https_redirect:    self.https_redirect.unwrap_or(false),
           load_balancing_policy: self.load_balancing_policy,
           answer_503: None,
-          maintenance_page: None,
         }))
       }
     }
@@ -517,7 +515,6 @@ pub struct HttpAppConfig {
   pub https_redirect:    bool,
   pub load_balancing_policy: LoadBalancingAlgorithms,
   pub answer_503: Option<String>,
-  pub maintenance_page: Option<String>,
 }
 
 impl HttpAppConfig {
@@ -529,11 +526,6 @@ impl HttpAppConfig {
       e
     }).ok());
 
-    let maintenance_page = self.maintenance_page.as_ref().and_then(|path| Config::load_file(&path).map_err(|e| {
-      error!("cannot load maintenance page at path '{}': {:?}", path, e);
-      e
-    }).ok());
-
     v.push(Order::AddApplication(Application {
       app_id: self.app_id.clone(),
       sticky_session: self.sticky_session,
@@ -541,7 +533,6 @@ impl HttpAppConfig {
       proxy_protocol: None,
       load_balancing_policy: self.load_balancing_policy,
       answer_503,
-      maintenance_page,
     }));
 
     for frontend in &self.frontends {
@@ -597,7 +588,6 @@ impl TcpAppConfig {
       proxy_protocol: self.proxy_protocol.clone(),
       load_balancing_policy: self.load_balancing_policy,
       answer_503: None,
-      maintenance_page: None,
     }));
 
     for frontend in &self.frontends {
