@@ -1335,7 +1335,7 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
               (BufferMove::Advance(buf.offset(i)), RequestState::Request(rl, conn, h))
             },
             res => {
-              error!("PARSER\tHasHost could not parse header for input:\n{}\n", buf.to_hex(16));
+              //error!("PARSER\tHasHost could not parse header for input:\n{}\n", buf.to_hex(16));
               default_request_result(RequestState::HasHost(rl, conn, h), res)
             }
           }
