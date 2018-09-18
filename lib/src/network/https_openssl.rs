@@ -1430,83 +1430,67 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
     client.app_id = Some(app_id.clone());
 
-    let conn   = try!(unwrap_msg!(client.http()).state().get_front_keep_alive().ok_or(ConnectionError::ToBeDefined));
     let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();
-    let conn = match (front_should_stick, sticky_session) {
-      (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session),
-      _ => self.backend_from_app_id(client, &app_id, front_should_stick),
+    let socket = match (front_should_stick, sticky_session) {
+      (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session)?,
+      _ => self.backend_from_app_id(client, &app_id, front_should_stick)?,
     };
 
-    match conn {
-      Ok(socket) => {
-        let new_app_id = client.http().and_then(|ref http| http.app_id.clone());
-        let replacing_connection = old_app_id.is_some() && old_app_id != new_app_id;
+    let new_app_id = client.http().and_then(|ref http| http.app_id.clone());
+    let replacing_connection = old_app_id.is_some() && old_app_id != new_app_id;
 
-        //deregister back socket if it is the wrong one or if it was not connecting
-        if replacing_connection {
-          if let Some(token) = client.back_token() {
-            let addr = client.close_backend(token, poll);
-            if let Some((app_id, address)) = addr {
-               self.close_backend(app_id, &address);
-            }
-          }
+    //deregister back socket if it is the wrong one or if it was not connecting
+    if replacing_connection {
+      if let Some(token) = client.back_token() {
+        let addr = client.close_backend(token, poll);
+        if let Some((app_id, address)) = addr {
+           self.close_backend(app_id, &address);
         }
+      }
+    }
 
-        // we still want to use the new socket
-        client.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::writable()));
+    // we still want to use the new socket
+    client.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::writable()));
 
-        let req_state = unwrap_msg!(client.http()).state().request.clone();
-        let req_header_end = unwrap_msg!(client.http()).state().req_header_end;
-        let res_header_end = unwrap_msg!(client.http()).state().res_header_end;
-        let added_req_header = unwrap_msg!(client.http()).state().added_req_header.clone();
-        let added_res_header = unwrap_msg!(client.http()).state().added_res_header.clone();
-        // FIXME: is this still needed?
-        unwrap_msg!(client.http()).set_state(HttpState {
-          req_header_end: req_header_end,
-          res_header_end: res_header_end,
-          request:  req_state,
-          response: Some(ResponseState::Initial),
-          added_req_header: added_req_header,
-          added_res_header: added_res_header,
-        });
+    let req_state = unwrap_msg!(client.http()).state().request.clone();
+    let req_header_end = unwrap_msg!(client.http()).state().req_header_end;
+    let res_header_end = unwrap_msg!(client.http()).state().res_header_end;
+    let added_req_header = unwrap_msg!(client.http()).state().added_req_header.clone();
+    let added_res_header = unwrap_msg!(client.http()).state().added_res_header.clone();
+    // FIXME: is this still needed?
+    unwrap_msg!(client.http()).set_state(HttpState {
+      req_header_end: req_header_end,
+      res_header_end: res_header_end,
+      request:  req_state,
+      response: Some(ResponseState::Initial),
+      added_req_header: added_req_header,
+      added_res_header: added_res_header,
+    });
 
-        socket.set_nodelay(true);
+    socket.set_nodelay(true);
 
-        if replacing_connection {
-          client.set_back_token(old_back_token.expect("FIXME"));
-          poll.register(
-            &socket,
-            client.back_token().expect("FIXME"),
-            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-            PollOpt::edge()
-          );
+    if replacing_connection {
+      client.set_back_token(old_back_token.expect("FIXME"));
+      poll.register(
+        &socket,
+        client.back_token().expect("FIXME"),
+        Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+        PollOpt::edge()
+      );
 
-          client.set_back_socket(socket);
-          Ok(BackendConnectAction::Replace)
-        } else {
-          poll.register(
-            &socket,
-            back_token,
-            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-            PollOpt::edge()
-          );
+      client.set_back_socket(socket);
+      Ok(BackendConnectAction::Replace)
+    } else {
+      poll.register(
+        &socket,
+        back_token,
+        Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+        PollOpt::edge()
+      );
 
-          client.set_back_socket(socket);
-          client.set_back_token(back_token);
-          Ok(BackendConnectAction::New)
-        }
-      },
-      Err(ConnectionError::NoBackendAvailable) => {
-        let answer = self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
-        unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer503, answer);
-        Err(ConnectionError::NoBackendAvailable)
-      },
-      Err(ConnectionError::HostNotFound) => {
-        let answer = self.listeners[&client.listen_token].answers.NotFound.clone();
-        unwrap_msg!(client.http()).set_answer(DefaultAnswerStatus::Answer404, answer);
-        Err(ConnectionError::HostNotFound)
-      },
-      e => panic!(e)
+      client.set_back_socket(socket);
+      client.set_back_token(back_token);
+      Ok(BackendConnectAction::New)
     }
   }
 

@@ -149,13 +149,17 @@ impl<Front:SocketHandler> Http<Front> {
     self.front_buf = None;
     self.back_buf = None;
 
-    match answer {
-      DefaultAnswerStatus::Answer301 => incr!("http.301.redirection"),
-      DefaultAnswerStatus::Answer400 => incr!("http.400.errors"),
-      DefaultAnswerStatus::Answer404 => incr!("http.404.errors"),
-      DefaultAnswerStatus::Answer413 => incr!("http.413.errors"),
-      DefaultAnswerStatus::Answer503 => incr!("http.503.errors"),
-    };
+    if let ClientStatus::DefaultAnswer(status, _, _) = self.status {
+      error!("already set the default answer to {:?}, trying to set to {:?}", status, answer);
+    } else {
+      match answer {
+        DefaultAnswerStatus::Answer301 => incr!("http.301.redirection"),
+        DefaultAnswerStatus::Answer400 => incr!("http.400.errors"),
+        DefaultAnswerStatus::Answer404 => incr!("http.404.errors"),
+        DefaultAnswerStatus::Answer413 => incr!("http.413.errors"),
+        DefaultAnswerStatus::Answer503 => incr!("http.503.errors"),
+      };
+    }
 
     self.status = ClientStatus::DefaultAnswer(answer, buf, 0);
     self.front_readiness.interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();

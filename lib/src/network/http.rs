@@ -1085,70 +1085,54 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
     client.app_id = Some(app_id.clone());
 
-    let conn = match (front_should_stick, sticky_session) {
-      (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session),
-      _ => self.backend_from_app_id(client, &app_id, front_should_stick),
+    let socket = match (front_should_stick, sticky_session) {
+      (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session)?,
+      _ => self.backend_from_app_id(client, &app_id, front_should_stick)?,
     };
 
-    match conn {
-      Ok(socket) => {
-        let new_app_id = client.http().and_then(|ref http| http.app_id.clone());
-        let replacing_connection = old_app_id.is_some() && old_app_id != new_app_id;
+    let new_app_id = client.http().and_then(|ref http| http.app_id.clone());
+    let replacing_connection = old_app_id.is_some() && old_app_id != new_app_id;
 
-        if replacing_connection {
-          if let Some(token) = client.back_token() {
-            let addr = client.close_backend(token, poll);
-            if let Some((app_id, address)) = addr {
-              self.close_backend(app_id, &address);
-            }
-          }
+    if replacing_connection {
+      if let Some(token) = client.back_token() {
+        let addr = client.close_backend(token, poll);
+        if let Some((app_id, address)) = addr {
+          self.close_backend(app_id, &address);
         }
-
-        // we still want to use the new socket
-        client.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::writable()));
-
-
-        socket.set_nodelay(true);
-        client.back_readiness().map(|r| {
-          r.interest.insert(Ready::writable());
-          r.interest.insert(UnixReady::hup());
-          r.interest.insert(UnixReady::error());
-        });
-        if replacing_connection {
-          client.set_back_token(old_back_token.expect("FIXME"));
-          poll.register(
-            &socket,
-            client.back_token().expect("FIXME"),
-            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-            PollOpt::edge()
-          );
-          client.set_back_socket(socket);
-          Ok(BackendConnectAction::Replace)
-        } else {
-          poll.register(
-            &socket,
-            back_token,
-            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-            PollOpt::edge()
-          );
-
-          client.set_back_socket(socket);
-          client.set_back_token(back_token);
-          Ok(BackendConnectAction::New)
-        }
-        //Ok(())
-      },
-      Err(ConnectionError::NoBackendAvailable) => {
-        let answer =  self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
-        client.set_answer(DefaultAnswerStatus::Answer503, answer);
-        Err(ConnectionError::NoBackendAvailable)
       }
-      Err(ConnectionError::HostNotFound) => {
-        let answer = self.listeners[&client.listen_token].answers.NotFound.clone();
-        client.set_answer(DefaultAnswerStatus::Answer404, answer);
-        Err(ConnectionError::HostNotFound)
-      }
-      e => panic!(e)
+    }
+
+    // we still want to use the new socket
+    client.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::writable()));
+
+
+    socket.set_nodelay(true);
+    client.back_readiness().map(|r| {
+      r.interest.insert(Ready::writable());
+      r.interest.insert(UnixReady::hup());
+      r.interest.insert(UnixReady::error());
+    });
+    if replacing_connection {
+      client.set_back_token(old_back_token.expect("FIXME"));
+      poll.register(
+        &socket,
+        client.back_token().expect("FIXME"),
+        Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+        PollOpt::edge()
+      );
+      client.set_back_socket(socket);
+      Ok(BackendConnectAction::Replace)
+    } else {
+      poll.register(
+        &socket,
+        back_token,
+        Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+        PollOpt::edge()
+      );
+
+      client.set_back_socket(socket);
+      client.set_back_token(back_token);
+      Ok(BackendConnectAction::New)
     }
   }
 
