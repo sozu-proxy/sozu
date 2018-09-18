@@ -218,6 +218,8 @@ pub struct Application {
     pub proxy_protocol:    Option<ProxyProtocolConfig>,
     #[serde(rename = "load_balancing_policy")]
     pub load_balancing_policy: LoadBalancingAlgorithms,
+    pub answer_503: Option<String>,
+    pub maintenance_page: Option<String>,
 }
 
 fn socketaddr_cmp(a: &SocketAddr, b: &SocketAddr) -> Ordering {

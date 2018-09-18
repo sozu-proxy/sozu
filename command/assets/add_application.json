@@ -9,7 +9,9 @@
       "sticky_session": true,
       "https_redirect": true,
       "proxy_protocol": "EXPECT_HEADER",
-      "load_balancing_policy": "roundrobin"
+      "load_balancing_policy": "roundrobin",
+      "answer_503": null,
+      "maintenance_page": null
     }
   }
 }

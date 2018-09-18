@@ -396,6 +396,8 @@ mod tests {
                   https_redirect: true,
                   proxy_protocol: Some(ProxyProtocolConfig::ExpectHeader),
                   load_balancing_policy: LoadBalancingAlgorithms::RoundRobin,
+                  answer_503: None,
+                  maintenance_page: None,
       })),
       proxy_id: None
     });

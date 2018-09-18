@@ -638,7 +638,7 @@ impl CommandServer {
     }
 
     let id = message_id.to_string();
-    let should_stop_master = proxy_id.is_none();
+    let should_stop_master = (order == Order::SoftStop || order == Order::HardStop) && proxy_id.is_none();
     let f = join_all(futures).map(move |_| {
       if should_stop_master {
         executor::Executor::stop_master();
