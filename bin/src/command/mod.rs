@@ -437,6 +437,8 @@ impl CommandServer {
       self.handle_worker_message(token, msg);
     }
 
+    self.run_executor();
+
     let worker_run_state = self.proxies.get(&token).as_ref().map(|proxy| proxy.run_state);
     if self.config.worker_automatic_restart && worker_run_state == Some(RunState::NotAnswering) {
       self.check_worker_status(token);
@@ -522,8 +524,6 @@ impl CommandServer {
 
   fn handle_worker_message(&mut self, token: Token, msg: OrderMessageAnswer) {
     Executor::handle_message(token, msg);
-
-    self.run_executor();
   }
 
   pub fn check_worker_status(&mut self, token: Token) {
