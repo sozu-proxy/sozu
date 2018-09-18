@@ -328,6 +328,7 @@ pub struct FileAppConfig {
   pub send_proxy:            Option<bool>,
   #[serde(default)]
   pub load_balancing_policy: LoadBalancingAlgorithms,
+  pub maintenance_page:      Option<String>,
 }
 
 #[derive(Debug,Copy,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -387,6 +388,11 @@ pub struct BackendConfig {
 
 impl FileAppConfig {
   pub fn to_app_config(self, app_id: &str, expect_proxy: &HashSet<SocketAddr>) -> Result<AppConfig, String> {
+    let maintenance_page = self.maintenance_page.as_ref().and_then(|path| Config::load_file(&path).map_err(|e| {
+      error!("cannot load 503 error page at path '{}': {:?}", path, e);
+      e
+    }).ok());
+
     match self.protocol {
       FileAppProtocolConfig::Tcp => {
         let mut has_expect_proxy = None;
@@ -427,6 +433,7 @@ impl FileAppConfig {
           backends:       self.backends,
           proxy_protocol,
           load_balancing_policy: self.load_balancing_policy,
+          maintenance_page,
         }))
       },
       FileAppProtocolConfig::Http => {
@@ -445,6 +452,7 @@ impl FileAppConfig {
           sticky_session:    self.sticky_session.unwrap_or(false),
           https_redirect:    self.https_redirect.unwrap_or(false),
           load_balancing_policy: self.load_balancing_policy,
+          maintenance_page,
         }))
       }
     }
@@ -512,6 +520,7 @@ pub struct HttpAppConfig {
   pub sticky_session:    bool,
   pub https_redirect:    bool,
   pub load_balancing_policy: LoadBalancingAlgorithms,
+  pub maintenance_page: Option<String>,
 }
 
 impl HttpAppConfig {
@@ -524,6 +533,7 @@ impl HttpAppConfig {
       https_redirect: self.https_redirect,
       proxy_protocol: None,
       load_balancing_policy: self.load_balancing_policy,
+      maintenance_page: self.maintenance_page.clone(),
     }));
 
     for frontend in &self.frontends {
@@ -566,6 +576,7 @@ pub struct TcpAppConfig {
   #[serde(default)]
   pub proxy_protocol:    Option<ProxyProtocolConfig>,
   pub load_balancing_policy: LoadBalancingAlgorithms,
+  pub maintenance_page: Option<String>,
 }
 
 impl TcpAppConfig {
@@ -578,6 +589,7 @@ impl TcpAppConfig {
       https_redirect: false,
       proxy_protocol: self.proxy_protocol.clone(),
       load_balancing_policy: self.load_balancing_policy,
+      maintenance_page: self.maintenance_page.clone(),
     }));
 
     for frontend in &self.frontends {
