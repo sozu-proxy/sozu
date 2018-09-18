@@ -89,7 +89,6 @@ impl BackendMap {
         }
         return Err(ConnectionError::NoBackendAvailable);
       }
-      Err(ConnectionError::NoBackendAvailable)
     } else {
       Err(ConnectionError::NoBackendAvailable)
     }
