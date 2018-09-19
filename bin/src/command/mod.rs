@@ -314,6 +314,9 @@ impl CommandServer {
             if proxy.run_state != RunState::Stopped && proxy.run_state != RunState::Stopping {
               proxy.run_state = RunState::NotAnswering;
             }
+            if proxy.run_state == RunState::Stopping {
+              proxy.run_state = RunState::Stopped;
+            }
           }
 
         }
@@ -440,7 +443,7 @@ impl CommandServer {
     self.run_executor();
 
     let worker_run_state = self.proxies.get(&token).as_ref().map(|proxy| proxy.run_state);
-    if self.config.worker_automatic_restart && worker_run_state == Some(RunState::NotAnswering) {
+    if (self.config.worker_automatic_restart && worker_run_state == Some(RunState::NotAnswering)) || worker_run_state == Some(RunState::Stopping) {
       self.check_worker_status(token);
     }
   }
@@ -529,9 +532,9 @@ impl CommandServer {
   pub fn check_worker_status(&mut self, token: Token) {
     {
       let ref mut proxy = self.proxies.get_mut(&token).expect("there should be a worker at that token");
-      let res = waitpid(Pid::from_raw(proxy.pid), Some(WaitPidFlag::WNOHANG));
+      let res = kill(Pid::from_raw(proxy.pid), None);
 
-      if let Ok(WaitStatus::StillAlive) = res {
+      if let Ok(()) = res {
         if proxy.run_state == RunState::NotAnswering {
           error!("worker process {} (PID = {}) not answering, killing and replacing", proxy.id, proxy.pid);
           if let Err(e) = kill(Pid::from_raw(proxy.pid), Signal::SIGKILL) {
@@ -546,6 +549,11 @@ impl CommandServer {
       } else {
         if proxy.run_state == RunState::NotAnswering {
           error!("worker process {} (PID = {}) stopped running, replacing", proxy.id, proxy.pid);
+        } else if proxy.run_state == RunState::Stopping {
+          info!("worker process {} (PID = {}) not detected, assuming it stopped", proxy.id, proxy.pid);
+          proxy.run_state = RunState::Stopped;
+          let _ = self.poll.deregister(&proxy.channel.sock);
+          return;
         } else {
           error!("failed to check process status: {:?}", res);
           return;
@@ -557,31 +565,33 @@ impl CommandServer {
 
     self.proxies.remove(&token);
 
-    incr!("worker_restart");
+    if self.config.worker_automatic_restart {
+      incr!("worker_restart");
 
-    let id = self.next_id;
-    let listeners = Some(Listeners {
-      http: Vec::new(),
-      tls:  Vec::new(),
-      tcp:  Vec::new(),
-    });
+      let id = self.next_id;
+      let listeners = Some(Listeners {
+        http: Vec::new(),
+        tls:  Vec::new(),
+        tcp:  Vec::new(),
+      });
 
-    if let Ok(mut worker) = start_worker(id, &self.config, self.executable_path.clone(), &self.state, listeners) {
-      info!("created new worker: {}", id);
-      self.next_id += 1;
-      let worker_token = self.token_count + 1;
-      self.token_count = worker_token;
-      worker.token     = Some(Token(worker_token));
+      if let Ok(mut worker) = start_worker(id, &self.config, self.executable_path.clone(), &self.state, listeners) {
+        info!("created new worker: {}", id);
+        self.next_id += 1;
+        let worker_token = self.token_count + 1;
+        self.token_count = worker_token;
+        worker.token     = Some(Token(worker_token));
 
-      debug!("registering new sock {:?} at token {:?} for id {} (sock error: {:?})",
-        worker.channel.sock, worker_token, worker.id, worker.channel.sock.take_error());
+        debug!("registering new sock {:?} at token {:?} for id {} (sock error: {:?})",
+          worker.channel.sock, worker_token, worker.id, worker.channel.sock.take_error());
 
-      self.poll.register(&worker.channel.sock, Token(worker_token),
-        Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
-        PollOpt::edge()).unwrap();
-      worker.token = Some(Token(worker_token));
-      self.proxies.insert(Token(worker_token), worker);
+        self.poll.register(&worker.channel.sock, Token(worker_token),
+          Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
+          PollOpt::edge()).unwrap();
+        worker.token = Some(Token(worker_token));
+        self.proxies.insert(Token(worker_token), worker);
 
+      }
     }
   }
 }
