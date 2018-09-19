@@ -1832,7 +1832,7 @@ mod tests {
       let expected = RequestLine {
         method: b"GET",
         uri: b"/index.html",
-        version: [b"1", b"1"]
+        version: Version::V11
       };
 
       assert_eq!(result, Ok((&[][..], expected)));
@@ -1885,79 +1885,6 @@ mod tests {
   }
 
   #[test]
-  fn request_get_test() {
-      let input =
-          b"GET /index.html HTTP/1.1\r\n\
-            Host: localhost:8888\r\n\
-            User-Agent: curl/7.43.0\r\n\
-            Accept: */*\r\n\
-            \r\n";
-      let result = request_head(input);
-      let expected = Request {
-        request_line: RequestLine {
-        method: b"GET",
-        uri: b"/index.html",
-        version: [b"1", b"1"]
-      },
-        headers: vec!(
-          Header {
-            name: b"Host",
-            value: b"localhost:8888"
-          },
-          Header {
-            name: b"User-Agent",
-            value: b"curl/7.43.0"
-          },
-          Header {
-            name: b"Accept",
-            value: b"*/*"
-          }
-        )
-      };
-
-      assert_eq!(result, Ok((&b""[..], expected)))
-  }
-
-  #[test]
-  fn content_length_test() {
-      let input =
-          b"GET /index.html HTTP/1.1\r\n\
-            Host: localhost:8888\r\n\
-            User-Agent: curl/7.43.0\r\n\
-            Accept: */*\r\n\
-            Content-Length: 200\r\n\
-            \r\n";
-      let result = request_head(input);
-      let expected = Request {
-        request_line: RequestLine {
-        method: b"GET",
-        uri: b"/index.html",
-        version: [b"1", b"1"]
-      },
-        headers: vec!(
-          Header {
-            name: b"Host",
-            value: b"localhost:8888"
-          },
-          Header {
-            name: b"User-Agent",
-            value: b"curl/7.43.0"
-          },
-          Header {
-            name: b"Accept",
-            value: b"*/*"
-          },
-          Header {
-            name: b"Content-Length",
-            value: b"200"
-          }
-        )
-      };
-
-      assert_eq!(result, Ok((&b""[..], expected)));
-  }
-
-  #[test]
   fn header_user_agent() {
       let input = b"User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10.10; rv:44.0) Gecko/20100101 Firefox/44.0\r\n";
 
@@ -2001,7 +1928,7 @@ mod tests {
           req_header_end: Some(110),
           res_header_end: None,
           request: Some(RequestState::RequestWithBody(
-            RRequestLine { method: String::from("GET"), uri: String::from("http://example.com:8888/index.html"), version: String::from("11") },
+            RRequestLine { method: Method::Get, uri: String::from("http://example.com:8888/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("example.com"),
             200
@@ -2042,7 +1969,7 @@ mod tests {
           req_header_end: None,
           res_header_end: None,
           request: Some(RequestState::Error(Some(
-            RRequestLine { method: String::from("GET"), uri: String::from("http://example.com:8888/index.html"), version: String::from("11") },
+            RRequestLine { method: Method::Get, uri: String::from("http://example.com:8888/index.html"), version: Version::V11 },
           ),
             Some(Connection::new()), Some(String::from("example.com")), None, None)),
           response: Some(ResponseState::Initial),
@@ -2083,7 +2010,7 @@ mod tests {
           req_header_end: Some(109),
           res_header_end: None,
           request: Some(RequestState::RequestWithBody(
-            RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
+            RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             200
@@ -2109,9 +2036,9 @@ mod tests {
         res_header_end: None,
         request:  Some(RequestState::HasRequestLine(
           RRequestLine {
-            method: String::from("GET"),
+            method: Method::Get,
             uri: String::from("/index.html"),
-            version: String::from("11")
+            version: Version::V11
           },
           Connection::keep_alive()
         )),
@@ -2147,7 +2074,7 @@ mod tests {
           req_header_end: Some(109),
           res_header_end: None,
           request:    Some(RequestState::RequestWithBody(
-            RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
+            RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
             Connection::keep_alive(),
             String::from("localhost:8888"),
             200
@@ -2182,7 +2109,7 @@ mod tests {
           req_header_end: Some(116),
           res_header_end: None,
           request:    Some(RequestState::RequestWithBodyChunks(
-            RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
+            RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             Chunk::Initial
@@ -2217,7 +2144,7 @@ mod tests {
           req_header_end: None,
           res_header_end: None,
           request: Some(RequestState::Error(Some(
-            RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
+            RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
           ),
             Some(Connection::new()), Some(String::from("localhost:8888")),
             Some(LengthInformation::Length(120)), None)),
@@ -2253,7 +2180,7 @@ mod tests {
           req_header_end: Some(136),
           res_header_end: None,
           request:  Some(RequestState::RequestWithBodyChunks(
-            RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
+            RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             Chunk::Initial
@@ -2292,7 +2219,7 @@ mod tests {
           req_header_end: Some(59),
           res_header_end: None,
           request:  Some(RequestState::Request(
-            RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
+            RRequestLine { method: Method::Get, uri: String::from("/"), version: Version::V11 },
             Connection::close(),
             String::from("localhost:8888")
           )),
@@ -2324,7 +2251,7 @@ mod tests {
           req_header_end: Some(40),
           res_header_end: None,
           request:  Some(RequestState::Request(
-            RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
+            RRequestLine { method: Method::Get, uri: String::from("/"), version: Version::V10 },
             Connection::new(),
             String::from("localhost:8888")
           )),
@@ -2363,7 +2290,7 @@ mod tests {
           req_header_end: Some(64),
           res_header_end: None,
           request:  Some(RequestState::Request(
-            RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("10") },
+            RRequestLine { method: Method::Get, uri: String::from("/"), version: Version::V10 },
             Connection::keep_alive(),
             String::from("localhost:8888")
           )),
@@ -2400,7 +2327,7 @@ mod tests {
           req_header_end: Some(40),
           res_header_end: None,
           request:  Some(RequestState::Request(
-            RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
+            RRequestLine { method: Method::Get, uri: String::from("/"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888")
           )),
@@ -2438,7 +2365,7 @@ mod tests {
           req_header_end: Some(59),
           res_header_end: None,
           request:  Some(RequestState::Request(
-            RRequestLine { method: String::from("GET"), uri: String::from("/"), version: String::from("11") },
+            RRequestLine { method: Method::Get, uri: String::from("/"), version: Version::V11 },
             Connection::close(),
             String::from("localhost:8888")
           )),
@@ -2482,7 +2409,7 @@ mod tests {
           req_header_end: Some(109),
           res_header_end: None,
           request: Some(RequestState::RequestWithBody(
-            RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
+            RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             200
@@ -2578,7 +2505,7 @@ mod tests {
           req_header_end: Some(117),
           res_header_end: None,
           request:    Some(RequestState::RequestWithBodyChunks(
-            RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
+            RRequestLine { method: Method::Post, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             Chunk::Ended
@@ -2621,7 +2548,7 @@ mod tests {
           req_header_end: Some(117),
           res_header_end: None,
           request:    Some(RequestState::RequestWithBodyChunks(
-            RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
+            RRequestLine { method: Method::Post, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             Chunk::Copying
@@ -2645,7 +2572,7 @@ mod tests {
           req_header_end: Some(117),
           res_header_end: None,
           request:    Some(RequestState::RequestWithBodyChunks(
-            RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
+            RRequestLine { method: Method::Post, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             Chunk::Copying
@@ -2667,7 +2594,7 @@ mod tests {
           req_header_end: Some(117),
           res_header_end: None,
           request:    Some(RequestState::RequestWithBodyChunks(
-            RRequestLine { method: String::from("POST"), uri: String::from("/index.html"), version: String::from("11") },
+            RRequestLine { method: Method::Post, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             Chunk::Ended
@@ -2710,7 +2637,7 @@ mod tests {
           res_header_end: Some(74),
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
-            RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
+            RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::new(),
             Chunk::Copying
           )),
@@ -2733,7 +2660,7 @@ mod tests {
           res_header_end: Some(74),
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
-            RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
+            RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::new(),
             Chunk::Copying
           )),
@@ -2756,7 +2683,7 @@ mod tests {
           res_header_end: Some(74),
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
-            RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
+            RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::new(),
             Chunk::CopyingLastHeader
           )),
@@ -2778,7 +2705,7 @@ mod tests {
           res_header_end: Some(74),
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
-            RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
+            RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::new(),
             Chunk::Ended
           )),
@@ -2810,7 +2737,7 @@ mod tests {
         res_header_end: None,
         request:      Some(RequestState::Initial),
         response:     Some(ResponseState::HasLength(
-          RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
+          RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
           Connection::keep_alive(),
           LengthInformation::Chunked
         )),
@@ -2836,7 +2763,7 @@ mod tests {
           res_header_end: Some(74),
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
-            RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
+            RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::keep_alive(),
             Chunk::Initial
           )),
@@ -2858,7 +2785,7 @@ mod tests {
           res_header_end: Some(74),
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
-            RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
+            RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::keep_alive(),
             Chunk::Copying
           )),
@@ -2883,7 +2810,7 @@ mod tests {
           res_header_end: Some(74),
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
-            RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
+            RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::keep_alive(),
             Chunk::CopyingLastHeader
           )),
@@ -2903,7 +2830,7 @@ mod tests {
           res_header_end: Some(74),
           request:      Some(RequestState::Initial),
           response:     Some(ResponseState::ResponseWithBodyChunks(
-            RStatusLine { version: String::from("11"), status: 200, reason: String::from("OK") },
+            RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::keep_alive(),
             Chunk::Ended
           )),
@@ -2950,7 +2877,7 @@ mod tests {
         res_header_end: Some(125),
         request:  Some(RequestState::Initial),
         response: Some(ResponseState::ResponseWithBody(
-          RStatusLine { version: String::from("11"), status: 302, reason: String::from("Found") },
+          RStatusLine { version: Version::V11, status: 302, reason: String::from("Found") },
           Connection::close(),
           0
         )),
@@ -2993,7 +2920,7 @@ mod tests {
         res_header_end: Some(129),
         request: Some(RequestState::Initial),
         response: Some(ResponseState::ResponseWithBody(
-          RStatusLine { version: String::from("11"), status: 303, reason: String::from("See Other") },
+          RStatusLine { version: Version::V11, status: 303, reason: String::from("See Other") },
           Connection::close(),
           0
         )),
@@ -3050,7 +2977,7 @@ mod tests {
         req_header_end: Some(110),
         res_header_end: None,
         request:  Some(RequestState::Request(
-            RRequestLine { method: String::from("HEAD"), uri: String::from("/index.html"), version: String::from("11") },
+            RRequestLine { method: Method::Head, uri: String::from("/index.html"), version: Version::V11 },
           Connection::new(),
           String::from("localhost:8888")
         )),
@@ -3078,12 +3005,12 @@ mod tests {
           req_header_end: Some(110),
           res_header_end: Some(40),
           request:  Some(RequestState::Request(
-              RRequestLine { method: String::from("HEAD"), uri: String::from("/index.html"), version: String::from("11") },
+              RRequestLine { method: Method::Head, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888")
           )),
           response: Some(ResponseState::Response(
-            RStatusLine { version: String::from("11"), status: 200, reason: String::from("Ok") },
+            RStatusLine { version: Version::V11, status: 200, reason: String::from("Ok") },
             Connection::new()
           )),
           added_req_header: String::from(""),
@@ -3124,7 +3051,7 @@ mod tests {
           req_header_end: Some(141),
           res_header_end: None,
           request: Some(RequestState::Request(
-            RRequestLine { method: String::from("GET"), uri: String::from("/index.html"), version: String::from("11") },
+            RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
             Connection {
               keep_alive:  Some(true),
               has_upgrade: true,
