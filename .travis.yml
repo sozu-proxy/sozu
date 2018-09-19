@@ -21,10 +21,14 @@ before_script:
 matrix:
   include:
     - rust: nightly
+      env: CODECOV=1
       before_script:
         - which cargo-tarpaulin || `RUSTFLAGS="--cfg procmacro2_semver_exempt" cargo install cargo-tarpaulin`
       script:
-        cd $ROOT_PATH && cargo tarpaulin --all --features use-openssl --ciserver travis-ci --coveralls $TRAVIS_JOB_ID
+        cd $ROOT_PATH && cargo +nightly tarpaulin --all --features use-openssl --ciserver travis-ci --coveralls $TRAVIS_JOB_ID
+  allow_failures:
+    - rust: nightly
+      env: CODECOV=1
 
 # Dependencies of kcov, used by coverage
 addons:
@@ -37,6 +41,8 @@ addons:
       - libssl-dev
       - libssl1.0.0
       - cmake
+      - pkg-config
+      - zlib1g-dev
     sources:
       - kalakris-cmake
 
