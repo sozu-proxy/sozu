@@ -12,7 +12,7 @@ use nom::{AsChar, is_alphanumeric,is_space,space};
 
 use url::Url;
 
-use std::str;
+use std::{fmt,str};
 use std::cmp::min;
 use std::convert::From;
 use std::collections::HashSet;
@@ -74,6 +74,59 @@ named!(pub vchar_ws_1, take_while!(is_vchar_or_ws));
 
 named!(digit_complete, take_while1_complete!(|item:u8| item.is_dec_digit()));
 
+#[derive(PartialEq,Debug,Clone)]
+pub enum Method {
+  Get,
+  Post,
+  Head,
+  Options,
+  Put,
+  Delete,
+  Trace,
+  Connect,
+  Custom(String),
+}
+
+impl Method {
+  pub fn new(s: &[u8]) -> Method {
+    if compare_no_case(&s, b"GET") {
+      Method::Get
+    } else if compare_no_case(&s, b"POST") {
+      Method::Post
+    } else if compare_no_case(&s, b"HEAD") {
+      Method::Head
+    } else if compare_no_case(&s, b"OPTIONS") {
+      Method::Options
+    } else if compare_no_case(&s, b"PUT") {
+      Method::Put
+    } else if compare_no_case(&s, b"DELETE") {
+      Method::Delete
+    } else if compare_no_case(&s, b"TRACE") {
+      Method::Trace
+    } else if compare_no_case(&s, b"CONNECT") {
+      Method::Connect
+    } else {
+      Method::Custom(String::from(unsafe { str::from_utf8_unchecked(s) }))
+    }
+  }
+}
+
+impl fmt::Display for Method {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    match self {
+     Method::Get => write!(f, "GET"),
+     Method::Post => write!(f, "POST"),
+     Method::Head => write!(f, "HEAD"),
+     Method::Options => write!(f, "OPTIONS"),
+     Method::Put => write!(f, "PUT"),
+     Method::Delete => write!(f, "DELETE"),
+     Method::Trace => write!(f, "TRACE"),
+     Method::Connect => write!(f, "CONNECT"),
+     Method::Custom(s)  => write!(f, "{}", s),
+    }
+  }
+}
+
 #[derive(PartialEq,Debug)]
 pub struct RequestLine<'a> {
     pub method: &'a [u8],
@@ -83,25 +136,21 @@ pub struct RequestLine<'a> {
 
 #[derive(PartialEq,Debug,Clone)]
 pub struct RRequestLine {
-    pub method: String,
+    pub method: Method,
     pub uri: String,
     pub version: String
 }
 
 impl RRequestLine {
   pub fn from_request_line(r: RequestLine) -> Option<RRequestLine> {
-    if let Ok(method) = str::from_utf8(r.method) {
-      if let Ok(uri) = str::from_utf8(r.uri) {
-        if let Ok(version1) = str::from_utf8(r.version[0]) {
-          if let Ok(version2) = str::from_utf8(r.version[1]) {
-            Some(RRequestLine {
-              method:  method.to_uppercase(),
-              uri:     String::from(uri),
-              version: String::from(version1) + version2
-            })
-          } else {
-            None
-          }
+    if let Ok(uri) = str::from_utf8(r.uri) {
+      if let Ok(version1) = str::from_utf8(r.version[0]) {
+        if let Ok(version2) = str::from_utf8(r.version[1]) {
+          Some(RRequestLine {
+            method:  Method::new(r.method),
+            uri:     String::from(uri),
+            version: String::from(version1) + version2
+          })
         } else {
           None
         }
@@ -801,7 +850,7 @@ impl RequestState {
       RequestState::Request(ref rl, _, _)            |
       RequestState::RequestWithBody(ref rl, _, _, _) |
       RequestState::RequestWithBodyChunks(ref rl, _, _, _) => {
-        &rl.method == "HEAD"
+        rl.method == Method::Head
       },
       _                                                => false
     }
