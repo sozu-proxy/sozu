@@ -3270,7 +3270,7 @@ mod bench {
     //println!("res: {:?}", parse_request_until_stop(initial, &mut buf, b""));
     b.iter(||{
       let initial = HttpState::new();
-      parse_request_until_stop(initial, "", &mut buf)
+      parse_request_until_stop(initial, "", &mut buf, "")
     });
   }
 
@@ -3289,7 +3289,7 @@ mod bench {
       let mut position      = 0;
       loop {
         let test_position = position;
-        let (mv, new_state) = parse_request(current_state, &data[test_position..]);
+        let (mv, new_state) = parse_request(current_state, &data[test_position..], "");
         current_state = new_state;
 
         if let BufferMove::Delete(end) = mv {
@@ -3305,7 +3305,7 @@ mod bench {
 
         match current_state {
           RequestState::Request(_,_,_) | RequestState::RequestWithBody(_,_,_,_) |
-            RequestState::Error(_) | RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended) => break,
+            RequestState::Error(_,_,_,_,_) | RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended) => break,
           _ => ()
         }
 
