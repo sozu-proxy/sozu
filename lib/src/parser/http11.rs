@@ -17,6 +17,18 @@ use std::cmp::min;
 use std::convert::From;
 use std::collections::HashSet;
 
+pub fn compare_no_case(left: &[u8], right: &[u8]) -> bool {
+  if left.len() != right.len() {
+    return false;
+  }
+
+  left.iter().zip(right).all(|(a, b)| match (*a, *b) {
+    (0...64, 0...64) | (91...96, 91...96) | (123...255, 123...255) => a == b,
+    (65...90, 65...90) | (97...122, 97...122) | (65...90, 97...122) | (97...122, 65...90) => *a | 0b00_10_00_00 == *b | 0b00_10_00_00,
+    _ => false
+  })
+}
+
 // Primitives
 fn is_token_char(i: u8) -> bool {
   is_alphanumeric(i) ||
@@ -483,123 +495,91 @@ pub enum HeaderResult<T> {
 
 impl<'a> Header<'a> {
   pub fn value(&self) -> HeaderValue {
-    //FIXME: should replace with allocation-free, case insensitive matching here
-    match &self.name.to_ascii_lowercase()[..] {
-      b"host" => {
-        //FIXME: UTF8 conversion should be unchecked here, since we already checked the tokens?
-        if let Some(s) = str::from_utf8(self.value).map(|s| String::from(s)).ok() {
-          HeaderValue::Host(s)
-        } else {
-          HeaderValue::Error
-        }
-      },
-      b"content-length" => {
-        if let Ok(l) = str::from_utf8(self.value) {
-          if let Some(length) = l.parse().ok() {
-             return HeaderValue::ContentLength(length)
-          }
-        }
+    if compare_no_case(self.name, b"host") {
+      //FIXME: UTF8 conversion should be unchecked here, since we already checked the tokens?
+      if let Some(s) = str::from_utf8(self.value).map(|s| String::from(s)).ok() {
+        HeaderValue::Host(s)
+      } else {
         HeaderValue::Error
-      },
-      b"transfer-encoding" => {
-        match &self.value.to_ascii_lowercase()[..] {
-          b"chunked"  => HeaderValue::Encoding(TransferEncodingValue::Chunked),
-          b"compress" => HeaderValue::Encoding(TransferEncodingValue::Compress),
-          b"deflate"  => HeaderValue::Encoding(TransferEncodingValue::Deflate),
-          b"gzip"     => HeaderValue::Encoding(TransferEncodingValue::Gzip),
-          b"identity" => HeaderValue::Encoding(TransferEncodingValue::Identity),
-          _           => HeaderValue::Encoding(TransferEncodingValue::Unknown)
-        }
-      },
-      b"connection" => {
-        match comma_separated_header_values(self.value) {
-          Some(tokens) => HeaderValue::Connection(tokens),
-          None         => HeaderValue::Error
-        }
-      },
-      b"upgrade" => HeaderValue::Upgrade(self.value),
-      b"forwarded" | b"x-forwarded-for" | b"x-forwarded-proto" | b"x-forwarded-port" => {
-        HeaderValue::Forwarded
-      },
-      b"expect" => {
-        if &self.value.to_ascii_lowercase() == b"100-continue" {
-          HeaderValue::ExpectContinue
-        } else {
-          HeaderValue::Error
-        }
-      },
-      b"cookie" => {
-        match parse_request_cookies(self.value) {
-          Some(cookies) => HeaderValue::Cookie(cookies),
-          None          => HeaderValue::Error
-        }
-      },
-      /*b"forwarded" => {
-        match comma_separated_header_value(self.value) {
-          Some(forwarded) => HeaderValue::Forwarded(forwarded),
-          None            => HeaderValue::Error
-        }
-      },
-      b"x-forwarded-for" => {
-        match comma_separated_header_value(self.value) {
-          Some(ips) => HeaderValue::XForwardedFor(ips),
-          None      => HeaderValue::Error
+      }
+    } else if compare_no_case(self.name, b"content-length") {
+      if let Ok(l) = str::from_utf8(self.value) {
+        if let Some(length) = l.parse().ok() {
+           return HeaderValue::ContentLength(length)
         }
       }
-      b"x-forwarded-proto" => {
-        match &self.value.to_ascii_lowercase()[..] {
-          b"http"  => HeaderValue::XForwardedProto(ForwardedProtocol::HTTP),
-          b"https" => HeaderValue::XForwardedProto(ForwardedProtocol::HTTPS),
-          _        => HeaderValue::Error
-        }
+      HeaderValue::Error
+    } else if compare_no_case(self.name, b"transfer-encoding") {
+      if compare_no_case(&self.value, b"chunked") {
+        HeaderValue::Encoding(TransferEncodingValue::Chunked)
+      } else if compare_no_case(&self.value, b"compress") {
+        HeaderValue::Encoding(TransferEncodingValue::Compress)
+      } else if compare_no_case(&self.value, b"deflate") {
+        HeaderValue::Encoding(TransferEncodingValue::Deflate)
+      } else if compare_no_case(&self.value, b"gzip") {
+        HeaderValue::Encoding(TransferEncodingValue::Gzip)
+      } else if compare_no_case(&self.value, b"identity") {
+        HeaderValue::Encoding(TransferEncodingValue::Identity)
+      } else {
+        HeaderValue::Encoding(TransferEncodingValue::Unknown)
       }
-      b"x-forwarded-port" => {
-        match str::from_utf8(self.value) {
-          Err(_)  => HeaderValue::Error,
-          Ok(s) => match u16::from_str(s) {
-            Ok(val) => HeaderValue::XForwardedPort(val),
-            Err(_)  => HeaderValue::Error,
-          },
-        }
-      }*/
-      _ => HeaderValue::Other(self.name, self.value)
+    } else if compare_no_case(self.name, b"connection") {
+      match comma_separated_header_values(self.value) {
+        Some(tokens) => HeaderValue::Connection(tokens),
+        None         => HeaderValue::Error
+      }
+    } else if compare_no_case(self.name, b"upgrade") {
+      HeaderValue::Upgrade(self.value)
+    } else if compare_no_case(self.name, b"forwarded")   ||
+        compare_no_case(self.name, b"x-forwarded-for")   ||
+        compare_no_case(self.name, b"x-forwarded-proto") ||
+        compare_no_case(self.name, b"x-forwarded-port") {
+      HeaderValue::Forwarded
+    } else if compare_no_case(self.name, b"expect") {
+      if compare_no_case(self.value, b"100-continue") {
+        HeaderValue::ExpectContinue
+      } else {
+        HeaderValue::Error
+      }
+    } else if compare_no_case(self.name, b"cookie") {
+      match parse_request_cookies(self.value) {
+        Some(cookies) => HeaderValue::Cookie(cookies),
+        None          => HeaderValue::Error
+      }
+    } else {
+      HeaderValue::Other(self.name, self.value)
     }
   }
 
   pub fn should_delete(&self, conn: &Connection, sticky_name: &str) -> bool {
-    let lowercase = self.name.to_ascii_lowercase();
     //FIXME: we should delete this header anyway, and add a Connection: Upgrade if we detected an upgrade
-    if &lowercase[..] == b"connection" {
+    if compare_no_case(&self.name, b"connection") {
       match comma_separated_header_values(self.value) {
-        //FIXME: do case insensitive ascii comparison
-        Some(tokens) => ! tokens.iter().any(|value| &value.to_ascii_lowercase()[..] == b"upgrade"),
+        Some(tokens) => ! tokens.iter().any(|value| compare_no_case(&value, b"upgrade")),
         None         => true
       }
-    } else if &lowercase[..] == b"set-cookie" {
+    } else if compare_no_case(&self.name, b"set-cookie") {
       self.value.starts_with(sticky_name.as_bytes())
     } else {
-      &lowercase[..] == b"connection" && &self.value.to_ascii_lowercase()[..] != b"upgrade" ||
-      &lowercase[..] == b"forwarded"         ||
-      &lowercase[..] == b"x-forwarded-for"   ||
-      &lowercase[..] == b"x-forwarded-proto" ||
-      &lowercase[..] == b"x-forwarded-port"  ||
-      &lowercase[..] == b"sozu-id"           ||
+      (compare_no_case(&self.name, b"connection") && !compare_no_case(&self.value, b"upgrade")) ||
+      compare_no_case(&self.name, b"forwarded")         ||
+      compare_no_case(&self.name, b"x-forwarded-for")   ||
+      compare_no_case(&self.name, b"x-forwarded-proto") ||
+      compare_no_case(&self.name, b"x-forwarded-port")  ||
+      compare_no_case(&self.name, b"sozu-id")           ||
       conn.to_delete.contains(unsafe {str::from_utf8_unchecked(&self.value.to_ascii_lowercase()[..])})
     }
   }
 
   pub fn must_mutate(&self) -> bool {
-    let lowercase = self.name.to_ascii_lowercase();
-    match &lowercase[..] {
-      b"cookie" => true,
-      _ => false
-    }
+    compare_no_case(&self.name, b"cookie")
   }
 
   pub fn mutate_header(&self, buf: &[u8], offset: usize, sticky_name: &str) -> Vec<BufferMove> {
-    match &self.name.to_ascii_lowercase()[..] {
-      b"cookie" => self.remove_sticky_cookie_in_request(buf, offset, sticky_name),
-      _ => vec![BufferMove::Advance(offset)]
+    if compare_no_case(&self.name, b"cookie") {
+      self.remove_sticky_cookie_in_request(buf, offset, sticky_name)
+    } else {
+      vec![BufferMove::Advance(offset)]
     }
   }
 
@@ -1201,11 +1181,11 @@ pub fn validate_request_header(state: RequestState, header: &Header, sticky_name
       let mut conn = state.get_keep_alive().unwrap_or(Connection::new());
       for value in c {
       trace!("PARSER\tgot Connection header: \"{:?}\"", str::from_utf8(value).expect("could not make string from value"));
-        match &value.to_ascii_lowercase()[..] {
-          b"close"      => { conn.keep_alive = Some(false); },
-          b"keep-alive" => { conn.keep_alive = Some(true); },
-          b"upgrade"    => { conn.has_upgrade    = true; },
-          v             => { conn.to_delete.insert(unsafe { str::from_utf8_unchecked(v).to_string() }); },
+        if compare_no_case(&value, b"close") { conn.keep_alive = Some(false); }
+        else if compare_no_case(&value, b"keep-alive") { conn.keep_alive = Some(true); }
+        else if compare_no_case(&value, b"upgrade") { conn.has_upgrade    = true; }
+        else {
+          conn.to_delete.insert(unsafe { str::from_utf8_unchecked(value).to_string() });
         };
       }
       match state {
@@ -1430,12 +1410,10 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
       let mut conn = state.get_keep_alive().unwrap_or(Connection::new());
       for value in c {
       trace!("PARSER\tgot Connection header: \"{:?}\"", str::from_utf8(value).expect("could not make string from value"));
-        match &value.to_ascii_lowercase()[..] {
-          b"close"      => { conn.keep_alive = Some(false); },
-          b"keep-alive" => { conn.keep_alive = Some(true); },
-          b"upgrade"    => { conn.has_upgrade    = true; },
-          v             => { conn.to_delete.insert(unsafe { str::from_utf8_unchecked(v).to_string() }); },
-        };
+        if compare_no_case(&value, b"close") { conn.keep_alive = Some(false); }
+          else if compare_no_case(&value, b"keep-alive") { conn.keep_alive = Some(true); }
+          else if compare_no_case(&value, b"upgrade") { conn.has_upgrade    = true; }
+          else { conn.to_delete.insert(unsafe { str::from_utf8_unchecked(value).to_string() }); }
       }
       match state {
         ResponseState::HasStatusLine(rl, _)     => ResponseState::HasStatusLine(rl, conn),
