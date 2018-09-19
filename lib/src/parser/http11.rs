@@ -481,44 +481,6 @@ impl Chunk {
 }
 
 #[derive(PartialEq,Debug)]
-pub struct Request<'a> {
-    pub request_line: RequestLine<'a>,
-    pub headers: Vec<Header<'a>>
-}
-
-named!(pub request_head<Request>,
-  do_parse!(
-    rl: request_line >>
-    hs: many0!(message_header) >>
-    crlf >> (
-      Request {
-        request_line: rl,
-        headers: hs
-      }
-    )
-  )
-);
-
-#[derive(PartialEq,Debug)]
-pub struct Response<'a> {
-    pub status_line: StatusLine<'a>,
-    pub headers: Vec<Header<'a>>
-}
-
-named!(pub response_head<Response>,
-  do_parse!(
-    sl: status_line >>
-    hs: many0!(message_header) >>
-    crlf >> (
-      Response {
-        status_line: sl,
-        headers: hs
-      }
-    )
-  )
-);
-
-#[derive(PartialEq,Debug)]
 pub enum TransferEncodingValue {
   Chunked,
   Compress,
