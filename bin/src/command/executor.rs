@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use slab::Slab;
 use std::collections::{HashSet, VecDeque};
-use sozu_command::messages::{Order, OrderMessage, OrderMessageAnswer, OrderMessageStatus};
-use sozu_command::data::{ConfigMessageAnswer, ConfigMessageStatus};
+use sozu_command::messages::{OrderMessage, OrderMessageAnswer, OrderMessageStatus};
+use sozu_command::data::ConfigMessageAnswer;
 use super::FrontToken;
 
 lazy_static! {
@@ -278,7 +278,8 @@ mod tests {
   use futures::executor::spawn;
   use futures::task;
   use futures::future::{lazy, result};
-  use sozu_command::messages::OrderMessageStatus;
+  use sozu_command::messages::{Order,OrderMessageStatus};
+  use sozu_command::data::ConfigMessageStatus;
 
   #[test]
   fn executor() {
