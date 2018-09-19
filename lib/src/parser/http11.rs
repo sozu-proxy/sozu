@@ -127,29 +127,63 @@ impl fmt::Display for Method {
   }
 }
 
+#[derive(PartialEq,Debug,Clone,Copy)]
+pub enum Version {
+  V10,
+  V11,
+}
+
 #[derive(PartialEq,Debug)]
 pub struct RequestLine<'a> {
     pub method: &'a [u8],
     pub uri: &'a [u8],
-    pub version: [&'a [u8];2]
+    pub version: Version
 }
 
 #[derive(PartialEq,Debug,Clone)]
 pub struct RRequestLine {
     pub method: Method,
     pub uri: String,
-    pub version: String
+    pub version: Version
 }
 
 impl RRequestLine {
   pub fn from_request_line(r: RequestLine) -> Option<RRequestLine> {
     if let Ok(uri) = str::from_utf8(r.uri) {
-      if let Ok(version1) = str::from_utf8(r.version[0]) {
-        if let Ok(version2) = str::from_utf8(r.version[1]) {
-          Some(RRequestLine {
-            method:  Method::new(r.method),
-            uri:     String::from(uri),
-            version: String::from(version1) + version2
+      Some(RRequestLine {
+        method:  Method::new(r.method),
+        uri:     String::from(uri),
+        version: r.version
+      })
+    } else {
+      None
+    }
+  }
+}
+
+#[derive(PartialEq,Debug)]
+pub struct StatusLine<'a> {
+    pub version: Version,
+    pub status: &'a [u8],
+    pub reason: &'a [u8],
+}
+
+#[derive(PartialEq,Debug,Clone)]
+pub struct RStatusLine {
+    pub version: Version,
+    pub status:  u16,
+    pub reason:  String,
+}
+
+impl RStatusLine {
+  pub fn from_status_line(r: StatusLine) -> Option<RStatusLine> {
+    if let Ok(status_str) = str::from_utf8(r.status) {
+      if let Ok(status) = status_str.parse::<u16>() {
+        if let Ok(reason) = str::from_utf8(r.reason) {
+          Some(RStatusLine {
+            version: r.version,
+            status:  status,
+            reason:  String::from(reason),
           })
         } else {
           None
@@ -163,57 +197,16 @@ impl RRequestLine {
   }
 }
 
-#[derive(PartialEq,Debug)]
-pub struct StatusLine<'a> {
-    pub version: [&'a [u8];2],
-    pub status: &'a [u8],
-    pub reason: &'a [u8],
-}
-
-#[derive(PartialEq,Debug,Clone)]
-pub struct RStatusLine {
-    pub version: String,
-    pub status:  u16,
-    pub reason:  String,
-}
-
-impl RStatusLine {
-  pub fn from_status_line(r: StatusLine) -> Option<RStatusLine> {
-    if let Ok(status_str) = str::from_utf8(r.status) {
-      if let Ok(status) = status_str.parse::<u16>() {
-        if let Ok(reason) = str::from_utf8(r.reason) {
-          if let Ok(version1) = str::from_utf8(r.version[0]) {
-            if let Ok(version2) = str::from_utf8(r.version[1]) {
-              Some(RStatusLine {
-                version: String::from(version1) + version2,
-                status:  status,
-                reason:  String::from(reason),
-              })
-            } else {
-              None
-            }
-          } else {
-            None
-          }
-        } else {
-          None
-        }
-      } else {
-        None
-      }
-    } else {
-      None
-    }
-  }
-}
-
-named!(pub http_version<[&[u8];2]>,
+named!(pub http_version<Version>,
 do_parse!(
   tag!("HTTP/") >>
-  major: digit >>
-  tag!(".") >>
-  minor: digit >> (
-    [major, minor] // ToDo do we need it?
+  tag!("1.") >>
+  minor: one_of!("01") >> (
+    if minor == '0' {
+      Version::V10
+    } else {
+      Version::V11
+    }
   )
 )
 );
@@ -930,14 +923,14 @@ impl RequestState {
   pub fn should_keep_alive(&self) -> bool {
     //FIXME: should not clone here
     let rl =  self.get_request_line();
-    let version: &str    = rl.as_ref().map(|rl| rl.version.as_str()).unwrap_or("");
+    let version = rl.as_ref().map(|rl| rl.version);
     let conn = self.get_keep_alive();
     match (version, conn.map(|c| c.keep_alive)) {
-      (_, Some(Some(true)))  => true,
-      (_, Some(Some(false))) => false,
-      ("10", _)              => false,
-      ("11", _)              => true,
-      (_, _)                 => false,
+      (_, Some(Some(true)))   => true,
+      (_, Some(Some(false)))  => false,
+      (Some(Version::V10), _) => false,
+      (Some(Version::V11), _) => true,
+      (_, _)                  => false,
     }
   }
 
@@ -1026,14 +1019,14 @@ impl ResponseState {
   pub fn should_keep_alive(&self) -> bool {
     //FIXME: should not clone here
     let sl      = self.get_status_line();
-    let version = sl.as_ref().map(|sl| sl.version.as_str()).unwrap_or("");
+    let version = sl.as_ref().map(|sl| sl.version);
     let conn    = self.get_keep_alive();
     match (version, conn.map(|c| c.keep_alive)) {
-      (_, Some(Some(true)))  => true,
-      (_, Some(Some(false))) => false,
-      ("10", _)              => false,
-      ("11", _)              => true,
-      (_, _)                 => false,
+      (_, Some(Some(true)))   => true,
+      (_, Some(Some(false)))  => false,
+      (Some(Version::V10), _) => false,
+      (Some(Version::V11), _) => true,
+      (_, _)                  => false,
     }
   }
 
