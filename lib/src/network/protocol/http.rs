@@ -484,16 +484,17 @@ impl<Front:SocketHandler> Http<Front> {
     debug!("{}\tFRONT: read {} bytes", self.log_ctx, sz);
 
     if sz > 0 {
-      self.front_buf.as_mut().unwrap().buffer.fill(sz);
-      self.front_buf.as_mut().unwrap().sliced_input(sz);
       count!("bytes_in", sz as i64);
       metrics.bin += sz;
 
-      if self.front_buf.as_ref().unwrap().start_parsing_position > self.front_buf.as_ref().unwrap().parsed_position {
-        let to_consume = min(self.front_buf.as_ref().unwrap().input_data_size(),
-        self.front_buf.as_ref().unwrap().start_parsing_position - self.front_buf.as_ref().unwrap().parsed_position);
-        self.front_buf.as_mut().unwrap().consume_parsed_data(to_consume);
-      }
+      self.front_buf.as_mut().map(|front_buf| {
+        front_buf.buffer.fill(sz);
+        front_buf.sliced_input(sz);
+        if front_buf.start_parsing_position > front_buf.parsed_position {
+          let to_consume = min(front_buf.input_data_size(), front_buf.start_parsing_position - front_buf.parsed_position);
+          front_buf.consume_parsed_data(to_consume);
+        }
+      });
 
       if self.front_buf.as_ref().unwrap().buffer.available_space() == 0 {
         self.front_readiness.interest.remove(Ready::readable());
@@ -678,7 +679,7 @@ impl<Front:SocketHandler> Http<Front> {
     }
 
     let output_size = self.back_buf.as_ref().unwrap().output_data_size();
-    if self.back_buf.as_ref().unwrap().output_data_size() == 0 || self.back_buf.as_ref().unwrap().next_output_data().len() == 0 {
+    if self.back_buf.as_ref().map(|buf| buf.output_data_size() == 0 || buf.next_output_data().len() == 0).unwrap() {
       self.back_readiness.interest.insert(Ready::readable());
       self.front_readiness.interest.remove(Ready::writable());
       return ClientResult::Continue;
@@ -731,8 +732,10 @@ impl<Front:SocketHandler> Http<Front> {
       if self.front_buf.is_some() {
         // we must now copy the body from front to back
         trace!("100-Continue => copying {} of body from front to back", sz);
-        self.front_buf.as_mut().unwrap().slice_output(sz);
-        self.front_buf.as_mut().unwrap().consume_parsed_data(sz);
+        self.front_buf.as_mut().map(|buf| {
+          buf.slice_output(sz);
+          buf.consume_parsed_data(sz);
+        });
 
         self.state.as_mut().map(|ref mut st| {
           st.response = Some(ResponseState::Initial);
@@ -752,8 +755,8 @@ impl<Front:SocketHandler> Http<Front> {
       Some(ResponseState::Response(_,_))                            |
       Some(ResponseState::ResponseWithBody(_,_,_))                  |
       Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) => {
-        let front_keep_alive = self.state.as_ref().map(|st| st.request.as_ref().map(|r| r.should_keep_alive()).unwrap_or(false)).unwrap_or(false);
-        let back_keep_alive  = self.state.as_ref().map(|st| st.response.as_ref().map(|r| r.should_keep_alive()).unwrap_or(false)).unwrap_or(false);
+        let front_keep_alive = self.state.as_ref().and_then(|st| st.request.as_ref().map(|r| r.should_keep_alive())).unwrap_or(false);
+        let back_keep_alive  = self.state.as_ref().and_then(|st| st.response.as_ref().map(|r| r.should_keep_alive())).unwrap_or(false);
 
         save_http_status_metric(self.get_response_status());
 
@@ -815,7 +818,7 @@ impl<Front:SocketHandler> Http<Front> {
       return ClientResult::Continue;
     }
 
-    if self.front_buf.as_ref().unwrap().output_data_size() == 0 || self.front_buf.as_ref().unwrap().next_output_data().len() == 0 {
+    if self.front_buf.as_ref().map(|buf| buf.output_data_size() == 0 || buf.next_output_data().len() == 0).unwrap() {
       self.front_readiness.interest.insert(Ready::readable());
       self.back_readiness.interest.remove(Ready::writable());
       return ClientResult::Continue;
@@ -957,8 +960,10 @@ impl<Front:SocketHandler> Http<Front> {
       sock.socket_read(&mut self.back_buf.as_mut().unwrap().buffer.space())
     };
 
-    self.back_buf.as_mut().unwrap().buffer.fill(sz);
-    self.back_buf.as_mut().unwrap().sliced_input(sz);
+    self.back_buf.as_mut().map(|back_buf| {
+      back_buf.buffer.fill(sz);
+      back_buf.sliced_input(sz);
+    });
 
     metrics.backend_bin += sz;
 
