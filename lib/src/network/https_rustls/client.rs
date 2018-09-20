@@ -457,21 +457,8 @@ impl ProxyClient for TlsClient {
       result.tokens.push(tk)
     }
 
-    self.remove_backend();
-
-    let back_connected = self.back_connected();
-    if back_connected != BackendConnectionStatus::NotConnected {
-      if let Some(sock) = self.back_socket() {
-        sock.shutdown(Shutdown::Both);
-        poll.deregister(sock);
-      }
-    }
-
-    if back_connected == BackendConnectionStatus::Connected {
-      gauge_add!("backend.connections", -1);
-    }
-
-    self.set_back_connected(BackendConnectionStatus::NotConnected);
+    //FIXME: should we really pass a token here?
+    self.close_backend(Token(0), poll);
 
     if let Some(State::Http(ref http)) = self.protocol {
       //if the state was initial, the connection was already reset
