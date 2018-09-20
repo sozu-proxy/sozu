@@ -369,7 +369,11 @@ impl TlsClient {
   }
 
   fn set_back_token(&mut self, token: Token) {
-    unwrap_msg!(self.http()).set_back_token(token)
+     match *unwrap_msg!(self.protocol.as_mut()) {
+       State::Http(ref mut http)      => http.set_back_token(token),
+       State::WebSocket(ref mut pipe) => pipe.set_back_token(token),
+       _ => {}
+     }
   }
 
   fn back_connected(&self)     -> BackendConnectionStatus {

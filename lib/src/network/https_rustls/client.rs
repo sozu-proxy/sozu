@@ -383,8 +383,10 @@ impl TlsClient {
   }
 
   pub fn set_back_token(&mut self, token: Token) {
-    if let &mut State::Http(ref mut http) = unwrap_msg!(self.protocol.as_mut()) {
-      http.set_back_token(token)
+    match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Http(ref mut http)      => http.set_back_token(token),
+      State::WebSocket(ref mut pipe) => pipe.set_back_token(token),
+      _ => {}
     }
   }
 
