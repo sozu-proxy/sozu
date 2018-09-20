@@ -811,7 +811,6 @@ impl ServerConfiguration {
     match self.backends.backend_from_app_id(app_id) {
       Err(e) => Err(e),
       Ok((backend, conn))  => {
-        client.back_connected = BackendConnectionStatus::Connecting;
         client.backend = Some(backend);
 
         Ok(conn)
@@ -869,6 +868,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     match conn {
       Ok(stream) => {
         stream.set_nodelay(true);
+        client.back_connected = BackendConnectionStatus::Connecting;
 
         poll.register(
           &stream,

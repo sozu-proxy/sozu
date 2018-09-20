@@ -1234,7 +1234,6 @@ impl ServerConfiguration {
         Err(e)
       },
       Ok((backend, conn))  => {
-        client.back_connected = BackendConnectionStatus::Connecting;
         if front_should_stick {
           let sticky_name = self.listeners[&client.listen_token].config.sticky_name.clone();
           client.http().map(|http| {
@@ -1263,7 +1262,6 @@ impl ServerConfiguration {
         Err(e)
       },
       Ok((backend, conn))  => {
-        client.back_connected = BackendConnectionStatus::Connecting;
         let sticky_name = self.listeners[&client.listen_token].config.sticky_name.clone();
         client.http().map(|http| {
           http.sticky_session = Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or(sticky_session.clone())));
@@ -1452,6 +1450,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     });
 
 
+    client.back_connected = BackendConnectionStatus::Connecting;
     if replacing_connection {
       client.set_back_token(old_back_token.expect("FIXME"));
       poll.register(
