@@ -416,6 +416,20 @@ impl Client {
     self.backend_token = None;
   }
 
+  fn fail_backend_connection(&mut self) {
+    self.backend.as_ref().map(|backend| {
+      let ref mut backend = *backend.borrow_mut();
+      backend.failures += 1;
+
+      let already_unavailable = backend.retry_policy.is_down();
+      backend.retry_policy.fail();
+      incr!("backend.connections.error");
+      if !already_unavailable && backend.retry_policy.is_down() {
+        incr!("backend.down");
+      }
+    });
+  }
+
   fn reset_connection_attempt(&mut self) {
     self.connection_attempt = 0;
   }
@@ -514,7 +528,9 @@ impl ProxyClient for Client {
         error!("error connecting to backend, trying again");
         self.metrics().service_stop();
         self.connection_attempt += 1;
-        let backend_token = self.backend_token.take();
+        self.fail_backend_connection();
+
+        let backend_token = self.backend_token.clone();
         return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.back_readiness().unwrap().event != UnixReady::from(Ready::empty()) {
         self.reset_connection_attempt();
@@ -819,27 +835,10 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     client.app_id = app_id.clone();
     let app_id = app_id.unwrap();
 
-    // Circuit breaker
-    if client.back_connected == BackendConnectionStatus::Connecting {
-      client.backend.as_ref().map(|backend| {
-        let ref mut backend = *backend.borrow_mut();
-        backend.failures += 1;
 
-        let already_unavailable = backend.retry_policy.is_down();
-        backend.retry_policy.fail();
-        incr!("backend.connections.error");
-        if !already_unavailable && backend.retry_policy.is_down() {
-          incr!("backend.down");
-        }
-      });
-
-      //FIXME: is the token necessary here
-      client.close_backend(Token(0), poll);
-
-      if client.connection_attempt == CONN_RETRIES {
-        error!("{} max connection attempt reached", client.log_context());
-        return Err(ConnectionError::NoBackendAvailable)
-      }
+    if client.connection_attempt == CONN_RETRIES {
+      error!("{} max connection attempt reached", client.log_context());
+      return Err(ConnectionError::NoBackendAvailable)
     }
 
     let conn = self.backend_from_app_id(client, &app_id);

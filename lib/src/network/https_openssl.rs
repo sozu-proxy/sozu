@@ -426,6 +426,20 @@ impl TlsClient {
     r
   }
 
+  fn fail_backend_connection(&mut self) {
+    self.backend.as_ref().map(|backend| {
+      let ref mut backend = *backend.borrow_mut();
+      backend.failures += 1;
+
+      let already_unavailable = backend.retry_policy.is_down();
+      backend.retry_policy.fail();
+      incr!("backend.connections.error");
+      if !already_unavailable && backend.retry_policy.is_down() {
+        incr!("backend.down");
+      }
+    });
+  }
+
   fn reset_connection_attempt(&mut self) {
     self.connection_attempt = 0;
   }
@@ -540,9 +554,9 @@ impl ProxyClient for TlsClient {
         error!("{} error connecting to backend, trying again", self.log_context());
         self.metrics().service_stop();
         self.connection_attempt += 1;
+         self.fail_backend_connection();
+
         let backend_token = self.back_token();
-        self.http().map(|h| h.clear_back_token());
-        self.http().map(|h| h.remove_backend());
         return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
         self.reset_connection_attempt();
@@ -1320,33 +1334,15 @@ impl ServerConfiguration {
     }
   }
 
-  fn check_circuit_breaker(&mut self, poll: &mut Poll, client: &mut TlsClient) -> Result<(), ConnectionError> {
-    // circuit breaker
-    if client.back_connected == BackendConnectionStatus::Connecting {
-      client.backend.as_ref().map(|backend| {
-        let ref mut backend = *backend.borrow_mut();
-        backend.failures += 1;
-
-        let already_unavailable = backend.retry_policy.is_down();
-        backend.retry_policy.fail();
-        incr!("backend.connections.error");
-        if !already_unavailable && backend.retry_policy.is_down() {
-          incr!("backend.down");
-        }
-      });
-
-      //FIXME: is the token necessary here
-      client.close_backend(Token(0), poll);
-
-      if client.connection_attempt == CONN_RETRIES {
-        error!("{} max connection attempt reached", client.log_context());
-        let answer = self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
-        client.set_answer(DefaultAnswerStatus::Answer503, answer);
-        return Err(ConnectionError::NoBackendAvailable);
-      }
+  fn check_circuit_breaker(&mut self, client: &mut TlsClient) -> Result<(), ConnectionError> {
+    if client.connection_attempt == CONN_RETRIES {
+      error!("{} max connection attempt reached", client.log_context());
+      let answer = self.listeners[&client.listen_token].answers.ServiceUnavailable.clone();
+      client.set_answer(DefaultAnswerStatus::Answer503, answer);
+      Err(ConnectionError::NoBackendAvailable)
+    } else {
+      Ok(())
     }
-
-    Ok(())
   }
 }
 
@@ -1383,7 +1379,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
     let old_back_token = client.back_token();
 
-    self.check_circuit_breaker(poll, client)?;
+    self.check_circuit_breaker(client)?;
 
     let app_id = self.app_id_from_request(client)?;
 

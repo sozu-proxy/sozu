@@ -1110,7 +1110,9 @@ impl Server {
       ClientResult::ReconnectBackend(main_token, backend_token)  => {
         if let Some(t) = backend_token {
           let cl = self.to_client(t);
-          let _ = self.clients.remove(cl);
+          if let Some(client) = self.clients.remove(cl) {
+            client.borrow_mut().close_backend(t, &mut self.poll);
+          }
         }
 
         if let Some(t) = main_token {

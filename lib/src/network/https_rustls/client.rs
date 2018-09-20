@@ -438,6 +438,20 @@ impl TlsClient {
     r
   }
 
+  fn fail_backend_connection(&mut self) {
+    self.backend.as_ref().map(|backend| {
+      let ref mut backend = *backend.borrow_mut();
+      backend.failures += 1;
+
+      let already_unavailable = backend.retry_policy.is_down();
+      backend.retry_policy.fail();
+      incr!("backend.connections.error");
+      if !already_unavailable && backend.retry_policy.is_down() {
+        incr!("backend.down");
+      }
+    });
+  }
+
   fn reset_connection_attempt(&mut self) {
     self.connection_attempt = 0;
   }
@@ -544,13 +558,12 @@ impl ProxyClient for TlsClient {
     if self.back_connected() == BackendConnectionStatus::Connecting {
       if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) {
         //retry connecting the backend
-        //FIXME: there should probably be a circuit breaker per client too
         error!("{} error connecting to backend, trying again", self.log_context());
-        self.connection_attempt += 1;
-        let backend_token = self.back_token();
-        self.http().map(|h| h.clear_back_token());
-        self.http().map(|h| h.remove_backend());
         self.metrics().service_stop();
+        self.connection_attempt += 1;
+        self.fail_backend_connection();
+
+        let backend_token = self.back_token();
         return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
         self.reset_connection_attempt();
