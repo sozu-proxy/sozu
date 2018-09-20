@@ -126,6 +126,10 @@ impl<Front:SocketHandler> Http<Front> {
 
     self.back_buf = None;
     self.request_id = request_id;
+    self.reset_log_context();
+  }
+
+  pub fn reset_log_context(&mut self) {
     self.log_ctx = format!("{} {}\t",
       self.request_id, self.app_id.as_ref().unwrap_or(&String::from("unknown")));
   }

@@ -525,15 +525,13 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
   fn connect_to_backend(&mut self, poll: &mut Poll,  client: &mut TlsClient, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let old_app_id = client.http().and_then(|ref http| http.app_id.clone());
+    let old_back_token = client.back_token();
 
     self.check_circuit_breaker(poll, client)?;
 
     let app_id = self.app_id_from_request(client)?;
 
-    let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
-    let old_back_token = client.back_token();
-
-    if (client.http().map(|h| h.app_id.as_ref()).unwrap_or(None) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
+    if (client.http().and_then(|h| h.app_id.as_ref()) == Some(&app_id)) && client.back_connected == BackendConnectionStatus::Connected {
       if client.backend.as_ref().map(|backend| {
          let ref backend = *backend.borrow();
          self.backends.has_backend(&app_id, backend)
@@ -554,17 +552,21 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
     client.app_id = Some(app_id.clone());
 
-    let sticky_session = client.http().unwrap().state.as_ref().unwrap().get_request_sticky_session();
+    let sticky_session = client.http().and_then(|http| http.state.as_ref()).unwrap().get_request_sticky_session();
+    let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
     let socket = match (front_should_stick, sticky_session) {
       (true, Some(session)) => self.backend_from_sticky_session(client, &app_id, session)?,
       _ => self.backend_from_app_id(client, &app_id, front_should_stick)?,
     };
 
-    let new_app_id = client.http().and_then(|ref http| http.app_id.clone());
-    let replacing_connection = old_app_id.is_some() && old_app_id != new_app_id;
+    client.http().map(|http| {
+      http.app_id = Some(app_id.clone());
+      http.reset_log_context();
+    });
+    let replacing_connection = old_app_id.is_some() && old_app_id != Some(app_id);
 
     //deregister back socket if it is the wrong one or if it was not connecting
-    if old_app_id.is_some() && old_app_id != new_app_id {
+    if replacing_connection {
       if let Some(token) = client.back_token() {
         let addr = client.close_backend(token, poll);
         if let Some((app_id, address)) = addr {
@@ -574,24 +576,10 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     }
 
     // we still want to use the new socket
-    client.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::writable()));
-
-    let req_state = unwrap_msg!(client.http()).state().request.clone();
-    let req_header_end = unwrap_msg!(client.http()).state().req_header_end;
-    let res_header_end = unwrap_msg!(client.http()).state().res_header_end;
-    let added_req_header = unwrap_msg!(client.http()).state().added_req_header.clone();
-    let added_res_header = unwrap_msg!(client.http()).state().added_res_header.clone();
-    // FIXME: is this still needed?
-    unwrap_msg!(client.http()).set_state(HttpState {
-      req_header_end: req_header_end,
-      res_header_end: res_header_end,
-      request:  req_state,
-      response: Some(ResponseState::Initial),
-      added_req_header: added_req_header,
-      added_res_header: added_res_header,
-    });
-
     socket.set_nodelay(true);
+    client.back_readiness().map(|r| {
+      r.interest  = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
+    });
 
     if replacing_connection {
       client.set_back_token(old_back_token.expect("FIXME"));
