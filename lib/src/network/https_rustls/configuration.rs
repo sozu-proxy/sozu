@@ -542,10 +542,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         return Ok(BackendConnectAction::Reuse);
       } else {
         if let Some(token) = client.back_token() {
-          let addr = client.close_backend(token, poll);
-          if let Some((app_id, address)) = addr {
-            self.close_backend(app_id, &address);
-          }
+          client.close_backend(token, poll);
         }
       }
     }
@@ -568,10 +565,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
     //deregister back socket if it is the wrong one or if it was not connecting
     if replacing_connection {
       if let Some(token) = client.back_token() {
-        let addr = client.close_backend(token, poll);
-        if let Some((app_id, address)) = addr {
-          self.close_backend(app_id, &address);
-        }
+        client.close_backend(token, poll);
       }
     }
 
@@ -714,10 +708,6 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
         OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message")), data: None }
       }
     }
-  }
-
-  fn close_backend(&mut self, app_id: AppId, addr: &SocketAddr) {
-    self.backends.close_backend_connection(&app_id, &addr);
   }
 
   fn listen_port_state(&self, port: &u16) -> ListenPortState {

@@ -357,19 +357,15 @@ impl Client {
     &mut self.metrics
   }
 
-  fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
+  fn remove_backend(&mut self) {
     debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND",
       self.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), self.frontend_token.0,
       self.back_token().map(|t| format!("{}", t.0)).unwrap_or("-".to_string()));
 
-    let backend = self.backend.take();
-    if backend.is_some() {
-      let addr:Option<SocketAddr> = self.back_socket().and_then(|sock| sock.peer_addr().ok());
+    if let Some(backend) = self.backend.take() {
       self.http().map(|h| h.clear_back_token());
 
-      (self.app_id.clone(), addr)
-    } else {
-      (None, None)
+      (*backend.borrow_mut()).dec_connections();
     }
   }
 
@@ -406,9 +402,7 @@ impl ProxyClient for Client {
       result.tokens.push(tk)
     }
 
-    if let (Some(app_id), Some(addr)) = self.remove_backend() {
-      result.backends.push((app_id, addr.clone()));
-    }
+    self.remove_backend();
 
     let back_connected = self.back_connected();
     if back_connected != BackendConnectionStatus::NotConnected {
@@ -461,11 +455,9 @@ impl ProxyClient for Client {
     timer.cancel_timeout(&self.front_timeout);
   }
 
-  fn close_backend(&mut self, _: Token, poll: &mut Poll) -> Option<(String,SocketAddr)> {
-    let mut res = None;
-    if let (Some(app_id), Some(addr)) = self.remove_backend() {
-      res = Some((app_id, addr.clone()));
-    }
+  //FIXME: check the token passed as argument
+  fn close_backend(&mut self, _: Token, poll: &mut Poll) {
+    self.remove_backend();
 
     let back_connected = self.back_connected();
     if back_connected != BackendConnectionStatus::NotConnected {
@@ -483,7 +475,6 @@ impl ProxyClient for Client {
 
     self.http().map(|h| h.clear_back_token());
     self.http().map(|h| h.remove_backend());
-    res
   }
 
   fn protocol(&self) -> Protocol {
@@ -1071,10 +1062,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         return Ok(BackendConnectAction::Reuse);
       } else {
         if let Some(token) = client.back_token() {
-          let addr = client.close_backend(token, poll);
-          if let Some((app_id, address)) = addr {
-            self.close_backend(app_id, &address);
-          }
+          client.close_backend(token, poll);
         }
       }
     }
@@ -1096,10 +1084,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
     if replacing_connection {
       if let Some(token) = client.back_token() {
-        let addr = client.close_backend(token, poll);
-        if let Some((app_id, address)) = addr {
-          self.close_backend(app_id, &address);
-        }
+        client.close_backend(token, poll);
       }
     }
 
@@ -1251,10 +1236,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       Err(AcceptError::IoError)
     }
 
-  }
-
-  fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {
-    self.backends.close_backend_connection(&app_id, &addr);
   }
 
   fn listen_port_state(&self, port: &u16) -> ListenPortState {

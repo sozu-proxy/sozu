@@ -411,9 +411,12 @@ impl TlsClient {
     &mut self.metrics
   }
 
-  fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    let addr:Option<SocketAddr> = self.back_socket().and_then(|sock| sock.peer_addr().ok());
-    (self.app_id.clone(), addr)
+  fn remove_backend(&mut self) {
+    if let Some(backend) = self.backend.take() {
+      self.http().map(|h| h.clear_back_token());
+
+      (*backend.borrow_mut()).dec_connections();
+    }
   }
 
   pub fn front_readiness(&mut self)      -> &mut Readiness {
@@ -454,9 +457,7 @@ impl ProxyClient for TlsClient {
       result.tokens.push(tk)
     }
 
-    if let (Some(app_id), Some(addr)) = self.remove_backend() {
-      result.backends.push((app_id, addr.clone()));
-    }
+    self.remove_backend();
 
     let back_connected = self.back_connected();
     if back_connected != BackendConnectionStatus::NotConnected {
@@ -511,11 +512,8 @@ impl ProxyClient for TlsClient {
     timer.cancel_timeout(&self.timeout);
   }
 
-  fn close_backend(&mut self, _: Token, poll: &mut Poll) -> Option<(String,SocketAddr)> {
-    let mut res = None;
-    if let (Some(app_id), Some(addr)) = self.remove_backend() {
-      res = Some((app_id, addr.clone()));
-    }
+  fn close_backend(&mut self, _: Token, poll: &mut Poll) {
+    self.remove_backend();
 
     let back_connected = self.back_connected();
     if back_connected != BackendConnectionStatus::NotConnected {
@@ -532,8 +530,6 @@ impl ProxyClient for TlsClient {
     self.set_back_connected(BackendConnectionStatus::NotConnected);
     self.http().map(|h| h.clear_back_token());
     self.http().map(|h| h.remove_backend());
-
-    res
   }
 
   fn protocol(&self) -> Protocol {

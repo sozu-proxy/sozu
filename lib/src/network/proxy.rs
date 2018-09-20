@@ -770,32 +770,11 @@ impl Server {
     if self.clients.contains(token) {
       let client = self.clients.remove(token).expect("client shoud be there");
       client.borrow().cancel_timeouts(&mut self.timer);
-      let CloseResult { tokens, backends } = client.borrow_mut().close(&mut self.poll);
+      let CloseResult { tokens } = client.borrow_mut().close(&mut self.poll);
 
       for tk in tokens.into_iter() {
         let cl = self.to_client(tk);
         self.clients.remove(cl);
-      }
-
-      let protocol = { client.borrow().protocol() };
-
-      match protocol {
-        Protocol::TCP   => {
-          for (app_id, address) in backends.into_iter() {
-            self.tcp.close_backend(app_id, &address);
-          }
-        },
-        Protocol::HTTP   => {
-          for (app_id, address) in backends.into_iter() {
-            self.http.close_backend(app_id, &address);
-          }
-        },
-        Protocol::HTTPS   => {
-          for (app_id, address) in backends.into_iter() {
-            self.https.close_backend(app_id, &address);
-          }
-        },
-        _ => {}
       }
 
       assert!(self.nb_connections != 0);
@@ -1124,24 +1103,7 @@ impl Server {
         if let Some(token) = opt {
           let cl = self.to_client(token);
           if let Some(client) = self.clients.remove(cl) {
-            let protocol = client.borrow().protocol();
-            let res = client.borrow_mut().close_backend(token, &mut self.poll);
-            if let Some((app_id, address)) = res {
-              match protocol {
-                Protocol::TCP   => {
-                  Some(self.tcp.close_backend(app_id, &address))
-                },
-                Protocol::HTTP  => {
-                  Some(self.http.close_backend(app_id, &address))
-                },
-                Protocol::HTTPS => {
-                  Some(self.https.close_backend(app_id, &address))
-                },
-                _ => {
-                  panic!("should not call interpret_client_order on a listen socket");
-                }
-              };
-            }
+            client.borrow_mut().close_backend(token, &mut self.poll);
           }
         }
       },
@@ -1310,8 +1272,7 @@ impl ProxyClient for ListenClient {
     CloseResult::default()
   }
 
-  fn close_backend(&mut self, token: Token, poll: &mut Poll) -> Option<(String, SocketAddr)> {
-    None
+  fn close_backend(&mut self, token: Token, poll: &mut Poll) {
   }
 
   fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &time::Duration) -> ClientResult {
@@ -1398,13 +1359,6 @@ impl HttpsProvider {
     }
   }
 
-  pub fn close_backend(&mut self, app_id: AppId, addr: &SocketAddr) {
-    match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.close_backend(app_id, addr),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.close_backend(app_id, addr),
-    }
-  }
-
   pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_client: Rc<RefCell<ProxyClientCast>>, back_token: Token)
     -> Result<BackendConnectAction, ConnectionError> {
 
@@ -1466,11 +1420,6 @@ impl HttpsProvider {
   pub fn create_client(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
     rustls.create_client(frontend_sock, token, poll, client_token, timeout)
-  }
-
-  pub fn close_backend(&mut self, app_id: AppId, addr: &SocketAddr) {
-    let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.close_backend(app_id, addr);
   }
 
   pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_client: Rc<RefCell<ProxyClientCast>>, back_token: Token)

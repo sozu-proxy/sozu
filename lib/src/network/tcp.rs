@@ -408,18 +408,17 @@ impl Client {
     &mut self.metrics
   }
 
-  fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
+  fn remove_backend(&mut self) {
+    if let Some(backend) = self.backend.take() {
+      (*backend.borrow_mut()).dec_connections();
+    }
 
-    let addr = self.backend.as_ref().map(|backend| (*backend.borrow_mut()).address);
-
-    self.backend       = None;
     self.backend_token = None;
-    (self.app_id.clone(), addr)
   }
 
-    fn reset_connection_attempt(&mut self) {
-      self.connection_attempt = 0;
-    }
+  fn reset_connection_attempt(&mut self) {
+    self.connection_attempt = 0;
+  }
 }
 
 impl ProxyClient for Client {
@@ -434,9 +433,7 @@ impl ProxyClient for Client {
       result.tokens.push(tk)
     }
 
-    if let (Some(app_id), Some(addr)) = self.remove_backend() {
-      result.backends.push((app_id, addr.clone()));
-    }
+    self.remove_backend();
 
     let back_connected = self.back_connected();
     if back_connected != BackendConnectionStatus::NotConnected {
@@ -484,11 +481,8 @@ impl ProxyClient for Client {
     timer.cancel_timeout(&self.timeout);
   }
 
-  fn close_backend(&mut self, _: Token, poll: &mut Poll) -> Option<(String,SocketAddr)> {
-    let mut res = None;
-    if let (Some(app_id), Some(addr)) = self.remove_backend() {
-      res = Some((app_id, addr.clone()));
-    }
+  fn close_backend(&mut self, _: Token, poll: &mut Poll) {
+    self.remove_backend();
 
     let back_connected = self.back_connected();
     if back_connected != BackendConnectionStatus::NotConnected {
@@ -503,8 +497,6 @@ impl ProxyClient for Client {
     }
 
     self.set_back_connected(BackendConnectionStatus::NotConnected);
-
-    res
   }
 
   fn protocol(&self) -> Protocol {
@@ -1019,10 +1011,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     } else {
       Err(AcceptError::IoError)
     }
-  }
-
-  fn close_backend(&mut self, app_id: String, addr: &SocketAddr) {
-    self.backends.close_backend_connection(&app_id, &addr);
   }
 
   fn listen_port_state(&self, port: &u16) -> ListenPortState {

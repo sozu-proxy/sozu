@@ -58,7 +58,6 @@ pub enum Protocol {
 #[derive(Debug,Clone,Default)]
 pub struct CloseResult {
   pub tokens:   Vec<Token>,
-  pub backends: Vec<(String, SocketAddr)>,
 }
 
 pub trait ProxyClient {
@@ -66,7 +65,7 @@ pub trait ProxyClient {
   fn ready(&mut self) -> ClientResult;
   fn process_events(&mut self, token: Token, events: Ready);
   fn close(&mut self, poll: &mut Poll) -> CloseResult;
-  fn close_backend(&mut self, token: Token, poll: &mut Poll) -> Option<(String, SocketAddr)>;
+  fn close_backend(&mut self, token: Token, poll: &mut Poll);
   fn timeout(&self, t: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> ClientResult;
   fn cancel_timeouts(&self, timer: &mut Timer<Token>);
   fn last_event(&self) -> SteadyTime;
@@ -103,7 +102,6 @@ pub trait ProxyConfiguration<Client> {
   fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
   fn create_client(&mut self, socket: TcpStream, token: ListenToken, event_loop: &mut Poll, client_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<Client>>, bool), AcceptError>;
-  fn close_backend(&mut self, app_id: String, addr: &SocketAddr);
   fn listen_port_state(&self, port: &u16) -> ListenPortState;
 }
 
