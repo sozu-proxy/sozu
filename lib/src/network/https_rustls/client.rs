@@ -504,6 +504,7 @@ impl ProxyClient for TlsClient {
 
     let back_connected = self.back_connected();
     if back_connected != BackendConnectionStatus::NotConnected {
+      self.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
       if let Some(sock) = self.back_socket() {
         sock.shutdown(Shutdown::Both);
         poll.deregister(sock);

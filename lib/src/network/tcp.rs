@@ -473,6 +473,7 @@ impl ProxyClient for Client {
 
     let back_connected = self.back_connected();
     if back_connected != BackendConnectionStatus::NotConnected {
+      self.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
       if let Some(sock) = self.back_socket() {
         sock.shutdown(Shutdown::Both);
         poll.deregister(sock);
@@ -822,7 +823,6 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     if client.back_connected == BackendConnectionStatus::Connecting {
       client.backend.as_ref().map(|backend| {
         let ref mut backend = *backend.borrow_mut();
-        backend.dec_connections();
         backend.failures += 1;
 
         let already_unavailable = backend.retry_policy.is_down();
@@ -833,17 +833,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         }
       });
 
-      //deregister back socket if it is the wrong one or if it was not connecting
-      client.backend = None;
-      client.back_connected = BackendConnectionStatus::NotConnected;
-      client.back_readiness().map(|r| {
-        r.interest = UnixReady::from(Ready::empty());
-        r.event = UnixReady::from(Ready::empty());
-      });
-      client.back_socket().as_ref().map(|sock| {
-        poll.deregister(*sock);
-        sock.shutdown(Shutdown::Both);
-      });
+      //FIXME: is the token necessary here
+      client.close_backend(Token(0), poll);
 
       if client.connection_attempt == CONN_RETRIES {
         error!("{} max connection attempt reached", client.log_context());
