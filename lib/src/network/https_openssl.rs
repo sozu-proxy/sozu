@@ -1395,7 +1395,22 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       } else {
         if let Some(token) = client.back_token() {
           client.close_backend(token, poll);
+
+          //reset the back token here so we can remove it
+          //from the slab after backend_from* fails
+          client.set_back_token(token);
         }
+      }
+    }
+
+    //replacing with a connection to another application
+    if old_app_id.is_some() && old_app_id.as_ref() != Some(&app_id) {
+      if let Some(token) = client.back_token() {
+        client.close_backend(token, poll);
+
+        //reset the back token here so we can remove it
+        //from the slab after backend_from* fails
+        client.set_back_token(token);
       }
     }
 
@@ -1412,14 +1427,6 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
       http.app_id = Some(app_id.clone());
       http.reset_log_context();
     });
-    let replacing_connection = old_app_id.is_some() && old_app_id != Some(app_id);
-
-    //deregister back socket if it is the wrong one or if it was not connecting
-    if replacing_connection {
-      if let Some(token) = client.back_token() {
-        client.close_backend(token, poll);
-      }
-    }
 
     socket.set_nodelay(true);
     client.back_readiness().map(|r| {
@@ -1428,11 +1435,11 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
 
     client.back_connected = BackendConnectionStatus::Connecting;
-    if replacing_connection {
-      client.set_back_token(old_back_token.expect("FIXME"));
+    if let Some(back_token) = old_back_token {
+      client.set_back_token(back_token);
       poll.register(
         &socket,
-        client.back_token().expect("FIXME"),
+        back_token,
         Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
         PollOpt::edge()
       );
