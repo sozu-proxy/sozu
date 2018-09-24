@@ -1,4 +1,5 @@
 use sozu_command::config::LoadBalancingAlgorithms;
+use std::net::SocketAddr;
 
 #[derive(StructOpt, PartialEq, Debug)]
 pub struct App {
@@ -124,10 +125,8 @@ pub enum BackendCmd {
     id: String,
     #[structopt(long = "backend-id")]
     backend_id: String,
-    #[structopt(long = "ip")]
-    ip: String,
-    #[structopt(short = "p", long = "port")]
-    port: u16,
+    #[structopt(short = "a", long = "address", help = "server address, format: IP:port")]
+    address: SocketAddr,
   },
   #[structopt(name = "add")]
   Add {
@@ -135,10 +134,8 @@ pub enum BackendCmd {
     id: String,
     #[structopt(long = "backend-id")]
     backend_id: String,
-    #[structopt(long = "ip")]
-    ip: String,
-    #[structopt(short = "p", long = "port")]
-    port: u16,
+    #[structopt(short = "a", long = "address", help = "server address, format: IP:port")]
+    address: SocketAddr,
     #[structopt(short = "s", long = "sticky-id", help = "value for the sticky session cookie")]
     sticky_id: Option<String>,
     #[structopt(short = "b", long = "backup", help = "set backend as a backup backend")]
@@ -164,10 +161,8 @@ pub enum FrontendCmd {
 pub enum HttpFrontendCmd {
   #[structopt(name = "add")]
   Add {
-    #[structopt(long = "listener-ip")]
-    listener_ip: String,
-    #[structopt(long = "listener-port")]
-    listener_port: u16,
+    #[structopt(short = "a", long = "address", help = "frontend address, format: IP:port")]
+    address: SocketAddr,
     #[structopt(short = "i", long = "id", help = "app id of the frontend")]
     id: String,
     #[structopt(short = "host", long = "hostname")]
@@ -179,10 +174,8 @@ pub enum HttpFrontendCmd {
   },
   #[structopt(name = "remove")]
   Remove {
-    #[structopt(long = "listener-ip")]
-    listener_ip: String,
-    #[structopt(long = "listener-port")]
-    listener_port: u16,
+    #[structopt(short = "a", long = "address", help = "frontend address, format: IP:port")]
+    address: SocketAddr,
     #[structopt(short = "i", long = "id", help = "app id of the frontend")]
     id: String,
     #[structopt(short = "host", long = "hostname")]
@@ -200,19 +193,15 @@ pub enum TcpFrontendCmd {
   Add {
     #[structopt(short = "i", long = "id", help = "app id of the frontend")]
     id: String,
-    #[structopt(long = "ip", help = "IP address of the frontend")]
-    ip_address: String,
-    #[structopt(short = "p", long = "port", help="TCP port of the frontend")]
-    port: u16,
+    #[structopt(short = "a", long = "address", help = "frontend address, format: IP:port")]
+    address: SocketAddr,
   },
   #[structopt(name = "remove")]
   Remove {
     #[structopt(short = "i", long = "id", help = "app id of the frontend")]
     id: String,
-    #[structopt(long = "ip", help = "IP address of the frontend")]
-    ip_address: String,
-    #[structopt(short = "p", long = "port", help="TCP port of the frontend")]
-    port: u16,
+    #[structopt(short = "a", long = "address", help = "frontend address, format: IP:port")]
+    address: SocketAddr,
   },
 }
 
@@ -220,10 +209,8 @@ pub enum TcpFrontendCmd {
 pub enum CertificateCmd {
   #[structopt(name = "add")]
   Add {
-    #[structopt(short = "i", long = "listener-ip")]
-    listener_ip: String,
-    #[structopt(short = "p", long = "listener-port")]
-    listener_port: u16,
+    #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
+    address: SocketAddr,
     #[structopt(long = "certificate", help = "path to the certificate")]
     certificate: String,
     #[structopt(long = "certificate-chain", help = "path to the certificate chain")]
@@ -233,19 +220,15 @@ pub enum CertificateCmd {
   },
   #[structopt(name = "remove")]
   Remove {
-    #[structopt(short = "i", long = "listener-ip")]
-    listener_ip: String,
-    #[structopt(short = "p", long = "listener-port")]
-    listener_port: u16,
+    #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
+    address: SocketAddr,
     #[structopt(short = "cert", long = "certificate", help = "path to the certificate")]
     certificate: String,
   },
   #[structopt(name = "replace")]
   Replace {
-    #[structopt(short = "i", long = "listener-ip")]
-    listener_ip: String,
-    #[structopt(short = "p", long = "listener-port")]
-    listener_port: u16,
+    #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
+    address: SocketAddr,
     #[structopt(long = "new-certificate", help = "path to the new certificate")]
     certificate: String,
     #[structopt(long = "new-certificate-chain", help = "path to the new certificate chain")]

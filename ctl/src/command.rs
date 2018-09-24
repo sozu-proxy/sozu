@@ -805,11 +805,10 @@ pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>,
 
 
 pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
-  backend_id: &str, ip: &str, port: u16, sticky_id: Option<String>, backup: Option<bool>) {
-  let address = format!("{}:{}", ip, port);
+  backend_id: &str, address: SocketAddr, sticky_id: Option<String>, backup: Option<bool>) {
   order_command(channel, timeout, Order::AddBackend(Backend {
       app_id: String::from(app_id),
-      address: address.parse().expect("could not parse network address"),
+      address: address,
       backend_id: String::from(backend_id),
       load_balancing_parameters: Some(LoadBalancingParams::default()),
       sticky_id: sticky_id,
@@ -818,11 +817,10 @@ pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout:
 }
 
 pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
-  backend_id: &str, ip: &str, port: u16) {
-  let address = format!("{}:{}", ip, port);
+  backend_id: &str, address: SocketAddr) {
   order_command(channel, timeout, Order::RemoveBackend(RemoveBackend {
     app_id: String::from(app_id),
-    address: address.parse().expect("could not parse network address"),
+    address: address,
     backend_id: String::from(backend_id),
   }));
 }
@@ -866,8 +864,7 @@ pub fn replace_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, 
 }
 
 pub fn add_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
-  ip_address: &str, port: u16) {
-  let address: SocketAddr = (format!("{}:{}", ip_address, port)).parse().expect("could not parse listener address");
+  address: SocketAddr) {
   order_command(channel, timeout, Order::AddTcpFront(TcpFront {
     app_id: String::from(app_id),
     address,
@@ -875,8 +872,7 @@ pub fn add_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, tim
 }
 
 pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
-  ip_address: &str, port: u16) {
-  let address: SocketAddr = (format!("{}:{}", ip_address, port)).parse().expect("could not parse listener address");
+  address: SocketAddr) {
   order_command(channel, timeout, Order::RemoveTcpFront(TcpFront {
     app_id: String::from(app_id),
     address,
