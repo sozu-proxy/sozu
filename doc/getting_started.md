@@ -54,7 +54,10 @@ You can build the image by doing:
 
 `docker build -t sozu .`
 
-And run it with the command
+There's also the [clevercloud/sozu](https://hub.docker.com/r/clevercloud/sozu/) image
+following the master branch.
+
+Run it with the command:
 
 ```bash
 docker run \
