@@ -1000,7 +1000,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
 
 pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
-  use network::proxy::ProxyClientCast;
+  use network::proxy::{self,ProxyClientCast};
 
   let mut poll          = Poll::new().expect("could not create event loop");
   let pool = Rc::new(RefCell::new(
@@ -1035,8 +1035,11 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
   let _ = configuration.add_listener(config, pool.clone(), token);
   let _ = configuration.activate_listener(&mut poll, &front, None);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
+
+  let mut server_config: proxy::ServerConfig = Default::default();
+  server_config.max_connections = max_buffers;
   let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), clients,
-    pool, None ,None, Some(configuration), None, max_buffers, 60, 1800, 60);
+    pool, None ,None, Some(configuration), server_config, None);
 
   info!("starting event loop");
   server.run();
@@ -1143,7 +1146,7 @@ mod tests {
   }
 
   pub fn start_proxy() -> Channel<OrderMessage,OrderMessageAnswer> {
-    use network::proxy::ProxyClientCast;
+    use network::proxy::{self,ProxyClientCast};
 
     info!("listen for connections");
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
@@ -1195,8 +1198,11 @@ mod tests {
         tls:  Vec::new(),
         tcp:  Vec::new(),
       });
+
+      let mut server_config: proxy::ServerConfig = Default::default();
+      server_config.max_connections = max_buffers;
       let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.into_raw_fd()),
-        clients, pool, None, None, Some(configuration), None, max_buffers, 60, 1800, 60);
+        clients, pool, None, None, Some(configuration), server_config, None);
       info!("will run");
       s.run();
       info!("ending event loop");

@@ -700,7 +700,7 @@ impl ProxyConfiguration<TlsClient> for ServerConfiguration {
 
 use network::proxy::HttpsProvider;
 pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
-  use network::proxy::ProxyClientCast;
+  use network::proxy::{self,ProxyClientCast};
 
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_listeners   = 1;
@@ -737,8 +737,10 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
   if configuration.add_listener(config, pool.clone(), token).is_some() {
     if configuration.activate_listener(&mut event_loop, &front, None).is_some() {
       let (scm_server, scm_client) = UnixStream::pair().unwrap();
+      let mut server_config: proxy::ServerConfig = Default::default();
+      server_config.max_connections = max_buffers;
       let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-        clients, pool, None, Some(HttpsProvider::Rustls(configuration)), None, None, max_buffers, 60, 1800, 60);
+        clients, pool, None, Some(HttpsProvider::Rustls(configuration)), None, server_config, None);
 
       info!("starting event loop");
       server.run();

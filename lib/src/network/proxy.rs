@@ -90,6 +90,35 @@ impl From<ClientToken> for usize {
     }
 }
 
+pub struct ServerConfig {
+  pub max_connections:          usize,
+  pub front_timeout:            u32,
+  pub zombie_check_interval:    u32,
+  pub accept_queue_timeout:     u32,
+}
+
+impl ServerConfig {
+  pub fn from_config(config: &Config) -> ServerConfig {
+    ServerConfig {
+      max_connections: config.max_connections,
+      front_timeout: config.front_timeout,
+      zombie_check_interval: config.zombie_check_interval,
+      accept_queue_timeout: config.accept_queue_timeout,
+    }
+  }
+}
+
+impl Default for ServerConfig {
+  fn default() -> ServerConfig {
+    ServerConfig {
+      max_connections: 10000,
+      front_timeout: 60,
+      zombie_check_interval: 30*60,
+      accept_queue_timeout: 60,
+    }
+  }
+}
+
 pub struct Server {
   pub poll:        Poll,
   shutting_down:   Option<MessageId>,
@@ -144,8 +173,8 @@ impl Server {
     let use_openssl = config.tls_provider == TlsProvider::Openssl;
     let https = HttpsProvider::new(use_openssl, pool.clone());
 
-    Server::new(event_loop, channel, scm, clients, pool, None, Some(https), None, Some(config_state),
-      config.max_connections, config.front_timeout, config.zombie_check_interval, config.accept_queue_timeout)
+    let server_config = ServerConfig::from_config(&config);
+    Server::new(event_loop, channel, scm, clients, pool, None, Some(https), None, server_config, Some(config_state))
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
@@ -154,11 +183,8 @@ impl Server {
     http: Option<http::ServerConfiguration>,
     https: Option<HttpsProvider>,
     tcp:  Option<tcp::ServerConfiguration>,
-    config_state: Option<ConfigState>,
-    max_connections: usize,
-    front_timeout: u32,
-    zombie_check_interval: u32,
-    accept_queue_timeout: u32,) -> Self {
+    server_config: ServerConfig,
+    config_state: Option<ConfigState>) -> Self {
 
     poll.register(
       &channel,
@@ -196,15 +222,15 @@ impl Server {
       config_state:    ConfigState::new(),
       scm,
       clients,
-      max_connections,
+      max_connections: server_config.max_connections,
       nb_connections:  0,
       scm_listeners:   None,
       timer,
       pool,
-      front_timeout: time::Duration::seconds(i64::from(front_timeout)),
-      zombie_check_interval: time::Duration::seconds(i64::from(zombie_check_interval)),
+      front_timeout: time::Duration::seconds(i64::from(server_config.front_timeout)),
+      zombie_check_interval: time::Duration::seconds(i64::from(server_config.zombie_check_interval)),
       accept_queue:    VecDeque::new(),
-      accept_queue_timeout: time::Duration::seconds(i64::from(accept_queue_timeout)),
+      accept_queue_timeout: time::Duration::seconds(i64::from(server_config.accept_queue_timeout)),
       base_clients_count,
     };
 

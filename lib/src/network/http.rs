@@ -1300,7 +1300,7 @@ impl InitialServerConfiguration {
 
 
 pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
-  use network::proxy::ProxyClientCast;
+  use network::proxy::{self,ProxyClientCast};
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_listeners   = 1;
 
@@ -1342,8 +1342,10 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
     tcp:  Vec::new(),
   });
 
+  let mut server_config: proxy::ServerConfig = Default::default();
+  server_config.max_connections = max_buffers;
   let mut server    = Server::new(event_loop, channel, ScmSocket::new(scm_server.into_raw_fd()),
-    clients, pool, Some(configuration), None, None, None, max_buffers, 60, 1800, 60);
+    clients, pool, Some(configuration), None, None, server_config, None);
 
   println!("starting event loop");
   server.run();
