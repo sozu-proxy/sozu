@@ -81,11 +81,14 @@ If `/my/custom/config.toml` is the path and name of your custom configuration fi
 To use `sozuctl` CLI from the host with the docker container you have to bind `/run/sozu` with the host by using a docker volume:
 `docker run -v /run/sozu:/run/sozu sozu`
 
+To change the path of the configuration socket, modify the `command_socket` option in the configuration file (default value is `/var/lib/sozu/sock`).
 
 #### Provide an initial configuration state
 Sozu can use a JSON file to load an initial configuration state for its routing.
 you can mount it by using a volume, you can start your sozu container with this in a volume (note that only the directory path of the custom config file is used in this command):
 `docker run -v /my/state:/var/lib/sozu sozu`
+
+To change the path of the saved state file, modify the `saved_state` option in the configuration file (default value is `/var/lib/sozu/state.json`).
 
 [cr]: https://crates.io/
 [cfg]: https://github.com/sozu-proxy/sozu/blob/master/bin/config.toml
