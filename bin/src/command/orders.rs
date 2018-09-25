@@ -65,7 +65,7 @@ impl CommandServer {
         self.query(token, &message.id, query);
       },
       ConfigCommand::ProxyConfiguration(order) => {
-        self.worker_order(token, &message.id, order, message.proxy_id);
+        self.worker_order(token, &message.id, order, message.worker_id);
       },
       ConfigCommand::UpgradeWorker(id) => {
         self.upgrade_worker(token, &message.id, id);
@@ -209,11 +209,11 @@ impl CommandServer {
                 let mut found = false;
                 let id = format!("LOAD-STATE-{}-{}", message_id, counter);
 
-                for ref mut proxy in self.proxies.values_mut()
+                for ref mut worker in self.workers.values_mut()
                   .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
                   let o = order.clone();
                   futures.push(
-                    executor::send(proxy.token.expect("worker should have a token"), OrderMessage { id: id.clone(), order: o })
+                    executor::send(worker.token.expect("worker should have a token"), OrderMessage { id: id.clone(), order: o })
                   );
                   found = true;
 
@@ -222,7 +222,7 @@ impl CommandServer {
 
                 if !found {
                   // FIXME: should send back error here
-                  error!("no proxy found");
+                  error!("no worker found");
                 }
               }
             },
@@ -279,11 +279,11 @@ impl CommandServer {
   }
 
   pub fn list_workers(&mut self, token: FrontToken, message_id: &str) {
-    let workers: Vec<WorkerInfo> = self.proxies.values().map(|ref proxy| {
+    let workers: Vec<WorkerInfo> = self.workers.values().map(|ref worker| {
       WorkerInfo {
-        id:         proxy.id,
-        pid:        proxy.pid,
-        run_state:  proxy.run_state.clone(),
+        id:         worker.id,
+        pid:        worker.pid,
+        run_state:  worker.run_state.clone(),
       }
     }).collect();
     self.answer_success(token, message_id, "", Some(AnswerData::Workers(workers)));
@@ -329,7 +329,7 @@ impl CommandServer {
         count += 1;
       }
 
-      self.proxies.insert(Token(worker_token), worker);
+      self.workers.insert(Token(worker_token), worker);
 
       self.answer_success(token, message.id.as_str(), "", None);
     } else {
@@ -369,7 +369,7 @@ impl CommandServer {
       return self.answer_error(token, message_id, "failed creating worker", None);
     };
 
-    if self.proxies.values().find(|worker| {
+    if self.workers.values().find(|worker| {
       worker.id == id && worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
     }).is_none() {
       self.answer_error(token, message_id, "worker not found", None);
@@ -378,7 +378,7 @@ impl CommandServer {
 
     let mut listeners = None;
     {
-      let old_worker = self.proxies.values_mut().filter(|worker| worker.id == id).next().unwrap();
+      let old_worker = self.workers.values_mut().filter(|worker| worker.id == id).next().unwrap();
 
       old_worker.channel.set_blocking(true);
       old_worker.channel.write_message(&OrderMessage { id: String::from(message_id), order: Order::ReturnListenSockets });
@@ -429,7 +429,7 @@ impl CommandServer {
       });
       count += 1;
     }
-    self.proxies.insert(Token(worker_token), worker);
+    self.workers.insert(Token(worker_token), worker);
 
     self.answer_success(token, message_id, "", None);
   }
@@ -468,13 +468,13 @@ impl CommandServer {
     let mut futures = Vec::new();
     let id = message_id.to_string();
 
-    for ref mut proxy in self.proxies.values_mut()
+    for ref mut worker in self.workers.values_mut()
       .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
 
-      let tag = proxy.id.to_string();
+      let tag = worker.id.to_string();
       futures.push(
         executor::send(
-          proxy.token.expect("worker should have a token"),
+          worker.token.expect("worker should have a token"),
           OrderMessage { id: id.clone(), order: Order::Metrics }).map(|data| (tag, data))
       );
     }
@@ -514,13 +514,13 @@ impl CommandServer {
   pub fn query(&mut self, token: FrontToken, message_id: &str, query: Query) {
     let id = message_id.to_string();
     let mut futures = Vec::new();
-    for ref mut proxy in self.proxies.values_mut()
+    for ref mut worker in self.workers.values_mut()
       .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
 
-      let tag = proxy.id.to_string();
+      let tag = worker.id.to_string();
       futures.push(
         executor::send(
-          proxy.token.expect("worker should have a token"),
+          worker.token.expect("worker should have a token"),
           OrderMessage { id: id.clone(), order: Order::Query(query.clone()) }).map(|data| (tag, data))
       );
 
@@ -581,11 +581,11 @@ impl CommandServer {
     };
   }
 
-  pub fn worker_order(&mut self, token: FrontToken, message_id: &str, order: Order, proxy_id: Option<u32>) {
+  pub fn worker_order(&mut self, token: FrontToken, message_id: &str, order: Order, worker_id: Option<u32>) {
     if let &Order::AddCertificate(_) = &order {
-      debug!("proxyconfig client order AddCertificate()");
+      debug!("workerconfig client order AddCertificate()");
     } else {
-      debug!("proxyconfig client order {:?}", order);
+      debug!("workerconfig client order {:?}", order);
     }
 
     if let &Order::Logging(ref logging_filter) = &order {
@@ -603,19 +603,19 @@ impl CommandServer {
 
     let mut found = false;
     let mut futures = Vec::new();
-    for ref mut proxy in self.proxies.values_mut()
+    for ref mut worker in self.workers.values_mut()
       .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
 
-      if let Some(id) = proxy_id {
-        if id != proxy.id {
+      if let Some(id) = worker_id {
+        if id != worker.id {
           continue;
         }
       }
 
-      let worker_token = proxy.token.expect("worker should have a token");
+      let worker_token = worker.token.expect("worker should have a token");
       let should_stop_worker = order == Order::SoftStop || order == Order::HardStop;
       if should_stop_worker {
-        proxy.run_state = RunState::Stopping;
+        worker.run_state = RunState::Stopping;
       }
 
       futures.push(
@@ -634,11 +634,11 @@ impl CommandServer {
 
     if !found {
       // FIXME: should send back error here
-      error!("no proxy found");
+      error!("no worker found");
     }
 
     let id = message_id.to_string();
-    let should_stop_master = (order == Order::SoftStop || order == Order::HardStop) && proxy_id.is_none();
+    let should_stop_master = (order == Order::SoftStop || order == Order::HardStop) && worker_id.is_none();
     let f = join_all(futures).map(move |_| {
       if should_stop_master {
         executor::Executor::stop_master();
@@ -687,17 +687,17 @@ impl CommandServer {
           debug!("config generated {:?}", order);
         }
         let mut found = false;
-        for ref mut proxy in self.proxies.values_mut()
+        for ref mut worker in self.workers.values_mut()
           .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
 
           let o = order.clone();
-          proxy.push_message(OrderMessage { id: message.id.clone(), order: o });
+          worker.push_message(OrderMessage { id: message.id.clone(), order: o });
           found = true;
         }
 
         if !found {
           // FIXME: should send back error here
-          error!("no proxy found");
+          error!("no worker found");
         }
       }
     }
@@ -710,9 +710,9 @@ impl CommandServer {
   }
 
   pub fn disable_cloexec_before_upgrade(&mut self) {
-    for ref mut proxy in self.proxies.values() {
-      if proxy.run_state == RunState::Running {
-        util::disable_close_on_exec(proxy.channel.sock.as_raw_fd());
+    for ref mut worker in self.workers.values() {
+      if worker.run_state == RunState::Running {
+        util::disable_close_on_exec(worker.channel.sock.as_raw_fd());
       }
     }
     trace!("disabling cloexec on listener: {}", self.sock.as_raw_fd());
@@ -720,16 +720,16 @@ impl CommandServer {
   }
 
   pub fn enable_cloexec_after_upgrade(&mut self) {
-    for ref mut proxy in self.proxies.values() {
-      if proxy.run_state == RunState::Running {
-        util::enable_close_on_exec(proxy.channel.sock.as_raw_fd());
+    for ref mut worker in self.workers.values() {
+      if worker.run_state == RunState::Running {
+        util::enable_close_on_exec(worker.channel.sock.as_raw_fd());
       }
     }
         util::enable_close_on_exec(self.sock.as_raw_fd());
   }
 
   pub fn generate_upgrade_data(&self) -> UpgradeData {
-    let workers: Vec<SerializedWorker> = self.proxies.values().map(|ref proxy| SerializedWorker::from_proxy(proxy)).collect();
+    let workers: Vec<SerializedWorker> = self.workers.values().map(|ref worker| SerializedWorker::from_worker(worker)).collect();
     //FIXME: ensure there's at least one worker
     let state = self.state.clone();
 
@@ -807,7 +807,7 @@ impl CommandServer {
       max_buffer_size: max_buffer_size,
       //FIXME: deserialize client connections as well, otherwise they might leak?
       clients:         Slab::with_capacity(128),
-      proxies:         workers,
+      workers:         workers,
       next_id:         next_id,
       state:           config_state,
       token_count:     token_count,

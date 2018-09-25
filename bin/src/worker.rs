@@ -25,7 +25,7 @@ use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
-use sozu::network::proxy::Server;
+use sozu::network::server::Server;
 use sozu::network::metrics;
 
 use util;
@@ -76,23 +76,23 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
   let config_state: ConfigState = serde_json::from_reader(configuration_state_file)
     .expect("could not parse configuration state data");
 
-  let proxy_config = command.read_message().expect("worker could not read configuration from socket");
-  //println!("got message: {:?}", proxy_config);
+  let worker_config = command.read_message().expect("worker could not read configuration from socket");
+  //println!("got message: {:?}", worker_config);
 
   let worker_id = format!("{}-{:02}", "WRK", id);
-  logging::setup(worker_id.clone(), &proxy_config.log_level,
-    &proxy_config.log_target, proxy_config.log_access_target.as_ref().map(|s| s.as_str()));
+  logging::setup(worker_id.clone(), &worker_config.log_level,
+    &worker_config.log_target, worker_config.log_access_target.as_ref().map(|s| s.as_str()));
   info!("worker {} starting...", id);
 
   command.set_nonblocking(true);
   let mut command: Channel<OrderMessageAnswer,OrderMessage> = command.into();
   command.readiness.insert(Ready::readable());
 
-  if let Some(ref metrics) = proxy_config.metrics.as_ref() {
+  if let Some(ref metrics) = worker_config.metrics.as_ref() {
     metrics::setup(&metrics.address, worker_id, metrics.tagged_metrics, metrics.prefix.clone());
   }
 
-  let mut server = Server::new_from_config(command, ScmSocket::new(scm), proxy_config, config_state);
+  let mut server = Server::new_from_config(command, ScmSocket::new(scm), worker_config, config_state);
 
   info!("starting event loop");
   server.run();

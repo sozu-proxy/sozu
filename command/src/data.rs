@@ -25,19 +25,19 @@ pub enum ConfigCommand {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub struct ConfigMessage {
-  pub id:       String,
-  pub version:  u8,
-  pub data:     ConfigCommand,
-  pub proxy_id: Option<u32>,
+  pub id:        String,
+  pub version:   u8,
+  pub data:      ConfigCommand,
+  pub worker_id: Option<u32>,
 }
 
 impl ConfigMessage {
-  pub fn new(id: String, data: ConfigCommand, proxy_id: Option<u32>) -> ConfigMessage {
+  pub fn new(id: String, data: ConfigCommand, worker_id: Option<u32>) -> ConfigMessage {
     ConfigMessage {
       version:  PROTOCOL_VERSION,
       id,
       data,
-      proxy_id,
+      worker_id,
     }
   }
 }
@@ -104,7 +104,7 @@ struct SaveStateData {
 enum ConfigMessageField {
   Id,
   Version,
-  ProxyId,
+  WorkerId,
   Type,
   Data,
 }
@@ -117,18 +117,18 @@ impl<'de> serde::Deserialize<'de> for ConfigMessageField {
       type Value = ConfigMessageField;
 
       fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("expected id, version, proxy id, type or data")
+        formatter.write_str("expected id, version, worker id, type or data")
       }
 
       fn visit_str<E>(self, value: &str) -> Result<ConfigMessageField, E>
         where E: serde::de::Error {
         match value {
-          "id"       => Ok(ConfigMessageField::Id),
-          "version"  => Ok(ConfigMessageField::Version),
-          "type"     => Ok(ConfigMessageField::Type),
-          "proxy_id" => Ok(ConfigMessageField::ProxyId),
-          "data"     => Ok(ConfigMessageField::Data),
-          e => Err(serde::de::Error::custom(format!("expected id, version, proxy id, type or data, got: {}", e))),
+          "id"        => Ok(ConfigMessageField::Id),
+          "version"   => Ok(ConfigMessageField::Version),
+          "type"      => Ok(ConfigMessageField::Type),
+          "worker_id" => Ok(ConfigMessageField::WorkerId),
+          "data"      => Ok(ConfigMessageField::Data),
+          e => Err(serde::de::Error::custom(format!("expected id, version, worker id, type or data, got: {}", e))),
         }
       }
     }
@@ -149,7 +149,7 @@ impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
         where V: serde::de::MapAccess<'de> {
     let mut id:Option<String>              = None;
     let mut version:Option<u8>             = None;
-    let mut proxy_id: Option<u32>          = None;
+    let mut worker_id: Option<u32>          = None;
     let mut config_type:Option<String>     = None;
     let mut data:Option<serde_json::Value> = None;
 
@@ -158,7 +158,7 @@ impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
         Some(ConfigMessageField::Type)    => { config_type = Some(try!(visitor.next_value())); }
         Some(ConfigMessageField::Id)      => { id = Some(try!(visitor.next_value())); }
         Some(ConfigMessageField::Version) => { version = Some(try!(visitor.next_value())); }
-        Some(ConfigMessageField::ProxyId) => { proxy_id = Some(try!(visitor.next_value())); }
+        Some(ConfigMessageField::WorkerId) => { worker_id = Some(try!(visitor.next_value())); }
         Some(ConfigMessageField::Data)    => { data = Some(try!(visitor.next_value())); }
         None => { break; }
       }
@@ -240,7 +240,7 @@ impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
       id:      id,
       version: PROTOCOL_VERSION,
       data:    data,
-      proxy_id: proxy_id,
+      worker_id: worker_id,
     })
   }
 }
@@ -248,7 +248,7 @@ impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
 impl<'de> serde::Deserialize<'de> for ConfigMessage {
   fn deserialize<D>(deserializer: D) -> Result<ConfigMessage, D::Error>
     where D: serde::de::Deserializer<'de> {
-    static FIELDS: &'static [&'static str] = &["id", "version", "proxy_id", "type", "data"];
+    static FIELDS: &'static [&'static str] = &["id", "version", "worker_id", "type", "data"];
     deserializer.deserialize_struct("ConfigMessage", FIELDS, ConfigMessageVisitor)
   }
 }
@@ -263,7 +263,7 @@ impl serde::Serialize for ConfigMessage {
       where S: serde::Serializer,
   {
     let mut count = 4;
-    if self.proxy_id.is_some() {
+    if self.worker_id.is_some() {
       count += 1;
     }
     let mut map = try!(serializer.serialize_map(Some(count)));
@@ -271,8 +271,8 @@ impl serde::Serialize for ConfigMessage {
     try!(map.serialize_entry("id", &self.id));
     try!(map.serialize_entry("version", &self.version));
 
-    if self.proxy_id.is_some() {
-      try!(map.serialize_entry("proxy_id", self.proxy_id.as_ref().unwrap()));
+    if self.worker_id.is_some() {
+      try!(map.serialize_entry("worker_id", self.worker_id.as_ref().unwrap()));
     }
 
     match self.data {
@@ -397,14 +397,14 @@ mod tests {
                   proxy_protocol: Some(ProxyProtocolConfig::ExpectHeader),
                   load_balancing_policy: LoadBalancingAlgorithms::RoundRobin,
       })),
-      proxy_id: None
+      worker_id: None
     });
 
   test_message!(remove_application, "../assets/remove_application.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     ConfigCommand::ProxyConfiguration(Order::RemoveApplication( String::from("xxx") )),
-      proxy_id: None
+      worker_id: None
     });
 
   test_message!(add_http_front, "../assets/add_http_front.json", ConfigMessage {
@@ -416,7 +416,7 @@ mod tests {
                   path_begin: String::from("xxx"),
                   address: "0.0.0.0:8080".parse().unwrap(),
       })),
-      proxy_id: None
+      worker_id: None
     });
 
   test_message!(remove_http_front, "../assets/remove_http_front.json", ConfigMessage {
@@ -428,7 +428,7 @@ mod tests {
                   path_begin: String::from("xxx"),
                   address: "0.0.0.0:8080".parse().unwrap(),
       })),
-      proxy_id: None
+      worker_id: None
     });
 
   test_message!(add_https_front, "../assets/add_https_front.json", ConfigMessage {
@@ -441,7 +441,7 @@ mod tests {
                   fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
                   address: "0.0.0.0:8443".parse().unwrap(),
       })),
-      proxy_id: None
+      worker_id: None
     });
 
   test_message!(remove_https_front, "../assets/remove_https_front.json", ConfigMessage {
@@ -454,7 +454,7 @@ mod tests {
                   fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
                   address: "0.0.0.0:8443".parse().unwrap(),
       })),
-      proxy_id: None
+      worker_id: None
     });
 
   const KEY        : &'static str = include_str!("../../lib/assets/key.pem");
@@ -473,7 +473,7 @@ mod tests {
         },
         names: Vec::new()
       })),
-      proxy_id: None
+      worker_id: None
     });
 
   test_message!(remove_certificate, "../assets/remove_certificate.json", ConfigMessage {
@@ -484,7 +484,7 @@ mod tests {
           fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
           names: Vec::new(),
       })),
-      proxy_id: None
+      worker_id: None
     });
 
   test_message!(add_backend, "../assets/add_backend.json", ConfigMessage {
@@ -498,7 +498,7 @@ mod tests {
                   sticky_id: Some(String::from("xxx-0")),
                   backup: Some(false),
       })),
-      proxy_id: None
+      worker_id: None
     });
 
   test_message!(remove_backend, "../assets/remove_backend.json", ConfigMessage {
@@ -509,70 +509,70 @@ mod tests {
                   backend_id: String::from("xxx-0"),
                   address: "127.0.0.1:8080".parse().unwrap(),
       })),
-      proxy_id: None
+      worker_id: None
     });
 
   test_message!(soft_stop, "../assets/soft_stop.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     ConfigCommand::ProxyConfiguration(Order::SoftStop),
-      proxy_id: Some(0),
+      worker_id: Some(0),
     });
 
   test_message!(hard_stop, "../assets/hard_stop.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     ConfigCommand::ProxyConfiguration(Order::HardStop),
-      proxy_id: Some(0),
+      worker_id: Some(0),
     });
 
   test_message!(status, "../assets/status.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     ConfigCommand::ProxyConfiguration(Order::Status),
-      proxy_id: Some(0),
+      worker_id: Some(0),
     });
 
   test_message!(load_state, "../assets/load_state.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     ConfigCommand::LoadState(String::from("./config_dump.json")),
-      proxy_id: None
+      worker_id: None
     });
 
   test_message!(save_state, "../assets/save_state.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     ConfigCommand::SaveState(String::from("./config_dump.json")),
-      proxy_id: None
+      worker_id: None
     });
 
   test_message!(dump_state, "../assets/dump_state.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     ConfigCommand::DumpState,
-      proxy_id: None
+      worker_id: None
     });
 
   test_message!(list_workers, "../assets/list_workers.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     ConfigCommand::ListWorkers,
-      proxy_id: None
+      worker_id: None
     });
 
   test_message!(upgrade_master, "../assets/upgrade_master.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     ConfigCommand::UpgradeMaster,
-      proxy_id: None
+      worker_id: None
     });
 
   test_message!(upgrade_worker, "../assets/upgrade_worker.json", ConfigMessage {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     ConfigCommand::UpgradeWorker(0),
-      proxy_id: None
+      worker_id: None
     });
 
   test_message_answer!(answer_workers_status, "../assets/answer_workers_status.json", ConfigMessageAnswer {

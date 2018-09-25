@@ -15,10 +15,10 @@ You send a `ConfigMessage`, defined as follows:
 
 ```rust
 pub struct ConfigMessage {
-  pub id:       String,
-  pub version:  u8,
-  pub data:     ConfigCommand,
-  pub proxy_id: Option<String>,
+  pub id:        String,
+  pub version:   u8,
+  pub data:      ConfigCommand,
+  pub worker_id: Option<String>,
 }
 ```
 
@@ -26,18 +26,18 @@ When serialized to JSON it looks like this:
 
 ```json
 {
-  "id":       "ID_TEST",
-  "version":  0,
-  "proxy_id": 0,
-  "type":     "<ConfigCommand enum name>",
-  "data":     { <ConfigCommand data> }
+    "id":        "ID_TEST",
+    "version":   0,
+    "worker_id": 0,
+    "type":      "<ConfigCommand enum name>",
+    "data":      { <ConfigCommand data> }
 }"
 ```
 
 The type indicates which kind of message it wraps. The id field will be used
 for answers. Since the protocol is asynchronous, this is used to identify
 answers to a specific message (you can receive multiple answers to one message).
-The `proxy_id` field is used to target a specific worker.
+The `worker_id` field is used to target a specific worker.
 
 An answer has the format `ConfigMessageAnswer`, defined as follows:
 

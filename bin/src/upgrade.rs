@@ -31,15 +31,15 @@ pub struct SerializedWorker {
 }
 
 impl SerializedWorker {
-  pub fn from_proxy(proxy: &Worker) -> SerializedWorker {
+  pub fn from_worker(worker: &Worker) -> SerializedWorker {
     SerializedWorker {
-      fd:         proxy.channel.sock.as_raw_fd(),
-      pid:        proxy.pid,
-      id:         proxy.id,
-      run_state:  proxy.run_state.clone(),
-      token:      proxy.token.clone().map(|Token(t)| t),
-      queue:      proxy.queue.clone().into(),
-      scm:        proxy.scm.raw_fd(),
+      fd:         worker.channel.sock.as_raw_fd(),
+      pid:        worker.pid,
+      id:         worker.id,
+      run_state:  worker.run_state.clone(),
+      token:      worker.token.clone().map(|Token(t)| t),
+      queue:      worker.queue.clone().into(),
+      scm:        worker.scm.raw_fd(),
     }
   }
 }

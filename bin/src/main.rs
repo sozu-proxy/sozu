@@ -207,7 +207,7 @@ fn check_process_limits(config: &Config) -> Result<(), StartupError> {
 
   // check if all proxies are under the hard limit
   if config.max_connections > hard_limit {
-    let error = format!("At least one proxy can't have that much of connections. \
+    let error = format!("At least one worker can't have that many connections. \
             Current max file descriptor hard limit is: {}", hard_limit);
     return Err(StartupError::TooManyAllowedConnectionsForWorker(error));
   }

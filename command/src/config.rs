@@ -930,7 +930,7 @@ impl Config {
       v.push(ConfigMessage {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
-        proxy_id: None,
+        worker_id: None,
         data:     ConfigCommand::ProxyConfiguration(Order::AddHttpListener(listener.clone())),
       });
       count += 1;
@@ -940,7 +940,7 @@ impl Config {
       v.push(ConfigMessage {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
-        proxy_id: None,
+        worker_id: None,
         data:     ConfigCommand::ProxyConfiguration(Order::AddHttpsListener(listener.clone())),
       });
       count += 1;
@@ -950,7 +950,7 @@ impl Config {
       v.push(ConfigMessage {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
-        proxy_id: None,
+        worker_id: None,
         data:     ConfigCommand::ProxyConfiguration(Order::AddTcpListener(listener.clone())),
       });
       count += 1;
@@ -962,7 +962,7 @@ impl Config {
         v.push(ConfigMessage {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
-          proxy_id: None,
+          worker_id: None,
           data:     ConfigCommand::ProxyConfiguration(order),
         });
         count += 1;
@@ -974,7 +974,7 @@ impl Config {
         v.push(ConfigMessage {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
-          proxy_id: None,
+          worker_id: None,
           data:     ConfigCommand::ProxyConfiguration(Order::ActivateListener(ActivateListener{
             front:    listener.front,
             proxy:    ListenerType::HTTP,
@@ -988,7 +988,7 @@ impl Config {
         v.push(ConfigMessage {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
-          proxy_id: None,
+          worker_id: None,
           data:     ConfigCommand::ProxyConfiguration(Order::ActivateListener(ActivateListener{
             front:    listener.front,
             proxy:    ListenerType::HTTPS,
@@ -1002,7 +1002,7 @@ impl Config {
         v.push(ConfigMessage {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
-          proxy_id: None,
+          worker_id: None,
           data:     ConfigCommand::ProxyConfiguration(Order::ActivateListener(ActivateListener{
             front:    listener.front,
             proxy:    ListenerType::TCP,
