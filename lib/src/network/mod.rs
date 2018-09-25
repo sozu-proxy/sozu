@@ -31,7 +31,7 @@ pub mod load_balancing;
 mod splice;
 
 pub mod tcp;
-pub mod proxy;
+pub mod server;
 
 #[cfg(feature = "use-openssl")]
 pub mod https_openssl;
@@ -94,7 +94,7 @@ pub enum AcceptError {
   WouldBlock,
 }
 
-use self::proxy::{SessionToken,ListenToken,ListenPortState};
+use self::server::{SessionToken,ListenToken,ListenPortState};
 pub trait ProxyConfiguration<Session> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, session: &mut Session,
     back_token: Token) ->Result<BackendConnectAction,ConnectionError>;

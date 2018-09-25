@@ -34,7 +34,7 @@ use network::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,Ses
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use network::backends::BackendMap;
-use network::proxy::{Server,ProxyChannel,ListenToken};
+use network::server::{Server,ProxyChannel,ListenToken};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
 use network::trie::*;
@@ -45,7 +45,7 @@ use network::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use network::retry::RetryPolicy;
 use network::tcp;
 use util::UnwrapLog;
-use super::configuration::{ServerConfiguration,TlsApp};
+use super::configuration::{Proxy,TlsApp};
 
 pub enum State {
   Expect(ExpectProxyProtocol<TcpStream>, ServerSession),

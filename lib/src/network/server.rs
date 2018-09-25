@@ -126,9 +126,9 @@ pub struct Server {
   can_accept:      bool,
   channel:         ProxyChannel,
   queue:           VecDeque<OrderMessageAnswer>,
-  http:            http::ServerConfiguration,
+  http:            http::Proxy,
   https:           HttpsProvider,
-  tcp:             tcp::ServerConfiguration,
+  tcp:             tcp::Proxy,
   config_state:    ConfigState,
   scm:             ScmSocket,
   sessions:        Slab<Rc<RefCell<ProxySessionCast>>,SessionToken>,
@@ -180,9 +180,9 @@ impl Server {
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
     sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken>,
     pool: Rc<RefCell<Pool<BufferQueue>>>,
-    http: Option<http::ServerConfiguration>,
+    http: Option<http::Proxy>,
     https: Option<HttpsProvider>,
-    tcp:  Option<tcp::ServerConfiguration>,
+    tcp:  Option<tcp::Proxy>,
     server_config: ServerConfig,
     config_state: Option<ConfigState>) -> Self {
 
@@ -216,9 +216,9 @@ impl Server {
       can_accept:      true,
       channel,
       queue:           VecDeque::new(),
-      http:            http.unwrap_or(http::ServerConfiguration::new(pool.clone())),
+      http:            http.unwrap_or(http::Proxy::new(pool.clone())),
       https:           https.unwrap_or(HttpsProvider::new(false, pool.clone())),
-      tcp:             tcp.unwrap_or(tcp::ServerConfiguration::new()),
+      tcp:             tcp.unwrap_or(tcp::Proxy::new()),
       config_state:    ConfigState::new(),
       scm,
       sessions,
@@ -1320,22 +1320,22 @@ use network::https_rustls;
 
 #[cfg(feature = "use-openssl")]
 pub enum HttpsProvider {
-  Openssl(https_openssl::ServerConfiguration),
-  Rustls(https_rustls::configuration::ServerConfiguration),
+  Openssl(https_openssl::Proxy),
+  Rustls(https_rustls::configuration::Proxy),
 }
 
 #[cfg(not(feature = "use-openssl"))]
 pub enum HttpsProvider {
-  Rustls(https_rustls::configuration::ServerConfiguration),
+  Rustls(https_rustls::configuration::Proxy),
 }
 
 #[cfg(feature = "use-openssl")]
 impl HttpsProvider {
   pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>) -> HttpsProvider {
     if use_openssl {
-      HttpsProvider::Openssl(https_openssl::ServerConfiguration::new(pool))
+      HttpsProvider::Openssl(https_openssl::Proxy::new(pool))
     } else {
-      HttpsProvider::Rustls(https_rustls::configuration::ServerConfiguration::new(pool))
+      HttpsProvider::Rustls(https_rustls::configuration::Proxy::new(pool))
     }
   }
 
@@ -1414,7 +1414,7 @@ impl HttpsProvider {
       error!("the openssl provider is not compiled, continuing with the rustls provider");
     }
 
-    let configuration = https_rustls::configuration::ServerConfiguration::new(pool);
+    let configuration = https_rustls::configuration::Proxy::new(pool);
     HttpsProvider::Rustls(configuration)
   }
 
@@ -1464,7 +1464,7 @@ impl HttpsProvider {
 /// this trait is used to work around the fact that we need to transform
 /// the sessions (that are all stored as a ProxySession in the slab) back
 /// to their original type to call the `connect_to_backend` method of
-/// their corresponding `ServerConfiguration`.
+/// their corresponding `Proxy`.
 /// If we find a way to make `connect_to_backend` work wothout transforming
 /// back to the type (example: storing a reference to the configuration
 /// in the session and making `connect_to_backend` a method of `ProxySession`?),

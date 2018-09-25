@@ -32,7 +32,7 @@ use network::{AppId,Backend,SessionResult,ConnectionError,RequiredEvents,Protoco
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use network::backends::BackendMap;
-use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
+use network::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
 use network::pool::{Pool,Checkout,Reset};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -736,17 +736,17 @@ pub struct ApplicationConfiguration {
   load_balancing_policy: LoadBalancingAlgorithms,
 }
 
-pub struct ServerConfiguration {
+pub struct Proxy {
   fronts:    HashMap<String, Token>,
   backends:  BackendMap,
   listeners: HashMap<Token, Listener>,
   configs:   HashMap<AppId, ApplicationConfiguration>,
 }
 
-impl ServerConfiguration {
-  pub fn new() -> ServerConfiguration {
+impl Proxy {
+  pub fn new() -> Proxy {
 
-    ServerConfiguration {
+    Proxy {
       backends:  BackendMap::new(),
       listeners: HashMap::new(),
       configs:   HashMap::new(),
@@ -823,7 +823,7 @@ impl ServerConfiguration {
   }
 }
 
-impl ProxyConfiguration<Session> for ServerConfiguration {
+impl ProxyConfiguration<Session> for Proxy {
 
   fn connect_to_backend(&mut self, poll: &mut Poll, session: &mut Session, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
     if self.listeners[&session.accept_token].app_id.is_none() {
@@ -1005,7 +1005,7 @@ impl ProxyConfiguration<Session> for ServerConfiguration {
 
 
 pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
-  use network::proxy::{self,ProxySessionCast};
+  use network::server::{self,ProxySessionCast};
 
   let mut poll          = Poll::new().expect("could not create event loop");
   let pool = Rc::new(RefCell::new(
@@ -1036,12 +1036,12 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
   };
 
   let front = config.front.clone();
-  let mut configuration = ServerConfiguration::new();
+  let mut configuration = Proxy::new();
   let _ = configuration.add_listener(config, pool.clone(), token);
   let _ = configuration.activate_listener(&mut poll, &front, None);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
 
-  let mut server_config: proxy::ServerConfig = Default::default();
+  let mut server_config: server::ServerConfig = Default::default();
   server_config.max_connections = max_buffers;
   let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), sessions,
     pool, None ,None, Some(configuration), server_config, None);
@@ -1151,7 +1151,7 @@ mod tests {
   }
 
   pub fn start_proxy() -> Channel<OrderMessage,OrderMessageAnswer> {
-    use network::proxy::{self,ProxySessionCast};
+    use network::server::{self,ProxySessionCast};
 
     info!("listen for connections");
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
@@ -1181,7 +1181,7 @@ mod tests {
         entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
       }
 
-      let mut configuration = ServerConfiguration::new();
+      let mut configuration = Proxy::new();
       let listener_config = TcpListenerConfig {
         front: "127.0.0.1:1234".parse().unwrap(),
         public_address: None,
@@ -1204,7 +1204,7 @@ mod tests {
         tcp:  Vec::new(),
       });
 
-      let mut server_config: proxy::ServerConfig = Default::default();
+      let mut server_config: server::ServerConfig = Default::default();
       server_config.max_connections = max_buffers;
       let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.into_raw_fd()),
         sessions, pool, None, None, Some(configuration), server_config, None);

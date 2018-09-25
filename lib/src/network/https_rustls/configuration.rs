@@ -38,7 +38,7 @@ use network::pool::{Pool,Checkout};
 use network::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus};
 use network::backends::BackendMap;
-use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession,CONN_RETRIES};
+use network::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession,CONN_RETRIES};
 use network::http::{self,DefaultAnswers};
 use network::socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
 use network::trie::*;
@@ -289,16 +289,16 @@ impl Listener {
 
 }
 
-pub struct ServerConfiguration {
+pub struct Proxy {
   listeners:    HashMap<Token, Listener>,
   applications: HashMap<AppId, Application>,
   backends:     BackendMap,
   pool:         Rc<RefCell<Pool<BufferQueue>>>,
 }
 
-impl ServerConfiguration {
-  pub fn new(pool: Rc<RefCell<Pool<BufferQueue>>>) -> ServerConfiguration {
-    ServerConfiguration {
+impl Proxy {
+  pub fn new(pool: Rc<RefCell<Pool<BufferQueue>>>) -> Proxy {
+    Proxy {
       listeners : HashMap::new(),
       applications: HashMap::new(),
       backends: BackendMap::new(),
@@ -469,7 +469,7 @@ impl ServerConfiguration {
   }
 }
 
-impl ProxyConfiguration<TlsSession> for ServerConfiguration {
+impl ProxyConfiguration<TlsSession> for Proxy {
   fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
     self.listeners.get_mut(&Token(token.0)).unwrap().accept(token)
   }
@@ -698,9 +698,9 @@ impl ProxyConfiguration<TlsSession> for ServerConfiguration {
   }
 }
 
-use network::proxy::HttpsProvider;
+use network::server::HttpsProvider;
 pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
-  use network::proxy::{self,ProxySessionCast};
+  use network::server::{self,ProxySessionCast};
 
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_listeners   = 1;
@@ -733,11 +733,11 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
   };
 
   let front = config.front.clone();
-  let mut configuration = ServerConfiguration::new(pool.clone());
+  let mut configuration = Proxy::new(pool.clone());
   if configuration.add_listener(config, pool.clone(), token).is_some() {
     if configuration.activate_listener(&mut event_loop, &front, None).is_some() {
       let (scm_server, scm_client) = UnixStream::pair().unwrap();
-      let mut server_config: proxy::ServerConfig = Default::default();
+      let mut server_config: server::ServerConfig = Default::default();
       server_config.max_connections = max_buffers;
       let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
         sessions, pool, None, Some(HttpsProvider::Rustls(configuration)), None, server_config, None);
