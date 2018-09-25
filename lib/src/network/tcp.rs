@@ -963,6 +963,11 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
       let mut p = (*listener.pool).borrow_mut();
 
       if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
+        if listener.app_id.is_none() {
+          error!("listener at address {:?} has no linked application", listener.address);
+          return Err(AcceptError::IoError);
+        }
+
         let proxy_protocol = self.configs
                                 .get(listener.app_id.as_ref().unwrap())
                                 .and_then(|c| c.proxy_protocol.clone());
