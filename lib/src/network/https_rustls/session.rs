@@ -30,8 +30,8 @@ use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::pool::{Pool,Checkout};
 use network::buffer_queue::BufferQueue;
-use network::{AppId,Backend,ClientResult,ConnectionError,Protocol,Readiness,SessionMetrics,ClientToken,
-  ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
+use network::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,SessionToken,
+  ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use network::backends::BackendMap;
 use network::proxy::{Server,ProxyChannel,ListenToken};
@@ -54,7 +54,7 @@ pub enum State {
   WebSocket(Pipe<FrontRustls>)
 }
 
-pub struct TlsClient {
+pub struct TlsSession {
   pub frontend_token: Token,
   pub backend:        Option<Rc<RefCell<Backend>>>,
   pub back_connected: BackendConnectionStatus,
@@ -70,9 +70,9 @@ pub struct TlsClient {
   pub connection_attempt: u8,
 }
 
-impl TlsClient {
+impl TlsSession {
   pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
-    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout, listen_token: Token) -> TlsClient {
+    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout, listen_token: Token) -> TlsSession {
     let state = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);
@@ -82,7 +82,7 @@ impl TlsClient {
       Some(State::Handshake(TlsHandshake::new(ssl, sock)))
     };
 
-    let mut client = TlsClient {
+    let mut session = TlsSession {
       frontend_token: token,
       backend:        None,
       back_connected: BackendConnectionStatus::NotConnected,
@@ -97,8 +97,8 @@ impl TlsClient {
       listen_token,
       connection_attempt: 0,
     };
-    client.front_readiness().interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-    client
+    session.front_readiness().interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+    session
   }
 
   pub fn http(&mut self) -> Option<&mut Http<FrontRustls>> {
@@ -125,7 +125,7 @@ impl TlsClient {
     if let State::Expect(expect, ssl) = protocol {
       debug!("switching to TLS handshake");
       if let Some(ref addresses) = expect.addresses {
-        if let (Some(public_address), Some(client_address)) = (addresses.destination(), addresses.source()) {
+        if let (Some(public_address), Some(session_address)) = (addresses.destination(), addresses.source()) {
           self.public_address = Some(public_address.ip());
 
           let ExpectProxyProtocol {
@@ -249,21 +249,21 @@ impl TlsClient {
     }
   }
 
-  fn front_hup(&mut self)     -> ClientResult {
-    self.http().map(|h| h.front_hup()).unwrap_or(ClientResult::CloseClient)
+  fn front_hup(&mut self)     -> SessionResult {
+    self.http().map(|h| h.front_hup()).unwrap_or(SessionResult::CloseSession)
   }
 
-  fn back_hup(&mut self)      -> ClientResult {
+  fn back_hup(&mut self)      -> SessionResult {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.back_hup(),
       State::WebSocket(ref mut pipe) => pipe.back_hup(),
       State::Handshake(_)            => {
         error!("why a backend HUP event while still in frontend handshake?");
-        ClientResult::CloseClient
+        SessionResult::CloseSession
       },
       State::Expect(_,_)             => {
         error!("why a backend HUP event while still in frontend proxy protocol expect?");
-        ClientResult::CloseClient
+        SessionResult::CloseSession
       }
     }
   }
@@ -276,7 +276,7 @@ impl TlsClient {
     }
   }
 
-  fn readable(&mut self)      -> ClientResult {
+  fn readable(&mut self)      -> SessionResult {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Expect(ref mut expect, _)    => expect.readable(&mut self.metrics),
       State::Handshake(ref mut handshake) => handshake.readable(),
@@ -290,14 +290,14 @@ impl TlsClient {
       if self.upgrade() {
         self.readable()
       } else {
-        ClientResult::CloseClient
+        SessionResult::CloseSession
       }
     }
   }
 
-  fn writable(&mut self)      -> ClientResult {
+  fn writable(&mut self)      -> SessionResult {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Expect(_,_)                  => return ClientResult::CloseClient,
+      State::Expect(_,_)                  => return SessionResult::CloseSession,
       State::Handshake(ref mut handshake) => handshake.writable(),
       State::Http(ref mut http)           => (ProtocolResult::Continue, http.writable(&mut self.metrics)),
       State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.writable(&mut self.metrics)),
@@ -310,19 +310,19 @@ impl TlsClient {
         if (self.front_readiness().event & self.front_readiness().interest).is_writable() {
         self.writable()
         } else {
-          ClientResult::Continue
+          SessionResult::Continue
         }
       } else {
-        ClientResult::CloseClient
+        SessionResult::CloseSession
       }
     }
   }
 
-  fn back_readable(&mut self) -> ClientResult {
+  fn back_readable(&mut self) -> SessionResult {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Expect(_,_)                  => return ClientResult::CloseClient,
+      State::Expect(_,_)                  => return SessionResult::CloseSession,
       State::Http(ref mut http)           => http.back_readable(&mut self.metrics),
-      State::Handshake(ref mut handshake) => (ProtocolResult::Continue, ClientResult::CloseClient),
+      State::Handshake(ref mut handshake) => (ProtocolResult::Continue, SessionResult::CloseSession),
       State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.back_readable(&mut self.metrics)),
     };
 
@@ -335,15 +335,15 @@ impl TlsClient {
           _ => result
         }
       } else {
-        ClientResult::CloseClient
+        SessionResult::CloseSession
       }
     }
   }
 
-  fn back_writable(&mut self) -> ClientResult {
+  fn back_writable(&mut self) -> SessionResult {
     match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Expect(_,_)                  => ClientResult::CloseClient,
-      State::Handshake(_)                 => ClientResult::CloseClient,
+      State::Expect(_,_)                  => SessionResult::CloseSession,
+      State::Handshake(_)                 => SessionResult::CloseSession,
       State::Http(ref mut http)           => http.back_writable(&mut self.metrics),
       State::WebSocket(ref mut pipe)      => pipe.back_writable(&mut self.metrics),
     }
@@ -457,7 +457,7 @@ impl TlsClient {
   }
 }
 
-impl ProxyClient for TlsClient {
+impl ProxySession for TlsSession {
   fn close(&mut self, poll: &mut Poll) -> CloseResult {
     //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
     self.http().map(|http| http.close());
@@ -494,18 +494,18 @@ impl ProxyClient for TlsClient {
     result
   }
 
-  fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> ClientResult {
+  fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult {
     if self.frontend_token == token {
       let dur = SteadyTime::now() - self.last_event;
       if dur < *front_timeout {
         timer.set_timeout((*front_timeout - dur).to_std().unwrap(), token);
-        ClientResult::Continue
+        SessionResult::Continue
       } else {
-        ClientResult::CloseClient
+        SessionResult::CloseSession
       }
     } else {
       //invalid token, obsolete timeout triggered
-      ClientResult::Continue
+      SessionResult::Continue
     }
   }
 
@@ -549,7 +549,7 @@ impl ProxyClient for TlsClient {
     }
   }
 
-  fn ready(&mut self) -> ClientResult {
+  fn ready(&mut self) -> SessionResult {
     let mut counter = 0;
     let max_loop_iterations = 100000;
 
@@ -564,7 +564,7 @@ impl ProxyClient for TlsClient {
         self.fail_backend_connection();
 
         let backend_token = self.back_token();
-        return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
+        return SessionResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
         self.reset_connection_attempt();
         self.set_back_connected(BackendConnectionStatus::Connected);
@@ -574,7 +574,7 @@ impl ProxyClient for TlsClient {
     if self.front_readiness().event.is_hup() {
       let order = self.front_hup();
       match order {
-        ClientResult::CloseClient => {
+        SessionResult::CloseSession => {
           return order;
         },
         _ => {
@@ -602,31 +602,31 @@ impl ProxyClient for TlsClient {
 
       if front_interest.is_readable() {
         let order = self.readable();
-        trace!("front readable\tinterpreting client order {:?}", order);
+        trace!("front readable\tinterpreting session order {:?}", order);
 
-        if order != ClientResult::Continue {
+        if order != SessionResult::Continue {
           return order;
         }
       }
 
       if back_interest.is_writable() {
         let order = self.back_writable();
-        if order != ClientResult::Continue {
+        if order != SessionResult::Continue {
           return order;
         }
       }
 
       if back_interest.is_readable() {
         let order = self.back_readable();
-        if order != ClientResult::Continue {
+        if order != SessionResult::Continue {
           return order;
         }
       }
 
       if front_interest.is_writable() {
         let order = self.writable();
-        trace!("front writable\tinterpreting client order {:?}", order);
-        if order != ClientResult::Continue {
+        trace!("front writable\tinterpreting session order {:?}", order);
+        if order != SessionResult::Continue {
           return order;
         }
       }
@@ -634,10 +634,10 @@ impl ProxyClient for TlsClient {
       if back_interest.is_hup() {
         let order = self.back_hup();
         match order {
-          ClientResult::CloseClient => {
+          SessionResult::CloseSession => {
             return order;
           },
-          ClientResult::Continue => {},
+          SessionResult::Continue => {},
           _ => {
             self.back_readiness().map(|r| r.event.remove(UnixReady::hup()));
             return order;
@@ -647,21 +647,21 @@ impl ProxyClient for TlsClient {
 
       if front_interest.is_error() || back_interest.is_error() {
         if front_interest.is_error() {
-          error!("PROXY client {:?} front error, disconnecting", self.frontend_token);
+          error!("PROXY session {:?} front error, disconnecting", self.frontend_token);
         } else {
-          error!("PROXY client {:?} back error, disconnecting", self.frontend_token);
+          error!("PROXY session {:?} back error, disconnecting", self.frontend_token);
         }
 
         self.front_readiness().interest = UnixReady::from(Ready::empty());
         self.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::empty()));
-        return ClientResult::CloseClient;
+        return SessionResult::CloseSession;
       }
 
       counter += 1;
     }
 
     if counter == max_loop_iterations {
-      error!("PROXY\thandling client {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
+      error!("PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
 
       let front_interest = self.front_readiness().interest & self.front_readiness().event;
       let back_interest  = self.back_readiness().map(|r| r.interest & r.event);
@@ -671,10 +671,10 @@ impl ProxyClient for TlsClient {
       error!("PROXY\t{:?} readiness: front {:?} / back {:?} |front: {:?} | back: {:?} ", token,
         self.front_readiness(), back, front_interest, back_interest);
 
-      return ClientResult::CloseClient;
+      return SessionResult::CloseSession;
     }
 
-    ClientResult::Continue
+    SessionResult::Continue
   }
 
   fn last_event(&self) -> SteadyTime {
@@ -697,7 +697,7 @@ impl ProxyClient for TlsClient {
       State::WebSocket(ref pipe)      => &pipe.front_readiness,
     };
 
-    error!("zombie client[{:?} => {:?}], state => readiness: {:?}, protocol: {}, app_id: {:?}, back_connected: {:?}, metrics: {:?}",
+    error!("zombie session[{:?} => {:?}], state => readiness: {:?}, protocol: {}, app_id: {:?}, back_connected: {:?}, metrics: {:?}",
       self.frontend_token, self.back_token(), r, p, self.app_id, self.back_connected, self.metrics);
   }
 

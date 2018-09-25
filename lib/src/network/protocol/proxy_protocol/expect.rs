@@ -7,7 +7,7 @@ use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use nom::{Err,Offset};
 use network::protocol::proxy_protocol::header;
-use network::{Protocol, ClientResult};
+use network::{Protocol, SessionResult};
 use network::Readiness;
 use network::protocol::ProtocolResult;
 use network::socket::{SocketHandler, SocketResult};
@@ -51,7 +51,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
     }
   }
 
-  pub fn readable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, ClientResult) {
+  pub fn readable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, SessionResult) {
     let total_len = match self.header_len {
       HeaderLen::V4   => 28,
       HeaderLen::V6   => 52,
@@ -78,7 +78,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       metrics.service_stop();
       incr!("proxy_protocol.errors");
       self.readiness.reset();
-      return (ProtocolResult::Continue, ClientResult::CloseClient);
+      return (ProtocolResult::Continue, SessionResult::CloseSession);
     }
 
     if res == SocketResult::WouldBlock {
@@ -89,7 +89,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       Ok((rest, header)) => {
         trace!("got expect header: {:?}, rest.len() = {}", header, rest.len());
         self.addresses = Some(header.addr);
-        return (ProtocolResult::Upgrade, ClientResult::Continue);
+        return (ProtocolResult::Upgrade, SessionResult::Continue);
       },
       Err(Err::Incomplete(_)) => {
         match self.header_len {
@@ -104,17 +104,17 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
             metrics.service_stop();
             incr!("proxy_protocol.errors");
             self.readiness.reset();
-            return (ProtocolResult::Continue, ClientResult::CloseClient)
+            return (ProtocolResult::Continue, SessionResult::CloseSession)
           }
         };
-        return (ProtocolResult::Continue, ClientResult::Continue)
+        return (ProtocolResult::Continue, SessionResult::Continue)
       },
       Err(e) => {
         error!("[{:?}] front socket parse error, closing the connection: {:?}", self.frontend_token, e);
         metrics.service_stop();
         incr!("proxy_protocol.errors");
         self.readiness.reset();
-        return (ProtocolResult::Continue, ClientResult::CloseClient)
+        return (ProtocolResult::Continue, SessionResult::CloseSession)
       }
     };
   }
@@ -187,26 +187,26 @@ mod expect_test {
   // Accept connection from an upfront proxy and expect to read a proxy protocol header in this stream.
   fn start_middleware(middleware_addr: SocketAddr, barrier: Arc<Barrier>) {
     let upfront_middleware_conn_listener = TcpListener::bind(&middleware_addr).expect("could not accept upfront middleware connection");
-    let client_stream;
+    let session_stream;
     barrier.wait();
 
     // mio::TcpListener use a nonblocking mode so we have to loop on accept
     loop {
       if let Ok((stream, _addr)) = upfront_middleware_conn_listener.accept() {
-        client_stream = stream;
+        session_stream = stream;
         break;
       }
     }
 
     let mut session_metrics = SessionMetrics::new();
-    let mut expect_pp = ExpectProxyProtocol::new(client_stream, Token(0));
+    let mut expect_pp = ExpectProxyProtocol::new(session_stream, Token(0));
 
-    let mut res = (ProtocolResult::Continue, ClientResult::Continue);
-    while res == (ProtocolResult::Continue, ClientResult::Continue) {
+    let mut res = (ProtocolResult::Continue, SessionResult::Continue);
+    while res == (ProtocolResult::Continue, SessionResult::Continue) {
       res = expect_pp.readable(&mut session_metrics);
     }
 
-    if res != (ProtocolResult::Upgrade, ClientResult::Continue) {
+    if res != (ProtocolResult::Upgrade, SessionResult::Continue) {
       panic!("Should receive a complete proxy protocol header, res = {:?}", res);
     };
   }

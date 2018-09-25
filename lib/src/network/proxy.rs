@@ -33,7 +33,7 @@ use sozu_command::messages::{self,TcpFront,Order,Backend,MessageId,OrderMessageA
 use sozu_command::messages::HttpsListener;
 
 use network::buffer_queue::BufferQueue;
-use network::{ClientResult,ConnectionError,Protocol,RequiredEvents,ProxyClient,
+use network::{SessionResult,ConnectionError,Protocol,RequiredEvents,ProxySession,
   CloseResult,AcceptError,BackendConnectAction,ProxyConfiguration};
 use network::{http,tcp,AppId};
 use network::pool::Pool;
@@ -64,7 +64,7 @@ pub enum ListenPortState {
 #[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
 pub struct ListenToken(pub usize);
 #[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
-pub struct ClientToken(pub usize);
+pub struct SessionToken(pub usize);
 
 impl From<usize> for ListenToken {
     fn from(val: usize) -> ListenToken {
@@ -78,14 +78,14 @@ impl From<ListenToken> for usize {
     }
 }
 
-impl From<usize> for ClientToken {
-    fn from(val: usize) -> ClientToken {
-        ClientToken(val)
+impl From<usize> for SessionToken {
+    fn from(val: usize) -> SessionToken {
+        SessionToken(val)
     }
 }
 
-impl From<ClientToken> for usize {
-    fn from(val: ClientToken) -> usize {
+impl From<SessionToken> for usize {
+    fn from(val: SessionToken) -> usize {
         val.0
     }
 }
@@ -131,7 +131,7 @@ pub struct Server {
   tcp:             tcp::ServerConfiguration,
   config_state:    ConfigState,
   scm:             ScmSocket,
-  clients:         Slab<Rc<RefCell<ProxyClientCast>>,ClientToken>,
+  sessions:        Slab<Rc<RefCell<ProxySessionCast>>,SessionToken>,
   max_connections: usize,
   nb_connections:  usize,
   front_timeout:   time::Duration,
@@ -141,7 +141,7 @@ pub struct Server {
   zombie_check_interval: time::Duration,
   accept_queue:    VecDeque<(TcpStream, ListenToken, Protocol, SteadyTime)>,
   accept_queue_timeout: time::Duration,
-  base_clients_count: usize,
+  base_sessions_count: usize,
 }
 
 impl Server {
@@ -152,33 +152,33 @@ impl Server {
     ));
 
     //FIXME: we will use a few entries for the channel, metrics socket and the listeners
-    //FIXME: for HTTP/2, we will have more than 2 entries per client
-    let mut clients: Slab<Rc<RefCell<ProxyClientCast>>,ClientToken> = Slab::with_capacity(10+2*config.max_connections);
+    //FIXME: for HTTP/2, we will have more than 2 entries per session
+    let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(10+2*config.max_connections);
     {
-      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+      let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
       trace!("taking token {:?} for channel", entry.index());
-      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::Channel })));
+      entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::Channel })));
     }
     {
-      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+      let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
       trace!("taking token {:?} for metrics", entry.index());
-      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::Timer })));
+      entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::Timer })));
     }
     {
-      let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+      let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
       trace!("taking token {:?} for metrics", entry.index());
-      entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::Metrics })));
+      entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::Metrics })));
     }
 
     let use_openssl = config.tls_provider == TlsProvider::Openssl;
     let https = HttpsProvider::new(use_openssl, pool.clone());
 
     let server_config = ServerConfig::from_config(&config);
-    Server::new(event_loop, channel, scm, clients, pool, None, Some(https), None, server_config, Some(config_state))
+    Server::new(event_loop, channel, scm, sessions, pool, None, Some(https), None, server_config, Some(config_state))
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
-    clients: Slab<Rc<RefCell<ProxyClientCast>>,ClientToken>,
+    sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken>,
     pool: Rc<RefCell<Pool<BufferQueue>>>,
     http: Option<http::ServerConfiguration>,
     https: Option<HttpsProvider>,
@@ -207,7 +207,7 @@ impl Server {
       }
     });
 
-    let base_clients_count = clients.len();
+    let base_sessions_count = sessions.len();
 
     let mut server = Server {
       poll,
@@ -221,7 +221,7 @@ impl Server {
       tcp:             tcp.unwrap_or(tcp::ServerConfiguration::new()),
       config_state:    ConfigState::new(),
       scm,
-      clients,
+      sessions,
       max_connections: server_config.max_connections,
       nb_connections:  0,
       scm_listeners:   None,
@@ -231,7 +231,7 @@ impl Server {
       zombie_check_interval: time::Duration::seconds(i64::from(server_config.zombie_check_interval)),
       accept_queue:    VecDeque::new(),
       accept_queue_timeout: time::Duration::seconds(i64::from(server_config.accept_queue_timeout)),
-      base_clients_count,
+      base_sessions_count,
     };
 
     // initialize the worker with the state we got from a file
@@ -246,7 +246,7 @@ impl Server {
         };
 
         trace!("generating initial config order: {:#?}", message);
-        server.notify_sessions(message);
+        server.notify_proxys(message);
 
         counter += 1;
       }
@@ -273,7 +273,7 @@ impl Server {
     let max_poll_errors = 10000;
     let mut current_poll_errors = 0;
     let mut last_zombie_check = SteadyTime::now();
-    let mut last_clients_len = self.clients.len();
+    let mut last_sessions_len = self.sessions.len();
 
     loop {
       if current_poll_errors == max_poll_errors {
@@ -339,7 +339,7 @@ impl Server {
                   return;
                 } else if let Order::SoftStop = msg.order {
                   self.shutting_down = Some(msg.id.clone());
-                  last_clients_len = self.clients.len();
+                  last_sessions_len = self.sessions.len();
                   self.notify(msg);
                 } else if let Order::ReturnListenSockets = msg.order {
                   info!("received ReturnListenSockets order");
@@ -393,7 +393,7 @@ impl Server {
       }
 
       self.handle_remaining_readiness();
-      self.create_clients();
+      self.create_sessions();
 
       let now = SteadyTime::now();
       if now - last_zombie_check > self.zombie_check_interval {
@@ -405,12 +405,12 @@ impl Server {
 
         let mut count = 0;
         let duration = self.zombie_check_interval.clone();
-        for client in self.clients.iter_mut().filter(|c| {
+        for session in self.sessions.iter_mut().filter(|c| {
           now - c.borrow().last_event() > duration
         }) {
-          let t = client.borrow().tokens();
+          let t = session.borrow().tokens();
           if !frontend_tokens.contains(&t[0]) {
-            client.borrow().print_state();
+            session.borrow().print_state();
 
             frontend_tokens.insert(t[0]);
             for tk in t.into_iter() {
@@ -422,8 +422,8 @@ impl Server {
         }
 
         for tk in frontend_tokens.iter() {
-          let cl = self.to_client(*tk);
-          self.close_client(cl);
+          let cl = self.to_session(*tk);
+          self.close_session(cl);
         }
 
         if count > 0 {
@@ -431,8 +431,8 @@ impl Server {
 
           let mut remaining = 0;
           for tk in tokens.into_iter() {
-            let cl = self.to_client(tk);
-            if self.clients.remove(cl).is_some() {
+            let cl = self.to_session(tk);
+            if self.sessions.remove(cl).is_some() {
               remaining += 1;
             }
           }
@@ -441,23 +441,23 @@ impl Server {
       }
 
       gauge!("client.connections", self.nb_connections);
-      gauge!("slab.count", self.clients.len());
+      gauge!("slab.count", self.sessions.len());
       METRICS.with(|metrics| {
         (*metrics.borrow_mut()).send_data();
       });
 
       if self.shutting_down.is_some() {
-        let count = self.clients.len();
-        if count <= self.base_clients_count {
-          info!("last client stopped, shutting down!");
+        let count = self.sessions.len();
+        if count <= self.base_sessions_count {
+          info!("last session stopped, shutting down!");
           self.channel.run();
           self.channel.set_blocking(true);
           self.channel.write_message(&OrderMessageAnswer{ id: self.shutting_down.take().expect("should have shut down correctly"), status: OrderMessageStatus::Ok, data: None});
           return;
-        } else if count < last_clients_len {
+        } else if count < last_sessions_len {
           info!("shutting down, {} slab elements remaining (base: {})",
-            count - self.base_clients_count, self.base_clients_count);
-          last_clients_len = count;
+            count - self.base_sessions_count, self.base_sessions_count);
+          last_sessions_len = count;
         }
       }
     }
@@ -513,10 +513,10 @@ impl Server {
       return
     }
 
-    self.notify_sessions(message);
+    self.notify_proxys(message);
   }
 
-  pub fn notify_sessions(&mut self, message: OrderMessage) {
+  pub fn notify_proxys(&mut self, message: OrderMessage) {
     self.config_state.handle_order(&message.order);
 
     let topics = message.order.get_topics();
@@ -537,12 +537,12 @@ impl Server {
             return;
           }*/
 
-          let entry = self.clients.vacant_entry();
+          let entry = self.sessions.vacant_entry();
 
           if entry.is_none() {
             self.queue.push_back(OrderMessageAnswer {
               id: id.to_string(),
-              status: OrderMessageStatus::Error(String::from("client list is full, cannot add a listener")),
+              status: OrderMessageStatus::Error(String::from("session list is full, cannot add a listener")),
               data: None
             });
             return;
@@ -554,8 +554,8 @@ impl Server {
 
           let front = listener.front.clone();
           let status = if let Some(token) = self.http.add_listener(listener.clone(), self.pool.clone(), token) {
-            entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
-            self.base_clients_count += 1;
+            entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
+            self.base_sessions_count += 1;
             OrderMessageStatus::Ok
           } else {
             error!("Couldn't add HTTP listener");
@@ -568,7 +568,7 @@ impl Server {
         OrderMessage { ref id, order: Order::RemoveListener(ref remove) } => {
           if remove.proxy == ListenerType::HTTP {
             debug!("{} remove http listener {:?}", id, remove);
-            self.base_clients_count -= 1;
+            self.base_sessions_count -= 1;
             self.queue.push_back(self.http.notify(&mut self.poll, OrderMessage {
               id: id.to_string(),
               order: Order::RemoveListener(remove.clone())
@@ -614,12 +614,12 @@ impl Server {
             return;
           }*/
 
-          let entry = self.clients.vacant_entry();
+          let entry = self.sessions.vacant_entry();
 
           if entry.is_none() {
             self.queue.push_back(OrderMessageAnswer {
               id: id.to_string(),
-              status: OrderMessageStatus::Error(String::from("client list is full, cannot add a listener")),
+              status: OrderMessageStatus::Error(String::from("session list is full, cannot add a listener")),
               data: None
             });
             return;
@@ -631,8 +631,8 @@ impl Server {
 
           let front = listener.front.clone();
           let status = if let Some(token) = self.https.add_listener(listener.clone(), self.pool.clone(), token) {
-            entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPSListen })));
-            self.base_clients_count += 1;
+            entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPSListen })));
+            self.base_sessions_count += 1;
             OrderMessageStatus::Ok
           } else {
             error!("Couldn't add HTTPS listener");
@@ -645,7 +645,7 @@ impl Server {
         OrderMessage { ref id, order: Order::RemoveListener(ref remove) } => {
           if remove.proxy == ListenerType::HTTPS {
             debug!("{} remove https listener {:?}", id, remove);
-            self.base_clients_count -= 1;
+            self.base_sessions_count -= 1;
             self.queue.push_back(self.https.notify(&mut self.poll, OrderMessage {
               id: id.to_string(),
               order: Order::RemoveListener(remove.clone())
@@ -691,12 +691,12 @@ impl Server {
           }
           */
 
-          let entry = self.clients.vacant_entry();
+          let entry = self.sessions.vacant_entry();
 
           if entry.is_none() {
             self.queue.push_back(OrderMessageAnswer {
               id,
-              status: OrderMessageStatus::Error(String::from("client list is full, cannot add a listener")),
+              status: OrderMessageStatus::Error(String::from("session list is full, cannot add a listener")),
               data: None
             });
             return;
@@ -708,8 +708,8 @@ impl Server {
 
           let front = listener.front.clone();
           let status = if let Some(token) = self.tcp.add_listener(listener.clone(), self.pool.clone(), token) {
-            entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::TCPListen })));
-            self.base_clients_count += 1;
+            entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::TCPListen })));
+            self.base_sessions_count += 1;
             OrderMessageStatus::Ok
           } else {
             error!("Couldn't add TCP listener");
@@ -721,7 +721,7 @@ impl Server {
         OrderMessage { ref id, order: Order::RemoveListener(ref remove) } => {
           if remove.proxy == ListenerType::TCP {
             debug!("{} remove tcp listener {:?}", id, remove);
-            self.base_clients_count -= 1;
+            self.base_sessions_count -= 1;
             self.queue.push_back(self.tcp.notify(&mut self.poll, OrderMessage {
               id: id.to_string(),
               order: Order::RemoveListener(remove.clone())
@@ -784,23 +784,23 @@ impl Server {
     info!("sent default listeners: {:?}", res);
   }
 
-  pub fn to_client(&self, token: Token) -> ClientToken {
-    ClientToken(token.0)
+  pub fn to_session(&self, token: Token) -> SessionToken {
+    SessionToken(token.0)
   }
 
-  pub fn from_client(&self, token: ClientToken) -> Token {
+  pub fn from_session(&self, token: SessionToken) -> Token {
     Token(token.0)
   }
 
-  pub fn close_client(&mut self, token: ClientToken) {
-    if self.clients.contains(token) {
-      let client = self.clients.remove(token).expect("client shoud be there");
-      client.borrow().cancel_timeouts(&mut self.timer);
-      let CloseResult { tokens } = client.borrow_mut().close(&mut self.poll);
+  pub fn close_session(&mut self, token: SessionToken) {
+    if self.sessions.contains(token) {
+      let session = self.sessions.remove(token).expect("session shoud be there");
+      session.borrow().cancel_timeouts(&mut self.timer);
+      let CloseResult { tokens } = session.borrow_mut().close(&mut self.poll);
 
       for tk in tokens.into_iter() {
-        let cl = self.to_client(tk);
-        self.clients.remove(cl);
+        let cl = self.to_session(tk);
+        self.sessions.remove(cl);
       }
 
       assert!(self.nb_connections != 0);
@@ -815,29 +815,29 @@ impl Server {
     }
   }
 
-  pub fn create_client_tcp(&mut self, token: ListenToken, socket: TcpStream) -> bool {
+  pub fn create_session_tcp(&mut self, token: ListenToken, socket: TcpStream) -> bool {
     if self.nb_connections == self.max_connections {
-      error!("max number of client connection reached, flushing the accept queue");
+      error!("max number of session connection reached, flushing the accept queue");
       self.can_accept = false;
       return false;
     }
 
-    //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
-    let index = match self.clients.vacant_entry() {
+    //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
+    let index = match self.sessions.vacant_entry() {
       None => {
-        error!("not enough memory to accept another client, flushing the accept queue");
+        error!("not enough memory to accept another session, flushing the accept queue");
         error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
         self.can_accept = false;
 
         return false;
       },
       Some(entry) => {
-        let client_token = Token(entry.index().0);
+        let session_token = Token(entry.index().0);
         let index = entry.index();
-        let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), client_token);
-        match self.tcp.create_client(socket, token, &mut self.poll, client_token, timeout) {
-          Ok((client, should_connect)) => {
-            entry.insert(client);
+        let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
+        match self.tcp.create_session(socket, token, &mut self.poll, session_token, timeout) {
+          Ok((session, should_connect)) => {
+            entry.insert(session);
             self.nb_connections += 1;
             assert!(self.nb_connections <= self.max_connections);
             gauge!("client.connections", self.nb_connections);
@@ -856,8 +856,8 @@ impl Server {
             self.accept_ready.remove(&token);
             return false;
           },
-          Err(AcceptError::TooManyClients) => {
-            error!("max number of client connection reached, flushing the accept queue");
+          Err(AcceptError::TooManySessions) => {
+            error!("max number of session connection reached, flushing the accept queue");
             self.can_accept = false;
             return false;
           }
@@ -869,28 +869,28 @@ impl Server {
     true
   }
 
-  pub fn create_client_http(&mut self, token: ListenToken, socket: TcpStream) -> bool {
+  pub fn create_session_http(&mut self, token: ListenToken, socket: TcpStream) -> bool {
     if self.nb_connections == self.max_connections {
-      error!("max number of client connection reached, flushing the accept queue");
+      error!("max number of session connection reached, flushing the accept queue");
       self.can_accept = false;
       return false;
     }
 
-    //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
-    match self.clients.vacant_entry() {
+    //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
+    match self.sessions.vacant_entry() {
       None => {
-        error!("not enough memory to accept another client, flushing the accept queue");
+        error!("not enough memory to accept another session, flushing the accept queue");
         error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
         self.can_accept = false;
         return false;
       },
       Some(entry) => {
-        let client_token = Token(entry.index().0);
+        let session_token = Token(entry.index().0);
         let index = entry.index();
-        let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), client_token);
-        match self.http.create_client(socket, token, &mut self.poll, client_token, timeout) {
-          Ok((client, should_connect)) => {
-            entry.insert(client);
+        let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
+        match self.http.create_session(socket, token, &mut self.poll, session_token, timeout) {
+          Ok((session, should_connect)) => {
+            entry.insert(session);
             self.nb_connections += 1;
             assert!(self.nb_connections <= self.max_connections);
             gauge!("client.connections", self.nb_connections);
@@ -904,8 +904,8 @@ impl Server {
             self.accept_ready.remove(&token);
             false
           },
-          Err(AcceptError::TooManyClients) => {
-            error!("max number of client connection reached, flushing the accept queue");
+          Err(AcceptError::TooManySessions) => {
+            error!("max number of session connection reached, flushing the accept queue");
             self.can_accept = false;
             false
           }
@@ -914,28 +914,28 @@ impl Server {
     }
   }
 
-  pub fn create_client_https(&mut self, token: ListenToken, socket: TcpStream) -> bool {
+  pub fn create_session_https(&mut self, token: ListenToken, socket: TcpStream) -> bool {
     if self.nb_connections == self.max_connections {
-      error!("max number of client connection reached, flushing the accept queue");
+      error!("max number of session connection reached, flushing the accept queue");
       self.can_accept = false;
       return false;
     }
 
-    //FIXME: we must handle separately the client limit since the clients slab also has entries for listeners and backends
-    match self.clients.vacant_entry() {
+    //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
+    match self.sessions.vacant_entry() {
       None => {
-        error!("not enough memory to accept another client, flushing the accept queue");
+        error!("not enough memory to accept another session, flushing the accept queue");
         error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
         self.can_accept = false;
         false
       },
       Some(entry) => {
-        let client_token = Token(entry.index().0);
+        let session_token = Token(entry.index().0);
         let index = entry.index();
-        let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), client_token);
-        match self.https.create_client(socket, token, &mut self.poll, client_token, timeout) {
-          Ok((client, should_connect)) => {
-            entry.insert(client);
+        let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
+        match self.https.create_session(socket, token, &mut self.poll, session_token, timeout) {
+          Ok((session, should_connect)) => {
+            entry.insert(session);
             self.nb_connections += 1;
             assert!(self.nb_connections <= self.max_connections);
             gauge!("client.connections", self.nb_connections);
@@ -949,8 +949,8 @@ impl Server {
             self.accept_ready.remove(&token);
             false
           },
-          Err(AcceptError::TooManyClients) => {
-            error!("max number of client connection reached, flushing the accept queue");
+          Err(AcceptError::TooManySessions) => {
+            error!("max number of session connection reached, flushing the accept queue");
             self.can_accept = false;
             false
           }
@@ -1009,13 +1009,13 @@ impl Server {
           }
         }
       },
-      _ => panic!("should not call accept() on a HTTP, HTTPS or TCP client"),
+      _ => panic!("should not call accept() on a HTTP, HTTPS or TCP session"),
     }
 
     gauge!("accept_queue.count", self.accept_queue.len());
   }
 
-  pub fn create_clients(&mut self) {
+  pub fn create_sessions(&mut self) {
     loop {
       if let Some((sock, token, protocol, timestamp)) = self.accept_queue.pop_back() {
         let delay = SteadyTime::now() - timestamp;
@@ -1027,21 +1027,21 @@ impl Server {
         //FIXME: check the timestamp
         match protocol {
           Protocol::TCPListen   => {
-            if !self.create_client_tcp(token, sock) {
+            if !self.create_session_tcp(token, sock) {
               break;
             }
           },
           Protocol::HTTPListen  => {
-            if !self.create_client_http(token, sock) {
+            if !self.create_session_http(token, sock) {
               break;
             }
           },
           Protocol::HTTPSListen => {
-            if !self.create_client_https(token, sock) {
+            if !self.create_session_https(token, sock) {
               break;
             }
           },
-          _ => panic!("should not call accept() on a HTTP, HTTPS or TCP client"),
+          _ => panic!("should not call accept() on a HTTP, HTTPS or TCP session"),
         }
       } else {
         break;
@@ -1051,17 +1051,17 @@ impl Server {
     gauge!("accept_queue.count", self.accept_queue.len());
   }
 
-  pub fn connect_to_backend(&mut self, token: ClientToken) {
-    if ! self.clients.contains(token) {
+  pub fn connect_to_backend(&mut self, token: SessionToken) {
+    if ! self.sessions.contains(token) {
       error!("invalid token in connect_to_backend");
       return;
     }
 
     let (protocol, res) = {
-      let cl = self.clients[token].clone();
-      let cl2: Rc<RefCell<ProxyClientCast>> = self.clients[token].clone();
+      let cl = self.sessions[token].clone();
+      let cl2: Rc<RefCell<ProxySessionCast>> = self.sessions[token].clone();
       let protocol = { cl.borrow().protocol() };
-      let entry = self.clients.vacant_entry();
+      let entry = self.sessions.vacant_entry();
       if entry.is_none() {
         error!("not enough memory, cannot connect to backend");
         return;
@@ -1073,16 +1073,16 @@ impl Server {
       let (protocol, res) = match protocol {
         Protocol::TCP   => {
           let mut b = cl2.borrow_mut();
-          let client: &mut tcp::Client = b.as_tcp() ;
-          let r = self.tcp.connect_to_backend(&mut self.poll, client, back_token);
+          let session: &mut tcp::Session = b.as_tcp() ;
+          let r = self.tcp.connect_to_backend(&mut self.poll, session, back_token);
 
           (Protocol::TCP, r)
         },
         Protocol::HTTP  => {
           (Protocol::HTTP, {
             let mut b = cl2.borrow_mut();
-            let client: &mut http::Client = b.as_http() ;
-            let r = self.http.connect_to_backend(&mut self.poll, client, back_token);
+            let session: &mut http::Session = b.as_http() ;
+            let r = self.http.connect_to_backend(&mut self.poll, session, back_token);
             r
           })
         },
@@ -1114,50 +1114,50 @@ impl Server {
       Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) |
         Err(ConnectionError::HttpsRedirect) | Err(ConnectionError::InvalidHost) => {
         if protocol == Protocol::TCP {
-          self.close_client(token);
+          self.close_session(token);
         }
       },
-      _ => self.close_client(token),
+      _ => self.close_session(token),
     }
   }
 
-  pub fn interpret_client_order(&mut self, token: ClientToken, order: ClientResult) {
+  pub fn interpret_session_order(&mut self, token: SessionToken, order: SessionResult) {
     //trace!("INTERPRET ORDER: {:?}", order);
     match order {
-      ClientResult::CloseClient     => self.close_client(token),
-      ClientResult::CloseBackend(opt) => {
+      SessionResult::CloseSession     => self.close_session(token),
+      SessionResult::CloseBackend(opt) => {
         if let Some(token) = opt {
-          let cl = self.to_client(token);
-          if let Some(client) = self.clients.remove(cl) {
-            client.borrow_mut().close_backend(token, &mut self.poll);
+          let cl = self.to_session(token);
+          if let Some(session) = self.sessions.remove(cl) {
+            session.borrow_mut().close_backend(token, &mut self.poll);
           }
         }
       },
-      ClientResult::ReconnectBackend(main_token, backend_token)  => {
+      SessionResult::ReconnectBackend(main_token, backend_token)  => {
         if let Some(t) = backend_token {
-          let cl = self.to_client(t);
-          if let Some(client) = self.clients.remove(cl) {
-            client.borrow_mut().close_backend(t, &mut self.poll);
+          let cl = self.to_session(t);
+          if let Some(session) = self.sessions.remove(cl) {
+            session.borrow_mut().close_backend(t, &mut self.poll);
           }
         }
 
         if let Some(t) = main_token {
-          let tok = self.to_client(t);
+          let tok = self.to_session(t);
           self.connect_to_backend(tok)
         }
       },
-      ClientResult::ConnectBackend  => self.connect_to_backend(token),
-      ClientResult::Continue        => {}
+      SessionResult::ConnectBackend  => self.connect_to_backend(token),
+      SessionResult::Continue        => {}
     }
   }
 
   pub fn ready(&mut self, token: Token, events: Ready) {
     trace!("PROXY\t{:?} got events: {:?}", token, events);
 
-    let mut client_token = ClientToken(token.0);
-    if self.clients.contains(client_token) {
-      //info!("clients contains {:?}", client_token);
-      let protocol = self.clients[client_token].borrow().protocol();
+    let mut session_token = SessionToken(token.0);
+    if self.sessions.contains(session_token) {
+      //info!("sessions contains {:?}", session_token);
+      let protocol = self.sessions[session_token].borrow().protocol();
       //info!("protocol: {:?}", protocol);
       match protocol {
         Protocol::HTTPListen | Protocol::HTTPSListen | Protocol::TCPListen => {
@@ -1186,35 +1186,35 @@ impl Server {
         _ => {}
       }
 
-      self.clients[client_token].borrow_mut().process_events(token, events);
+      self.sessions[session_token].borrow_mut().process_events(token, events);
 
       loop {
-        //self.client_ready(poll, client_token, events);
-        if !self.clients.contains(client_token) {
+        //self.session_ready(poll, session_token, events);
+        if !self.sessions.contains(session_token) {
           break;
         }
 
-        let order = self.clients[client_token].borrow_mut().ready();
-        trace!("client[{:?} -> {:?}] got events {:?} and returned order {:?}", client_token, self.from_client(client_token), events, order);
+        let order = self.sessions[session_token].borrow_mut().ready();
+        trace!("session[{:?} -> {:?}] got events {:?} and returned order {:?}", session_token, self.from_session(session_token), events, order);
         //FIXME: the CloseBackend message might not mean we have nothing else to do
-        //with that client
+        //with that session
         let is_connect = match order {
-          ClientResult::ConnectBackend | ClientResult::ReconnectBackend(_,_) => true,
+          SessionResult::ConnectBackend | SessionResult::ReconnectBackend(_,_) => true,
           _ => false,
         };
 
-        // if we got ReconnectBackend, that means the current client_token
-        // corresponds to an entry that will be removed in interpret_client_order
+        // if we got ReconnectBackend, that means the current session_token
+        // corresponds to an entry that will be removed in interpret_session_order
         // so we ask for the "main" token, ie the one for the front socket
-        if let ClientResult::ReconnectBackend(Some(t), _) = order {
-          client_token = self.to_client(t);
+        if let SessionResult::ReconnectBackend(Some(t), _) = order {
+          session_token = self.to_session(t);
         }
 
-        self.interpret_client_order(client_token, order);
+        self.interpret_session_order(session_token, order);
 
         // if we had to connect to a backend server, go back to the loop
         // I'm not sure we would have anything to do right away, though,
-        // so maybe we can just stop there for that client?
+        // so maybe we can just stop there for that session?
         // also the events would change?
         if !is_connect {
           break;
@@ -1226,20 +1226,20 @@ impl Server {
   pub fn timeout(&mut self, token: Token) {
     trace!("PROXY\t{:?} got timeout", token);
 
-    let client_token = ClientToken(token.0);
-    if self.clients.contains(client_token) {
-      let order = self.clients[client_token].borrow_mut().timeout(token, &mut self.timer, &self.front_timeout);
-      self.interpret_client_order(client_token, order);
+    let session_token = SessionToken(token.0);
+    if self.sessions.contains(session_token) {
+      let order = self.sessions[session_token].borrow_mut().timeout(token, &mut self.timer, &self.front_timeout);
+      self.interpret_session_order(session_token, order);
     }
   }
 
   pub fn handle_remaining_readiness(&mut self) {
-    // try to accept again after handling all client events,
-    // since we might have released a few client slots
+    // try to accept again after handling all session events,
+    // since we might have released a few session slots
     if self.can_accept && !self.accept_ready.is_empty() {
       loop {
         if let Some(token) = self.accept_ready.iter().next().map(|token| ListenToken(token.0)) {
-          let protocol = self.clients[ClientToken(token.0)].borrow().protocol();
+          let protocol = self.sessions[SessionToken(token.0)].borrow().protocol();
           self.accept(token, protocol);
           if !self.can_accept || self.accept_ready.is_empty() {
             break;
@@ -1271,11 +1271,11 @@ impl Server {
   }
 }
 
-pub struct ListenClient {
+pub struct ListenSession {
   pub protocol: Protocol,
 }
 
-impl ProxyClient for ListenClient {
+impl ProxySession for ListenSession {
   fn last_event(&self) -> SteadyTime {
     SteadyTime::now()
   }
@@ -1290,8 +1290,8 @@ impl ProxyClient for ListenClient {
     self.protocol
   }
 
-  fn ready(&mut self) -> ClientResult {
-    ClientResult::Continue
+  fn ready(&mut self) -> SessionResult {
+    SessionResult::Continue
   }
 
   fn process_events(&mut self, token: Token, events: Ready) {}
@@ -1303,7 +1303,7 @@ impl ProxyClient for ListenClient {
   fn close_backend(&mut self, token: Token, poll: &mut Poll) {
   }
 
-  fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &time::Duration) -> ClientResult {
+  fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &time::Duration) -> SessionResult {
     unimplemented!();
   }
 
@@ -1376,37 +1376,37 @@ impl HttpsProvider {
     }
   }
 
-  pub fn create_client(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<ProxyClientCast>>,bool), AcceptError> {
+  pub fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<ProxySessionCast>>,bool), AcceptError> {
     match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.create_client(frontend_sock, token, poll, client_token, timeout).map(|(r,b)| {
-        (r as Rc<RefCell<ProxyClientCast>>, b)
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.create_session(frontend_sock, token, poll, session_token, timeout).map(|(r,b)| {
+        (r as Rc<RefCell<ProxySessionCast>>, b)
       }),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.create_client(frontend_sock, token, poll, client_token, timeout).map(|(r,b)| {
-        (r as Rc<RefCell<ProxyClientCast>>, b)
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.create_session(frontend_sock, token, poll, session_token, timeout).map(|(r,b)| {
+        (r as Rc<RefCell<ProxySessionCast>>, b)
       }),
     }
   }
 
-  pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_client: Rc<RefCell<ProxyClientCast>>, back_token: Token)
+  pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_session: Rc<RefCell<ProxySessionCast>>, back_token: Token)
     -> Result<BackendConnectAction, ConnectionError> {
 
     match self {
       &mut HttpsProvider::Rustls(ref mut rustls)   => {
-        let mut b = proxy_client.borrow_mut();
-        let client: &mut https_rustls::client::TlsClient = b.as_https_rustls();
-        rustls.connect_to_backend(poll, client, back_token)
+        let mut b = proxy_session.borrow_mut();
+        let session: &mut https_rustls::session::TlsSession = b.as_https_rustls();
+        rustls.connect_to_backend(poll, session, back_token)
       },
       &mut HttpsProvider::Openssl(ref mut openssl) => {
-        let mut b = proxy_client.borrow_mut();
-        let client: &mut https_openssl::TlsClient = b.as_https_openssl();
-        openssl.connect_to_backend(poll, client, back_token)
+        let mut b = proxy_session.borrow_mut();
+        let session: &mut https_openssl::TlsSession = b.as_https_openssl();
+        openssl.connect_to_backend(poll, session, back_token)
       }
     }
 
   }
 }
 
-use network::https_rustls::client::TlsClient;
+use network::https_rustls::session::TlsSession;
 #[cfg(not(feature = "use-openssl"))]
 impl HttpsProvider {
   pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>) -> HttpsProvider {
@@ -1445,109 +1445,109 @@ impl HttpsProvider {
     rustls.accept(token)
   }
 
-  pub fn create_client(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<TlsClient>>,bool), AcceptError> {
+  pub fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<TlsSession>>,bool), AcceptError> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.create_client(frontend_sock, token, poll, client_token, timeout)
+    rustls.create_session(frontend_sock, token, poll, session_token, timeout)
   }
 
-  pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_client: Rc<RefCell<ProxyClientCast>>, back_token: Token)
+  pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_session: Rc<RefCell<ProxySessionCast>>, back_token: Token)
     -> Result<BackendConnectAction, ConnectionError> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
 
-    let mut b = proxy_client.borrow_mut();
-    let client: &mut https_rustls::client::TlsClient = b.as_https_rustls() ;
-    rustls.connect_to_backend(poll, client, back_token)
+    let mut b = proxy_session.borrow_mut();
+    let session: &mut https_rustls::session::TlsSession = b.as_https_rustls() ;
+    rustls.connect_to_backend(poll, session, back_token)
   }
 }
 
 #[cfg(not(feature = "use-openssl"))]
 /// this trait is used to work around the fact that we need to transform
-/// the clients (that are all stored as a ProxyClient in the slab) back
+/// the sessions (that are all stored as a ProxySession in the slab) back
 /// to their original type to call the `connect_to_backend` method of
 /// their corresponding `ServerConfiguration`.
 /// If we find a way to make `connect_to_backend` work wothout transforming
 /// back to the type (example: storing a reference to the configuration
-/// in the client and making `connect_to_backend` a method of `ProxyClient`?),
+/// in the session and making `connect_to_backend` a method of `ProxySession`?),
 /// we'll be able to remove all those ugly casts and panics
-pub trait ProxyClientCast: ProxyClient {
-  fn as_tcp(&mut self) -> &mut tcp::Client;
-  fn as_http(&mut self) -> &mut http::Client;
-  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient;
+pub trait ProxySessionCast: ProxySession {
+  fn as_tcp(&mut self) -> &mut tcp::Session;
+  fn as_http(&mut self) -> &mut http::Session;
+  fn as_https_rustls(&mut self) -> &mut https_rustls::session::TlsSession;
 }
 
 #[cfg(feature = "use-openssl")]
-pub trait ProxyClientCast: ProxyClient {
-  fn as_tcp(&mut self) -> &mut tcp::Client;
-  fn as_http(&mut self) -> &mut http::Client;
-  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient;
-  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsClient;
+pub trait ProxySessionCast: ProxySession {
+  fn as_tcp(&mut self) -> &mut tcp::Session;
+  fn as_http(&mut self) -> &mut http::Session;
+  fn as_https_rustls(&mut self) -> &mut https_rustls::session::TlsSession;
+  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsSession;
 }
 
 #[cfg(not(feature = "use-openssl"))]
-impl ProxyClientCast for ListenClient {
-  fn as_http(&mut self) -> &mut http::Client { panic!() }
-  fn as_tcp(&mut self) -> &mut tcp::Client { panic!() }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { panic!() }
+impl ProxySessionCast for ListenSession {
+  fn as_http(&mut self) -> &mut http::Session { panic!() }
+  fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::session::TlsSession { panic!() }
 }
 
 #[cfg(feature = "use-openssl")]
-impl ProxyClientCast for ListenClient {
-  fn as_http(&mut self) -> &mut http::Client { panic!() }
-  fn as_tcp(&mut self) -> &mut tcp::Client { panic!() }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { panic!() }
-  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsClient { panic!() }
+impl ProxySessionCast for ListenSession {
+  fn as_http(&mut self) -> &mut http::Session { panic!() }
+  fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::session::TlsSession { panic!() }
+  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsSession { panic!() }
 }
 
 #[cfg(not(feature = "use-openssl"))]
-impl ProxyClientCast for http::Client {
-  fn as_http(&mut self) -> &mut http::Client { self }
-  fn as_tcp(&mut self) -> &mut tcp::Client { panic!() }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { panic!() }
+impl ProxySessionCast for http::Session {
+  fn as_http(&mut self) -> &mut http::Session { self }
+  fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::session::TlsSession { panic!() }
 }
 
 #[cfg(feature = "use-openssl")]
-impl ProxyClientCast for http::Client {
-  fn as_http(&mut self) -> &mut http::Client { self }
-  fn as_tcp(&mut self) -> &mut tcp::Client { panic!() }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { panic!() }
-  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsClient { panic!() }
+impl ProxySessionCast for http::Session {
+  fn as_http(&mut self) -> &mut http::Session { self }
+  fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::session::TlsSession { panic!() }
+  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsSession { panic!() }
 }
 
 #[cfg(not(feature = "use-openssl"))]
-impl ProxyClientCast for tcp::Client {
-  fn as_http(&mut self) -> &mut http::Client { panic!() }
-  fn as_tcp(&mut self) -> &mut tcp::Client { self }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { panic!() }
+impl ProxySessionCast for tcp::Session {
+  fn as_http(&mut self) -> &mut http::Session { panic!() }
+  fn as_tcp(&mut self) -> &mut tcp::Session { self }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::session::TlsSession { panic!() }
 }
 
 #[cfg(feature = "use-openssl")]
-impl ProxyClientCast for tcp::Client {
-  fn as_http(&mut self) -> &mut http::Client { panic!() }
-  fn as_tcp(&mut self) -> &mut tcp::Client { self }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { panic!() }
-  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsClient { panic!() }
+impl ProxySessionCast for tcp::Session {
+  fn as_http(&mut self) -> &mut http::Session { panic!() }
+  fn as_tcp(&mut self) -> &mut tcp::Session { self }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::session::TlsSession { panic!() }
+  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsSession { panic!() }
 }
 
 #[cfg(not(feature = "use-openssl"))]
-impl ProxyClientCast for https_rustls::client::TlsClient {
-  fn as_http(&mut self) -> &mut http::Client { panic!() }
-  fn as_tcp(&mut self) -> &mut tcp::Client { panic!() }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { self }
+impl ProxySessionCast for https_rustls::session::TlsSession {
+  fn as_http(&mut self) -> &mut http::Session { panic!() }
+  fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::session::TlsSession { self }
 }
 
 #[cfg(feature = "use-openssl")]
-impl ProxyClientCast for https_rustls::client::TlsClient {
-  fn as_http(&mut self) -> &mut http::Client { panic!() }
-  fn as_tcp(&mut self) -> &mut tcp::Client { panic!() }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { self }
-  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsClient { panic!() }
+impl ProxySessionCast for https_rustls::session::TlsSession {
+  fn as_http(&mut self) -> &mut http::Session { panic!() }
+  fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::session::TlsSession { self }
+  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsSession { panic!() }
 }
 
 #[cfg(feature = "use-openssl")]
-impl ProxyClientCast for https_openssl::TlsClient {
-  fn as_http(&mut self) -> &mut http::Client { panic!() }
-  fn as_tcp(&mut self) -> &mut tcp::Client { panic!() }
-  fn as_https_rustls(&mut self) -> &mut https_rustls::client::TlsClient { panic!() }
-  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsClient { self }
+impl ProxySessionCast for https_openssl::TlsSession {
+  fn as_http(&mut self) -> &mut http::Session { panic!() }
+  fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
+  fn as_https_rustls(&mut self) -> &mut https_rustls::session::TlsSession { panic!() }
+  fn as_https_openssl(&mut self) -> &mut https_openssl::TlsSession { self }
 }
 

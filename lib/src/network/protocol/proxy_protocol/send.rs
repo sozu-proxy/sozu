@@ -7,7 +7,7 @@ use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use network::{
   SessionMetrics,
-  ClientResult,
+  SessionResult,
   Readiness,
   BackendConnectionStatus,
   protocol::{ProtocolResult, pipe::Pipe},
@@ -51,7 +51,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
 
   // The header is send immediately at once upon the connection is establish
   // and prepended before any data.
-  pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, ClientResult) {
+  pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, SessionResult) {
     debug!("Writing proxy protocol header");
 
     if let Some(ref mut socket) = self.backend {
@@ -64,18 +64,18 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
 
               if self.cursor_header == header.len() {
                 debug!("Proxy protocol sent, upgrading");
-                return (ProtocolResult::Upgrade, ClientResult::Continue);
+                return (ProtocolResult::Upgrade, SessionResult::Continue);
               }
             },
             Err(e) => match e.kind() {
               ErrorKind::WouldBlock => {
                 self.back_readiness.event.remove(Ready::writable());
-                return (ProtocolResult::Continue, ClientResult::Continue);
+                return (ProtocolResult::Continue, SessionResult::Continue);
               },
               e => {
                 incr!("proxy_protocol.errors");
                 debug!("send proxy protocol write error {:?}", e);
-                return (ProtocolResult::Continue, ClientResult::CloseClient);
+                return (ProtocolResult::Continue, SessionResult::CloseSession);
               }
             },
           }
@@ -84,7 +84,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
     }
 
     error!("started Send proxy protocol with no header or backend socket");
-    (ProtocolResult::Continue, ClientResult::CloseClient)
+    (ProtocolResult::Continue, SessionResult::CloseSession)
   }
 
   pub fn front_socket(&self) -> &TcpStream {
@@ -193,16 +193,16 @@ mod send_test {
     backend.join().expect("Couldn't join on the associated backend");
   }
 
-  // Get connection from the client and connect to the backend
+  // Get connection from the session and connect to the backend
   // When connections are etablish we send the proxy protocol header
   fn start_middleware(addr_client: SocketAddr, addr_backend: SocketAddr, barrier: Arc<Barrier>) {
-    let client_listener = TcpListener::bind(&addr_client).expect("could not accept client connection");
+    let listener = TcpListener::bind(&addr_client).expect("could not accept session connection");
 
     let client_stream;
     barrier.wait();
 
     loop {
-      if let Ok((stream, _addr)) = client_listener.accept() {
+      if let Ok((stream, _addr)) = listener.accept() {
         client_stream = stream;
         break;
       }
@@ -219,9 +219,9 @@ mod send_test {
     send_pp.set_back_connected(BackendConnectionStatus::Connected);
 
     loop {
-      let (protocol, client) = send_pp.back_writable(&mut session_metrics);
-      if client != ClientResult::Continue {
-        panic!("state machine error: protocol result = {:?}, client result = {:?}", protocol, client);
+      let (protocol, session) = send_pp.back_writable(&mut session_metrics);
+      if session != SessionResult::Continue {
+        panic!("state machine error: protocol result = {:?}, session result = {:?}", protocol, session);
       }
 
       if protocol == ProtocolResult::Upgrade {

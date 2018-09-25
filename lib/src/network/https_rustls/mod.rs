@@ -1,3 +1,3 @@
 pub mod configuration;
-pub mod client;
+pub mod session;
 pub mod resolver;

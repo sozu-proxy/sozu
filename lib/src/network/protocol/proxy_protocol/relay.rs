@@ -7,7 +7,7 @@ use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use nom::{Err,Offset};
 use network::protocol::proxy_protocol::header;
-use network::{Protocol, ClientResult};
+use network::{Protocol, SessionResult};
 use network::Readiness;
 use network::protocol::ProtocolResult;
 use network::socket::{SocketHandler, SocketResult};
@@ -50,7 +50,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
     }
   }
 
-  pub fn readable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
+  pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
     debug!("FRONT proxy protocol [{:?}]: read {} bytes and res={:?}", self.frontend_token, sz, res);
 
@@ -68,7 +68,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
         incr!("proxy_protocol.errors");
         self.front_readiness.reset();
         self.back_readiness.reset();
-        return ClientResult::CloseClient;
+        return SessionResult::CloseSession;
       }
 
       if res == SocketResult::WouldBlock {
@@ -82,25 +82,25 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
           self.front_buf.next_output_data().offset(rest)
         },
         Err(Err::Incomplete(_)) => {
-          return ClientResult::Continue
+          return SessionResult::Continue
         },
         Err(e) => {
-          return ClientResult::CloseClient
+          return SessionResult::CloseSession
         }
       };
 
       self.header_size = Some(read_sz);
       self.front_buf.consume_parsed_data(sz);
       self.front_buf.slice_output(sz);
-      return ClientResult::Continue
+      return SessionResult::Continue
     }
 
-    return ClientResult::Continue;
+    return SessionResult::Continue;
   }
 
   // The header is send immediately at once upon the connection is establish
   // and prepended before any data.
-  pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, ClientResult) {
+  pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, SessionResult) {
     debug!("Writing proxy protocol header");
 
     if let Some(ref mut socket) = self.backend {
@@ -115,7 +115,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
 
               if self.cursor_header >= *header_size {
                 info!("Proxy protocol sent, upgrading");
-                return (ProtocolResult::Upgrade, ClientResult::Continue)
+                return (ProtocolResult::Upgrade, SessionResult::Continue)
               }
             },
             Err(e) => {
@@ -130,7 +130,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
         }
       }
     }
-    (ProtocolResult::Continue, ClientResult::Continue)
+    (ProtocolResult::Continue, SessionResult::Continue)
   }
 
   pub fn front_socket(&self) -> &TcpStream {

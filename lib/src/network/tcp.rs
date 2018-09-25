@@ -28,11 +28,11 @@ use sozu_command::messages::{self,TcpFront,Order,OrderMessage,OrderMessageAnswer
 use sozu_command::messages::TcpListener as TcpListenerConfig;
 use sozu_command::logging;
 
-use network::{AppId,Backend,ClientResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
-  ProxyClient,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
+use network::{AppId,Backend,SessionResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
+  ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use network::backends::BackendMap;
-use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,ClientToken,ListenClient, CONN_RETRIES};
+use network::proxy::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
 use network::pool::{Pool,Checkout,Reset};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult,server_bind};
@@ -71,7 +71,7 @@ pub enum State {
   ExpectProxyProtocol(ExpectProxyProtocol<TcpStream>),
 }
 
-pub struct Client {
+pub struct Session {
   sock:               TcpStream,
   backend:            Option<Rc<RefCell<Backend>>>,
   frontend_token:     Token,
@@ -92,9 +92,9 @@ pub struct Client {
   connection_attempt: u8,
 }
 
-impl Client {
+impl Session {
   fn new(sock: TcpStream, frontend_token: Token, accept_token: Token, front_buf: Checkout<BufferQueue>,
-    back_buf: Checkout<BufferQueue>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Client {
+    back_buf: Checkout<BufferQueue>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Session {
     let s = sock.try_clone().expect("could not clone the socket");
     let addr = sock.peer_addr().map(|s| s.ip()).ok();
     let mut frontend_buffer = None;
@@ -124,7 +124,7 @@ impl Client {
       }
     };
 
-    Client {
+    Session {
       sock:               sock,
       backend:            None,
       frontend_token:     frontend_token,
@@ -147,7 +147,7 @@ impl Client {
   }
 
   fn log_request(&self) {
-    let client = match self.sock.peer_addr().ok() {
+    let frontend = match self.sock.peer_addr().ok() {
       None => String::from("-"),
       Some(SocketAddr::V4(addr)) => format!("{}", addr),
       Some(SocketAddr::V6(addr)) => format!("{}", addr),
@@ -174,28 +174,28 @@ impl Client {
     }
 
     info!("{}{} -> {}\t{} {} {} {}",
-      self.log_context(), client, backend,
+      self.log_context(), frontend, backend,
       response_time, service_time, self.metrics.bin, self.metrics.bout);
   }
 
-  fn front_hup(&mut self) -> ClientResult {
+  fn front_hup(&mut self) -> SessionResult {
     self.log_request();
 
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.front_hup(),
       Some(State::SendProxyProtocol(_)) => {
-        ClientResult::CloseClient
+        SessionResult::CloseSession
       },
       _ => unreachable!(),
     }
   }
 
-  fn back_hup(&mut self) -> ClientResult {
+  fn back_hup(&mut self) -> SessionResult {
     self.log_request();
 
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.back_hup(),
-      _ => ClientResult::CloseClient,
+      _ => SessionResult::CloseSession,
     }
   }
 
@@ -208,7 +208,7 @@ impl Client {
     }
   }
 
-  fn readable(&mut self) -> ClientResult {
+  fn readable(&mut self) -> SessionResult {
     let mut should_upgrade_protocol = ProtocolResult::Continue;
 
     let res = match self.protocol {
@@ -219,36 +219,36 @@ impl Client {
         should_upgrade_protocol = res.0;
         res.1
       },
-      _ => ClientResult::Continue,
+      _ => SessionResult::Continue,
     };
 
     if let ProtocolResult::Upgrade = should_upgrade_protocol {
       match self.upgrade() {
-        UpgradeResult::Continue => ClientResult::Continue,
-        UpgradeResult::Close    => ClientResult::CloseClient,
-        UpgradeResult::ConnectBackend => ClientResult::ConnectBackend,
+        UpgradeResult::Continue => SessionResult::Continue,
+        UpgradeResult::Close    => SessionResult::CloseSession,
+        UpgradeResult::ConnectBackend => SessionResult::ConnectBackend,
       }
     } else {
       res
     }
   }
 
-  fn writable(&mut self) -> ClientResult {
+  fn writable(&mut self) -> SessionResult {
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.writable(&mut self.metrics),
-      _ => ClientResult::Continue,
+      _ => SessionResult::Continue,
     }
   }
 
-  fn back_readable(&mut self) -> ClientResult {
+  fn back_readable(&mut self) -> SessionResult {
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.back_readable(&mut self.metrics),
-      _ => ClientResult::Continue,
+      _ => SessionResult::Continue,
     }
   }
 
-  fn back_writable(&mut self) -> ClientResult {
-    let mut res = (ProtocolResult::Continue, ClientResult::Continue);
+  fn back_writable(&mut self) -> SessionResult {
+    let mut res = (ProtocolResult::Continue, SessionResult::Continue);
 
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => res.1 = pipe.back_writable(&mut self.metrics),
@@ -435,7 +435,7 @@ impl Client {
   }
 }
 
-impl ProxyClient for Client {
+impl ProxySession for Session {
   fn close(&mut self, poll: &mut Poll) -> CloseResult {
     self.metrics.service_stop();
     self.front_socket().shutdown(Shutdown::Both);
@@ -463,18 +463,18 @@ impl ProxyClient for Client {
     result
   }
 
-  fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> ClientResult {
+  fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult {
     if self.frontend_token == token {
       let dur = SteadyTime::now() - self.last_event;
       if dur < *front_timeout {
         timer.set_timeout((*front_timeout - dur).to_std().unwrap(), token);
-        ClientResult::Continue
+        SessionResult::Continue
       } else {
-        ClientResult::CloseClient
+        SessionResult::CloseSession
       }
     } else {
       // invalid token, obsolete timeout triggered
-      ClientResult::Continue
+      SessionResult::Continue
     }
   }
 
@@ -516,7 +516,7 @@ impl ProxyClient for Client {
     }
   }
 
-  fn ready(&mut self) -> ClientResult {
+  fn ready(&mut self) -> SessionResult {
     let mut counter = 0;
     let max_loop_iterations = 100000;
 
@@ -531,7 +531,7 @@ impl ProxyClient for Client {
         self.fail_backend_connection();
 
         let backend_token = self.backend_token.clone();
-        return ClientResult::ReconnectBackend(Some(self.frontend_token), backend_token);
+        return SessionResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.back_readiness().unwrap().event != UnixReady::from(Ready::empty()) {
         self.reset_connection_attempt();
         self.set_back_connected(BackendConnectionStatus::Connected);
@@ -541,7 +541,7 @@ impl ProxyClient for Client {
     if self.front_readiness().event.is_hup() {
       let order = self.front_hup();
       match order {
-        ClientResult::CloseClient => {
+        SessionResult::CloseSession => {
           return order;
         },
         _ => {
@@ -569,31 +569,31 @@ impl ProxyClient for Client {
 
       if front_interest.is_readable() {
         let order = self.readable();
-        trace!("front readable\tinterpreting client order {:?}", order);
+        trace!("front readable\tinterpreting session order {:?}", order);
 
-        if order != ClientResult::Continue {
+        if order != SessionResult::Continue {
           return order;
         }
       }
 
       if back_interest.is_writable() {
         let order = self.back_writable();
-        if order != ClientResult::Continue {
+        if order != SessionResult::Continue {
           return order;
         }
       }
 
       if back_interest.is_readable() {
         let order = self.back_readable();
-        if order != ClientResult::Continue {
+        if order != SessionResult::Continue {
           return order;
         }
       }
 
       if front_interest.is_writable() {
         let order = self.writable();
-        trace!("front writable\tinterpreting client order {:?}", order);
-        if order != ClientResult::Continue {
+        trace!("front writable\tinterpreting session order {:?}", order);
+        if order != SessionResult::Continue {
           return order;
         }
       }
@@ -601,10 +601,10 @@ impl ProxyClient for Client {
       if back_interest.is_hup() {
         let order = self.back_hup();
         match order {
-          ClientResult::CloseClient => {
+          SessionResult::CloseSession => {
             return order;
           },
-          ClientResult::Continue => {},
+          SessionResult::Continue => {},
           _ => {
             self.back_readiness().map(|r| r.event.remove(UnixReady::hup()));
             return order;
@@ -614,21 +614,21 @@ impl ProxyClient for Client {
 
       if front_interest.is_error() || back_interest.is_error() {
         if front_interest.is_error() {
-          error!("PROXY client {:?} front error, disconnecting", self.frontend_token);
+          error!("PROXY session {:?} front error, disconnecting", self.frontend_token);
         } else {
-          error!("PROXY client {:?} back error, disconnecting", self.frontend_token);
+          error!("PROXY session {:?} back error, disconnecting", self.frontend_token);
         }
 
         self.front_readiness().interest = UnixReady::from(Ready::empty());
         self.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::empty()));
-        return ClientResult::CloseClient;
+        return SessionResult::CloseSession;
       }
 
       counter += 1;
     }
 
     if counter == max_loop_iterations {
-      error!("PROXY\thandling client {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
+      error!("PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
 
       let front_interest = self.front_readiness().interest & self.front_readiness().event;
       let back_interest  = self.back_readiness().map(|r| r.interest & r.event).unwrap_or(UnixReady::from(Ready::empty()));
@@ -637,10 +637,10 @@ impl ProxyClient for Client {
       error!("PROXY\t{:?} readiness: front {:?} / back {:?} | front: {:?} | back: {:?} ", self.frontend_token.clone(),
         self.front_readiness(), back, front_interest, back_interest);
 
-      return ClientResult::CloseClient;
+      return SessionResult::CloseSession;
     }
 
-    ClientResult::Continue
+    SessionResult::Continue
   }
 
   fn last_event(&self) -> SteadyTime {
@@ -670,7 +670,7 @@ impl ProxyClient for Client {
       _ => None,
     };
 
-    error!("zombie client[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, app_id: {:?}, back_connected: {:?}, metrics: {:?}",
+    error!("zombie session[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, app_id: {:?}, back_connected: {:?}, metrics: {:?}",
       self.frontend_token, self.back_token(), rf, rb, p, self.app_id, self.back_connected, self.metrics);
   }
 
@@ -811,11 +811,11 @@ impl ServerConfiguration {
     let backend = self.backends.remove_backend(app_id, backend_address);
   }
 
-  fn backend_from_app_id(&mut self, client: &mut Client, app_id: &str) -> Result<TcpStream,ConnectionError> {
+  fn backend_from_app_id(&mut self, session: &mut Session, app_id: &str) -> Result<TcpStream,ConnectionError> {
     match self.backends.backend_from_app_id(app_id) {
       Err(e) => Err(e),
       Ok((backend, conn))  => {
-        client.backend = Some(backend);
+        session.backend = Some(backend);
 
         Ok(conn)
       }
@@ -823,29 +823,29 @@ impl ServerConfiguration {
   }
 }
 
-impl ProxyConfiguration<Client> for ServerConfiguration {
+impl ProxyConfiguration<Session> for ServerConfiguration {
 
-  fn connect_to_backend(&mut self, poll: &mut Poll, client: &mut Client, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
-    if self.listeners[&client.accept_token].app_id.is_none() {
+  fn connect_to_backend(&mut self, poll: &mut Poll, session: &mut Session, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
+    if self.listeners[&session.accept_token].app_id.is_none() {
       error!("no TCP application corresponds to that front address");
       return Err(ConnectionError::HostNotFound);
     }
 
-    let app_id = self.listeners[&client.accept_token].app_id.clone();
-    client.app_id = app_id.clone();
+    let app_id = self.listeners[&session.accept_token].app_id.clone();
+    session.app_id = app_id.clone();
     let app_id = app_id.unwrap();
 
 
-    if client.connection_attempt == CONN_RETRIES {
-      error!("{} max connection attempt reached", client.log_context());
+    if session.connection_attempt == CONN_RETRIES {
+      error!("{} max connection attempt reached", session.log_context());
       return Err(ConnectionError::NoBackendAvailable)
     }
 
-    let conn = self.backend_from_app_id(client, &app_id);
+    let conn = self.backend_from_app_id(session, &app_id);
     match conn {
       Ok(stream) => {
         stream.set_nodelay(true);
-        client.back_connected = BackendConnectionStatus::Connecting;
+        session.back_connected = BackendConnectionStatus::Connecting;
 
         poll.register(
           &stream,
@@ -854,8 +854,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
           PollOpt::edge()
         );
 
-        client.set_back_token(back_token);
-        client.set_back_socket(stream);
+        session.set_back_token(back_token);
+        session.set_back_socket(stream);
         Ok(BackendConnectAction::New)
       },
       Err(ConnectionError::NoBackendAvailable) => Err(ConnectionError::NoBackendAvailable),
@@ -956,8 +956,8 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
     }
   }
 
-  fn create_client(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, client_token: Token, timeout: Timeout)
-    -> Result<(Rc<RefCell<Client>>, bool), AcceptError> {
+  fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout)
+    -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
     let internal_token = Token(token.0);
     if let Some(listener) = self.listeners.get_mut(&internal_token) {
       let mut p = (*listener.pool).borrow_mut();
@@ -973,13 +973,13 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
                                 .and_then(|c| c.proxy_protocol.clone());
 
         frontend_sock.set_nodelay(true);
-        let c = Client::new(frontend_sock, client_token, internal_token, front_buf, back_buf, proxy_protocol.clone(),
+        let c = Session::new(frontend_sock, session_token, internal_token, front_buf, back_buf, proxy_protocol.clone(),
         timeout);
         incr!("tcp.requests");
 
         poll.register(
           c.front_socket(),
-          client_token,
+          session_token,
           Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
           PollOpt::edge()
           );
@@ -988,7 +988,7 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
         Ok((Rc::new(RefCell::new(c)), should_connect_backend))
       } else {
         error!("could not get buffers from pool");
-        Err(AcceptError::TooManyClients)
+        Err(AcceptError::TooManySessions)
       }
     } else {
       Err(AcceptError::IoError)
@@ -1005,33 +1005,33 @@ impl ProxyConfiguration<Client> for ServerConfiguration {
 
 
 pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
-  use network::proxy::{self,ProxyClientCast};
+  use network::proxy::{self,ProxySessionCast};
 
   let mut poll          = Poll::new().expect("could not create event loop");
   let pool = Rc::new(RefCell::new(
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
 
-  let mut clients: Slab<Rc<RefCell<ProxyClientCast>>,ClientToken> = Slab::with_capacity(max_buffers);
+  let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
   {
-    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
     info!("taking token {:?} for channel", entry.index());
-    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+    entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
   }
   {
-    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
     info!("taking token {:?} for timer", entry.index());
-    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+    entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
   }
   {
-    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+    let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
     info!("taking token {:?} for metrics", entry.index());
-    entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+    entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
   }
 
   let token = {
-    let entry = clients.vacant_entry().expect("client list should have enough room at startup");
-    let e = entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+    let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
+    let e = entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
     Token(e.index().0)
   };
 
@@ -1043,7 +1043,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
 
   let mut server_config: proxy::ServerConfig = Default::default();
   server_config.max_connections = max_buffers;
-  let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), clients,
+  let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), sessions,
     pool, None ,None, Some(configuration), server_config, None);
 
   info!("starting event loop");
@@ -1151,7 +1151,7 @@ mod tests {
   }
 
   pub fn start_proxy() -> Channel<OrderMessage,OrderMessageAnswer> {
-    use network::proxy::{self,ProxyClientCast};
+    use network::proxy::{self,ProxySessionCast};
 
     info!("listen for connections");
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
@@ -1164,21 +1164,21 @@ mod tests {
         Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
       ));
 
-      let mut clients: Slab<Rc<RefCell<ProxyClientCast>>,ClientToken> = Slab::with_capacity(max_buffers);
+      let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
       {
-        let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+        let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
         info!("taking token {:?} for channel", entry.index());
-        entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+        entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
       }
       {
-        let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+        let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
         info!("taking token {:?} for timer", entry.index());
-        entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+        entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
       }
       {
-        let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+        let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
         info!("taking token {:?} for metrics", entry.index());
-        entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::HTTPListen })));
+        entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
       }
 
       let mut configuration = ServerConfiguration::new();
@@ -1190,10 +1190,10 @@ mod tests {
 
       {
         let front = listener_config.front.clone();
-        let entry = clients.vacant_entry().expect("client list should have enough room at startup");
+        let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
         let _ = configuration.add_listener(listener_config, pool.clone(), Token(entry.index().0));
         let _ = configuration.activate_listener(&mut poll, &front, None);
-        entry.insert(Rc::new(RefCell::new(ListenClient { protocol: Protocol::TCPListen })));
+        entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::TCPListen })));
       }
 
       let (scm_server, scm_client) = UnixStream::pair().unwrap();
@@ -1207,7 +1207,7 @@ mod tests {
       let mut server_config: proxy::ServerConfig = Default::default();
       server_config.max_connections = max_buffers;
       let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.into_raw_fd()),
-        clients, pool, None, None, Some(configuration), server_config, None);
+        sessions, pool, None, None, Some(configuration), server_config, None);
       info!("will run");
       s.run();
       info!("ending event loop");

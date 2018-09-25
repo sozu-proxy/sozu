@@ -6,7 +6,7 @@ use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
-use network::{ClientResult,Readiness,SessionMetrics};
+use network::{SessionResult,Readiness,SessionMetrics};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult};
 use network::pool::{Pool,Checkout,Reset};
@@ -15,7 +15,7 @@ use nom::HexDisplay;
 type BackendToken = Token;
 
 #[derive(PartialEq)]
-pub enum ClientStatus {
+pub enum SessionStatus {
   Normal,
   DefaultAnswer,
 }
@@ -41,7 +41,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   pub fn new(frontend: Front, frontend_token: Token, backend: Option<TcpStream>, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Pipe<Front> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{}\tunknown\t", &request_id);
-    let client = Pipe {
+    let session = Pipe {
       frontend:           frontend,
       backend:            backend,
       frontend_token:     frontend_token,
@@ -65,7 +65,7 @@ impl<Front:SocketHandler> Pipe<Front> {
     };
 
     trace!("created pipe");
-    client
+    session
   }
 
   fn tokens(&self) -> Option<(Token,Token)> {
@@ -114,35 +114,35 @@ impl<Front:SocketHandler> Pipe<Front> {
     &mut self.back_readiness
   }
 
-  pub fn front_hup(&mut self) -> ClientResult {
-    ClientResult::CloseClient
+  pub fn front_hup(&mut self) -> SessionResult {
+    SessionResult::CloseSession
   }
 
-  pub fn back_hup(&mut self) -> ClientResult {
+  pub fn back_hup(&mut self) -> SessionResult {
     if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
       if self.back_readiness.event.is_readable() {
         self.back_readiness().interest.insert(Ready::readable());
         error!("Pipe::back_hup: backend connection closed but the kernel still holds some data. readiness: {:?} -> {:?}", self.front_readiness, self.back_readiness);
-        ClientResult::Continue
+        SessionResult::Continue
       } else {
-        ClientResult::CloseClient
+        SessionResult::CloseSession
       }
     } else {
       self.front_readiness().interest.insert(Ready::writable());
       if self.back_readiness.event.is_readable() {
         self.back_readiness.interest.insert(Ready::readable());
       }
-      ClientResult::Continue
+      SessionResult::Continue
     }
   }
 
-  // Read content from the client
-  pub fn readable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
+  // Read content from the session
+  pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("pipe readable");
     if self.front_buf.buffer.available_space() == 0 {
       self.front_readiness.interest.remove(Ready::readable());
       self.back_readiness.interest.insert(Ready::writable());
-      return ClientResult::Continue;
+      return SessionResult::Continue;
     }
 
     let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
@@ -173,13 +173,13 @@ impl<Front:SocketHandler> Pipe<Front> {
         incr!("pipe.errors");
         self.front_readiness.reset();
         self.back_readiness.reset();
-        return ClientResult::CloseClient;
+        return SessionResult::CloseSession;
       },
       SocketResult::Closed => {
         metrics.service_stop();
         self.front_readiness.reset();
         self.back_readiness.reset();
-        return ClientResult::CloseClient;
+        return SessionResult::CloseSession;
       },
       SocketResult::WouldBlock => {
         self.front_readiness.event.remove(Ready::readable());
@@ -188,16 +188,16 @@ impl<Front:SocketHandler> Pipe<Front> {
     };
 
     self.back_readiness.interest.insert(Ready::writable());
-    ClientResult::Continue
+    SessionResult::Continue
   }
 
-  // Forward content to client
-  pub fn writable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
+  // Forward content to session
+  pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("pipe writable");
     if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
       self.back_readiness.interest.insert(Ready::readable());
       self.front_readiness.interest.remove(Ready::writable());
-      return ClientResult::Continue;
+      return SessionResult::Continue;
     }
 
     let mut sz = 0usize;
@@ -207,7 +207,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       if self.back_buf.next_output_data().len() == 0 {
         self.back_readiness.interest.insert(Ready::readable());
         self.front_readiness.interest.remove(Ready::writable());
-        return ClientResult::Continue;
+        return SessionResult::Continue;
       }
       let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
       res = current_res;
@@ -235,7 +235,7 @@ impl<Front:SocketHandler> Pipe<Front> {
         metrics.service_stop();
         self.front_readiness.reset();
         self.back_readiness.reset();
-        return ClientResult::CloseClient;
+        return SessionResult::CloseSession;
       },
       SocketResult::WouldBlock => {
         self.front_readiness.event.remove(Ready::writable());
@@ -243,16 +243,16 @@ impl<Front:SocketHandler> Pipe<Front> {
       SocketResult::Continue => {},
     }
 
-    ClientResult::Continue
+    SessionResult::Continue
   }
 
   // Forward content to application
-  pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
+  pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("pipe back_writable");
     if self.front_buf.output_data_size() == 0 || self.front_buf.next_output_data().len() == 0 {
       self.front_readiness.interest.insert(Ready::readable());
       self.back_readiness.interest.remove(Ready::writable());
-      return ClientResult::Continue;
+      return SessionResult::Continue;
     }
 
     let tokens = self.tokens().clone();
@@ -267,7 +267,7 @@ impl<Front:SocketHandler> Pipe<Front> {
         if self.front_buf.next_output_data().len() == 0 {
           self.front_readiness.interest.insert(Ready::readable());
           self.back_readiness.interest.remove(Ready::writable());
-          return ClientResult::Continue;
+          return SessionResult::Continue;
         }
 
         let (current_sz, current_res) = backend.socket_write(self.front_buf.next_output_data());
@@ -290,7 +290,7 @@ impl<Front:SocketHandler> Pipe<Front> {
         incr!("pipe.errors");
         self.front_readiness.reset();
         self.back_readiness.reset();
-        return ClientResult::CloseClient;
+        return SessionResult::CloseSession;
       },
       SocketResult::WouldBlock => {
         self.back_readiness.event.remove(Ready::writable());
@@ -298,15 +298,15 @@ impl<Front:SocketHandler> Pipe<Front> {
       },
       SocketResult::Continue => {}
     }
-    ClientResult::Continue
+    SessionResult::Continue
   }
 
   // Read content from application
-  pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> ClientResult {
+  pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("pipe back_readable");
     if self.back_buf.buffer.available_space() == 0 {
       self.back_readiness.interest.remove(Ready::readable());
-      return ClientResult::Continue;
+      return SessionResult::Continue;
     }
 
     let tokens     = self.tokens().clone();
@@ -337,13 +337,13 @@ impl<Front:SocketHandler> Pipe<Front> {
           incr!("pipe.errors");
           self.front_readiness.reset();
           self.back_readiness.reset();
-          return ClientResult::CloseClient;
+          return SessionResult::CloseSession;
         },
         SocketResult::Closed => {
           metrics.service_stop();
           self.front_readiness.reset();
           self.back_readiness.reset();
-          return ClientResult::CloseClient;
+          return SessionResult::CloseSession;
         },
         SocketResult::WouldBlock => {
           self.back_readiness.event.remove(Ready::readable());
@@ -352,7 +352,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       }
     }
 
-    ClientResult::Continue
+    SessionResult::Continue
   }
 }
 

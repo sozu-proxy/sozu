@@ -3,7 +3,7 @@ use mio::net::*;
 use mio::unix::UnixReady;
 use network::buffer_queue::BufferQueue;
 use network::pool::Checkout;
-use network::{ClientResult,Readiness};
+use network::{SessionResult,Readiness};
 use network::protocol::ProtocolResult;
 use openssl::ssl::{self,HandshakeError,MidHandshakeSslStream,Ssl,SslStream};
 
@@ -38,9 +38,9 @@ impl TlsHandshake {
     }
   }
 
-  pub fn readable(&mut self) -> (ProtocolResult,ClientResult) {
+  pub fn readable(&mut self) -> (ProtocolResult,SessionResult) {
     match self.state {
-      TlsState::Error(_) => return (ProtocolResult::Continue, ClientResult::CloseClient),
+      TlsState::Error(_) => return (ProtocolResult::Continue, SessionResult::CloseSession),
       TlsState::Initial => {
         let ssl     = self.ssl.take().expect("TlsHandshake should have a Ssl backend");
         let sock    = self.front.take().expect("TlsHandshake should have a front socket");
@@ -48,12 +48,12 @@ impl TlsHandshake {
           Ok(stream) => {
             self.stream = Some(stream);
             self.state = TlsState::Established;
-            return (ProtocolResult::Upgrade, ClientResult::Continue);
+            return (ProtocolResult::Upgrade, SessionResult::Continue);
           },
           Err(HandshakeError::SetupFailure(e)) => {
             error!("accept: handshake setup failed: {:?}", e);
             self.state = TlsState::Error(HandshakeError::SetupFailure(e));
-            return (ProtocolResult::Continue, ClientResult::CloseClient);
+            return (ProtocolResult::Continue, SessionResult::CloseSession);
           },
           Err(HandshakeError::Failure(e)) => {
             {
@@ -82,13 +82,13 @@ impl TlsHandshake {
               }
             }
             self.state = TlsState::Error(HandshakeError::Failure(e));
-            return (ProtocolResult::Continue, ClientResult::CloseClient);
+            return (ProtocolResult::Continue, SessionResult::CloseSession);
           },
           Err(HandshakeError::WouldBlock(mid)) => {
             self.state = TlsState::Handshake;
             self.mid = Some(mid);
             self.readiness.event.remove(Ready::readable());
-            return (ProtocolResult::Continue, ClientResult::Continue);
+            return (ProtocolResult::Continue, SessionResult::Continue);
           }
         }
       },
@@ -98,28 +98,28 @@ impl TlsHandshake {
           Ok(stream) => {
             self.stream = Some(stream);
             self.state = TlsState::Established;
-            return (ProtocolResult::Upgrade, ClientResult::Continue);
+            return (ProtocolResult::Upgrade, SessionResult::Continue);
           },
           Err(HandshakeError::SetupFailure(e)) => {
             debug!("mid handshake setup failed: {:?}", e);
             self.state = TlsState::Error(HandshakeError::SetupFailure(e));
-            return (ProtocolResult::Continue, ClientResult::CloseClient);
+            return (ProtocolResult::Continue, SessionResult::CloseSession);
           },
           Err(HandshakeError::Failure(e)) => {
             debug!("mid handshake failed: {:?}", e);
             self.state = TlsState::Error(HandshakeError::Failure(e));
-            return (ProtocolResult::Continue, ClientResult::CloseClient);
+            return (ProtocolResult::Continue, SessionResult::CloseSession);
           },
           Err(HandshakeError::WouldBlock(new_mid)) => {
             self.state = TlsState::Handshake;
             self.mid = Some(new_mid);
             self.readiness.event.remove(Ready::readable());
-            return (ProtocolResult::Continue, ClientResult::Continue);
+            return (ProtocolResult::Continue, SessionResult::Continue);
           }
         }
       },
       TlsState::Established => {
-        return (ProtocolResult::Upgrade, ClientResult::Continue);
+        return (ProtocolResult::Upgrade, SessionResult::Continue);
       }
     }
 

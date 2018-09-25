@@ -60,13 +60,13 @@ pub struct CloseResult {
   pub tokens:   Vec<Token>,
 }
 
-pub trait ProxyClient {
+pub trait ProxySession {
   fn protocol(&self)  -> Protocol;
-  fn ready(&mut self) -> ClientResult;
+  fn ready(&mut self) -> SessionResult;
   fn process_events(&mut self, token: Token, events: Ready);
   fn close(&mut self, poll: &mut Poll) -> CloseResult;
   fn close_backend(&mut self, token: Token, poll: &mut Poll);
-  fn timeout(&self, t: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> ClientResult;
+  fn timeout(&self, t: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult;
   fn cancel_timeouts(&self, timer: &mut Timer<Token>);
   fn last_event(&self) -> SteadyTime;
   fn print_state(&self);
@@ -90,18 +90,18 @@ pub enum BackendConnectAction {
 #[derive(Debug,PartialEq)]
 pub enum AcceptError {
   IoError,
-  TooManyClients,
+  TooManySessions,
   WouldBlock,
 }
 
-use self::proxy::{ClientToken,ListenToken,ListenPortState};
-pub trait ProxyConfiguration<Client> {
-  fn connect_to_backend(&mut self, event_loop: &mut Poll, client: &mut Client,
+use self::proxy::{SessionToken,ListenToken,ListenPortState};
+pub trait ProxyConfiguration<Session> {
+  fn connect_to_backend(&mut self, event_loop: &mut Poll, session: &mut Session,
     back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
   fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
-  fn create_client(&mut self, socket: TcpStream, token: ListenToken, event_loop: &mut Poll, client_token: Token, timeout: Timeout)
-    -> Result<(Rc<RefCell<Client>>, bool), AcceptError>;
+  fn create_session(&mut self, socket: TcpStream, token: ListenToken, event_loop: &mut Poll, session_token: Token, timeout: Timeout)
+    -> Result<(Rc<RefCell<Session>>, bool), AcceptError>;
   fn listen_port_state(&self, port: &u16) -> ListenPortState;
 }
 
@@ -185,8 +185,8 @@ impl RequiredEvents {
 }
 
 #[derive(Debug,PartialEq,Eq)]
-pub enum ClientResult {
-  CloseClient,
+pub enum SessionResult {
+  CloseSession,
   CloseBackend(Option<Token>),
   ReconnectBackend(Option<Token>, Option<Token>),
   Continue,

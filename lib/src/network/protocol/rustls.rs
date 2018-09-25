@@ -3,7 +3,7 @@ use mio::net::*;
 use mio::unix::UnixReady;
 use std::io::ErrorKind;
 use network::buffer_queue::BufferQueue;
-use network::{ClientResult,Protocol,Readiness};
+use network::{SessionResult,Protocol,Readiness};
 use network::pool::Checkout;
 use network::protocol::ProtocolResult;
 use rustls::{ServerSession, Session};
@@ -34,7 +34,7 @@ impl TlsHandshake {
     }
   }
 
-  pub fn readable(&mut self) -> (ProtocolResult,ClientResult) {
+  pub fn readable(&mut self) -> (ProtocolResult,SessionResult) {
     let mut can_read  = true;
 
     loop {
@@ -46,7 +46,7 @@ impl TlsHandshake {
         match self.session.read_tls(&mut self.stream) {
           Ok(0) => {
             error!("connection closed during handshake");
-            return (ProtocolResult::Continue, ClientResult::CloseClient);
+            return (ProtocolResult::Continue, SessionResult::CloseSession);
           },
           Ok(_) => {
           },
@@ -57,14 +57,14 @@ impl TlsHandshake {
             },
             _ => {
               error!("could not perform handshake: {:?}", e);
-              return (ProtocolResult::Continue, ClientResult::CloseClient);
+              return (ProtocolResult::Continue, SessionResult::CloseSession);
             }
           }
         }
 
         if let Err(e) = self.session.process_new_packets() {
           error!("could not perform handshake: {:?}", e);
-          return (ProtocolResult::Continue, ClientResult::CloseClient);
+          return (ProtocolResult::Continue, SessionResult::CloseSession);
         }
       }
 
@@ -82,21 +82,21 @@ impl TlsHandshake {
     }
 
     if self.session.is_handshaking() {
-      (ProtocolResult::Continue, ClientResult::Continue)
+      (ProtocolResult::Continue, SessionResult::Continue)
     } else {
       // handshake might be finished but we still have something to send
       if self.session.wants_write() {
-        (ProtocolResult::Continue, ClientResult::Continue)
+        (ProtocolResult::Continue, SessionResult::Continue)
       } else {
         self.readiness.interest.insert(Ready::readable());
         self.readiness.event.insert(Ready::readable());
         self.readiness.interest.insert(Ready::writable());
-        (ProtocolResult::Upgrade, ClientResult::Continue)
+        (ProtocolResult::Upgrade, SessionResult::Continue)
       }
     }
   }
 
-  pub fn writable(&mut self) -> (ProtocolResult,ClientResult) {
+  pub fn writable(&mut self) -> (ProtocolResult,SessionResult) {
     let mut can_write = true;
 
     loop {
@@ -114,14 +114,14 @@ impl TlsHandshake {
             },
             _ => {
               error!("could not perform handshake: {:?}", e);
-              return (ProtocolResult::Continue, ClientResult::CloseClient);
+              return (ProtocolResult::Continue, SessionResult::CloseSession);
             }
           }
         }
 
         if let Err(e) = self.session.process_new_packets() {
           error!("could not perform handshake: {:?}", e);
-          return (ProtocolResult::Continue, ClientResult::CloseClient);
+          return (ProtocolResult::Continue, SessionResult::CloseSession);
         }
       }
 
@@ -139,14 +139,14 @@ impl TlsHandshake {
     }
 
     if self.session.is_handshaking() {
-      (ProtocolResult::Continue, ClientResult::Continue)
+      (ProtocolResult::Continue, SessionResult::Continue)
     } else {
       if self.session.wants_read() {
-        (ProtocolResult::Continue, ClientResult::Continue)
+        (ProtocolResult::Continue, SessionResult::Continue)
       } else {
         self.readiness.interest.insert(Ready::writable());
         self.readiness.interest.insert(Ready::readable());
-        (ProtocolResult::Upgrade, ClientResult::Continue)
+        (ProtocolResult::Upgrade, SessionResult::Continue)
       }
     }
   }
