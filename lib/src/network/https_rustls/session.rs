@@ -18,7 +18,7 @@ use std::net::{IpAddr,SocketAddr};
 use std::str::{FromStr, from_utf8, from_utf8_unchecked};
 use time::{precise_time_s, precise_time_ns, SteadyTime, Duration};
 use rand::random;
-use rustls::{ServerSession,Session,ProtocolVersion,SupportedCipherSuite,CipherSuite};
+use rustls::{ServerSession,Session as ClientSession,ProtocolVersion,SupportedCipherSuite,CipherSuite};
 use nom::{HexDisplay,IResult};
 use mio_extras::timer::{Timer, Timeout};
 
@@ -54,7 +54,7 @@ pub enum State {
   WebSocket(Pipe<FrontRustls>)
 }
 
-pub struct TlsSession {
+pub struct Session {
   pub frontend_token: Token,
   pub backend:        Option<Rc<RefCell<Backend>>>,
   pub back_connected: BackendConnectionStatus,
@@ -70,9 +70,9 @@ pub struct TlsSession {
   pub connection_attempt: u8,
 }
 
-impl TlsSession {
+impl Session {
   pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
-    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout, listen_token: Token) -> TlsSession {
+    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout, listen_token: Token) -> Session {
     let state = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);
@@ -82,7 +82,7 @@ impl TlsSession {
       Some(State::Handshake(TlsHandshake::new(ssl, sock)))
     };
 
-    let mut session = TlsSession {
+    let mut session = Session {
       frontend_token: token,
       backend:        None,
       back_connected: BackendConnectionStatus::NotConnected,
@@ -457,7 +457,7 @@ impl TlsSession {
   }
 }
 
-impl ProxySession for TlsSession {
+impl ProxySession for Session {
   fn close(&mut self, poll: &mut Poll) -> CloseResult {
     //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
     self.http().map(|http| http.close());

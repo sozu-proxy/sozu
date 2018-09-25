@@ -48,7 +48,7 @@ use network::retry::RetryPolicy;
 use util::UnwrapLog;
 
 use super::resolver::{CertificateResolver,CertificateResolverWrapper};
-use super::session::TlsSession;
+use super::session::Session;
 
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct TlsApp {
@@ -351,7 +351,7 @@ impl Proxy {
     self.backends.remove_backend(app_id, backend_address);
   }
 
-  pub fn backend_from_app_id(&mut self, session: &mut TlsSession, app_id: &str, front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
+  pub fn backend_from_app_id(&mut self, session: &mut Session, app_id: &str, front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
     session.http().map(|h| h.set_app_id(app_id.clone().to_string()));
 
     match self.backends.backend_from_app_id(&app_id) {
@@ -378,7 +378,7 @@ impl Proxy {
     }
   }
 
-  pub fn backend_from_sticky_session(&mut self, session: &mut TlsSession, app_id: &str, sticky_session: String) -> Result<TcpStream,ConnectionError> {
+  pub fn backend_from_sticky_session(&mut self, session: &mut Session, app_id: &str, sticky_session: String) -> Result<TcpStream,ConnectionError> {
     session.http().map(|h| h.set_app_id(String::from(app_id)));
 
     match self.backends.backend_from_sticky_session(app_id, &sticky_session) {
@@ -403,7 +403,7 @@ impl Proxy {
     }
   }
 
-  fn app_id_from_request(&mut self, session: &mut TlsSession) -> Result<String, ConnectionError> {
+  fn app_id_from_request(&mut self, session: &mut Session) -> Result<String, ConnectionError> {
     let h = session.http().and_then(|h| h.state().get_host()).ok_or(ConnectionError::NoHostGiven)?;
 
     let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
@@ -457,7 +457,7 @@ impl Proxy {
     }
   }
 
-  fn check_circuit_breaker(&mut self, session: &mut TlsSession) -> Result<(), ConnectionError> {
+  fn check_circuit_breaker(&mut self, session: &mut Session) -> Result<(), ConnectionError> {
     if session.connection_attempt == CONN_RETRIES {
       error!("{} max connection attempt reached", session.log_context());
       let answer = self.listeners[&session.listen_token].answers.ServiceUnavailable.clone();
@@ -469,13 +469,13 @@ impl Proxy {
   }
 }
 
-impl ProxyConfiguration<TlsSession> for Proxy {
+impl ProxyConfiguration<Session> for Proxy {
   fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
     self.listeners.get_mut(&Token(token.0)).unwrap().accept(token)
   }
 
   fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout)
-    -> Result<(Rc<RefCell<TlsSession>>,bool), AcceptError> {
+    -> Result<(Rc<RefCell<Session>>,bool), AcceptError> {
       if let Some(ref listener) = self.listeners.get(&Token(token.0)) {
         frontend_sock.set_nodelay(true);
 
@@ -487,7 +487,7 @@ impl ProxyConfiguration<TlsSession> for Proxy {
         );
 
         let session = ServerSession::new(&listener.ssl_config);
-        let c = TlsSession::new(session, frontend_sock, session_token, Rc::downgrade(&self.pool), listener.config.public_address,
+        let c = Session::new(session, frontend_sock, session_token, Rc::downgrade(&self.pool), listener.config.public_address,
           listener.config.expect_proxy, listener.config.sticky_name.clone(), timeout, Token(token.0));
 
         Ok((Rc::new(RefCell::new(c)), false))
@@ -497,7 +497,7 @@ impl ProxyConfiguration<TlsSession> for Proxy {
       }
     }
 
-  fn connect_to_backend(&mut self, poll: &mut Poll,  session: &mut TlsSession, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
+  fn connect_to_backend(&mut self, poll: &mut Poll,  session: &mut Session, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
     let old_app_id = session.http().and_then(|ref http| http.app_id.clone());
     let old_back_token = session.back_token();
 
