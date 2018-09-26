@@ -584,6 +584,16 @@ impl CommandServer {
         debug!("registering new sock {:?} at token {:?} for id {} (sock error: {:?})",
           worker.channel.sock, worker_token, worker.id, worker.channel.sock.take_error());
 
+        let mut count = 0;
+        let mut orders = self.state.generate_activate_orders();
+        for order in orders.drain(..) {
+          worker.push_message(OrderMessage {
+            id: format!("RESTART-{}-ACTIVATE-{}", id, count),
+            order
+          });
+          count += 1;
+        }
+
         self.poll.register(&worker.channel.sock, Token(worker_token),
           Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
           PollOpt::edge()).unwrap();
