@@ -931,7 +931,7 @@ impl Config {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
         worker_id: None,
-        data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::AddHttpListener(listener.clone())),
+        data:     CommandRequestData::Proxy(ProxyRequestData::AddHttpListener(listener.clone())),
       });
       count += 1;
     }
@@ -941,7 +941,7 @@ impl Config {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
         worker_id: None,
-        data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::AddHttpsListener(listener.clone())),
+        data:     CommandRequestData::Proxy(ProxyRequestData::AddHttpsListener(listener.clone())),
       });
       count += 1;
     }
@@ -951,7 +951,7 @@ impl Config {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
         worker_id: None,
-        data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::AddTcpListener(listener.clone())),
+        data:     CommandRequestData::Proxy(ProxyRequestData::AddTcpListener(listener.clone())),
       });
       count += 1;
     }
@@ -963,7 +963,7 @@ impl Config {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           worker_id: None,
-          data:     CommandRequestData::ProxyConfiguration(order),
+          data:     CommandRequestData::Proxy(order),
         });
         count += 1;
       }
@@ -975,7 +975,7 @@ impl Config {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           worker_id: None,
-          data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::ActivateListener(ActivateListener{
+          data:     CommandRequestData::Proxy(ProxyRequestData::ActivateListener(ActivateListener{
             front:    listener.front,
             proxy:    ListenerType::HTTP,
             from_scm: false,
@@ -989,7 +989,7 @@ impl Config {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           worker_id: None,
-          data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::ActivateListener(ActivateListener{
+          data:     CommandRequestData::Proxy(ProxyRequestData::ActivateListener(ActivateListener{
             front:    listener.front,
             proxy:    ListenerType::HTTPS,
             from_scm: false,
@@ -1003,7 +1003,7 @@ impl Config {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           worker_id: None,
-          data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::ActivateListener(ActivateListener{
+          data:     CommandRequestData::Proxy(ProxyRequestData::ActivateListener(ActivateListener{
             front:    listener.front,
             proxy:    ListenerType::TCP,
             from_scm: false,

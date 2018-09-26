@@ -193,7 +193,7 @@ pub fn soft_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id:
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
-    CommandRequestData::ProxyConfiguration(ProxyRequestData::SoftStop),
+    CommandRequestData::Proxy(ProxyRequestData::SoftStop),
     proxy_id,
   ));
 
@@ -227,7 +227,7 @@ pub fn hard_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id:
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
-    CommandRequestData::ProxyConfiguration(ProxyRequestData::HardStop),
+    CommandRequestData::Proxy(ProxyRequestData::HardStop),
     proxy_id,
   ));
 
@@ -442,7 +442,7 @@ pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
               let id = generate_id();
               let msg = CommandRequest::new(
                 id.clone(),
-                CommandRequestData::ProxyConfiguration(ProxyRequestData::Status),
+                CommandRequestData::Proxy(ProxyRequestData::Status),
                 Some(worker.id),
               );
               //println!("sending message: {:?}", msg);
@@ -556,7 +556,7 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
   //println!("will send message for metrics with id {}", id);
   channel.write_message(&CommandRequest::new(
     id.clone(),
-    CommandRequestData::ProxyConfiguration(ProxyRequestData::Metrics),
+    CommandRequestData::Proxy(ProxyRequestData::Metrics),
     None,
   ));
   //println!("message sent");
@@ -886,7 +886,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
   }
 
   let command = if let Some(ref app_id) = application_id {
-    CommandRequestData::ProxyConfiguration(ProxyRequestData::Query(Query::Applications(QueryApplicationType::AppId(app_id.to_string()))))
+    CommandRequestData::Proxy(ProxyRequestData::Query(Query::Applications(QueryApplicationType::AppId(app_id.to_string()))))
   } else if let Some(ref domain) = domain {
     let splitted: Vec<String> = domain.splitn(2, "/").map(|elem| elem.to_string()).collect();
 
@@ -900,9 +900,9 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
       path_begin: splitted.get(1).cloned().map(|path| format!("/{}", path)) // We add the / again because of the splitn removing it
     };
 
-    CommandRequestData::ProxyConfiguration(ProxyRequestData::Query(Query::Applications(QueryApplicationType::Domain(query_domain))))
+    CommandRequestData::Proxy(ProxyRequestData::Query(Query::Applications(QueryApplicationType::Domain(query_domain))))
   } else {
-    CommandRequestData::ProxyConfiguration(ProxyRequestData::Query(Query::ApplicationsHashes))
+    CommandRequestData::Proxy(ProxyRequestData::Query(Query::ApplicationsHashes))
   };
 
   let id = generate_id();
@@ -1158,7 +1158,7 @@ fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: 
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
-    CommandRequestData::ProxyConfiguration(order.clone()),
+    CommandRequestData::Proxy(order.clone()),
     None,
   ));
 

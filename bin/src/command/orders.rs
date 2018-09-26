@@ -58,7 +58,7 @@ impl CommandServer {
       CommandRequestData::UpgradeMaster => {
         self.upgrade_master(token, &message.id);
       },
-      CommandRequestData::ProxyConfiguration(order) => {
+      CommandRequestData::Proxy(order) => {
         match order {
           ProxyRequestData::Metrics => self.metrics(token, &message.id),
           ProxyRequestData::Query(query) => self.query(token, &message.id, query),
@@ -108,7 +108,7 @@ impl CommandServer {
         for command in orders {
           let message = CommandRequest::new(
             format!("SAVE-{}", counter),
-            CommandRequestData::ProxyConfiguration(command),
+            CommandRequestData::Proxy(command),
             None
           );
 
@@ -190,7 +190,7 @@ impl CommandServer {
 
               let mut new_state = self.state.clone();
               for message in orders {
-                if let CommandRequestData::ProxyConfiguration(order) = message.data {
+                if let CommandRequestData::Proxy(order) = message.data {
                   new_state.handle_order(&order);
                 }
               }
@@ -678,7 +678,7 @@ impl CommandServer {
   pub fn load_static_application_configuration(&mut self) {
     //FIXME: too many loops, this could be cleaner
     for message in self.config.generate_config_messages() {
-      if let CommandRequestData::ProxyConfiguration(order) = message.data {
+      if let CommandRequestData::Proxy(order) = message.data {
         self.state.handle_order(&order);
 
         if let &ProxyRequestData::AddCertificate(_) = &order {
