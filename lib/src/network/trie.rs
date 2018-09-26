@@ -234,6 +234,10 @@ impl<V:Debug> TrieNode<V> {
 
   // specific version that will handle wildcard domains
   pub fn domain_lookup(&self, key: &[u8]) -> Option<&KeyValue<Key,V>> {
+    if key.is_empty() {
+      return None;
+    }
+
     //println!("looking up: {}", str::from_utf8(key).unwrap());
     let mut partial_key = key.to_vec();
     partial_key.reverse();
