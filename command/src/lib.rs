@@ -17,7 +17,7 @@ extern crate time;
 #[macro_use] pub mod logging;
 pub mod certificate;
 pub mod config;
-pub mod data;
+pub mod command;
 pub mod state;
 pub mod messages;
 pub mod channel;

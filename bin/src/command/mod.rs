@@ -17,7 +17,7 @@ use sozu::network::metrics::METRICS;
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
-use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState};
+use sozu_command::command::{CommandRequest,CommandResponse,CommandStatus,RunState};
 use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 
@@ -480,9 +480,9 @@ impl CommandServer {
                   if client.channel.back_buf.capacity() == capacity {
                     //we cannot grow the channel further
                     error!("cannot write message back to config client: message is larger than max_buffer_size");
-                    client.push_message(ConfigMessageAnswer::new(
+                    client.push_message(CommandResponse::new(
                       msg.id,
-                      ConfigMessageStatus::Error,
+                      CommandStatus::Error,
                       "cannot write message back to config client because message is larger than max_buffer_size".to_string(),
                       None
                     ));

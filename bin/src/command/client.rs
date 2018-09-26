@@ -7,12 +7,12 @@ use serde_json::from_str;
 
 use sozu_command::channel::Channel;
 
-use super::{ConfigMessage,ConfigMessageAnswer};
+use super::{CommandRequest,CommandResponse};
 
 pub struct CommandClient {
-  pub channel:       Channel<ConfigMessageAnswer,ConfigMessage>,
+  pub channel:       Channel<CommandResponse,CommandRequest>,
   pub token:         Option<Token>,
-  pub queue:         VecDeque<ConfigMessageAnswer>,
+  pub queue:         VecDeque<CommandResponse>,
 }
 
 impl CommandClient {
@@ -25,7 +25,7 @@ impl CommandClient {
     }
   }
 
-  pub fn push_message(&mut self, message: ConfigMessageAnswer) {
+  pub fn push_message(&mut self, message: CommandResponse) {
     self.queue.push_back(message);
     self.channel.interest.insert(Ready::writable());
   }
@@ -35,7 +35,7 @@ impl CommandClient {
   }
 }
 
-pub fn parse(input: &[u8]) -> IResult<&[u8], Vec<ConfigMessage>> {
+pub fn parse(input: &[u8]) -> IResult<&[u8], Vec<CommandRequest>> {
   many0!(input,
     complete!(terminated!(map_res!(map_res!(is_not!("\0"), from_utf8), from_str), char!('\0')))
   )

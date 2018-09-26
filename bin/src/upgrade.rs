@@ -11,7 +11,7 @@ use serde_json;
 use tempfile::tempfile;
 
 use sozu_command::config::Config;
-use sozu_command::data::RunState;
+use sozu_command::command::RunState;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::messages::OrderMessage;

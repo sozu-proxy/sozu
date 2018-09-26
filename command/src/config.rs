@@ -15,7 +15,7 @@ use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,TcpF
   HttpListener,HttpsListener,TcpListener,AddCertificate,TlsProvider,LoadBalancingParams,
   Application, TlsVersion,ActivateListener,ListenerType};
 
-use data::{ConfigCommand,ConfigMessage,PROTOCOL_VERSION};
+use command::{CommandRequestData,CommandRequest,PROTOCOL_VERSION};
 
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
@@ -922,36 +922,36 @@ impl Config {
     FileConfig::load_from_path(path).map(|config| config.into(path))
   }
 
-  pub fn generate_config_messages(&self) -> Vec<ConfigMessage> {
+  pub fn generate_config_messages(&self) -> Vec<CommandRequest> {
     let mut v = Vec::new();
     let mut count = 0u8;
 
     for listener in &self.http_listeners {
-      v.push(ConfigMessage {
+      v.push(CommandRequest {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
         worker_id: None,
-        data:     ConfigCommand::ProxyConfiguration(Order::AddHttpListener(listener.clone())),
+        data:     CommandRequestData::ProxyConfiguration(Order::AddHttpListener(listener.clone())),
       });
       count += 1;
     }
 
     for listener in &self.https_listeners {
-      v.push(ConfigMessage {
+      v.push(CommandRequest {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
         worker_id: None,
-        data:     ConfigCommand::ProxyConfiguration(Order::AddHttpsListener(listener.clone())),
+        data:     CommandRequestData::ProxyConfiguration(Order::AddHttpsListener(listener.clone())),
       });
       count += 1;
     }
 
     for listener in &self.tcp_listeners {
-      v.push(ConfigMessage {
+      v.push(CommandRequest {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
         worker_id: None,
-        data:     ConfigCommand::ProxyConfiguration(Order::AddTcpListener(listener.clone())),
+        data:     CommandRequestData::ProxyConfiguration(Order::AddTcpListener(listener.clone())),
       });
       count += 1;
     }
@@ -959,11 +959,11 @@ impl Config {
     for app in self.applications.values() {
       let mut orders = app.generate_orders();
       for order in orders.drain(..) {
-        v.push(ConfigMessage {
+        v.push(CommandRequest {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           worker_id: None,
-          data:     ConfigCommand::ProxyConfiguration(order),
+          data:     CommandRequestData::ProxyConfiguration(order),
         });
         count += 1;
       }
@@ -971,11 +971,11 @@ impl Config {
 
     if self.activate_listeners {
       for listener in &self.http_listeners {
-        v.push(ConfigMessage {
+        v.push(CommandRequest {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           worker_id: None,
-          data:     ConfigCommand::ProxyConfiguration(Order::ActivateListener(ActivateListener{
+          data:     CommandRequestData::ProxyConfiguration(Order::ActivateListener(ActivateListener{
             front:    listener.front,
             proxy:    ListenerType::HTTP,
             from_scm: false,
@@ -985,11 +985,11 @@ impl Config {
       }
 
       for listener in &self.https_listeners {
-        v.push(ConfigMessage {
+        v.push(CommandRequest {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           worker_id: None,
-          data:     ConfigCommand::ProxyConfiguration(Order::ActivateListener(ActivateListener{
+          data:     CommandRequestData::ProxyConfiguration(Order::ActivateListener(ActivateListener{
             front:    listener.front,
             proxy:    ListenerType::HTTPS,
             from_scm: false,
@@ -999,11 +999,11 @@ impl Config {
       }
 
       for listener in &self.tcp_listeners {
-        v.push(ConfigMessage {
+        v.push(CommandRequest {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           worker_id: None,
-          data:     ConfigCommand::ProxyConfiguration(Order::ActivateListener(ActivateListener{
+          data:     CommandRequestData::ProxyConfiguration(Order::ActivateListener(ActivateListener{
             front:    listener.front,
             proxy:    ListenerType::TCP,
             from_scm: false,

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use slab::Slab;
 use std::collections::{HashSet, VecDeque};
 use sozu_command::messages::{OrderMessage, OrderMessageAnswer, OrderMessageStatus};
-use sozu_command::data::ConfigMessageAnswer;
+use sozu_command::command::CommandResponse;
 use super::FrontToken;
 
 lazy_static! {
@@ -29,7 +29,7 @@ pub struct Executor {
   pub to_notify: Mutex<HashMap<(Token, String, MessageStatus), Task>>,
   pub messages: Mutex<HashMap<(Token, String, MessageStatus), OrderMessageAnswer>>,
   pub worker_queue: Mutex<VecDeque<(Token, OrderMessage)>>,
-  pub client_queue: Mutex<VecDeque<(FrontToken, ConfigMessageAnswer)>>,
+  pub client_queue: Mutex<VecDeque<(FrontToken, CommandResponse)>>,
   pub state_queue: Mutex<VecDeque<StateChange>>,
 }
 
@@ -99,12 +99,12 @@ impl Executor {
     queue.pop_front()
   }
 
-  pub fn send_client(client: FrontToken, message: ConfigMessageAnswer) {
+  pub fn send_client(client: FrontToken, message: CommandResponse) {
     let mut queue = EXECUTOR.client_queue.lock().unwrap();
     queue.push_back((client, message));
   }
 
-  pub fn get_client_message() -> Option<(FrontToken, ConfigMessageAnswer)> {
+  pub fn get_client_message() -> Option<(FrontToken, CommandResponse)> {
     let mut queue = EXECUTOR.client_queue.lock().unwrap();
     queue.pop_front()
   }
@@ -279,7 +279,7 @@ mod tests {
   use futures::task;
   use futures::future::{lazy, result};
   use sozu_command::messages::{Order,OrderMessageStatus};
-  use sozu_command::data::ConfigMessageStatus;
+  use sozu_command::command::CommandStatus;
 
   #[test]
   fn executor() {
@@ -290,9 +290,9 @@ mod tests {
         Ok(())
       }).join(msg_future.map(|msg| {
           println!("TEST: future got msg: {:?}", msg);
-          Executor::send_client(FrontToken(1), ConfigMessageAnswer::new(
+          Executor::send_client(FrontToken(1), CommandResponse::new(
             "test".to_string(),
-            ConfigMessageStatus::Ok,
+            CommandStatus::Ok,
             "ok".to_string(),
             None
           ));
@@ -322,9 +322,9 @@ mod tests {
     assert_eq!(
       Executor::get_client_message(),
       Some((FrontToken(1),
-        ConfigMessageAnswer::new(
+        CommandResponse::new(
           "test".to_string(),
-          ConfigMessageStatus::Ok,
+          CommandStatus::Ok,
           "ok".to_string(),
           None
         )

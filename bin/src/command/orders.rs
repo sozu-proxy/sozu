@@ -19,7 +19,7 @@ use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners, ScmSocket};
 use sozu_command::messages::{Order, OrderMessage, Query, QueryAnswer, QueryApplicationType,
 MetricsData, AggregatedMetricsData, OrderMessageAnswerData};
-use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
+use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
 use sozu_command::state::get_application_ids_by_domain;
 use sozu_command::logging;
 use sozu::network::metrics::METRICS;
@@ -35,63 +35,63 @@ use futures::future::join_all;
 use futures::Future;
 
 impl CommandServer {
-  pub fn handle_client_message(&mut self, token: FrontToken, message: &ConfigMessage) {
+  pub fn handle_client_message(&mut self, token: FrontToken, message: &CommandRequest) {
     //info!("handle_client_message: front token = {:?}, message = {:#?}", token, message);
     let config_command = message.data.clone();
     match config_command {
-      ConfigCommand::SaveState(path) => {
+      CommandRequestData::SaveState(path) => {
         self.save_state(token, &message.id, &path);
       },
-      ConfigCommand::DumpState => {
+      CommandRequestData::DumpState => {
         self.dump_state(token, &message.id);
       },
-      ConfigCommand::LoadState(path) => {
+      CommandRequestData::LoadState(path) => {
         self.load_state(Some(token), &message.id, &path);
         //self.answer_success(token, message.id.as_str(), "loaded the configuration", None);
       },
-      ConfigCommand::ListWorkers => {
+      CommandRequestData::ListWorkers => {
         self.list_workers(token, &message.id);
       },
-      ConfigCommand::LaunchWorker(tag) => {
+      CommandRequestData::LaunchWorker(tag) => {
         self.launch_worker(token, message, &tag);
       },
-      ConfigCommand::UpgradeMaster => {
+      CommandRequestData::UpgradeMaster => {
         self.upgrade_master(token, &message.id);
       },
-      ConfigCommand::Metrics => {
+      CommandRequestData::Metrics => {
         self.metrics(token, &message.id);
       },
-      ConfigCommand::Query(query) => {
+      CommandRequestData::Query(query) => {
         self.query(token, &message.id, query);
       },
-      ConfigCommand::ProxyConfiguration(order) => {
+      CommandRequestData::ProxyConfiguration(order) => {
         self.worker_order(token, &message.id, order, message.worker_id);
       },
-      ConfigCommand::UpgradeWorker(id) => {
+      CommandRequestData::UpgradeWorker(id) => {
         self.upgrade_worker(token, &message.id, id);
       },
     }
   }
 
-  pub fn answer_success<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<AnswerData>)
+  pub fn answer_success<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<CommandResponseData>)
     where T: Clone+Into<String>,
           U: Clone+Into<String> {
     trace!("answer_success for front token {:?} id {}, message {:#?} data {:#?}", token, id.clone().into(), message.clone().into(), data);
-    self.clients[token].push_message(ConfigMessageAnswer::new(
+    self.clients[token].push_message(CommandResponse::new(
       id.into(),
-      ConfigMessageStatus::Ok,
+      CommandStatus::Ok,
       message.into(),
       data
     ));
   }
 
-  pub fn answer_error<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<AnswerData>)
+  pub fn answer_error<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<CommandResponseData>)
     where T: Clone+Into<String>,
           U: Clone+Into<String> {
     trace!("answer_error for front token {:?} id {}, message {:#?} data {:#?}", token, id.clone().into(), message.clone().into(), data);
-    self.clients[token].push_message(ConfigMessageAnswer::new(
+    self.clients[token].push_message(CommandResponse::new(
       id.into(),
-      ConfigMessageStatus::Error,
+      CommandStatus::Error,
       message.into(),
       data
     ));
@@ -106,9 +106,9 @@ impl CommandServer {
 
       let res: io::Result<usize> = (move || {
         for command in orders {
-          let message = ConfigMessage::new(
+          let message = CommandRequest::new(
             format!("SAVE-{}", counter),
-            ConfigCommand::ProxyConfiguration(command),
+            CommandRequestData::ProxyConfiguration(command),
             None
           );
 
@@ -144,7 +144,7 @@ impl CommandServer {
 
   pub fn dump_state(&mut self, token: FrontToken, message_id: &str) {
     let state = self.state.clone();
-    self.answer_success(token, message_id, String::new(), Some(AnswerData::State(state)));
+    self.answer_success(token, message_id, String::new(), Some(CommandResponseData::State(state)));
   }
 
   pub fn load_state(&mut self, token_opt: Option<FrontToken>, message_id: &str, path: &str) {
@@ -190,7 +190,7 @@ impl CommandServer {
 
               let mut new_state = self.state.clone();
               for message in orders {
-                if let ConfigCommand::ProxyConfiguration(order) = message.data {
+                if let CommandRequestData::ProxyConfiguration(order) = message.data {
                   new_state.handle_order(&order);
                 }
               }
@@ -246,9 +246,9 @@ impl CommandServer {
             //FIXME: join_all will stop at the first error, and we will end up accumulating messages
             join_all(futures).map(move |v| {
               info!("load_state: {} messages loaded", v.len());
-              executor::Executor::send_client(token_opt.unwrap(), ConfigMessageAnswer::new(
+              executor::Executor::send_client(token_opt.unwrap(), CommandResponse::new(
                 id,
-                ConfigMessageStatus::Ok,
+                CommandStatus::Ok,
                 format!("ok: {} messages, error: 0", v.len()),
                 None
               ));
@@ -259,9 +259,9 @@ impl CommandServer {
         } else {
           info!("no messages sent to workers: local state already had those messages");
           if let Some(token) = token_opt {
-            let answer = ConfigMessageAnswer::new(
+            let answer = CommandResponse::new(
               message_id.to_string(),
-              ConfigMessageStatus::Ok,
+              CommandStatus::Ok,
               format!("ok: 0 messages, error: 0"),
               None
             );
@@ -286,15 +286,15 @@ impl CommandServer {
         run_state:  worker.run_state.clone(),
       }
     }).collect();
-    self.answer_success(token, message_id, "", Some(AnswerData::Workers(workers)));
+    self.answer_success(token, message_id, "", Some(CommandResponseData::Workers(workers)));
   }
 
-  pub fn launch_worker(&mut self, token: FrontToken, message: &ConfigMessage, tag: &str) {
+  pub fn launch_worker(&mut self, token: FrontToken, message: &CommandRequest, tag: &str) {
     let id = self.next_id;
     if let Ok(mut worker) = start_worker(id, &self.config, self.executable_path.clone(), &self.state, None) {
-      self.clients[token].push_message(ConfigMessageAnswer::new(
+      self.clients[token].push_message(CommandResponse::new(
           message.id.clone(),
-          ConfigMessageStatus::Processing,
+          CommandStatus::Processing,
           "sending configuration orders".to_string(),
           None
           ));
@@ -344,9 +344,9 @@ impl CommandServer {
     let next_id = self.next_id;
     let worker_token = self.token_count + 1;
     let mut worker = if let Ok(mut worker) = start_worker(next_id, &self.config, self.executable_path.clone(), &self.state, None) {
-      self.clients[token].push_message(ConfigMessageAnswer::new(
+      self.clients[token].push_message(CommandResponse::new(
           String::from(message_id),
-          ConfigMessageStatus::Processing,
+          CommandStatus::Processing,
           "sending configuration orders".to_string(),
           None
           ));
@@ -438,9 +438,9 @@ impl CommandServer {
     self.disable_cloexec_before_upgrade();
     //FIXME: do we need to be blocking here?
     self.clients[token].channel.set_blocking(true);
-    self.clients[token].channel.write_message(&ConfigMessageAnswer::new(
+    self.clients[token].channel.write_message(&CommandResponse::new(
         String::from(message_id),
-        ConfigMessageStatus::Processing,
+        CommandStatus::Processing,
         "".to_string(),
         None
         ));
@@ -449,9 +449,9 @@ impl CommandServer {
     let res = channel.read_message();
     debug!("upgrade channel sent: {:?}", res);
     if let Some(true) = res {
-      self.clients[token].channel.write_message(&ConfigMessageAnswer::new(
+      self.clients[token].channel.write_message(&CommandResponse::new(
         message_id.into(),
-        ConfigMessageStatus::Ok,
+        CommandStatus::Ok,
         format!("new master process launched with pid {}, closing the old one", pid),
         None
       ));
@@ -499,11 +499,11 @@ impl CommandServer {
           workers: data,
         };
 
-        executor::Executor::send_client(token, ConfigMessageAnswer::new(
+        executor::Executor::send_client(token, CommandResponse::new(
           id,
-          ConfigMessageStatus::Ok,
+          CommandStatus::Ok,
           String::new(),
-          Some(AnswerData::Metrics(aggregated_data))
+          Some(CommandResponseData::Metrics(aggregated_data))
         ));
       }).map_err(|e| {
         error!("metrics error: {}", e);
@@ -544,11 +544,11 @@ impl CommandServer {
         executor::Executor::execute(f.map(move |mut data| {
           data.insert(String::from("master"), master);
 
-          executor::Executor::send_client(token, ConfigMessageAnswer::new(
+          executor::Executor::send_client(token, CommandResponse::new(
             id,
-            ConfigMessageStatus::Ok,
+            CommandStatus::Ok,
             String::new(),
-            Some(AnswerData::Query(data))
+            Some(CommandResponseData::Query(data))
           ));
         }).map_err(|e| {
           //FIXME: send back errors
@@ -567,11 +567,11 @@ impl CommandServer {
         executor::Executor::execute(f.map(move |mut data| {
           data.insert(String::from("master"), QueryAnswer::Applications(master));
 
-          executor::Executor::send_client(token, ConfigMessageAnswer::new(
+          executor::Executor::send_client(token, CommandResponse::new(
             id,
-            ConfigMessageStatus::Ok,
+            CommandStatus::Ok,
             String::new(),
-            Some(AnswerData::Query(data))
+            Some(CommandResponseData::Query(data))
           ));
         }).map_err(|e| {
           //FIXME: send back errors
@@ -647,9 +647,9 @@ impl CommandServer {
 
     executor::Executor::execute(
       f.map(move |_v| {
-        executor::Executor::send_client(token, ConfigMessageAnswer::new(
+        executor::Executor::send_client(token, CommandResponse::new(
           id,
-          ConfigMessageStatus::Ok,
+          CommandStatus::Ok,
           String::new(),
           None
         ));
@@ -678,7 +678,7 @@ impl CommandServer {
   pub fn load_static_application_configuration(&mut self) {
     //FIXME: too many loops, this could be cleaner
     for message in self.config.generate_config_messages() {
-      if let ConfigCommand::ProxyConfiguration(order) = message.data {
+      if let CommandRequestData::ProxyConfiguration(order) = message.data {
         self.state.handle_order(&order);
 
         if let &Order::AddCertificate(_) = &order {

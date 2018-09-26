@@ -10,7 +10,7 @@ use messages::{AggregatedMetricsData,Order,Query,QueryAnswer};
 pub const PROTOCOL_VERSION: u8 = 0;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
-pub enum ConfigCommand {
+pub enum CommandRequestData {
   ProxyConfiguration(Order),
   SaveState(String),
   LoadState(String),
@@ -24,16 +24,16 @@ pub enum ConfigCommand {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
-pub struct ConfigMessage {
+pub struct CommandRequest {
   pub id:        String,
   pub version:   u8,
-  pub data:      ConfigCommand,
+  pub data:      CommandRequestData,
   pub worker_id: Option<u32>,
 }
 
-impl ConfigMessage {
-  pub fn new(id: String, data: ConfigCommand, worker_id: Option<u32>) -> ConfigMessage {
-    ConfigMessage {
+impl CommandRequest {
+  pub fn new(id: String, data: CommandRequestData, worker_id: Option<u32>) -> CommandRequest {
+    CommandRequest {
       version:  PROTOCOL_VERSION,
       id,
       data,
@@ -44,7 +44,7 @@ impl ConfigMessage {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ConfigMessageStatus {
+pub enum CommandStatus {
   Ok,
   Processing,
   Error
@@ -52,7 +52,7 @@ pub enum ConfigMessageStatus {
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum AnswerData {
+pub enum CommandResponseData {
   Workers(Vec<WorkerInfo>),
   Metrics(AggregatedMetricsData),
   Query(BTreeMap<String, QueryAnswer>),
@@ -60,17 +60,17 @@ pub enum AnswerData {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
-pub struct ConfigMessageAnswer {
+pub struct CommandResponse {
   pub id:      String,
   pub version: u8,
-  pub status:  ConfigMessageStatus,
+  pub status:  CommandStatus,
   pub message: String,
-  pub data:    Option<AnswerData>,
+  pub data:    Option<CommandResponseData>,
 }
 
-impl ConfigMessageAnswer {
-  pub fn new(id: String, status: ConfigMessageStatus, message: String, data: Option<AnswerData>) -> ConfigMessageAnswer {
-    ConfigMessageAnswer {
+impl CommandResponse {
+  pub fn new(id: String, status: CommandStatus, message: String, data: Option<CommandResponseData>) -> CommandResponse {
+    CommandResponse {
       version: PROTOCOL_VERSION,
       id,
       status,
@@ -101,7 +101,7 @@ struct SaveStateData {
   path : String
 }
 
-enum ConfigMessageField {
+enum CommandRequestField {
   Id,
   Version,
   WorkerId,
@@ -109,43 +109,43 @@ enum ConfigMessageField {
   Data,
 }
 
-impl<'de> serde::Deserialize<'de> for ConfigMessageField {
-  fn deserialize<D>(deserializer: D) -> Result<ConfigMessageField, D::Error>
+impl<'de> serde::Deserialize<'de> for CommandRequestField {
+  fn deserialize<D>(deserializer: D) -> Result<CommandRequestField, D::Error>
         where D: serde::de::Deserializer<'de> {
-    struct ConfigMessageFieldVisitor;
-    impl<'de> serde::de::Visitor<'de> for ConfigMessageFieldVisitor {
-      type Value = ConfigMessageField;
+    struct CommandRequestFieldVisitor;
+    impl<'de> serde::de::Visitor<'de> for CommandRequestFieldVisitor {
+      type Value = CommandRequestField;
 
       fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         formatter.write_str("expected id, version, worker id, type or data")
       }
 
-      fn visit_str<E>(self, value: &str) -> Result<ConfigMessageField, E>
+      fn visit_str<E>(self, value: &str) -> Result<CommandRequestField, E>
         where E: serde::de::Error {
         match value {
-          "id"        => Ok(ConfigMessageField::Id),
-          "version"   => Ok(ConfigMessageField::Version),
-          "type"      => Ok(ConfigMessageField::Type),
-          "worker_id" => Ok(ConfigMessageField::WorkerId),
-          "data"      => Ok(ConfigMessageField::Data),
+          "id"        => Ok(CommandRequestField::Id),
+          "version"   => Ok(CommandRequestField::Version),
+          "type"      => Ok(CommandRequestField::Type),
+          "worker_id" => Ok(CommandRequestField::WorkerId),
+          "data"      => Ok(CommandRequestField::Data),
           e => Err(serde::de::Error::custom(format!("expected id, version, worker id, type or data, got: {}", e))),
         }
       }
     }
 
-    deserializer.deserialize_any(ConfigMessageFieldVisitor)
+    deserializer.deserialize_any(CommandRequestFieldVisitor)
   }
 }
 
-struct ConfigMessageVisitor;
-impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
-  type Value = ConfigMessage;
+struct CommandRequestVisitor;
+impl<'de> serde::de::Visitor<'de> for CommandRequestVisitor {
+  type Value = CommandRequest;
 
   fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
     formatter.write_str("")
   }
 
-  fn visit_map<V>(self, mut visitor: V) -> Result<ConfigMessage, V::Error>
+  fn visit_map<V>(self, mut visitor: V) -> Result<CommandRequest, V::Error>
         where V: serde::de::MapAccess<'de> {
     let mut id:Option<String>              = None;
     let mut version:Option<u8>             = None;
@@ -155,11 +155,11 @@ impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
 
     loop {
       match try!(visitor.next_key()) {
-        Some(ConfigMessageField::Type)    => { config_type = Some(try!(visitor.next_value())); }
-        Some(ConfigMessageField::Id)      => { id = Some(try!(visitor.next_value())); }
-        Some(ConfigMessageField::Version) => { version = Some(try!(visitor.next_value())); }
-        Some(ConfigMessageField::WorkerId) => { worker_id = Some(try!(visitor.next_value())); }
-        Some(ConfigMessageField::Data)    => { data = Some(try!(visitor.next_value())); }
+        Some(CommandRequestField::Type)    => { config_type = Some(try!(visitor.next_value())); }
+        Some(CommandRequestField::Id)      => { id = Some(try!(visitor.next_value())); }
+        Some(CommandRequestField::Version) => { version = Some(try!(visitor.next_value())); }
+        Some(CommandRequestField::WorkerId) => { worker_id = Some(try!(visitor.next_value())); }
+        Some(CommandRequestField::Data)    => { data = Some(try!(visitor.next_value())); }
         None => { break; }
       }
     }
@@ -191,52 +191,52 @@ impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
         None => return Err(serde::de::Error::missing_field("data")),
       };
       let command = try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("proxy configuration command"))));
-      ConfigCommand::ProxyConfiguration(command)
+      CommandRequestData::ProxyConfiguration(command)
     } else if config_type == "SAVE_STATE" {
       let data = match data {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
       let state: SaveStateData = try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("save state"))));
-      ConfigCommand::SaveState(state.path)
+      CommandRequestData::SaveState(state.path)
     } else if config_type == "DUMP_STATE" {
-      ConfigCommand::DumpState
+      CommandRequestData::DumpState
     } else if config_type == "LOAD_STATE" {
       let data = match data {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
       let state: SaveStateData = try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("save state"))));
-      ConfigCommand::LoadState(state.path)
+      CommandRequestData::LoadState(state.path)
     } else if config_type == "LIST_WORKERS" {
-      ConfigCommand::ListWorkers
+      CommandRequestData::ListWorkers
     } else if config_type == "LAUNCH_WORKER" {
       let data = match data {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
-      ConfigCommand::LaunchWorker(try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("launch worker")))))
+      CommandRequestData::LaunchWorker(try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("launch worker")))))
     } else if config_type == "UPGRADE_MASTER" {
-      ConfigCommand::UpgradeMaster
+      CommandRequestData::UpgradeMaster
     } else if config_type == "UPGRADE_WORKER" {
       let data = match data {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
-      ConfigCommand::UpgradeWorker(try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("upgrade worker")))))
+      CommandRequestData::UpgradeWorker(try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("upgrade worker")))))
     } else if config_type == "METRICS" {
-      ConfigCommand::Metrics
+      CommandRequestData::Metrics
     } else if config_type == "QUERY" {
       let data = match data {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
-      ConfigCommand::Query(try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("launch worker")))))
+      CommandRequestData::Query(try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("launch worker")))))
     } else {
       return Err(serde::de::Error::custom("unrecognized command"));
     };
 
-    Ok(ConfigMessage {
+    Ok(CommandRequest {
       id:      id,
       version: PROTOCOL_VERSION,
       data:    data,
@@ -245,11 +245,11 @@ impl<'de> serde::de::Visitor<'de> for ConfigMessageVisitor {
   }
 }
 
-impl<'de> serde::Deserialize<'de> for ConfigMessage {
-  fn deserialize<D>(deserializer: D) -> Result<ConfigMessage, D::Error>
+impl<'de> serde::Deserialize<'de> for CommandRequest {
+  fn deserialize<D>(deserializer: D) -> Result<CommandRequest, D::Error>
     where D: serde::de::Deserializer<'de> {
     static FIELDS: &'static [&'static str] = &["id", "version", "worker_id", "type", "data"];
-    deserializer.deserialize_struct("ConfigMessage", FIELDS, ConfigMessageVisitor)
+    deserializer.deserialize_struct("CommandRequest", FIELDS, CommandRequestVisitor)
   }
 }
 
@@ -258,7 +258,7 @@ struct StatePath {
   path: String
 }
 
-impl serde::Serialize for ConfigMessage {
+impl serde::Serialize for CommandRequest {
   fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
       where S: serde::Serializer,
   {
@@ -276,39 +276,39 @@ impl serde::Serialize for ConfigMessage {
     }
 
     match self.data {
-      ConfigCommand::ProxyConfiguration(ref order) => {
+      CommandRequestData::ProxyConfiguration(ref order) => {
         try!(map.serialize_entry("type", "PROXY"));
         try!(map.serialize_entry("data", order));
       },
-      ConfigCommand::SaveState(ref path) => {
+      CommandRequestData::SaveState(ref path) => {
         try!(map.serialize_entry("type", "SAVE_STATE"));
         try!(map.serialize_entry("data", &StatePath { path: path.to_string() }));
       },
-      ConfigCommand::LoadState(ref path) => {
+      CommandRequestData::LoadState(ref path) => {
         try!(map.serialize_entry("type", "LOAD_STATE"));
         try!(map.serialize_entry("data", &StatePath { path: path.to_string() }));
       },
-      ConfigCommand::DumpState => {
+      CommandRequestData::DumpState => {
         try!(map.serialize_entry("type", "DUMP_STATE"));
       },
-      ConfigCommand::ListWorkers => {
+      CommandRequestData::ListWorkers => {
         try!(map.serialize_entry("type", "LIST_WORKERS"));
       },
-      ConfigCommand::LaunchWorker(ref tag) => {
+      CommandRequestData::LaunchWorker(ref tag) => {
         try!(map.serialize_entry("type", "LAUNCH_WORKER"));
         try!(map.serialize_entry("data", tag));
       },
-      ConfigCommand::UpgradeMaster => {
+      CommandRequestData::UpgradeMaster => {
         try!(map.serialize_entry("type", "UPGRADE_MASTER"));
       },
-      ConfigCommand::Metrics => {
+      CommandRequestData::Metrics => {
         try!(map.serialize_entry("type", "METRICS"));
       },
-      ConfigCommand::Query(ref query) => {
+      CommandRequestData::Query(ref query) => {
         try!(map.serialize_entry("type", "QUERY"));
         try!(map.serialize_entry("data", query));
       },
-      ConfigCommand::UpgradeWorker(ref id) => {
+      CommandRequestData::UpgradeWorker(ref id) => {
         try!(map.serialize_entry("type", "UPGRADE_WORKER"));
         try!(map.serialize_entry("data", id));
       },
@@ -333,9 +333,9 @@ mod tests {
   #[test]
   fn config_message_test() {
     let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "address": "0.0.0.0:8080"}} }"#;
-    let message: ConfigMessage = serde_json::from_str(raw_json).unwrap();
+    let message: CommandRequest = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", message);
-    assert_eq!(message.data, ConfigCommand::ProxyConfiguration(Order::AddHttpFront(HttpFront{
+    assert_eq!(message.data, CommandRequestData::ProxyConfiguration(Order::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
@@ -347,7 +347,7 @@ mod tests {
   fn protocol_version_mismatch_test() {
     let data = include_str!("../assets/protocol_mismatch.json");
     let msg = format!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {} at line 14 column 1", PROTOCOL_VERSION, 1);
-    let res: Result<ConfigMessage, serde_json::Error> = serde_json::from_str(data);
+    let res: Result<CommandRequest, serde_json::Error> = serde_json::from_str(data);
 
     let err = format!("{}", res.unwrap_err());
     assert_eq!(err, msg);
@@ -362,7 +362,7 @@ mod tests {
         let pretty_print = serde_json::to_string_pretty(&$expected_message).expect("should have serialized");
         assert_eq!(&pretty_print, data, "\nserialized message:\n{}\n\nexpected message:\n{}", pretty_print, data);
 
-        let message: ConfigMessage = serde_json::from_str(data).unwrap();
+        let message: CommandRequest = serde_json::from_str(data).unwrap();
         assert_eq!(message, $expected_message, "\ndeserialized message:\n{:#?}\n\nexpected message:\n{:#?}", message, $expected_message);
 
       }
@@ -379,7 +379,7 @@ mod tests {
         let pretty_print = serde_json::to_string_pretty(&$expected_message).expect("should have serialized");
         assert_eq!(&pretty_print, data, "\nserialized message:\n{}\n\nexpected message:\n{}", pretty_print, data);
 
-        let message: ConfigMessageAnswer = serde_json::from_str(data).unwrap();
+        let message: CommandResponse = serde_json::from_str(data).unwrap();
         assert_eq!(message, $expected_message, "\ndeserialized message:\n{:#?}\n\nexpected message:\n{:#?}", message, $expected_message);
 
       }
@@ -387,10 +387,10 @@ mod tests {
     )
   );
 
-  test_message!(add_application, "../assets/add_application.json", ConfigMessage {
+  test_message!(add_application, "../assets/add_application.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::AddApplication(Application {
+      data:     CommandRequestData::ProxyConfiguration(Order::AddApplication(Application {
                   app_id: String::from("xxx"),
                   sticky_session: true,
                   https_redirect: true,
@@ -400,17 +400,17 @@ mod tests {
       worker_id: None
     });
 
-  test_message!(remove_application, "../assets/remove_application.json", ConfigMessage {
+  test_message!(remove_application, "../assets/remove_application.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::RemoveApplication( String::from("xxx") )),
+      data:     CommandRequestData::ProxyConfiguration(Order::RemoveApplication( String::from("xxx") )),
       worker_id: None
     });
 
-  test_message!(add_http_front, "../assets/add_http_front.json", ConfigMessage {
+  test_message!(add_http_front, "../assets/add_http_front.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::AddHttpFront(HttpFront{
+      data:     CommandRequestData::ProxyConfiguration(Order::AddHttpFront(HttpFront{
                   app_id: String::from("xxx"),
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
@@ -419,10 +419,10 @@ mod tests {
       worker_id: None
     });
 
-  test_message!(remove_http_front, "../assets/remove_http_front.json", ConfigMessage {
+  test_message!(remove_http_front, "../assets/remove_http_front.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::RemoveHttpFront(HttpFront{
+      data:     CommandRequestData::ProxyConfiguration(Order::RemoveHttpFront(HttpFront{
                   app_id: String::from("xxx"),
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
@@ -431,10 +431,10 @@ mod tests {
       worker_id: None
     });
 
-  test_message!(add_https_front, "../assets/add_https_front.json", ConfigMessage {
+  test_message!(add_https_front, "../assets/add_https_front.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::AddHttpsFront(HttpsFront{
+      data:     CommandRequestData::ProxyConfiguration(Order::AddHttpsFront(HttpsFront{
                   app_id: String::from("xxx"),
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
@@ -444,10 +444,10 @@ mod tests {
       worker_id: None
     });
 
-  test_message!(remove_https_front, "../assets/remove_https_front.json", ConfigMessage {
+  test_message!(remove_https_front, "../assets/remove_https_front.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::RemoveHttpsFront(HttpsFront{
+      data:     CommandRequestData::ProxyConfiguration(Order::RemoveHttpsFront(HttpsFront{
                   app_id: String::from("xxx"),
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
@@ -461,10 +461,10 @@ mod tests {
   const CERTIFICATE: &'static str = include_str!("../../lib/assets/certificate.pem");
   const CHAIN      : &'static str = include_str!("../../lib/assets/certificate_chain.pem");
 
-  test_message!(add_certificate, "../assets/add_certificate.json", ConfigMessage {
+  test_message!(add_certificate, "../assets/add_certificate.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::AddCertificate( AddCertificate{
+      data:     CommandRequestData::ProxyConfiguration(Order::AddCertificate( AddCertificate{
         front: "0.0.0.0:443".parse().unwrap(),
         certificate: CertificateAndKey {
                   certificate: String::from(CERTIFICATE),
@@ -476,10 +476,10 @@ mod tests {
       worker_id: None
     });
 
-  test_message!(remove_certificate, "../assets/remove_certificate.json", ConfigMessage {
+  test_message!(remove_certificate, "../assets/remove_certificate.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::RemoveCertificate(RemoveCertificate {
+      data:     CommandRequestData::ProxyConfiguration(Order::RemoveCertificate(RemoveCertificate {
           front: "0.0.0.0:443".parse().unwrap(),
           fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
           names: Vec::new(),
@@ -487,10 +487,10 @@ mod tests {
       worker_id: None
     });
 
-  test_message!(add_backend, "../assets/add_backend.json", ConfigMessage {
+  test_message!(add_backend, "../assets/add_backend.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::AddBackend(Backend{
+      data:     CommandRequestData::ProxyConfiguration(Order::AddBackend(Backend{
                   app_id: String::from("xxx"),
                   backend_id: String::from("xxx-0"),
                   address: "127.0.0.1:8080".parse().unwrap(),
@@ -501,10 +501,10 @@ mod tests {
       worker_id: None
     });
 
-  test_message!(remove_backend, "../assets/remove_backend.json", ConfigMessage {
+  test_message!(remove_backend, "../assets/remove_backend.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::RemoveBackend(RemoveBackend{
+      data:     CommandRequestData::ProxyConfiguration(Order::RemoveBackend(RemoveBackend{
                   app_id: String::from("xxx"),
                   backend_id: String::from("xxx-0"),
                   address: "127.0.0.1:8080".parse().unwrap(),
@@ -512,75 +512,75 @@ mod tests {
       worker_id: None
     });
 
-  test_message!(soft_stop, "../assets/soft_stop.json", ConfigMessage {
+  test_message!(soft_stop, "../assets/soft_stop.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::SoftStop),
+      data:     CommandRequestData::ProxyConfiguration(Order::SoftStop),
       worker_id: Some(0),
     });
 
-  test_message!(hard_stop, "../assets/hard_stop.json", ConfigMessage {
+  test_message!(hard_stop, "../assets/hard_stop.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::HardStop),
+      data:     CommandRequestData::ProxyConfiguration(Order::HardStop),
       worker_id: Some(0),
     });
 
-  test_message!(status, "../assets/status.json", ConfigMessage {
+  test_message!(status, "../assets/status.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ProxyConfiguration(Order::Status),
+      data:     CommandRequestData::ProxyConfiguration(Order::Status),
       worker_id: Some(0),
     });
 
-  test_message!(load_state, "../assets/load_state.json", ConfigMessage {
+  test_message!(load_state, "../assets/load_state.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::LoadState(String::from("./config_dump.json")),
+      data:     CommandRequestData::LoadState(String::from("./config_dump.json")),
       worker_id: None
     });
 
-  test_message!(save_state, "../assets/save_state.json", ConfigMessage {
+  test_message!(save_state, "../assets/save_state.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::SaveState(String::from("./config_dump.json")),
+      data:     CommandRequestData::SaveState(String::from("./config_dump.json")),
       worker_id: None
     });
 
-  test_message!(dump_state, "../assets/dump_state.json", ConfigMessage {
+  test_message!(dump_state, "../assets/dump_state.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::DumpState,
+      data:     CommandRequestData::DumpState,
       worker_id: None
     });
 
-  test_message!(list_workers, "../assets/list_workers.json", ConfigMessage {
+  test_message!(list_workers, "../assets/list_workers.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::ListWorkers,
+      data:     CommandRequestData::ListWorkers,
       worker_id: None
     });
 
-  test_message!(upgrade_master, "../assets/upgrade_master.json", ConfigMessage {
+  test_message!(upgrade_master, "../assets/upgrade_master.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::UpgradeMaster,
+      data:     CommandRequestData::UpgradeMaster,
       worker_id: None
     });
 
-  test_message!(upgrade_worker, "../assets/upgrade_worker.json", ConfigMessage {
+  test_message!(upgrade_worker, "../assets/upgrade_worker.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     ConfigCommand::UpgradeWorker(0),
+      data:     CommandRequestData::UpgradeWorker(0),
       worker_id: None
     });
 
-  test_message_answer!(answer_workers_status, "../assets/answer_workers_status.json", ConfigMessageAnswer {
+  test_message_answer!(answer_workers_status, "../assets/answer_workers_status.json", CommandResponse {
       id:       "ID_TEST".to_string(),
       version:  0,
-      status:   ConfigMessageStatus::Ok,
+      status:   CommandStatus::Ok,
       message:  String::from(""),
-      data:     Some(AnswerData::Workers(vec!(
+      data:     Some(CommandResponseData::Workers(vec!(
         WorkerInfo {
           id:        1,
           pid:       5678,
@@ -594,12 +594,12 @@ mod tests {
       ))),
     });
 
-    test_message_answer!(answer_metrics, "../assets/answer_metrics.json", ConfigMessageAnswer {
+    test_message_answer!(answer_metrics, "../assets/answer_metrics.json", CommandResponse {
       id:       "ID_TEST".to_string(),
       version:  0,
-      status:   ConfigMessageStatus::Ok,
+      status:   CommandStatus::Ok,
       message:  String::from(""),
-      data:     Some(AnswerData::Metrics(AggregatedMetricsData {
+      data:     Some(CommandResponseData::Metrics(AggregatedMetricsData {
         master: [
           (String::from("sozu.gauge"), FilteredData::Gauge(1)),
           (String::from("sozu.count"), FilteredData::Count(-2)),
