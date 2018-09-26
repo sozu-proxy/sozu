@@ -9,8 +9,8 @@ use std::env;
 use std::io::stdout;
 use sozu::network;
 use sozu_command::logging::{Logger,LoggerBackend};
-use sozu_command::messages;
-use sozu_command::messages::LoadBalancingParams;
+use sozu_command::proxy;
+use sozu_command::proxy::LoadBalancingParams;
 use sozu_command::channel::Channel;
 
 fn main() {
@@ -25,7 +25,7 @@ fn main() {
   network::metrics::setup(&"127.0.0.1:8125".parse().unwrap(), "main", false, None);
   gauge!("sozu.TEST", 42);
 
-  let config = messages::HttpListener {
+  let config = proxy::HttpListener {
     front: "127.0.0.1:8080".parse().expect("could not parse address"),
     ..Default::default()
   };
@@ -37,14 +37,14 @@ fn main() {
     network::http::start(config, channel, max_buffers, buffer_size);
   });
 
-  let http_front = messages::HttpFront {
+  let http_front = proxy::HttpFront {
     app_id:     String::from("app_1"),
     address:    "127.0.0.1:8080".parse().unwrap(),
     hostname:   String::from("lolcatho.st"),
     path_begin: String::from("/")
   };
 
-  let http_backend = messages::Backend {
+  let http_backend = proxy::Backend {
     app_id:      String::from("app_1"),
     backend_id:  String::from("app_1-0"),
     sticky_id:   None,
@@ -53,21 +53,21 @@ fn main() {
     backup:      None,
   };
 
-  command.write_message(&messages::OrderMessage {
+  command.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_ABCD"),
-    order: messages::Order::AddHttpFront(http_front)
+    order: proxy::ProxyRequestData::AddHttpFront(http_front)
   });
 
-  command.write_message(&messages::OrderMessage {
+  command.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_EFGH"),
-    order: messages::Order::AddBackend(http_backend)
+    order: proxy::ProxyRequestData::AddBackend(http_backend)
   });
 
   info!("MAIN\tHTTP -> {:?}", command.read_message());
   info!("MAIN\tHTTP -> {:?}", command.read_message());
 
 
-  let config = messages::HttpsListener {
+  let config = proxy::HttpsListener {
     front: "127.0.0.1:8443".parse().expect("could not parse address"),
     cipher_list: String::from("ECDHE-ECDSA-CHACHA20-POLY1305:\
     ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:\
@@ -96,33 +96,33 @@ fn main() {
   let cert1 = include_str!("../assets/certificate.pem");
   let key1  = include_str!("../assets/key.pem");
 
-  let certificate_and_key = messages::CertificateAndKey {
+  let certificate_and_key = proxy::CertificateAndKey {
     certificate:       String::from(cert1),
     key:               String::from(key1),
     certificate_chain: vec!()
   };
-  command2.write_message(&messages::OrderMessage {
+  command2.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_IJKL1"),
-    order: messages::Order::AddCertificate(messages::AddCertificate{
+    order: proxy::ProxyRequestData::AddCertificate(proxy::AddCertificate{
       front: "127.0.0.1:8443".parse().unwrap(),
       certificate: certificate_and_key,
       names: Vec::new(),
     })
   });
 
-  let tls_front = messages::HttpsFront {
+  let tls_front = proxy::HttpsFront {
     app_id:      String::from("app_1"),
     address:     "127.0.0.1:8443".parse().unwrap(),
     hostname:    String::from("lolcatho.st"),
     path_begin:  String::from("/"),
-    fingerprint: messages::CertFingerprint(hex::FromHex::from_hex("AB2618B674E15243FD02A5618C66509E4840BA60E7D64CEBEC84CDBFECEEE0C5").unwrap()),
+    fingerprint: proxy::CertFingerprint(hex::FromHex::from_hex("AB2618B674E15243FD02A5618C66509E4840BA60E7D64CEBEC84CDBFECEEE0C5").unwrap()),
   };
 
-  command2.write_message(&messages::OrderMessage {
+  command2.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_IJKL2"),
-    order: messages::Order::AddHttpsFront(tls_front)
+    order: proxy::ProxyRequestData::AddHttpsFront(tls_front)
   });
-  let tls_backend = messages::Backend {
+  let tls_backend = proxy::Backend {
     app_id:      String::from("app_1"),
     backend_id:  String::from("app_1-0"),
     sticky_id:   None,
@@ -131,43 +131,43 @@ fn main() {
     backup:      None,
   };
 
-  command2.write_message(&messages::OrderMessage {
+  command2.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_MNOP"),
-    order: messages::Order::AddBackend(tls_backend)
+    order: proxy::ProxyRequestData::AddBackend(tls_backend)
   });
 
   let cert2 = include_str!("../assets/cert_test.pem");
   let key2  = include_str!("../assets/key_test.pem");
 
-  let certificate_and_key2 = messages::CertificateAndKey {
+  let certificate_and_key2 = proxy::CertificateAndKey {
     certificate: String::from(cert2),
     key: String::from(key2),
     certificate_chain: vec!()
   };
 
-  command2.write_message(&messages::OrderMessage {
+  command2.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_QRST1"),
-    order: messages::Order::AddCertificate(messages::AddCertificate {
+    order: proxy::ProxyRequestData::AddCertificate(proxy::AddCertificate {
       front: "127.0.0.1:8443".parse().unwrap(),
       certificate: certificate_and_key2,
       names: Vec::new(),
     })
   });
 
-  let tls_front2 = messages::HttpsFront {
+  let tls_front2 = proxy::HttpsFront {
     app_id:      String::from("app_2"),
     address:     "127.0.0.1:8443".parse().unwrap(),
     hostname:    String::from("test.local"),
     path_begin:  String::from("/"),
-    fingerprint: messages::CertFingerprint(hex::FromHex::from_hex("7E8EBF9AD0645AB755A2E51EB3734B91D4ACACEF1F28AD9D96D9385487FAE6E6").unwrap()),
+    fingerprint: proxy::CertFingerprint(hex::FromHex::from_hex("7E8EBF9AD0645AB755A2E51EB3734B91D4ACACEF1F28AD9D96D9385487FAE6E6").unwrap()),
   };
 
-  command2.write_message(&messages::OrderMessage {
+  command2.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_QRST2"),
-    order: messages::Order::AddHttpsFront(tls_front2)
+    order: proxy::ProxyRequestData::AddHttpsFront(tls_front2)
   });
 
-  let tls_backend2 = messages::Backend {
+  let tls_backend2 = proxy::Backend {
     app_id:      String::from("app_2"),
     backend_id:  String::from("app_2-0"),
     sticky_id:   None,
@@ -176,9 +176,9 @@ fn main() {
     backup:      None,
   };
 
-  command2.write_message(&messages::OrderMessage {
+  command2.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_UVWX"),
-    order: messages::Order::AddBackend(tls_backend2)
+    order: proxy::ProxyRequestData::AddBackend(tls_backend2)
   });
 
   info!("MAIN\tTLS -> {:?}", command2.read_message());

@@ -19,7 +19,7 @@ pub mod certificate;
 pub mod config;
 pub mod command;
 pub mod state;
-pub mod messages;
+pub mod proxy;
 pub mod channel;
 pub mod buffer;
 pub mod scm_socket;

@@ -6,8 +6,7 @@ extern crate time;
 use std::thread;
 use std::io::stdout;
 use sozu::network;
-use sozu_command::messages;
-use sozu_command::messages::{TcpListener, LoadBalancingParams};
+use sozu_command::proxy::{self, TcpListener, LoadBalancingParams};
 use sozu_command::channel::Channel;
 use sozu_command::logging::{Logger,LoggerBackend};
 
@@ -38,11 +37,11 @@ fn main() {
     network::tcp::start(listener, max_buffers, buffer_size, channel);
   });
 
-  let tcp_front = messages::TcpFront {
+  let tcp_front = proxy::TcpFront {
     app_id:  String::from("test"),
     address: "127.0.0.1:8080".parse().unwrap(),
   };
-  let tcp_backend = messages::Backend {
+  let tcp_backend = proxy::Backend {
     app_id:     String::from("test"),
     backend_id: String::from("test-0"),
     address:    "127.0.0.1:1026".parse().unwrap(),
@@ -51,14 +50,14 @@ fn main() {
     backup:      None,
   };
 
-  command.write_message(&messages::OrderMessage {
+  command.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_ABCD"),
-    order: messages::Order::AddTcpFront(tcp_front)
+    order: proxy::ProxyRequestData::AddTcpFront(tcp_front)
   });
 
-  command.write_message(&messages::OrderMessage {
+  command.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_EFGH"),
-    order: messages::Order::AddBackend(tcp_backend)
+    order: proxy::ProxyRequestData::AddBackend(tcp_backend)
   });
 
   info!("TCP -> {:?}", command.read_message());

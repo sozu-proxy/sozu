@@ -14,20 +14,20 @@ use config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
 pub type MessageId = String;
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
-pub struct OrderMessageAnswer {
+pub struct ProxyResponse {
   pub id:     MessageId,
-  pub status: OrderMessageStatus,
-  pub data:   Option<OrderMessageAnswerData>
+  pub status: ProxyResponseStatus,
+  pub data:   Option<ProxyResponseData>
 }
 
-impl fmt::Display for OrderMessageAnswer {
+impl fmt::Display for ProxyResponse {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
     write!(f, "{}-{:?}", self.id, self.status)
   }
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub enum OrderMessageStatus {
+pub enum ProxyResponseStatus {
   Ok,
   Processing,
   Error(String),
@@ -35,7 +35,7 @@ pub enum OrderMessageStatus {
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum OrderMessageAnswerData {
+pub enum ProxyResponseData {
   //placeholder for now
   Metrics(MetricsData),
   Query(QueryAnswer),
@@ -105,12 +105,12 @@ pub struct BackendMetricsData {
 }
 
 #[derive(Debug,Clone,Serialize,Deserialize)]
-pub struct OrderMessage {
+pub struct ProxyRequest {
   pub id:    MessageId,
-  pub order: Order,
+  pub order: ProxyRequestData,
 }
 
-impl fmt::Display for OrderMessage {
+impl fmt::Display for ProxyRequest {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
     write!(f, "{}-{:?}", self.id, self.order)
   }
@@ -118,7 +118,7 @@ impl fmt::Display for OrderMessage {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Order {
+pub enum ProxyRequestData {
     AddApplication(Application),
     RemoveApplication(String),
 
@@ -571,35 +571,35 @@ impl Default for QueryAnswerApplication {
   }
 }
 
-impl Order {
+impl ProxyRequestData {
   pub fn get_topics(&self) -> HashSet<Topic> {
     match *self {
-      Order::AddApplication(_)      => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::RemoveApplication(_)   => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::AddHttpFront(_)        => [Topic::HttpProxyConfig].iter().cloned().collect(),
-      Order::RemoveHttpFront(_)     => [Topic::HttpProxyConfig].iter().cloned().collect(),
-      Order::AddHttpsFront(_)       => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      Order::RemoveHttpsFront(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      Order::AddCertificate(_)      => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      Order::ReplaceCertificate(_)  => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      Order::RemoveCertificate(_)   => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      Order::AddTcpFront(_)         => [Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::RemoveTcpFront(_)      => [Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::AddBackend(_)          => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::RemoveBackend(_)       => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::AddHttpListener(_)     => [Topic::HttpProxyConfig].iter().cloned().collect(),
-      Order::AddHttpsListener(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      Order::AddTcpListener(_)      => [Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::RemoveListener(_)      => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::ActivateListener(_)    => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::DeactivateListener(_)  => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::Query(_)               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::SoftStop               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::HardStop               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::Status                 => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::Metrics                => HashSet::new(),
-      Order::Logging(_)             => [Topic::HttpsProxyConfig, Topic::HttpProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      Order::ReturnListenSockets    => HashSet::new(),
+      ProxyRequestData::AddApplication(_)      => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::RemoveApplication(_)   => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::AddHttpFront(_)        => [Topic::HttpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::RemoveHttpFront(_)     => [Topic::HttpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::AddHttpsFront(_)       => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::RemoveHttpsFront(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::AddCertificate(_)      => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::ReplaceCertificate(_)  => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::RemoveCertificate(_)   => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::AddTcpFront(_)         => [Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::RemoveTcpFront(_)      => [Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::AddBackend(_)          => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::RemoveBackend(_)       => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::AddHttpListener(_)     => [Topic::HttpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::AddHttpsListener(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::AddTcpListener(_)      => [Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::RemoveListener(_)      => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::ActivateListener(_)    => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::DeactivateListener(_)  => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::Query(_)               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::SoftStop               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::HardStop               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::Status                 => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::Metrics                => HashSet::new(),
+      ProxyRequestData::Logging(_)             => [Topic::HttpsProxyConfig, Topic::HttpProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::ReturnListenSockets    => HashSet::new(),
     }
   }
 }
@@ -619,9 +619,9 @@ mod tests {
   #[test]
   fn add_front_test() {
     let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "address": "127.0.0.1:4242", "sticky_session": false}}"#;
-    let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
+    let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
-    assert!(command == Order::AddHttpFront(HttpFront{
+    assert!(command == ProxyRequestData::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
@@ -632,9 +632,9 @@ mod tests {
   #[test]
   fn remove_front_test() {
     let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "address": "127.0.0.1:4242"}}"#;
-    let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
+    let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
-    assert!(command == Order::RemoveHttpFront(HttpFront{
+    assert!(command == ProxyRequestData::RemoveHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
@@ -646,9 +646,9 @@ mod tests {
   #[test]
   fn add_backend_test() {
     let raw_json = r#"{"type": "ADD_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080", "load_balancing_parameters": { "weight": 0 }}}"#;
-    let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
+    let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
-    assert!(command == Order::AddBackend(Backend{
+    assert!(command == ProxyRequestData::AddBackend(Backend{
       app_id: String::from("xxx"),
       backend_id: String::from("xxx-0"),
       address: "0.0.0.0:8080".parse().unwrap(),
@@ -661,9 +661,9 @@ mod tests {
   #[test]
   fn remove_backend_test() {
     let raw_json = r#"{"type": "REMOVE_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080"}}"#;
-    let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
+    let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
-    assert!(command == Order::RemoveBackend(RemoveBackend {
+    assert!(command == ProxyRequestData::RemoveBackend(RemoveBackend {
       app_id: String::from("xxx"),
       backend_id: String::from("xxx-0"),
       address: "0.0.0.0:8080".parse().unwrap(),
@@ -673,9 +673,9 @@ mod tests {
   #[test]
   fn http_front_crash_test() {
     let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"app_id": "aa", "hostname": "cltdl.fr", "path_begin": "", "address": "127.0.0.1:4242"}}"#;
-    let command: Order = serde_json::from_str(raw_json).expect("could not parse json");
+    let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
-    assert!(command == Order::AddHttpFront(HttpFront{
+    assert!(command == ProxyRequestData::AddHttpFront(HttpFront{
       app_id: String::from("aa"),
       hostname: String::from("cltdl.fr"),
       path_begin: String::from(""),

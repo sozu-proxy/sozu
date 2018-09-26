@@ -14,7 +14,7 @@ use sozu_command::config::Config;
 use sozu_command::command::RunState;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
-use sozu_command::messages::OrderMessage;
+use sozu_command::proxy::ProxyRequest;
 
 use util;
 use command::{CommandServer,Worker};
@@ -26,7 +26,7 @@ pub struct SerializedWorker {
   pub id:         u32,
   pub run_state:  RunState,
   pub token:      Option<usize>,
-  pub queue:      Vec<OrderMessage>,
+  pub queue:      Vec<ProxyRequest>,
   pub scm:        i32,
 }
 

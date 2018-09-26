@@ -17,8 +17,8 @@ use nom::{Err,HexDisplay,Offset};
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners, ScmSocket};
-use sozu_command::messages::{Order, OrderMessage, Query, QueryAnswer, QueryApplicationType,
-MetricsData, AggregatedMetricsData, OrderMessageAnswerData};
+use sozu_command::proxy::{ProxyRequestData, ProxyRequest, Query, QueryAnswer, QueryApplicationType,
+MetricsData, AggregatedMetricsData, ProxyResponseData};
 use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
 use sozu_command::state::get_application_ids_by_domain;
 use sozu_command::logging;
@@ -199,7 +199,7 @@ impl CommandServer {
               for order in diff {
                 self.state.handle_order(&order);
 
-                /* if let &Order::AddHttpsFront(ref data) = &order {
+                /* if let &ProxyRequestData::AddHttpsFront(ref data) = &order {
                   info!("load state AddHttpsFront(HttpsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
                     data.app_id, data.hostname, data.path_begin);
                 } else {
@@ -213,7 +213,7 @@ impl CommandServer {
                   .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
                   let o = order.clone();
                   futures.push(
-                    executor::send(worker.token.expect("worker should have a token"), OrderMessage { id: id.clone(), order: o })
+                    executor::send(worker.token.expect("worker should have a token"), ProxyRequest { id: id.clone(), order: o })
                   );
                   found = true;
 
@@ -322,7 +322,7 @@ impl CommandServer {
       let activate_orders = self.state.generate_activate_orders();
       let mut count = 0;
       for order in activate_orders.into_iter() {
-        worker.push_message(OrderMessage {
+        worker.push_message(ProxyRequest {
           id: format!("{}-ACTIVATE-{}", id, count),
           order
         });
@@ -381,7 +381,7 @@ impl CommandServer {
       let old_worker = self.workers.values_mut().filter(|worker| worker.id == id).next().unwrap();
 
       old_worker.channel.set_blocking(true);
-      old_worker.channel.write_message(&OrderMessage { id: String::from(message_id), order: Order::ReturnListenSockets });
+      old_worker.channel.write_message(&ProxyRequest { id: String::from(message_id), order: ProxyRequestData::ReturnListenSockets });
       info!("sent returnlistensockets message to worker");
       old_worker.channel.set_blocking(false);
 
@@ -405,7 +405,7 @@ impl CommandServer {
       executor::Executor::execute(
         executor::send(
           old_worker_token,
-          OrderMessage { id: message_id.to_string(), order: Order::SoftStop })
+          ProxyRequest { id: message_id.to_string(), order: ProxyRequestData::SoftStop })
         .map(move |_| {
           executor::Executor::stop_worker(old_worker_token)
         }).map_err(|s| {
@@ -423,7 +423,7 @@ impl CommandServer {
     let activate_orders = self.state.generate_activate_orders();
     let mut count = 0;
     for order in activate_orders.into_iter() {
-      worker.push_message(OrderMessage {
+      worker.push_message(ProxyRequest {
         id: format!("{}-ACTIVATE-{}", message_id, count),
         order
       });
@@ -475,7 +475,7 @@ impl CommandServer {
       futures.push(
         executor::send(
           worker.token.expect("worker should have a token"),
-          OrderMessage { id: id.clone(), order: Order::Metrics }).map(|data| (tag, data))
+          ProxyRequest { id: id.clone(), order: ProxyRequestData::Metrics }).map(|data| (tag, data))
       );
     }
 
@@ -487,7 +487,7 @@ impl CommandServer {
       //FIXME: join_all will stop at the first error, and we will end up accumulating messages
       join_all(futures).map(move |v| {
         let data: BTreeMap<String, MetricsData> = v.into_iter().filter_map(|(tag, metrics)| {
-          if let Some(OrderMessageAnswerData::Metrics(d)) = metrics.data {
+          if let Some(ProxyResponseData::Metrics(d)) = metrics.data {
             Some((tag, d))
           } else {
             None
@@ -521,14 +521,14 @@ impl CommandServer {
       futures.push(
         executor::send(
           worker.token.expect("worker should have a token"),
-          OrderMessage { id: id.clone(), order: Order::Query(query.clone()) }).map(|data| (tag, data))
+          ProxyRequest { id: id.clone(), order: ProxyRequestData::Query(query.clone()) }).map(|data| (tag, data))
       );
 
     }
 
     let f = join_all(futures).map(move |v| {
       let data: BTreeMap<String, QueryAnswer> = v.into_iter().filter_map(|(tag, query)| {
-        if let Some(OrderMessageAnswerData::Query(d)) = query.data {
+        if let Some(ProxyResponseData::Query(d)) = query.data {
           Some((tag, d))
         } else {
           None
@@ -581,14 +581,14 @@ impl CommandServer {
     };
   }
 
-  pub fn worker_order(&mut self, token: FrontToken, message_id: &str, order: Order, worker_id: Option<u32>) {
-    if let &Order::AddCertificate(_) = &order {
+  pub fn worker_order(&mut self, token: FrontToken, message_id: &str, order: ProxyRequestData, worker_id: Option<u32>) {
+    if let &ProxyRequestData::AddCertificate(_) = &order {
       debug!("workerconfig client order AddCertificate()");
     } else {
       debug!("workerconfig client order {:?}", order);
     }
 
-    if let &Order::Logging(ref logging_filter) = &order {
+    if let &ProxyRequestData::Logging(ref logging_filter) = &order {
       debug!("Changing master log level to {}", logging_filter);
       logging::LOGGER.with(|l| {
         let directives = logging::parse_logging_spec(&logging_filter);
@@ -613,7 +613,7 @@ impl CommandServer {
       }
 
       let worker_token = worker.token.expect("worker should have a token");
-      let should_stop_worker = order == Order::SoftStop || order == Order::HardStop;
+      let should_stop_worker = order == ProxyRequestData::SoftStop || order == ProxyRequestData::HardStop;
       if should_stop_worker {
         worker.run_state = RunState::Stopping;
       }
@@ -621,7 +621,7 @@ impl CommandServer {
       futures.push(
         Box::new(executor::send(
           worker_token,
-          OrderMessage { id: message_id.to_string(), order: order.clone() })
+          ProxyRequest { id: message_id.to_string(), order: order.clone() })
         .map(move |_| {
           if should_stop_worker {
             executor::Executor::stop_worker(worker_token)
@@ -638,7 +638,7 @@ impl CommandServer {
     }
 
     let id = message_id.to_string();
-    let should_stop_master = (order == Order::SoftStop || order == Order::HardStop) && worker_id.is_none();
+    let should_stop_master = (order == ProxyRequestData::SoftStop || order == ProxyRequestData::HardStop) && worker_id.is_none();
     let f = join_all(futures).map(move |_| {
       if should_stop_master {
         executor::Executor::stop_master();
@@ -659,12 +659,12 @@ impl CommandServer {
     );
 
     match order {
-      Order::AddBackend(_) => self.backends_count += 1,
-      Order::RemoveBackend(_) => self.backends_count -= 1,
-      Order::AddHttpFront(_) | Order::AddHttpsFront(_) | Order::AddTcpFront(_) => {
+      ProxyRequestData::AddBackend(_) => self.backends_count += 1,
+      ProxyRequestData::RemoveBackend(_) => self.backends_count -= 1,
+      ProxyRequestData::AddHttpFront(_) | ProxyRequestData::AddHttpsFront(_) | ProxyRequestData::AddTcpFront(_) => {
         self.frontends_count += 1;
       },
-      Order::RemoveHttpFront(_) | Order::RemoveHttpsFront(_) | Order::RemoveTcpFront(_) => {
+      ProxyRequestData::RemoveHttpFront(_) | ProxyRequestData::RemoveHttpsFront(_) | ProxyRequestData::RemoveTcpFront(_) => {
         self.frontends_count -= 1;
       },
       _ => {}
@@ -681,7 +681,7 @@ impl CommandServer {
       if let CommandRequestData::ProxyConfiguration(order) = message.data {
         self.state.handle_order(&order);
 
-        if let &Order::AddCertificate(_) = &order {
+        if let &ProxyRequestData::AddCertificate(_) = &order {
           debug!("config generated AddCertificate( ... )");
         } else {
           debug!("config generated {:?}", order);
@@ -691,7 +691,7 @@ impl CommandServer {
           .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
 
           let o = order.clone();
-          worker.push_message(OrderMessage { id: message.id.clone(), order: o });
+          worker.push_message(ProxyRequest { id: message.id.clone(), order: o });
           found = true;
         }
 

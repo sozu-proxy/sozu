@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use rand::random;
 use mio::net::TcpStream;
 
-use sozu_command::{messages, config::LoadBalancingAlgorithms, messages::LoadBalancingParams};
+use sozu_command::{proxy, config::LoadBalancingAlgorithms, proxy::LoadBalancingParams};
 
 use network::{AppId,Backend,ConnectionError,load_balancing::*};
 
@@ -25,7 +25,7 @@ impl BackendMap {
     }
   }
 
-  pub fn import_configuration_state(&mut self, backends: &HashMap<AppId, Vec<messages::Backend>>) {
+  pub fn import_configuration_state(&mut self, backends: &HashMap<AppId, Vec<proxy::Backend>>) {
     self.backends.extend(backends.iter().map(|(ref app_id, ref backend_vec)| {
       (app_id.to_string(), BackendList::import_configuration_state(backend_vec))
     }));
@@ -145,7 +145,7 @@ impl BackendList {
     }
   }
 
-  pub fn import_configuration_state(backend_vec: &Vec<messages::Backend>) -> BackendList {
+  pub fn import_configuration_state(backend_vec: &Vec<proxy::Backend>) -> BackendList {
     let mut list = BackendList::new();
     for ref backend in backend_vec {
       let backend = Backend::new(&backend.backend_id, backend.address.clone(), backend.sticky_id.clone(), backend.load_balancing_parameters.clone(), backend.backup);

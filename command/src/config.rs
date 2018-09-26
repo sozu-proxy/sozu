@@ -11,7 +11,7 @@ use std::io::{self,Error,ErrorKind,Read};
 use certificate::{calculate_fingerprint,split_certificate_chain};
 use toml;
 
-use messages::{CertFingerprint,CertificateAndKey,Order,HttpFront,HttpsFront,TcpFront,Backend,
+use proxy::{CertFingerprint,CertificateAndKey,ProxyRequestData,HttpFront,HttpsFront,TcpFront,Backend,
   HttpListener,HttpsListener,TcpListener,AddCertificate,TlsProvider,LoadBalancingParams,
   Application, TlsVersion,ActivateListener,ListenerType};
 
@@ -463,12 +463,12 @@ pub struct HttpFrontendConfig {
 }
 
 impl HttpFrontendConfig {
-  pub fn generate_orders(&self, app_id: &str) -> Vec<Order> {
+  pub fn generate_orders(&self, app_id: &str) -> Vec<ProxyRequestData> {
     let mut v = Vec::new();
 
     if self.key.is_some() && self.certificate.is_some() {
 
-      v.push(Order::AddCertificate(AddCertificate{
+      v.push(ProxyRequestData::AddCertificate(AddCertificate{
         front: self.address,
         certificate: CertificateAndKey {
           key:               self.key.clone().unwrap(),
@@ -479,7 +479,7 @@ impl HttpFrontendConfig {
       }));
 
       if let Some(f) = calculate_fingerprint(&self.certificate.as_ref().unwrap().as_bytes()[..]) {
-        v.push(Order::AddHttpsFront(HttpsFront {
+        v.push(ProxyRequestData::AddHttpsFront(HttpsFront {
           app_id:      app_id.to_string(),
           address:     self.address,
           hostname:    self.hostname.clone(),
@@ -491,7 +491,7 @@ impl HttpFrontendConfig {
       }
     } else {
       //create the front both for HTTP and HTTPS if possible
-      v.push(Order::AddHttpFront(HttpFront {
+      v.push(ProxyRequestData::AddHttpFront(HttpFront {
         app_id:     app_id.to_string(),
         address:    self.address,
         hostname:   self.hostname.clone(),
@@ -515,10 +515,10 @@ pub struct HttpAppConfig {
 }
 
 impl HttpAppConfig {
-  pub fn generate_orders(&self) -> Vec<Order> {
+  pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
     let mut v = Vec::new();
 
-    v.push(Order::AddApplication(Application {
+    v.push(ProxyRequestData::AddApplication(Application {
       app_id: self.app_id.clone(),
       sticky_session: self.sticky_session,
       https_redirect: self.https_redirect,
@@ -537,7 +537,7 @@ impl HttpAppConfig {
           weight: backend.weight.unwrap_or(100),
         });
 
-        v.push(Order::AddBackend(Backend {
+        v.push(ProxyRequestData::AddBackend(Backend {
           app_id:     self.app_id.clone(),
           backend_id:  format!("{}-{}", self.app_id, backend_count),
           address:    backend.address,
@@ -569,10 +569,10 @@ pub struct TcpAppConfig {
 }
 
 impl TcpAppConfig {
-  pub fn generate_orders(&self) -> Vec<Order> {
+  pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
     let mut v = Vec::new();
 
-    v.push(Order::AddApplication(Application {
+    v.push(ProxyRequestData::AddApplication(Application {
       app_id: self.app_id.clone(),
       sticky_session: false,
       https_redirect: false,
@@ -581,7 +581,7 @@ impl TcpAppConfig {
     }));
 
     for frontend in &self.frontends {
-      v.push(Order::AddTcpFront(TcpFront {
+      v.push(ProxyRequestData::AddTcpFront(TcpFront {
         app_id:  self.app_id.clone(),
         address: frontend.address,
       }));
@@ -593,7 +593,7 @@ impl TcpAppConfig {
         weight: backend.weight.unwrap_or(100),
       });
 
-      v.push(Order::AddBackend(Backend {
+      v.push(ProxyRequestData::AddBackend(Backend {
         app_id:     self.app_id.clone(),
         backend_id: format!("{}-{}", self.app_id, backend_count),
         address:    backend.address,
@@ -616,7 +616,7 @@ pub enum AppConfig {
 }
 
 impl AppConfig {
-  pub fn generate_orders(&self) -> Vec<Order> {
+  pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
     match *self {
       AppConfig::Http(ref http) => http.generate_orders(),
       AppConfig::Tcp(ref tcp)   => tcp.generate_orders(),
@@ -931,7 +931,7 @@ impl Config {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
         worker_id: None,
-        data:     CommandRequestData::ProxyConfiguration(Order::AddHttpListener(listener.clone())),
+        data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::AddHttpListener(listener.clone())),
       });
       count += 1;
     }
@@ -941,7 +941,7 @@ impl Config {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
         worker_id: None,
-        data:     CommandRequestData::ProxyConfiguration(Order::AddHttpsListener(listener.clone())),
+        data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::AddHttpsListener(listener.clone())),
       });
       count += 1;
     }
@@ -951,7 +951,7 @@ impl Config {
         id:       format!("CONFIG-{}", count),
         version:  PROTOCOL_VERSION,
         worker_id: None,
-        data:     CommandRequestData::ProxyConfiguration(Order::AddTcpListener(listener.clone())),
+        data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::AddTcpListener(listener.clone())),
       });
       count += 1;
     }
@@ -975,7 +975,7 @@ impl Config {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           worker_id: None,
-          data:     CommandRequestData::ProxyConfiguration(Order::ActivateListener(ActivateListener{
+          data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::ActivateListener(ActivateListener{
             front:    listener.front,
             proxy:    ListenerType::HTTP,
             from_scm: false,
@@ -989,7 +989,7 @@ impl Config {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           worker_id: None,
-          data:     CommandRequestData::ProxyConfiguration(Order::ActivateListener(ActivateListener{
+          data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::ActivateListener(ActivateListener{
             front:    listener.front,
             proxy:    ListenerType::HTTPS,
             from_scm: false,
@@ -1003,7 +1003,7 @@ impl Config {
           id:       format!("CONFIG-{}", count),
           version:  PROTOCOL_VERSION,
           worker_id: None,
-          data:     CommandRequestData::ProxyConfiguration(Order::ActivateListener(ActivateListener{
+          data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::ActivateListener(ActivateListener{
             front:    listener.front,
             proxy:    ListenerType::TCP,
             from_scm: false,

@@ -13,7 +13,7 @@ use std::io::{self,BufWriter,Write,Error,ErrorKind};
 use nom::HexDisplay;
 use hdrhistogram::Histogram;
 use sozu_command::buffer::Buffer;
-use sozu_command::messages::{FilteredData,MetricsData,Percentiles,BackendMetricsData,FilteredTimeSerie,AppMetricsData};
+use sozu_command::proxy::{FilteredData,MetricsData,Percentiles,BackendMetricsData,FilteredTimeSerie,AppMetricsData};
 
 use super::{MetricData,Subscriber};
 use super::MetricLine;

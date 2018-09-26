@@ -25,9 +25,9 @@ use mio_extras::timer::Timeout;
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
-use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,
-  Order,HttpsFront,HttpsListener,OrderMessage,OrderMessageAnswer,
-  OrderMessageStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
+use sozu_command::proxy::{self,Application,CertFingerprint,CertificateAndKey,
+  ProxyRequestData,HttpsFront,HttpsListener,ProxyRequest,ProxyResponse,
+  ProxyResponseStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
   LoadBalancingParams, TlsVersion};
 use sozu_command::certificate::split_certificate_chain;
 use sozu_command::logging;
@@ -581,112 +581,112 @@ impl ProxyConfiguration<Session> for Proxy {
     }
   }
 
-  fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
+  fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
     //info!("{} notified", message);
     match message.order {
-      Order::AddApplication(application) => {
+      ProxyRequestData::AddApplication(application) => {
         debug!("{} add application {:?}", message.id, application);
         self.add_application(application, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      Order::RemoveApplication(application) => {
+      ProxyRequestData::RemoveApplication(application) => {
         debug!("{} remove application {:?}", message.id, application);
         self.remove_application(&application, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      Order::AddHttpsFront(front) => {
+      ProxyRequestData::AddHttpsFront(front) => {
         //info!("HTTPS\t{} add front {:?}", id, front);
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
           listener.add_https_front(front, event_loop);
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
           panic!("unknown listener: {:?}", front.address)
         }
       },
-      Order::RemoveHttpsFront(front) => {
+      ProxyRequestData::RemoveHttpsFront(front) => {
         //info!("HTTPS\t{} remove front {:?}", id, front);
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
           listener.remove_https_front(front, event_loop);
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
           panic!("unknown listener: {:?}", front.address)
         }
       },
-      Order::AddCertificate(add_certificate) => {
+      ProxyRequestData::AddCertificate(add_certificate) => {
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == add_certificate.front) {
           listener.add_certificate(add_certificate, event_loop);
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
           panic!()
         }
       },
-      Order::RemoveCertificate(remove_certificate) => {
+      ProxyRequestData::RemoveCertificate(remove_certificate) => {
         //FIXME: should return an error if certificate still has fronts referencing it
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == remove_certificate.front) {
           listener.remove_certificate(remove_certificate, event_loop);
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
           panic!()
         }
       },
-      Order::ReplaceCertificate(replace_certificate) => {
+      ProxyRequestData::ReplaceCertificate(replace_certificate) => {
         //FIXME: should return an error if certificate still has fronts referencing it
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == replace_certificate.front) {
           listener.replace_certificate(replace_certificate, event_loop);
-          OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
           panic!()
         }
       },
-      Order::AddBackend(backend) => {
+      ProxyRequestData::AddBackend(backend) => {
         debug!("{} add backend {:?}", message.id, backend);
         let new_backend = Backend::new(&backend.backend_id, backend.address.clone(), backend.sticky_id.clone(), backend.load_balancing_parameters, backend.backup);
         self.add_backend(&backend.app_id, new_backend, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      Order::RemoveBackend(backend) => {
+      ProxyRequestData::RemoveBackend(backend) => {
         debug!("{} remove backend {:?}", message.id, backend);
         self.remove_backend(&backend.app_id, &backend.address, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      Order::RemoveListener(remove) => {
+      ProxyRequestData::RemoveListener(remove) => {
         info!("removing https listener at address: {:?}", remove.front);
         fixme!();
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      Order::SoftStop => {
+      ProxyRequestData::SoftStop => {
         info!("{} processing soft shutdown", message.id);
         self.listeners.iter_mut().map(|(token, l)| {
           l.listener.take().map(|sock| {
             event_loop.deregister(&sock);
           })
         });
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Processing, data: None }
       },
-      Order::HardStop => {
+      ProxyRequestData::HardStop => {
         info!("{} hard shutdown", message.id);
         self.listeners.drain().map(|(token, mut l)| {
           l.listener.take().map(|sock| {
             event_loop.deregister(&sock);
           })
         });
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Processing, data: None }
       },
-      Order::Status => {
+      ProxyRequestData::Status => {
         debug!("{} status", message.id);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      Order::Logging(logging_filter) => {
+      ProxyRequestData::Logging(logging_filter) => {
         debug!("{} changing logging filter to {}", message.id, logging_filter);
         logging::LOGGER.with(|l| {
           let directives = logging::parse_logging_spec(&logging_filter);
           l.borrow_mut().set_directives(directives);
         });
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       command => {
         error!("{} unsupported message, ignoring {:?}", message.id, command);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message")), data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None }
       }
     }
   }

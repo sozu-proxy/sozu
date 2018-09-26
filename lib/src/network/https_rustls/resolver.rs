@@ -6,7 +6,7 @@ use rustls::{ResolvesServerCert, SignatureScheme, PrivateKey};
 use rustls::sign::{CertifiedKey, RSASigningKey};
 use rustls::internal::pemfile;
 
-use sozu_command::messages::{CertificateAndKey, CertFingerprint, AddCertificate, RemoveCertificate};
+use sozu_command::proxy::{CertificateAndKey, CertFingerprint, AddCertificate, RemoveCertificate};
 use sozu_command::certificate::calculate_fingerprint_from_der;
 
 use network::trie::TrieNode;

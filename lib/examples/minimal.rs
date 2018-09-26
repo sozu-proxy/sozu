@@ -7,9 +7,9 @@ use std::env;
 use std::thread;
 use std::io::stdout;
 use sozu::network;
-use sozu_command::messages;
+use sozu_command::proxy;
 use sozu_command::channel::Channel;
-use sozu_command::messages::LoadBalancingParams;
+use sozu_command::proxy::LoadBalancingParams;
 use sozu_command::logging::{Logger,LoggerBackend};
 
 fn main() {
@@ -21,7 +21,7 @@ fn main() {
 
   info!("starting up");
 
-  let config = messages::HttpListener {
+  let config = proxy::HttpListener {
     front: "127.0.0.1:8080".parse().expect("could not parse address"),
     ..Default::default()
   };
@@ -34,13 +34,13 @@ fn main() {
     network::http::start(config, channel, max_buffers, buffer_size);
   });
 
-  let http_front = messages::HttpFront {
+  let http_front = proxy::HttpFront {
     app_id:     String::from("test"),
     address:    "127.0.0.1:8080".parse().unwrap(),
     hostname:   String::from("example.com"),
     path_begin: String::from("/"),
   };
-  let http_backend = messages::Backend {
+  let http_backend = proxy::Backend {
     app_id:                    String::from("test"),
     backend_id:                String::from("test-0"),
     address:                   "127.0.0.1:8000".parse().unwrap(),
@@ -49,14 +49,14 @@ fn main() {
     backup:                    None,
   };
 
-  command.write_message(&messages::OrderMessage {
+  command.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_ABCD"),
-    order: messages::Order::AddHttpFront(http_front)
+    order: proxy::ProxyRequestData::AddHttpFront(http_front)
   });
 
-  command.write_message(&messages::OrderMessage {
+  command.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_EFGH"),
-    order: messages::Order::AddBackend(http_backend)
+    order: proxy::ProxyRequestData::AddBackend(http_backend)
   });
 
   println!("HTTP -> {:?}", command.read_message());

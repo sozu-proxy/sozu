@@ -27,10 +27,9 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::state::{ConfigState,get_application_ids_by_domain};
-use sozu_command::messages::{self,TcpFront,Order,Backend,MessageId,OrderMessageAnswer,
-  OrderMessageAnswerData,OrderMessageStatus,OrderMessage,Topic,Query,QueryAnswer,
-  QueryApplicationType,TlsProvider,ListenerType};
-use sozu_command::messages::HttpsListener;
+use sozu_command::proxy::{self,TcpFront,ProxyRequestData,Backend,MessageId,ProxyResponse,
+  ProxyResponseData,ProxyResponseStatus,ProxyRequest,Topic,Query,QueryAnswer,
+  QueryApplicationType,TlsProvider,ListenerType,HttpsListener};
 
 use network::buffer_queue::BufferQueue;
 use network::{SessionResult,ConnectionError,Protocol,RequiredEvents,ProxySession,
@@ -46,7 +45,7 @@ const DEFAULT_BACK_TIMEOUT:  u64 = 50000;
 // Number of retries to perform on a server after a connection failure
 pub const CONN_RETRIES: u8 = 3;
 
-pub type ProxyChannel = Channel<OrderMessageAnswer,OrderMessage>;
+pub type ProxyChannel = Channel<ProxyResponse,ProxyRequest>;
 
 #[derive(Debug,Clone,PartialEq)]
 enum ProxyType {
@@ -125,7 +124,7 @@ pub struct Server {
   accept_ready:    HashSet<ListenToken>,
   can_accept:      bool,
   channel:         ProxyChannel,
-  queue:           VecDeque<OrderMessageAnswer>,
+  queue:           VecDeque<ProxyResponse>,
   http:            http::Proxy,
   https:           HttpsProvider,
   tcp:             tcp::Proxy,
@@ -240,7 +239,7 @@ impl Server {
 
       for order in state.generate_orders() {
         let id = format!("INIT-{}", counter);
-        let message = OrderMessage {
+        let message = ProxyRequest {
           id:    id,
           order: order,
         };
@@ -331,17 +330,17 @@ impl Server {
                 }
 
                 let msg = msg.expect("the message should be valid");
-                if let Order::HardStop = msg.order {
+                if let ProxyRequestData::HardStop = msg.order {
                   let id_msg = msg.id.clone();
                   self.notify(msg);
-                  self.channel.write_message(&OrderMessageAnswer{ id: id_msg, status: OrderMessageStatus::Ok, data: None});
+                  self.channel.write_message(&ProxyResponse{ id: id_msg, status: ProxyResponseStatus::Ok, data: None});
                   self.channel.run();
                   return;
-                } else if let Order::SoftStop = msg.order {
+                } else if let ProxyRequestData::SoftStop = msg.order {
                   self.shutting_down = Some(msg.id.clone());
                   last_sessions_len = self.sessions.len();
                   self.notify(msg);
-                } else if let Order::ReturnListenSockets = msg.order {
+                } else if let ProxyRequestData::ReturnListenSockets = msg.order {
                   info!("received ReturnListenSockets order");
                   self.return_listen_sockets();
                 } else {
@@ -452,7 +451,7 @@ impl Server {
           info!("last session stopped, shutting down!");
           self.channel.run();
           self.channel.set_blocking(true);
-          self.channel.write_message(&OrderMessageAnswer{ id: self.shutting_down.take().expect("should have shut down correctly"), status: OrderMessageStatus::Ok, data: None});
+          self.channel.write_message(&ProxyResponse{ id: self.shutting_down.take().expect("should have shut down correctly"), status: ProxyResponseStatus::Ok, data: None});
           return;
         } else if count < last_sessions_len {
           info!("shutting down, {} slab elements remaining (base: {})",
@@ -463,15 +462,15 @@ impl Server {
     }
   }
 
-  fn notify(&mut self, message: OrderMessage) {
-    if let Order::Metrics = message.order {
+  fn notify(&mut self, message: ProxyRequest) {
+    if let ProxyRequestData::Metrics = message.order {
       let q = &mut self.queue;
       //let id = message.id.clone();
       let msg = METRICS.with(|metrics| {
-        q.push_back(OrderMessageAnswer {
+        q.push_back(ProxyResponse {
           id:     message.id.clone(),
-          status: OrderMessageStatus::Ok,
-          data:   Some(OrderMessageAnswerData::Metrics(
+          status: ProxyResponseStatus::Ok,
+          data:   Some(ProxyResponseData::Metrics(
             (*metrics.borrow_mut()).dump_metrics_data()
           ))
         });
@@ -479,13 +478,13 @@ impl Server {
       return;
     }
 
-    if let Order::Query(ref query) = message.order {
+    if let ProxyRequestData::Query(ref query) = message.order {
       match query {
         &Query::ApplicationsHashes => {
-          self.queue.push_back(OrderMessageAnswer {
+          self.queue.push_back(ProxyResponse {
             id:     message.id.clone(),
-            status: OrderMessageStatus::Ok,
-            data:   Some(OrderMessageAnswerData::Query(
+            status: ProxyResponseStatus::Ok,
+            data:   Some(ProxyResponseData::Query(
               QueryAnswer::ApplicationsHashes(self.config_state.hash_state())
             ))
           });
@@ -503,10 +502,10 @@ impl Server {
             }
           };
 
-          self.queue.push_back(OrderMessageAnswer {
+          self.queue.push_back(ProxyResponse {
             id:     message.id.clone(),
-            status: OrderMessageStatus::Ok,
-            data:   Some(OrderMessageAnswerData::Query(answer))
+            status: ProxyResponseStatus::Ok,
+            data:   Some(ProxyResponseData::Query(answer))
           });
         }
       }
@@ -516,7 +515,7 @@ impl Server {
     self.notify_proxys(message);
   }
 
-  pub fn notify_proxys(&mut self, message: OrderMessage) {
+  pub fn notify_proxys(&mut self, message: ProxyRequest) {
     self.config_state.handle_order(&message.order);
 
     let topics = message.order.get_topics();
@@ -524,14 +523,14 @@ impl Server {
     if topics.contains(&Topic::HttpProxyConfig) {
       match message {
         // special case for AddHttpListener because we need to register a listener
-        OrderMessage { ref id, order: Order::AddHttpListener(ref listener) } => {
+        ProxyRequest { ref id, order: ProxyRequestData::AddHttpListener(ref listener) } => {
           debug!("{} add http listener {:?}", id, listener);
           /*FIXME
           if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
             error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
-            self.queue.push_back(OrderMessageAnswer {
+            self.queue.push_back(ProxyResponse {
               id,
-              status: OrderMessageStatus::Error(String::from("Couldn't add TCP front: port already in use")),
+              status: ProxyResponseStatus::Error(String::from("Couldn't add TCP front: port already in use")),
               data: None
             });
             return;
@@ -540,9 +539,9 @@ impl Server {
           let entry = self.sessions.vacant_entry();
 
           if entry.is_none() {
-            self.queue.push_back(OrderMessageAnswer {
+            self.queue.push_back(ProxyResponse {
               id: id.to_string(),
-              status: OrderMessageStatus::Error(String::from("session list is full, cannot add a listener")),
+              status: ProxyResponseStatus::Error(String::from("session list is full, cannot add a listener")),
               data: None
             });
             return;
@@ -556,26 +555,26 @@ impl Server {
           let status = if let Some(token) = self.http.add_listener(listener.clone(), self.pool.clone(), token) {
             entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
             self.base_sessions_count += 1;
-            OrderMessageStatus::Ok
+            ProxyResponseStatus::Ok
           } else {
             error!("Couldn't add HTTP listener");
-            OrderMessageStatus::Error(String::from("cannot add HTTP listener"))
+            ProxyResponseStatus::Error(String::from("cannot add HTTP listener"))
           };
 
-          let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
+          let answer = ProxyResponse { id: id.to_string(), status, data: None };
           self.queue.push_back(answer);
         },
-        OrderMessage { ref id, order: Order::RemoveListener(ref remove) } => {
+        ProxyRequest { ref id, order: ProxyRequestData::RemoveListener(ref remove) } => {
           if remove.proxy == ListenerType::HTTP {
             debug!("{} remove http listener {:?}", id, remove);
             self.base_sessions_count -= 1;
-            self.queue.push_back(self.http.notify(&mut self.poll, OrderMessage {
+            self.queue.push_back(self.http.notify(&mut self.poll, ProxyRequest {
               id: id.to_string(),
-              order: Order::RemoveListener(remove.clone())
+              order: ProxyRequestData::RemoveListener(remove.clone())
             }));
           }
         },
-        OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
+        ProxyRequest { ref id, order: ProxyRequestData::ActivateListener(ref activate) } => {
           if activate.proxy == ListenerType::HTTP {
             debug!("{} activate http listener {:?}", id, activate);
             let listener = self.scm_listeners.as_mut().and_then(|s| s.get_http(&activate.front))
@@ -583,15 +582,15 @@ impl Server {
             let status = match self.http.activate_listener(&mut self.poll, &activate.front, listener) {
               Some(token) => {
                 self.accept(ListenToken(token.0), Protocol::HTTPListen);
-                OrderMessageStatus::Ok
+                ProxyResponseStatus::Ok
               },
               None => {
                 error!("Couldn't activate HTTP listener");
-                OrderMessageStatus::Error(String::from("cannot activate HTTP listener"))
+                ProxyResponseStatus::Error(String::from("cannot activate HTTP listener"))
               }
             };
 
-            let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
+            let answer = ProxyResponse { id: id.to_string(), status, data: None };
             self.queue.push_back(answer);
           }
         },
@@ -601,14 +600,14 @@ impl Server {
     if topics.contains(&Topic::HttpsProxyConfig) {
       match message {
         // special case for AddHttpListener because we need to register a listener
-        OrderMessage { ref id, order: Order::AddHttpsListener(ref listener) } => {
+        ProxyRequest { ref id, order: ProxyRequestData::AddHttpsListener(ref listener) } => {
           debug!("{} add https listener {:?}", id, listener);
           /*FIXME
           if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
             error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
-            self.queue.push_back(OrderMessageAnswer {
+            self.queue.push_back(ProxyResponse {
               id,
-              status: OrderMessageStatus::Error(String::from("Couldn't add TCP front: port already in use")),
+              status: ProxyResponseStatus::Error(String::from("Couldn't add TCP front: port already in use")),
               data: None
             });
             return;
@@ -617,9 +616,9 @@ impl Server {
           let entry = self.sessions.vacant_entry();
 
           if entry.is_none() {
-            self.queue.push_back(OrderMessageAnswer {
+            self.queue.push_back(ProxyResponse {
               id: id.to_string(),
-              status: OrderMessageStatus::Error(String::from("session list is full, cannot add a listener")),
+              status: ProxyResponseStatus::Error(String::from("session list is full, cannot add a listener")),
               data: None
             });
             return;
@@ -633,26 +632,26 @@ impl Server {
           let status = if let Some(token) = self.https.add_listener(listener.clone(), self.pool.clone(), token) {
             entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPSListen })));
             self.base_sessions_count += 1;
-            OrderMessageStatus::Ok
+            ProxyResponseStatus::Ok
           } else {
             error!("Couldn't add HTTPS listener");
-            OrderMessageStatus::Error(String::from("cannot add HTTPS listener"))
+            ProxyResponseStatus::Error(String::from("cannot add HTTPS listener"))
           };
 
-          let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
+          let answer = ProxyResponse { id: id.to_string(), status, data: None };
           self.queue.push_back(answer);
         },
-        OrderMessage { ref id, order: Order::RemoveListener(ref remove) } => {
+        ProxyRequest { ref id, order: ProxyRequestData::RemoveListener(ref remove) } => {
           if remove.proxy == ListenerType::HTTPS {
             debug!("{} remove https listener {:?}", id, remove);
             self.base_sessions_count -= 1;
-            self.queue.push_back(self.https.notify(&mut self.poll, OrderMessage {
+            self.queue.push_back(self.https.notify(&mut self.poll, ProxyRequest {
               id: id.to_string(),
-              order: Order::RemoveListener(remove.clone())
+              order: ProxyRequestData::RemoveListener(remove.clone())
             }));
           }
         },
-        OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
+        ProxyRequest { ref id, order: ProxyRequestData::ActivateListener(ref activate) } => {
           if activate.proxy == ListenerType::HTTPS {
             debug!("{} activate https listener {:?}", id, activate);
             let listener = self.scm_listeners.as_mut().and_then(|s| s.get_https(&activate.front))
@@ -660,15 +659,15 @@ impl Server {
             let status = match self.https.activate_listener(&mut self.poll, &activate.front, listener) {
               Some(token) => {
                 self.accept(ListenToken(token.0), Protocol::HTTPSListen);
-                OrderMessageStatus::Ok
+                ProxyResponseStatus::Ok
               },
               None => {
                 error!("Couldn't activate HTTPS listener");
-                OrderMessageStatus::Error(String::from("cannot activate HTTPS listener"))
+                ProxyResponseStatus::Error(String::from("cannot activate HTTPS listener"))
               }
             };
 
-            let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
+            let answer = ProxyResponse { id: id.to_string(), status, data: None };
             self.queue.push_back(answer);
           }
         },
@@ -678,13 +677,13 @@ impl Server {
     if topics.contains(&Topic::TcpProxyConfig) {
       match message {
         // special case for AddTcpFront because we need to register a listener
-        OrderMessage { id, order: Order::AddTcpListener(listener) } => {
+        ProxyRequest { id, order: ProxyRequestData::AddTcpListener(listener) } => {
           debug!("{} add tcp listener {:?}", id, listener);
           /*if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
             error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
-            self.queue.push_back(OrderMessageAnswer {
+            self.queue.push_back(ProxyResponse {
               id,
-              status: OrderMessageStatus::Error(String::from("Couldn't add TCP front: port already in use")),
+              status: ProxyResponseStatus::Error(String::from("Couldn't add TCP front: port already in use")),
               data: None
             });
             return;
@@ -694,9 +693,9 @@ impl Server {
           let entry = self.sessions.vacant_entry();
 
           if entry.is_none() {
-            self.queue.push_back(OrderMessageAnswer {
+            self.queue.push_back(ProxyResponse {
               id,
-              status: OrderMessageStatus::Error(String::from("session list is full, cannot add a listener")),
+              status: ProxyResponseStatus::Error(String::from("session list is full, cannot add a listener")),
               data: None
             });
             return;
@@ -710,25 +709,25 @@ impl Server {
           let status = if let Some(token) = self.tcp.add_listener(listener.clone(), self.pool.clone(), token) {
             entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::TCPListen })));
             self.base_sessions_count += 1;
-            OrderMessageStatus::Ok
+            ProxyResponseStatus::Ok
           } else {
             error!("Couldn't add TCP listener");
-            OrderMessageStatus::Error(String::from("cannot add TCP listener"))
+            ProxyResponseStatus::Error(String::from("cannot add TCP listener"))
           };
-          let answer = OrderMessageAnswer { id, status, data: None };
+          let answer = ProxyResponse { id, status, data: None };
           self.queue.push_back(answer);
         },
-        OrderMessage { ref id, order: Order::RemoveListener(ref remove) } => {
+        ProxyRequest { ref id, order: ProxyRequestData::RemoveListener(ref remove) } => {
           if remove.proxy == ListenerType::TCP {
             debug!("{} remove tcp listener {:?}", id, remove);
             self.base_sessions_count -= 1;
-            self.queue.push_back(self.tcp.notify(&mut self.poll, OrderMessage {
+            self.queue.push_back(self.tcp.notify(&mut self.poll, ProxyRequest {
               id: id.to_string(),
-              order: Order::RemoveListener(remove.clone())
+              order: ProxyRequestData::RemoveListener(remove.clone())
             }));
           }
         },
-        OrderMessage { ref id, order: Order::ActivateListener(ref activate) } => {
+        ProxyRequest { ref id, order: ProxyRequestData::ActivateListener(ref activate) } => {
           if activate.proxy == ListenerType::TCP {
             debug!("{} activate tcp listener {:?}", id, activate);
             let listener = self.scm_listeners.as_mut().and_then(|s| s.get_tcp(&activate.front))
@@ -736,15 +735,15 @@ impl Server {
             let status = match self.tcp.activate_listener(&mut self.poll, &activate.front, listener) {
               Some(token) => {
                 self.accept(ListenToken(token.0), Protocol::TCPListen);
-                OrderMessageStatus::Ok
+                ProxyResponseStatus::Ok
               },
               None => {
                 error!("Couldn't activate TCP listener");
-                OrderMessageStatus::Error(String::from("cannot activate TCP listener"))
+                ProxyResponseStatus::Error(String::from("cannot activate TCP listener"))
               }
             };
 
-            let answer = OrderMessageAnswer { id: id.to_string(), status, data: None };
+            let answer = ProxyResponse { id: id.to_string(), status, data: None };
             self.queue.push_back(answer);
           }
         },
@@ -1339,7 +1338,7 @@ impl HttpsProvider {
     }
   }
 
-  pub fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
+  pub fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
     match self {
       &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.notify(event_loop, message),
       &mut HttpsProvider::Openssl(ref mut openssl) => openssl.notify(event_loop, message),
@@ -1418,7 +1417,7 @@ impl HttpsProvider {
     HttpsProvider::Rustls(configuration)
   }
 
-  pub fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
+  pub fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
     rustls.notify(event_loop, message)
   }

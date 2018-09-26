@@ -24,7 +24,7 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
-use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
+use sozu_command::proxy::{ProxyRequest,ProxyResponse};
 use sozu::network::server::Server;
 use sozu::network::metrics;
 
@@ -64,7 +64,7 @@ pub fn start_worker(id: u32, config: &Config, executable_path: String, state: &C
 
 pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: i32,
   command_buffer_size: usize, max_command_buffer_size: usize) {
-  let mut command: Channel<OrderMessageAnswer,Config> = Channel::new(
+  let mut command: Channel<ProxyResponse,Config> = Channel::new(
     unsafe { UnixStream::from_raw_fd(fd) },
     command_buffer_size,
     max_command_buffer_size
@@ -85,7 +85,7 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
   info!("worker {} starting...", id);
 
   command.set_nonblocking(true);
-  let mut command: Channel<OrderMessageAnswer,OrderMessage> = command.into();
+  let mut command: Channel<ProxyResponse,ProxyRequest> = command.into();
   command.readiness.insert(Ready::readable());
 
   if let Some(ref metrics) = worker_config.metrics.as_ref() {
@@ -99,7 +99,7 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
   info!("ending event loop");
 }
 
-pub fn start_worker_process(id: &str, config: &Config, executable_path: String, state: &ConfigState, listeners: Option<Listeners>) -> nix::Result<(pid_t, Channel<OrderMessage,OrderMessageAnswer>, ScmSocket)> {
+pub fn start_worker_process(id: &str, config: &Config, executable_path: String, state: &ConfigState, listeners: Option<Listeners>) -> nix::Result<(pid_t, Channel<ProxyRequest,ProxyResponse>, ScmSocket)> {
   trace!("parent({})", unsafe { libc::getpid() });
 
   let mut state_file = tempfile().expect("could not create temporary file for configuration state");
@@ -116,7 +116,7 @@ pub fn start_worker_process(id: &str, config: &Config, executable_path: String, 
   util::disable_close_on_exec(client.as_raw_fd());
   util::disable_close_on_exec(scm_client.as_raw_fd());
 
-  let mut command: Channel<Config,OrderMessageAnswer> = Channel::new(
+  let mut command: Channel<Config,ProxyResponse> = Channel::new(
     server,
     config.command_buffer_size,
     config.max_command_buffer_size
@@ -138,7 +138,7 @@ pub fn start_worker_process(id: &str, config: &Config, executable_path: String, 
       };
       util::disable_close_on_exec(scm_server.fd);
 
-      let command: Channel<OrderMessage,OrderMessageAnswer> = command.into();
+      let command: Channel<ProxyRequest,ProxyResponse> = command.into();
       Ok((child.into(), command, scm_server))
     },
     Ok(ForkResult::Child) => {

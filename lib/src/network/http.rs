@@ -22,7 +22,7 @@ use mio_extras::timer::{Timer, Timeout};
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
-use sozu_command::messages::{self,Application,Order,HttpFront,HttpListener,OrderMessage,OrderMessageAnswer,OrderMessageStatus, LoadBalancingParams};
+use sozu_command::proxy::{self,Application,ProxyRequestData,HttpFront,HttpListener,ProxyRequest,ProxyResponse,ProxyResponseStatus,LoadBalancingParams};
 use sozu_command::logging;
 
 use network::{AppId,Backend,SessionResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
@@ -1100,26 +1100,26 @@ impl ProxyConfiguration<Session> for Proxy {
     }
   }
 
-  fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
+  fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
     // ToDo temporary
     //trace!("{} notified", message);
     match message.order {
-      Order::AddApplication(application) => {
+      ProxyRequestData::AddApplication(application) => {
         debug!("{} add application {:?}", message.id, application);
         self.add_application(application, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      Order::RemoveApplication(application) => {
+      ProxyRequestData::RemoveApplication(application) => {
         debug!("{} remove application {:?}", message.id, application);
         self.remove_application(&application, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      Order::AddHttpFront(front) => {
+      ProxyRequestData::AddHttpFront(front) => {
         debug!("{} add front {:?}", message.id, front);
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
           match listener.add_http_front(front, event_loop) {
-            Ok(_) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None },
-            Err(err) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(err), data: None }
+            Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
+            Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err), data: None }
           }
         } else {
           panic!("no HTTP listener found for front: {:?}", front);
@@ -1128,66 +1128,66 @@ impl ProxyConfiguration<Session> for Proxy {
           //  self.pool.clone(), None, token: Token) -> (Listener,HashSet<Token>
         }
       },
-      Order::RemoveHttpFront(front) => {
+      ProxyRequestData::RemoveHttpFront(front) => {
         debug!("{} front {:?}", message.id, front);
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
           match (*listener).remove_http_front(front, event_loop) {
-            Ok(_) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None },
-            Err(err) => OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(err), data: None }
+            Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
+            Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err), data: None }
           }
         } else {
           panic!("trying to remove front from non existing listener");
         }
       },
-      Order::AddBackend(backend) => {
+      ProxyRequestData::AddBackend(backend) => {
         debug!("{} add backend {:?}", message.id, backend);
         let new_backend = Backend::new(&backend.backend_id, backend.address.clone(), backend.sticky_id.clone(), backend.load_balancing_parameters, backend.backup);
         self.add_backend(&backend.app_id, new_backend, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      Order::RemoveBackend(backend) => {
+      ProxyRequestData::RemoveBackend(backend) => {
         debug!("{} remove backend {:?}", message.id, backend);
         self.remove_backend(&backend.app_id, &backend.address, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      Order::RemoveListener(remove) => {
+      ProxyRequestData::RemoveListener(remove) => {
         info!("removing http listener at address {:?}", remove.front);
         fixme!();
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unimplemented")), data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unimplemented")), data: None }
       },
-      Order::SoftStop => {
+      ProxyRequestData::SoftStop => {
         info!("{} processing soft shutdown", message.id);
         self.listeners.iter_mut().map(|(token, l)| {
           l.listener.take().map(|sock| {
             event_loop.deregister(&sock);
           })
         });
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Processing, data: None }
       },
-      Order::HardStop => {
+      ProxyRequestData::HardStop => {
         info!("{} hard shutdown", message.id);
         self.listeners.drain().map(|(token, mut l)| {
           l.listener.take().map(|sock| {
             event_loop.deregister(&sock);
           })
         });
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Processing, data: None }
       },
-      Order::Status => {
+      ProxyRequestData::Status => {
         debug!("{} status", message.id);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      Order::Logging(logging_filter) => {
+      ProxyRequestData::Logging(logging_filter) => {
         info!("{} changing logging filter to {}", message.id, logging_filter);
         logging::LOGGER.with(|l| {
           let directives = logging::parse_logging_spec(&logging_filter);
           l.borrow_mut().set_directives(directives);
         });
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       command => {
         debug!("{} unsupported message, ignoring: {:?}", message.id, command);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message")), data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None }
       }
     }
   }
@@ -1369,7 +1369,7 @@ mod tests {
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
-  use sozu_command::messages::{Order,HttpFront,Backend,HttpListener,OrderMessage,OrderMessageAnswer, LoadBalancingParams};
+  use sozu_command::proxy::{ProxyRequestData,HttpFront,Backend,HttpListener,ProxyRequest,ProxyResponse, LoadBalancingParams};
   use network::buffer_queue::BufferQueue;
   use network::pool::Pool;
   use sozu_command::config::LoadBalancingAlgorithms;
@@ -1395,9 +1395,9 @@ mod tests {
     });
 
     let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1024".parse().unwrap(), hostname: String::from("localhost"), path_begin: String::from("/") };
-    command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
+    command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFront(front) });
     let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), address: "127.0.0.1:1025".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
-    command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddBackend(backend) });
+    command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
     println!("test received: {:?}", command.read_message());
@@ -1452,9 +1452,9 @@ mod tests {
     });
 
     let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1031".parse().unwrap(), hostname: String::from("localhost"), path_begin: String::from("/") };
-    command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddHttpFront(front) });
+    command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFront(front) });
     let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
-    command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddBackend(backend) });
+    command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
     println!("test received: {:?}", command.read_message());
@@ -1530,11 +1530,11 @@ mod tests {
     });
 
     let application = Application { app_id: String::from("app_1"), sticky_session: false, https_redirect: true, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::default() };
-    command.write_message(&OrderMessage { id: String::from("ID_ABCD"), order: Order::AddApplication(application) });
+    command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddApplication(application) });
     let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1041".parse().unwrap(), hostname: String::from("localhost"), path_begin: String::from("/") };
-    command.write_message(&OrderMessage { id: String::from("ID_EFGH"), order: Order::AddHttpFront(front) });
+    command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddHttpFront(front) });
     let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), address: "127.0.0.1:1040".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
-    command.write_message(&OrderMessage { id: String::from("ID_IJKL"), order: Order::AddBackend(backend) });
+    command.write_message(&ProxyRequest { id: String::from("ID_IJKL"), order: ProxyRequestData::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
     println!("test received: {:?}", command.read_message());

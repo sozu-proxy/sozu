@@ -24,8 +24,8 @@ use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
-use sozu_command::messages::{self,TcpFront,Order,OrderMessage,OrderMessageAnswer,OrderMessageStatus,LoadBalancingParams};
-use sozu_command::messages::TcpListener as TcpListenerConfig;
+use sozu_command::proxy::{self,TcpFront,ProxyRequestData,ProxyRequest,ProxyResponse,ProxyResponseStatus,LoadBalancingParams};
+use sozu_command::proxy::TcpListener as TcpListenerConfig;
 use sozu_command::logging;
 
 use network::{AppId,Backend,SessionResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
@@ -865,53 +865,53 @@ impl ProxyConfiguration<Session> for Proxy {
     }
   }
 
-  fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer {
+  fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
     match message.order {
-      Order::AddTcpFront(front) => {
+      ProxyRequestData::AddTcpFront(front) => {
         let _ = self.add_tcp_front(&front.app_id, &front.address, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
-      Order::RemoveTcpFront(front) => {
+      ProxyRequestData::RemoveTcpFront(front) => {
         let _ = self.remove_tcp_front(front.address.clone(), event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
-      Order::AddBackend(backend) => {
+      ProxyRequestData::AddBackend(backend) => {
         let new_backend = Backend::new(&backend.backend_id, backend.address.clone(), backend.sticky_id.clone(), backend.load_balancing_parameters, backend.backup);
         self.add_backend(&backend.app_id, new_backend, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
-      Order::RemoveBackend(backend) => {
+      ProxyRequestData::RemoveBackend(backend) => {
         trace!("{:?}", backend);
         self.remove_backend(&backend.app_id, &backend.address, event_loop);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
-      Order::SoftStop => {
+      ProxyRequestData::SoftStop => {
         info!("{} processing soft shutdown", message.id);
         for (_, l) in self.listeners.iter_mut() {
           l.listener.take().map(|sock| event_loop.deregister(&sock));
         }
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Processing, data: None}
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Processing, data: None}
       },
-      Order::HardStop => {
+      ProxyRequestData::HardStop => {
         info!("{} hard shutdown", message.id);
         for (_, mut l) in self.listeners.drain() {
           l.listener.take().map(|sock| event_loop.deregister(&sock));
         }
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
-      Order::Status => {
+      ProxyRequestData::Status => {
         info!("{} status", message.id);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None}
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
-      Order::Logging(logging_filter) => {
+      ProxyRequestData::Logging(logging_filter) => {
         info!("{} changing logging filter to {}", message.id, logging_filter);
         logging::LOGGER.with(|l| {
           let directives = logging::parse_logging_spec(&logging_filter);
           l.borrow_mut().set_directives(directives);
         });
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      Order::AddApplication(application) => {
+      ProxyRequestData::AddApplication(application) => {
         let config = ApplicationConfiguration {
           proxy_protocol: application.proxy_protocol,
           load_balancing_policy: application.load_balancing_policy,
@@ -919,18 +919,18 @@ impl ProxyConfiguration<Session> for Proxy {
         self.configs.insert(application.app_id.clone(), config);
         self.backends.set_load_balancing_policy_for_app(&application.app_id, application.load_balancing_policy);
 
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      Order::RemoveApplication(_) => {
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Ok, data: None }
+      ProxyRequestData::RemoveApplication(_) => {
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      Order::RemoveListener(remove) => {
+      ProxyRequestData::RemoveListener(remove) => {
         fixme!();
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unimplemented")), data: None }
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unimplemented")), data: None }
       },
       command => {
         error!("{} unsupported message, ignoring {:?}", message.id, command);
-        OrderMessageAnswer{ id: message.id, status: OrderMessageStatus::Error(String::from("unsupported message")), data: None}
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None}
       }
     }
   }
@@ -1150,7 +1150,7 @@ mod tests {
     });
   }
 
-  pub fn start_proxy() -> Channel<OrderMessage,OrderMessageAnswer> {
+  pub fn start_proxy() -> Channel<ProxyRequest,ProxyResponse> {
     use network::server::{self,ProxySessionCast};
 
     info!("listen for connections");
@@ -1219,7 +1219,7 @@ mod tests {
         app_id: String::from("yolo"),
         address: "127.0.0.1:1234".parse().unwrap(),
       };
-      let backend = messages::Backend {
+      let backend = proxy::Backend {
         app_id: String::from("yolo"),
         backend_id: String::from("yolo-0"),
         address: "127.0.0.1:5678".parse().unwrap(),
@@ -1228,15 +1228,15 @@ mod tests {
         backup: None,
       };
 
-      command.write_message(&OrderMessage { id: String::from("ID_YOLO1"), order: Order::AddTcpFront(front) });
-      command.write_message(&OrderMessage { id: String::from("ID_YOLO2"), order: Order::AddBackend(backend) });
+      command.write_message(&ProxyRequest { id: String::from("ID_YOLO1"), order: ProxyRequestData::AddTcpFront(front) });
+      command.write_message(&ProxyRequest { id: String::from("ID_YOLO2"), order: ProxyRequestData::AddBackend(backend) });
     }
     {
       let front = TcpFront {
         app_id: String::from("yolo"),
         address: "127.0.0.1:1235".parse().unwrap(),
       };
-      let backend = messages::Backend {
+      let backend = proxy::Backend {
         app_id: String::from("yolo"),
         backend_id: String::from("yolo-0"),
         address: "127.0.0.1:5678".parse().unwrap(),
@@ -1244,8 +1244,8 @@ mod tests {
         sticky_id: None,
         backup: None,
       };
-      command.write_message(&OrderMessage { id: String::from("ID_YOLO3"), order: Order::AddTcpFront(front) });
-      command.write_message(&OrderMessage { id: String::from("ID_YOLO4"), order: Order::AddBackend(backend) });
+      command.write_message(&ProxyRequest { id: String::from("ID_YOLO3"), order: ProxyRequestData::AddTcpFront(front) });
+      command.write_message(&ProxyRequest { id: String::from("ID_YOLO4"), order: ProxyRequestData::AddBackend(backend) });
     }
 
     println!("read_message: {:?}", command.read_message().unwrap());

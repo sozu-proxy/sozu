@@ -18,7 +18,7 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::command::{CommandRequest,CommandResponse,CommandStatus,RunState};
-use sozu_command::messages::{OrderMessage,OrderMessageAnswer};
+use sozu_command::proxy::{ProxyRequest,ProxyResponse};
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 
 pub mod executor;
@@ -49,16 +49,16 @@ impl From<FrontToken> for usize {
 
 pub struct Worker {
   pub id:            u32,
-  pub channel:       Channel<OrderMessage,OrderMessageAnswer>,
+  pub channel:       Channel<ProxyRequest,ProxyResponse>,
   pub token:         Option<Token>,
   pub pid:           pid_t,
   pub run_state:     RunState,
-  pub queue:         VecDeque<OrderMessage>,
+  pub queue:         VecDeque<ProxyRequest>,
   pub scm:           ScmSocket,
 }
 
 impl Worker {
-  pub fn new(id: u32, pid: pid_t, channel: Channel<OrderMessage,OrderMessageAnswer>, scm: ScmSocket, _: &Config)
+  pub fn new(id: u32, pid: pid_t, channel: Channel<ProxyRequest,ProxyResponse>, scm: ScmSocket, _: &Config)
     -> Worker {
     Worker {
       id:         id,
@@ -71,7 +71,7 @@ impl Worker {
     }
   }
 
-  pub fn push_message(&mut self, message: OrderMessage) {
+  pub fn push_message(&mut self, message: ProxyRequest) {
     self.queue.push_back(message);
     self.channel.interest.insert(Ready::writable());
   }
@@ -524,7 +524,7 @@ impl CommandServer {
     }
   }
 
-  fn handle_worker_message(&mut self, token: Token, msg: OrderMessageAnswer) {
+  fn handle_worker_message(&mut self, token: Token, msg: ProxyResponse) {
     Executor::handle_message(token, msg);
   }
 
@@ -587,7 +587,7 @@ impl CommandServer {
         let mut count = 0;
         let mut orders = self.state.generate_activate_orders();
         for order in orders.drain(..) {
-          worker.push_message(OrderMessage {
+          worker.push_message(ProxyRequest {
             id: format!("RESTART-{}-ACTIVATE-{}", id, count),
             order
           });

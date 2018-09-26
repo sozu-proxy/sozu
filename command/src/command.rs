@@ -5,13 +5,13 @@ use std::fmt;
 use std::collections::BTreeMap;
 
 use state::ConfigState;
-use messages::{AggregatedMetricsData,Order,Query,QueryAnswer};
+use proxy::{AggregatedMetricsData,ProxyRequestData,Query,QueryAnswer};
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub enum CommandRequestData {
-  ProxyConfiguration(Order),
+  ProxyConfiguration(ProxyRequestData),
   SaveState(String),
   LoadState(String),
   DumpState,
@@ -325,9 +325,9 @@ mod tests {
   use serde_json;
   use hex::FromHex;
   use certificate::split_certificate_chain;
-  use messages::{Application,CertificateAndKey,CertFingerprint,Order,HttpFront,HttpsFront,Backend};
-  use messages::{AppMetricsData,MetricsData,FilteredData,Percentiles,RemoveBackend};
-  use messages::{AddCertificate,RemoveCertificate,LoadBalancingParams};
+  use proxy::{Application,CertificateAndKey,CertFingerprint,ProxyRequestData,HttpFront,HttpsFront,Backend,
+    AppMetricsData,MetricsData,FilteredData,Percentiles,RemoveBackend,
+    AddCertificate,RemoveCertificate,LoadBalancingParams};
   use config::{LoadBalancingAlgorithms,ProxyProtocolConfig};
 
   #[test]
@@ -335,7 +335,7 @@ mod tests {
     let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "data":{"type": "ADD_HTTP_FRONT", "data": {"app_id": "xxx", "hostname": "yyy", "path_begin": "xxx", "address": "0.0.0.0:8080"}} }"#;
     let message: CommandRequest = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", message);
-    assert_eq!(message.data, CommandRequestData::ProxyConfiguration(Order::AddHttpFront(HttpFront{
+    assert_eq!(message.data, CommandRequestData::ProxyConfiguration(ProxyRequestData::AddHttpFront(HttpFront{
       app_id: String::from("xxx"),
       hostname: String::from("yyy"),
       path_begin: String::from("xxx"),
@@ -390,7 +390,7 @@ mod tests {
   test_message!(add_application, "../assets/add_application.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::ProxyConfiguration(Order::AddApplication(Application {
+      data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::AddApplication(Application {
                   app_id: String::from("xxx"),
                   sticky_session: true,
                   https_redirect: true,
@@ -403,14 +403,14 @@ mod tests {
   test_message!(remove_application, "../assets/remove_application.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::ProxyConfiguration(Order::RemoveApplication( String::from("xxx") )),
+      data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::RemoveApplication( String::from("xxx") )),
       worker_id: None
     });
 
   test_message!(add_http_front, "../assets/add_http_front.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::ProxyConfiguration(Order::AddHttpFront(HttpFront{
+      data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::AddHttpFront(HttpFront{
                   app_id: String::from("xxx"),
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
@@ -422,7 +422,7 @@ mod tests {
   test_message!(remove_http_front, "../assets/remove_http_front.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::ProxyConfiguration(Order::RemoveHttpFront(HttpFront{
+      data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::RemoveHttpFront(HttpFront{
                   app_id: String::from("xxx"),
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
@@ -434,7 +434,7 @@ mod tests {
   test_message!(add_https_front, "../assets/add_https_front.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::ProxyConfiguration(Order::AddHttpsFront(HttpsFront{
+      data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::AddHttpsFront(HttpsFront{
                   app_id: String::from("xxx"),
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
@@ -447,7 +447,7 @@ mod tests {
   test_message!(remove_https_front, "../assets/remove_https_front.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::ProxyConfiguration(Order::RemoveHttpsFront(HttpsFront{
+      data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::RemoveHttpsFront(HttpsFront{
                   app_id: String::from("xxx"),
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
@@ -464,7 +464,7 @@ mod tests {
   test_message!(add_certificate, "../assets/add_certificate.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::ProxyConfiguration(Order::AddCertificate( AddCertificate{
+      data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::AddCertificate( AddCertificate{
         front: "0.0.0.0:443".parse().unwrap(),
         certificate: CertificateAndKey {
                   certificate: String::from(CERTIFICATE),
@@ -479,7 +479,7 @@ mod tests {
   test_message!(remove_certificate, "../assets/remove_certificate.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::ProxyConfiguration(Order::RemoveCertificate(RemoveCertificate {
+      data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::RemoveCertificate(RemoveCertificate {
           front: "0.0.0.0:443".parse().unwrap(),
           fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
           names: Vec::new(),
@@ -490,7 +490,7 @@ mod tests {
   test_message!(add_backend, "../assets/add_backend.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::ProxyConfiguration(Order::AddBackend(Backend{
+      data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::AddBackend(Backend{
                   app_id: String::from("xxx"),
                   backend_id: String::from("xxx-0"),
                   address: "127.0.0.1:8080".parse().unwrap(),
@@ -504,7 +504,7 @@ mod tests {
   test_message!(remove_backend, "../assets/remove_backend.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::ProxyConfiguration(Order::RemoveBackend(RemoveBackend{
+      data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::RemoveBackend(RemoveBackend{
                   app_id: String::from("xxx"),
                   backend_id: String::from("xxx-0"),
                   address: "127.0.0.1:8080".parse().unwrap(),
@@ -515,21 +515,21 @@ mod tests {
   test_message!(soft_stop, "../assets/soft_stop.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::ProxyConfiguration(Order::SoftStop),
+      data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::SoftStop),
       worker_id: Some(0),
     });
 
   test_message!(hard_stop, "../assets/hard_stop.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::ProxyConfiguration(Order::HardStop),
+      data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::HardStop),
       worker_id: Some(0),
     });
 
   test_message!(status, "../assets/status.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::ProxyConfiguration(Order::Status),
+      data:     CommandRequestData::ProxyConfiguration(ProxyRequestData::Status),
       worker_id: Some(0),
     });
 

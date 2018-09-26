@@ -12,7 +12,7 @@
 //! too).
 //!
 //! ```ignore
-//! let config = messages::HttpProxyConfiguration {
+//! let config = proxy::HttpProxyConfiguration {
 //!   front: "198.51.100.0:80".parse().unwrap(),
 //!   ..Default::default()
 //! };
@@ -22,7 +22,7 @@
 //! and launch the thread:
 //!
 //! ```ignore
-//! let config = messages::HttpProxyConfiguration {
+//! let config = proxy::HttpProxyConfiguration {
 //!   front: "198.51.100.0:80".parse().unwrap(),
 //!   ..Default::default()
 //! };
@@ -46,25 +46,25 @@
 //! answer.
 //!
 //! ```ignore
-//! let http_front = messages::HttpFront {
+//! let http_front = proxy::HttpFront {
 //!   app_id:     String::from("test"),
 //!   hostname:   String::from("example.com"),
 //!   path_begin: String::from("/")
 //! };
-//! let http_backend = messages::Backend {
+//! let http_backend = proxy::Backend {
 //!   app_id:     String::from("test"),
 //!   ip_address: String::from("192.0.2.1"),
 //!   port:       8080
 //! };
 //!
-//! command.write_message(&messages::OrderMessage {
+//! command.write_message(&proxy::ProxyRequest {
 //!   id:    String::from("ID_ABCD"),
-//!   order: messages::Order::AddHttpFront(http_front)
+//!   order: proxy::ProxyRequestData::AddHttpFront(http_front)
 //! ));
 //!
-//! command.write_message(&messages::OrderMessage {
+//! command.write_message(&proxy::ProxyRequest {
 //!   id:    String::from("ID_EFGH"),
-//!   order: messages::Order::AddBackend(http_backend)
+//!   order: proxy::ProxyRequestData::AddBackend(http_backend)
 //! ));
 //!
 //! println!("HTTP -> {:?}", command.read_message());
@@ -110,7 +110,7 @@
 //!   env_logger::init().unwrap();
 //!   info!("starting up");
 //!
-//!   let config = messages::HttpProxyConfiguration {
+//!   let config = proxy::HttpProxyConfiguration {
 //!     front: "198.51.100.0:80".parse().unwrap(),
 //!     ..Default::default()
 //!   };
@@ -121,25 +121,25 @@
 //!      network::http::start(config, channel);
 //!   });
 //!
-//!   let http_front = messages::HttpFront {
+//!   let http_front = proxy::HttpFront {
 //!     app_id:     String::from("test"),
 //!     hostname:   String::from("example.com"),
 //!     path_begin: String::from("/")
 //!   };
-//!   let http_backend = messages::Backend {
+//!   let http_backend = proxy::Backend {
 //!     app_id:     String::from("test"),
 //!     ip_address: String::from("192.0.2.1"),
 //!     port:       8080
 //!   };
 //!
-//!   command.write_message(&messages::OrderMessage {
+//!   command.write_message(&proxy::ProxyRequest {
 //!     id:    String::from("ID_ABCD"),
-//!     order: messages::Order::AddHttpFront(http_front)
+//!     order: proxy::ProxyRequestData::AddHttpFront(http_front)
 //!   ));
 //!
-//!   command.write_message(&messages::OrderMessage {
+//!   command.write_message(&proxy::ProxyRequest {
 //!     id:    String::from("ID_EFGH"),
-//!     order: messages::Order::AddBackend(http_backend)
+//!     order: proxy::ProxyRequestData::AddBackend(http_backend)
 //!   ));
 //!
 //!   println!("HTTP -> {:?}", command.read_message());

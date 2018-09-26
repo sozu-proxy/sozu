@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use slab::Slab;
 use std::collections::{HashSet, VecDeque};
-use sozu_command::messages::{OrderMessage, OrderMessageAnswer, OrderMessageStatus};
+use sozu_command::proxy::{ProxyRequest, ProxyResponse, ProxyResponseStatus};
 use sozu_command::command::CommandResponse;
 use super::FrontToken;
 
@@ -27,8 +27,8 @@ lazy_static! {
 pub struct Executor {
   pub inner: Mutex<Runner>,
   pub to_notify: Mutex<HashMap<(Token, String, MessageStatus), Task>>,
-  pub messages: Mutex<HashMap<(Token, String, MessageStatus), OrderMessageAnswer>>,
-  pub worker_queue: Mutex<VecDeque<(Token, OrderMessage)>>,
+  pub messages: Mutex<HashMap<(Token, String, MessageStatus), ProxyResponse>>,
+  pub worker_queue: Mutex<VecDeque<(Token, ProxyRequest)>>,
   pub client_queue: Mutex<VecDeque<(FrontToken, CommandResponse)>>,
   pub state_queue: Mutex<VecDeque<StateChange>>,
 }
@@ -89,12 +89,12 @@ impl Executor {
     to_notify.insert((worker, message_id.to_string(), status), task);
   }
 
-  pub fn send_worker(worker: Token, message: OrderMessage) {
+  pub fn send_worker(worker: Token, message: ProxyRequest) {
     let mut queue = EXECUTOR.worker_queue.lock().unwrap();
     queue.push_back((worker, message));
   }
 
-  pub fn get_worker_message() -> Option<(Token, OrderMessage)> {
+  pub fn get_worker_message() -> Option<(Token, ProxyRequest)> {
     let mut queue = EXECUTOR.worker_queue.lock().unwrap();
     queue.pop_front()
   }
@@ -124,11 +124,11 @@ impl Executor {
     queue.pop_front()
   }
 
-  pub fn handle_message(worker: Token, message: OrderMessageAnswer) {
+  pub fn handle_message(worker: Token, message: ProxyResponse) {
     trace!("executor handle_message({:?}, {}, {:?})", worker, message.id, message);
 
     let status = match message.status {
-      OrderMessageStatus::Processing => MessageStatus::Processing,
+      ProxyResponseStatus::Processing => MessageStatus::Processing,
       _ => MessageStatus::Other
     };
 
@@ -169,7 +169,7 @@ impl Executor {
     inner.run();
   }
 
-  pub fn get_message(worker: Token, message_id: &str, status: MessageStatus) -> Option<OrderMessageAnswer> {
+  pub fn get_message(worker: Token, message_id: &str, status: MessageStatus) -> Option<ProxyResponse> {
     {
       let mut messages = EXECUTOR.messages.lock().unwrap();
       messages.remove(&(worker, message_id.to_string(), status))
@@ -197,15 +197,15 @@ pub struct FutureAnswer {
 }
 
 impl Future for FutureAnswer {
-  type Item  = OrderMessageAnswer;
+  type Item  = ProxyResponse;
   type Error = String;
   fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
     //FIXME: handle workers disconnected
     match Executor::get_message(self.worker_id, &self.message_id, MessageStatus::Other) {
       Some(message) => {
         match message.status {
-          OrderMessageStatus::Ok => Ok(Async::Ready(message)),
-          OrderMessageStatus::Error(s) => Err(s),
+          ProxyResponseStatus::Ok => Ok(Async::Ready(message)),
+          ProxyResponseStatus::Error(s) => Err(s),
           _ => panic!(),
         }
       },
@@ -223,7 +223,7 @@ pub struct FutureProcessing {
 }
 
 impl Stream for FutureProcessing {
-  type Item  = OrderMessageAnswer;
+  type Item  = ProxyResponse;
   type Error = ();
   fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
     //FIXME: handle workers disconnected
@@ -236,7 +236,7 @@ impl Stream for FutureProcessing {
     match Executor::get_message(self.worker_id, &self.message_id, MessageStatus::Processing) {
       Some(message) => {
         match message.status {
-          OrderMessageStatus::Processing => Ok(Async::Ready(Some(message))),
+          ProxyResponseStatus::Processing => Ok(Async::Ready(Some(message))),
           _ => panic!(),
         }
       },
@@ -248,7 +248,7 @@ impl Stream for FutureProcessing {
   }
 }
 
-pub fn send_processing(worker_id: Token, message: OrderMessage) -> (FutureProcessing, FutureAnswer) {
+pub fn send_processing(worker_id: Token, message: ProxyRequest) -> (FutureProcessing, FutureAnswer) {
   let message_id = message.id.to_string();
   Executor::send_worker(worker_id, message);
   (FutureProcessing {
@@ -262,7 +262,7 @@ pub fn send_processing(worker_id: Token, message: OrderMessage) -> (FutureProces
   })
 }
 
-pub fn send(worker_id: Token, message: OrderMessage) -> FutureAnswer {
+pub fn send(worker_id: Token, message: ProxyRequest) -> FutureAnswer {
   let message_id = message.id.to_string();
   Executor::send_worker(worker_id, message);
   FutureAnswer {
@@ -278,13 +278,13 @@ mod tests {
   use futures::executor::spawn;
   use futures::task;
   use futures::future::{lazy, result};
-  use sozu_command::messages::{Order,OrderMessageStatus};
+  use sozu_command::proxy::{ProxyRequestData,ProxyResponseStatus};
   use sozu_command::command::CommandStatus;
 
   #[test]
   fn executor() {
     Executor::execute(lazy(||{
-      let (processing, msg_future) = send_processing(Token(0), OrderMessage { id: "test".to_string(), order: Order::Status });
+      let (processing, msg_future) = send_processing(Token(0), ProxyRequest { id: "test".to_string(), order: ProxyRequestData::Status });
       processing.for_each(|msg| {
         println!("TEST: got processing message: {:?}", msg);
         Ok(())
@@ -303,17 +303,17 @@ mod tests {
     }));
     Executor::run();
 
-    Executor::handle_message(Token(0), OrderMessageAnswer{
+    Executor::handle_message(Token(0), ProxyResponse{
       id: "test".to_string(),
-      status: OrderMessageStatus::Processing,
+      status: ProxyResponseStatus::Processing,
       data: None
     });
 
     Executor::run();
 
-    Executor::handle_message(Token(0), OrderMessageAnswer{
+    Executor::handle_message(Token(0), ProxyResponse{
       id: "test".to_string(),
-      status: OrderMessageStatus::Ok,
+      status: ProxyResponseStatus::Ok,
       data: None
     });
 

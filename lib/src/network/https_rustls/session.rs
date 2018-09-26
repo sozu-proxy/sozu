@@ -24,8 +24,8 @@ use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
-use sozu_command::messages::{self,Application,CertFingerprint,CertificateAndKey,Order,HttpsFront,
-  HttpsListener,OrderMessage,OrderMessageAnswer,OrderMessageStatus};
+use sozu_command::proxy::{self,Application,CertFingerprint,CertificateAndKey,ProxyRequestData,HttpsFront,
+  HttpsListener,ProxyRequest,ProxyResponse,ProxyResponseStatus};
 
 use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::pool::{Pool,Checkout};

@@ -12,7 +12,7 @@ use mio::net::UdpSocket;
 use std::io::{self,LineWriter,Write,Error,ErrorKind};
 use nom::HexDisplay;
 use hdrhistogram::Histogram;
-use sozu_command::messages::{FilteredData,MetricsData,Percentiles,BackendMetricsData,FilteredTimeSerie};
+use sozu_command::proxy::{FilteredData,MetricsData,Percentiles,BackendMetricsData,FilteredTimeSerie};
 
 use super::{Subscriber,MetricData,StoredMetricData};
 

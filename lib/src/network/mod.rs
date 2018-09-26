@@ -14,7 +14,7 @@ use time::{precise_time_ns,SteadyTime,Duration};
 use std::time;
 use mio_extras::timer::{Timer,Timeout};
 
-use sozu_command::messages::{OrderMessage,OrderMessageAnswer,LoadBalancingParams};
+use sozu_command::proxy::{ProxyRequest,ProxyResponse,LoadBalancingParams};
 
 #[macro_use] pub mod metrics;
 pub mod pool;
@@ -98,7 +98,7 @@ use self::server::{SessionToken,ListenToken,ListenPortState};
 pub trait ProxyConfiguration<Session> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, session: &mut Session,
     back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
-  fn notify(&mut self, event_loop: &mut Poll, message: OrderMessage) -> OrderMessageAnswer;
+  fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse;
   fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
   fn create_session(&mut self, socket: TcpStream, token: ListenToken, event_loop: &mut Poll, session_token: Token, timeout: Timeout)
     -> Result<(Rc<RefCell<Session>>, bool), AcceptError>;
