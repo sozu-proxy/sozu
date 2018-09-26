@@ -5,7 +5,7 @@ use std::fmt;
 use std::collections::BTreeMap;
 
 use state::ConfigState;
-use proxy::{AggregatedMetricsData,ProxyRequestData,Query,QueryAnswer};
+use proxy::{AggregatedMetricsData,ProxyRequestData,QueryAnswer};
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
@@ -18,8 +18,6 @@ pub enum CommandRequestData {
   ListWorkers,
   LaunchWorker(String),
   UpgradeMaster,
-  Metrics,
-  Query(Query),
   UpgradeWorker(u32),
 }
 
@@ -224,14 +222,6 @@ impl<'de> serde::de::Visitor<'de> for CommandRequestVisitor {
         None => return Err(serde::de::Error::missing_field("data")),
       };
       CommandRequestData::UpgradeWorker(try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("upgrade worker")))))
-    } else if config_type == "METRICS" {
-      CommandRequestData::Metrics
-    } else if config_type == "QUERY" {
-      let data = match data {
-        Some(data) => data,
-        None => return Err(serde::de::Error::missing_field("data")),
-      };
-      CommandRequestData::Query(try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("launch worker")))))
     } else {
       return Err(serde::de::Error::custom("unrecognized command"));
     };
@@ -300,13 +290,6 @@ impl serde::Serialize for CommandRequest {
       },
       CommandRequestData::UpgradeMaster => {
         try!(map.serialize_entry("type", "UPGRADE_MASTER"));
-      },
-      CommandRequestData::Metrics => {
-        try!(map.serialize_entry("type", "METRICS"));
-      },
-      CommandRequestData::Query(ref query) => {
-        try!(map.serialize_entry("type", "QUERY"));
-        try!(map.serialize_entry("data", query));
       },
       CommandRequestData::UpgradeWorker(ref id) => {
         try!(map.serialize_entry("type", "UPGRADE_WORKER"));

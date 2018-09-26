@@ -58,14 +58,14 @@ impl CommandServer {
       CommandRequestData::UpgradeMaster => {
         self.upgrade_master(token, &message.id);
       },
-      CommandRequestData::Metrics => {
-        self.metrics(token, &message.id);
-      },
-      CommandRequestData::Query(query) => {
-        self.query(token, &message.id, query);
-      },
       CommandRequestData::ProxyConfiguration(order) => {
-        self.worker_order(token, &message.id, order, message.worker_id);
+        match order {
+          ProxyRequestData::Metrics => self.metrics(token, &message.id),
+          ProxyRequestData::Query(query) => self.query(token, &message.id, query),
+          order => {
+            self.worker_order(token, &message.id, order, message.worker_id);
+          }
+        };
       },
       CommandRequestData::UpgradeWorker(id) => {
         self.upgrade_worker(token, &message.id, id);

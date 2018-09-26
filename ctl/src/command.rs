@@ -556,7 +556,7 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
   //println!("will send message for metrics with id {}", id);
   channel.write_message(&CommandRequest::new(
     id.clone(),
-    CommandRequestData::Metrics,
+    CommandRequestData::ProxyConfiguration(ProxyRequestData::Metrics),
     None,
   ));
   //println!("message sent");
@@ -886,7 +886,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
   }
 
   let command = if let Some(ref app_id) = application_id {
-    CommandRequestData::Query(Query::Applications(QueryApplicationType::AppId(app_id.to_string())))
+    CommandRequestData::ProxyConfiguration(ProxyRequestData::Query(Query::Applications(QueryApplicationType::AppId(app_id.to_string()))))
   } else if let Some(ref domain) = domain {
     let splitted: Vec<String> = domain.splitn(2, "/").map(|elem| elem.to_string()).collect();
 
@@ -900,9 +900,9 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
       path_begin: splitted.get(1).cloned().map(|path| format!("/{}", path)) // We add the / again because of the splitn removing it
     };
 
-    CommandRequestData::Query(Query::Applications(QueryApplicationType::Domain(query_domain)))
+    CommandRequestData::ProxyConfiguration(ProxyRequestData::Query(Query::Applications(QueryApplicationType::Domain(query_domain))))
   } else {
-    CommandRequestData::Query(Query::ApplicationsHashes)
+    CommandRequestData::ProxyConfiguration(ProxyRequestData::Query(Query::ApplicationsHashes))
   };
 
   let id = generate_id();
