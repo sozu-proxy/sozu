@@ -16,15 +16,15 @@ use futures::{Async, Sink, Stream, Future, future};
 use tokio_uds::UnixStream;
 use tokio_codec::{Decoder, Encoder, Framed};
 use std::str::from_utf8;
-use sozu_command::data::{ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus};
+use sozu_command::command::{CommandRequest,CommandResponse,CommandStatus};
 
 pub struct CommandCodec;
 
 impl Decoder for CommandCodec {
-    type Item  = ConfigMessageAnswer;
+    type Item  = CommandResponse;
     type Error = io::Error;
 
-    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<ConfigMessageAnswer>, io::Error> {
+    fn decode(&mut self, buf: &mut BytesMut) -> Result<Option<CommandResponse>, io::Error> {
         if let Some(pos) = (&buf[..]).iter().position(|&x| x == 0) {
             let res = if let Ok(s) = from_utf8(&buf[..pos]) {
                 match serde_json::from_str(s) {
@@ -49,10 +49,10 @@ impl Decoder for CommandCodec {
 }
 
 impl Encoder for CommandCodec {
-    type Item = ConfigMessage;
+    type Item = CommandRequest;
     type Error = io::Error;
 
-    fn encode(&mut self, message: ConfigMessage, buf: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, message: CommandRequest, buf: &mut BytesMut) -> Result<(), Self::Error> {
         match serde_json::to_string(&message) {
         Ok(data) => {
             trace!("encoded message: {}", data);
@@ -67,7 +67,7 @@ impl Encoder for CommandCodec {
 
 pub struct SozuCommandTransport {
     upstream: Framed<UnixStream,CommandCodec>,
-    received: HashMap<String,ConfigMessageAnswer>,
+    received: HashMap<String,CommandResponse>,
 }
 
 impl SozuCommandTransport {
@@ -91,7 +91,7 @@ impl SozuCommandClient {
         }
     }
 
-    pub fn send(&mut self, message: ConfigMessage)  -> Box<Future<Item = ConfigMessageAnswer, Error = io::Error> + Send + 'static> {
+    pub fn send(&mut self, message: CommandRequest)  -> Box<Future<Item = CommandResponse, Error = io::Error> + Send + 'static> {
         trace!("will send message: {:?}", message);
         let tr  = self.transport.clone();
         let tr2 = self.transport.clone();
@@ -113,7 +113,7 @@ impl SozuCommandClient {
                     trace!("polling for id = {}", id);
                     if let Ok(mut transport) = tr.try_lock() {
                         if let Some(message) = transport.received.remove(&id) {
-                            if message.status == ConfigMessageStatus::Processing {
+                            if message.status == CommandStatus::Processing {
                                 info!("processing: {:?}", message);
                             } else {
                                 return Ok(Async::Ready(message))
@@ -138,7 +138,7 @@ impl SozuCommandClient {
                                 transport.received.insert(message.id.clone(), message);
                                 Ok(Async::NotReady)
                             } else {
-                                if message.status == ConfigMessageStatus::Processing {
+                                if message.status == CommandStatus::Processing {
                                     info!("processing: {:?}", message);
                                     Ok(Async::NotReady)
                                 } else {

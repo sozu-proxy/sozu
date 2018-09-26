@@ -1,8 +1,8 @@
 use sozu_command::config::{Config, ProxyProtocolConfig, LoadBalancingAlgorithms};
 use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
-use sozu_command::data::{AnswerData,ConfigCommand,ConfigMessage,ConfigMessageAnswer,ConfigMessageStatus,RunState,WorkerInfo};
-use sozu_command::messages::{Application, Order, Backend, HttpFront, HttpsFront, TcpFront,
+use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
+use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFront, HttpsFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
   AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend};
 
@@ -61,11 +61,11 @@ macro_rules! command_timeout {
   )
 }
 
-pub fn save_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, path: String) {
+pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, path: String) {
   let id = generate_id();
-  channel.write_message(&ConfigMessage::new(
+  channel.write_message(&CommandRequest::new(
     id.clone(),
-    ConfigCommand::SaveState(path),
+    CommandRequestData::SaveState(path),
     None,
   ));
 
@@ -81,16 +81,16 @@ pub fn save_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
           exit(1);
         }
         match message.status {
-          ConfigMessageStatus::Processing => {
+          CommandStatus::Processing => {
             // do nothing here
             // for other messages, we would loop over read_message
             // until an error or ok message was sent
           },
-          ConfigMessageStatus::Error => {
+          CommandStatus::Error => {
             println!("could not save proxy state: {}", message.message);
             exit(1);
           },
-          ConfigMessageStatus::Ok => {
+          CommandStatus::Ok => {
             println!("{}", message.message);
           }
         }
@@ -99,11 +99,11 @@ pub fn save_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
   });
 }
 
-pub fn load_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, path: String) {
+pub fn load_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, path: String) {
   let id = generate_id();
-  channel.write_message(&ConfigMessage::new(
+  channel.write_message(&CommandRequest::new(
     id.clone(),
-    ConfigCommand::LoadState(path.clone()),
+    CommandRequestData::LoadState(path.clone()),
     None,
   ));
 
@@ -119,16 +119,16 @@ pub fn load_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
           exit(1);
         }
         match message.status {
-          ConfigMessageStatus::Processing => {
+          CommandStatus::Processing => {
             // do nothing here
             // for other messages, we would loop over read_message
             // until an error or ok message was sent
           },
-          ConfigMessageStatus::Error => {
+          CommandStatus::Error => {
             println!("could not load proxy state: {}", message.message);
             exit(1);
           },
-          ConfigMessageStatus::Ok => {
+          CommandStatus::Ok => {
             println!("Proxy state loaded successfully from {}", path);
           }
         }
@@ -137,11 +137,11 @@ pub fn load_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
   });
 }
 
-pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, json: bool) {
+pub fn dump_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, json: bool) {
   let id = generate_id();
-  channel.write_message(&ConfigMessage::new(
+  channel.write_message(&CommandRequest::new(
     id.clone(),
-    ConfigCommand::DumpState,
+    CommandRequestData::DumpState,
     None,
   ));
 
@@ -157,12 +157,12 @@ pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
           exit(1);
         }
         match message.status {
-          ConfigMessageStatus::Processing => {
+          CommandStatus::Processing => {
             // do nothing here
             // for other messages, we would loop over read_message
             // until an error or ok message was sent
           },
-          ConfigMessageStatus::Error => {
+          CommandStatus::Error => {
             if json {
               print_json_response(&message.message);
             } else {
@@ -170,8 +170,8 @@ pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
             }
             exit(1);
           },
-          ConfigMessageStatus::Ok => {
-            if let Some(AnswerData::State(state)) = message.data {
+          CommandStatus::Ok => {
+            if let Some(CommandResponseData::State(state)) = message.data {
               if json {
                 print_json_response(&state);
               } else {
@@ -188,12 +188,12 @@ pub fn dump_state(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeo
   });
 }
 
-pub fn soft_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, proxy_id: Option<u32>) {
+pub fn soft_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id: Option<u32>) {
   println!("shutting down proxy");
   let id = generate_id();
-  channel.write_message(&ConfigMessage::new(
+  channel.write_message(&CommandRequest::new(
     id.clone(),
-    ConfigCommand::ProxyConfiguration(Order::SoftStop),
+    CommandRequestData::ProxyConfiguration(ProxyRequestData::SoftStop),
     proxy_id,
   ));
 
@@ -206,13 +206,13 @@ pub fn soft_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, proxy_
           return;
         }
         match message.status {
-          ConfigMessageStatus::Processing => {
+          CommandStatus::Processing => {
             println!("Proxy is processing: {}", message.message);
           },
-          ConfigMessageStatus::Error => {
+          CommandStatus::Error => {
             println!("could not stop the proxy: {}", message.message);
           },
-          ConfigMessageStatus::Ok => {
+          CommandStatus::Ok => {
             println!("Proxy shut down: {}", message.message);
             break;
           }
@@ -222,12 +222,12 @@ pub fn soft_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, proxy_
   }
 }
 
-pub fn hard_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, proxy_id: Option<u32>, timeout: u64) {
+pub fn hard_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id: Option<u32>, timeout: u64) {
   println!("shutting down proxy");
   let id = generate_id();
-  channel.write_message(&ConfigMessage::new(
+  channel.write_message(&CommandRequest::new(
     id.clone(),
-    ConfigCommand::ProxyConfiguration(Order::HardStop),
+    CommandRequestData::ProxyConfiguration(ProxyRequestData::HardStop),
     proxy_id,
   ));
 
@@ -237,13 +237,13 @@ pub fn hard_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, proxy_
         None          => println!("the proxy didn't answer"),
         Some(message) => {
           match message.status {
-            ConfigMessageStatus::Processing => {
+            CommandStatus::Processing => {
               println!("Proxy is processing: {}", message.message);
             },
-            ConfigMessageStatus::Error => {
+            CommandStatus::Error => {
               println!("could not stop the proxy: {}", message.message);
             },
-            ConfigMessageStatus::Ok => {
+            CommandStatus::Ok => {
               if &id == &message.id {
                 println!("Proxy shut down: {}", message.message);
                 break;
@@ -256,14 +256,14 @@ pub fn hard_stop(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, proxy_
   );
 }
 
-pub fn upgrade_master(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
+pub fn upgrade_master(mut channel: Channel<CommandRequest,CommandResponse>,
                   socket_path: &str) {
   println!("Preparing to upgrade proxy...");
 
   let id = generate_tagged_id("LIST-WORKERS");
-  channel.write_message(&ConfigMessage::new(
+  channel.write_message(&CommandRequest::new(
     id.clone(),
-    ConfigCommand::ListWorkers,
+    CommandRequestData::ListWorkers,
     None,
   ));
 
@@ -275,16 +275,16 @@ pub fn upgrade_master(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
         return;
       }
       match message.status {
-        ConfigMessageStatus::Processing => {
+        CommandStatus::Processing => {
           println!("Error: the proxy didn't return list of workers immediately");
           return;
         },
-        ConfigMessageStatus::Error => {
+        CommandStatus::Error => {
           println!("Error: failed to get the list of worker: {}", message.message);
           return
         },
-        ConfigMessageStatus::Ok => {
-          if let Some(AnswerData::Workers(ref workers)) = message.data {
+        CommandStatus::Ok => {
+          if let Some(CommandResponseData::Workers(ref workers)) = message.data {
             let mut table = Table::new();
             table.add_row(row!["Worker", "pid", "run state"]);
             for ref worker in workers.iter() {
@@ -296,9 +296,9 @@ pub fn upgrade_master(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
             println!("");
 
             let id = generate_tagged_id("UPGRADE-MASTER");
-            channel.write_message(&ConfigMessage::new(
+            channel.write_message(&CommandRequest::new(
               id.clone(),
-              ConfigCommand::UpgradeMaster,
+              CommandRequestData::UpgradeMaster,
               None,
             ));
             println!("Upgrading master process");
@@ -315,12 +315,12 @@ pub fn upgrade_master(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
                     return;
                   }
                   match message.status {
-                    ConfigMessageStatus::Processing => {},
-                    ConfigMessageStatus::Error => {
+                    CommandStatus::Processing => {},
+                    CommandStatus::Error => {
                       println!("Error: failed to upgrade the master: {}", message.message);
                       return;
                     },
-                    ConfigMessageStatus::Ok => {
+                    CommandStatus::Ok => {
                       println!("Master process upgrade succeeded: {}", message.message);
                       break;
                     },
@@ -353,12 +353,12 @@ pub fn upgrade_master(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>,
   }
 }
 
-pub fn upgrade_worker(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, worker_id: u32) -> Channel<ConfigMessage,ConfigMessageAnswer> {
+pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, worker_id: u32) -> Channel<CommandRequest,CommandResponse> {
   println!("upgrading worker {}", worker_id);
   let id = generate_id();
-  channel.write_message(&ConfigMessage::new(
+  channel.write_message(&CommandRequest::new(
     id.clone(),
-    ConfigCommand::UpgradeWorker(worker_id),
+    CommandRequestData::UpgradeWorker(worker_id),
     //FIXME: we should be able to soft stop one specific worker
     None,
   ));
@@ -373,14 +373,14 @@ pub fn upgrade_worker(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, t
         None          => println!("the proxy didn't answer"),
         Some(message) => {
           match message.status {
-            ConfigMessageStatus::Processing => {
+            CommandStatus::Processing => {
               println!("Proxy is processing: {}", message.message);
             },
-            ConfigMessageStatus::Error => {
+            CommandStatus::Error => {
               println!("could not stop the proxy: {}", message.message);
               break;
             },
-            ConfigMessageStatus::Ok => {
+            CommandStatus::Ok => {
               if &id == &message.id {
                 println!("Proxy shut down: {}", message.message);
                 break;
@@ -401,11 +401,11 @@ pub fn upgrade_worker(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, t
   timeout_thread.join().expect("upgrade_worker: Timeout thread should correctly terminate")
 }
 
-pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bool) {
+pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) {
   let id = generate_id();
-  channel.write_message(&ConfigMessage::new(
+  channel.write_message(&CommandRequest::new(
     id.clone(),
-    ConfigCommand::ListWorkers,
+    CommandRequestData::ListWorkers,
     None,
   ));
 
@@ -420,11 +420,11 @@ pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: boo
         exit(1);
       }
       match message.status {
-        ConfigMessageStatus::Processing => {
+        CommandStatus::Processing => {
           println!("should have obtained an answer immediately");
           exit(1);
         },
-        ConfigMessageStatus::Error => {
+        CommandStatus::Error => {
           if json {
             print_json_response(&message.message);
           } else {
@@ -432,23 +432,23 @@ pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: boo
           }
           exit(1);
         },
-        ConfigMessageStatus::Ok => {
+        CommandStatus::Ok => {
           //println!("Worker list:\n{:?}", message.data);
-          if let Some(AnswerData::Workers(ref workers)) = message.data {
+          if let Some(CommandResponseData::Workers(ref workers)) = message.data {
             let mut expecting: HashSet<String> = HashSet::new();
 
             let mut h = HashMap::new();
             for ref worker in workers.iter().filter(|worker| worker.run_state == RunState::Running) {
               let id = generate_id();
-              let msg = ConfigMessage::new(
+              let msg = CommandRequest::new(
                 id.clone(),
-                ConfigCommand::ProxyConfiguration(Order::Status),
+                CommandRequestData::ProxyConfiguration(ProxyRequestData::Status),
                 Some(worker.id),
               );
               //println!("sending message: {:?}", msg);
               channel.write_message(&msg);
               expecting.insert(id.clone());
-              h.insert(id, (worker.id, ConfigMessageStatus::Processing));
+              h.insert(id, (worker.id, CommandStatus::Processing));
             }
 
             let state = Arc::new(Mutex::new(h));
@@ -469,27 +469,27 @@ pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: boo
                   Some(message) => {
                     //println!("received message: {:?}", message);
                     match message.status {
-                      ConfigMessageStatus::Processing => {
+                      CommandStatus::Processing => {
                       },
-                      ConfigMessageStatus::Error => {
+                      CommandStatus::Error => {
                         println!("error for message[{}]: {}", message.id, message.message);
                         if expecting.contains(&message.id) {
                           expecting.remove(&message.id);
                           //println!("status message with ID {} done", message.id);
                           if let Ok(mut h) = state.try_lock() {
                             if let Some(data) = h.get_mut(&message.id) {
-                              *data = ((*data).0, ConfigMessageStatus::Error);
+                              *data = ((*data).0, CommandStatus::Error);
                             }
                           }
                         }
                       },
-                      ConfigMessageStatus::Ok => {
+                      CommandStatus::Ok => {
                         if expecting.contains(&message.id) {
                           expecting.remove(&message.id);
                           //println!("status message with ID {} done", message.id);
                           if let Ok(mut h) = state.try_lock() {
                             if let Some(data) = h.get_mut(&message.id) {
-                              *data = ((*data).0, ConfigMessageStatus::Ok);
+                              *data = ((*data).0, CommandStatus::Ok);
                             }
                           }
                         }
@@ -512,13 +512,13 @@ pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: boo
             let mut h2: HashMap<u32, String> = if let Ok(mut state) = st.try_lock() {
               state.values().map(|&(ref id, ref status)| {
                 (*id, String::from(match *status {
-                  ConfigMessageStatus::Processing => if finished {
+                  CommandStatus::Processing => if finished {
                     "processing"
                   } else {
                     "timeout"
                   },
-                  ConfigMessageStatus::Error      => "error",
-                  ConfigMessageStatus::Ok         => "ok",
+                  CommandStatus::Error      => "error",
+                  CommandStatus::Ok         => "ok",
                 }))
               }).collect()
             } else {
@@ -551,12 +551,12 @@ pub fn status(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: boo
   }
 }
 
-pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bool) {
+pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) {
   let id = generate_id();
   //println!("will send message for metrics with id {}", id);
-  channel.write_message(&ConfigMessage::new(
+  channel.write_message(&CommandRequest::new(
     id.clone(),
-    ConfigCommand::Metrics,
+    CommandRequestData::Metrics,
     None,
   ));
   //println!("message sent");
@@ -566,21 +566,21 @@ pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bo
       None          => println!("the proxy didn't answer"),
       Some(message) => {
         match message.status {
-          ConfigMessageStatus::Processing => {
+          CommandStatus::Processing => {
             println!("Proxy is processing: {}", message.message);
           },
-          ConfigMessageStatus::Error => {
+          CommandStatus::Error => {
             if json {
               print_json_response(&message.message);
             } else {
               println!("could not stop the proxy: {}", message.message);
             }
           },
-          ConfigMessageStatus::Ok => {
+          CommandStatus::Ok => {
             if &id == &message.id {
               //println!("Sozu metrics:\n{}\n{:#?}", message.message, message.data);
 
-              if let Some(AnswerData::Metrics(mut data)) = message.data {
+              if let Some(CommandResponseData::Metrics(mut data)) = message.data {
                 if json {
                   print_json_response(&data);
                   return;
@@ -722,7 +722,7 @@ pub fn metrics(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bo
   }
 }
 
-pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool, load_balancing_policy: LoadBalancingAlgorithms) {
+pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool, load_balancing_policy: LoadBalancingAlgorithms) {
   let proxy_protocol = match (send_proxy, expect_proxy) {
     (true, true) => Some(ProxyProtocolConfig::RelayHeader),
     (true, false) => Some(ProxyProtocolConfig::SendHeader),
@@ -730,7 +730,7 @@ pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, time
     _ => None,
   };
 
-  order_command(channel, timeout, Order::AddApplication(Application {
+  order_command(channel, timeout, ProxyRequestData::AddApplication(Application {
     app_id: String::from(app_id),
     sticky_session,
     https_redirect,
@@ -739,11 +739,11 @@ pub fn add_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, time
   }));
 }
 
-pub fn remove_application(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str) {
-  order_command(channel, timeout, Order::RemoveApplication(String::from(app_id)));
+pub fn remove_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str) {
+  order_command(channel, timeout, ProxyRequestData::RemoveApplication(String::from(app_id)));
 }
 
-pub fn add_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
+pub fn add_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
   address: SocketAddr, hostname: &str, path_begin: &str, certificate: Option<String>) {
   if let Some(certificate_path) = certificate {
     match Config::load_file_bytes(&certificate_path) {
@@ -751,7 +751,7 @@ pub fn add_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, ti
         match calculate_fingerprint(&data) {
           None              => println!("could not calculate fingerprint for certificate"),
           Some(fingerprint) => {
-            order_command(channel, timeout, Order::AddHttpsFront(HttpsFront {
+            order_command(channel, timeout, ProxyRequestData::AddHttpsFront(HttpsFront {
               app_id: String::from(app_id),
               address,
               hostname: String::from(hostname),
@@ -764,7 +764,7 @@ pub fn add_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, ti
       Err(e) => println!("could not load file: {:?}", e)
     }
   } else {
-    order_command(channel, timeout, Order::AddHttpFront(HttpFront {
+    order_command(channel, timeout, ProxyRequestData::AddHttpFront(HttpFront {
       app_id: String::from(app_id),
       address,
       hostname: String::from(hostname),
@@ -773,7 +773,7 @@ pub fn add_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, ti
   }
 }
 
-pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
+pub fn remove_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
   address: SocketAddr, hostname: &str, path_begin: &str, certificate: Option<String>) {
   if let Some(certificate_path) = certificate {
     match Config::load_file_bytes(&certificate_path) {
@@ -781,7 +781,7 @@ pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>,
         match calculate_fingerprint(&data) {
           None              => println!("could not calculate fingerprint for certificate"),
           Some(fingerprint) => {
-            order_command(channel, timeout, Order::RemoveHttpsFront(HttpsFront {
+            order_command(channel, timeout, ProxyRequestData::RemoveHttpsFront(HttpsFront {
               app_id: String::from(app_id),
               address,
               hostname: String::from(hostname),
@@ -794,7 +794,7 @@ pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>,
       Err(e) => println!("could not load file: {:?}", e)
     }
   } else {
-    order_command(channel, timeout, Order::RemoveHttpFront(HttpFront {
+    order_command(channel, timeout, ProxyRequestData::RemoveHttpFront(HttpFront {
       app_id: String::from(app_id),
       address,
       hostname: String::from(hostname),
@@ -804,9 +804,9 @@ pub fn remove_http_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>,
 }
 
 
-pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
+pub fn add_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
   backend_id: &str, address: SocketAddr, sticky_id: Option<String>, backup: Option<bool>) {
-  order_command(channel, timeout, Order::AddBackend(Backend {
+  order_command(channel, timeout, ProxyRequestData::AddBackend(Backend {
       app_id: String::from(app_id),
       address: address,
       backend_id: String::from(backend_id),
@@ -816,19 +816,19 @@ pub fn add_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout:
     }));
 }
 
-pub fn remove_backend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
+pub fn remove_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
   backend_id: &str, address: SocketAddr) {
-  order_command(channel, timeout, Order::RemoveBackend(RemoveBackend {
+  order_command(channel, timeout, ProxyRequestData::RemoveBackend(RemoveBackend {
     app_id: String::from(app_id),
     address: address,
     backend_id: String::from(backend_id),
   }));
 }
 
-pub fn add_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, address: SocketAddr,
+pub fn add_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
   certificate_path: &str, certificate_chain_path: &str, key_path: &str) {
   if let Some(new_certificate) = load_full_certificate(certificate_path, certificate_chain_path, key_path) {
-    order_command(channel, timeout, Order::AddCertificate(AddCertificate {
+    order_command(channel, timeout, ProxyRequestData::AddCertificate(AddCertificate {
       front: address,
       certificate: new_certificate,
       names: Vec::new(),
@@ -836,10 +836,10 @@ pub fn add_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, time
   }
 }
 
-pub fn remove_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, address: SocketAddr,
+pub fn remove_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
   certificate_path: &str) {
   if let Some(fingerprint) = get_certificate_fingerprint(certificate_path) {
-    order_command(channel, timeout, Order::RemoveCertificate(RemoveCertificate {
+    order_command(channel, timeout, ProxyRequestData::RemoveCertificate(RemoveCertificate {
       front: address,
       fingerprint: fingerprint,
       names: Vec::new(),
@@ -847,12 +847,12 @@ pub fn remove_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, t
   }
 }
 
-pub fn replace_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, address: SocketAddr,
+pub fn replace_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
   new_certificate_path: &str, new_certificate_chain_path: &str, new_key_path: &str, old_certificate_path: &str)
 {
   if let Some(new_certificate) = load_full_certificate(new_certificate_path, new_certificate_chain_path, new_key_path) {
     if let Some(old_fingerprint) = get_certificate_fingerprint(old_certificate_path) {
-      order_command(channel, timeout, Order::ReplaceCertificate(ReplaceCertificate {
+      order_command(channel, timeout, ProxyRequestData::ReplaceCertificate(ReplaceCertificate {
         front: address,
         new_certificate,
         old_fingerprint,
@@ -863,30 +863,30 @@ pub fn replace_certificate(channel: Channel<ConfigMessage,ConfigMessageAnswer>, 
   }
 }
 
-pub fn add_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
+pub fn add_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
   address: SocketAddr) {
-  order_command(channel, timeout, Order::AddTcpFront(TcpFront {
+  order_command(channel, timeout, ProxyRequestData::AddTcpFront(TcpFront {
     app_id: String::from(app_id),
     address,
   }));
 }
 
-pub fn remove_tcp_frontend(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, app_id: &str,
+pub fn remove_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
   address: SocketAddr) {
-  order_command(channel, timeout, Order::RemoveTcpFront(TcpFront {
+  order_command(channel, timeout, ProxyRequestData::RemoveTcpFront(TcpFront {
     app_id: String::from(app_id),
     address,
   }));
 }
 
-pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, json: bool, application_id: Option<String>, domain: Option<String>) {
+pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, json: bool, application_id: Option<String>, domain: Option<String>) {
   if application_id.is_some() && domain.is_some() {
     println!("Error: Either request an application ID or a domain name");
     return;
   }
 
   let command = if let Some(ref app_id) = application_id {
-    ConfigCommand::Query(Query::Applications(QueryApplicationType::AppId(app_id.to_string())))
+    CommandRequestData::Query(Query::Applications(QueryApplicationType::AppId(app_id.to_string())))
   } else if let Some(ref domain) = domain {
     let splitted: Vec<String> = domain.splitn(2, "/").map(|elem| elem.to_string()).collect();
 
@@ -900,13 +900,13 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
       path_begin: splitted.get(1).cloned().map(|path| format!("/{}", path)) // We add the / again because of the splitn removing it
     };
 
-    ConfigCommand::Query(Query::Applications(QueryApplicationType::Domain(query_domain)))
+    CommandRequestData::Query(Query::Applications(QueryApplicationType::Domain(query_domain)))
   } else {
-    ConfigCommand::Query(Query::ApplicationsHashes)
+    CommandRequestData::Query(Query::ApplicationsHashes)
   };
 
   let id = generate_id();
-  channel.write_message(&ConfigMessage::new(
+  channel.write_message(&CommandRequest::new(
     id.clone(),
     command,
     None,
@@ -920,21 +920,21 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
         return;
       }
       match message.status {
-        ConfigMessageStatus::Processing => {
+        CommandStatus::Processing => {
           // do nothing here
           // for other messages, we would loop over read_message
           // until an error or ok message was sent
         },
-        ConfigMessageStatus::Error => {
+        CommandStatus::Error => {
           if json {
             print_json_response(&message.message);
           } else {
             println!("could not query proxy state: {}", message.message);
           }
         },
-        ConfigMessageStatus::Ok => {
+        CommandStatus::Ok => {
           if let Some(needle) = application_id.or(domain) {
-            if let Some(AnswerData::Query(data)) = message.data {
+            if let Some(CommandResponseData::Query(data)) = message.data {
               if json {
                 print_json_response(&data);
                 return;
@@ -1098,7 +1098,7 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
               backend_table.printstd();
             }
           } else {
-            if let Some(AnswerData::Query(data)) = message.data {
+            if let Some(CommandResponseData::Query(data)) = message.data {
               let mut table = Table::new();
               let mut header = Vec::new();
               header.push(cell!("key"));
@@ -1150,15 +1150,15 @@ pub fn query_application(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>
   }
 }
 
-pub fn logging_filter(channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, filter: &str) {
-  order_command(channel, timeout, Order::Logging(String::from(filter)));
+pub fn logging_filter(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, filter: &str) {
+  order_command(channel, timeout, ProxyRequestData::Logging(String::from(filter)));
 }
 
-fn order_command(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeout: u64, order: Order) {
+fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, order: ProxyRequestData) {
   let id = generate_id();
-  channel.write_message(&ConfigMessage::new(
+  channel.write_message(&CommandRequest::new(
     id.clone(),
-    ConfigCommand::ProxyConfiguration(order.clone()),
+    CommandRequestData::ProxyConfiguration(order.clone()),
     None,
   ));
 
@@ -1171,27 +1171,27 @@ fn order_command(mut channel: Channel<ConfigMessage,ConfigMessageAnswer>, timeou
           return;
         }
         match message.status {
-          ConfigMessageStatus::Processing => {
+          CommandStatus::Processing => {
             // do nothing here
             // for other messages, we would loop over read_message
             // until an error or ok message was sent
           },
-          ConfigMessageStatus::Error => {
+          CommandStatus::Error => {
             println!("could not execute order: {}", message.message);
             exit(1);
           },
-          ConfigMessageStatus::Ok => {
+          CommandStatus::Ok => {
             //deactivate success messages for now
             /*
             match order {
-              Order::AddApplication(_) => println!("application added : {}", message.message),
-              Order::RemoveApplication(_) => println!("application removed : {} ", message.message),
-              Order::AddBackend(_) => println!("backend added : {}", message.message),
-              Order::RemoveBackend(_) => println!("backend removed : {} ", message.message),
-              Order::AddCertificate(_) => println!("certificate added: {}", message.message),
-              Order::RemoveCertificate(_) => println!("certificate removed: {}", message.message),
-              Order::AddHttpFront(_) => println!("front added: {}", message.message),
-              Order::RemoveHttpFront(_) => println!("front removed: {}", message.message),
+              ProxyRequestData::AddApplication(_) => println!("application added : {}", message.message),
+              ProxyRequestData::RemoveApplication(_) => println!("application removed : {} ", message.message),
+              ProxyRequestData::AddBackend(_) => println!("backend added : {}", message.message),
+              ProxyRequestData::RemoveBackend(_) => println!("backend removed : {} ", message.message),
+              ProxyRequestData::AddCertificate(_) => println!("certificate added: {}", message.message),
+              ProxyRequestData::RemoveCertificate(_) => println!("certificate removed: {}", message.message),
+              ProxyRequestData::AddHttpFront(_) => println!("front added: {}", message.message),
+              ProxyRequestData::RemoveHttpFront(_) => println!("front removed: {}", message.message),
               _ => {
                 // do nothing for now
               }

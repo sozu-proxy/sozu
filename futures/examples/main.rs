@@ -10,7 +10,7 @@ use futures::future::Future;
 use tokio_uds::UnixStream;
 use tokio_core::reactor::Core;
 use command::SozuCommandClient;
-use sozu_command::data::{ConfigCommand,ConfigMessage};
+use sozu_command::command::{CommandRequestData,CommandRequest};
 
 fn main() {
     env_logger::init();
@@ -20,9 +20,9 @@ fn main() {
         Box::new(futures::future::lazy( || {
             UnixStream::connect("/Users/geal/dev/rust/projects/yxorp/bin/sock").and_then(|stream| {
                 let mut client = SozuCommandClient::new(stream);
-                client.send(ConfigMessage::new(
+                client.send(CommandRequest::new(
                     String::from("message-id-42"),
-                    ConfigCommand::ListWorkers,
+                    CommandRequestData::ListWorkers,
                     None,
                 )).and_then(|answer| {
                     info!("received answer: {:?}", answer);

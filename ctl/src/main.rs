@@ -15,7 +15,7 @@ use structopt::StructOpt;
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
-use sozu_command::data::{ConfigMessage,ConfigMessageAnswer};
+use sozu_command::command::{CommandRequest,CommandResponse};
 
 use command::{add_application,remove_application,dump_state,load_state,
   save_state, soft_stop, hard_stop, upgrade_master, status,metrics,
@@ -105,7 +105,7 @@ fn main() {
   }
 }
 
-pub fn create_channel(path: &str) -> Result<Channel<ConfigMessage,ConfigMessageAnswer>,io::Error> {
+pub fn create_channel(path: &str) -> Result<Channel<CommandRequest,CommandResponse>,io::Error> {
   Channel::from_path(path, 10_000, 2_000_000)
     .and_then(|mut channel| {
       channel.set_nonblocking(false);
