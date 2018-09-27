@@ -667,32 +667,40 @@ pub struct DefaultAnswers {
   pub BadRequest:         Rc<Vec<u8>>,
 }
 
+
+#[allow(non_snake_case)]
+pub struct CustomAnswers {
+  pub ServiceUnavailable: Option<Rc<Vec<u8>>>,
+}
+
 pub type Hostname = String;
 
 pub struct Listener {
-  listener:     Option<TcpListener>,
-  pub address:  SocketAddr,
-  fronts:       TrieNode<Vec<HttpFront>>,
-  pool:         Rc<RefCell<Pool<BufferQueue>>>,
-  answers:      DefaultAnswers,
-  config:       HttpListener,
-  pub token:    Token,
-  pub active:   bool,
+  listener:       Option<TcpListener>,
+  pub address:    SocketAddr,
+  fronts:         TrieNode<Vec<HttpFront>>,
+  pool:           Rc<RefCell<Pool<BufferQueue>>>,
+  answers:        DefaultAnswers,
+  config:         HttpListener,
+  pub token:      Token,
+  pub active:     bool,
 }
 
 pub struct Proxy {
-  listeners:    HashMap<Token,Listener>,
-  backends:     BackendMap,
-  applications: HashMap<AppId, Application>,
-  pool:         Rc<RefCell<Pool<BufferQueue>>>,
+  listeners:      HashMap<Token,Listener>,
+  backends:       BackendMap,
+  applications:   HashMap<AppId, Application>,
+  custom_answers: HashMap<AppId, CustomAnswers>,
+  pool:           Rc<RefCell<Pool<BufferQueue>>>,
 }
 
 impl Proxy {
   pub fn new(pool: Rc<RefCell<Pool<BufferQueue>>>) -> Proxy {
-      Proxy {
-      listeners:    HashMap::new(),
-      backends:     BackendMap::new(),
-      applications: HashMap::new(),
+    Proxy {
+      listeners:      HashMap::new(),
+      backends:       BackendMap::new(),
+      applications:   HashMap::new(),
+      custom_answers: HashMap::new(),
       pool,
     }
   }
@@ -722,9 +730,16 @@ impl Proxy {
     }).collect()
   }
 
-  pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
+  pub fn add_application(&mut self, mut application: Application, event_loop: &mut Poll) {
     let app_id = &application.app_id.clone();
     let lb_alg = application.load_balancing_policy;
+
+    if let Some(answer_503) = application.answer_503.take() {
+      self.custom_answers
+        .entry(application.app_id.clone())
+        .and_modify(|c| c.ServiceUnavailable = Some(Rc::new(answer_503.clone().into_bytes())))
+        .or_insert(CustomAnswers{ ServiceUnavailable: Some(Rc::new(answer_503.into_bytes())) });
+    }
 
     self.applications.insert(application.app_id.clone(), application);
     self.backends.set_load_balancing_policy_for_app(app_id, lb_alg);
@@ -732,6 +747,7 @@ impl Proxy {
 
   pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
     self.applications.remove(app_id);
+    self.custom_answers.remove(app_id);
   }
 
   pub fn add_backend(&mut self, app_id: &str, backend: Backend, event_loop: &mut Poll) {
@@ -747,7 +763,7 @@ impl Proxy {
 
     match self.backends.backend_from_app_id(app_id) {
       Err(e) => {
-        let answer = self.listeners[&session.listen_token].answers.ServiceUnavailable.clone();
+        let answer = self.get_service_unavailable_answer(Some(app_id), &session.listen_token);
         session.set_answer(DefaultAnswerStatus::Answer503, answer);
         Err(e)
       },
@@ -775,7 +791,7 @@ impl Proxy {
     match self.backends.backend_from_sticky_session(app_id, &sticky_session) {
       Err(e) => {
         debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
-        let answer = self.listeners[&session.listen_token].answers.ServiceUnavailable.clone();
+        let answer = self.get_service_unavailable_answer(Some(app_id), &session.listen_token);
         session.set_answer(DefaultAnswerStatus::Answer503, answer);
         Err(e)
       },
@@ -850,11 +866,19 @@ impl Proxy {
   fn check_circuit_breaker(&mut self, session: &mut Session) -> Result<(), ConnectionError> {
     if session.connection_attempt == CONN_RETRIES {
       error!("{} max connection attempt reached", session.log_context());
-      let answer = self.listeners[&session.listen_token].answers.ServiceUnavailable.clone();
+      let answer = self.get_service_unavailable_answer(session.app_id.as_ref().map(|app_id| app_id.as_str()), &session.listen_token);
       session.set_answer(DefaultAnswerStatus::Answer503, answer);
       Err(ConnectionError::NoBackendAvailable)
     } else {
       Ok(())
+    }
+  }
+
+  fn get_service_unavailable_answer(&self, app_id: Option<&str>, listen_token: &Token) -> Rc<Vec<u8>> {
+    if let Some(answer_service_unavailable) = app_id.and_then(|app_id| self.custom_answers.get(app_id).and_then(|c| c.ServiceUnavailable.as_ref())) {
+      answer_service_unavailable.clone()
+    } else {
+      self.listeners[&listen_token].answers.ServiceUnavailable.clone()
     }
   }
 }
@@ -1529,7 +1553,7 @@ mod tests {
       start(config, channel, 10, 16384);
     });
 
-    let application = Application { app_id: String::from("app_1"), sticky_session: false, https_redirect: true, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::default() };
+    let application = Application { app_id: String::from("app_1"), sticky_session: false, https_redirect: true, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::default(), answer_503: None };
     command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddApplication(application) });
     let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1041".parse().unwrap(), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddHttpFront(front) });
