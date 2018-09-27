@@ -20,10 +20,9 @@ to force that connection to close if too many of those are lingering.
 
 ## Exploring the source
 
-- `channel.rs`: the `Channel` implementation, using anonymous unix socket as underlying transport
 - `parser/`: only the HTTP 1.1 parser for now
-- `network/buffer*`: data buffering implementations
+- `network/buffer_queue.rs`: data buffering implementation
 - `network/protocol/`: the HTTP, TLS handshake and piping proxies
-- `network/{http|tls|tcp}.rs`: proxies for HTTP, HTTPS and TCP
-- `network/proxy.rs`: the main event loop shared by all proxies
+- `network/{{http|https_openssl|tcp}.rs|https_rustls}`: proxies for HTTP, HTTPS and TCP
+- `network/server.rs`: the main event loop shared by all proxies
 - `network/socket.rs`: abstraction over normal sockets and `SslStream`

@@ -20,12 +20,21 @@ Parameters in the global section allow you to define the global settings shared 
 * `saved_state` path from which sozu tries to load its state at startup
 * `log_level` possible values are: `debug, trace, error, warn, info`
 * `log_target` possible values are: `stdout, tcp or udp address`
+* `log_access_target` possible values are: `stdout, tcp or udp address` (if activated, sends access logs to a separate target)
 * `command_buffer_size` size of the buffer used by the master to process commands.
+* `max_command_buffer_size` maximum size of the buffer used by the master to process commands.
 * `worker_count` number of workers
+* `worker_automatic_restart` if activated, workers that panicked or crashed are restarted (activated by default)
 * `handle_process_affinity` bind workers to cpu cores.
 * `max_connections` maximum number of simultaneous / opened connections
 * `max_buffers` maximum number of buffers use to proxying
 * `buffer_size` size of requests buffer use by the workers
+* `ctl_command_timeout` maximum time sozuctl will wait for a command to complete
+* `pid_file_path` stores the pid in a specific file location
+* `tls_provider` specifies which TLS implementation to use (openssl or rustls)
+* `front_timeout` maximum time of inactivity for a front socket
+* `zombie_check_interval` duration between checks for zombie sessions
+
 
 *Example:*
 ``` toml
@@ -41,36 +50,62 @@ max_buffers = 500
 buffer_size = 16384
 ```
 
-### Protocols
+### Listeners
 
-The _protocols_ section describes a set of listening sockets accepting client connections.
-Protocols configuration can be declared in a set of sections : for example `[https]`.
-
+The _listener_ section describes a set of listening sockets accepting client connections.
+You can define as many listeners as you want.
 They follow the format:
 
-*Mandatories parameters:*
-``` toml
-[name]
-address = "127.0.0.1"
-port = 8080
+*General parameters:*
+```toml
+[[listeners]]
+# possible values are http, https or tcp
+protocol = "http"
+# listening address
+address = "127.0.0.1:8080"
+
+# specify a different IP than the one the socket sees, for logs and forwarded headers
+# public_address = "1.2.3.4:80
+
+# Configures the client socket to receive a PROXY protocol header
+# expect_proxy = false
 ```
 
-*Optional parameters:*
-``` toml
-answer_404 = "path/to/404.html"
-answer_503 = "path/to/503.html"
-default_app_id = "Name of you app"
-tls_versions = ["TLSv1.2"]
-cipher_list = "ECDHE-ECDSA-....."
-default_certificate = "cert.pem"
-default_certificate_chain = "cert_chain.pem"
-default_key = "key.pem"
-max_listeners = 1000
+### Options specific to HTTP and HTTPS listeners
+
+```toml
+# path to custom 404 and 503 answers
+# a 404 response is sent when sozu does not know about the requested domain or path
+# a 503 response is sent if there are no backend servers available
+#answer_404 = "../lib/assets/404.html"
+#answer_503 = "../lib/assets/503.html"
+
+# defines the sticky session cookie's name, if `sticky_session` is activated format
+# an application. Defaults to "SOZUBALANCEID"
+# sticky_name = "SOZUBALANCEID"
 ```
 
-Sozu will detect which type of proxy you have set due to your parameters.
-It's why you don't have to specify: `https`, `http`...
-Currently we support: `tcp, http, https`.
+### Options specific to HTTPS listeners
+
+```toml
+# supported TLS versions. Possible values are "SSLv2", "SSLv3", "TLSv1",
+# "TLSv1.1", "TLSv1.2", "TLSv1.3". Defaults to "TLSv1.2"
+# tls_versions = ["TLSv1.2"]
+```
+
+### Options specific to Openssl based HTTPS listeners
+
+```toml
+#option specific to Openssl based HTTPS listeners
+#cipher_list = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256"
+```
+
+### Options specific to Rustls based HTTPS listeners
+
+```toml
+#option specific to rustls based HTTPS listeners
+#rustls_cipher_list = ["TLS13_CHACHA20_POLY1305_SHA256"]
+```
 
 ### Applications
 
@@ -82,20 +117,24 @@ They follow the format:
 [applications]
 
 [applications.NameOfYourApp]
-hostname  = "mydomain.foo"
-frontends = ["http", "https"]
-backends  = ["127.0.0.1:1026"]
-```
-> Take care, the _frontends_ declaration is case sensitive.
-> The _backends_ field describes a set of servers to which the proxy will connect to forward incoming requests.
+# possible values are http or tcp
+# https proxies will use http here
+protocol = "http"
 
-*Optionals parameters:*
-``` toml
-path_begin = "/api"
-certificate = "certificate.pem"
-key = "key.pem"
-certificate_chain = "certificate_chain.pem"
-sticky_session = true
+# per application load balancing algorithm. The possible values are
+# "roundrobin" and "random". Defaults to "roundrobin"
+# load_balancing_policy="roundrobin"
+
+
+frontends = [
+  { address = "0.0.0.0:8080", hostname = "lolcatho.st" },
+  { address = "0.0.0.0:8443", hostname = "lolcatho.st", certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" }
+]
+# additional options for frontends: sticky_session (boolean) and https_redirect (boolean)
+
+backends  = [
+  { address = "127.0.0.1:1026" }
+]
 ```
 
 ## Sozuctl
@@ -119,17 +158,19 @@ In your `config.toml`, you can define the address and port of your external serv
 
 ``` toml
 [metrics]
-address = "127.0.0.1"
-port = 8125
+address = "127.0.0.1:8125"
+# use InfluxDB's statsd protocol flavor to add tags
+# tagged_metrics = false
+# metrics key prefix
+# prefix = "sozu"
 ```
 
 > Currently, we can't change the frequency of sending messages.
 
 ### Example of externals services
 
-* [cernan](https://github.com/postmates/cernan)
-
 * [statsd](https://github.com/etsy/statsd)
+* [grad](https://github.com/geal/grad)
 
 ## Systemd integration
 
@@ -152,7 +193,7 @@ Sōzu support the *version 2* of the `PROXY protocol` in three configurations:
 - "expect" protocol: Sōzu receives the header from a proxy, and interprets it for its own logging and metrics, and uses it in HTTP forwarding headers
 - "relay" protocol: Sōzu, in TCP proxy mode, can reveice the header, and transmit it to a backend server
 
-More infos here: [proxy-protocol spec](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt)
+More information here: [proxy-protocol spec](https://www.haproxy.org/download/1.8/doc/proxy-protocol.txt)
 
 ### Configuring Sōzu to *expect* a PROXY Protocol header
 
@@ -169,21 +210,13 @@ Configures the client-facing connection to receive a PROXY protocol header befor
   /________/               +---------+                   +------------+      +-----------+
 ```
 
+It is supported by HTTP, HTTPS and TCP proxies.
+
 *Configuration:*
 
-For the HTTP and HTTPS proxies, it affects all the applications, since they listen on the same TCP socket:
-
 ```toml
-[http]
-address = "0.0.0.0"
-port = 80
-expect_proxy = true
-```
-
-TCP applications will each have their own listen socket, so this is configurable per application:
-
-```toml
-[applications.NameOfYourApp]
+[[listeners]]
+address = "0.0.0.0:80"
 expect_proxy = true
 ```
 
@@ -202,9 +235,17 @@ Send a PROXY protocol header over any connection established to the backends dec
 ```
 
 *Configuration:*
+
 ```toml
-[applications.NameOfYourApp]
+[[listeners]]
+address = "0.0.0.0:81"
+
+[applications]
+[applications.NameOfYourTcpApp]
 send_proxy = true
+frontends = [
+  { address = "0.0.0.0:81" }
+]
 ```
 
 NOTE: Only for TCP applications (HTTP and HTTPS proxies will use the forwarding headers).
@@ -229,7 +270,15 @@ Sōzu will receive a PROXY protocol header from the client connection, check its
 This only concerns TCP applications (HTTP and HTTPS proxies can work directly in expect mode, and will use the forwarding headers).
 
 ```toml
+[[listeners]]
+address = "0.0.0.0:80"
+expect_proxy = true
+
+[applications]
+
 [applications.NameOfYourApp]
 send_proxy = true
-expect_proxy = true
+frontends = [
+  { address = "0.0.0.0:80" }
+]
 ```
