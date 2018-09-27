@@ -736,6 +736,7 @@ pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout
     https_redirect,
     proxy_protocol,
     load_balancing_policy,
+    answer_503: None,
   }));
 }
 
