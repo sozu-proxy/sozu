@@ -1,0 +1,121 @@
+# Changelog
+
+## [Unreleased]
+
+### Changed
+
+## 0.9.0 - 2018-09-27
+
+### Added
+
+- a futures executor for asynchronous tasks in the master process
+- custom 503 page per application
+
+### Changed
+
+- HTTP parser optimizations
+- renamed various parts of the code and configuration protocol for more consistency
+
+### Fixed
+
+- upgrade process
+- event loop behaviour around abckend connections
+- openssl cipher configuration
+- circuit breaker
+
+
+## 0.8.0 - 2018-08-21
+
+- metrics writing fixes
+- event loop fixes
+- front socket timeout verification
+- configuration state verification optimizations
+- rustls and openssl configuration fixes
+- separate listeners as a specific configuration option
+- configuration file refactoring and simplification
+- zombie session check
+
+## 0.7.0 - 2018-06-07
+
+- more metrics
+- circuit breaking in the TCP proxy
+
+## 0.6.0 - 2018-04-11
+
+- disable debug and trace logs in release builds
+- rustls based HTTPS proxy
+- ProxyClient trait refactoring
+- proxy protocol implementation
+- option to send metrics in InfluxDB's tagged format
+- PID file
+
+
+## 0.5.0 - 2018-01-29
+
+- TCP proxy refactoring
+- sozuctl UX
+- HTTP -> HTTPS redirection
+- documentation
+- ReplaceCertifacte message
+
+
+## 0.4.0 - 2017-11-29
+
+- remove mio timeouts
+- upgrade fixes
+- optimizations
+
+## 0.3.0 - 2017-11-21
+
+- process affinity
+- clean system shutdown
+- implement 100 continue
+- sticky sessions
+- build scripts for Fedora, Atchlinux, RPM
+- systemd unit file
+- metrics
+- load balancing algorithms
+- retry policy algorithms
+
+
+### Added
+
+### Changed
+
+### Removed
+
+### Fixed
+
+## 0.2.0 - 2017-04-20
+
+- Event loop refactoring
+- contribution guidelines
+
+## 0.1.0 - 2017-04-04
+
+Started implementation:
+- TCP proxy
+- HTTP proxy
+- HTTPS proxy with SNI
+- mio based event loop
+- configuration diff messages support
+- buffer based streaming
+- Docker image
+- HTTP keep alive
+- tested getting configuration events directly from AMQP, was removed
+- getting configuration events from a Unix socket
+- configuration bootstrap from a TOML file
+- logger implementation
+- architecture based around master process and worker processes
+- control with command line app sozuctl
+- command library
+
+[Unreleased]: https://github.com/sozu-proxy/sozu/compare/0.9.0...HEAD
+[0.9.0]: https://github.com/sozu-proxy/sozu/compare/0.8.0...0.9.0
+[0.8.0]: https://github.com/sozu-proxy/sozu/compare/0.7.0...0.8.0
+[0.7.0]: https://github.com/sozu-proxy/sozu/compare/0.6.0...0.7.0
+[0.6.0]: https://github.com/sozu-proxy/sozu/compare/0.5.0...0.6.0
+[0.5.0]: https://github.com/sozu-proxy/sozu/compare/0.4.0...0.5.0
+[0.4.0]: https://github.com/sozu-proxy/sozu/compare/0.3.0...0.4.0
+[0.3.0]: https://github.com/sozu-proxy/sozu/compare/0.2.0...0.3.0
+[0.2.0]: https://github.com/sozu-proxy/sozu/compare/0.1.0...0.2.0

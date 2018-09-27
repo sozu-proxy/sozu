@@ -32,6 +32,8 @@ Launch sozu with `worker_automatic_restart` on, test a request, kill a worker, t
 
 For minor and patch releases, the upgrade process must always pass correctly.
 
+### Update the changelog
+
 ## Publish the new version
 
 update the version number in `Cargo.toml` files in:
