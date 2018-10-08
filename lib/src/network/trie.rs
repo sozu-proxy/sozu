@@ -92,36 +92,36 @@ impl<V:Debug> TrieNode<V> {
             self.children.push(new_parent);
           },
           None => {
-          if partial_key.len() > child_key.len()  {
-            let i = child_key.len();
-            let res = child.insert_recursive(&partial_key[i..], key, value);
-            self.keys.push((&partial_key[..i]).to_vec());
-            self.children.push(child);
-            return res;
-          } else if partial_key.len() == child_key.len() {
-            if child.key_value.is_some() {
-              self.keys.push(child_key);
+            if partial_key.len() > child_key.len()  {
+              let i = child_key.len();
+              let res = child.insert_recursive(&partial_key[i..], key, value);
+              self.keys.push((&partial_key[..i]).to_vec());
               self.children.push(child);
-              return InsertResult::Existing;
+              return res;
+            } else if partial_key.len() == child_key.len() {
+              if child.key_value.is_some() {
+                self.keys.push(child_key);
+                self.children.push(child);
+                return InsertResult::Existing;
+              } else {
+                child.key_value = Some((key.clone(), value));
+                self.keys.push(child_key);
+                self.children.push(child);
+                return InsertResult::Ok;
+              }
             } else {
-              child.key_value = Some((key.clone(), value));
-              self.keys.push(child_key);
-              self.children.push(child);
+              // the partial key is smaller, insert as parent
+              let i = partial_key.len();
+              let new_parent = TrieNode {
+                key_value: Some((key.clone(), value)),
+                keys: vec!((&child_key[i..]).to_vec()),
+                children: vec!(child),
+              };
+              self.keys.push(partial_key.to_vec());
+              self.children.push(new_parent);
+
               return InsertResult::Ok;
             }
-          } else {
-            // the partial key is smaller, insert as parent
-            let i = partial_key.len();
-            let new_parent = TrieNode {
-              key_value: Some((key.clone(), value)),
-              keys: vec!((&child_key[i..]).to_vec()),
-              children: vec!(child),
-            };
-            self.keys.push(partial_key.to_vec());
-            self.children.push(new_parent);
-
-            return InsertResult::Ok;
-          }
 
           }
         }
