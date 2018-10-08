@@ -9,7 +9,7 @@ use proxy::{Application,CertFingerprint,CertificateAndKey,ProxyRequestData,
   HttpFront,HttpsFront,TcpFront,Backend,QueryAnswerApplication,
   AddCertificate, RemoveCertificate, RemoveBackend,
   HttpListener,HttpsListener,TcpListener,ListenerType,
-  ActivateListener};
+  ActivateListener,RemoveListener};
 
 pub type AppId = String;
 
@@ -345,6 +345,13 @@ impl ConfigState {
     let removed_apps = my_apps.difference(&their_apps);
     let added_apps: Vec<&Application> = their_apps.difference(&my_apps).filter_map(|app_id| other.applications.get(app_id.as_str())).collect();
 
+    //pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
+    let my_tcp_listeners: HashSet<&SocketAddr> = self.tcp_listeners.keys().collect();
+    let their_tcp_listeners: HashSet<&SocketAddr> = self.tcp_listeners.keys().collect();
+    let removed_tcp_listeners = my_tcp_listeners.difference(&their_tcp_listeners);
+    let added_tcp_listeners: Vec<&SocketAddr> = their_tcp_listeners.difference(&my_tcp_listeners)
+      .cloned().collect();
+
     let mut my_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
     for (ref app_id, ref front_list) in self.http_fronts.iter() {
       for ref front in front_list.iter() {
@@ -422,6 +429,17 @@ impl ConfigState {
     let added_certificates   = their_certificates.difference(&my_certificates);
 
     let mut v = vec!();
+
+    for address in removed_tcp_listeners {
+      v.push(ProxyRequestData::RemoveListener(RemoveListener {
+        front: *address.clone(),
+        proxy: ListenerType::TCP
+      }));
+    }
+
+    for address in added_tcp_listeners {
+      v.push(ProxyRequestData::AddTcpListener(other.tcp_listeners[address].0.clone()));
+    }
 
     for app_id in removed_apps {
       v.push(ProxyRequestData::RemoveApplication(app_id.to_string()));
