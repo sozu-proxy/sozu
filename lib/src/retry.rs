@@ -1,7 +1,7 @@
 use rand;
 use rand::distributions::{Distribution, Range};
 
-use std::{cmp, thread, time};
+use std::{cmp, time};
 use std::fmt::Debug;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -150,8 +150,6 @@ impl RetryPolicy for RetryPolicyWrapper {
 
 #[cfg(test)]
 mod tests {
-    use std::time;
-
     use super::{RetryAction, RetryPolicy, ExponentialBackoffPolicy};
 
     const MAX_FAILS: usize = 10;

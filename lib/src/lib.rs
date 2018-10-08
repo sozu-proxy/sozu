@@ -151,6 +151,7 @@
 //! ```
 //!
 #![cfg_attr(feature = "unstable", feature(test))]
+#![allow(dead_code, unused_must_use, unused_variables)]
 #[cfg(all(feature = "unstable", test))]
 extern crate test;
 
@@ -210,8 +211,7 @@ use std::str;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::cell::RefCell;
-use slab::{Entry,VacantEntry};
-use time::{precise_time_ns,SteadyTime,Duration};
+use time::{SteadyTime,Duration};
 use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::proxy::{ProxyRequest,ProxyResponse,LoadBalancingParams};
@@ -272,7 +272,7 @@ pub enum AcceptError {
   WouldBlock,
 }
 
-use self::server::{SessionToken,ListenToken,ListenPortState};
+use self::server::{ListenToken,ListenPortState};
 pub trait ProxyConfiguration<Session> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, session: &mut Session,
     back_token: Token) ->Result<BackendConnectAction,ConnectionError>;

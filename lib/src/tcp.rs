@@ -1,42 +1,32 @@
-use std::thread::{self,Thread,Builder};
-use std::sync::mpsc::{self,channel,Receiver};
 use mio::net::*;
 use mio::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
-use std::collections::{HashMap,HashSet};
-use std::os::unix::io::RawFd;
-use std::os::unix::io::{FromRawFd,AsRawFd};
-use std::io::{self,Read,ErrorKind};
-use nom::HexDisplay;
-use std::error::Error;
-use slab::{Slab,Entry,VacantEntry};
+use std::collections::HashMap;
+use std::os::unix::io::AsRawFd;
+use std::io::ErrorKind;
+use slab::Slab;
 use std::rc::Rc;
-use std::cell::{RefCell,RefMut};
+use std::cell::RefCell;
 use std::net::{SocketAddr,Shutdown};
-use std::str::FromStr;
-use time::{Duration,SteadyTime,precise_time_s};
-use rand::random;
+use time::{Duration,SteadyTime};
 use uuid::Uuid;
 use mio_extras::timer::{Timer,Timeout};
 
-use sozu_command::buffer::Buffer;
-use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
-use sozu_command::proxy::{self,TcpFront,ProxyRequestData,ProxyRequest,ProxyResponse,ProxyResponseStatus,LoadBalancingParams};
+use sozu_command::proxy::{ProxyRequestData,ProxyRequest,ProxyResponse,ProxyResponseStatus};
 use sozu_command::proxy::TcpListener as TcpListenerConfig;
 use sozu_command::logging;
 
-use {AppId,Backend,SessionResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
+use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
-use pool::{Pool,Checkout,Reset};
+use pool::{Pool,Checkout};
 use buffer_queue::BufferQueue;
-use socket::{SocketHandler,SocketResult,server_bind};
-use {http,https_rustls};
+use socket::server_bind;
 use protocol::{Pipe, ProtocolResult};
 use protocol::proxy_protocol::send::SendProxyProtocol;
 use protocol::proxy_protocol::relay::RelayProxyProtocol;
@@ -1055,13 +1045,14 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::net::{TcpListener, TcpStream, Shutdown, IpAddr, Ipv4Addr, SocketAddr};
+  use std::net::{TcpListener, TcpStream, Shutdown};
   use std::io::{Read,Write};
-  use std::time::Duration;
   use std::{thread,str};
   use std::sync::{Arc, Barrier};
   use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
   use sozu_command::scm_socket::Listeners;
+  use sozu_command::proxy::{self,TcpFront,LoadBalancingParams};
+  use sozu_command::channel::Channel;
   use std::os::unix::io::IntoRawFd;
   static TEST_FINISHED: AtomicBool = ATOMIC_BOOL_INIT;
 

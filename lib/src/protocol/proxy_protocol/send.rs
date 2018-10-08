@@ -1,4 +1,3 @@
-use std::net::IpAddr;
 use std::io::{Write, ErrorKind};
 use std::io::Read;
 
@@ -11,7 +10,7 @@ use {
   Readiness,
   BackendConnectionStatus,
   protocol::{ProtocolResult, pipe::Pipe},
-  socket::{SocketHandler, SocketResult, server_bind},
+  socket::SocketHandler,
   buffer_queue::BufferQueue,
   pool::Checkout,
 };
@@ -173,7 +172,7 @@ mod send_test {
 
   use super::super::parser::parse_v2_header;
 
-  use std::{sync::{Arc, Barrier}, thread::{self, JoinHandle}, time::Duration, net::SocketAddr};
+  use std::{sync::{Arc, Barrier}, thread::{self, JoinHandle}, net::SocketAddr};
   use mio::net::{TcpListener, TcpStream};
   use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
   use std::os::unix::io::{FromRawFd,IntoRawFd};

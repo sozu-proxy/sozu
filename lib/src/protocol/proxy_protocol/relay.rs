@@ -1,13 +1,11 @@
-use std::net::IpAddr;
-use std::io::{Write, ErrorKind};
+use std::io::Write;
 use std::io::Read;
 
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use nom::{Err,Offset};
-use protocol::proxy_protocol::header;
-use {Protocol, SessionResult};
+use SessionResult;
 use Readiness;
 use protocol::ProtocolResult;
 use socket::{SocketHandler, SocketResult};

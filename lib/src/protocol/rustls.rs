@@ -2,9 +2,7 @@ use mio::*;
 use mio::net::*;
 use mio::unix::UnixReady;
 use std::io::ErrorKind;
-use buffer_queue::BufferQueue;
-use {SessionResult,Protocol,Readiness};
-use pool::Checkout;
+use {SessionResult,Readiness};
 use protocol::ProtocolResult;
 use rustls::{ServerSession, Session};
 

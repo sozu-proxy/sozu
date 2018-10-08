@@ -1,26 +1,23 @@
 use std::cmp::min;
-use std::io::Write;
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
 use std::net::{SocketAddr,IpAddr};
 use mio::*;
 use mio::unix::UnixReady;
 use mio::tcp::TcpStream;
-use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
 use super::super::{SessionResult,Protocol,Readiness,SessionMetrics, LogDuration};
 use buffer_queue::BufferQueue;
 use socket::{SocketHandler,SocketResult};
 use protocol::ProtocolResult;
 use pool::{Pool,Checkout};
-use pool_crate::Reset;
 use util::UnwrapLog;
 
 pub mod parser;
 mod cookies;
 
 use self::parser::{HttpState,parse_request_until_stop, parse_response_until_stop,
-  BufferMove, RequestState, ResponseState, Chunk, Continue, RRequestLine, RStatusLine};
+  RequestState, ResponseState, Chunk, Continue, RRequestLine, RStatusLine};
 
 #[derive(Clone)]
 pub struct StickySession {

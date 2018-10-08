@@ -2,10 +2,9 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::collections::HashMap;
-use rand::random;
 use mio::net::TcpStream;
 
-use sozu_command::{proxy, config::LoadBalancingAlgorithms, proxy::LoadBalancingParams};
+use sozu_command::{proxy, config::LoadBalancingAlgorithms};
 
 use super::{AppId,Backend,ConnectionError,load_balancing::*};
 

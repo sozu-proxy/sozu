@@ -1,53 +1,42 @@
-use std::thread::{self,Thread,Builder};
-use std::sync::mpsc::{self,channel,Receiver};
-use std::sync::{Arc,Mutex};
-use std::rc::{Rc,Weak};
+use std::sync::Arc;
+use std::rc::Rc;
 use std::cell::RefCell;
-use std::mem;
-use std::net::Shutdown;
 use mio::*;
 use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
 use std::os::unix::io::{AsRawFd};
-use std::io::{self,Read,Write,ErrorKind,BufReader};
-use std::collections::{HashMap,HashSet};
-use std::error::Error;
-use slab::{Slab,Entry,VacantEntry};
-use std::net::{IpAddr,SocketAddr};
-use std::str::{FromStr, from_utf8, from_utf8_unchecked};
-use time::{precise_time_s, precise_time_ns};
-use rand::random;
-use rustls::{self, ServerConfig, ServerSession, NoClientAuth, ProtocolVersion,
-  SupportedCipherSuite, ALL_CIPHERSUITES};
+use std::io::ErrorKind;
+use std::collections::HashMap;
+use slab::Slab;
+use std::net::SocketAddr;
+use std::str::from_utf8_unchecked;
+use rustls::{ServerConfig, ServerSession, NoClientAuth, ProtocolVersion,
+  ALL_CIPHERSUITES};
 use mio_extras::timer::Timeout;
 
-use sozu_command::buffer::Buffer;
-use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
-use sozu_command::proxy::{self,Application,CertFingerprint,CertificateAndKey,
+use sozu_command::proxy::{Application,CertFingerprint,
   ProxyRequestData,HttpsFront,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
-  LoadBalancingParams, TlsVersion};
-use sozu_command::certificate::split_certificate_chain;
+  TlsVersion};
 use sozu_command::logging;
 
-use protocol::http::parser::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
+use protocol::http::parser::{RRequestLine,hostname_and_port};
 use buffer_queue::BufferQueue;
-use pool::{Pool,Checkout};
-use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
+use pool::Pool;
+use {AppId,Backend,ConnectionError,Protocol,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus};
 use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession,CONN_RETRIES};
-use http::{self,DefaultAnswers, CustomAnswers};
-use socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
+use http::{DefaultAnswers, CustomAnswers};
+use socket::server_bind;
 use trie::*;
-use protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
+use protocol::StickySession;
 use protocol::http::DefaultAnswerStatus;
-use retry::RetryPolicy;
 use util::UnwrapLog;
 
-use super::resolver::{CertificateResolver,CertificateResolverWrapper};
+use super::resolver::CertificateResolverWrapper;
 use super::session::Session;
 
 #[derive(Debug,Clone,PartialEq,Eq)]

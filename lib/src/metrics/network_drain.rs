@@ -1,18 +1,10 @@
 use std::str;
-use std::thread;
-use std::sync::Mutex;
-use std::cell::RefCell;
 use std::time::{Duration,Instant};
-use std::iter::repeat;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
-use std::fmt::Arguments;
 use std::net::SocketAddr;
 use mio::net::UdpSocket;
-use std::io::{self,LineWriter,Write,Error,ErrorKind};
-use nom::HexDisplay;
-use hdrhistogram::Histogram;
-use sozu_command::proxy::{FilteredData,MetricsData,Percentiles,BackendMetricsData,FilteredTimeSerie};
+use std::io::{self,LineWriter,Write,ErrorKind};
 
 use super::{Subscriber,MetricData,StoredMetricData};
 

@@ -1,16 +1,12 @@
-use std::cmp::min;
-use std::net::{SocketAddr,IpAddr};
-use std::io::Write;
+use std::net::IpAddr;
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
-use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
 use {SessionResult,Readiness,SessionMetrics};
 use buffer_queue::BufferQueue;
 use socket::{SocketHandler,SocketResult};
-use pool::{Pool,Checkout,Reset};
-use nom::HexDisplay;
+use pool::Checkout;
 
 type BackendToken = Token;
 

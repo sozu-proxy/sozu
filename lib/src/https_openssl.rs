@@ -1,24 +1,18 @@
-use std::thread::{self,Thread,Builder};
-use std::sync::mpsc::{self,channel,Receiver};
 use std::sync::{Arc,Mutex};
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
-use std::mem;
 use std::net::Shutdown;
-use std::os::unix::io::RawFd;
-use std::os::unix::io::{FromRawFd,AsRawFd};
+use std::os::unix::io::AsRawFd;
 use mio::*;
 use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
-use std::io::{self,Read,Write,ErrorKind,BufReader};
-use std::collections::{HashMap,HashSet};
-use std::error::Error;
-use slab::{Slab,Entry,VacantEntry};
+use std::io::ErrorKind;
+use std::collections::HashMap;
+use slab::Slab;
 use std::net::{IpAddr,SocketAddr};
-use std::str::{FromStr, from_utf8, from_utf8_unchecked};
-use time::{precise_time_s, precise_time_ns, SteadyTime, Duration};
-use rand::random;
+use std::str::from_utf8_unchecked;
+use time::{SteadyTime, Duration};
 use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod, SslAlert,
                    Ssl, SslOptions, SslRef, SslStream, SniError, NameType};
 use openssl::x509::X509;
@@ -30,34 +24,29 @@ use openssl::error::ErrorStack;
 use openssl::ssl::SslVersion;
 use mio_extras::timer::{Timer,Timeout};
 
-use sozu_command::config::LoadBalancingAlgorithms;
-use sozu_command::buffer::Buffer;
-use sozu_command::channel::Channel;
 use sozu_command::scm_socket::ScmSocket;
-use sozu_command::proxy::{self,Application,CertFingerprint,CertificateAndKey,
+use sozu_command::proxy::{Application,CertFingerprint,CertificateAndKey,
   ProxyRequestData,HttpsFront,HttpsListener,ProxyRequest,ProxyResponse,
-  ProxyResponseStatus,LoadBalancingParams,TlsVersion};
+  ProxyResponseStatus,TlsVersion};
 use sozu_command::logging;
 
-use protocol::http::parser::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
-use pool::{Pool,Checkout};
+use protocol::http::parser::{RequestState,RRequestLine,hostname_and_port};
+use pool::Pool;
 use buffer_queue::BufferQueue;
 use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
-use http::{self,DefaultAnswers, CustomAnswers};
-use socket::{SocketHandler,SocketResult,server_bind};
+use http::{DefaultAnswers, CustomAnswers};
+use socket::server_bind;
 use trie::*;
 use protocol::{ProtocolResult,Http,Pipe,StickySession};
 use protocol::openssl::TlsHandshake;
 use protocol::http::DefaultAnswerStatus;
 use protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use retry::RetryPolicy;
-use tcp;
 use util::UnwrapLog;
-use https_rustls;
 
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct TlsApp {
@@ -1709,26 +1698,16 @@ mod tests {
   extern crate tiny_http;
   use super::*;
   use std::collections::HashMap;
-  use std::net::{TcpListener, TcpStream, Shutdown};
-  use std::io::{Read,Write};
-  use std::{thread,str};
-  use std::sync::mpsc::channel;
   use std::net::SocketAddr;
   use std::str::FromStr;
-  use std::time::Duration;
-  use std::rc::{Rc,Weak};
+  use std::rc::Rc;
   use std::sync::{Arc,Mutex};
   use std::cell::RefCell;
-  use slab::Slab;
   use pool::Pool;
-  use sozu_command::buffer::Buffer;
   use buffer_queue::BufferQueue;
   use http::DefaultAnswers;
   use trie::TrieNode;
-  use sozu_command::proxy::{ProxyRequestData,HttpsFront,Backend,ProxyRequest,ProxyResponse};
-  use openssl::ssl::{SslContext, SslMethod, Ssl, SslStream};
-  use openssl::x509::X509;
-  use mio::net;
+  use openssl::ssl::{SslContext, SslMethod};
 
   #[test]
   fn frontend_from_request_test() {

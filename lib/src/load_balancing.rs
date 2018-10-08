@@ -1,7 +1,6 @@
 use rand::{thread_rng, Rng};
 
 use Backend;
-use sozu_command::config::LoadBalancingAlgorithms;
 
 use std::{ rc::Rc, cell::RefCell };
 use std::fmt::Debug;

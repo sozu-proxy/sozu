@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6, IpAddr};
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::fmt;
 
 #[derive(PartialEq, Debug)]
@@ -312,7 +312,7 @@ fn u16_to_array_of_u8(x: u16) -> [u8; 2] {
 mod testV2 {
 
   use super::*;
-  use std::net::{Ipv4Addr, Ipv6Addr};
+  use std::net::{Ipv4Addr, Ipv6Addr, IpAddr};
 
   #[test]
   fn test_u16_to_array_of_u8() {

@@ -1,13 +1,10 @@
-use std::net::IpAddr;
-use std::io::{Write, ErrorKind};
 use std::io::Read;
 
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
-use nom::{Err,Offset};
-use protocol::proxy_protocol::header;
-use {Protocol, SessionResult};
+use nom::Err;
+use SessionResult;
 use Readiness;
 use protocol::ProtocolResult;
 use socket::{SocketHandler, SocketResult};
@@ -156,14 +153,11 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
 #[cfg(test)]
 mod expect_test {
 
- use super::*;
-
-  use super::super::parser::parse_v2_header;
-  use pool::Pool;
-
-  use std::{sync::{Arc, Barrier}, thread::{self, JoinHandle}, time::Duration, net::{SocketAddr, IpAddr, Ipv4Addr}};
-  use mio::net::{TcpListener, TcpStream};
-  use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
+  use super::*;
+  use std::{sync::{Arc, Barrier}, thread::{self, JoinHandle}, net::{SocketAddr, IpAddr, Ipv4Addr}};
+  use mio::net::TcpListener;
+  use std::net::{TcpStream as StdTcpStream};
+  use std::io::Write;
 
   use protocol::proxy_protocol::header::*;
 

@@ -1,51 +1,27 @@
-use std::thread::{self,Thread,Builder};
-use std::sync::mpsc::{self,channel,Receiver};
-use std::sync::{Arc,Mutex};
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
-use std::mem;
 use std::net::Shutdown;
 use mio::*;
 use mio::net::*;
-use mio_uds::UnixStream;
 use mio::unix::UnixReady;
-use std::io::{self,Read,Write,ErrorKind,BufReader};
-use std::collections::HashMap;
-use std::error::Error;
-use slab::Slab;
-use std::io::Cursor;
-use std::net::{IpAddr,SocketAddr};
-use std::str::{FromStr, from_utf8, from_utf8_unchecked};
-use time::{precise_time_s, precise_time_ns, SteadyTime, Duration};
-use rand::random;
+use std::io::Read;
+use std::net::IpAddr;
+use time::{SteadyTime, Duration};
 use rustls::{ServerSession,Session as ClientSession,ProtocolVersion,SupportedCipherSuite,CipherSuite};
-use nom::{HexDisplay,IResult};
 use mio_extras::timer::{Timer, Timeout};
 
-use sozu_command::buffer::Buffer;
-use sozu_command::channel::Channel;
-use sozu_command::proxy::{self,Application,CertFingerprint,CertificateAndKey,ProxyRequestData,HttpsFront,
-  HttpsListener,ProxyRequest,ProxyResponse,ProxyResponseStatus};
-
-use protocol::http::parser::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
-use pool::{Pool,Checkout};
+use protocol::http::parser::RequestState;
+use pool::Pool;
 use buffer_queue::BufferQueue;
-use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,SessionToken,
-  ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
-  CloseResult};
-use backends::BackendMap;
-use server::{Server,ProxyChannel,ListenToken};
-use http::{self,DefaultAnswers};
-use socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
-use trie::*;
-use protocol::{ProtocolResult,Http,Pipe,StickySession};
+use {Backend,SessionResult,Protocol,Readiness,SessionMetrics, ProxySession,
+  BackendConnectionStatus, CloseResult};
+use socket::FrontRustls;
+use protocol::{ProtocolResult,Http,Pipe};
 use protocol::rustls::TlsHandshake;
 use protocol::http::DefaultAnswerStatus;
 use protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use retry::RetryPolicy;
-use tcp;
 use util::UnwrapLog;
-use super::configuration::{Proxy,TlsApp};
 
 pub enum State {
   Expect(ExpectProxyProtocol<TcpStream>, ServerSession),

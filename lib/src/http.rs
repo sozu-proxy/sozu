@@ -1,47 +1,39 @@
-use std::collections::{HashMap,HashSet};
-use std::io::{self,Read,Write,ErrorKind};
+use std::collections::HashMap;
+use std::io::{self,ErrorKind};
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
-use std::thread::{self,Thread,Builder};
-use std::os::unix::io::RawFd;
-use std::os::unix::io::{FromRawFd,AsRawFd,IntoRawFd};
-use std::sync::mpsc::{self,channel,Receiver};
+use std::os::unix::io::IntoRawFd;
 use std::net::{SocketAddr,IpAddr,Shutdown};
-use std::str::{FromStr, from_utf8, from_utf8_unchecked};
+use std::str::from_utf8_unchecked;
 use mio::*;
 use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
 use uuid::Uuid;
-use nom::HexDisplay;
-use rand::random;
 use time::{SteadyTime,Duration};
-use slab::{Entry,VacantEntry,Slab};
+use slab::Slab;
 use mio_extras::timer::{Timer, Timeout};
 
-use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
-use sozu_command::proxy::{self,Application,ProxyRequestData,HttpFront,HttpListener,ProxyRequest,ProxyResponse,ProxyResponseStatus,LoadBalancingParams};
+use sozu_command::proxy::{Application,ProxyRequestData,HttpFront,HttpListener,ProxyRequest,ProxyResponse,ProxyResponseStatus};
 use sozu_command::logging;
 
-use super::{AppId,Backend,SessionResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
+use super::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use super::backends::BackendMap;
-use super::pool::{Pool,Checkout,Reset};
+use super::pool::Pool;
 use super::buffer_queue::BufferQueue;
-use super::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
+use super::protocol::{ProtocolResult,StickySession,Http,Pipe};
 use super::protocol::http::DefaultAnswerStatus;
 use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use super::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
-use super::socket::{SocketHandler,SocketResult,server_bind};
+use super::socket::server_bind;
 use super::retry::RetryPolicy;
 use super::protocol::http::parser::{hostname_and_port, RequestState};
 use super::trie::TrieNode;
-use super::tcp;
 use util::UnwrapLog;
-use super::https_rustls;
 
 type BackendToken = Token;
 
@@ -1380,23 +1372,20 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
 mod tests {
   extern crate tiny_http;
   use super::*;
-  use slab::Slab;
-  use mio::Poll;
-  use std::collections::HashMap;
-  use std::net::{TcpListener, TcpStream, Shutdown};
+  use std::net::TcpStream;
   use std::io::{Read,Write};
   use std::{thread,str};
   use std::sync::{
     Arc, Barrier,
-    mpsc::channel
   };
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
-  use sozu_command::proxy::{ProxyRequestData,HttpFront,Backend,HttpListener,ProxyRequest,ProxyResponse, LoadBalancingParams};
+  use sozu_command::proxy::{ProxyRequestData,HttpFront,Backend,HttpListener,ProxyRequest,LoadBalancingParams};
   use buffer_queue::BufferQueue;
   use pool::Pool;
   use sozu_command::config::LoadBalancingAlgorithms;
+  use sozu_command::channel::Channel;
 
   #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
@@ -1623,7 +1612,6 @@ mod tests {
     });
   }
 
-  use mio::net;
   #[test]
   fn frontend_from_request_test() {
     let app_id1 = "app_1".to_owned();
