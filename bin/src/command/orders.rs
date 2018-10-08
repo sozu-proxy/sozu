@@ -654,7 +654,7 @@ impl CommandServer {
           None
         ));
       }).map_err(|e| {
-        error!("load_state error: {}", e);
+        error!("worker_state error: {}", e);
       })
     );
 
