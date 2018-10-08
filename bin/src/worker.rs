@@ -25,8 +25,8 @@ use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::proxy::{ProxyRequest,ProxyResponse};
-use sozu::network::server::Server;
-use sozu::network::metrics;
+use sozu::server::Server;
+use sozu::metrics;
 
 use util;
 use logging;

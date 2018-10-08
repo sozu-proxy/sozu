@@ -8,11 +8,11 @@ use mio::unix::UnixReady;
 use mio::tcp::TcpStream;
 use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
-use network::{SessionResult,Protocol,Readiness,SessionMetrics, LogDuration};
-use network::buffer_queue::BufferQueue;
-use network::socket::{SocketHandler,SocketResult};
-use network::protocol::ProtocolResult;
-use network::pool::{Pool,Checkout};
+use super::super::{SessionResult,Protocol,Readiness,SessionMetrics, LogDuration};
+use buffer_queue::BufferQueue;
+use socket::{SocketHandler,SocketResult};
+use protocol::ProtocolResult;
+use pool::{Pool,Checkout};
 use pool_crate::Reset;
 use util::UnwrapLog;
 

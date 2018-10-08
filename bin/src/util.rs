@@ -6,7 +6,7 @@ use libc;
 
 use logging;
 use sozu_command::config::Config;
-use sozu::network::metrics;
+use sozu::metrics;
 
 pub fn enable_close_on_exec(fd: RawFd) -> Option<i32> {
   fcntl(fd, FcntlArg::F_GETFD).map_err(|e| {

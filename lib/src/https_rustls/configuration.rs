@@ -32,19 +32,19 @@ use sozu_command::proxy::{self,Application,CertFingerprint,CertificateAndKey,
 use sozu_command::certificate::split_certificate_chain;
 use sozu_command::logging;
 
-use network::protocol::http::parser::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
-use network::buffer_queue::BufferQueue;
-use network::pool::{Pool,Checkout};
-use network::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
+use protocol::http::parser::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
+use buffer_queue::BufferQueue;
+use pool::{Pool,Checkout};
+use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus};
-use network::backends::BackendMap;
-use network::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession,CONN_RETRIES};
-use network::http::{self,DefaultAnswers, CustomAnswers};
-use network::socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
-use network::trie::*;
-use network::protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
-use network::protocol::http::DefaultAnswerStatus;
-use network::retry::RetryPolicy;
+use backends::BackendMap;
+use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession,CONN_RETRIES};
+use http::{self,DefaultAnswers, CustomAnswers};
+use socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
+use trie::*;
+use protocol::{ProtocolResult,TlsHandshake,Http,Pipe,StickySession};
+use protocol::http::DefaultAnswerStatus;
+use retry::RetryPolicy;
 use util::UnwrapLog;
 
 use super::resolver::{CertificateResolver,CertificateResolverWrapper};
@@ -709,9 +709,9 @@ impl ProxyConfiguration<Session> for Proxy {
   }
 }
 
-use network::server::HttpsProvider;
+use server::HttpsProvider;
 pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
-  use network::server::{self,ProxySessionCast};
+  use server::{self,ProxySessionCast};
 
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_listeners   = 1;

@@ -28,20 +28,20 @@ use sozu_command::proxy::{self,TcpFront,ProxyRequestData,ProxyRequest,ProxyRespo
 use sozu_command::proxy::TcpListener as TcpListenerConfig;
 use sozu_command::logging;
 
-use network::{AppId,Backend,SessionResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
+use {AppId,Backend,SessionResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
-use network::backends::BackendMap;
-use network::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
-use network::pool::{Pool,Checkout,Reset};
-use network::buffer_queue::BufferQueue;
-use network::socket::{SocketHandler,SocketResult,server_bind};
-use network::{http,https_rustls};
-use network::protocol::{Pipe, ProtocolResult};
-use network::protocol::proxy_protocol::send::SendProxyProtocol;
-use network::protocol::proxy_protocol::relay::RelayProxyProtocol;
-use network::protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use network::retry::RetryPolicy;
+use backends::BackendMap;
+use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
+use pool::{Pool,Checkout,Reset};
+use buffer_queue::BufferQueue;
+use socket::{SocketHandler,SocketResult,server_bind};
+use {http,https_rustls};
+use protocol::{Pipe, ProtocolResult};
+use protocol::proxy_protocol::send::SendProxyProtocol;
+use protocol::proxy_protocol::relay::RelayProxyProtocol;
+use protocol::proxy_protocol::expect::ExpectProxyProtocol;
+use retry::RetryPolicy;
 
 use util::UnwrapLog;
 
@@ -1005,7 +1005,7 @@ impl ProxyConfiguration<Session> for Proxy {
 
 
 pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, channel: ProxyChannel) {
-  use network::server::{self,ProxySessionCast};
+  use server::{self,ProxySessionCast};
 
   let mut poll          = Poll::new().expect("could not create event loop");
   let pool = Rc::new(RefCell::new(
@@ -1151,7 +1151,7 @@ mod tests {
   }
 
   pub fn start_proxy() -> Channel<ProxyRequest,ProxyResponse> {
-    use network::server::{self,ProxySessionCast};
+    use server::{self,ProxySessionCast};
 
     info!("listen for connections");
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");

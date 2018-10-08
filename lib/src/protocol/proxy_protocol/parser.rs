@@ -3,7 +3,7 @@ use nom::{be_u8, be_u16};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::convert::From;
 
-use network::protocol::proxy_protocol::header::*;
+use protocol::proxy_protocol::header::*;
 
 const PROTOCOL_SIGNATURE_V2: [u8; 12] = [0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A];
 

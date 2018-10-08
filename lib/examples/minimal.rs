@@ -6,7 +6,6 @@ extern crate time;
 use std::env;
 use std::thread;
 use std::io::stdout;
-use sozu::network;
 use sozu_command::proxy;
 use sozu_command::channel::Channel;
 use sozu_command::proxy::LoadBalancingParams;
@@ -31,7 +30,7 @@ fn main() {
   let jg = thread::spawn(move || {
     let max_buffers = 500;
     let buffer_size = 16384;
-    network::http::start(config, channel, max_buffers, buffer_size);
+    sozu::http::start(config, channel, max_buffers, buffer_size);
   });
 
   let http_front = proxy::HttpFront {

@@ -6,16 +6,16 @@ use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use nom::{Err,Offset};
-use network::protocol::proxy_protocol::header;
-use network::{Protocol, SessionResult};
-use network::Readiness;
-use network::protocol::ProtocolResult;
-use network::socket::{SocketHandler, SocketResult};
-use network::buffer_queue::BufferQueue;
-use network::SessionMetrics;
-use network::protocol::pipe::Pipe;
+use protocol::proxy_protocol::header;
+use {Protocol, SessionResult};
+use Readiness;
+use protocol::ProtocolResult;
+use socket::{SocketHandler, SocketResult};
+use buffer_queue::BufferQueue;
+use SessionMetrics;
+use protocol::pipe::Pipe;
 use super::parser::parse_v2_header;
-use network::pool::Checkout;
+use pool::Checkout;
 
 pub struct RelayProxyProtocol<Front:SocketHandler> {
   pub header_size:    Option<usize>,

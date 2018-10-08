@@ -211,7 +211,7 @@ pub fn udp_bind() -> UdpSocket {
 macro_rules! count (
   ($key:expr, $value: expr) => ({
     let v = $value;
-    $crate::network::metrics::METRICS.with(|metrics| {
+    $crate::metrics::METRICS.with(|metrics| {
       (*metrics.borrow_mut()).count_add($key, v);
     });
   })
@@ -231,7 +231,7 @@ macro_rules! decr (
 macro_rules! gauge (
   ($key:expr, $value: expr) => ({
     let v = $value;
-    $crate::network::metrics::METRICS.with(|metrics| {
+    $crate::metrics::METRICS.with(|metrics| {
       (*metrics.borrow_mut()).set_gauge($key, v);
     });
   })
@@ -241,7 +241,7 @@ macro_rules! gauge (
 macro_rules! gauge_add (
   ($key:expr, $value: expr) => ({
     let v = $value;
-    $crate::network::metrics::METRICS.with(|metrics| {
+    $crate::metrics::METRICS.with(|metrics| {
       (*metrics.borrow_mut()).gauge_add($key, v);
     });
   })
@@ -251,9 +251,9 @@ macro_rules! gauge_add (
 macro_rules! time (
   ($key:expr, $value: expr) => {
     use std::time::Instant;
-    use $crate::network::metrics::{MetricData,Subscriber};
+    use $crate::metrics::{MetricData,Subscriber};
     let v = $value;
-    $crate::network::metrics::METRICS.with(|metrics| {
+    $crate::metrics::METRICS.with(|metrics| {
       let ref mut m = *metrics.borrow_mut();
 
       m.receive_metric($key, None, None, MetricData::Time($value as usize));
@@ -261,9 +261,9 @@ macro_rules! time (
   };
   ($key:expr, $app_id:expr, $value: expr) => {
     use std::time::Instant;
-    use $crate::network::metrics::{MetricData,Subscriber};
+    use $crate::metrics::{MetricData,Subscriber};
     let v = $value;
-    $crate::network::metrics::METRICS.with(|metrics| {
+    $crate::metrics::METRICS.with(|metrics| {
       let ref mut m = *metrics.borrow_mut();
       let app: &str = $app_id;
 
@@ -276,8 +276,8 @@ macro_rules! time (
 macro_rules! record_backend_metrics (
   ($app_id:expr, $backend_id:expr, $response_time: expr, $bin: expr, $bout: expr) => {
     use std::time::Instant;
-    use $crate::network::metrics::{MetricData,Subscriber};
-    $crate::network::metrics::METRICS.with(|metrics| {
+    use $crate::metrics::{MetricData,Subscriber};
+    $crate::metrics::METRICS.with(|metrics| {
       let ref mut m = *metrics.borrow_mut();
       let app_id: &str = $app_id.as_str();
       let backend_id: &str = $backend_id;

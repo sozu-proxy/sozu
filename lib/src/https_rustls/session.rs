@@ -27,23 +27,23 @@ use sozu_command::channel::Channel;
 use sozu_command::proxy::{self,Application,CertFingerprint,CertificateAndKey,ProxyRequestData,HttpsFront,
   HttpsListener,ProxyRequest,ProxyResponse,ProxyResponseStatus};
 
-use network::protocol::http::parser::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
-use network::pool::{Pool,Checkout};
-use network::buffer_queue::BufferQueue;
-use network::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,SessionToken,
+use protocol::http::parser::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
+use pool::{Pool,Checkout};
+use buffer_queue::BufferQueue;
+use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,SessionToken,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
-use network::backends::BackendMap;
-use network::server::{Server,ProxyChannel,ListenToken};
-use network::http::{self,DefaultAnswers};
-use network::socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
-use network::trie::*;
-use network::protocol::{ProtocolResult,Http,Pipe,StickySession};
-use network::protocol::rustls::TlsHandshake;
-use network::protocol::http::DefaultAnswerStatus;
-use network::protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use network::retry::RetryPolicy;
-use network::tcp;
+use backends::BackendMap;
+use server::{Server,ProxyChannel,ListenToken};
+use http::{self,DefaultAnswers};
+use socket::{SocketHandler,SocketResult,server_bind,FrontRustls};
+use trie::*;
+use protocol::{ProtocolResult,Http,Pipe,StickySession};
+use protocol::rustls::TlsHandshake;
+use protocol::http::DefaultAnswerStatus;
+use protocol::proxy_protocol::expect::ExpectProxyProtocol;
+use retry::RetryPolicy;
+use tcp;
 use util::UnwrapLog;
 use super::configuration::{Proxy,TlsApp};
 

@@ -31,12 +31,12 @@ use sozu_command::proxy::{self,TcpFront,ProxyRequestData,Backend,MessageId,Proxy
   ProxyResponseData,ProxyResponseStatus,ProxyRequest,Topic,Query,QueryAnswer,
   QueryApplicationType,TlsProvider,ListenerType,HttpsListener};
 
-use network::buffer_queue::BufferQueue;
-use network::{SessionResult,ConnectionError,Protocol,RequiredEvents,ProxySession,
+use buffer_queue::BufferQueue;
+use {SessionResult,ConnectionError,Protocol,RequiredEvents,ProxySession,
   CloseResult,AcceptError,BackendConnectAction,ProxyConfiguration};
-use network::{http,tcp,AppId};
-use network::pool::Pool;
-use network::metrics::METRICS;
+use {http,tcp,AppId};
+use pool::Pool;
+use metrics::METRICS;
 
 const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
@@ -1313,9 +1313,9 @@ impl ProxySession for ListenSession {
 }
 
 #[cfg(feature = "use-openssl")]
-use network::https_openssl;
+use https_openssl;
 
-use network::https_rustls;
+use https_rustls;
 
 #[cfg(feature = "use-openssl")]
 pub enum HttpsProvider {
@@ -1405,7 +1405,7 @@ impl HttpsProvider {
   }
 }
 
-use network::https_rustls::session::Session;
+use https_rustls::session::Session;
 #[cfg(not(feature = "use-openssl"))]
 impl HttpsProvider {
   pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>) -> HttpsProvider {

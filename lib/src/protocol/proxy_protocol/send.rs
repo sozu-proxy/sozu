@@ -5,7 +5,7 @@ use std::io::Read;
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
-use network::{
+use {
   SessionMetrics,
   SessionResult,
   Readiness,

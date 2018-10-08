@@ -22,7 +22,7 @@ MetricsData, AggregatedMetricsData, ProxyResponseData};
 use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
 use sozu_command::state::get_application_ids_by_domain;
 use sozu_command::logging;
-use sozu::network::metrics::METRICS;
+use sozu::metrics::METRICS;
 
 use super::{CommandServer,FrontToken,Worker};
 use super::client::parse;

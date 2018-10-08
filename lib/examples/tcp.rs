@@ -5,7 +5,6 @@ extern crate time;
 
 use std::thread;
 use std::io::stdout;
-use sozu::network;
 use sozu_command::proxy::{self, TcpListener, LoadBalancingParams};
 use sozu_command::channel::Channel;
 use sozu_command::logging::{Logger,LoggerBackend};
@@ -34,7 +33,7 @@ fn main() {
       expect_proxy: false,
     };
     Logger::init("TCP".to_string(), "debug", LoggerBackend::Stdout(stdout()), None);
-    network::tcp::start(listener, max_buffers, buffer_size, channel);
+    sozu::tcp::start(listener, max_buffers, buffer_size, channel);
   });
 
   let tcp_front = proxy::TcpFront {

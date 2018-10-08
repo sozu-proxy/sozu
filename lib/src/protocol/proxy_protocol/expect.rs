@@ -6,15 +6,15 @@ use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use nom::{Err,Offset};
-use network::protocol::proxy_protocol::header;
-use network::{Protocol, SessionResult};
-use network::Readiness;
-use network::protocol::ProtocolResult;
-use network::socket::{SocketHandler, SocketResult};
-use network::buffer_queue::BufferQueue;
-use network::SessionMetrics;
-use network::protocol::pipe::Pipe;
-use network::pool::Checkout;
+use protocol::proxy_protocol::header;
+use {Protocol, SessionResult};
+use Readiness;
+use protocol::ProtocolResult;
+use socket::{SocketHandler, SocketResult};
+use buffer_queue::BufferQueue;
+use SessionMetrics;
+use protocol::pipe::Pipe;
+use pool::Checkout;
 use super::parser::parse_v2_header;
 use super::header::ProxyAddr;
 
@@ -159,13 +159,13 @@ mod expect_test {
  use super::*;
 
   use super::super::parser::parse_v2_header;
-  use network::pool::Pool;
+  use pool::Pool;
 
   use std::{sync::{Arc, Barrier}, thread::{self, JoinHandle}, time::Duration, net::{SocketAddr, IpAddr, Ipv4Addr}};
   use mio::net::{TcpListener, TcpStream};
   use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
 
-  use network::protocol::proxy_protocol::header::*;
+  use protocol::proxy_protocol::header::*;
 
   // Flow diagram of the test below
   //                [connect]   [send proxy protocol]

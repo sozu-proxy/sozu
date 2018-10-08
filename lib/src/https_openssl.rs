@@ -39,25 +39,25 @@ use sozu_command::proxy::{self,Application,CertFingerprint,CertificateAndKey,
   ProxyResponseStatus,LoadBalancingParams,TlsVersion};
 use sozu_command::logging;
 
-use network::protocol::http::parser::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
-use network::pool::{Pool,Checkout};
-use network::buffer_queue::BufferQueue;
-use network::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
+use protocol::http::parser::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
+use pool::{Pool,Checkout};
+use buffer_queue::BufferQueue;
+use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
-use network::backends::BackendMap;
-use network::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
-use network::http::{self,DefaultAnswers, CustomAnswers};
-use network::socket::{SocketHandler,SocketResult,server_bind};
-use network::trie::*;
-use network::protocol::{ProtocolResult,Http,Pipe,StickySession};
-use network::protocol::openssl::TlsHandshake;
-use network::protocol::http::DefaultAnswerStatus;
-use network::protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use network::retry::RetryPolicy;
-use network::tcp;
+use backends::BackendMap;
+use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
+use http::{self,DefaultAnswers, CustomAnswers};
+use socket::{SocketHandler,SocketResult,server_bind};
+use trie::*;
+use protocol::{ProtocolResult,Http,Pipe,StickySession};
+use protocol::openssl::TlsHandshake;
+use protocol::http::DefaultAnswerStatus;
+use protocol::proxy_protocol::expect::ExpectProxyProtocol;
+use retry::RetryPolicy;
+use tcp;
 use util::UnwrapLog;
-use network::https_rustls;
+use https_rustls;
 
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct TlsApp {
@@ -1652,9 +1652,9 @@ yD0TrUjkXyjV/zczIYiYSROg9OE5UgYqswIBAg==
   ctx.set_tmp_dh(&dh)
 }
 
-use network::server::HttpsProvider;
+use server::HttpsProvider;
 pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
-  use network::server::{self,ProxySessionCast};
+  use server::{self,ProxySessionCast};
 
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_listeners   = 1;
@@ -1720,11 +1720,11 @@ mod tests {
   use std::sync::{Arc,Mutex};
   use std::cell::RefCell;
   use slab::Slab;
-  use network::pool::Pool;
+  use pool::Pool;
   use sozu_command::buffer::Buffer;
-  use network::buffer_queue::BufferQueue;
-  use network::http::DefaultAnswers;
-  use network::trie::TrieNode;
+  use buffer_queue::BufferQueue;
+  use http::DefaultAnswers;
+  use trie::TrieNode;
   use sozu_command::proxy::{ProxyRequestData,HttpsFront,Backend,ProxyRequest,ProxyResponse};
   use openssl::ssl::{SslContext, SslMethod, Ssl, SslStream};
   use openssl::x509::X509;

@@ -25,23 +25,23 @@ use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::proxy::{self,Application,ProxyRequestData,HttpFront,HttpListener,ProxyRequest,ProxyResponse,ProxyResponseStatus,LoadBalancingParams};
 use sozu_command::logging;
 
-use network::{AppId,Backend,SessionResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
+use super::{AppId,Backend,SessionResult,ConnectionError,RequiredEvents,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
-use network::backends::BackendMap;
-use network::pool::{Pool,Checkout,Reset};
-use network::buffer_queue::BufferQueue;
-use network::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
-use network::protocol::http::DefaultAnswerStatus;
-use network::protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use network::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
-use network::socket::{SocketHandler,SocketResult,server_bind};
-use network::retry::RetryPolicy;
-use network::protocol::http::parser::{hostname_and_port, RequestState};
-use network::trie::TrieNode;
-use network::tcp;
+use super::backends::BackendMap;
+use super::pool::{Pool,Checkout,Reset};
+use super::buffer_queue::BufferQueue;
+use super::protocol::{ProtocolResult,StickySession,TlsHandshake,Http,Pipe};
+use super::protocol::http::DefaultAnswerStatus;
+use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
+use super::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
+use super::socket::{SocketHandler,SocketResult,server_bind};
+use super::retry::RetryPolicy;
+use super::protocol::http::parser::{hostname_and_port, RequestState};
+use super::trie::TrieNode;
+use super::tcp;
 use util::UnwrapLog;
-use network::https_rustls;
+use super::https_rustls;
 
 type BackendToken = Token;
 
@@ -1324,7 +1324,7 @@ impl InitialConfiguration {
 
 
 pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, buffer_size: usize) {
-  use network::server::{self,ProxySessionCast};
+  use super::server::{self,ProxySessionCast};
   let mut event_loop  = Poll::new().expect("could not create event loop");
   let max_listeners   = 1;
 
@@ -1394,8 +1394,8 @@ mod tests {
   use std::str::FromStr;
   use std::time::Duration;
   use sozu_command::proxy::{ProxyRequestData,HttpFront,Backend,HttpListener,ProxyRequest,ProxyResponse, LoadBalancingParams};
-  use network::buffer_queue::BufferQueue;
-  use network::pool::Pool;
+  use buffer_queue::BufferQueue;
+  use pool::Pool;
   use sozu_command::config::LoadBalancingAlgorithms;
 
   #[allow(unused_mut, unused_must_use, unused_variables)]

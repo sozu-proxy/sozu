@@ -1,6 +1,6 @@
 use rand::{thread_rng, Rng};
 
-use network::Backend;
+use Backend;
 use sozu_command::config::LoadBalancingAlgorithms;
 
 use std::{ rc::Rc, cell::RefCell };
@@ -69,8 +69,8 @@ impl LoadBalancingAlgorithm for LeastConnectionsAlgorithm {
 mod test {
   use super::*;
   use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-  use network::BackendStatus;
-  use network::retry::{RetryPolicyWrapper, ExponentialBackoffPolicy};
+  use BackendStatus;
+  use retry::{RetryPolicyWrapper, ExponentialBackoffPolicy};
 
   fn create_backend(id: String, connections: Option<usize>) -> Backend {
     Backend {

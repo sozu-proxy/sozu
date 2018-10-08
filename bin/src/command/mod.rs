@@ -13,7 +13,7 @@ use libc::pid_t;
 use nix::unistd::Pid;
 use nix::sys::signal::{kill,Signal};
 
-use sozu::network::metrics::METRICS;
+use sozu::metrics::METRICS;
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;

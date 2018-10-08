@@ -7,7 +7,7 @@ use mio::net::TcpStream;
 
 use sozu_command::{proxy, config::LoadBalancingAlgorithms, proxy::LoadBalancingParams};
 
-use network::{AppId,Backend,ConnectionError,load_balancing::*};
+use super::{AppId,Backend,ConnectionError,load_balancing::*};
 
 #[derive(Debug)]
 pub struct BackendMap {

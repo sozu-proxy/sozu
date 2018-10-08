@@ -2,8 +2,8 @@
 #![allow(dead_code)]
 
 use sozu_command::buffer::Buffer;
-use network::buffer_queue::BufferQueue;
-use network::protocol::StickySession;
+use buffer_queue::BufferQueue;
+use protocol::StickySession;
 use super::cookies::{RequestCookie, parse_request_cookies};
 
 use nom::{digit, HexDisplay,IResult,Offset};
@@ -1820,7 +1820,7 @@ mod tests {
   use nom::Err;
   use nom::HexDisplay;
   use sozu_command::buffer::Buffer;
-  use network::buffer_queue::{BufferQueue,OutputElement};
+  use buffer_queue::{BufferQueue,OutputElement};
   use std::str;
   use std::io::Write;
 

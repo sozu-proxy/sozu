@@ -37,7 +37,7 @@ use libc::{cpu_set_t,pid_t};
 
 use command::Worker;
 use worker::{start_workers,get_executable_path};
-use sozu::network::metrics::METRICS;
+use sozu::metrics::METRICS;
 
 enum StartupError {
   ConfigurationFileNotSpecified,

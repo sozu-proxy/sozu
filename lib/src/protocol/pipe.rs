@@ -6,10 +6,10 @@ use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
-use network::{SessionResult,Readiness,SessionMetrics};
-use network::buffer_queue::BufferQueue;
-use network::socket::{SocketHandler,SocketResult};
-use network::pool::{Pool,Checkout,Reset};
+use {SessionResult,Readiness,SessionMetrics};
+use buffer_queue::BufferQueue;
+use socket::{SocketHandler,SocketResult};
+use pool::{Pool,Checkout,Reset};
 use nom::HexDisplay;
 
 type BackendToken = Token;

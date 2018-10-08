@@ -7,7 +7,6 @@ extern crate hex;
 use std::thread;
 use std::env;
 use std::io::stdout;
-use sozu::network;
 use sozu_command::logging::{Logger,LoggerBackend};
 use sozu_command::proxy;
 use sozu_command::proxy::LoadBalancingParams;
@@ -22,7 +21,7 @@ fn main() {
 
   info!("MAIN\tstarting up");
 
-  network::metrics::setup(&"127.0.0.1:8125".parse().unwrap(), "main", false, None);
+  sozu::metrics::setup(&"127.0.0.1:8125".parse().unwrap(), "main", false, None);
   gauge!("sozu.TEST", 42);
 
   let config = proxy::HttpListener {
@@ -34,7 +33,7 @@ fn main() {
   let jg = thread::spawn(move || {
     let max_buffers = 500;
     let buffer_size = 16384;
-    network::http::start(config, channel, max_buffers, buffer_size);
+    sozu::http::start(config, channel, max_buffers, buffer_size);
   });
 
   let http_front = proxy::HttpFront {
@@ -90,7 +89,7 @@ fn main() {
   let jg2 = thread::spawn(move || {
     let max_buffers = 500;
     let buffer_size = 16384;
-    network::https_rustls::configuration::start(config, channel2, max_buffers, buffer_size);
+    sozu::https_rustls::configuration::start(config, channel2, max_buffers, buffer_size);
   });
 
   let cert1 = include_str!("../assets/certificate.pem");
