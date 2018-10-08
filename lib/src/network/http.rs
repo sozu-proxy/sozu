@@ -37,7 +37,7 @@ use network::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use network::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
 use network::socket::{SocketHandler,SocketResult,server_bind};
 use network::retry::RetryPolicy;
-use parser::http11::{hostname_and_port, RequestState};
+use network::protocol::http::parser::{hostname_and_port, RequestState};
 use network::trie::TrieNode;
 use network::tcp;
 use util::UnwrapLog;

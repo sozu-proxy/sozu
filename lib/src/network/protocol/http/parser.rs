@@ -4,7 +4,7 @@
 use sozu_command::buffer::Buffer;
 use network::buffer_queue::BufferQueue;
 use network::protocol::StickySession;
-use parser::cookies::{RequestCookie, parse_request_cookies};
+use super::cookies::{RequestCookie, parse_request_cookies};
 
 use nom::{digit, HexDisplay,IResult,Offset};
 

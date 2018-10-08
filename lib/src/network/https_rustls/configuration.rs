@@ -32,7 +32,7 @@ use sozu_command::proxy::{self,Application,CertFingerprint,CertificateAndKey,
 use sozu_command::certificate::split_certificate_chain;
 use sozu_command::logging;
 
-use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
+use network::protocol::http::parser::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::buffer_queue::BufferQueue;
 use network::pool::{Pool,Checkout};
 use network::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,

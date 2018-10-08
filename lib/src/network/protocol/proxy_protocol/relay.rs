@@ -14,7 +14,7 @@ use network::socket::{SocketHandler, SocketResult};
 use network::buffer_queue::BufferQueue;
 use network::SessionMetrics;
 use network::protocol::pipe::Pipe;
-use parser::proxy_protocol::parse_v2_header;
+use super::parser::parse_v2_header;
 use network::pool::Checkout;
 
 pub struct RelayProxyProtocol<Front:SocketHandler> {

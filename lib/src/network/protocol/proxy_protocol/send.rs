@@ -171,7 +171,7 @@ mod send_test {
 
   use super::*;
 
-  use parser::proxy_protocol::parse_v2_header;
+  use super::super::parser::parse_v2_header;
 
   use std::{sync::{Arc, Barrier}, thread::{self, JoinHandle}, time::Duration, net::SocketAddr};
   use mio::net::{TcpListener, TcpStream};

@@ -15,7 +15,7 @@ use network::buffer_queue::BufferQueue;
 use network::SessionMetrics;
 use network::protocol::pipe::Pipe;
 use network::pool::Checkout;
-use parser::proxy_protocol::parse_v2_header;
+use super::parser::parse_v2_header;
 use super::header::ProxyAddr;
 
 #[derive(Clone,Copy)]
@@ -158,7 +158,7 @@ mod expect_test {
 
  use super::*;
 
-  use parser::proxy_protocol::parse_v2_header;
+  use super::super::parser::parse_v2_header;
   use network::pool::Pool;
 
   use std::{sync::{Arc, Barrier}, thread::{self, JoinHandle}, time::Duration, net::{SocketAddr, IpAddr, Ipv4Addr}};

@@ -180,4 +180,3 @@ extern crate quickcheck;
 
 #[macro_use] pub mod util;
 #[macro_use] pub mod network;
-pub mod parser;

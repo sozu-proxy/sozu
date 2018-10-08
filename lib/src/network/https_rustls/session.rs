@@ -27,7 +27,7 @@ use sozu_command::channel::Channel;
 use sozu_command::proxy::{self,Application,CertFingerprint,CertificateAndKey,ProxyRequestData,HttpsFront,
   HttpsListener,ProxyRequest,ProxyResponse,ProxyResponseStatus};
 
-use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
+use network::protocol::http::parser::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::pool::{Pool,Checkout};
 use network::buffer_queue::BufferQueue;
 use network::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,SessionToken,

@@ -8,8 +8,6 @@ use mio::unix::UnixReady;
 use mio::tcp::TcpStream;
 use time::{Duration, precise_time_s, precise_time_ns};
 use uuid::Uuid;
-use parser::http11::{HttpState,parse_request_until_stop, parse_response_until_stop,
-  BufferMove, RequestState, ResponseState, Chunk, Continue, RRequestLine, RStatusLine};
 use network::{SessionResult,Protocol,Readiness,SessionMetrics, LogDuration};
 use network::buffer_queue::BufferQueue;
 use network::socket::{SocketHandler,SocketResult};
@@ -17,6 +15,12 @@ use network::protocol::ProtocolResult;
 use network::pool::{Pool,Checkout};
 use pool_crate::Reset;
 use util::UnwrapLog;
+
+pub mod parser;
+mod cookies;
+
+use self::parser::{HttpState,parse_request_until_stop, parse_response_until_stop,
+  BufferMove, RequestState, ResponseState, Chunk, Continue, RRequestLine, RStatusLine};
 
 #[derive(Clone)]
 pub struct StickySession {

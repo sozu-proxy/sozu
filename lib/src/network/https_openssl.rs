@@ -39,7 +39,7 @@ use sozu_command::proxy::{self,Application,CertFingerprint,CertificateAndKey,
   ProxyResponseStatus,LoadBalancingParams,TlsVersion};
 use sozu_command::logging;
 
-use parser::http11::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
+use network::protocol::http::parser::{HttpState,RequestState,ResponseState,RRequestLine,parse_request_until_stop,hostname_and_port};
 use network::pool::{Pool,Checkout};
 use network::buffer_queue::BufferQueue;
 use network::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
