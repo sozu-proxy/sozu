@@ -1,6 +1,3 @@
-#![allow(unused_imports)]
-#![allow(dead_code)]
-
 use sozu_command::buffer::Buffer;
 use buffer_queue::BufferQueue;
 use protocol::StickySession;
@@ -1575,7 +1572,6 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
   }
 }
 
-#[allow(unused_variables)]
 pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue, sticky_name: &str) -> HttpState {
   let mut current_state  = rs.request.take().expect("the request state should never be None outside of this function");
   let mut header_end     = rs.req_header_end;
@@ -1687,7 +1683,6 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
   rs
 }
 
-#[allow(unused_variables)]
 pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue,
   sticky_name: &str, sticky_session: Option<StickySession>) -> HttpState {
 
@@ -1814,7 +1809,6 @@ fn add_sticky_session_to_response(rs: &mut HttpState, buf: &mut BufferQueue, sti
 }
 
 #[cfg(test)]
-#[allow(unused_must_use)]
 mod tests {
   use super::*;
   use nom::Err;
@@ -3254,7 +3248,6 @@ mod bench {
   use nom::HexDisplay;
 
   #[bench]
-  #[allow(unused_must_use)]
   fn req_bench(b: &mut Bencher) {
     let data = b"GET /reddit-init.en-us.O1zuMqOOQvY.js HTTP/1.1\r\n\
                  Host: www.redditstatic.com\r\n\

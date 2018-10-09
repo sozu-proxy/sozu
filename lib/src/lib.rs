@@ -89,10 +89,9 @@
 //! options are added to the proxy's state, it will send back an acknowledgement
 //! message.
 //!
-//! Here is the comple example for reference:
+//! Here is the complete example for reference:
 //!
 //! ```ignore
-//! #![allow(unused_variables,unused_must_use)]
 //! #[macro_use] extern crate log;
 //! extern crate env_logger;
 //! extern crate sozu_lib as sozu;
@@ -151,7 +150,6 @@
 //! ```
 //!
 #![cfg_attr(feature = "unstable", feature(test))]
-#![allow(dead_code, unused_must_use, unused_variables)]
 #[cfg(all(feature = "unstable", test))]
 extern crate test;
 

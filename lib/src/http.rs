@@ -1387,7 +1387,6 @@ mod tests {
   use sozu_command::config::LoadBalancingAlgorithms;
   use sozu_command::channel::Channel;
 
-  #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn mi() {
     setup_test_logger!();
@@ -1444,7 +1443,6 @@ mod tests {
     println!("Response: {}", str::from_utf8(&buffer[..index]).expect("could not make string from buffer"));
   }
 
-  #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn keep_alive() {
     setup_test_logger!();
@@ -1526,7 +1524,6 @@ mod tests {
     println!("Response: {}", str::from_utf8(&buffer2[..index]).expect("could not make string from buffer"));
   }
 
-  #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn https_redirect() {
     setup_test_logger!();
@@ -1587,7 +1584,6 @@ mod tests {
 
   use self::tiny_http::{Server, Response};
 
-  #[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server(port: u16, barrier: Arc<Barrier>) {
     thread::spawn(move|| {
       let server = Server::http(&format!("127.0.0.1:{}", port)).expect("could not create server");

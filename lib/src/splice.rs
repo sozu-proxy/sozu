@@ -91,7 +91,6 @@ mod tests {
     //assert!(false);
   }
 
-  #[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server() {
     let listener = TcpListener::bind("127.0.0.1:4242").expect("could not bind socket");
     fn handle_client(stream: &mut TcpStream, id: u8) {
@@ -122,7 +121,6 @@ mod tests {
     });
   }
 
-#[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server2(barrier: Arc<Barrier>) {
     let listener = TcpListener::bind("127.0.0.1:2121").expect("could not bind socket");
 

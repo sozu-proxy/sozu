@@ -1056,7 +1056,6 @@ mod tests {
   use std::os::unix::io::IntoRawFd;
   static TEST_FINISHED: AtomicBool = ATOMIC_BOOL_INIT;
 
-  #[allow(unused_mut, unused_must_use, unused_variables)]
   #[test]
   fn mi() {
     setup_test_logger!();
@@ -1105,7 +1104,6 @@ mod tests {
     TEST_FINISHED.store(true, Ordering::Relaxed);
   }
 
-  #[allow(unused_mut, unused_must_use, unused_variables)]
   fn start_server(barrier: Arc<Barrier>) {
     let listener = TcpListener::bind("127.0.0.1:5678").expect("could not parse address");
     fn handle_client(stream: &mut TcpStream, id: u8) {
