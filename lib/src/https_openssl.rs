@@ -424,7 +424,7 @@ impl Session {
       backend.retry_policy.fail();
       incr!("backend.connections.error");
       if !already_unavailable && backend.retry_policy.is_down() {
-        error!("backend server {} at {} is down", backend.backend_id, backend.address;)
+        error!("backend server {} at {} is down", backend.backend_id, backend.address);
         incr!("backend.down");
       }
     });
