@@ -1,38 +1,28 @@
-use std::thread::{self,Thread,Builder};
-use std::sync::mpsc::TryRecvError;
-use std::net::{SocketAddr,Shutdown};
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::cell::RefCell;
 use mio::net::*;
 use mio::*;
 use mio::unix::UnixReady;
-use std::collections::{HashSet,HashMap,VecDeque};
-use std::io::{self,Read,ErrorKind};
-use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd};
-use nom::HexDisplay;
-use std::error::Error;
+use std::collections::{HashSet,VecDeque};
+use std::os::unix::io::{FromRawFd,IntoRawFd};
 use slab::Slab;
-use std::io::Write;
-use std::str::FromStr;
-use std::marker::PhantomData;
-use std::fmt::Debug;
-use time::{self, SteadyTime, precise_time_ns};
+use time::{self, SteadyTime};
 use std::time::Duration;
-use rand::random;
 use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::state::{ConfigState,get_application_ids_by_domain};
-use sozu_command::proxy::{self,TcpFront,ProxyRequestData,Backend,MessageId,ProxyResponse,
+use sozu_command::proxy::{ProxyRequestData,MessageId,ProxyResponse,
   ProxyResponseData,ProxyResponseStatus,ProxyRequest,Topic,Query,QueryAnswer,
   QueryApplicationType,TlsProvider,ListenerType,HttpsListener};
 
 use buffer_queue::BufferQueue;
-use {SessionResult,ConnectionError,Protocol,RequiredEvents,ProxySession,
+use {SessionResult,ConnectionError,Protocol,ProxySession,
   CloseResult,AcceptError,BackendConnectAction,ProxyConfiguration};
-use {http,tcp,AppId};
+use {http,tcp};
 use pool::Pool;
 use metrics::METRICS;
 
@@ -1403,7 +1393,6 @@ impl HttpsProvider {
   }
 }
 
-use https_rustls::session::Session;
 #[cfg(not(feature = "use-openssl"))]
 impl HttpsProvider {
   pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>) -> HttpsProvider {

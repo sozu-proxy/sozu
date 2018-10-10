@@ -3,14 +3,13 @@ use buffer_queue::BufferQueue;
 use protocol::StickySession;
 use super::cookies::{RequestCookie, parse_request_cookies};
 
-use nom::{digit, HexDisplay,IResult,Offset};
+use nom::{HexDisplay,IResult,Offset};
 
-use nom::{AsChar, is_alphanumeric,is_space,space};
+use nom::{AsChar, is_alphanumeric, is_space};
 
 use url::Url;
 
 use std::{fmt,str};
-use std::cmp::min;
 use std::convert::From;
 use std::collections::HashSet;
 
@@ -338,8 +337,8 @@ named!(pub hostname_and_port<(&[u8],Option<&[u8]>)>,
   )
 );
 
-use std::str::{from_utf8, FromStr};
-use nom::{Err,ErrorKind,Needed};
+use std::str::from_utf8;
+use nom::{Err,Needed};
 
 pub fn is_hex_digit(chr: u8) -> bool {
   (chr >= 0x30 && chr <= 0x39) ||

@@ -246,7 +246,7 @@ macro_rules! time (
     $crate::metrics::METRICS.with(|metrics| {
       let ref mut m = *metrics.borrow_mut();
 
-      m.receive_metric($key, None, None, MetricData::Time($value as usize));
+      m.receive_metric($key, None, None, MetricData::Time(v as usize));
     });
   };
   ($key:expr, $app_id:expr, $value: expr) => {
@@ -256,7 +256,7 @@ macro_rules! time (
       let ref mut m = *metrics.borrow_mut();
       let app: &str = $app_id;
 
-      m.receive_metric($key, Some(app), None, MetricData::Time($value as usize));
+      m.receive_metric($key, Some(app), None, MetricData::Time(v as usize));
     });
   }
 );
