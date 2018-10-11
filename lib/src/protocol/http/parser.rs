@@ -1810,11 +1810,9 @@ fn add_sticky_session_to_response(rs: &mut HttpState, buf: &mut BufferQueue, sti
 #[cfg(test)]
 mod tests {
   use super::*;
-  use nom::Err;
-  use nom::HexDisplay;
+  use nom::{Err,ErrorKind,HexDisplay};
   use sozu_command::buffer::Buffer;
   use buffer_queue::{BufferQueue,OutputElement};
-  use std::str;
   use std::io::Write;
 
 

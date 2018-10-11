@@ -1394,6 +1394,9 @@ impl HttpsProvider {
 }
 
 #[cfg(not(feature = "use-openssl"))]
+use https_rustls::session::Session;
+
+#[cfg(not(feature = "use-openssl"))]
 impl HttpsProvider {
   pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>) -> HttpsProvider {
     if use_openssl {
