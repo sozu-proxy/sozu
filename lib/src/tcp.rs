@@ -173,10 +173,7 @@ impl Session {
 
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.front_hup(),
-      Some(State::SendProxyProtocol(_)) => {
-        SessionResult::CloseSession
-      },
-      _ => unreachable!(),
+      _ => SessionResult::CloseSession,
     }
   }
 
