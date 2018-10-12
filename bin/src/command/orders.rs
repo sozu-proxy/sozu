@@ -659,14 +659,14 @@ impl CommandServer {
     );
 
     match order {
-      ProxyRequestData::AddBackend(_) => self.backends_count += 1,
-      ProxyRequestData::RemoveBackend(_) => self.backends_count -= 1,
-      ProxyRequestData::AddHttpFront(_) | ProxyRequestData::AddHttpsFront(_) | ProxyRequestData::AddTcpFront(_) => {
-        self.frontends_count += 1;
-      },
-      ProxyRequestData::RemoveHttpFront(_) | ProxyRequestData::RemoveHttpsFront(_) | ProxyRequestData::RemoveTcpFront(_) => {
-        self.frontends_count -= 1;
-      },
+      ProxyRequestData::AddBackend(_)
+      | ProxyRequestData::RemoveBackend(_) => self.backends_count = self.state.count_backends(),
+      ProxyRequestData::AddHttpFront(_)
+      | ProxyRequestData::AddHttpsFront(_)
+      | ProxyRequestData::AddTcpFront(_)
+      | ProxyRequestData::RemoveHttpFront(_)
+      | ProxyRequestData::RemoveHttpsFront(_)
+      | ProxyRequestData::RemoveTcpFront(_) => self.frontends_count = self.state.count_frontends(),
       _ => {}
     };
 

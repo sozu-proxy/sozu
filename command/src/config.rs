@@ -523,6 +523,26 @@ pub struct HttpAppConfig {
 }
 
 impl HttpAppConfig {
+  pub fn remove_backend(&mut self, address: &SocketAddr) {
+    if let Some(index) = self.backends.iter().position(|b| b.address == *address) {
+      self.backends.remove(index);
+    }
+  }
+
+  pub fn remove_frontend(&mut self, address: &SocketAddr) {
+    if let Some(index) = self.frontends.iter().position(|f| f.address == *address) {
+      self.frontends.remove(index);
+    }
+  }
+
+  pub fn contains_backend(&self, address: &SocketAddr) -> bool {
+    self.backends.iter().find(|b| b.address == *address).is_some()
+  }
+
+  pub fn contains_frontend(&self, address: &SocketAddr) -> bool {
+    self.frontends.iter().find(|f| f.address == *address).is_some()
+  }
+
   pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
     let mut v = Vec::new();
 
@@ -578,6 +598,26 @@ pub struct TcpAppConfig {
 }
 
 impl TcpAppConfig {
+  pub fn remove_backend(&mut self, address: &SocketAddr) {
+    if let Some(index) = self.backends.iter().position(|b| b.address == *address) {
+      self.backends.remove(index);
+    }
+  }
+
+  pub fn remove_frontend(&mut self, address: &SocketAddr) {
+    if let Some(index) = self.frontends.iter().position(|f| f.address == *address) {
+      self.frontends.remove(index);
+    }
+  }
+
+  pub fn contains_backend(&self, address: &SocketAddr) -> bool {
+    self.backends.iter().find(|b| b.address == *address).is_some()
+  }
+
+  pub fn contains_frontend(&self, address: &SocketAddr) -> bool {
+    self.frontends.iter().find(|f| f.address == *address).is_some()
+  }
+
   pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
     let mut v = Vec::new();
 
@@ -626,6 +666,34 @@ pub enum AppConfig {
 }
 
 impl AppConfig {
+  pub fn remove_backend(&mut self, address: &SocketAddr) {
+    match *self {
+      AppConfig::Http(ref mut http) => http.remove_backend(address),
+      AppConfig::Tcp(ref mut tcp)   => tcp.remove_backend(address),
+    }
+  }
+
+  pub fn remove_frontend(&mut self, address: &SocketAddr) {
+    match *self {
+      AppConfig::Http(ref mut http) => http.remove_frontend(address),
+      AppConfig::Tcp(ref mut tcp)   => tcp.remove_frontend(address),
+    }
+  }
+
+  pub fn contains_backend(&self, address: &SocketAddr) -> bool {
+    match *self {
+      AppConfig::Http(ref http) => http.contains_backend(address),
+      AppConfig::Tcp(ref tcp)   => tcp.contains_backend(address),
+    }
+  }
+
+  pub fn contains_frontend(&self, address: &SocketAddr) -> bool {
+    match *self {
+      AppConfig::Http(ref http) => http.contains_frontend(address),
+      AppConfig::Tcp(ref tcp)   => tcp.contains_frontend(address),
+    }
+  }
+
   pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
     match *self {
       AppConfig::Http(ref http) => http.generate_orders(),
