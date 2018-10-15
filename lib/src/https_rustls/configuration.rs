@@ -322,12 +322,15 @@ impl Proxy {
     }).collect()
   }
 
-  pub fn add_application(&mut self, application: Application, event_loop: &mut Poll) {
-    let app_id = &application.app_id.clone();
-    let lb_alg = application.load_balancing_policy;
+  pub fn add_application(&mut self, mut application: Application) {
+    if let Some(answer_503) = application.answer_503.take() {
+      self.custom_answers
+        .entry(application.app_id.clone())
+        .and_modify(|c| c.ServiceUnavailable = Some(Rc::new(answer_503.clone().into_bytes())))
+        .or_insert(CustomAnswers{ ServiceUnavailable: Some(Rc::new(answer_503.into_bytes())) });
+    }
 
     self.applications.insert(application.app_id.clone(), application);
-    self.backends.borrow_mut().set_load_balancing_policy_for_app(app_id, lb_alg);
   }
 
   pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
@@ -562,7 +565,7 @@ impl ProxyConfiguration<Session> for Proxy {
     match message.order {
       ProxyRequestData::AddApplication(application) => {
         debug!("{} add application {:?}", message.id, application);
-        self.add_application(application, event_loop);
+        self.add_application(application);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::RemoveApplication(application) => {
