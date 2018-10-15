@@ -1215,10 +1215,22 @@ impl Proxy {
     self.custom_answers.remove(app_id);
   }
 
-  pub fn backend_from_app_id(&mut self, session: &mut Session, app_id: &str, front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
+  pub fn backend_from_request(&mut self, session: &mut Session, app_id: &str,
+  front_should_stick: bool, sticky_session: Option<String>) -> Result<TcpStream,ConnectionError> {
     session.http().map(|h| h.set_app_id(String::from(app_id)));
 
-    match self.backends.borrow_mut().backend_from_app_id(&app_id) {
+    let res = match (front_should_stick, sticky_session) {
+      (true, Some(sticky_session)) => {
+        self.backends.borrow_mut().backend_from_sticky_session(app_id, &sticky_session)
+          .map_err(|e| {
+            debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
+            e
+          })
+      },
+      _ => self.backends.borrow_mut().backend_from_app_id(app_id),
+    };
+
+    match res {
       Err(e) => {
         let answer = self.get_service_unavailable_answer(Some(app_id), &session.listen_token);
         session.set_answer(DefaultAnswerStatus::Answer503, answer);
@@ -1233,31 +1245,6 @@ impl Proxy {
             http.sticky_name = sticky_name;
           });
         }
-        session.metrics.backend_id = Some(backend.borrow().backend_id.clone());
-        session.metrics.backend_start();
-        session.backend = Some(backend);
-
-        Ok(conn)
-      }
-    }
-  }
-
-  pub fn backend_from_sticky_session(&mut self, session: &mut Session, app_id: &str, sticky_session: String) -> Result<TcpStream,ConnectionError> {
-    session.http().map(|h| h.set_app_id(String::from(app_id)));
-
-    match self.backends.borrow_mut().backend_from_sticky_session(app_id, &sticky_session) {
-      Err(e) => {
-        debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
-        let answer = self.get_service_unavailable_answer(Some(app_id), &session.listen_token);
-        session.set_answer(DefaultAnswerStatus::Answer503, answer);
-        Err(e)
-      },
-      Ok((backend, conn))  => {
-        let sticky_name = self.listeners[&session.listen_token].config.sticky_name.clone();
-        session.http().map(|http| {
-          http.sticky_session = Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or(sticky_session.clone())));
-          http.sticky_name = sticky_name;
-        });
         session.metrics.backend_id = Some(backend.borrow().backend_id.clone());
         session.metrics.backend_start();
         session.backend = Some(backend);
@@ -1415,10 +1402,7 @@ impl ProxyConfiguration<Session> for Proxy {
 
     let sticky_session = session.http().and_then(|http| http.state.as_ref()).unwrap().get_request_sticky_session();
     let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
-    let socket = match (front_should_stick, sticky_session) {
-      (true, Some(sticky_session)) => self.backend_from_sticky_session(session, &app_id, sticky_session)?,
-      _ => self.backend_from_app_id(session, &app_id, front_should_stick)?,
-    };
+    let socket = self.backend_from_request(session, &app_id, front_should_stick, sticky_session)?;
 
     session.http().map(|http| {
       http.app_id = Some(app_id.clone());
