@@ -105,7 +105,7 @@ impl Session {
           self.public_address = Some(public_address.ip());
 
           let ExpectProxyProtocol {
-            frontend, frontend_token, readiness, .. } = expect;
+            frontend, readiness, .. } = expect;
 
           let mut tls = TlsHandshake::new(ssl, frontend);
           tls.readiness.event = readiness.event;
@@ -296,10 +296,10 @@ impl Session {
 
   fn back_readable(&mut self) -> SessionResult {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Expect(_,_)                  => return SessionResult::CloseSession,
-      State::Http(ref mut http)           => http.back_readable(&mut self.metrics),
-      State::Handshake(ref mut handshake) => (ProtocolResult::Continue, SessionResult::CloseSession),
-      State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.back_readable(&mut self.metrics)),
+      State::Expect(_,_)             => return SessionResult::CloseSession,
+      State::Http(ref mut http)      => http.back_readable(&mut self.metrics),
+      State::Handshake(_)            => (ProtocolResult::Continue, SessionResult::CloseSession),
+      State::WebSocket(ref mut pipe) => (ProtocolResult::Continue, pipe.back_readable(&mut self.metrics)),
     };
 
     if upgrade == ProtocolResult::Continue {

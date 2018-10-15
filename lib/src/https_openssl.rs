@@ -723,7 +723,6 @@ pub struct Listener {
   address:         SocketAddr,
   fronts:          TrieNode<Vec<TlsApp>>,
   domains:         Arc<Mutex<TrieNode<CertFingerprint>>>,
-  pool:            Rc<RefCell<Pool<BufferQueue>>>,
   contexts:        Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
   default_context: SslContext,
   answers:         DefaultAnswers,
@@ -764,7 +763,6 @@ impl Listener {
       answers:         default,
       active:          false,
       fronts,
-      pool,
       config,
       ssl_options,
       token,
@@ -874,7 +872,7 @@ impl Listener {
     Some((context.build(), ssl_options))
   }
 
-  pub fn add_https_front(&mut self, tls_front: HttpsFront, event_loop: &mut Poll) -> bool {
+  pub fn add_https_front(&mut self, tls_front: HttpsFront) -> bool {
     {
       let mut contexts = unwrap_msg!(self.contexts.lock());
 
@@ -909,7 +907,7 @@ impl Listener {
     true
   }
 
-  pub fn remove_https_front(&mut self, front: HttpsFront, event_loop: &mut Poll) {
+  pub fn remove_https_front(&mut self, front: HttpsFront) {
     debug!("removing tls_front {:?}", front);
 
     let should_delete = {
@@ -939,7 +937,7 @@ impl Listener {
     }
   }
 
-  pub fn add_certificate(&mut self, certificate_and_key: CertificateAndKey, event_loop: &mut Poll) -> bool {
+  pub fn add_certificate(&mut self, certificate_and_key: CertificateAndKey) -> bool {
     //FIXME: insert some error management with a Result here
     let c = SslContext::builder(SslMethod::tls());
     if c.is_err() { return false; }
@@ -1054,7 +1052,7 @@ impl Listener {
   }
 
   // FIXME: return an error if the cert is still in use
-  pub fn remove_certificate(&mut self, fingerprint: CertFingerprint, event_loop: &mut Poll) {
+  pub fn remove_certificate(&mut self, fingerprint: CertFingerprint) {
     debug!("removing certificate {:?}", fingerprint);
     let mut contexts = unwrap_msg!(self.contexts.lock());
     let mut domains  = unwrap_msg!(self.domains.lock());
@@ -1196,10 +1194,7 @@ impl Proxy {
     }).collect()
   }
 
-  pub fn add_application(&mut self, mut application: Application, event_loop: &mut Poll) {
-    let app_id = &application.app_id.clone();
-    let lb_alg = application.load_balancing_policy;
-
+  pub fn add_application(&mut self, mut application: Application) {
     if let Some(answer_503) = application.answer_503.take() {
       self.custom_answers
         .entry(application.app_id.clone())
@@ -1210,7 +1205,7 @@ impl Proxy {
     self.applications.insert(application.app_id.clone(), application);
   }
 
-  pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
+  pub fn remove_application(&mut self, app_id: &str) {
     self.applications.remove(app_id);
     self.custom_answers.remove(app_id);
   }
@@ -1446,18 +1441,18 @@ impl ProxyConfiguration<Session> for Proxy {
     match message.order {
       ProxyRequestData::AddApplication(application) => {
         debug!("{} add application {:?}", message.id, application);
-        self.add_application(application, event_loop);
+        self.add_application(application);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::RemoveApplication(application) => {
         debug!("{} remove application {:?}", message.id, application);
-        self.remove_application(&application, event_loop);
+        self.remove_application(&application);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::AddHttpsFront(front) => {
         //info!("HTTPS\t{} add front {:?}", id, front);
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
-          listener.add_https_front(front, event_loop);
+          listener.add_https_front(front);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
           panic!();
@@ -1466,7 +1461,7 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::RemoveHttpsFront(front) => {
         //info!("HTTPS\t{} remove front {:?}", id, front);
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
-          listener.remove_https_front(front, event_loop);
+          listener.remove_https_front(front);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
           panic!();
@@ -1475,7 +1470,7 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::AddCertificate(add_certificate) => {
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == add_certificate.front) {
           //info!("HTTPS\t{} add certificate: {:?}", id, certificate_and_key);
-          listener.add_certificate(add_certificate.certificate, event_loop);
+          listener.add_certificate(add_certificate.certificate);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
           panic!();
@@ -1484,7 +1479,7 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::RemoveCertificate(remove_certificate) => {
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == remove_certificate.front) {
           //info!("TLS\t{} remove certificate with fingerprint {:?}", id, fingerprint);
-          listener.remove_certificate(remove_certificate.fingerprint, event_loop);
+          listener.remove_certificate(remove_certificate.fingerprint);
           //FIXME: should return an error if certificate still has fronts referencing it
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
@@ -1495,8 +1490,8 @@ impl ProxyConfiguration<Session> for Proxy {
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == replace.front) {
           //info!("TLS\t{} replace certificate of fingerprint {:?} with {:?}", id,
           //  replace.old_fingerprint, replace.new_certificate);
-          listener.remove_certificate(replace.old_fingerprint, event_loop);
-          listener.add_certificate(replace.new_certificate, event_loop);
+          listener.remove_certificate(replace.old_fingerprint);
+          listener.add_certificate(replace.new_certificate);
           //FIXME: should return an error if certificate still has fronts referencing it
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
@@ -1644,7 +1639,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
   if configuration.add_listener(config, pool.clone(), token).is_some() {
     if configuration.activate_listener(&mut event_loop, &front, None).is_some() {
 
-      let (scm_server, scm_client) = UnixStream::pair().unwrap();
+      let (scm_server, _scm_client) = UnixStream::pair().unwrap();
       let mut server_config: server::ServerConfig = Default::default();
       server_config.max_connections = max_buffers;
       let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
@@ -1666,9 +1661,6 @@ mod tests {
   use std::str::FromStr;
   use std::rc::Rc;
   use std::sync::{Arc,Mutex};
-  use std::cell::RefCell;
-  use pool::Pool;
-  use buffer_queue::BufferQueue;
   use http::DefaultAnswers;
   use trie::TrieNode;
   use openssl::ssl::{SslContext, SslMethod};
@@ -1719,7 +1711,6 @@ mod tests {
       domains:   rc_domains,
       default_context: context.build(),
       contexts: rc_ctx,
-      pool:      Rc::new(RefCell::new(Pool::with_capacity(1, 0, || BufferQueue::with_capacity(16384)))),
       answers:   DefaultAnswers {
         NotFound: Rc::new(Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..])),
         ServiceUnavailable: Rc::new(Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..])),

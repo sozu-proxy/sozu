@@ -35,19 +35,6 @@ use retry::RetryPolicy;
 
 use util::UnwrapLog;
 
-
-const SERVER: Token = Token(0);
-
-#[derive(Debug,Clone,PartialEq,Eq)]
-pub enum ConnectionStatus {
-  Initial,
-  ClientConnected,
-  Connected,
-  ClientClosed,
-  ServerClosed,
-  Closed
-}
-
 pub enum UpgradeResult {
   Continue,
   Close,
@@ -68,9 +55,6 @@ pub struct Session {
   backend_token:      Option<Token>,
   back_connected:     BackendConnectionStatus,
   accept_token:       Token,
-  status:             ConnectionStatus,
-  rx_count:           usize,
-  tx_count:           usize,
   app_id:             Option<String>,
   request_id:         String,
   metrics:            SessionMetrics,
@@ -121,9 +105,6 @@ impl Session {
       backend_token:      None,
       back_connected:     BackendConnectionStatus::NotConnected,
       accept_token:       accept_token,
-      status:             ConnectionStatus::Connected,
-      rx_count:           0,
-      tx_count:           0,
       app_id:             None,
       request_id:         Uuid::new_v4().hyphenated().to_string(),
       metrics:            SessionMetrics::new(),
@@ -769,7 +750,7 @@ impl Proxy {
     res
   }
 
-  pub fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr, event_loop: &mut Poll) -> bool {
+  pub fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr) -> bool {
     if let Some(listener) = self.listeners.values_mut().find(|l| l.address == *front) {
       self.fronts.insert(app_id.to_string(), listener.token);
       info!("add_tcp_front: fronts are now: {:?}", self.fronts);
@@ -780,7 +761,7 @@ impl Proxy {
     }
   }
 
-  pub fn remove_tcp_front(&mut self, front: SocketAddr, event_loop: &mut Poll) -> bool {
+  pub fn remove_tcp_front(&mut self, front: SocketAddr) -> bool {
     if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front) {
       if let Some(app_id) = listener.app_id.take() {
         self.fronts.remove(&app_id);
@@ -848,11 +829,11 @@ impl ProxyConfiguration<Session> for Proxy {
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
     match message.order {
       ProxyRequestData::AddTcpFront(front) => {
-        let _ = self.add_tcp_front(&front.app_id, &front.address, event_loop);
+        let _ = self.add_tcp_front(&front.app_id, &front.address);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
       ProxyRequestData::RemoveTcpFront(front) => {
-        let _ = self.remove_tcp_front(front.address.clone(), event_loop);
+        let _ = self.remove_tcp_front(front.address.clone());
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
       ProxyRequestData::SoftStop => {
@@ -1009,7 +990,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
   let mut configuration = Proxy::new(backends.clone());
   let _ = configuration.add_listener(config, pool.clone(), token);
   let _ = configuration.activate_listener(&mut poll, &front, None);
-  let (scm_server, scm_client) = UnixStream::pair().unwrap();
+  let (scm_server, _scm_client) = UnixStream::pair().unwrap();
 
   let mut server_config: server::ServerConfig = Default::default();
   server_config.max_connections = max_buffers;
@@ -1045,7 +1026,7 @@ mod tests {
     barrier.wait();
 
     let mut s1 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
-    let mut s3 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
+    let s3 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
     let mut s2 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
 
     s1.write(&b"hello "[..]).map_err(|e| {
@@ -1067,7 +1048,7 @@ mod tests {
       e
     }).unwrap();
 
-    s3.shutdown(Shutdown::Both);
+    s3.shutdown(Shutdown::Both).unwrap();
     let sz2 = s2.read(&mut res[..]).map_err(|e| {
       TEST_FINISHED.store(true, Ordering::Relaxed);
       e
@@ -1092,7 +1073,7 @@ mod tests {
       while let Ok(sz) = stream.read(&mut buf[..]) {
         if sz > 0 {
           println!("ECHO[{}] got \"{:?}\"", id, str::from_utf8(&buf[..sz]));
-          stream.write(&buf[..sz]);
+          stream.write(&buf[..sz]).unwrap();
         }
         if TEST_FINISHED.load(Ordering::Relaxed) {
           println!("backend server stopping");

@@ -27,21 +27,10 @@ use pool::Pool;
 use metrics::METRICS;
 use backends::BackendMap;
 
-const SERVER: Token = Token(0);
-const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
-const DEFAULT_BACK_TIMEOUT:  u64 = 50000;
-
 // Number of retries to perform on a server after a connection failure
 pub const CONN_RETRIES: u8 = 3;
 
 pub type ProxyChannel = Channel<ProxyResponse,ProxyRequest>;
-
-#[derive(Debug,Clone,PartialEq)]
-enum ProxyType {
-  HTTP,
-  HTTPS,
-  TCP,
-}
 
 #[derive(PartialEq)]
 pub enum ListenPortState {

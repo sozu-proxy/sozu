@@ -1811,7 +1811,6 @@ fn add_sticky_session_to_response(rs: &mut HttpState, buf: &mut BufferQueue, sti
 mod tests {
   use super::*;
   use nom::{Err,ErrorKind,HexDisplay};
-  use sozu_command::buffer::Buffer;
   use buffer_queue::{BufferQueue,OutputElement};
   use std::io::Write;
 
@@ -1899,7 +1898,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
@@ -1942,7 +1941,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
@@ -1981,7 +1980,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
@@ -2040,7 +2039,7 @@ mod tests {
 
       let mut buf = BufferQueue::with_capacity(2048);
       println!("skipping input:\n{}", (&input[..26]).to_hex(16));
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
       println!("unparsed data:\n{}", buf.unparsed_data().to_hex(16));
       println!("buffer output: {:?}", buf.output_queue);
       buf.consume_parsed_data(26);
@@ -2088,7 +2087,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
       let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
@@ -2124,7 +2123,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
 
       let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
       println!("result: {:?}", result);
@@ -2159,7 +2158,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
       let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
@@ -2193,7 +2192,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
       let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
@@ -2230,7 +2229,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
       let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
@@ -2264,7 +2263,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
       let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
@@ -2302,7 +2301,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
       let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
@@ -2340,7 +2339,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
       let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
@@ -2380,7 +2379,7 @@ mod tests {
             \r\n";
       let mut initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
 
       let new_header = b"Sozu-Id: 123456789\r\n";
       initial.added_req_header = String::from("Sozu-Id: 123456789\r\n");
@@ -2484,7 +2483,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
       let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
@@ -2527,7 +2526,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..125]);
+      buf.write(&input[..125]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
       let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
@@ -2551,7 +2550,7 @@ mod tests {
       );
 
       //buf.consume(124);
-      buf.write(&input[125..140]);
+      buf.write(&input[125..140]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
       let result = parse_request_until_stop(result, "", &mut buf,"SOZUBALANCEID");
@@ -2574,7 +2573,7 @@ mod tests {
         }
       );
 
-      buf.write(&input[153..]);
+      buf.write(&input[153..]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
       let result = parse_request_until_stop(result, "", &mut buf, "SOZUBALANCEID");
       println!("result({}): {:?}", line!(), result);
@@ -2615,7 +2614,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..78]);
+      buf.write(&input[..78]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
       let result = parse_response_until_stop(initial, "", &mut buf, "SOZUBALANCEID", None);
@@ -2638,7 +2637,7 @@ mod tests {
       );
 
       //buf.consume(78);
-      buf.write(&input[81..100]);
+      buf.write(&input[81..100]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
       let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
@@ -2662,7 +2661,7 @@ mod tests {
 
       //buf.consume(19);
       println!("remaining:\n{}", &input[110..].to_hex(16));
-      buf.write(&input[110..116]);
+      buf.write(&input[110..116]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
       let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
@@ -2684,7 +2683,7 @@ mod tests {
       );
 
       //buf.consume(5);
-      buf.write(&input[116..]);
+      buf.write(&input[116..]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
       let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
@@ -2737,7 +2736,7 @@ mod tests {
       };
       let mut buf = BufferQueue::with_capacity(2048);
 
-      buf.write(&input[..74]);
+      buf.write(&input[..74]).unwrap();
       buf.consume_parsed_data(72);
       //println!("parsing\n{}", buf.buffer.data().to_hex(16));
       let result = parse_response_until_stop(initial, "", &mut buf, "SOZUBALANCEID", None);
@@ -2764,7 +2763,7 @@ mod tests {
       );
 
       // we got the chunk header, but not the chunk content
-      buf.write(&input[74..77]);
+      buf.write(&input[74..77]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
       let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
       println!("result: {:?}", result);
@@ -2789,7 +2788,7 @@ mod tests {
       //buf.consume(5);
 
       // the external code copied the chunk content directly, starting at next chunk end
-      buf.write(&input[81..115]);
+      buf.write(&input[81..115]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
       let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
@@ -2809,7 +2808,7 @@ mod tests {
           added_res_header: String::from(""),
         }
       );
-      buf.write(&input[115..]);
+      buf.write(&input[115..]).unwrap();
       println!("parsing\n{}", &input[115..].to_hex(16));
       let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
@@ -2842,7 +2841,7 @@ mod tests {
           \r\n";
     let mut initial = HttpState::new();
     let mut buf = BufferQueue::with_capacity(2048);
-    buf.write(&input[..]);
+    buf.write(&input[..]).unwrap();
 
     let new_header = b"Sozu-Id: 123456789\r\n";
     initial.added_res_header = String::from("Sozu-Id: 123456789\r\n");
@@ -2889,7 +2888,7 @@ mod tests {
           \r\n";
     let mut initial = HttpState::new();
     let mut buf = BufferQueue::with_capacity(2048);
-    buf.write(&input[..]);
+    buf.write(&input[..]).unwrap();
 
     let new_header = b"Sozu-Id: 123456789\r\n";
     initial.added_res_header = String::from("Sozu-Id: 123456789\r\n");
@@ -2977,7 +2976,7 @@ mod tests {
         added_res_header: String::from(""),
       };
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
@@ -3022,7 +3021,7 @@ mod tests {
             \r\n";
       let initial = HttpState::new();
       let mut buf = BufferQueue::with_capacity(2048);
-      buf.write(&input[..]);
+      buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
@@ -3256,7 +3255,7 @@ mod bench {
                  Referer: http://www.reddit.com/\r\n\r\n";
 
     let mut buf = BufferQueue::with_capacity(data.len());
-    buf.write(&data[..]);
+    buf.write(&data[..]).unwrap();
     //println!("res: {:?}", parse_request_until_stop(initial, &mut buf, b""));
     b.iter(||{
       let initial = HttpState::new();

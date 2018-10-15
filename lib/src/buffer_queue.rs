@@ -514,6 +514,6 @@ mod tests {
     );
     assert_eq!(b.next_output_data(), &b"HIJ"[..]);
 
-    b.write(&b"KLMNOP"[..]);
+    b.write(&b"KLMNOP"[..]).unwrap();
   }
 }

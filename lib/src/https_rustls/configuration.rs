@@ -25,7 +25,7 @@ use sozu_command::logging;
 use protocol::http::parser::{RRequestLine,hostname_and_port};
 use buffer_queue::BufferQueue;
 use pool::Pool;
-use {AppId,Backend,ConnectionError,Protocol,
+use {AppId,ConnectionError,Protocol,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus};
 use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession,CONN_RETRIES};
@@ -145,7 +145,7 @@ impl Listener {
     Some(self.token)
   }
 
-  pub fn add_https_front(&mut self, tls_front: HttpsFront, event_loop: &mut Poll) -> bool {
+  pub fn add_https_front(&mut self, tls_front: HttpsFront) -> bool {
     if !(*self.resolver).add_front(&tls_front.fingerprint) {
       return false;
     }
@@ -170,7 +170,7 @@ impl Listener {
     true
   }
 
-  pub fn remove_https_front(&mut self, front: HttpsFront, event_loop: &mut Poll) {
+  pub fn remove_https_front(&mut self, front: HttpsFront) {
     debug!("removing tls_front {:?}", front);
 
     let should_delete = {
@@ -192,17 +192,17 @@ impl Listener {
     }
   }
 
-  pub fn add_certificate(&mut self, add_certificate: AddCertificate, event_loop: &mut Poll) -> bool {
+  pub fn add_certificate(&mut self, add_certificate: AddCertificate) -> bool {
     (*self.resolver).add_certificate(add_certificate).is_some()
   }
 
   // FIXME: return an error if the cert is still in use
-  pub fn remove_certificate(&mut self, remove_certificate: RemoveCertificate, event_loop: &mut Poll) {
+  pub fn remove_certificate(&mut self, remove_certificate: RemoveCertificate) {
     debug!("removing certificate {:?}", remove_certificate);
     (*self.resolver).remove_certificate(remove_certificate)
   }
 
-  pub fn replace_certificate(&mut self, replace_certificate: ReplaceCertificate, event_loop: &mut Poll) {
+  pub fn replace_certificate(&mut self, replace_certificate: ReplaceCertificate) {
     debug!("replacing certificate {:?}", replace_certificate);
     let ReplaceCertificate { front, new_certificate, old_fingerprint, old_names, new_names } = replace_certificate;
     let remove = RemoveCertificate {
@@ -333,7 +333,7 @@ impl Proxy {
     self.applications.insert(application.app_id.clone(), application);
   }
 
-  pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
+  pub fn remove_application(&mut self, app_id: &str) {
     self.applications.remove(app_id);
     self.custom_answers.remove(app_id);
   }
@@ -570,13 +570,13 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::RemoveApplication(application) => {
         debug!("{} remove application {:?}", message.id, application);
-        self.remove_application(&application, event_loop);
+        self.remove_application(&application);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::AddHttpsFront(front) => {
         //info!("HTTPS\t{} add front {:?}", id, front);
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
-          listener.add_https_front(front, event_loop);
+          listener.add_https_front(front);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
           panic!("unknown listener: {:?}", front.address)
@@ -585,7 +585,7 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::RemoveHttpsFront(front) => {
         //info!("HTTPS\t{} remove front {:?}", id, front);
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
-          listener.remove_https_front(front, event_loop);
+          listener.remove_https_front(front);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
           panic!("unknown listener: {:?}", front.address)
@@ -593,7 +593,7 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::AddCertificate(add_certificate) => {
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == add_certificate.front) {
-          listener.add_certificate(add_certificate, event_loop);
+          listener.add_certificate(add_certificate);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
           panic!()
@@ -602,7 +602,7 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::RemoveCertificate(remove_certificate) => {
         //FIXME: should return an error if certificate still has fronts referencing it
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == remove_certificate.front) {
-          listener.remove_certificate(remove_certificate, event_loop);
+          listener.remove_certificate(remove_certificate);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
           panic!()
@@ -611,7 +611,7 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::ReplaceCertificate(replace_certificate) => {
         //FIXME: should return an error if certificate still has fronts referencing it
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == replace_certificate.front) {
-          listener.replace_certificate(replace_certificate, event_loop);
+          listener.replace_certificate(replace_certificate);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
           panic!()
@@ -705,7 +705,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
   let mut configuration = Proxy::new(pool.clone(), backends.clone());
   if configuration.add_listener(config, pool.clone(), token).is_some() {
     if configuration.activate_listener(&mut event_loop, &front, None).is_some() {
-      let (scm_server, scm_client) = UnixStream::pair().unwrap();
+      let (scm_server, _scm_client) = UnixStream::pair().unwrap();
       let mut server_config: server::ServerConfig = Default::default();
       server_config.max_connections = max_buffers;
       let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),

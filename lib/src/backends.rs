@@ -252,7 +252,7 @@ mod backends_test {
     backend_map.add_backend(app_id, Backend::new(&format!("{}-1", app_id), backend_addr.parse().unwrap(), None, None, None));
 
     assert!(backend_map.backend_from_app_id(app_id).is_ok());
-    sender.send(());
+    sender.send(()).unwrap();
   }
 
   #[test]
@@ -287,7 +287,7 @@ mod backends_test {
     backend_map.add_backend(app_id, Backend::new(&format!("{}-3", app_id), backend_addr.parse().unwrap(), Some("server-3".to_string()), None, None));
 
     assert!(backend_map.backend_from_sticky_session(app_id, sticky_session).is_ok());
-    sender.send(());
+    sender.send(()).unwrap();
   }
 
   #[test]

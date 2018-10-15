@@ -672,7 +672,6 @@ pub struct Listener {
   listener:       Option<TcpListener>,
   pub address:    SocketAddr,
   fronts:         TrieNode<Vec<HttpFront>>,
-  pool:           Rc<RefCell<Pool<BufferQueue>>>,
   answers:        DefaultAnswers,
   config:         HttpListener,
   pub token:      Token,
@@ -723,10 +722,7 @@ impl Proxy {
     }).collect()
   }
 
-  pub fn add_application(&mut self, mut application: Application, event_loop: &mut Poll) {
-    let app_id = &application.app_id.clone();
-    let lb_alg = application.load_balancing_policy;
-
+  pub fn add_application(&mut self, mut application: Application) {
     if let Some(answer_503) = application.answer_503.take() {
       self.custom_answers
         .entry(application.app_id.clone())
@@ -737,7 +733,7 @@ impl Proxy {
     self.applications.insert(application.app_id.clone(), application);
   }
 
-  pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
+  pub fn remove_application(&mut self, app_id: &str) {
     self.applications.remove(app_id);
     self.custom_answers.remove(app_id);
   }
@@ -871,7 +867,6 @@ impl Listener {
       listener: None,
       address: config.front,
       fronts:  TrieNode::root(),
-      pool,
       answers: default,
       config,
       token,
@@ -899,7 +894,7 @@ impl Listener {
     Some(self.token)
   }
 
-  pub fn add_http_front(&mut self, mut http_front: HttpFront, event_loop: &mut Poll) -> Result<(), String> {
+  pub fn add_http_front(&mut self, mut http_front: HttpFront) -> Result<(), String> {
     match ::idna::domain_to_ascii(&http_front.hostname) {
       Ok(hostname) => {
         http_front.hostname = hostname;
@@ -923,7 +918,7 @@ impl Listener {
     }
   }
 
-  pub fn remove_http_front(&mut self, mut front: HttpFront, event_loop: &mut Poll) -> Result<(), String> {
+  pub fn remove_http_front(&mut self, mut front: HttpFront) -> Result<(), String> {
     debug!("removing http_front {:?}", front);
     match ::idna::domain_to_ascii(&front.hostname) {
       Ok(hostname) => {
@@ -1098,18 +1093,18 @@ impl ProxyConfiguration<Session> for Proxy {
     match message.order {
       ProxyRequestData::AddApplication(application) => {
         debug!("{} add application {:?}", message.id, application);
-        self.add_application(application, event_loop);
+        self.add_application(application);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::RemoveApplication(application) => {
         debug!("{} remove application {:?}", message.id, application);
-        self.remove_application(&application, event_loop);
+        self.remove_application(&application);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::AddHttpFront(front) => {
         debug!("{} add front {:?}", message.id, front);
         if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
-          match listener.add_http_front(front, event_loop) {
+          match listener.add_http_front(front) {
             Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
             Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err), data: None }
           }
@@ -1123,7 +1118,7 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::RemoveHttpFront(front) => {
         debug!("{} front {:?}", message.id, front);
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
-          match (*listener).remove_http_front(front, event_loop) {
+          match (*listener).remove_http_front(front) {
             Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
             Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err), data: None }
           }
@@ -1348,8 +1343,6 @@ mod tests {
   use std::str::FromStr;
   use std::time::Duration;
   use sozu_command::proxy::{ProxyRequestData,HttpFront,Backend,HttpListener,ProxyRequest,LoadBalancingParams};
-  use buffer_queue::BufferQueue;
-  use pool::Pool;
   use sozu_command::config::LoadBalancingAlgorithms;
   use sozu_command::channel::Channel;
 
@@ -1384,7 +1377,7 @@ mod tests {
 
     // 5 seconds of timeout
     client.set_read_timeout(Some(Duration::new(5,0)));
-    let mut w  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\nConnection: Close\r\n\r\n"[..]);
+    let w = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\nConnection: Close\r\n\r\n"[..]);
     println!("http client write: {:?}", w);
 
     barrier.wait();
@@ -1397,7 +1390,7 @@ mod tests {
         break;
       }
 
-      let mut r = client.read(&mut buffer[index..]);
+      let r = client.read(&mut buffer[index..]);
       println!("http client read: {:?}", r);
       match r {
         Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
@@ -1440,7 +1433,7 @@ mod tests {
     // 5 seconds of timeout
     client.set_read_timeout(Some(Duration::new(5,0)));
 
-    let mut w  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..]);
+    let w = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..]).unwrap();
     println!("http client write: {:?}", w);
     barrier.wait();
 
@@ -1453,7 +1446,7 @@ mod tests {
         break;
       }
 
-      let mut r = client.read(&mut buffer[index..]);
+      let r = client.read(&mut buffer[index..]);
       println!("http client read: {:?}", r);
       match r {
         Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
@@ -1465,7 +1458,7 @@ mod tests {
     println!("Response: {}", str::from_utf8(&buffer[..index]).expect("could not make string from buffer"));
 
     println!("first request ended, will send second one");
-    let mut w2  = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..]);
+    let w2 = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..]);
     println!("http client write: {:?}", w2);
     barrier.wait();
 
@@ -1478,7 +1471,7 @@ mod tests {
         break;
       }
 
-      let mut r2 = client.read(&mut buffer2[index..]);
+      let r2 = client.read(&mut buffer2[index..]);
       println!("http client read: {:?}", r2);
       match r2 {
         Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
@@ -1520,7 +1513,7 @@ mod tests {
     // 5 seconds of timeout
     client.set_read_timeout(Some(Duration::new(5,0)));
 
-    let mut w  = client.write(&b"GET /redirected?true HTTP/1.1\r\nHost: localhost\r\nConnection: Close\r\n\r\n"[..]);
+    let w = client.write(&b"GET /redirected?true HTTP/1.1\r\nHost: localhost\r\nConnection: Close\r\n\r\n"[..]);
     println!("http client write: {:?}", w);
 
     let expected_answer = "HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://localhost/redirected?true\r\n\r\n";
@@ -1532,7 +1525,7 @@ mod tests {
         break;
       }
 
-      let mut r = client.read(&mut buffer[..]);
+      let r = client.read(&mut buffer[..]);
       println!("http client read: {:?}", r);
       match r {
         Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),
@@ -1564,7 +1557,7 @@ mod tests {
         );
 
         let response = Response::from_string("hello world");
-        request.respond(response);
+        request.respond(response).unwrap();
         println!("backend web server sent response");
         barrier.wait();
         println!("server session stopped");
@@ -1598,7 +1591,6 @@ mod tests {
       listener: None,
       address:  front,
       fronts,
-      pool:      Rc::new(RefCell::new(Pool::with_capacity(1,0, || BufferQueue::with_capacity(16384)))),
       answers:   DefaultAnswers {
         NotFound: Rc::new(Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..])),
         ServiceUnavailable: Rc::new(Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..])),
