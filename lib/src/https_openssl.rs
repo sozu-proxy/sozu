@@ -1156,17 +1156,17 @@ pub struct Proxy {
   listeners:      HashMap<Token, Listener>,
   applications:   HashMap<AppId, Application>,
   custom_answers: HashMap<AppId, CustomAnswers>,
-  backends:       BackendMap,
+  backends:       Rc<RefCell<BackendMap>>,
   pool:           Rc<RefCell<Pool<BufferQueue>>>,
 }
 
 impl Proxy {
-  pub fn new(pool: Rc<RefCell<Pool<BufferQueue>>>) -> Proxy {
+  pub fn new(pool: Rc<RefCell<Pool<BufferQueue>>>, backends: Rc<RefCell<BackendMap>>) -> Proxy {
     Proxy {
       listeners : HashMap::new(),
       applications: HashMap::new(),
       custom_answers: HashMap::new(),
-      backends: BackendMap::new(),
+      backends,
       pool,
     }
   }
@@ -1208,7 +1208,6 @@ impl Proxy {
     }
 
     self.applications.insert(application.app_id.clone(), application);
-    self.backends.set_load_balancing_policy_for_app(app_id, lb_alg);
   }
 
   pub fn remove_application(&mut self, app_id: &str, event_loop: &mut Poll) {
@@ -1216,20 +1215,10 @@ impl Proxy {
     self.custom_answers.remove(app_id);
   }
 
-
-  pub fn add_backend(&mut self, app_id: &str, backend: Backend, event_loop: &mut Poll) {
-    self.backends.add_backend(app_id, backend);
-  }
-
-  pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
-    self.backends.remove_backend(app_id, backend_address);
-  }
-
-
   pub fn backend_from_app_id(&mut self, session: &mut Session, app_id: &str, front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
     session.http().map(|h| h.set_app_id(String::from(app_id)));
 
-    match self.backends.backend_from_app_id(&app_id) {
+    match self.backends.borrow_mut().backend_from_app_id(&app_id) {
       Err(e) => {
         let answer = self.get_service_unavailable_answer(Some(app_id), &session.listen_token);
         session.set_answer(DefaultAnswerStatus::Answer503, answer);
@@ -1256,7 +1245,7 @@ impl Proxy {
   pub fn backend_from_sticky_session(&mut self, session: &mut Session, app_id: &str, sticky_session: String) -> Result<TcpStream,ConnectionError> {
     session.http().map(|h| h.set_app_id(String::from(app_id)));
 
-    match self.backends.backend_from_sticky_session(app_id, &sticky_session) {
+    match self.backends.borrow_mut().backend_from_sticky_session(app_id, &sticky_session) {
       Err(e) => {
         debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
         let answer = self.get_service_unavailable_answer(Some(app_id), &session.listen_token);
@@ -1394,7 +1383,7 @@ impl ProxyConfiguration<Session> for Proxy {
     if (session.http().and_then(|h| h.app_id.as_ref()) == Some(&app_id)) && session.back_connected == BackendConnectionStatus::Connected {
       if session.backend.as_ref().map(|backend| {
          let ref backend = *backend.borrow();
-         self.backends.has_backend(&app_id, backend)
+         self.backends.borrow().has_backend(&app_id, backend)
       }).unwrap_or(false) {
         //matched on keepalive
         session.metrics.backend_id = session.backend.as_ref().map(|i| i.borrow().backend_id.clone());
@@ -1530,17 +1519,6 @@ impl ProxyConfiguration<Session> for Proxy {
           panic!();
         }
       },
-      ProxyRequestData::AddBackend(backend) => {
-        debug!("{} add backend {:?}", message.id, backend);
-        let new_backend = Backend::new(&backend.backend_id, backend.address.clone(), backend.sticky_id.clone(), backend.load_balancing_parameters, backend.backup);
-        self.add_backend(&backend.app_id, new_backend, event_loop);
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
-      },
-      ProxyRequestData::RemoveBackend(backend) => {
-        debug!("{} remove backend {:?}", message.id, backend);
-        self.remove_backend(&backend.app_id, &backend.address, event_loop);
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
-      },
       ProxyRequestData::RemoveListener(remove) => {
         info!("removing https listener att address: {:?}", remove.front);
         fixme!();
@@ -1652,6 +1630,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
   let pool = Rc::new(RefCell::new(
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
+  let backends = Rc::new(RefCell::new(BackendMap::new()));
 
   let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
   {
@@ -1676,7 +1655,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
     Token(e.index().0)
   };
 
-  let mut configuration = Proxy::new(pool.clone());
+  let mut configuration = Proxy::new(pool.clone(), backends.clone());
   let front = config.front.clone();
   if configuration.add_listener(config, pool.clone(), token).is_some() {
     if configuration.activate_listener(&mut event_loop, &front, None).is_some() {
@@ -1685,7 +1664,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
       let mut server_config: server::ServerConfig = Default::default();
       server_config.max_connections = max_buffers;
       let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-        sessions, pool, None, Some(HttpsProvider::Openssl(configuration)), None, server_config, None);
+        sessions, pool, backends, None, Some(HttpsProvider::Openssl(configuration)), None, server_config, None);
 
       info!("starting event loop");
       server.run();

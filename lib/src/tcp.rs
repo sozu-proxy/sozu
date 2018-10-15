@@ -729,16 +729,16 @@ pub struct ApplicationConfiguration {
 
 pub struct Proxy {
   fronts:    HashMap<String, Token>,
-  backends:  BackendMap,
+  backends:  Rc<RefCell<BackendMap>>,
   listeners: HashMap<Token, Listener>,
   configs:   HashMap<AppId, ApplicationConfiguration>,
 }
 
 impl Proxy {
-  pub fn new() -> Proxy {
+  pub fn new(backends: Rc<RefCell<BackendMap>>) -> Proxy {
 
     Proxy {
-      backends:  BackendMap::new(),
+      backends,
       listeners: HashMap::new(),
       configs:   HashMap::new(),
       fronts:    HashMap::new(),
@@ -794,16 +794,8 @@ impl Proxy {
     }
   }
 
-  pub fn add_backend(&mut self, app_id: &str, backend: Backend, event_loop: &mut Poll) {
-    self.backends.add_backend(app_id, backend.clone());
-  }
-
-  pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr, event_loop: &mut Poll) {
-    let backend = self.backends.remove_backend(app_id, backend_address);
-  }
-
   fn backend_from_app_id(&mut self, session: &mut Session, app_id: &str) -> Result<TcpStream,ConnectionError> {
-    match self.backends.backend_from_app_id(app_id) {
+    match self.backends.borrow_mut().backend_from_app_id(app_id) {
       Err(e) => Err(e),
       Ok((backend, conn))  => {
         session.backend = Some(backend);
@@ -866,16 +858,6 @@ impl ProxyConfiguration<Session> for Proxy {
         let _ = self.remove_tcp_front(front.address.clone(), event_loop);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
-      ProxyRequestData::AddBackend(backend) => {
-        let new_backend = Backend::new(&backend.backend_id, backend.address.clone(), backend.sticky_id.clone(), backend.load_balancing_parameters, backend.backup);
-        self.add_backend(&backend.app_id, new_backend, event_loop);
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
-      },
-      ProxyRequestData::RemoveBackend(backend) => {
-        trace!("{:?}", backend);
-        self.remove_backend(&backend.app_id, &backend.address, event_loop);
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
-      },
       ProxyRequestData::SoftStop => {
         info!("{} processing soft shutdown", message.id);
         for (_, l) in self.listeners.iter_mut() {
@@ -908,7 +890,6 @@ impl ProxyConfiguration<Session> for Proxy {
           load_balancing_policy: application.load_balancing_policy,
         };
         self.configs.insert(application.app_id.clone(), config);
-        self.backends.set_load_balancing_policy_for_app(&application.app_id, application.load_balancing_policy);
 
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
@@ -1002,6 +983,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
   let pool = Rc::new(RefCell::new(
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
   ));
+  let backends = Rc::new(RefCell::new(BackendMap::new()));
 
   let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
   {
@@ -1027,7 +1009,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
   };
 
   let front = config.front.clone();
-  let mut configuration = Proxy::new();
+  let mut configuration = Proxy::new(backends.clone());
   let _ = configuration.add_listener(config, pool.clone(), token);
   let _ = configuration.activate_listener(&mut poll, &front, None);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
@@ -1035,7 +1017,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
   let mut server_config: server::ServerConfig = Default::default();
   server_config.max_connections = max_buffers;
   let mut server = Server::new(poll, channel, ScmSocket::new(scm_server.as_raw_fd()), sessions,
-    pool, None ,None, Some(configuration), server_config, None);
+    pool, backends, None ,None, Some(configuration), server_config, None);
 
   info!("starting event loop");
   server.run();
@@ -1153,6 +1135,7 @@ mod tests {
       let pool = Rc::new(RefCell::new(
         Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
       ));
+      let backends = Rc::new(RefCell::new(BackendMap::new()));
 
       let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
       {
@@ -1171,7 +1154,7 @@ mod tests {
         entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
       }
 
-      let mut configuration = Proxy::new();
+      let mut configuration = Proxy::new(backends.clone());
       let listener_config = TcpListenerConfig {
         front: "127.0.0.1:1234".parse().unwrap(),
         public_address: None,
@@ -1197,7 +1180,7 @@ mod tests {
       let mut server_config: server::ServerConfig = Default::default();
       server_config.max_connections = max_buffers;
       let mut s   = Server::new(poll, channel, ScmSocket::new(scm_server.into_raw_fd()),
-        sessions, pool, None, None, Some(configuration), server_config, None);
+        sessions, pool, backends, None, None, Some(configuration), server_config, None);
       info!("will run");
       s.run();
       info!("ending event loop");

@@ -21,10 +21,11 @@ use sozu_command::proxy::{ProxyRequestData,MessageId,ProxyResponse,
 
 use buffer_queue::BufferQueue;
 use {SessionResult,ConnectionError,Protocol,ProxySession,
-  CloseResult,AcceptError,BackendConnectAction,ProxyConfiguration};
+  CloseResult,AcceptError,BackendConnectAction,ProxyConfiguration,Backend};
 use {http,tcp};
 use pool::Pool;
 use metrics::METRICS;
+use backends::BackendMap;
 
 const SERVER: Token = Token(0);
 const DEFAULT_FRONT_TIMEOUT: u64 = 50000;
@@ -124,6 +125,7 @@ pub struct Server {
   front_timeout:   time::Duration,
   timer:           Timer<Token>,
   pool:            Rc<RefCell<Pool<BufferQueue>>>,
+  backends:        Rc<RefCell<BackendMap>>,
   scm_listeners:   Option<Listeners>,
   zombie_check_interval: time::Duration,
   accept_queue:    VecDeque<(TcpStream, ListenToken, Protocol, SteadyTime)>,
@@ -137,6 +139,7 @@ impl Server {
     let pool = Rc::new(RefCell::new(
       Pool::with_capacity(2*config.max_buffers, 0, || BufferQueue::with_capacity(config.buffer_size))
     ));
+    let backends = Rc::new(RefCell::new(BackendMap::new()));
 
     //FIXME: we will use a few entries for the channel, metrics socket and the listeners
     //FIXME: for HTTP/2, we will have more than 2 entries per session
@@ -158,15 +161,16 @@ impl Server {
     }
 
     let use_openssl = config.tls_provider == TlsProvider::Openssl;
-    let https = HttpsProvider::new(use_openssl, pool.clone());
+    let https = HttpsProvider::new(use_openssl, pool.clone(), backends.clone());
 
     let server_config = ServerConfig::from_config(&config);
-    Server::new(event_loop, channel, scm, sessions, pool, None, Some(https), None, server_config, Some(config_state))
+    Server::new(event_loop, channel, scm, sessions, pool, backends, None, Some(https), None, server_config, Some(config_state))
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
     sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken>,
     pool: Rc<RefCell<Pool<BufferQueue>>>,
+    backends: Rc<RefCell<BackendMap>>,
     http: Option<http::Proxy>,
     https: Option<HttpsProvider>,
     tcp:  Option<tcp::Proxy>,
@@ -203,9 +207,9 @@ impl Server {
       can_accept:      true,
       channel,
       queue:           VecDeque::new(),
-      http:            http.unwrap_or(http::Proxy::new(pool.clone())),
-      https:           https.unwrap_or(HttpsProvider::new(false, pool.clone())),
-      tcp:             tcp.unwrap_or(tcp::Proxy::new()),
+      http:            http.unwrap_or(http::Proxy::new(pool.clone(), backends.clone())),
+      https:           https.unwrap_or(HttpsProvider::new(false, pool.clone(), backends.clone())),
+      tcp:             tcp.unwrap_or(tcp::Proxy::new(backends.clone())),
       config_state:    ConfigState::new(),
       scm,
       sessions,
@@ -214,6 +218,7 @@ impl Server {
       scm_listeners:   None,
       timer,
       pool,
+      backends,
       front_timeout: time::Duration::seconds(i64::from(server_config.front_timeout)),
       zombie_check_interval: time::Duration::seconds(i64::from(server_config.zombie_check_interval)),
       accept_queue:    VecDeque::new(),
@@ -505,6 +510,31 @@ impl Server {
 
   pub fn notify_proxys(&mut self, message: ProxyRequest) {
     self.config_state.handle_order(&message.order);
+
+    match message {
+      ProxyRequest { ref id, order: ProxyRequestData::AddApplication(ref application) } => {
+        self.backends.borrow_mut().set_load_balancing_policy_for_app(&application.app_id,
+          application.load_balancing_policy);
+        //not returning because the message must still be handled by each proxy
+      },
+      ProxyRequest { ref id, order: ProxyRequestData::AddBackend(ref backend) } => {
+        let new_backend = Backend::new(&backend.backend_id, backend.address.clone(),
+          backend.sticky_id.clone(), backend.load_balancing_parameters.clone(), backend.backup);
+        self.backends.borrow_mut().add_backend(&backend.app_id, new_backend);
+
+        let answer = ProxyResponse { id: id.to_string(), status: ProxyResponseStatus::Ok, data: None };
+        self.queue.push_back(answer);
+        return;
+      },
+      ProxyRequest { ref id, order: ProxyRequestData::RemoveBackend(ref backend) } => {
+        self.backends.borrow_mut().remove_backend(&backend.app_id, &backend.address);
+
+        let answer = ProxyResponse { id: id.to_string(), status: ProxyResponseStatus::Ok, data: None };
+        self.queue.push_back(answer);
+        return;
+      },
+      _ => {},
+    };
 
     let topics = message.order.get_topics();
 
@@ -1318,11 +1348,11 @@ pub enum HttpsProvider {
 
 #[cfg(feature = "use-openssl")]
 impl HttpsProvider {
-  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>) -> HttpsProvider {
+  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
     if use_openssl {
-      HttpsProvider::Openssl(https_openssl::Proxy::new(pool))
+      HttpsProvider::Openssl(https_openssl::Proxy::new(pool, backends))
     } else {
-      HttpsProvider::Rustls(https_rustls::configuration::Proxy::new(pool))
+      HttpsProvider::Rustls(https_rustls::configuration::Proxy::new(pool, backends))
     }
   }
 
@@ -1398,12 +1428,12 @@ use https_rustls::session::Session;
 
 #[cfg(not(feature = "use-openssl"))]
 impl HttpsProvider {
-  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>) -> HttpsProvider {
+  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
     if use_openssl {
       error!("the openssl provider is not compiled, continuing with the rustls provider");
     }
 
-    let configuration = https_rustls::configuration::Proxy::new(pool);
+    let configuration = https_rustls::configuration::Proxy::new(pool, backends);
     HttpsProvider::Rustls(configuration)
   }
 
