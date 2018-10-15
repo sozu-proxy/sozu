@@ -1329,7 +1329,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
   };
 
   let front = config.front.clone();
-  let mut proxy = Proxy::new(pool.clone(), Rc::new(RefCell::new(BackendMap::new())));
+  let mut proxy = Proxy::new(pool.clone(), backends.clone());
   let _ = proxy.add_listener(config, pool.clone(), token);
   let _ = proxy.activate_listener(&mut event_loop, &front, None);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
