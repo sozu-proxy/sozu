@@ -18,7 +18,7 @@ use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners, ScmSocket};
 use sozu_command::proxy::{ProxyRequestData, ProxyRequest, Query, QueryAnswer, QueryApplicationType,
-MetricsData, AggregatedMetricsData, ProxyResponseData};
+MetricsData, AggregatedMetricsData, ProxyResponseData, HttpsFront, HttpFront, TcpFront};
 use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
 use sozu_command::state::get_application_ids_by_domain;
 use sozu_command::logging;
@@ -599,7 +599,28 @@ impl CommandServer {
       ::std::env::set_var("RUST_LOG", logging_filter);
     }
 
-    self.state.handle_order(&order);
+    if !self.state.handle_order(&order) {
+      // Check if the backend or frontend exist before deleting it
+      if worker_id.is_none() {
+        match order {
+          ProxyRequestData::RemoveBackend(ref backend) => {
+            let msg = format!("No such backend {} at {} for the application {}", backend.backend_id, backend.address, backend.app_id);
+            error!("{}", msg);
+            self.answer_error(token, message_id, msg, None);
+            return;
+          },
+          ProxyRequestData::RemoveHttpFront(HttpFront{ ref app_id, ref address, .. })
+          | ProxyRequestData::RemoveHttpsFront(HttpsFront{ ref app_id, ref address, .. })
+          | ProxyRequestData::RemoveTcpFront(TcpFront{ ref app_id, ref address }) => {
+            let msg = format!("No such frontend at {} for the application {}", address, app_id);
+            error!("{}", msg);
+            self.answer_error(token, message_id, msg, None);
+            return;
+          },
+          _ => {},
+        };
+      }
+    }
 
     let mut found = false;
     let mut futures = Vec::new();
