@@ -547,8 +547,20 @@ impl<Front:SocketHandler> Http<Front> {
     // if there's no host, continue parsing until we find it
     let has_host = unwrap_msg!(self.state.as_ref()).has_host();
     if !has_host {
-      self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-        &mut self.front_buf.as_mut().unwrap(), &self.sticky_name));
+      let (request_state, header_end) = self.state.as_mut()
+        .map(|s| (s.request.take().unwrap(), s.req_header_end.take()))
+        .unwrap_or((RequestState::Initial, None));
+      let (request_state, header_end) = parse_request_until_stop(request_state,
+        header_end, &mut self.front_buf.as_mut().unwrap(),
+        &unwrap_msg!(self.state.as_ref()).added_req_header,
+        &self.sticky_name);
+
+      self.state.as_mut().map(|s| {
+        s.request = Some(request_state);
+        s.req_header_end = header_end;
+      });
+      //self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
+      //  &mut self.front_buf.as_mut().unwrap(), &self.sticky_name));
       if unwrap_msg!(self.state.as_ref()).is_front_error() {
         self.log_request_error(metrics, "front parsing error, closing the connection");
         incr!("http.front_parse_errors");
@@ -596,8 +608,18 @@ impl<Front:SocketHandler> Http<Front> {
       },
       Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
         if ! self.front_buf.as_ref().unwrap().needs_input() {
-          self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-          &mut self.front_buf.as_mut().unwrap(), &self.sticky_name));
+          let (request_state, header_end) = self.state.as_mut()
+            .map(|s| (s.request.take().unwrap(), s.req_header_end.take()))
+            .unwrap_or((RequestState::Initial, None));
+          let (request_state, header_end) = parse_request_until_stop(request_state,
+            header_end, &mut self.front_buf.as_mut().unwrap(),
+            &unwrap_msg!(self.state.as_ref()).added_req_header,
+            &self.sticky_name);
+
+          self.state.as_mut().map(|s| {
+            s.request = Some(request_state);
+            s.req_header_end = header_end;
+          });
 
           if unwrap_msg!(self.state.as_ref()).is_front_error() {
             self.log_request_error(metrics, "front chunk parsing error, closing the connection");
@@ -612,8 +634,20 @@ impl<Front:SocketHandler> Http<Front> {
         SessionResult::Continue
       },
     _ => {
-        self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-          &mut self.front_buf.as_mut().unwrap(), &self.sticky_name));
+        let (request_state, header_end) = self.state.as_mut()
+          .map(|s| (s.request.take().unwrap(), s.req_header_end.take()))
+          .unwrap_or((RequestState::Initial, None));
+        let (request_state, header_end) = parse_request_until_stop(request_state,
+          header_end, &mut self.front_buf.as_mut().unwrap(),
+          &unwrap_msg!(self.state.as_ref()).added_req_header,
+          &self.sticky_name);
+
+        self.state.as_mut().map(|s| {
+          s.request = Some(request_state);
+          s.req_header_end = header_end;
+        });
+        //self.state = Some(parse_request_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
+        //  &mut self.front_buf.as_mut().unwrap(), &self.sticky_name));
 
         if unwrap_msg!(self.state.as_ref()).is_front_error() {
           self.log_request_error(metrics, "front parsing error, closing the connection");
@@ -1026,8 +1060,39 @@ impl<Front:SocketHandler> Http<Front> {
       },
       Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
         if ! self.back_buf.as_ref().unwrap().needs_input() {
-          self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-          &mut self.back_buf.as_mut().unwrap(), &self.sticky_name, self.sticky_session.take()));
+          let (response_state, header_end, is_head) = self.state.as_mut()
+            .map(|s| (s.response.take().unwrap(), s.res_header_end.take(),
+              s.request.as_ref().map(|request| request.is_head()).unwrap_or(false)))
+            .unwrap_or((ResponseState::Initial, None, false));
+
+          {
+            let sticky_session = self.sticky_session.as_ref().and_then(|session| {
+              if self.state.as_ref()
+                .and_then(|s| s.request.as_ref())
+                .and_then(|request| request.get_keep_alive())
+                .and_then(|conn| conn.sticky_session)
+                .map(|sticky_client| sticky_client != session.sticky_id)
+                .unwrap_or(false) {
+                  Some(session)
+                } else {
+                  None
+                }
+            });
+
+            let (response_state, header_end) = parse_response_until_stop(
+              response_state, header_end, &mut self.back_buf.as_mut().unwrap(),
+              is_head, &unwrap_msg!(self.state.as_ref()).added_res_header,
+              &self.sticky_name, sticky_session);
+
+
+            self.state.as_mut().map(|s| {
+              s.response = Some(response_state);
+              s.res_header_end = header_end;
+            });
+          }
+
+          //self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
+          //&mut self.back_buf.as_mut().unwrap(), &self.sticky_name, self.sticky_session.take()));
 
           if unwrap_msg!(self.state.as_ref()).is_back_error() {
             self.log_request_error(metrics, "back socket chunk parse error, closing connection");
@@ -1043,8 +1108,37 @@ impl<Front:SocketHandler> Http<Front> {
       },
       Some(ResponseState::Error(_,_,_,_,_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
       _ => {
-        self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
-        &mut self.back_buf.as_mut().unwrap(), &self.sticky_name, self.sticky_session.take()));
+        let (response_state, header_end, is_head) = self.state.as_mut()
+          .map(|s| (s.response.take().unwrap(), s.res_header_end.take(),
+            s.request.as_ref().map(|request| request.is_head()).unwrap_or(false)))
+          .unwrap_or((ResponseState::Initial, None, false));
+
+        {
+          let sticky_session = self.sticky_session.as_ref().and_then(|session| {
+            if self.state.as_ref()
+              .and_then(|s| s.request.as_ref())
+              .and_then(|request| request.get_keep_alive())
+              .and_then(|conn| conn.sticky_session)
+              .map(|sticky_client| sticky_client != session.sticky_id)
+              .unwrap_or(false) {
+                Some(session)
+              } else {
+                None
+              }
+          });
+
+          let (response_state2, header_end2) = parse_response_until_stop(
+            response_state, header_end, &mut self.back_buf.as_mut().unwrap(),
+            is_head, &unwrap_msg!(self.state.as_ref()).added_res_header,
+            &self.sticky_name, sticky_session);
+
+          self.state.as_mut().map(|s| {
+            s.response = Some(response_state2);
+            s.res_header_end = header_end2;
+          });
+        //self.state = Some(parse_response_until_stop(unwrap_msg!(self.state.take()), &self.request_id,
+        //&mut self.back_buf.as_mut().unwrap(), &self.sticky_name, self.sticky_session.take()));
+        };
 
         if unwrap_msg!(self.state.as_ref()).is_back_error() {
           self.log_request_error(metrics, "back socket parse error, closing connection");

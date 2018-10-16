@@ -1571,9 +1571,9 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
   }
 }
 
-pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue, sticky_name: &str) -> HttpState {
-  let mut current_state  = rs.request.take().expect("the request state should never be None outside of this function");
-  let mut header_end     = rs.req_header_end;
+pub fn parse_request_until_stop(mut current_state: RequestState, mut header_end: Option<usize>,
+  buf: &mut BufferQueue, added_req_header: &str, sticky_name: &str)
+  -> (RequestState, Option<usize>) {
   loop {
     let (mv, new_state) = parse_request(current_state, buf.unparsed_data(), sticky_name);
     //println!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, &buf.unparsed_data().to_hex(16), mv, new_state);
@@ -1592,12 +1592,12 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
             RequestState::RequestWithBodyChunks(_,_,_,Chunk::Initial) => {
               //println!("FOUND HEADER END (advance):{}", buf.start_parsing_position);
               header_end = Some(buf.start_parsing_position);
-              buf.insert_output(Vec::from(rs.added_req_header.as_bytes()));
+              buf.insert_output(Vec::from(added_req_header.as_bytes()));
               buf.slice_output(sz);
             },
             RequestState::RequestWithBody(_,ref mut conn,_,content_length) => {
               header_end = Some(buf.start_parsing_position);
-              buf.insert_output(Vec::from(rs.added_req_header.as_bytes()));
+              buf.insert_output(Vec::from(added_req_header.as_bytes()));
 
               // If we got "Expects: 100-continue", the body will be sent later
               if conn.continues == Continue::None {
@@ -1624,12 +1624,12 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
             RequestState::RequestWithBodyChunks(_,_,_,_) => {
               //println!("FOUND HEADER END (delete):{}", buf.start_parsing_position);
               header_end = Some(buf.start_parsing_position);
-              buf.insert_output(Vec::from(rs.added_req_header.as_bytes()));
+              buf.insert_output(Vec::from(added_req_header.as_bytes()));
               buf.delete_output(length);
             },
             RequestState::RequestWithBody(_,_,_,content_length) => {
               header_end = Some(buf.start_parsing_position);
-              buf.insert_output(Vec::from(rs.added_req_header.as_bytes()));
+              buf.insert_output(Vec::from(added_req_header.as_bytes()));
               buf.delete_output(length);
 
               buf.slice_output(content_length);
@@ -1675,19 +1675,13 @@ pub fn parse_request_until_stop(mut rs: HttpState, request_id: &str, buf: &mut B
     }
   }
 
-  //println!("END OF PARSE REQUEST, output queue: {:?}", buf.output_queue);
-  rs.request = Some(current_state);
-  rs.req_header_end = header_end;
-
-  rs
+  (current_state, header_end)
 }
 
-pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut BufferQueue,
-  sticky_name: &str, sticky_session: Option<StickySession>) -> HttpState {
-
-  let mut current_state = rs.response.take().expect("the response state should never be None outside of this function");
-  let mut header_end    = rs.res_header_end;
-  let is_head = rs.request.as_ref().map(|request| request.is_head()).unwrap_or(false);
+pub fn parse_response_until_stop(mut current_state: ResponseState, mut header_end: Option<usize>,
+    buf: &mut BufferQueue, is_head: bool, added_res_header: &str,
+    sticky_name: &str, sticky_session: Option<&StickySession>)
+  -> (ResponseState, Option<usize>) {
   loop {
     //trace!("PARSER\t{}\tpos[{}]: {:?}", request_id, position, current_state);
     let (mv, new_state) = parse_response(current_state, buf.unparsed_data(), is_head, sticky_name);
@@ -1705,8 +1699,8 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
             ResponseState::Response(_,_) |
             ResponseState::ResponseUpgrade(_,_,_) |
             ResponseState::ResponseWithBodyChunks(_,_,_) => {
-              buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
-              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session.clone());
+              buf.insert_output(Vec::from(added_res_header.as_bytes()));
+              add_sticky_session_to_response(buf, sticky_name, sticky_session);
 
               buf.consume_parsed_data(sz);
               header_end = Some(buf.start_parsing_position);
@@ -1714,8 +1708,8 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
               buf.slice_output(sz);
             },
             ResponseState::ResponseWithBody(_,_,content_length) => {
-              buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
-              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session.clone());
+              buf.insert_output(Vec::from(added_res_header.as_bytes()));
+              add_sticky_session_to_response(buf, sticky_name, sticky_session);
 
               buf.consume_parsed_data(sz);
               header_end = Some(buf.start_parsing_position);
@@ -1743,17 +1737,17 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
             ResponseState::ResponseWithBodyChunks(_,_,_) => {
               //println!("FOUND HEADER END (delete):{}", buf.start_parsing_position);
               header_end = Some(buf.start_parsing_position);
-              buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
-              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session.clone());
+              buf.insert_output(Vec::from(added_res_header.as_bytes()));
+              add_sticky_session_to_response(buf, sticky_name, sticky_session);
 
               buf.delete_output(length);
             },
             ResponseState::ResponseWithBody(_,_,content_length) => {
               header_end = Some(buf.start_parsing_position);
-              buf.insert_output(Vec::from(rs.added_res_header.as_bytes()));
+              buf.insert_output(Vec::from(added_res_header.as_bytes()));
               buf.delete_output(length);
 
-              add_sticky_session_to_response(&mut rs, buf, sticky_name, sticky_session.clone());
+              add_sticky_session_to_response(buf, sticky_name, sticky_session);
 
               buf.slice_output(content_length);
               buf.consume_parsed_data(content_length);
@@ -1783,27 +1777,14 @@ pub fn parse_response_until_stop(mut rs: HttpState, request_id: &str, buf: &mut 
   }
 
   //println!("end state: {:?}, input_queue {:?}, output_queue: {:?}", current_state, buf.input_queue, buf.output_queue);
-  rs.response = Some(current_state);
-  rs.res_header_end = header_end;
-
-  rs
+  (current_state, header_end)
 }
 
-fn add_sticky_session_to_response(rs: &mut HttpState, buf: &mut BufferQueue, sticky_name: &str, sticky_session: Option<StickySession>) {
-  if let Some(sticky_backend) = sticky_session.as_ref() {
-    // if the client has a sticky session that's different from the current backend
-    // (because the backend can no longer exist)
-    let send_sticky_to_client = rs.request
-      .as_ref()
-      .and_then(|request| request.get_keep_alive())
-      .and_then(|conn| conn.sticky_session)
-      .map(|sticky_client| sticky_client != sticky_backend.sticky_id)
-      .unwrap_or(true);
-
-    if send_sticky_to_client {
-      let sticky_cookie = format!("Set-Cookie: {}={}; Path=/\r\n", sticky_name, sticky_backend.sticky_id);
-      buf.insert_output(Vec::from(sticky_cookie.as_bytes()));
-    }
+fn add_sticky_session_to_response(buf: &mut BufferQueue,
+  sticky_name: &str, sticky_session: Option<&StickySession>) {
+  if let Some(ref sticky_backend) = sticky_session {
+    let sticky_cookie = format!("Set-Cookie: {}={}; Path=/\r\n", sticky_name, sticky_backend.sticky_id);
+    buf.insert_output(Vec::from(sticky_cookie.as_bytes()));
   }
 }
 
@@ -1896,13 +1877,13 @@ mod tests {
             Accept: */*\r\n\
             Content-Length: 200\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = RequestState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);
@@ -1914,19 +1895,15 @@ mod tests {
       assert_eq!(buf.start_parsing_position, 310);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(110),
-          res_header_end: None,
-          request: Some(RequestState::RequestWithBody(
+        (
+          RequestState::RequestWithBody(
             RRequestLine { method: Method::Get, uri: String::from("http://example.com:8888/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("example.com"),
             200
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(110)
+        )
       );
   }
 
@@ -1939,13 +1916,13 @@ mod tests {
             Accept: */*\r\n\
             Content-Length: 200\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = RequestState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);
@@ -1955,17 +1932,13 @@ mod tests {
       assert_eq!(buf.start_parsing_position, 65);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: None,
-          res_header_end: None,
-          request: Some(RequestState::Error(Some(
+        (
+          RequestState::Error(Some(
             RRequestLine { method: Method::Get, uri: String::from("http://example.com:8888/index.html"), version: Version::V11 },
           ),
-            Some(Connection::new()), Some(String::from("example.com")), None, None)),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+            Some(Connection::new()), Some(String::from("example.com")), None, None),
+          None
+        )
       );
   }
 
@@ -1978,13 +1951,13 @@ mod tests {
             Accept: */*\r\n\
             Content-Length: 200\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = RequestState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);
@@ -1996,19 +1969,15 @@ mod tests {
       assert_eq!(buf.start_parsing_position, 309);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(109),
-          res_header_end: None,
-          request: Some(RequestState::RequestWithBody(
+        (
+          RequestState::RequestWithBody(
             RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             200
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(109)
+        )
       );
   }
 
@@ -2021,21 +1990,14 @@ mod tests {
             Accept: */*\r\n\
             Content-Length: 200\r\n\
             \r\n";
-      let initial = HttpState {
-        req_header_end: None,
-        res_header_end: None,
-        request:  Some(RequestState::HasRequestLine(
+      let initial = RequestState::HasRequestLine(
           RRequestLine {
             method: Method::Get,
             uri: String::from("/index.html"),
             version: Version::V11
           },
           Connection::keep_alive()
-        )),
-        response: Some(ResponseState::Initial),
-        added_req_header: String::from(""),
-        added_res_header: String::from(""),
-      };
+        );
 
       let mut buf = BufferQueue::with_capacity(2048);
       println!("skipping input:\n{}", (&input[..26]).to_hex(16));
@@ -2047,7 +2009,7 @@ mod tests {
       println!("unparsed data after consume(26):\n{}", buf.unparsed_data().to_hex(16));
       println!("buffer output: {:?}", buf.output_queue);
 
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("unparsed data after parsing:\n{}", buf.unparsed_data().to_hex(16));
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
@@ -2060,19 +2022,15 @@ mod tests {
       assert_eq!(buf.start_parsing_position, 309);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(109),
-          res_header_end: None,
-          request:    Some(RequestState::RequestWithBody(
+        (
+          RequestState::RequestWithBody(
             RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
             Connection::keep_alive(),
             String::from("localhost:8888"),
             200
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(109)
+        )
       );
   }
 
@@ -2085,29 +2043,25 @@ mod tests {
             Transfer-Encoding: chunked\r\n\
             Accept: */*\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = RequestState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 116);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(116),
-          res_header_end: None,
-          request:    Some(RequestState::RequestWithBodyChunks(
+        (
+          RequestState::RequestWithBodyChunks(
             RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             Chunk::Initial
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(116)
+        )
       );
   }
 
@@ -2121,27 +2075,24 @@ mod tests {
             Accept: */*\r\n\
             Content-Length: 200\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = RequestState::Initial;
+
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 128);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: None,
-          res_header_end: None,
-          request: Some(RequestState::Error(Some(
+        (
+          RequestState::Error(Some(
             RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
           ),
             Some(Connection::new()), Some(String::from("localhost:8888")),
-            Some(LengthInformation::Length(120)), None)),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+            Some(LengthInformation::Length(120)), None),
+          None
+        )
       );
   }
 
@@ -2156,29 +2107,25 @@ mod tests {
             Transfer-Encoding: chunked\r\n\
             Accept: */*\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = RequestState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 136);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(136),
-          res_header_end: None,
-          request:  Some(RequestState::RequestWithBodyChunks(
+        (
+          RequestState::RequestWithBodyChunks(
             RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             Chunk::Initial
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(136)
+        )
       );
   }
 
@@ -2190,12 +2137,12 @@ mod tests {
             Host: localhost:8888\r\n\
             Connection: close\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = RequestState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer output: {:?}", buf.output_queue);
@@ -2205,18 +2152,14 @@ mod tests {
       assert_eq!(buf.start_parsing_position, 59);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(59),
-          res_header_end: None,
-          request:  Some(RequestState::Request(
+        (
+          RequestState::Request(
             RRequestLine { method: Method::Get, uri: String::from("/"), version: Version::V11 },
             Connection::close(),
             String::from("localhost:8888")
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(59)
+        )
       );
   }
 
@@ -2227,30 +2170,26 @@ mod tests {
           b"GET / HTTP/1.0\r\n\
             Host: localhost:8888\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = RequestState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 40);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(40),
-          res_header_end: None,
-          request:  Some(RequestState::Request(
+        (
+          RequestState::Request(
             RRequestLine { method: Method::Get, uri: String::from("/"), version: Version::V10 },
             Connection::new(),
             String::from("localhost:8888")
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(40)
+        )
       );
-      assert!(!result.request.unwrap().should_keep_alive());
+      assert!(!result.0.should_keep_alive());
   }
 
   #[test]
@@ -2261,12 +2200,12 @@ mod tests {
             Host: localhost:8888\r\n\
             Connection: keep-alive\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = RequestState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer output: {:?}", buf.output_queue);
@@ -2276,20 +2215,16 @@ mod tests {
       assert_eq!(buf.start_parsing_position, 64);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(64),
-          res_header_end: None,
-          request:  Some(RequestState::Request(
+        (
+          RequestState::Request(
             RRequestLine { method: Method::Get, uri: String::from("/"), version: Version::V10 },
             Connection::keep_alive(),
             String::from("localhost:8888")
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(64)
+        )
       );
-      assert!(result.request.unwrap().should_keep_alive());
+      assert!(result.0.should_keep_alive());
   }
 
   #[test]
@@ -2299,12 +2234,12 @@ mod tests {
           b"GET / HTTP/1.1\r\n\
             Host: localhost:8888\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = RequestState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("end buf:\n{}", buf.buffer.data().to_hex(16));
       println!("result: {:?}", result);
       assert_eq!(buf.output_queue, vec!(
@@ -2313,20 +2248,16 @@ mod tests {
       assert_eq!(buf.start_parsing_position, 40);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(40),
-          res_header_end: None,
-          request:  Some(RequestState::Request(
+        (
+          RequestState::Request(
             RRequestLine { method: Method::Get, uri: String::from("/"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888")
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(40)
+        )
       );
-      assert!(result.request.unwrap().should_keep_alive());
+      assert!(result.0.should_keep_alive());
   }
 
   #[test]
@@ -2337,12 +2268,12 @@ mod tests {
             Connection: close\r\n\
             Host: localhost:8888\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = RequestState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("end buf:\n{}", buf.buffer.data().to_hex(16));
       println!("result: {:?}", result);
       assert_eq!(buf.output_queue, vec!(
@@ -2351,20 +2282,16 @@ mod tests {
       assert_eq!(buf.start_parsing_position, 59);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(59),
-          res_header_end: None,
-          request:  Some(RequestState::Request(
+        (
+          RequestState::Request(
             RRequestLine { method: Method::Get, uri: String::from("/"), version: Version::V11 },
             Connection::close(),
             String::from("localhost:8888")
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(59)
+        )
       );
-      assert!(!result.request.unwrap().should_keep_alive());
+      assert!(!result.0.should_keep_alive());
   }
 
   #[test]
@@ -2377,13 +2304,12 @@ mod tests {
             Accept: */*\r\n\
             Content-Length: 200\r\n\
             \r\n";
-      let mut initial = HttpState::new();
+      let initial = RequestState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       let new_header = b"Sozu-Id: 123456789\r\n";
-      initial.added_req_header = String::from("Sozu-Id: 123456789\r\n");
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "Sozu-Id: 123456789\r\n", "SOZUBALANCEID");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer output: {:?}", buf.output_queue);
@@ -2395,19 +2321,15 @@ mod tests {
       assert_eq!(buf.start_parsing_position, 309);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(109),
-          res_header_end: None,
-          request: Some(RequestState::RequestWithBody(
+        (
+          RequestState::RequestWithBody(
             RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             200
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from("Sozu-Id: 123456789\r\n"),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(109)
+        )
       );
   }
 
@@ -2481,29 +2403,25 @@ mod tests {
             in\r\n\r\nchunks.\r\n\
             0\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = RequestState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 160);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(117),
-          res_header_end: None,
-          request:    Some(RequestState::RequestWithBodyChunks(
+        (
+          RequestState::RequestWithBodyChunks(
             RRequestLine { method: Method::Post, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             Chunk::Ended
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(117)
+        )
       );
   }
 
@@ -2524,75 +2442,63 @@ mod tests {
             in\r\n\r\nchunks.\r\n\
             0\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = RequestState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..125]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 124);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(117),
-          res_header_end: None,
-          request:    Some(RequestState::RequestWithBodyChunks(
+        (
+          RequestState::RequestWithBodyChunks(
             RRequestLine { method: Method::Post, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             Chunk::Copying
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(117)
+        )
       );
 
       //buf.consume(124);
       buf.write(&input[125..140]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_request_until_stop(result, "", &mut buf,"SOZUBALANCEID");
+      let result = parse_request_until_stop(result.0, result.1, &mut buf, "", "SOZUBALANCEID");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 153);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(117),
-          res_header_end: None,
-          request:    Some(RequestState::RequestWithBodyChunks(
+        (
+          RequestState::RequestWithBodyChunks(
             RRequestLine { method: Method::Post, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             Chunk::Copying
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(117)
+        )
       );
 
       buf.write(&input[153..]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_request_until_stop(result, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(result.0, result.1, &mut buf, "", "SOZUBALANCEID");
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 160);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(117),
-          res_header_end: None,
-          request:    Some(RequestState::RequestWithBodyChunks(
+        (
+          RequestState::RequestWithBodyChunks(
             RRequestLine { method: Method::Post, uri: String::from("/index.html"), version: Version::V11 },
             Connection::new(),
             String::from("localhost:8888"),
             Chunk::Ended
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(117)
+        )
       );
   }
 
@@ -2612,96 +2518,80 @@ mod tests {
             in\r\n\r\nchunks.\r\n\
             0\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = ResponseState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..78]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_response_until_stop(initial, "", &mut buf, "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(initial, None, &mut buf, false, "", "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 81);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: None,
-          res_header_end: Some(74),
-          request:      Some(RequestState::Initial),
-          response:     Some(ResponseState::ResponseWithBodyChunks(
+        (
+          ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::new(),
             Chunk::Copying
-          )),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(74)
+        )
       );
 
       //buf.consume(78);
       buf.write(&input[81..100]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 110);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: None,
-          res_header_end: Some(74),
-          request:      Some(RequestState::Initial),
-          response:     Some(ResponseState::ResponseWithBodyChunks(
+        (
+          ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::new(),
             Chunk::Copying
-          )),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(74)
+        )
       );
 
       //buf.consume(19);
       println!("remaining:\n{}", &input[110..].to_hex(16));
       buf.write(&input[110..116]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 115);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: None,
-          res_header_end: Some(74),
-          request:      Some(RequestState::Initial),
-          response:     Some(ResponseState::ResponseWithBodyChunks(
+        (
+          ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::new(),
             Chunk::CopyingLastHeader
-          )),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(74)
+        )
       );
 
       //buf.consume(5);
       buf.write(&input[116..]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 117);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: None,
-          res_header_end: Some(74),
-          request:      Some(RequestState::Initial),
-          response:     Some(ResponseState::ResponseWithBodyChunks(
+        (
+          ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::new(),
             Chunk::Ended
-          )),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(74)
+        )
       );
   }
 
@@ -2722,24 +2612,17 @@ mod tests {
             in\r\n\r\nchunks.\r\n\
             0\r\n\
             \r\n";
-      let initial = HttpState {
-        req_header_end: None,
-        res_header_end: None,
-        request:      Some(RequestState::Initial),
-        response:     Some(ResponseState::HasLength(
-          RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
-          Connection::keep_alive(),
-          LengthInformation::Chunked
-        )),
-        added_req_header: String::from(""),
-        added_res_header: String::from(""),
-      };
+      let initial = ResponseState::HasLength(
+        RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
+        Connection::keep_alive(),
+        LengthInformation::Chunked
+      );
       let mut buf = BufferQueue::with_capacity(2048);
 
       buf.write(&input[..74]).unwrap();
       buf.consume_parsed_data(72);
       //println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(initial, "", &mut buf, "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(initial, None, &mut buf, false, "", "SOZUBALANCEID", None);
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("initial input:\n{}", &input[..72].to_hex(8));
@@ -2748,40 +2631,32 @@ mod tests {
       assert_eq!(buf.start_parsing_position, 74);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: None,
-          res_header_end: Some(74),
-          request:      Some(RequestState::Initial),
-          response:     Some(ResponseState::ResponseWithBodyChunks(
+        (
+          ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::keep_alive(),
             Chunk::Initial
-          )),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(74)
+        )
       );
 
       // we got the chunk header, but not the chunk content
       buf.write(&input[74..77]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None);
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 81);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: None,
-          res_header_end: Some(74),
-          request:      Some(RequestState::Initial),
-          response:     Some(ResponseState::ResponseWithBodyChunks(
+        (
+          ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::keep_alive(),
             Chunk::Copying
-          )),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(74)
+        )
       );
 
 
@@ -2790,43 +2665,35 @@ mod tests {
       // the external code copied the chunk content directly, starting at next chunk end
       buf.write(&input[81..115]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 115);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: None,
-          res_header_end: Some(74),
-          request:      Some(RequestState::Initial),
-          response:     Some(ResponseState::ResponseWithBodyChunks(
+        (
+          ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::keep_alive(),
             Chunk::CopyingLastHeader
-          )),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(74)
+        )
       );
       buf.write(&input[115..]).unwrap();
       println!("parsing\n{}", &input[115..].to_hex(16));
-      let result = parse_response_until_stop(result, "", &mut buf, "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 117);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: None,
-          res_header_end: Some(74),
-          request:      Some(RequestState::Initial),
-          response:     Some(ResponseState::ResponseWithBodyChunks(
+        (
+          ResponseState::ResponseWithBodyChunks(
             RStatusLine { version: Version::V11, status: 200, reason: String::from("OK") },
             Connection::keep_alive(),
             Chunk::Ended
-          )),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(74)
+        )
       );
   }
 
@@ -2839,13 +2706,12 @@ mod tests {
           Location: https://www.clever-cloud.com\r\n\
           Connection: close\r\n\
           \r\n";
-    let mut initial = HttpState::new();
+    let initial = ResponseState::Initial;
     let mut buf = BufferQueue::with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     let new_header = b"Sozu-Id: 123456789\r\n";
-    initial.added_res_header = String::from("Sozu-Id: 123456789\r\n");
-    let result = parse_response_until_stop(initial, "", &mut buf, "SOZUBALANCEID", None);
+    let result = parse_response_until_stop(initial, None, &mut buf, false, "Sozu-Id: 123456789\r\n", "SOZUBALANCEID", None);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
@@ -2862,18 +2728,14 @@ mod tests {
     assert_eq!(buf.start_parsing_position, 125);
     assert_eq!(
       result,
-      HttpState {
-        req_header_end: None,
-        res_header_end: Some(125),
-        request:  Some(RequestState::Initial),
-        response: Some(ResponseState::ResponseWithBody(
+      (
+        ResponseState::ResponseWithBody(
           RStatusLine { version: Version::V11, status: 302, reason: String::from("Found") },
           Connection::close(),
           0
-        )),
-        added_req_header: String::from(""),
-        added_res_header: String::from("Sozu-Id: 123456789\r\n"),
-      }
+        ),
+        Some(125)
+      )
     );
   }
 
@@ -2886,13 +2748,12 @@ mod tests {
           Location: https://www.clever-cloud.com\r\n\
           Connection: close\r\n\
           \r\n";
-    let mut initial = HttpState::new();
+    let initial = ResponseState::Initial;
     let mut buf = BufferQueue::with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     let new_header = b"Sozu-Id: 123456789\r\n";
-    initial.added_res_header = String::from("Sozu-Id: 123456789\r\n");
-    let result = parse_response_until_stop(initial, "", &mut buf, "SOZUBALANCEID", None);
+    let result = parse_response_until_stop(initial, None, &mut buf, false, "Sozu-Id: 123456789\r\n", "SOZUBALANCEID", None);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
@@ -2905,18 +2766,14 @@ mod tests {
     assert_eq!(buf.start_parsing_position, 129);
     assert_eq!(
       result,
-      HttpState {
-        req_header_end: None,
-        res_header_end: Some(129),
-        request: Some(RequestState::Initial),
-        response: Some(ResponseState::ResponseWithBody(
+      (
+        ResponseState::ResponseWithBody(
           RStatusLine { version: Version::V11, status: 303, reason: String::from("See Other") },
           Connection::close(),
           0
-        )),
-        added_req_header: String::from(""),
-        added_res_header: String::from("Sozu-Id: 123456789\r\n"),
-      }
+        ),
+        Some(129)
+      )
     );
   }
 
@@ -2963,24 +2820,14 @@ mod tests {
           b"HTTP/1.1 200 Ok\r\n\
             Content-Length: 200\r\n\
             \r\n";
-      let initial = HttpState {
-        req_header_end: Some(110),
-        res_header_end: None,
-        request:  Some(RequestState::Request(
-            RRequestLine { method: Method::Head, uri: String::from("/index.html"), version: Version::V11 },
-          Connection::new(),
-          String::from("localhost:8888")
-        )),
-        response: Some(ResponseState::Initial),
-        added_req_header: String::from(""),
-        added_res_header: String::from(""),
-      };
+      let initial = ResponseState::Initial;
+      let is_head = true;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
-      let result = parse_response_until_stop(initial, "", &mut buf, "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(initial, None, &mut buf, is_head, "", "SOZUBALANCEID", None);
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);
@@ -2991,21 +2838,13 @@ mod tests {
       assert_eq!(buf.start_parsing_position, 40);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(110),
-          res_header_end: Some(40),
-          request:  Some(RequestState::Request(
-              RRequestLine { method: Method::Head, uri: String::from("/index.html"), version: Version::V11 },
-            Connection::new(),
-            String::from("localhost:8888")
-          )),
-          response: Some(ResponseState::Response(
+        (
+          ResponseState::Response(
             RStatusLine { version: Version::V11, status: 200, reason: String::from("Ok") },
             Connection::new()
-          )),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(40)
+        )
       );
   }
 
@@ -3019,13 +2858,13 @@ mod tests {
             Upgrade: WebSocket\r\n\
             Connection: keep-alive, Upgrade\r\n\
             \r\n";
-      let initial = HttpState::new();
+      let initial = RequestState::Initial;
       let mut buf = BufferQueue::with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
-      let result = parse_request_until_stop(initial, "", &mut buf, "SOZUBALANCEID");
+      let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);
@@ -3037,10 +2876,8 @@ mod tests {
       assert_eq!(buf.start_parsing_position, 141);
       assert_eq!(
         result,
-        HttpState {
-          req_header_end: Some(141),
-          res_header_end: None,
-          request: Some(RequestState::Request(
+        (
+          RequestState::Request(
             RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
             Connection {
               keep_alive:  Some(true),
@@ -3051,11 +2888,9 @@ mod tests {
               sticky_session: None
             },
             String::from("localhost:8888"),
-          )),
-          response: Some(ResponseState::Initial),
-          added_req_header: String::from(""),
-          added_res_header: String::from(""),
-        }
+          ),
+          Some(141)
+        )
       );
   }
 
@@ -3239,7 +3074,7 @@ mod tests {
 mod bench {
   use super::*;
   use test::Bencher;
-  use network::buffer_queue::BufferQueue;
+  use buffer_queue::BufferQueue;
   use std::io::Write;
   use nom::HexDisplay;
 
@@ -3258,8 +3093,8 @@ mod bench {
     buf.write(&data[..]).unwrap();
     //println!("res: {:?}", parse_request_until_stop(initial, &mut buf, b""));
     b.iter(||{
-      let initial = HttpState::new();
-      parse_request_until_stop(initial, "", &mut buf, "")
+      let initial = RequestState::Initial;
+      parse_request_until_stop(initial, None, &mut buf, "", "")
     });
   }
 
