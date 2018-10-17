@@ -3076,7 +3076,6 @@ mod bench {
   use test::Bencher;
   use buffer_queue::BufferQueue;
   use std::io::Write;
-  use nom::HexDisplay;
 
   #[bench]
   fn req_bench(b: &mut Bencher) {
@@ -3090,11 +3089,22 @@ mod bench {
                  Referer: http://www.reddit.com/\r\n\r\n";
 
     let mut buf = BufferQueue::with_capacity(data.len());
+
     buf.write(&data[..]).unwrap();
-    //println!("res: {:?}", parse_request_until_stop(initial, &mut buf, b""));
+    let res1 = parse_request_until_stop(RequestState::Initial, None, &mut buf, "", "");
+    println!("res: {:?}", res1);
+
+    b.bytes = data.len() as u64;
     b.iter(||{
+      buf.input_queue.clear();
+      buf.output_queue.clear();
+      buf.parsed_position = 0;
+      buf.start_parsing_position = 0;
+      buf.sliced_input(data.len());
+
       let initial = RequestState::Initial;
-      parse_request_until_stop(initial, None, &mut buf, "", "")
+      let res2 = parse_request_until_stop(initial, None, &mut buf, "", "");
+      assert_eq!(res1, res2);
     });
   }
 
@@ -3108,6 +3118,8 @@ mod bench {
                  Accept-Encoding: gzip, deflate\r\n\
                  Connection: keep-alive\r\n\
                  Referer: http://www.reddit.com/\r\n\r\n";
+
+    b.bytes = data.len() as u64;
     b.iter(||{
       let mut current_state = RequestState::Initial;
       let mut position      = 0;
