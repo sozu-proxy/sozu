@@ -595,7 +595,7 @@ impl<'a> Header<'a> {
       {
         let mut res = false;
         for ref header_value in &conn.to_delete {
-          if compare_no_case(&self.value, header_value.as_bytes()) {
+          if compare_no_case(&self.value, &header_value) {
             res = true;
             break;
           }
@@ -744,7 +744,7 @@ pub struct Connection {
   pub keep_alive:     Option<bool>,
   pub has_upgrade:    bool,
   pub upgrade:        Option<String>,
-  pub to_delete:      HashSet<String>,
+  pub to_delete:      HashSet<Vec<u8>>,
   pub continues:      Continue,
   pub sticky_session: Option<String>,
 }
@@ -1220,7 +1220,7 @@ pub fn validate_request_header(state: RequestState, header: &Header, sticky_name
         else if compare_no_case(&value, b"keep-alive") { conn.keep_alive = Some(true); }
         else if compare_no_case(&value, b"upgrade") { conn.has_upgrade    = true; }
         else {
-          conn.to_delete.insert(unsafe { str::from_utf8_unchecked(value).to_string() });
+          conn.to_delete.insert(Vec::from(value));
         };
       }
       match state {
@@ -1452,7 +1452,7 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
         if compare_no_case(&value, b"close") { conn.keep_alive = Some(false); }
           else if compare_no_case(&value, b"keep-alive") { conn.keep_alive = Some(true); }
           else if compare_no_case(&value, b"upgrade") { conn.has_upgrade    = true; }
-          else { conn.to_delete.insert(unsafe { str::from_utf8_unchecked(value).to_string() }); }
+          else { conn.to_delete.insert(Vec::from(value)); }
       }
       match state {
         ResponseState::HasStatusLine(rl, _)     => ResponseState::HasStatusLine(rl, conn),
