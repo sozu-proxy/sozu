@@ -554,9 +554,34 @@ impl<'a> Header<'a> {
   pub fn should_delete(&self, conn: &Connection, sticky_name: &str) -> bool {
     //FIXME: we should delete this header anyway, and add a Connection: Upgrade if we detected an upgrade
     if compare_no_case(&self.name, b"connection") {
-      match comma_separated_header_values(self.value) {
-        Some(tokens) => ! tokens.iter().any(|value| compare_no_case(&value, b"upgrade")),
-        None         => true
+
+      match single_header_value(self.value) {
+        Ok((input, first)) => {
+          if compare_no_case(first, b"upgrade") {
+            return false;
+          } else {
+            while input.len() != 0 {
+              match do_parse!(input,
+                opt!(complete!(sp)) >>
+                complete!(char!(',')) >>
+                opt!(sp) >>
+                v: single_header_value >> (v)
+              ) {
+                Ok((i, v)) => {
+                  if compare_no_case(v, b"upgrade") {
+                    return false;
+                  }
+                },
+                Err(_) => {
+                  return true;
+                }
+              }
+            }
+            return true;
+
+          }
+        },
+        Err(_) => true
       }
     } else if compare_no_case(&self.name, b"set-cookie") {
       self.value.starts_with(sticky_name.as_bytes())
@@ -567,7 +592,17 @@ impl<'a> Header<'a> {
       compare_no_case(&self.name, b"x-forwarded-proto") ||
       compare_no_case(&self.name, b"x-forwarded-port")  ||
       compare_no_case(&self.name, b"sozu-id")           ||
-      conn.to_delete.contains(unsafe {str::from_utf8_unchecked(&self.value.to_ascii_lowercase()[..])})
+      {
+        let mut res = false;
+        for ref header_value in &conn.to_delete {
+          if compare_no_case(&self.value, header_value.as_bytes()) {
+            res = true;
+            break;
+          }
+        }
+
+        res
+      }
     }
   }
 
@@ -1178,7 +1213,7 @@ pub fn validate_request_header(state: RequestState, header: &Header, sticky_name
     },
     // FIXME: for now, we don't remember if we cancel indications from a previous Connection Header
     HeaderValue::Connection(c) => {
-      let mut conn = state.get_keep_alive().unwrap_or(Connection::new());
+      let mut conn = state.get_keep_alive().unwrap_or_else(Connection::new);
       for value in c {
       trace!("PARSER\tgot Connection header: \"{:?}\"", str::from_utf8(value).expect("could not make string from value"));
         if compare_no_case(&value, b"close") { conn.keep_alive = Some(false); }
@@ -1199,7 +1234,7 @@ pub fn validate_request_header(state: RequestState, header: &Header, sticky_name
       }
     },
     HeaderValue::ExpectContinue => {
-      let mut conn = state.get_keep_alive().unwrap_or(Connection::new());
+      let mut conn = state.get_keep_alive().unwrap_or_else(Connection::new);
       conn.continues = Continue::Expects(0);
 
       match state {
