@@ -487,6 +487,13 @@ pub enum TransferEncodingValue {
 }
 
 #[derive(PartialEq,Debug)]
+pub struct ConnectionValue {
+  pub has_close: bool,
+  pub has_keep_alive: bool,
+  pub has_upgrade: bool,
+}
+
+#[derive(PartialEq,Debug)]
 pub enum HeaderResult<T> {
   Value(T),
   None,
@@ -524,9 +531,49 @@ impl<'a> Header<'a> {
         HeaderValue::Encoding(TransferEncodingValue::Unknown)
       }
     } else if compare_no_case(self.name, b"connection") {
-      match comma_separated_header_values(self.value) {
-        Some(tokens) => HeaderValue::Connection(tokens),
-        None         => HeaderValue::Error
+      let mut has_close = false;
+      let mut has_upgrade = false;
+      let mut has_keep_alive = false;
+
+      match single_header_value(self.value) {
+        Ok((mut input, first)) => {
+          if compare_no_case(first, b"upgrade") {
+            has_upgrade = true;
+          } else if compare_no_case(first, b"close") {
+            has_close = true;
+          } else if compare_no_case(first, b"keep-alive") {
+            has_keep_alive = true;
+          }
+
+          while input.len() != 0 {
+            match do_parse!(input,
+              opt!(complete!(sp)) >>
+              complete!(char!(',')) >>
+              opt!(sp) >>
+              v: single_header_value >> (v)
+            ) {
+              Ok((i, v)) => {
+                if compare_no_case(v, b"upgrade") {
+                  has_upgrade = true;
+                } else if compare_no_case(v, b"close") {
+                  has_close = true;
+                } else if compare_no_case(v, b"keep-alive") {
+                  has_keep_alive = true;
+                }
+                input = i;
+              },
+              Err(_) => {
+                return HeaderValue::Error;
+              }
+            }
+          }
+          let r = ConnectionValue {
+            has_close, has_keep_alive, has_upgrade
+          };
+          //println!("returning: {:?}", r);
+          HeaderValue::Connection(r)
+        },
+        Err(_) => HeaderValue::Error
       }
     } else if compare_no_case(self.name, b"upgrade") {
       HeaderValue::Upgrade(self.value)
@@ -554,9 +601,8 @@ impl<'a> Header<'a> {
   pub fn should_delete(&self, conn: &Connection, sticky_name: &str) -> bool {
     //FIXME: we should delete this header anyway, and add a Connection: Upgrade if we detected an upgrade
     if compare_no_case(&self.name, b"connection") {
-
       match single_header_value(self.value) {
-        Ok((input, first)) => {
+        Ok((mut input, first)) => {
           if compare_no_case(first, b"upgrade") {
             return false;
           } else {
@@ -571,6 +617,7 @@ impl<'a> Header<'a> {
                   if compare_no_case(v, b"upgrade") {
                     return false;
                   }
+                  input = i;
                 },
                 Err(_) => {
                   return true;
@@ -700,7 +747,7 @@ pub enum HeaderValue<'a> {
   ContentLength(usize),
   Encoding(TransferEncodingValue),
   //FIXME: are the references in Connection still valid after we delete that part of the headers?
-  Connection(Vec<&'a [u8]>),
+  Connection(ConnectionValue),
   Upgrade(&'a[u8]),
   Cookie(Vec<RequestCookie<'a>>),
   Other(&'a[u8],&'a[u8]),
@@ -1001,6 +1048,20 @@ impl ResponseState {
     }
   }
 
+  pub fn get_mut_connection(&mut self) -> Option<&mut Connection> {
+    match *self {
+      ResponseState::HasStatusLine(_, ref mut conn)             |
+      ResponseState::HasLength(_, ref mut conn, _)              |
+      ResponseState::HasUpgrade(_, ref mut conn, _)             |
+      ResponseState::Response(_, ref mut conn)                  |
+      ResponseState::ResponseUpgrade(_, ref mut conn, _)        |
+      ResponseState::ResponseWithBody(_, ref mut conn, _)       |
+      ResponseState::ResponseWithBodyChunks(_, ref mut conn, _) => Some(conn),
+      ResponseState::Error(_, ref mut conn, _, _, _)            => conn.as_mut(),
+      _                                                     => None
+    }
+  }
+
   pub fn should_copy(&self, position: usize) -> Option<usize> {
     match *self {
       ResponseState::ResponseWithBody(_, _, l) => Some(position + l),
@@ -1185,7 +1246,7 @@ pub fn default_request_result<O>(state: RequestState, res: IResult<&[u8], O>) ->
   }
 }
 
-pub fn validate_request_header(state: RequestState, header: &Header, sticky_name: &str) -> RequestState {
+pub fn validate_request_header(mut state: RequestState, header: &Header, sticky_name: &str) -> RequestState {
   match header.value() {
     HeaderValue::Host(host) => {
       match state {
@@ -1213,38 +1274,29 @@ pub fn validate_request_header(state: RequestState, header: &Header, sticky_name
     },
     // FIXME: for now, we don't remember if we cancel indications from a previous Connection Header
     HeaderValue::Connection(c) => {
-      let mut conn = state.get_keep_alive().unwrap_or_else(Connection::new);
-      for value in c {
-      trace!("PARSER\tgot Connection header: \"{:?}\"", str::from_utf8(value).expect("could not make string from value"));
-        if compare_no_case(&value, b"close") { conn.keep_alive = Some(false); }
-        else if compare_no_case(&value, b"keep-alive") { conn.keep_alive = Some(true); }
-        else if compare_no_case(&value, b"upgrade") { conn.has_upgrade    = true; }
-        else {
-          conn.to_delete.insert(Vec::from(value));
-        };
-      }
-      match state {
-        RequestState::HasRequestLine(rl, _)                 => RequestState::HasRequestLine(rl, conn),
-        RequestState::HasHost(rl, _, host)                  => RequestState::HasHost(rl, conn, host),
-        RequestState::HasLength(rl, _, length)              => RequestState::HasLength(rl, conn, length),
-        RequestState::HasHostAndLength(rl, _, host, length) => RequestState::HasHostAndLength(rl, conn, host, length),
-        RequestState::Request(rl, _, host)                  => RequestState::Request(rl, conn, host),
-        RequestState::RequestWithBody(rl, _, host, length)  => RequestState::RequestWithBody(rl, conn, host, length),
-        s                                                   => s.into_error()
+      if state.get_mut_connection().map(|conn| {
+        if c.has_close {
+          conn.keep_alive = Some(false);
+        }
+        if c.has_keep_alive {
+          conn.keep_alive = Some(true);
+        }
+        if c.has_upgrade {
+          conn.has_upgrade = true;
+        }
+      }).is_some() {
+        state
+      } else {
+        state.into_error()
       }
     },
     HeaderValue::ExpectContinue => {
-      let mut conn = state.get_keep_alive().unwrap_or_else(Connection::new);
-      conn.continues = Continue::Expects(0);
-
-      match state {
-        RequestState::HasRequestLine(rl, _)                 => RequestState::HasRequestLine(rl, conn),
-        RequestState::HasHost(rl, _, host)                  => RequestState::HasHost(rl, conn, host),
-        RequestState::HasLength(rl, _, length)              => RequestState::HasLength(rl, conn, length),
-        RequestState::HasHostAndLength(rl, _, host, length) => RequestState::HasHostAndLength(rl, conn, host, length),
-        RequestState::Request(rl, _, host)                  => RequestState::Request(rl, conn, host),
-        RequestState::RequestWithBody(rl, _, host, length)  => RequestState::RequestWithBody(rl, conn, host, length),
-        s                                                   => s.into_error()
+      if state.get_mut_connection().map(|conn| {
+        conn.continues = Continue::Expects(0);
+      }).is_some() {
+        state
+      } else {
+        state.into_error()
       }
     }
 
@@ -1424,7 +1476,7 @@ pub fn default_response_result<O>(state: ResponseState, res: IResult<&[u8], O>) 
   }
 }
 
-pub fn validate_response_header(state: ResponseState, header: &Header, is_head: bool) -> ResponseState {
+pub fn validate_response_header(mut state: ResponseState, header: &Header, is_head: bool) -> ResponseState {
   match header.value() {
     HeaderValue::ContentLength(sz) => {
       match state {
@@ -1446,27 +1498,28 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
     },
     // FIXME: for now, we don't remember if we cancel indications from a previous Connection Header
     HeaderValue::Connection(c) => {
-      let mut conn = state.get_keep_alive().unwrap_or(Connection::new());
-      for value in c {
-      trace!("PARSER\tgot Connection header: \"{:?}\"", str::from_utf8(value).expect("could not make string from value"));
-        if compare_no_case(&value, b"close") { conn.keep_alive = Some(false); }
-          else if compare_no_case(&value, b"keep-alive") { conn.keep_alive = Some(true); }
-          else if compare_no_case(&value, b"upgrade") { conn.has_upgrade    = true; }
-          else { conn.to_delete.insert(Vec::from(value)); }
-      }
-      match state {
-        ResponseState::HasStatusLine(rl, _)     => ResponseState::HasStatusLine(rl, conn),
-        ResponseState::HasLength(rl, _, length) => ResponseState::HasLength(rl, conn, length),
-        ResponseState::HasUpgrade(rl, _, proto) => {
-          trace!("has upgrade, got conn: \"{:?}\"", conn);
-          //FIXME: verify here if the Upgrade header we got is the same as the request Upgrade header
+      if state.get_mut_connection().map(|conn| {
+        if c.has_close {
+          conn.keep_alive = Some(false);
+        }
+        if c.has_keep_alive {
+          conn.keep_alive = Some(true);
+        }
+        if c.has_upgrade {
+          conn.has_upgrade = true;
+        }
+      }).is_some() {
+        if let ResponseState::HasUpgrade(rl, conn, proto) = state {
           if conn.has_upgrade {
             ResponseState::HasUpgrade(rl, conn, proto)
           } else {
             ResponseState::Error(Some(rl), Some(conn), Some(proto), None, None)
           }
+        } else {
+          state
         }
-        s                                       => s.into_error(),
+      } else {
+        state.into_error()
       }
     },
     HeaderValue::Upgrade(protocol) => {
