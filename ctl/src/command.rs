@@ -976,7 +976,6 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
               let mut header = Vec::new();
               header.push(cell!("backend id"));
               header.push(cell!("IP address"));
-              header.push(cell!("port"));
               for ref key in data.keys() {
                 header.push(cell!(&key));
               }
