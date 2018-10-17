@@ -1321,13 +1321,14 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
     RequestState::HasRequestLine(rl, conn) => {
       match message_header(buf) {
         Ok((i, header)) => {
-          if header.should_delete(&conn, sticky_name) {
-            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header, sticky_name))
+          let mv = if header.should_delete(&conn, sticky_name) {
+            BufferMove::Delete(buf.offset(i))
           } else if header.must_mutate() {
-            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header, sticky_name))
+            BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasRequestLine(rl, conn), &header, sticky_name))
-          }
+            BufferMove::Advance(buf.offset(i))
+          };
+          (mv, validate_request_header(RequestState::HasRequestLine(rl, conn), &header, sticky_name))
         },
         res => default_request_result(RequestState::HasRequestLine(rl, conn), res)
       }
@@ -1335,13 +1336,14 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
     RequestState::HasHost(rl, conn, h) => {
       match message_header(buf) {
         Ok((i, header)) => {
-          if header.should_delete(&conn, sticky_name) {
-            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header, sticky_name))
+          let mv = if header.should_delete(&conn, sticky_name) {
+            BufferMove::Delete(buf.offset(i))
           } else if header.must_mutate() {
-            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name)), validate_request_header(RequestState::HasHost(rl, conn, h), &header, sticky_name))
+            BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHost(rl, conn, h), &header, sticky_name))
-          }
+            BufferMove::Advance(buf.offset(i))
+          };
+          (mv, validate_request_header(RequestState::HasHost(rl, conn, h), &header, sticky_name))
         },
         Err(Err::Incomplete(_)) => (BufferMove::None, RequestState::HasHost(rl, conn, h)),
         Err(_) => {
@@ -1360,13 +1362,14 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
     RequestState::HasLength(rl, conn, l) => {
       match message_header(buf) {
         Ok((i, header)) => {
-          if header.should_delete(&conn, sticky_name) {
-            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasLength(rl, conn, l), &header, sticky_name))
+          let mv = if header.should_delete(&conn, sticky_name) {
+            BufferMove::Delete(buf.offset(i))
           } else if header.must_mutate() {
-            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name)), validate_request_header(RequestState::HasLength(rl, conn, l), &header, sticky_name))
+            BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasLength(rl, conn, l), &header, sticky_name))
-          }
+            BufferMove::Advance(buf.offset(i))
+          };
+          (mv, validate_request_header(RequestState::HasLength(rl, conn, l), &header, sticky_name))
         },
         res => default_request_result(RequestState::HasLength(rl, conn, l), res)
       }
@@ -1374,13 +1377,14 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
     RequestState::HasHostAndLength(rl, conn, h, l) => {
       match message_header(buf) {
         Ok((i, header)) => {
-          if header.should_delete(&conn, sticky_name) {
-            (BufferMove::Delete(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header, sticky_name))
+          let mv = if header.should_delete(&conn, sticky_name) {
+            BufferMove::Delete(buf.offset(i))
           } else if header.must_mutate() {
-            (BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header, sticky_name))
+            BufferMove::Multiple(header.mutate_header(buf, buf.offset(i), sticky_name))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header, sticky_name))
-          }
+            BufferMove::Advance(buf.offset(i))
+          };
+          (mv, validate_request_header(RequestState::HasHostAndLength(rl, conn, h, l), &header, sticky_name))
         },
         Err(Err::Incomplete(_)) => (BufferMove::None, RequestState::HasHostAndLength(rl, conn, h, l)),
         Err(_) => {
@@ -1523,11 +1527,12 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
     ResponseState::HasStatusLine(sl, conn) => {
       match message_header(buf) {
         Ok((i, header)) => {
-          if header.should_delete(&conn, sticky_name) {
-            (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header, is_head))
+          let mv = if header.should_delete(&conn, sticky_name) {
+            BufferMove::Delete(buf.offset(i))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasStatusLine(sl, conn), &header, is_head))
-          }
+            BufferMove::Advance(buf.offset(i))
+          };
+          (mv, validate_response_header(ResponseState::HasStatusLine(sl, conn), &header, is_head))
         },
         Err(Err::Incomplete(_)) => (BufferMove::None, ResponseState::HasStatusLine(sl, conn)),
         Err(_)      => {
@@ -1547,11 +1552,12 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
     ResponseState::HasLength(sl, conn, length) => {
       match message_header(buf) {
         Ok((i, header)) => {
-          if header.should_delete(&conn, sticky_name) {
-            (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header, is_head))
+          let mv = if header.should_delete(&conn, sticky_name) {
+            BufferMove::Delete(buf.offset(i))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasLength(sl, conn, length), &header, is_head))
-          }
+            BufferMove::Advance(buf.offset(i))
+          };
+          (mv,  validate_response_header(ResponseState::HasLength(sl, conn, length), &header, is_head))
         },
         Err(Err::Incomplete(_)) => (BufferMove::None, ResponseState::HasLength(sl, conn, length)),
         Err(_)      => {
@@ -1574,11 +1580,12 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
     ResponseState::HasUpgrade(sl, conn, protocol) => {
       match message_header(buf) {
         Ok((i, header)) => {
-          if header.should_delete(&conn, sticky_name) {
-            (BufferMove::Delete(buf.offset(i)), validate_response_header(ResponseState::HasUpgrade(sl, conn, protocol), &header, is_head))
+          let mv = if header.should_delete(&conn, sticky_name) {
+            BufferMove::Delete(buf.offset(i))
           } else {
-            (BufferMove::Advance(buf.offset(i)), validate_response_header(ResponseState::HasUpgrade(sl, conn, protocol), &header, is_head))
-          }
+            BufferMove::Advance(buf.offset(i))
+          };
+          (mv, validate_response_header(ResponseState::HasUpgrade(sl, conn, protocol), &header, is_head))
         },
         Err(Err::Incomplete(_)) => (BufferMove::None, ResponseState::HasUpgrade(sl, conn, protocol)),
         Err(_)      => {
