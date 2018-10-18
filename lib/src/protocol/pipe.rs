@@ -21,8 +21,6 @@ pub struct Pipe<Front:SocketHandler> {
   backend_token:      Option<Token>,
   pub front_buf:      Checkout<BufferQueue>,
   back_buf:           Checkout<BufferQueue>,
-  front_buf_position: usize,
-  back_buf_position:  usize,
   pub app_id:         Option<String>,
   pub request_id:     String,
   pub front_readiness:Readiness,
@@ -42,8 +40,6 @@ impl<Front:SocketHandler> Pipe<Front> {
       backend_token:      None,
       front_buf:          front_buf,
       back_buf:           back_buf,
-      front_buf_position: 0,
-      back_buf_position:  0,
       app_id:             None,
       request_id:         request_id,
       front_readiness:    Readiness {
@@ -206,7 +202,6 @@ impl<Front:SocketHandler> Pipe<Front> {
       let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
       res = current_res;
       self.back_buf.consume_output_data(current_sz);
-      self.back_buf_position += current_sz;
       sz += current_sz;
     }
 
@@ -267,7 +262,6 @@ impl<Front:SocketHandler> Pipe<Front> {
         let (current_sz, current_res) = backend.socket_write(self.front_buf.next_output_data());
         socket_res = current_res;
         self.front_buf.consume_output_data(current_sz);
-        self.front_buf_position += current_sz;
         sz += current_sz;
       }
     }
