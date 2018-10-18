@@ -133,7 +133,9 @@ impl Listener {
 
 
     if let Some(ref sock) = listener {
-      event_loop.register(sock, self.token, Ready::readable(), PollOpt::edge());
+      if let Err(e) = event_loop.register(sock, self.token, Ready::readable(), PollOpt::edge()) {
+        error!("error registering listen socket: {:?}", e);
+      }
     } else {
       return None;
     }
@@ -225,7 +227,7 @@ impl Listener {
       listener.accept().map_err(|e| {
         match e.kind() {
           ErrorKind::WouldBlock => AcceptError::WouldBlock,
-          other => {
+          _ => {
             error!("accept() IO error: {:?}", e);
             AcceptError::IoError
           }
@@ -238,7 +240,7 @@ impl Listener {
 
   // ToDo factor out with http.rs
   pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&TlsApp> {
-    let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(host.as_bytes()) {
+    let host: &str = if let Ok((i, (hostname, _))) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
         error!("invalid remaining chars after hostname");
         return None;
@@ -456,16 +458,20 @@ impl ProxyConfiguration<Session> for Proxy {
   }
 
   fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout)
-    -> Result<(Rc<RefCell<Session>>,bool), AcceptError> {
+    -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
       if let Some(ref listener) = self.listeners.get(&Token(token.0)) {
-        frontend_sock.set_nodelay(true);
+        if let Err(e) = frontend_sock.set_nodelay(true) {
+          error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
+        }
 
-        poll.register(
+        if let Err(e) = poll.register(
           &frontend_sock,
           session_token,
           Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
           PollOpt::edge()
-        );
+        ) {
+          error!("error registering fron socket({:?}): {:?}", frontend_sock, e);
+        }
 
         let session = ServerSession::new(&listener.ssl_config);
         let c = Session::new(session, frontend_sock, session_token, Rc::downgrade(&self.pool), listener.config.public_address,
@@ -530,7 +536,9 @@ impl ProxyConfiguration<Session> for Proxy {
     });
 
     // we still want to use the new socket
-    socket.set_nodelay(true);
+    if let Err(e) = socket.set_nodelay(true) {
+      error!("error setting nodelay on back socket: {:?}", e);
+    }
     session.back_readiness().map(|r| {
       r.interest  = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
     });
@@ -538,22 +546,26 @@ impl ProxyConfiguration<Session> for Proxy {
     session.back_connected = BackendConnectionStatus::Connecting;
     if let Some(back_token) = old_back_token {
       session.set_back_token(back_token);
-      poll.register(
+      if let Err(e) = poll.register(
         &socket,
         back_token,
         Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
         PollOpt::edge()
-      );
+      ) {
+        error!("error registering back socket: {:?}", e);
+      }
 
       session.set_back_socket(socket);
       Ok(BackendConnectAction::Replace)
     } else {
-      poll.register(
+      if let Err(e) = poll.register(
         &socket,
         back_token,
         Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
         PollOpt::edge()
-      );
+      ) {
+        error!("error registering back socket: {:?}", e);
+      }
 
       session.set_back_socket(socket);
       session.set_back_token(back_token);
@@ -625,20 +637,24 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::SoftStop => {
         info!("{} processing soft shutdown", message.id);
-        self.listeners.iter_mut().map(|(token, l)| {
+        for (_, l) in self.listeners.iter_mut() {
           l.listener.take().map(|sock| {
-            event_loop.deregister(&sock);
-          })
-        });
+            if let Err(e) = event_loop.deregister(&sock) {
+              error!("error deregistering listen socket: {:?}", e);
+            }
+          });
+        }
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Processing, data: None }
       },
       ProxyRequestData::HardStop => {
         info!("{} hard shutdown", message.id);
-        self.listeners.drain().map(|(token, mut l)| {
+        for (_, mut l) in self.listeners.drain() {
           l.listener.take().map(|sock| {
-            event_loop.deregister(&sock);
-          })
-        });
+            if let Err(e) = event_loop.deregister(&sock) {
+              error!("error deregistering listen socket: {:?}", e);
+            }
+          });
+        }
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Processing, data: None }
       },
       ProxyRequestData::Status => {
@@ -672,7 +688,6 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
   use server::{self,ProxySessionCast};
 
   let mut event_loop  = Poll::new().expect("could not create event loop");
-  let max_listeners   = 1;
 
   let pool = Rc::new(RefCell::new(
     Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))

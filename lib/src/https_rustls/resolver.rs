@@ -67,7 +67,7 @@ impl CertificateResolver {
   pub fn remove_certificate(&mut self, remove_certificate: RemoveCertificate) {
     let must_delete = self.certificates.get(&remove_certificate.fingerprint).map(|data| data.refcount == 0).unwrap_or(false);
 
-    if let Some(data) = self.certificates.get(&remove_certificate.fingerprint) {
+    if let Some(_data) = self.certificates.get(&remove_certificate.fingerprint) {
       //let cert = &data.cert.cert[0];
       if remove_certificate.names.is_empty() {
         //FIXME: waiting for https://github.com/briansmith/webpki/pull/65 to merge to get the DNS names

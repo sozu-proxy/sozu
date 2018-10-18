@@ -439,8 +439,13 @@ impl ProxySession for Session {
     //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
     self.http().map(|http| http.close());
     self.metrics.service_stop();
-    self.front_socket().shutdown(Shutdown::Both);
-    poll.deregister(self.front_socket());
+    if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
+      error!("error closing front socket: {:?}", e);
+    }
+
+    if let Err(e) = poll.deregister(self.front_socket()) {
+      error!("error deregistering front socket: {:?}", e);
+    }
 
     let mut result = CloseResult::default();
 
@@ -497,8 +502,13 @@ impl ProxySession for Session {
     if back_connected != BackendConnectionStatus::NotConnected {
       self.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
       if let Some(sock) = self.back_socket() {
-        sock.shutdown(Shutdown::Both);
-        poll.deregister(sock);
+        if let Err(e) = sock.shutdown(Shutdown::Both) {
+          error!("error deregistering backend socket: {:?}", e);
+        }
+
+        if let Err(e) = poll.deregister(sock) {
+          error!("error deregistering backend socket: {:?}", e);
+        }
       }
     }
 
