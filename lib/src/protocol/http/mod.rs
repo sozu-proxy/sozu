@@ -32,8 +32,6 @@ impl StickySession {
   }
 }
 
-type BackendToken = Token;
-
 #[derive(Debug,Clone,PartialEq)]
 pub enum SessionStatus {
   Normal,
@@ -435,9 +433,10 @@ impl<Front:SocketHandler> Http<Front> {
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
 
-    let app_id = self.app_id.clone().unwrap_or(String::from("-"));
     incr!("http.errors");
-    /*time!("request_time", &app_id, response_time);
+    /*
+    let app_id = self.app_id.clone().unwrap_or(String::from("-"));
+    time!("request_time", &app_id, response_time);
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
@@ -650,7 +649,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   fn writable_default_answer(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-    let res = if let SessionStatus::DefaultAnswer(answer, ref buf, mut index) = self.status {
+    let res = if let SessionStatus::DefaultAnswer(_, ref buf, mut index) = self.status {
       let len = buf.len();
 
       let mut sz = 0usize;

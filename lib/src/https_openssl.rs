@@ -733,7 +733,7 @@ pub struct Listener {
 }
 
 impl Listener {
-  pub fn new(config: HttpsListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Listener {
+  pub fn new(config: HttpsListener, token: Token) -> Listener {
 
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let domains      = TrieNode::root();
@@ -1169,11 +1169,11 @@ impl Proxy {
     }
   }
 
-  pub fn add_listener(&mut self, config: HttpsListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
+  pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
     if self.listeners.contains_key(&token) {
       None
     } else {
-      let listener = Listener::new(config, pool, token);
+      let listener = Listener::new(config, token);
       self.listeners.insert(listener.token.clone(), listener);
       Some(token)
     }
@@ -1637,7 +1637,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
 
   let mut configuration = Proxy::new(pool.clone(), backends.clone());
   let front = config.front.clone();
-  if configuration.add_listener(config, pool.clone(), token).is_some() {
+  if configuration.add_listener(config, token).is_some() {
     if configuration.activate_listener(&mut event_loop, &front, None).is_some() {
 
       let (scm_server, _scm_client) = UnixStream::pair().unwrap();

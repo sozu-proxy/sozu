@@ -35,8 +35,6 @@ use super::protocol::http::parser::{hostname_and_port, RequestState};
 use super::trie::TrieNode;
 use util::UnwrapLog;
 
-type BackendToken = Token;
-
 #[derive(PartialEq)]
 pub enum SessionStatus {
   Normal,
@@ -80,7 +78,6 @@ impl Session {
 
     protocol.map(|pr| {
       let request_id = Uuid::new_v4().hyphenated().to_string();
-      let log_ctx    = format!("{}\tunknown\t", &request_id);
       let mut session = Session {
         backend:            None,
         back_connected:     BackendConnectionStatus::NotConnected,
@@ -314,9 +311,10 @@ impl Session {
 
   fn set_back_socket(&mut self, socket: TcpStream) {
     match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http)      => http.set_back_socket(socket),
-      State::WebSocket(ref mut pipe) => {} /*pipe.set_back_socket(unwrap_msg!(socket.try_clone()))*/
-      State::Expect(_)               => {},
+      State::Http(ref mut http) => http.set_back_socket(socket),
+      // not passing it here since we should already have a connection available
+      State::WebSocket(_)       => {},
+      State::Expect(_)          => {},
     }
   }
 
@@ -697,11 +695,11 @@ impl Proxy {
     }
   }
 
-  pub fn add_listener(&mut self, config: HttpListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
+  pub fn add_listener(&mut self, config: HttpListener, token: Token) -> Option<Token> {
     if self.listeners.contains_key(&token) {
       None
     } else {
-     let listener = Listener::new(config, pool, token);
+     let listener = Listener::new(config, token);
       self.listeners.insert(listener.token.clone(), listener);
       Some(token)
     }
@@ -851,9 +849,7 @@ impl Proxy {
 }
 
 impl Listener {
-  pub fn new(config: HttpListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Listener {
-
-    let front = config.front;
+  pub fn new(config: HttpListener, token: Token) -> Listener {
 
     let default = DefaultAnswers {
       NotFound: Rc::new(Vec::from(config.answer_404.as_bytes())),
@@ -1311,7 +1307,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
 
   let front = config.front.clone();
   let mut proxy = Proxy::new(pool.clone(), backends.clone());
-  let _ = proxy.add_listener(config, pool.clone(), token);
+  let _ = proxy.add_listener(config, token);
   let _ = proxy.activate_listener(&mut event_loop, &front, None);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
   let scm = ScmSocket::new(scm_client.into_raw_fd());

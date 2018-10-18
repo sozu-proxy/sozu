@@ -74,7 +74,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
       }
 
       let read_sz = match parse_v2_header(self.front_buf.unparsed_data()) {
-        Ok((rest, header)) => {
+        Ok((rest, _)) => {
           self.front_readiness.interest.remove(Ready::readable());
           self.back_readiness.interest.insert(Ready::writable());
           self.front_buf.next_output_data().offset(rest)
@@ -83,6 +83,8 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
           return SessionResult::Continue
         },
         Err(e) => {
+          error!("[{:?}] error parsing the proxy protocol header(error={:?}), closing the connection",
+            self.frontend_token, e);
           return SessionResult::CloseSession
         }
       };

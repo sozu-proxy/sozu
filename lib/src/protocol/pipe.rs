@@ -8,8 +8,6 @@ use buffer_queue::BufferQueue;
 use socket::{SocketHandler,SocketResult};
 use pool::Checkout;
 
-type BackendToken = Token;
-
 #[derive(PartialEq)]
 pub enum SessionStatus {
   Normal,

@@ -68,7 +68,7 @@ impl CertificateResolver {
     let must_delete = self.certificates.get(&remove_certificate.fingerprint).map(|data| data.refcount == 0).unwrap_or(false);
 
     if let Some(data) = self.certificates.get(&remove_certificate.fingerprint) {
-      let cert = &data.cert.cert[0];
+      //let cert = &data.cert.cert[0];
       if remove_certificate.names.is_empty() {
         //FIXME: waiting for https://github.com/briansmith/webpki/pull/65 to merge to get the DNS names
         // create a untrusted::Input
@@ -181,7 +181,6 @@ pub fn generate_certified_key(certificate_and_key: CertificateAndKey) -> Option<
   let mut cert_reader = BufReader::new(certificate_and_key.certificate.as_bytes());
   let parsed_certs = pemfile::certs(&mut cert_reader);
 
-  let fingerprint:Vec<u8> = Vec::new();
   if let Ok(certs) = parsed_certs {
     for cert in certs {
       chain.push(cert);

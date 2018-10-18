@@ -54,7 +54,6 @@ pub struct Listener {
   listener:   Option<TcpListener>,
   address:    SocketAddr,
   fronts:     TrieNode<Vec<TlsApp>>,
-  pool:       Rc<RefCell<Pool<BufferQueue>>>,
   answers:    DefaultAnswers,
   config:     HttpsListener,
   ssl_config: Arc<ServerConfig>,
@@ -64,7 +63,7 @@ pub struct Listener {
 }
 
 impl Listener {
-  pub fn new(config: HttpsListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Listener {
+  pub fn new(config: HttpsListener, token: Token) -> Listener {
 
     let default = DefaultAnswers {
       NotFound: Rc::new(Vec::from(config.answer_404.as_bytes())),
@@ -116,7 +115,6 @@ impl Listener {
       answers:    default,
       ssl_config: Arc::new(server_config),
       listener: None,
-      pool,
       config,
       resolver,
       token,
@@ -297,11 +295,11 @@ impl Proxy {
     }
   }
 
-  pub fn add_listener(&mut self, config: HttpsListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
+  pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
     if self.listeners.contains_key(&token) {
       None
     } else {
-      let listener = Listener::new(config, pool, token);
+      let listener = Listener::new(config, token);
       self.listeners.insert(listener.token.clone(), listener);
       Some(token)
     }
@@ -706,7 +704,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
 
   let front = config.front.clone();
   let mut configuration = Proxy::new(pool.clone(), backends.clone());
-  if configuration.add_listener(config, pool.clone(), token).is_some() {
+  if configuration.add_listener(config, token).is_some() {
     if configuration.activate_listener(&mut event_loop, &front, None).is_some() {
       let (scm_server, _scm_client) = UnixStream::pair().unwrap();
       let mut server_config: server::ServerConfig = Default::default();

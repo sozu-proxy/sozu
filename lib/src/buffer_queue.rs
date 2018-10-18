@@ -286,7 +286,6 @@ impl BufferQueue {
     let mut start         = 0usize;
     let mut largest_size  = 0usize;
     let mut delete_ended  = false;
-    let available_buffer_size = self.buffer.available_data();
     //println!("NEXT OUTPUT DATA:\nqueue:\n{:?}\nbuffer:\n{}", self.output_queue, self.buffer.data().to_hex(16));
     for el in it {
       //println!("start={}, length={}, el = {:?}", start, largest_size, el);

@@ -559,7 +559,7 @@ impl Server {
           let token = Token(entry.index().0);
 
           let front = listener.front.clone();
-          let status = if let Some(token) = self.http.add_listener(listener.clone(), self.pool.clone(), token) {
+          let status = if self.http.add_listener(listener.clone(), token).is_some() {
             entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
             self.base_sessions_count += 1;
             ProxyResponseStatus::Ok
@@ -636,7 +636,7 @@ impl Server {
           let token = Token(entry.index().0);
 
           let front = listener.front.clone();
-          let status = if let Some(token) = self.https.add_listener(listener.clone(), self.pool.clone(), token) {
+          let status = if self.https.add_listener(listener.clone(), token).is_some() {
             entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPSListen })));
             self.base_sessions_count += 1;
             ProxyResponseStatus::Ok
@@ -713,7 +713,7 @@ impl Server {
           let token = Token(entry.index().0);
 
           let front = listener.front.clone();
-          let status = if let Some(token) = self.tcp.add_listener(listener.clone(), self.pool.clone(), token) {
+          let status = if self.tcp.add_listener(listener.clone(), self.pool.clone(), token).is_some() {
             entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::TCPListen })));
             self.base_sessions_count += 1;
             ProxyResponseStatus::Ok
@@ -1300,20 +1300,20 @@ impl ProxySession for ListenSession {
     SessionResult::Continue
   }
 
-  fn process_events(&mut self, token: Token, events: Ready) {}
+  fn process_events(&mut self, _token: Token, _events: Ready) {}
 
-  fn close(&mut self, poll: &mut Poll) -> CloseResult {
+  fn close(&mut self, _poll: &mut Poll) -> CloseResult {
     CloseResult::default()
   }
 
-  fn close_backend(&mut self, token: Token, poll: &mut Poll) {
+  fn close_backend(&mut self, _token: Token, _poll: &mut Poll) {
   }
 
-  fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &time::Duration) -> SessionResult {
+  fn timeout(&self, _token: Token, _timer: &mut Timer<Token>, _front_timeout: &time::Duration) -> SessionResult {
     unimplemented!();
   }
 
-  fn cancel_timeouts(&self, timer: &mut Timer<Token>) {
+  fn cancel_timeouts(&self, _timer: &mut Timer<Token>) {
     unimplemented!();
   }
 
@@ -1352,11 +1352,11 @@ impl HttpsProvider {
     }
   }
 
-  pub fn add_listener(&mut self, config: HttpsListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
+  pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
 
     match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.add_listener(config, pool, token),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.add_listener(config, pool, token),
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.add_listener(config, token),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.add_listener(config, token),
     }
   }
 
@@ -1431,9 +1431,9 @@ impl HttpsProvider {
     rustls.notify(event_loop, message)
   }
 
-  pub fn add_listener(&mut self, config: HttpsListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
+  pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.add_listener(config, pool, token)
+    rustls.add_listener(config, token)
   }
 
   pub fn activate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr, tcp_listener: Option<TcpListener>) -> Option<Token> {
