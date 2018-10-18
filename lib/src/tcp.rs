@@ -408,7 +408,9 @@ impl ProxySession for Session {
   fn close(&mut self, poll: &mut Poll) -> CloseResult {
     self.metrics.service_stop();
     if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
-      error!("error shutting down front socket({:?}): {:?}", self.front_socket(), e);
+      if e.kind() != ErrorKind::NotConnected {
+        error!("error shutting down front socket({:?}): {:?}", self.front_socket(), e);
+      }
     }
     if let Err(e) = poll.deregister(self.front_socket()) {
       error!("error deregistering front socket({:?}): {:?}", self.front_socket(), e);
@@ -463,7 +465,9 @@ impl ProxySession for Session {
       self.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
       if let Some(sock) = self.back_socket() {
         if let Err(e) = sock.shutdown(Shutdown::Both) {
-          error!("error closing back socket({:?}): {:?}", sock, e);
+          if e.kind() != ErrorKind::NotConnected {
+            error!("error closing back socket({:?}): {:?}", sock, e);
+          }
         }
         if let Err(e) = poll.deregister(sock) {
           error!("error deregistering back socket({:?}): {:?}", sock, e);

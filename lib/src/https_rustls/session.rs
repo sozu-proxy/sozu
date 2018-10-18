@@ -4,7 +4,7 @@ use std::net::Shutdown;
 use mio::*;
 use mio::net::*;
 use mio::unix::UnixReady;
-use std::io::Read;
+use std::io::{ErrorKind,Read};
 use std::net::IpAddr;
 use time::{SteadyTime, Duration};
 use rustls::{ServerSession,Session as ClientSession,ProtocolVersion,SupportedCipherSuite,CipherSuite};
@@ -440,7 +440,9 @@ impl ProxySession for Session {
     self.http().map(|http| http.close());
     self.metrics.service_stop();
     if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
-      error!("error closing front socket: {:?}", e);
+      if e.kind() != ErrorKind::NotConnected {
+        error!("error closing front socket: {:?}", e);
+      }
     }
 
     if let Err(e) = poll.deregister(self.front_socket()) {
@@ -503,7 +505,9 @@ impl ProxySession for Session {
       self.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
       if let Some(sock) = self.back_socket() {
         if let Err(e) = sock.shutdown(Shutdown::Both) {
-          error!("error deregistering backend socket: {:?}", e);
+          if e.kind() != ErrorKind::NotConnected {
+            error!("error shutting down backend socket: {:?}", e);
+          }
         }
 
         if let Err(e) = poll.deregister(sock) {
