@@ -491,6 +491,7 @@ pub struct ConnectionValue {
   pub has_close: bool,
   pub has_keep_alive: bool,
   pub has_upgrade: bool,
+  pub to_delete: Option<HashSet<Vec<u8>>>,
 }
 
 #[derive(PartialEq,Debug)]
@@ -534,6 +535,7 @@ impl<'a> Header<'a> {
       let mut has_close = false;
       let mut has_upgrade = false;
       let mut has_keep_alive = false;
+      let mut to_delete = None;
 
       match single_header_value(self.value) {
         Ok((mut input, first)) => {
@@ -543,6 +545,12 @@ impl<'a> Header<'a> {
             has_close = true;
           } else if compare_no_case(first, b"keep-alive") {
             has_keep_alive = true;
+          } else {
+            if to_delete.is_none() {
+              to_delete = Some(HashSet::new());
+            }
+
+            to_delete.as_mut().map(|h| h.insert(Vec::from(first)));
           }
 
           while input.len() != 0 {
@@ -559,7 +567,14 @@ impl<'a> Header<'a> {
                   has_close = true;
                 } else if compare_no_case(v, b"keep-alive") {
                   has_keep_alive = true;
+                } else {
+                  if to_delete.is_none() {
+                    to_delete = Some(HashSet::new());
+                  }
+
+                  to_delete.as_mut().map(|h| h.insert(Vec::from(v)));
                 }
+
                 input = i;
               },
               Err(_) => {
@@ -568,7 +583,7 @@ impl<'a> Header<'a> {
             }
           }
           let r = ConnectionValue {
-            has_close, has_keep_alive, has_upgrade
+            has_close, has_keep_alive, has_upgrade, to_delete
           };
           //println!("returning: {:?}", r);
           HeaderValue::Connection(r)
@@ -641,10 +656,12 @@ impl<'a> Header<'a> {
       compare_no_case(&self.name, b"sozu-id")           ||
       {
         let mut res = false;
-        for ref header_value in &conn.to_delete {
-          if compare_no_case(&self.value, &header_value) {
-            res = true;
-            break;
+        if let Some(ref to_delete) = conn.to_delete {
+          for ref header_value in to_delete {
+            if compare_no_case(&self.value, &header_value) {
+              res = true;
+              break;
+            }
           }
         }
 
@@ -791,7 +808,7 @@ pub struct Connection {
   pub keep_alive:     Option<bool>,
   pub has_upgrade:    bool,
   pub upgrade:        Option<String>,
-  pub to_delete:      HashSet<Vec<u8>>,
+  pub to_delete:      Option<HashSet<Vec<u8>>>,
   pub continues:      Continue,
   pub sticky_session: Option<String>,
 }
@@ -803,7 +820,7 @@ impl Connection {
       has_upgrade:    false,
       upgrade:        None,
       continues:      Continue::None,
-      to_delete:      HashSet::new(),
+      to_delete:      None,
       sticky_session: None,
     }
   }
@@ -814,7 +831,7 @@ impl Connection {
       has_upgrade:    false,
       upgrade:        None,
       continues:      Continue::None,
-      to_delete:      HashSet::new(),
+      to_delete:      None,
       sticky_session: None,
     }
   }
@@ -825,7 +842,7 @@ impl Connection {
       has_upgrade:    false,
       upgrade:        None,
       continues:      Continue::None,
-      to_delete:      HashSet::new(),
+      to_delete:      None,
       sticky_session: None
     }
   }
@@ -2979,7 +2996,7 @@ mod tests {
               has_upgrade: true,
               upgrade:     Some("WebSocket".to_string()),
               continues:   Continue::None,
-              to_delete:   HashSet::new(),
+              to_delete:   None,
               sticky_session: None
             },
             String::from("localhost:8888"),
