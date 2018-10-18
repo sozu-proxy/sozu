@@ -875,6 +875,18 @@ impl RequestState {
     }
   }
 
+  pub fn is_front_error(&self) -> bool {
+    if let RequestState::Error(_,_,_,_,_) = self {
+      true
+    } else {
+      false
+    }
+  }
+
+  pub fn get_sticky_session(&self) -> Option<String> {
+    self.get_keep_alive().and_then(|con| con.sticky_session)
+  }
+
   pub fn has_host(&self) -> bool {
     match *self {
       RequestState::HasHost(_, _, _)            |
@@ -1037,6 +1049,14 @@ impl ResponseState {
     }
   }
 
+  pub fn is_back_error(&self) -> bool {
+    if let ResponseState::Error(_,_,_,_,_) = self {
+      true
+    } else {
+      false
+    }
+  }
+
   pub fn get_status_line(&self) -> Option<RStatusLine> {
     match *self {
       ResponseState::HasStatusLine(ref sl, _)             |
@@ -1111,138 +1131,6 @@ impl ResponseState {
 }
 
 pub type HeaderEndPosition = Option<usize>;
-
-#[derive(Debug,PartialEq)]
-pub struct HttpState {
-  pub request:        Option<RequestState>,
-  pub response:       Option<ResponseState>,
-  pub req_header_end: HeaderEndPosition,
-  pub res_header_end: HeaderEndPosition,
-  pub added_req_header: String,
-  pub added_res_header: String,
-}
-
-impl HttpState {
-  pub fn new() -> HttpState {
-    HttpState {
-      request:        Some(RequestState::Initial),
-      response:       Some(ResponseState::Initial),
-      req_header_end: None,
-      res_header_end: None,
-      added_req_header: String::from(""),
-      added_res_header: String::from(""),
-    }
-  }
-
-  pub fn reset(&mut self) {
-    self.request        = Some(RequestState::Initial);
-    self.response       = Some(ResponseState::Initial);
-    self.req_header_end = None;
-    self.res_header_end = None;
-    self.added_req_header = String::from("");
-    self.added_res_header = String::from("");
-  }
-
-  pub fn has_host(&self) -> bool {
-    self.request.as_ref().map(|r| r.has_host()).expect("there should be a request")
-  }
-
-  pub fn is_front_error(&self) -> bool {
-    if let Some(RequestState::Error(_,_,_,_,_)) = self.request {
-      true
-    } else {
-      false
-    }
-  }
-
-  pub fn is_front_proxying(&self) -> bool {
-    self.request.as_ref().map(|r| r.is_proxying()).expect("there should be a request")
-  }
-
-  pub fn get_host(&self) -> Option<String> {
-    self.request.as_ref().map(|r| r.get_host()).expect("there should be a request")
-  }
-
-  pub fn get_uri(&self) -> Option<String> {
-    self.request.as_ref().map(|r| r.get_uri()).expect("there should be a request")
-  }
-
-  pub fn get_request_line(&self) -> Option<RRequestLine> {
-    self.request.as_ref().map(|r| r.get_request_line()).expect("there should be a request")
-  }
-
-  pub fn get_front_keep_alive(&self) -> Option<Connection> {
-    self.request.as_ref().map(|r| r.get_keep_alive()).expect("there should be a request")
-  }
-
-  pub fn get_request_sticky_session(&self) -> Option<String> {
-    self.request.as_ref().and_then(|r| r.get_keep_alive()).and_then(|con| con.sticky_session)
-  }
-
-  pub fn must_continue(&self) -> Option<usize> {
-    if let Some(Continue::Expects(sz)) = self.request.as_ref().and_then(|r| r.get_keep_alive().map(|conn| conn.continues)) {
-      if self.response.as_ref().and_then(|r| r.get_status_line().map(|st| st.status == 100)).unwrap_or(false) {
-        return Some(sz);
-      }
-    }
-    None
-  }
-  /*
-  pub fn front_should_copy(&self) -> Option<usize> {
-    if self.req_position == 0 {
-      None
-    } else {
-      Some(self.req_position)
-    }
-  }
-
-  pub fn front_copied(&mut self, copied: usize) {
-    if copied > self.req_position {
-      self.request = RequestState::Error(ErrorState::TooMuchDataCopied)
-    } else {
-      self.req_position = self.req_position - copied
-    }
-  }
-  */
-
-  pub fn front_should_keep_alive(&self) -> bool {
-    self.request.as_ref().map(|r| r.should_keep_alive()).expect("there should be a request")
-  }
-
-  pub fn is_back_error(&self) -> bool {
-    if let Some(ResponseState::Error(_,_,_,_,_)) = self.response {
-      true
-    } else {
-      false
-    }
-  }
-
-  pub fn is_back_proxying(&self) -> bool {
-    self.response.as_ref().map(|r| r.is_proxying()).expect("there should be a response")
-  }
-
-  pub fn get_status_line(&self) -> Option<RStatusLine> {
-    self.response.as_ref().map(|r| r.get_status_line()).expect("there should be a response")
-  }
-
-  pub fn get_back_keep_alive(&self) -> Option<Connection> {
-    self.response.as_ref().map(|ref r| r.get_keep_alive()).expect("there should be a response")
-  }
-
-  /*
-  pub fn back_copied(&mut self, copied: usize) {
-    if copied > self.res_position {
-      self.request = RequestState::Error(ErrorState::TooMuchDataCopied)
-    } else {
-      self.res_position = self.res_position - copied
-    }
-  }
-  */
-
-  pub fn back_should_keep_alive(&self) -> bool {
-    self.response.as_ref().map(|ref r| r.should_keep_alive()).expect("there should be a response")
-  }
-}
 
 #[derive(Debug,PartialEq)]
 pub enum BufferMove {

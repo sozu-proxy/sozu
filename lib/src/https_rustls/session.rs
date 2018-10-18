@@ -453,7 +453,7 @@ impl ProxySession for Session {
 
     if let Some(State::Http(ref http)) = self.protocol {
       //if the state was initial, the connection was already reset
-      if unwrap_msg!(http.state.as_ref()).request != Some(RequestState::Initial) {
+      if http.request != Some(RequestState::Initial) {
         gauge_add!("http.active_requests", -1);
       }
     }
@@ -662,7 +662,7 @@ impl ProxySession for Session {
     let p:String = match &self.protocol {
       Some(State::Expect(_,_))  => String::from("Expect"),
       Some(State::Handshake(_)) => String::from("Handshake"),
-      Some(State::Http(h))      => format!("HTTPS: {:?}", h.state),
+      Some(State::Http(h))      => h.print_state("HTTPS"),
       Some(State::WebSocket(_)) => String::from("WSS"),
       None                      => String::from("None"),
     };

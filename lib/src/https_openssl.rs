@@ -674,7 +674,7 @@ impl ProxySession for Session {
     let p:String = match &self.protocol {
       Some(State::Expect(_,_))  => String::from("Expect"),
       Some(State::Handshake(_)) => String::from("Handshake"),
-      Some(State::Http(h))      => format!("HTTPS: {:?}", h.state),
+      Some(State::Http(h))      => h.print_state("HTTPS"),
       Some(State::WebSocket(_)) => String::from("WSS"),
       None                      => String::from("None"),
     };
