@@ -457,7 +457,7 @@ impl ProxySession for Session {
 
     if let Some(State::Http(ref http)) = self.protocol {
       //if the state was initial, the connection was already reset
-      if unwrap_msg!(http.state.as_ref()).request != Some(RequestState::Initial) {
+      if http.request != Some(RequestState::Initial) {
         gauge_add!("http.active_requests", -1);
       }
     }
@@ -1250,7 +1250,7 @@ impl Proxy {
   }
 
   fn app_id_from_request(&mut self,  session: &mut Session) -> Result<String, ConnectionError> {
-    let h = session.http().and_then(|h| h.state.as_ref())
+    let h = session.http().and_then(|h| h.request.as_ref())
       .and_then(|s| s.get_host()).ok_or(ConnectionError::NoHostGiven)?;
 
     let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
@@ -1291,7 +1291,7 @@ impl Proxy {
       return Err(ConnectionError::InvalidHost);
     };
 
-    let rl:RRequestLine = session.http().and_then(|h| h.state().get_request_line())
+    let rl:RRequestLine = session.http().and_then(|h| h.request.as_ref()).and_then(|r| r.get_request_line())
       .ok_or(ConnectionError::NoRequestLineGiven)?;
     match self.listeners.get(&session.listen_token).as_ref()
       .and_then(|l| l.frontend_from_request(&host, &rl.uri))
@@ -1395,7 +1395,8 @@ impl ProxyConfiguration<Session> for Proxy {
 
     session.app_id = Some(app_id.clone());
 
-    let sticky_session = session.http().and_then(|http| http.state.as_ref()).unwrap().get_request_sticky_session();
+    let sticky_session = session.http().and_then(|http| http.request.as_ref())
+      .and_then(|r| r.get_sticky_session());
     let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
     let socket = self.backend_from_request(session, &app_id, front_should_stick, sticky_session)?;
 
