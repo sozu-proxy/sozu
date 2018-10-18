@@ -18,8 +18,8 @@ use sozu_command::state::{ConfigState,get_application_ids_by_domain};
 use sozu_command::proxy::{ProxyRequestData,MessageId,ProxyResponse,
   ProxyResponseData,ProxyResponseStatus,ProxyRequest,Topic,Query,QueryAnswer,
   QueryApplicationType,TlsProvider,ListenerType,HttpsListener};
+use sozu_command::buffer::Buffer;
 
-use buffer_queue::BufferQueue;
 use {SessionResult,ConnectionError,Protocol,ProxySession,
   CloseResult,AcceptError,BackendConnectAction,ProxyConfiguration,Backend};
 use {http,tcp};
@@ -113,7 +113,7 @@ pub struct Server {
   nb_connections:  usize,
   front_timeout:   time::Duration,
   timer:           Timer<Token>,
-  pool:            Rc<RefCell<Pool<BufferQueue>>>,
+  pool:            Rc<RefCell<Pool<Buffer>>>,
   backends:        Rc<RefCell<BackendMap>>,
   scm_listeners:   Option<Listeners>,
   zombie_check_interval: time::Duration,
@@ -126,7 +126,7 @@ impl Server {
   pub fn new_from_config(channel: ProxyChannel, scm: ScmSocket, config: Config, config_state: ConfigState) -> Self {
     let event_loop  = Poll::new().expect("could not create event loop");
     let pool = Rc::new(RefCell::new(
-      Pool::with_capacity(2*config.max_buffers, 0, || BufferQueue::with_capacity(config.buffer_size))
+      Pool::with_capacity(2*config.max_buffers, 0, || Buffer::with_capacity(config.buffer_size))
     ));
     let backends = Rc::new(RefCell::new(BackendMap::new()));
 
@@ -158,7 +158,7 @@ impl Server {
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
     sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken>,
-    pool: Rc<RefCell<Pool<BufferQueue>>>,
+    pool: Rc<RefCell<Pool<Buffer>>>,
     backends: Rc<RefCell<BackendMap>>,
     http: Option<http::Proxy>,
     https: Option<HttpsProvider>,
@@ -1341,7 +1341,7 @@ pub enum HttpsProvider {
 
 #[cfg(feature = "use-openssl")]
 impl HttpsProvider {
-  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
+  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
     if use_openssl {
       HttpsProvider::Openssl(https_openssl::Proxy::new(pool, backends))
     } else {
@@ -1421,7 +1421,7 @@ use https_rustls::session::Session;
 
 #[cfg(not(feature = "use-openssl"))]
 impl HttpsProvider {
-  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
+  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
     if use_openssl {
       error!("the openssl provider is not compiled, continuing with the rustls provider");
     }

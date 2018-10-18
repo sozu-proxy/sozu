@@ -5,11 +5,11 @@ use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use nom::{Err,Offset};
+use sozu_command::buffer::Buffer;
 use SessionResult;
 use Readiness;
 use protocol::ProtocolResult;
 use socket::{SocketHandler, SocketResult};
-use buffer_queue::BufferQueue;
 use SessionMetrics;
 use protocol::pipe::Pipe;
 use super::parser::parse_v2_header;
@@ -21,14 +21,14 @@ pub struct RelayProxyProtocol<Front:SocketHandler> {
   pub backend:        Option<TcpStream>,
   pub frontend_token: Token,
   pub backend_token:  Option<Token>,
-  pub front_buf:      Checkout<BufferQueue>,
+  pub front_buf:      Checkout<Buffer>,
   pub front_readiness:Readiness,
   pub back_readiness: Readiness,
   cursor_header:      usize,
 }
 
 impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
-  pub fn new(frontend: Front, frontend_token: Token,backend: Option<TcpStream>, front_buf: Checkout<BufferQueue>) -> Self {
+  pub fn new(frontend: Front, frontend_token: Token,backend: Option<TcpStream>, front_buf: Checkout<Buffer>) -> Self {
     RelayProxyProtocol {
       header_size: None,
       frontend,
@@ -49,12 +49,11 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
   }
 
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-    let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
+    let (sz, res) = self.frontend.socket_read(self.front_buf.space());
     debug!("FRONT proxy protocol [{:?}]: read {} bytes and res={:?}", self.frontend_token, sz, res);
 
     if sz > 0 {
-      self.front_buf.buffer.fill(sz);
-      self.front_buf.sliced_input(sz);
+      self.front_buf.fill(sz);
 
 
       count!("bytes_in", sz as i64);
@@ -73,11 +72,11 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
         self.front_readiness.event.remove(Ready::readable());
       }
 
-      let read_sz = match parse_v2_header(self.front_buf.unparsed_data()) {
+      let read_sz = match parse_v2_header(self.front_buf.data()) {
         Ok((rest, _)) => {
           self.front_readiness.interest.remove(Ready::readable());
           self.back_readiness.interest.insert(Ready::writable());
-          self.front_buf.next_output_data().offset(rest)
+          self.front_buf.data().offset(rest)
         },
         Err(Err::Incomplete(_)) => {
           return SessionResult::Continue
@@ -90,8 +89,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
       };
 
       self.header_size = Some(read_sz);
-      self.front_buf.consume_parsed_data(sz);
-      self.front_buf.slice_output(sz);
+      self.front_buf.consume(sz);
       return SessionResult::Continue
     }
 
@@ -106,12 +104,12 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
     if let Some(ref mut socket) = self.backend {
       if let Some(ref header_size) = self.header_size {
         loop {
-          match socket.write(self.front_buf.next_output_data()) {
+          match socket.write(self.front_buf.data()) {
             Ok(sz) => {
               self.cursor_header += sz;
 
               metrics.backend_bout += sz;
-              self.front_buf.consume_output_data(sz);
+              self.front_buf.consume(sz);
 
               if self.cursor_header >= *header_size {
                 info!("Proxy protocol sent, upgrading");
@@ -161,7 +159,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
     &mut self.back_readiness
   }
 
-  pub fn into_pipe(mut self, back_buf: Checkout<BufferQueue>) -> Pipe<Front> {
+  pub fn into_pipe(mut self, back_buf: Checkout<Buffer>) -> Pipe<Front> {
     let backend_socket = self.backend.take().unwrap();
     let addr = backend_socket.peer_addr().map(|s| s.ip()).ok();
 

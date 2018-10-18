@@ -18,6 +18,7 @@ use sozu_command::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
 use sozu_command::proxy::{ProxyRequestData,ProxyRequest,ProxyResponse,ProxyResponseStatus};
 use sozu_command::proxy::TcpListener as TcpListenerConfig;
 use sozu_command::logging;
+use sozu_command::buffer::Buffer;
 
 use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
@@ -25,7 +26,6 @@ use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetri
 use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
 use pool::{Pool,Checkout};
-use buffer_queue::BufferQueue;
 use socket::server_bind;
 use protocol::{Pipe, ProtocolResult};
 use protocol::proxy_protocol::send::SendProxyProtocol;
@@ -59,16 +59,16 @@ pub struct Session {
   request_id:         String,
   metrics:            SessionMetrics,
   protocol:           Option<State>,
-  front_buf:          Option<Checkout<BufferQueue>>,
-  back_buf:           Option<Checkout<BufferQueue>>,
+  front_buf:          Option<Checkout<Buffer>>,
+  back_buf:           Option<Checkout<Buffer>>,
   timeout:            Timeout,
   last_event:         SteadyTime,
   connection_attempt: u8,
 }
 
 impl Session {
-  fn new(sock: TcpStream, frontend_token: Token, accept_token: Token, front_buf: Checkout<BufferQueue>,
-    back_buf: Checkout<BufferQueue>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Session {
+  fn new(sock: TcpStream, frontend_token: Token, accept_token: Token, front_buf: Checkout<Buffer>,
+    back_buf: Checkout<Buffer>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Session {
     let s = sock.try_clone().expect("could not clone the socket");
     let addr = sock.peer_addr().map(|s| s.ip()).ok();
     let mut frontend_buffer = None;
@@ -671,13 +671,13 @@ pub struct Listener {
   listener: Option<TcpListener>,
   token:    Token,
   address:  SocketAddr,
-  pool:     Rc<RefCell<Pool<BufferQueue>>>,
+  pool:     Rc<RefCell<Pool<Buffer>>>,
   config:   TcpListenerConfig,
   active:   bool,
 }
 
 impl Listener {
-  fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Listener {
+  fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool<Buffer>>>, token: Token) -> Listener {
     Listener {
       app_id: None,
       listener: None,
@@ -737,7 +737,7 @@ impl Proxy {
     }
   }
 
-  pub fn add_listener(&mut self, config: TcpListenerConfig, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
+  pub fn add_listener(&mut self, config: TcpListenerConfig, pool: Rc<RefCell<Pool<Buffer>>>, token: Token) -> Option<Token> {
     if self.listeners.contains_key(&token) {
       None
     } else {
@@ -981,7 +981,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
 
   let mut poll          = Poll::new().expect("could not create event loop");
   let pool = Rc::new(RefCell::new(
-    Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
+    Pool::with_capacity(2*max_buffers, 0, || Buffer::with_capacity(buffer_size))
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
 
@@ -1133,7 +1133,7 @@ mod tests {
       let max_buffers = 100;
       let buffer_size = 16384;
       let pool = Rc::new(RefCell::new(
-        Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
+        Pool::with_capacity(2*max_buffers, 0, || Buffer::with_capacity(buffer_size))
       ));
       let backends = Rc::new(RefCell::new(BackendMap::new()));
 

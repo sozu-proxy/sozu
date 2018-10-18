@@ -16,13 +16,13 @@ use mio_extras::timer::{Timer, Timeout};
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::proxy::{Application,ProxyRequestData,HttpFront,HttpListener,ProxyRequest,ProxyResponse,ProxyResponseStatus};
 use sozu_command::logging;
+use sozu_command::buffer::Buffer;
 
 use super::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use super::backends::BackendMap;
 use super::pool::Pool;
-use super::buffer_queue::BufferQueue;
 use super::protocol::{ProtocolResult,StickySession,Http,Pipe};
 use super::protocol::http::DefaultAnswerStatus;
 use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
@@ -50,7 +50,7 @@ pub struct Session {
   backend:            Option<Rc<RefCell<Backend>>>,
   back_connected:     BackendConnectionStatus,
   protocol:           Option<State>,
-  pool:               Weak<RefCell<Pool<BufferQueue>>>,
+  pool:               Weak<RefCell<Pool<Buffer>>>,
   metrics:            SessionMetrics,
   pub app_id:         Option<String>,
   sticky_name:        String,
@@ -61,7 +61,7 @@ pub struct Session {
 }
 
 impl Session {
-  pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
+  pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout,
     listen_token: Token) -> Option<Session> {
     let protocol = if expect_proxy {
@@ -104,7 +104,7 @@ impl Session {
       let back_token  = unwrap_msg!(http.back_token());
 
       let front_buf = match http.front_buf {
-        Some(buf) => buf,
+        Some(buf) => buf.buffer,
         None => if let Some(p) = self.pool.upgrade() {
           if let Some(buf) = p.borrow_mut().checkout() {
             buf
@@ -117,7 +117,7 @@ impl Session {
       };
 
       let back_buf = match http.back_buf {
-        Some(buf) => buf,
+        Some(buf) => buf.buffer,
         None => if let Some(p) = self.pool.upgrade() {
           if let Some(buf) = p.borrow_mut().checkout() {
             buf
@@ -689,11 +689,11 @@ pub struct Proxy {
   backends:       Rc<RefCell<BackendMap>>,
   applications:   HashMap<AppId, Application>,
   custom_answers: HashMap<AppId, CustomAnswers>,
-  pool:           Rc<RefCell<Pool<BufferQueue>>>,
+  pool:           Rc<RefCell<Pool<Buffer>>>,
 }
 
 impl Proxy {
-  pub fn new(pool: Rc<RefCell<Pool<BufferQueue>>>, backends: Rc<RefCell<BackendMap>>) -> Proxy {
+  pub fn new(pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>) -> Proxy {
     Proxy {
       listeners:      HashMap::new(),
       applications:   HashMap::new(),
@@ -1233,7 +1233,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
   let mut event_loop  = Poll::new().expect("could not create event loop");
 
   let pool = Rc::new(RefCell::new(
-    Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
+    Pool::with_capacity(2*max_buffers, 0, || Buffer::with_capacity(buffer_size))
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
   let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);

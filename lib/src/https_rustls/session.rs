@@ -9,10 +9,10 @@ use std::net::IpAddr;
 use time::{SteadyTime, Duration};
 use rustls::{ServerSession,Session as ClientSession,ProtocolVersion,SupportedCipherSuite,CipherSuite};
 use mio_extras::timer::{Timer, Timeout};
+use sozu_command::buffer::Buffer;
 
 use protocol::http::parser::RequestState;
 use pool::Pool;
-use buffer_queue::BufferQueue;
 use {Backend,SessionResult,Protocol,Readiness,SessionMetrics, ProxySession,
   BackendConnectionStatus, CloseResult};
 use socket::FrontRustls;
@@ -22,6 +22,7 @@ use protocol::http::DefaultAnswerStatus;
 use protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use retry::RetryPolicy;
 use util::UnwrapLog;
+use buffer_queue::BufferQueue;
 
 pub enum State {
   Expect(ExpectProxyProtocol<TcpStream>, ServerSession),
@@ -36,7 +37,7 @@ pub struct Session {
   pub back_connected: BackendConnectionStatus,
   protocol:           Option<State>,
   pub public_address: Option<IpAddr>,
-  pool:               Weak<RefCell<Pool<BufferQueue>>>,
+  pool:               Weak<RefCell<Pool<Buffer>>>,
   pub metrics:        SessionMetrics,
   pub app_id:         Option<String>,
   sticky_name:        String,
@@ -47,7 +48,7 @@ pub struct Session {
 }
 
 impl Session {
-  pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
+  pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout, listen_token: Token) -> Session {
     let state = if expect_proxy {
       trace!("starting in expect proxy state");
@@ -128,6 +129,8 @@ impl Session {
         return false;
       }
 
+      let mut front_buf = front_buf.unwrap();
+
       handshake.session.get_protocol_version().map(|version| {
         incr!(version_str(version));
       });
@@ -144,12 +147,11 @@ impl Session {
       let http = Http::new(front_stream, self.frontend_token, self.pool.clone(),
         self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
 
-        let res = http.frontend.session.read(front_buf.as_mut().unwrap().buffer.space());
+        let res = http.frontend.session.read(front_buf.space());
         match res {
           Ok(sz) =>{
             //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
-            front_buf.as_mut().unwrap().buffer.fill(sz);
-            front_buf.as_mut().unwrap().sliced_input(sz);
+            front_buf.fill(sz);
             count!("bytes_in", sz as i64);
             self.metrics.bin += sz;
           },
@@ -158,10 +160,13 @@ impl Session {
           }
         }
 
+        let sz = front_buf.available_data();
+        let mut buf = BufferQueue::with_buffer(front_buf);
+        buf.sliced_input(sz);
 
         gauge_add!("protocol.tls.handshake", -1);
         gauge_add!("protocol.https", 1);
-        http.front_buf = front_buf;
+        http.front_buf = Some(buf);
         http.front_readiness = readiness;
         http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
         State::Http(http)
@@ -183,7 +188,7 @@ impl Session {
 
 
       let front_buf = match http.front_buf {
-        Some(buf) => buf,
+        Some(buf) => buf.buffer,
         None => if let Some(p) = self.pool.upgrade() {
           if let Some(buf) = p.borrow_mut().checkout() {
             buf
@@ -195,7 +200,7 @@ impl Session {
         }
       };
       let back_buf = match http.back_buf {
-        Some(buf) => buf,
+        Some(buf) => buf.buffer,
         None => if let Some(p) = self.pool.upgrade() {
           if let Some(buf) = p.borrow_mut().checkout() {
             buf

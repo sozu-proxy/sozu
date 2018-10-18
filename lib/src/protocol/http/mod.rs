@@ -6,11 +6,12 @@ use mio::*;
 use mio::unix::UnixReady;
 use mio::tcp::TcpStream;
 use uuid::Uuid;
+use sozu_command::buffer::Buffer;
 use super::super::{SessionResult,Protocol,Readiness,SessionMetrics, LogDuration};
 use buffer_queue::BufferQueue;
 use socket::{SocketHandler,SocketResult};
 use protocol::ProtocolResult;
-use pool::{Pool,Checkout};
+use pool::Pool;
 use util::UnwrapLog;
 
 pub mod parser;
@@ -54,8 +55,8 @@ pub struct Http<Front:SocketHandler> {
   frontend_token:     Token,
   backend_token:      Option<Token>,
   pub status:         SessionStatus,
-  pub front_buf:      Option<Checkout<BufferQueue>>,
-  pub back_buf:       Option<Checkout<BufferQueue>>,
+  pub front_buf:      Option<BufferQueue>,
+  pub back_buf:       Option<BufferQueue>,
   pub app_id:         Option<String>,
   pub request_id:     String,
   pub front_readiness:Readiness,
@@ -72,11 +73,11 @@ pub struct Http<Front:SocketHandler> {
   pub res_header_end: Option<usize>,
   pub added_req_header: String,
   pub added_res_header: String,
-  pool:                Weak<RefCell<Pool<BufferQueue>>>,
+  pool:                Weak<RefCell<Pool<Buffer>>>,
 }
 
 impl<Front:SocketHandler> Http<Front> {
-  pub fn new(sock: Front, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
+  pub fn new(sock: Front, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: Option<IpAddr>, session_address: Option<SocketAddr>, sticky_name: String,
     protocol: Protocol) -> Option<Http<Front>> {
 
@@ -464,7 +465,7 @@ impl<Front:SocketHandler> Http<Front> {
     if self.front_buf.is_none() {
       if let Some(p) = self.pool.upgrade() {
         if let Some(buf) = p.borrow_mut().checkout() {
-          self.front_buf = Some(buf);
+          self.front_buf = Some(BufferQueue::with_buffer(buf));
         } else {
           error!("cannot get front buffer from pool, closing");
           return SessionResult::CloseSession;
@@ -958,7 +959,7 @@ impl<Front:SocketHandler> Http<Front> {
     if self.back_buf.is_none() {
       if let Some(p) = self.pool.upgrade() {
         if let Some(buf) = p.borrow_mut().checkout() {
-          self.back_buf = Some(buf);
+          self.back_buf = Some(BufferQueue::with_buffer(buf));
         } else {
           error!("cannot get back buffer from pool, closing");
           return (ProtocolResult::Continue, SessionResult::CloseSession);

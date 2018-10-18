@@ -2,7 +2,8 @@ use sozu_command::buffer::Buffer;
 use pool_crate::Reset;
 use std::io::{self,Write};
 use std::cmp::{min,max};
-use std::str;
+use std::{fmt,str};
+use pool::{Pool,Checkout};
 
 #[derive(Debug,PartialEq,Clone)]
 pub enum InputElement {
@@ -42,27 +43,26 @@ pub enum OutputElement {
 /// like with a content length
 ///
 /// should the buffer queue indicate how much data it needs?
-#[derive(Debug,PartialEq,Clone)]
 pub struct BufferQueue {
   /// position of buffer start in stream
   pub buffer_position:        usize,
   pub parsed_position:        usize,
   pub start_parsing_position: usize,
-  pub buffer:                 Buffer,
+  pub buffer:                 Checkout<Buffer>,
   /// Vec<(start, length)>
   pub input_queue:            Vec<InputElement>,
   pub output_queue:           Vec<OutputElement>,
 }
 
 impl BufferQueue {
-  pub fn with_capacity(capacity: usize) -> BufferQueue {
+  pub fn with_buffer(buffer: Checkout<Buffer>) -> BufferQueue {
     BufferQueue {
       buffer_position:        0,
       parsed_position:        0,
       start_parsing_position: 0,
-      buffer:                 Buffer::with_capacity(capacity),
       input_queue:            Vec::with_capacity(8),
       output_queue:           Vec::with_capacity(8),
+      buffer,
     }
   }
 
@@ -423,6 +423,23 @@ impl Reset for BufferQueue {
   }
 }
 
+impl fmt::Debug for BufferQueue {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    use std::ops::Deref;
+    let b: &Buffer = &self.buffer;
+    write!(f, "BufferQueue {{\nbuffer_position: {},\nparsed_position: {},\nstart_parsing_position: {},\ninput_queue: {:?},\noutput_queue:{:?},\nbuffer: {:?}\n}}",
+    self.buffer_position, self.parsed_position, self.start_parsing_position,
+    self.input_queue, self.output_queue, b)
+  }
+}
+
+
+pub fn buf_with_capacity(capacity: usize) -> (Pool<Buffer>, BufferQueue) {
+  let mut pool = Pool::with_capacity(1, 0, || Buffer::with_capacity(capacity));
+  let b = BufferQueue::with_buffer(pool.checkout().unwrap());
+  (pool, b)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -432,14 +449,18 @@ mod tests {
 
   #[test]
   fn consume() {
-    let mut b = BufferQueue {
+    let (pool, mut b) = buf_with_capacity(10);
+    b.buffer.write(&b"ABCDEFGHIJ"[..]);
+    b.buffer.fill(10);
+    b.input_queue.push(InputElement::Slice(10));
+    /*let mut b = BufferQueue {
       parsed_position:        0,
       buffer_position:        0,
       start_parsing_position: 0,
       buffer:                 Buffer::from_slice(b"ABCDEFGHIJ"),
       input_queue:            vec!(InputElement::Slice(10)),
       output_queue:           vec!()
-    };
+    };*/
 
     assert_eq!(b.unparsed_data(), &b"ABCDEFGHIJ"[..]);
     b.consume_parsed_data(4);

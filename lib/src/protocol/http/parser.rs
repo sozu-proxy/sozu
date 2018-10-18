@@ -1792,9 +1792,8 @@ fn add_sticky_session_to_response(buf: &mut BufferQueue,
 mod tests {
   use super::*;
   use nom::{Err,ErrorKind,HexDisplay};
-  use buffer_queue::{BufferQueue,OutputElement};
+  use buffer_queue::{BufferQueue,OutputElement,buf_with_capacity};
   use std::io::Write;
-
 
   #[test]
   fn request_line_test() {
@@ -1878,7 +1877,7 @@ mod tests {
             Content-Length: 200\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
@@ -1917,7 +1916,7 @@ mod tests {
             Content-Length: 200\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
@@ -1952,7 +1951,7 @@ mod tests {
             Content-Length: 200\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
@@ -1999,7 +1998,7 @@ mod tests {
           Connection::keep_alive()
         );
 
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       println!("skipping input:\n{}", (&input[..26]).to_hex(16));
       buf.write(&input[..]).unwrap();
       println!("unparsed data:\n{}", buf.unparsed_data().to_hex(16));
@@ -2044,7 +2043,7 @@ mod tests {
             Accept: */*\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2077,7 +2076,7 @@ mod tests {
             \r\n";
       let initial = RequestState::Initial;
 
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
@@ -2108,7 +2107,7 @@ mod tests {
             Accept: */*\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2138,7 +2137,7 @@ mod tests {
             Connection: close\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2171,7 +2170,7 @@ mod tests {
             Host: localhost:8888\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2201,7 +2200,7 @@ mod tests {
             Connection: keep-alive\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2235,7 +2234,7 @@ mod tests {
             Host: localhost:8888\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2269,7 +2268,7 @@ mod tests {
             Host: localhost:8888\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2305,7 +2304,7 @@ mod tests {
             Content-Length: 200\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       let new_header = b"Sozu-Id: 123456789\r\n";
@@ -2404,7 +2403,7 @@ mod tests {
             0\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2443,7 +2442,7 @@ mod tests {
             0\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..125]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
@@ -2519,7 +2518,7 @@ mod tests {
             0\r\n\
             \r\n";
       let initial = ResponseState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..78]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
@@ -2617,7 +2616,7 @@ mod tests {
         Connection::keep_alive(),
         LengthInformation::Chunked
       );
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
 
       buf.write(&input[..74]).unwrap();
       buf.consume_parsed_data(72);
@@ -2707,7 +2706,7 @@ mod tests {
           Connection: close\r\n\
           \r\n";
     let initial = ResponseState::Initial;
-    let mut buf = BufferQueue::with_capacity(2048);
+    let (pool, mut buf) = buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     let new_header = b"Sozu-Id: 123456789\r\n";
@@ -2749,7 +2748,7 @@ mod tests {
           Connection: close\r\n\
           \r\n";
     let initial = ResponseState::Initial;
-    let mut buf = BufferQueue::with_capacity(2048);
+    let (pool, mut buf) = buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     let new_header = b"Sozu-Id: 123456789\r\n";
@@ -2822,7 +2821,7 @@ mod tests {
             \r\n";
       let initial = ResponseState::Initial;
       let is_head = true;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
@@ -2859,7 +2858,7 @@ mod tests {
             Connection: keep-alive, Upgrade\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
