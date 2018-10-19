@@ -51,7 +51,18 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
   // The header is send immediately at once upon the connection is establish
   // and prepended before any data.
   pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, SessionResult) {
-    debug!("Writing proxy protocol header");
+    debug!("Trying to write proxy protocol header");
+
+    // Generate the proxy protocol header if not already exist.
+    if self.header.is_none() {
+      if let Some(backend_addr) = self.back_socket().and_then(|s| s.peer_addr().ok()) {
+        if let Ok(frontend_addr) = self.front_socket().peer_addr() {
+          self.header = Some(ProxyProtocolHeader::V2(HeaderV2::new(Command::Proxy, frontend_addr, backend_addr)).into_bytes());
+        } else {
+          return (ProtocolResult::Continue, SessionResult::CloseSession);
+        }
+      };
+    }
 
     if let Some(ref mut socket) = self.backend {
       if let Some(ref mut header) = self.header {
@@ -108,7 +119,6 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
 
   pub fn set_back_connected(&mut self, status: BackendConnectionStatus) {
     if status == BackendConnectionStatus::Connected {
-      self.gen_proxy_protocol_header();
       self.back_readiness.interest.insert(UnixReady::from(Ready::writable()));
     }
   }
@@ -119,23 +129,6 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
 
   pub fn back_readiness(&mut self) -> &mut Readiness {
     &mut self.back_readiness
-  }
-
-  fn gen_proxy_protocol_header(&mut self) {
-    let addr_frontend = self.frontend.socket_ref().peer_addr().expect("frontend address should be available");
-
-    let addr_backend = self.backend.as_ref().and_then(|socket| {
-      socket.peer_addr().map_err(|e| error!("cannot get backend address: {:?}", e)).ok()
-    });
-
-    let addr_backend = match addr_backend {
-      Some(addr) => addr,
-      None       => return,
-    };
-
-    // PROXY command hardcoded for now, but we'll use LOCAL when we implement health checks
-    let protocol_header = ProxyProtocolHeader::V2(HeaderV2::new(Command::Proxy, addr_frontend, addr_backend));
-    self.header = Some(protocol_header.into_bytes());
   }
 
   pub fn into_pipe(mut self, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>) -> Pipe<Front> {
