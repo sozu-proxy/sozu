@@ -972,6 +972,15 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
               }
               https_frontend_table.add_row(Row::new(header));
 
+              let mut tcp_frontend_table = Table::new();
+              let mut header = Vec::new();
+              header.push(cell!("id"));
+              header.push(cell!("address"));
+              for ref key in data.keys() {
+                header.push(cell!(&key));
+              }
+              tcp_frontend_table.add_row(Row::new(header));
+
               let mut backend_table = Table::new();
               let mut header = Vec::new();
               header.push(cell!("backend id"));
@@ -987,6 +996,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
               let mut application_data = HashMap::new();
               let mut frontend_data = HashMap::new();
               let mut https_frontend_data = HashMap::new();
+              let mut tcp_frontend_data = HashMap::new();
               let mut backend_data = HashMap::new();
 
               for (ref key, ref metrics) in data.iter() {
@@ -1003,6 +1013,11 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
 
                     for frontend in app.https_frontends.iter() {
                       let mut entry = https_frontend_data.entry(frontend).or_insert(Vec::new());
+                      entry.push((*key).clone());
+                    }
+
+                    for frontend in app.tcp_frontends.iter() {
+                      let mut entry = tcp_frontend_data.entry(frontend).or_insert(Vec::new());
                       entry.push((*key).clone());
                     }
 
@@ -1077,6 +1092,26 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
               }
 
               https_frontend_table.printstd();
+
+              println!("\nTCP frontends configuration for {}:\n", needle);
+
+              for (ref key, ref values) in tcp_frontend_data.iter() {
+                let mut row = Vec::new();
+                row.push(cell!(key.app_id));
+                row.push(cell!(format!("{}", key.address)));
+
+                for val in values.iter() {
+                  if keys.contains(val) {
+                    row.push(cell!(String::from("X")));
+                  } else {
+                    row.push(cell!(String::from("")));
+                  }
+                }
+
+                tcp_frontend_table.add_row(Row::new(row));
+              }
+
+              tcp_frontend_table.printstd();
 
               println!("\nbackends configuration for {}:\n", needle);
 
