@@ -7,7 +7,7 @@ use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFront, Htt
   AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend};
 
 use serde_json;
-use std::collections::{HashMap,HashSet};
+use std::collections::{HashMap,HashSet,BTreeMap};
 use std::process::exit;
 use std::thread;
 use std::sync::{Arc,Mutex};
@@ -941,55 +941,20 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
                 return;
               }
 
-              let mut application_table = Table::new();
-              let mut header = Vec::new();
-              header.push(cell!("id"));
-              header.push(cell!("sticky_session"));
-              header.push(cell!("https_redirect"));
-              for ref key in data.keys() {
-                header.push(cell!(&key));
-              }
-              application_table.add_row(Row::new(header));
+              let mut application_headers = vec!["id", "sticky_session", "https_redirect"];
+              let mut application_table = create_queried_application_table(application_headers, &data);
 
-              let mut frontend_table = Table::new();
-              let mut header = Vec::new();
-              header.push(cell!("id"));
-              header.push(cell!("hostname"));
-              header.push(cell!("path begin"));
-              for ref key in data.keys() {
-                header.push(cell!(&key));
-              }
-              frontend_table.add_row(Row::new(header));
+              let mut http_headers = vec!["id", "hostname", "path begin"];
+              let mut frontend_table = create_queried_application_table(http_headers, &data);
 
-              let mut https_frontend_table = Table::new();
-              let mut header = Vec::new();
-              header.push(cell!("id"));
-              header.push(cell!("hostname"));
-              header.push(cell!("path begin"));
-              header.push(cell!("fingerprint"));
-              for ref key in data.keys() {
-                header.push(cell!(&key));
-              }
-              https_frontend_table.add_row(Row::new(header));
+              let mut https_headers = vec!["id", "hostname", "path begin", "fingerprint"];
+              let mut https_frontend_table = create_queried_application_table(https_headers, &data);
 
-              let mut tcp_frontend_table = Table::new();
-              let mut header = Vec::new();
-              header.push(cell!("id"));
-              header.push(cell!("address"));
-              for ref key in data.keys() {
-                header.push(cell!(&key));
-              }
-              tcp_frontend_table.add_row(Row::new(header));
+              let mut tcp_headers = vec!["id", "address"];
+              let mut tcp_frontend_table = create_queried_application_table(tcp_headers, &data);
 
-              let mut backend_table = Table::new();
-              let mut header = Vec::new();
-              header.push(cell!("backend id"));
-              header.push(cell!("IP address"));
-              header.push(cell!("Backup"));
-              for ref key in data.keys() {
-                header.push(cell!(&key));
-              }
-              backend_table.add_row(Row::new(header));
+              let mut backend_headers = vec!["backend id", "IP address", "Backup"];
+              let mut backend_table = create_queried_application_table(backend_headers, &data);
 
               let keys : HashSet<&String> = data.keys().collect();
 
@@ -1300,4 +1265,14 @@ fn get_certificate_fingerprint(certificate_path: &str) -> Option<CertFingerprint
       None
     }
   }
+}
+
+fn create_queried_application_table(headers: Vec<&str>, data: &BTreeMap<String, QueryAnswer>) -> Table {
+  let mut table = Table::new();
+  let mut row_header: Vec<_> = headers.iter().map(|h| cell!(h)).collect();
+  for ref key in data.keys() {
+    row_header.push(cell!(&key));
+  }
+  table.add_row(Row::new(row_header));
+  table
 }
