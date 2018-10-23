@@ -1,6 +1,6 @@
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
-use std::net::Shutdown;
+use std::net::{Shutdown,SocketAddr};
 use mio::*;
 use mio::net::*;
 use mio::unix::UnixReady;
@@ -45,11 +45,19 @@ pub struct Session {
   last_event:         SteadyTime,
   pub listen_token:   Token,
   pub connection_attempt: u8,
+  peer_address:       Option<SocketAddr>,
 }
 
 impl Session {
   pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout, listen_token: Token) -> Session {
+    let peer_address = if expect_proxy {
+      // Will be defined later once the expect proxy header has been received and parsed
+      None
+    } else {
+      sock.peer_addr().ok()
+    };
+
     let state = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);
@@ -73,6 +81,7 @@ impl Session {
       last_event:     SteadyTime::now(),
       listen_token,
       connection_attempt: 0,
+      peer_address:   peer_address
     };
     session.front_readiness().interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
     session
@@ -104,6 +113,7 @@ impl Session {
       if let Some(ref addresses) = expect.addresses {
         if let (Some(public_address), Some(session_address)) = (addresses.destination(), addresses.source()) {
           self.public_address = Some(public_address.ip());
+          self.peer_address = Some(session_address);
 
           let ExpectProxyProtocol {
             frontend, readiness, .. } = expect;
@@ -145,7 +155,7 @@ impl Session {
 
       let readiness = handshake.readiness.clone();
       let http = Http::new(front_stream, self.frontend_token, self.pool.clone(),
-        self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
+        self.public_address.clone(), self.peer_address, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
 
         let res = http.frontend.session.read(front_buf.space());
         match res {
