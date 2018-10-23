@@ -78,11 +78,19 @@ pub struct Session {
   last_event:         SteadyTime,
   pub listen_token:   Token,
   connection_attempt: u8,
+  peer_address:       Option<SocketAddr>,
 }
 
 impl Session {
   pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>, public_address: Option<IpAddr>,
     expect_proxy: bool, sticky_name: String, timeout: Timeout, listen_token: Token) -> Session {
+    let peer_address = if expect_proxy {
+      // Will be defined later once the expect proxy header has been received and parsed
+      None
+    } else {
+      sock.peer_addr().ok()
+    };
+
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);
@@ -107,6 +115,7 @@ impl Session {
       last_event:         SteadyTime::now(),
       listen_token,
       connection_attempt: 0,
+      peer_address:       peer_address,
     };
     session.front_readiness().interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
 
@@ -139,6 +148,7 @@ impl Session {
       if let Some(ref addresses) = expect.addresses {
         if let (Some(public_address), Some(session_address)) = (addresses.destination(), addresses.source()) {
           self.public_address = Some(public_address.ip());
+          self.peer_address = Some(session_address);
 
           let ExpectProxyProtocol { frontend, readiness, .. } = expect;
           let mut tls = TlsHandshake::new(ssl, frontend);
@@ -168,7 +178,7 @@ impl Session {
       });
 
       let http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), pool,
-        self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
+        self.public_address.clone(), self.peer_address, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
 
         http.front_readiness = readiness;
         http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
