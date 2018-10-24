@@ -4,15 +4,15 @@ use std::net::Shutdown;
 use mio::*;
 use mio::net::*;
 use mio::unix::UnixReady;
-use std::io::Read;
+use std::io::{ErrorKind,Read};
 use std::net::IpAddr;
 use time::{SteadyTime, Duration};
 use rustls::{ServerSession,Session as ClientSession,ProtocolVersion,SupportedCipherSuite,CipherSuite};
 use mio_extras::timer::{Timer, Timeout};
+use sozu_command::buffer::Buffer;
 
 use protocol::http::parser::RequestState;
 use pool::Pool;
-use buffer_queue::BufferQueue;
 use {Backend,SessionResult,Protocol,Readiness,SessionMetrics, ProxySession,
   BackendConnectionStatus, CloseResult};
 use socket::FrontRustls;
@@ -22,6 +22,7 @@ use protocol::http::DefaultAnswerStatus;
 use protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use retry::RetryPolicy;
 use util::UnwrapLog;
+use buffer_queue::BufferQueue;
 
 pub enum State {
   Expect(ExpectProxyProtocol<TcpStream>, ServerSession),
@@ -36,7 +37,7 @@ pub struct Session {
   pub back_connected: BackendConnectionStatus,
   protocol:           Option<State>,
   pub public_address: Option<IpAddr>,
-  pool:               Weak<RefCell<Pool<BufferQueue>>>,
+  pool:               Weak<RefCell<Pool<Buffer>>>,
   pub metrics:        SessionMetrics,
   pub app_id:         Option<String>,
   sticky_name:        String,
@@ -47,7 +48,7 @@ pub struct Session {
 }
 
 impl Session {
-  pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>,
+  pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout, listen_token: Token) -> Session {
     let state = if expect_proxy {
       trace!("starting in expect proxy state");
@@ -128,6 +129,8 @@ impl Session {
         return false;
       }
 
+      let mut front_buf = front_buf.unwrap();
+
       handshake.session.get_protocol_version().map(|version| {
         incr!(version_str(version));
       });
@@ -144,12 +147,11 @@ impl Session {
       let http = Http::new(front_stream, self.frontend_token, self.pool.clone(),
         self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
 
-        let res = http.frontend.session.read(front_buf.as_mut().unwrap().buffer.space());
+        let res = http.frontend.session.read(front_buf.space());
         match res {
           Ok(sz) =>{
             //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
-            front_buf.as_mut().unwrap().buffer.fill(sz);
-            front_buf.as_mut().unwrap().sliced_input(sz);
+            front_buf.fill(sz);
             count!("bytes_in", sz as i64);
             self.metrics.bin += sz;
           },
@@ -158,10 +160,13 @@ impl Session {
           }
         }
 
+        let sz = front_buf.available_data();
+        let mut buf = BufferQueue::with_buffer(front_buf);
+        buf.sliced_input(sz);
 
         gauge_add!("protocol.tls.handshake", -1);
         gauge_add!("protocol.https", 1);
-        http.front_buf = front_buf;
+        http.front_buf = Some(buf);
         http.front_readiness = readiness;
         http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
         State::Http(http)
@@ -183,7 +188,7 @@ impl Session {
 
 
       let front_buf = match http.front_buf {
-        Some(buf) => buf,
+        Some(buf) => buf.buffer,
         None => if let Some(p) = self.pool.upgrade() {
           if let Some(buf) = p.borrow_mut().checkout() {
             buf
@@ -195,7 +200,7 @@ impl Session {
         }
       };
       let back_buf = match http.back_buf {
-        Some(buf) => buf,
+        Some(buf) => buf.buffer,
         None => if let Some(p) = self.pool.upgrade() {
           if let Some(buf) = p.borrow_mut().checkout() {
             buf
@@ -439,8 +444,15 @@ impl ProxySession for Session {
     //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
     self.http().map(|http| http.close());
     self.metrics.service_stop();
-    self.front_socket().shutdown(Shutdown::Both);
-    poll.deregister(self.front_socket());
+    if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
+      if e.kind() != ErrorKind::NotConnected {
+        error!("error closing front socket: {:?}", e);
+      }
+    }
+
+    if let Err(e) = poll.deregister(self.front_socket()) {
+      error!("error deregistering front socket: {:?}", e);
+    }
 
     let mut result = CloseResult::default();
 
@@ -453,7 +465,7 @@ impl ProxySession for Session {
 
     if let Some(State::Http(ref http)) = self.protocol {
       //if the state was initial, the connection was already reset
-      if unwrap_msg!(http.state.as_ref()).request != Some(RequestState::Initial) {
+      if http.request != Some(RequestState::Initial) {
         gauge_add!("http.active_requests", -1);
       }
     }
@@ -497,8 +509,15 @@ impl ProxySession for Session {
     if back_connected != BackendConnectionStatus::NotConnected {
       self.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
       if let Some(sock) = self.back_socket() {
-        sock.shutdown(Shutdown::Both);
-        poll.deregister(sock);
+        if let Err(e) = sock.shutdown(Shutdown::Both) {
+          if e.kind() != ErrorKind::NotConnected {
+            error!("error shutting down backend socket: {:?}", e);
+          }
+        }
+
+        if let Err(e) = poll.deregister(sock) {
+          error!("error deregistering backend socket: {:?}", e);
+        }
       }
     }
 
@@ -662,7 +681,7 @@ impl ProxySession for Session {
     let p:String = match &self.protocol {
       Some(State::Expect(_,_))  => String::from("Expect"),
       Some(State::Handshake(_)) => String::from("Handshake"),
-      Some(State::Http(h))      => format!("HTTPS: {:?}", h.state),
+      Some(State::Http(h))      => h.print_state("HTTPS"),
       Some(State::WebSocket(_)) => String::from("WSS"),
       None                      => String::from("None"),
     };

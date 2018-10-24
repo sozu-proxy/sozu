@@ -8,10 +8,10 @@ use SessionResult;
 use Readiness;
 use protocol::ProtocolResult;
 use socket::{SocketHandler, SocketResult};
-use buffer_queue::BufferQueue;
 use SessionMetrics;
 use protocol::pipe::Pipe;
 use pool::Checkout;
+use sozu_command::buffer::Buffer;
 use super::parser::parse_v2_header;
 use super::header::ProxyAddr;
 
@@ -124,7 +124,9 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
     &mut self.readiness
   }
 
-  pub fn into_pipe(self, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, backend_socket: Option<TcpStream>, backend_token: Option<Token>) -> Pipe<Front> {
+  pub fn into_pipe(self, front_buf: Checkout<Buffer>, back_buf: Checkout<Buffer>,
+    backend_socket: Option<TcpStream>, backend_token: Option<Token>) -> Pipe<Front> {
+
     let addr = if let Some(ref backend_socket) = backend_socket {
       backend_socket.peer_addr().map(|s| s.ip()).ok()
     } else {

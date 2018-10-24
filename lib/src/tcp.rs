@@ -18,6 +18,7 @@ use sozu_command::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
 use sozu_command::proxy::{ProxyRequestData,ProxyRequest,ProxyResponse,ProxyResponseStatus};
 use sozu_command::proxy::TcpListener as TcpListenerConfig;
 use sozu_command::logging;
+use sozu_command::buffer::Buffer;
 
 use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
@@ -25,7 +26,6 @@ use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetri
 use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
 use pool::{Pool,Checkout};
-use buffer_queue::BufferQueue;
 use socket::server_bind;
 use protocol::{Pipe, ProtocolResult};
 use protocol::proxy_protocol::send::SendProxyProtocol;
@@ -59,16 +59,16 @@ pub struct Session {
   request_id:         String,
   metrics:            SessionMetrics,
   protocol:           Option<State>,
-  front_buf:          Option<Checkout<BufferQueue>>,
-  back_buf:           Option<Checkout<BufferQueue>>,
+  front_buf:          Option<Checkout<Buffer>>,
+  back_buf:           Option<Checkout<Buffer>>,
   timeout:            Timeout,
   last_event:         SteadyTime,
   connection_attempt: u8,
 }
 
 impl Session {
-  fn new(sock: TcpStream, frontend_token: Token, accept_token: Token, front_buf: Checkout<BufferQueue>,
-    back_buf: Checkout<BufferQueue>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Session {
+  fn new(sock: TcpStream, frontend_token: Token, accept_token: Token, front_buf: Checkout<Buffer>,
+    back_buf: Checkout<Buffer>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Session {
     let s = sock.try_clone().expect("could not clone the socket");
     let addr = sock.peer_addr().map(|s| s.ip()).ok();
     let mut frontend_buffer = None;
@@ -407,8 +407,14 @@ impl Session {
 impl ProxySession for Session {
   fn close(&mut self, poll: &mut Poll) -> CloseResult {
     self.metrics.service_stop();
-    self.front_socket().shutdown(Shutdown::Both);
-    poll.deregister(self.front_socket());
+    if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
+      if e.kind() != ErrorKind::NotConnected {
+        error!("error shutting down front socket({:?}): {:?}", self.front_socket(), e);
+      }
+    }
+    if let Err(e) = poll.deregister(self.front_socket()) {
+      error!("error deregistering front socket({:?}): {:?}", self.front_socket(), e);
+    }
 
     let mut result = CloseResult::default();
 
@@ -458,8 +464,14 @@ impl ProxySession for Session {
     if back_connected != BackendConnectionStatus::NotConnected {
       self.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
       if let Some(sock) = self.back_socket() {
-        sock.shutdown(Shutdown::Both);
-        poll.deregister(sock);
+        if let Err(e) = sock.shutdown(Shutdown::Both) {
+          if e.kind() != ErrorKind::NotConnected {
+            error!("error closing back socket({:?}): {:?}", sock, e);
+          }
+        }
+        if let Err(e) = poll.deregister(sock) {
+          error!("error deregistering back socket({:?}): {:?}", sock, e);
+        }
       }
     }
 
@@ -659,13 +671,13 @@ pub struct Listener {
   listener: Option<TcpListener>,
   token:    Token,
   address:  SocketAddr,
-  pool:     Rc<RefCell<Pool<BufferQueue>>>,
+  pool:     Rc<RefCell<Pool<Buffer>>>,
   config:   TcpListenerConfig,
   active:   bool,
 }
 
 impl Listener {
-  fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Listener {
+  fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool<Buffer>>>, token: Token) -> Listener {
     Listener {
       app_id: None,
       listener: None,
@@ -688,7 +700,9 @@ impl Listener {
 
 
     if let Some(ref sock) = listener {
-      event_loop.register(sock, self.token, Ready::readable(), PollOpt::edge());
+      if let Err(e ) = event_loop.register(sock, self.token, Ready::readable(), PollOpt::edge()) {
+        error!("error registering socket({:?}): {:?}", sock, e);
+      }
     } else {
       return None;
     }
@@ -723,7 +737,7 @@ impl Proxy {
     }
   }
 
-  pub fn add_listener(&mut self, config: TcpListenerConfig, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
+  pub fn add_listener(&mut self, config: TcpListenerConfig, pool: Rc<RefCell<Pool<Buffer>>>, token: Token) -> Option<Token> {
     if self.listeners.contains_key(&token) {
       None
     } else {
@@ -805,15 +819,19 @@ impl ProxyConfiguration<Session> for Proxy {
     let conn = self.backend_from_app_id(session, &app_id);
     match conn {
       Ok(stream) => {
-        stream.set_nodelay(true);
+        if let Err(e) = stream.set_nodelay(true) {
+          error!("error setting nodelay on back socket({:?}): {:?}", stream, e);
+        }
         session.back_connected = BackendConnectionStatus::Connecting;
 
-        poll.register(
+        if let Err(e) = poll.register(
           &stream,
           back_token,
           Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
           PollOpt::edge()
-        );
+        ) {
+          error!("error registering back socket({:?}): {:?}", stream, e);
+        }
 
         session.set_back_token(back_token);
         session.set_back_socket(stream);
@@ -892,7 +910,7 @@ impl ProxyConfiguration<Session> for Proxy {
         tcp_listener.accept().map(|(frontend_sock, _)| frontend_sock).map_err(|e| {
           match e.kind() {
             ErrorKind::WouldBlock => AcceptError::WouldBlock,
-            other => {
+            _ => {
               error!("accept() IO error: {:?}", e);
               AcceptError::IoError
             }
@@ -922,17 +940,21 @@ impl ProxyConfiguration<Session> for Proxy {
                                 .get(listener.app_id.as_ref().unwrap())
                                 .and_then(|c| c.proxy_protocol.clone());
 
-        frontend_sock.set_nodelay(true);
+        if let Err(e) = frontend_sock.set_nodelay(true) {
+          error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
+        }
         let c = Session::new(frontend_sock, session_token, internal_token, front_buf, back_buf, proxy_protocol.clone(),
         timeout);
         incr!("tcp.requests");
 
-        poll.register(
+        if let Err(e) = poll.register(
           c.front_socket(),
           session_token,
           Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
           PollOpt::edge()
-          );
+          ) {
+          error!("error registering front socket({:?}): {:?}", c.front_socket(), e);
+        }
 
         let should_connect_backend = proxy_protocol != Some(ProxyProtocolConfig::ExpectHeader);
         Ok((Rc::new(RefCell::new(c)), should_connect_backend))
@@ -959,7 +981,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
 
   let mut poll          = Poll::new().expect("could not create event loop");
   let pool = Rc::new(RefCell::new(
-    Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
+    Pool::with_capacity(2*max_buffers, 0, || Buffer::with_capacity(buffer_size))
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
 
@@ -1111,7 +1133,7 @@ mod tests {
       let max_buffers = 100;
       let buffer_size = 16384;
       let pool = Rc::new(RefCell::new(
-        Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
+        Pool::with_capacity(2*max_buffers, 0, || Buffer::with_capacity(buffer_size))
       ));
       let backends = Rc::new(RefCell::new(BackendMap::new()));
 

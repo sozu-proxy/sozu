@@ -71,6 +71,11 @@ pub enum SubCmd {
     json: bool,
     #[structopt(subcommand)]
     cmd: QueryCmd,
+  },
+  #[structopt(name = "config", about = "configuration file management")]
+  Config {
+    #[structopt(subcommand)]
+    cmd: ConfigCmd
   }
 }
 
@@ -249,4 +254,10 @@ pub enum QueryCmd {
     #[structopt(short = "d", long="domain", help="application domain name")]
     domain: Option<String>
   }
+}
+
+#[derive(StructOpt, PartialEq, Debug)]
+pub enum ConfigCmd {
+  #[structopt(name = "check", about = "check configuration file syntax and exit")]
+  Check {}
 }

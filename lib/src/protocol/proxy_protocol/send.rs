@@ -4,6 +4,7 @@ use std::io::Read;
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
+use sozu_command::buffer::Buffer;
 use {
   SessionMetrics,
   SessionResult,
@@ -11,7 +12,6 @@ use {
   BackendConnectionStatus,
   protocol::{ProtocolResult, pipe::Pipe},
   socket::SocketHandler,
-  buffer_queue::BufferQueue,
   pool::Checkout,
 };
 
@@ -131,7 +131,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
     &mut self.back_readiness
   }
 
-  pub fn into_pipe(mut self, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>) -> Pipe<Front> {
+  pub fn into_pipe(mut self, front_buf: Checkout<Buffer>, back_buf: Checkout<Buffer>) -> Pipe<Front> {
     let backend_socket = self.backend.take().unwrap();
     let addr = backend_socket.peer_addr().map(|s| s.ip()).ok();
 

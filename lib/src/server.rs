@@ -18,8 +18,8 @@ use sozu_command::state::{ConfigState,get_application_ids_by_domain};
 use sozu_command::proxy::{ProxyRequestData,MessageId,ProxyResponse,
   ProxyResponseData,ProxyResponseStatus,ProxyRequest,Topic,Query,QueryAnswer,
   QueryApplicationType,TlsProvider,ListenerType,HttpsListener};
+use sozu_command::buffer::Buffer;
 
-use buffer_queue::BufferQueue;
 use {SessionResult,ConnectionError,Protocol,ProxySession,
   CloseResult,AcceptError,BackendConnectAction,ProxyConfiguration,Backend};
 use {http,tcp};
@@ -113,7 +113,7 @@ pub struct Server {
   nb_connections:  usize,
   front_timeout:   time::Duration,
   timer:           Timer<Token>,
-  pool:            Rc<RefCell<Pool<BufferQueue>>>,
+  pool:            Rc<RefCell<Pool<Buffer>>>,
   backends:        Rc<RefCell<BackendMap>>,
   scm_listeners:   Option<Listeners>,
   zombie_check_interval: time::Duration,
@@ -126,7 +126,7 @@ impl Server {
   pub fn new_from_config(channel: ProxyChannel, scm: ScmSocket, config: Config, config_state: ConfigState) -> Self {
     let event_loop  = Poll::new().expect("could not create event loop");
     let pool = Rc::new(RefCell::new(
-      Pool::with_capacity(2*config.max_buffers, 0, || BufferQueue::with_capacity(config.buffer_size))
+      Pool::with_capacity(2*config.max_buffers, 0, || Buffer::with_capacity(config.buffer_size))
     ));
     let backends = Rc::new(RefCell::new(BackendMap::new()));
 
@@ -158,7 +158,7 @@ impl Server {
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
     sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken>,
-    pool: Rc<RefCell<Pool<BufferQueue>>>,
+    pool: Rc<RefCell<Pool<Buffer>>>,
     backends: Rc<RefCell<BackendMap>>,
     http: Option<http::Proxy>,
     https: Option<HttpsProvider>,
@@ -296,7 +296,9 @@ impl Server {
             }
 
             if self.channel.readiness().is_readable() {
-              self.channel.readable();
+              if let Err(e) = self.channel.readable() {
+                error!("error reading from channel: {:?}", e);
+              }
 
               loop {
                 let msg = self.channel.read_message();
@@ -304,7 +306,9 @@ impl Server {
                 // if the message was too large, we grow the buffer and retry to read if possible
                 if msg.is_none() {
                   if (self.channel.interest & self.channel.readiness).is_readable() {
-                    self.channel.readable();
+                    if let Err(e) = self.channel.readable() {
+                      error!("error reading from channel: {:?}", e);
+                    }
                     continue;
                   } else {
                     break;
@@ -346,7 +350,9 @@ impl Server {
                 }
 
                 if self.channel.back_buf.available_data() > 0 {
-                  self.channel.writable();
+                  if let Err(e) = self.channel.writable() {
+                    error!("error writing to channel: {:?}", e);
+                  }
                 }
 
                 if !self.channel.readiness.is_writable() {
@@ -448,7 +454,7 @@ impl Server {
     if let ProxyRequestData::Metrics = message.order {
       let q = &mut self.queue;
       //let id = message.id.clone();
-      let msg = METRICS.with(|metrics| {
+      METRICS.with(|metrics| {
         q.push_back(ProxyResponse {
           id:     message.id.clone(),
           status: ProxyResponseStatus::Ok,
@@ -501,7 +507,7 @@ impl Server {
     self.config_state.handle_order(&message.order);
 
     match message {
-      ProxyRequest { ref id, order: ProxyRequestData::AddApplication(ref application) } => {
+      ProxyRequest { id: _, order: ProxyRequestData::AddApplication(ref application) } => {
         self.backends.borrow_mut().set_load_balancing_policy_for_app(&application.app_id,
           application.load_balancing_policy);
         //not returning because the message must still be handled by each proxy
@@ -555,11 +561,9 @@ impl Server {
           }
 
           let entry = entry.unwrap();
-
           let token = Token(entry.index().0);
 
-          let front = listener.front.clone();
-          let status = if let Some(token) = self.http.add_listener(listener.clone(), self.pool.clone(), token) {
+          let status = if self.http.add_listener(listener.clone(), token).is_some() {
             entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
             self.base_sessions_count += 1;
             ProxyResponseStatus::Ok
@@ -632,11 +636,9 @@ impl Server {
           }
 
           let entry = entry.unwrap();
-
           let token = Token(entry.index().0);
 
-          let front = listener.front.clone();
-          let status = if let Some(token) = self.https.add_listener(listener.clone(), self.pool.clone(), token) {
+          let status = if self.https.add_listener(listener.clone(), token).is_some() {
             entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPSListen })));
             self.base_sessions_count += 1;
             ProxyResponseStatus::Ok
@@ -709,11 +711,9 @@ impl Server {
           }
 
           let entry = entry.unwrap();
-
           let token = Token(entry.index().0);
 
-          let front = listener.front.clone();
-          let status = if let Some(token) = self.tcp.add_listener(listener.clone(), self.pool.clone(), token) {
+          let status = if self.tcp.add_listener(listener.clone(), self.pool.clone(), token).is_some() {
             entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::TCPListen })));
             self.base_sessions_count += 1;
             ProxyResponseStatus::Ok
@@ -764,17 +764,23 @@ impl Server {
 
     let http_listeners = self.http.give_back_listeners();
     for &(_, ref sock) in http_listeners.iter() {
-      self.poll.deregister(sock);
+      if let Err(e) = self.poll.deregister(sock) {
+        error!("error deregistering HTTP listen socket({:?}): {:?}", sock, e);
+      }
     }
 
     let https_listeners = self.https.give_back_listeners();
     for &(_, ref sock) in https_listeners.iter() {
-      self.poll.deregister(sock);
+      if let Err(e) = self.poll.deregister(sock) {
+        error!("error deregistering HTTPS listen socket({:?}): {:?}", sock, e);
+      }
     }
 
     let tcp_listeners = self.tcp.give_back_listeners();
     for &(_, ref sock) in tcp_listeners.iter() {
-      self.poll.deregister(sock);
+      if let Err(e) = self.poll.deregister(sock) {
+        error!("error deregistering TCP listen socket({:?}): {:?}", sock, e);
+      }
     }
 
     let listeners = Listeners {
@@ -892,10 +898,9 @@ impl Server {
       },
       Some(entry) => {
         let session_token = Token(entry.index().0);
-        let index = entry.index();
         let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
         match self.http.create_session(socket, token, &mut self.poll, session_token, timeout) {
-          Ok((session, should_connect)) => {
+          Ok((session, _)) => {
             entry.insert(session);
             self.nb_connections += 1;
             assert!(self.nb_connections <= self.max_connections);
@@ -937,10 +942,9 @@ impl Server {
       },
       Some(entry) => {
         let session_token = Token(entry.index().0);
-        let index = entry.index();
         let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
         match self.https.create_session(socket, token, &mut self.poll, session_token, timeout) {
-          Ok((session, should_connect)) => {
+          Ok((session, _)) => {
             entry.insert(session);
             self.nb_connections += 1;
             assert!(self.nb_connections <= self.max_connections);
@@ -1300,20 +1304,20 @@ impl ProxySession for ListenSession {
     SessionResult::Continue
   }
 
-  fn process_events(&mut self, token: Token, events: Ready) {}
+  fn process_events(&mut self, _token: Token, _events: Ready) {}
 
-  fn close(&mut self, poll: &mut Poll) -> CloseResult {
+  fn close(&mut self, _poll: &mut Poll) -> CloseResult {
     CloseResult::default()
   }
 
-  fn close_backend(&mut self, token: Token, poll: &mut Poll) {
+  fn close_backend(&mut self, _token: Token, _poll: &mut Poll) {
   }
 
-  fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &time::Duration) -> SessionResult {
+  fn timeout(&self, _token: Token, _timer: &mut Timer<Token>, _front_timeout: &time::Duration) -> SessionResult {
     unimplemented!();
   }
 
-  fn cancel_timeouts(&self, timer: &mut Timer<Token>) {
+  fn cancel_timeouts(&self, _timer: &mut Timer<Token>) {
     unimplemented!();
   }
 
@@ -1337,7 +1341,7 @@ pub enum HttpsProvider {
 
 #[cfg(feature = "use-openssl")]
 impl HttpsProvider {
-  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
+  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
     if use_openssl {
       HttpsProvider::Openssl(https_openssl::Proxy::new(pool, backends))
     } else {
@@ -1352,11 +1356,11 @@ impl HttpsProvider {
     }
   }
 
-  pub fn add_listener(&mut self, config: HttpsListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
+  pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
 
     match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.add_listener(config, pool, token),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.add_listener(config, pool, token),
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.add_listener(config, token),
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.add_listener(config, token),
     }
   }
 
@@ -1417,7 +1421,7 @@ use https_rustls::session::Session;
 
 #[cfg(not(feature = "use-openssl"))]
 impl HttpsProvider {
-  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<BufferQueue>>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
+  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
     if use_openssl {
       error!("the openssl provider is not compiled, continuing with the rustls provider");
     }
@@ -1431,9 +1435,9 @@ impl HttpsProvider {
     rustls.notify(event_loop, message)
   }
 
-  pub fn add_listener(&mut self, config: HttpsListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
+  pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.add_listener(config, pool, token)
+    rustls.add_listener(config, token)
   }
 
   pub fn activate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr, tcp_listener: Option<TcpListener>) -> Option<Token> {

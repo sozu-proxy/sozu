@@ -29,10 +29,10 @@ use sozu_command::proxy::{Application,CertFingerprint,CertificateAndKey,
   ProxyRequestData,HttpsFront,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,TlsVersion};
 use sozu_command::logging;
+use sozu_command::buffer::Buffer;
 
 use protocol::http::parser::{RequestState,RRequestLine,hostname_and_port};
 use pool::Pool;
-use buffer_queue::BufferQueue;
 use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
@@ -70,7 +70,7 @@ pub struct Session {
   protocol:           Option<State>,
   public_address:     Option<IpAddr>,
   ssl:                Option<Ssl>,
-  pool:               Weak<RefCell<Pool<BufferQueue>>>,
+  pool:               Weak<RefCell<Pool<Buffer>>>,
   sticky_name:        String,
   metrics:            SessionMetrics,
   pub app_id:         Option<String>,
@@ -81,7 +81,7 @@ pub struct Session {
 }
 
 impl Session {
-  pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<BufferQueue>>>, public_address: Option<IpAddr>,
+  pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>, public_address: Option<IpAddr>,
     expect_proxy: bool, sticky_name: String, timeout: Timeout, listen_token: Token) -> Session {
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
@@ -140,8 +140,7 @@ impl Session {
         if let (Some(public_address), Some(session_address)) = (addresses.destination(), addresses.source()) {
           self.public_address = Some(public_address.ip());
 
-          let ExpectProxyProtocol {
-            frontend, frontend_token, readiness, .. } = expect;
+          let ExpectProxyProtocol { frontend, readiness, .. } = expect;
           let mut tls = TlsHandshake::new(ssl, frontend);
           tls.readiness.event = readiness.event;
 
@@ -194,7 +193,7 @@ impl Session {
       let back_token  = unwrap_msg!(http.back_token());
 
       let front_buf = match http.front_buf {
-        Some(buf) => buf,
+        Some(buf) => buf.buffer,
         None => if let Some(p) = self.pool.upgrade() {
           if let Some(buf) = p.borrow_mut().checkout() {
             buf
@@ -206,7 +205,7 @@ impl Session {
         }
       };
       let back_buf = match http.back_buf {
-        Some(buf) => buf,
+        Some(buf) => buf.buffer,
         None => if let Some(p) = self.pool.upgrade() {
           if let Some(buf) = p.borrow_mut().checkout() {
             buf
@@ -288,19 +287,19 @@ impl Session {
 
   fn writable(&mut self)      -> SessionResult {
     match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Expect(_,_)                  => SessionResult::CloseSession,
-      State::Handshake(ref mut handshake) => SessionResult::CloseSession,
-      State::Http(ref mut http)           => http.writable(&mut self.metrics),
-      State::WebSocket(ref mut pipe)      => pipe.writable(&mut self.metrics),
+      State::Expect(_,_)             => SessionResult::CloseSession,
+      State::Handshake(_)            => SessionResult::CloseSession,
+      State::Http(ref mut http)      => http.writable(&mut self.metrics),
+      State::WebSocket(ref mut pipe) => pipe.writable(&mut self.metrics),
     }
   }
 
   fn back_readable(&mut self) -> SessionResult {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Expect(_,_)                  => (ProtocolResult::Continue, SessionResult::CloseSession),
-      State::Http(ref mut http)           => http.back_readable(&mut self.metrics),
-      State::Handshake(ref mut handshake) => (ProtocolResult::Continue, SessionResult::CloseSession),
-      State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.back_readable(&mut self.metrics)),
+      State::Expect(_,_)             => (ProtocolResult::Continue, SessionResult::CloseSession),
+      State::Http(ref mut http)      => http.back_readable(&mut self.metrics),
+      State::Handshake(_)            => (ProtocolResult::Continue, SessionResult::CloseSession),
+      State::WebSocket(ref mut pipe) => (ProtocolResult::Continue, pipe.back_readable(&mut self.metrics)),
     };
 
     if upgrade == ProtocolResult::Continue {
@@ -319,10 +318,10 @@ impl Session {
 
   fn back_writable(&mut self) -> SessionResult {
     match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Expect(_,_)                  => SessionResult::CloseSession,
-      State::Handshake(ref mut handshake) => SessionResult::CloseSession,
-      State::Http(ref mut http)           => http.back_writable(&mut self.metrics),
-      State::WebSocket(ref mut pipe)      => pipe.back_writable(&mut self.metrics),
+      State::Expect(_,_)             => SessionResult::CloseSession,
+      State::Handshake(_)            => SessionResult::CloseSession,
+      State::Http(ref mut http)      => http.back_writable(&mut self.metrics),
+      State::WebSocket(ref mut pipe) => pipe.back_writable(&mut self.metrics),
     }
   }
 
@@ -337,10 +336,10 @@ impl Session {
 
   fn back_socket(&self)  -> Option<&TcpStream> {
     match unwrap_msg!(self.protocol.as_ref()) {
-      &State::Expect(_,_)              => None,
-      &State::Handshake(ref handshake) => None,
-      &State::Http(ref http)           => http.back_socket(),
-      &State::WebSocket(ref pipe)      => pipe.back_socket(),
+      &State::Expect(_,_)         => None,
+      &State::Handshake(_)        => None,
+      &State::Http(ref http)      => http.back_socket(),
+      &State::WebSocket(ref pipe) => pipe.back_socket(),
     }
   }
 
@@ -442,8 +441,14 @@ impl ProxySession for Session {
     self.http().map(|http| http.close());
     self.metrics.service_stop();
     if let Some(front_socket) = self.front_socket() {
-      front_socket.shutdown(Shutdown::Both);
-      poll.deregister(front_socket);
+      if let Err(e) = front_socket.shutdown(Shutdown::Both) {
+        if e.kind() != ErrorKind::NotConnected {
+          error!("error closing front socket({:?}): {:?}", front_socket, e);
+        }
+      }
+      if let Err(e) = poll.deregister(front_socket) {
+        error!("error deregistering front socket({:?}): {:?}", front_socket, e);
+      }
     }
 
     let mut result = CloseResult::default();
@@ -457,7 +462,7 @@ impl ProxySession for Session {
 
     if let Some(State::Http(ref http)) = self.protocol {
       //if the state was initial, the connection was already reset
-      if unwrap_msg!(http.state.as_ref()).request != Some(RequestState::Initial) {
+      if http.request != Some(RequestState::Initial) {
         gauge_add!("http.active_requests", -1);
       }
     }
@@ -502,8 +507,14 @@ impl ProxySession for Session {
     if back_connected != BackendConnectionStatus::NotConnected {
        self.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
       if let Some(sock) = self.back_socket() {
-        sock.shutdown(Shutdown::Both);
-        poll.deregister(sock);
+        if let Err(e) = sock.shutdown(Shutdown::Both) {
+          if e.kind() != ErrorKind::NotConnected {
+            error!("error closing back socket({:?}): {:?}", sock, e);
+          }
+        }
+        if let Err(e) = poll.deregister(sock) {
+          error!("error deregistering back socket({:?}): {:?}", sock, e);
+        }
       }
     }
 
@@ -674,7 +685,7 @@ impl ProxySession for Session {
     let p:String = match &self.protocol {
       Some(State::Expect(_,_))  => String::from("Expect"),
       Some(State::Handshake(_)) => String::from("Handshake"),
-      Some(State::Http(h))      => format!("HTTPS: {:?}", h.state),
+      Some(State::Http(h))      => h.print_state("HTTPS"),
       Some(State::WebSocket(_)) => String::from("WSS"),
       None                      => String::from("None"),
     };
@@ -733,7 +744,7 @@ pub struct Listener {
 }
 
 impl Listener {
-  pub fn new(config: HttpsListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Listener {
+  pub fn new(config: HttpsListener, token: Token) -> Listener {
 
     let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
     let domains      = TrieNode::root();
@@ -780,7 +791,9 @@ impl Listener {
 
 
     if let Some(ref sock) = listener {
-      event_loop.register(sock, self.token, Ready::readable(), PollOpt::edge());
+      if let Err(e) = event_loop.register(sock, self.token, Ready::readable(), PollOpt::edge()) {
+        error!("cannot register listen socket({:?}): {:?}", sock, e);
+      }
     } else {
       return None;
     }
@@ -794,7 +807,8 @@ impl Listener {
     ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>) -> Option<(SslContext, SslOptions)> {
     let ctx = SslContext::builder(SslMethod::tls());
     if let Err(e) = ctx {
-      return None
+      error!("error building SSL context: {:?}", e);
+      return None;
     }
 
     let mut context = ctx.expect("should have built a correct SSL context");
@@ -824,8 +838,7 @@ impl Listener {
     ssl_options.insert(versions);
     trace!("parsed tls options: {:?}", ssl_options);
 
-    let opt = context.set_options(ssl_options);
-
+    context.set_options(ssl_options);
 
     if let Err(e) = setup_curves(&mut context) {
       error!("could not setup curves for openssl: {:?}", e);
@@ -835,7 +848,9 @@ impl Listener {
       error!("could not setup DH for openssl: {:?}", e);
     }
 
-    context.set_cipher_list(&config.cipher_list);
+    if let Err(e) = context.set_cipher_list(&config.cipher_list) {
+      error!("could not set context cipher list: {:?}", e);
+    }
 
     context.set_servername_callback(move |ssl: &mut SslRef, alert: &mut SslAlert| {
       let contexts = unwrap_msg!(ref_ctx.lock());
@@ -942,7 +957,7 @@ impl Listener {
     let c = SslContext::builder(SslMethod::tls());
     if c.is_err() { return false; }
     let mut ctx = c.expect("should have built a correct SSL context");
-    let opt = ctx.set_options(self.ssl_options);
+    ctx.set_options(self.ssl_options);
 
     if let Err(e) = setup_curves(&mut ctx) {
       error!("could not setup curves for openssl: {:?}", e);
@@ -952,7 +967,9 @@ impl Listener {
       error!("could not setup DH for openssl: {:?}", e);
     }
 
-    ctx.set_cipher_list(&self.config.cipher_list);
+    if let Err(e) = ctx.set_cipher_list(&self.config.cipher_list) {
+      error!("cannot set context cipher list: {:?}", e);
+    }
 
     let mut cert_read  = &certificate_and_key.certificate.as_bytes()[..];
     let mut key_read   = &certificate_and_key.key.as_bytes()[..];
@@ -975,10 +992,17 @@ impl Listener {
       }).unwrap_or(vec!());
       debug!("got subject alt names: {:?}", names);
 
-      ctx.set_certificate(&cert);
-      ctx.set_private_key(&key);
+      if let Err(e) = ctx.set_certificate(&cert) {
+        error!("error adding certificate to context: {:?}", e);
+      }
+      if let Err(e) = ctx.set_private_key(&key) {
+        error!("error adding private key to context: {:?}", e);
+      }
+
       for cert in cert_chain {
-        ctx.add_extra_chain_cert(cert);
+        if let Err(e) = ctx.add_extra_chain_cert(cert) {
+          error!("error adding chain certificate to context: {:?}", e);
+        }
       }
 
       let ref_ctx = self.contexts.clone();
@@ -1085,7 +1109,7 @@ impl Listener {
 
   // ToDo factor out with http.rs
   pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<&TlsApp> {
-    let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(host.as_bytes()) {
+    let host: &str = if let Ok((i, (hostname, _))) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
         error!("frontend_from_request: invalid remaining chars after hostname. Host: {}", host);
         return None;
@@ -1126,7 +1150,7 @@ impl Listener {
       sock.accept().map_err(|e| {
         match e.kind() {
           ErrorKind::WouldBlock => AcceptError::WouldBlock,
-          other => {
+          _ => {
             error!("accept() IO error: {:?}", e);
             AcceptError::IoError
           }
@@ -1137,17 +1161,6 @@ impl Listener {
       Err(AcceptError::IoError)
     }
   }
-
-  fn accept_flush(&mut self) -> usize {
-    let mut counter = 0;
-    if let Some(ref sock) = self.listener {
-      while sock.accept().is_ok() {
-        counter += 1;
-      }
-    }
-    counter
-  }
-
 }
 
 pub struct Proxy {
@@ -1155,11 +1168,11 @@ pub struct Proxy {
   applications:   HashMap<AppId, Application>,
   custom_answers: HashMap<AppId, CustomAnswers>,
   backends:       Rc<RefCell<BackendMap>>,
-  pool:           Rc<RefCell<Pool<BufferQueue>>>,
+  pool:           Rc<RefCell<Pool<Buffer>>>,
 }
 
 impl Proxy {
-  pub fn new(pool: Rc<RefCell<Pool<BufferQueue>>>, backends: Rc<RefCell<BackendMap>>) -> Proxy {
+  pub fn new(pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>) -> Proxy {
     Proxy {
       listeners : HashMap::new(),
       applications: HashMap::new(),
@@ -1169,11 +1182,11 @@ impl Proxy {
     }
   }
 
-  pub fn add_listener(&mut self, config: HttpsListener, pool: Rc<RefCell<Pool<BufferQueue>>>, token: Token) -> Option<Token> {
+  pub fn add_listener(&mut self, config: HttpsListener, token: Token) -> Option<Token> {
     if self.listeners.contains_key(&token) {
       None
     } else {
-      let listener = Listener::new(config, pool, token);
+      let listener = Listener::new(config, token);
       self.listeners.insert(listener.token.clone(), listener);
       Some(token)
     }
@@ -1250,7 +1263,7 @@ impl Proxy {
   }
 
   fn app_id_from_request(&mut self,  session: &mut Session) -> Result<String, ConnectionError> {
-    let h = session.http().and_then(|h| h.state.as_ref())
+    let h = session.http().and_then(|h| h.request.as_ref())
       .and_then(|s| s.get_host()).ok_or(ConnectionError::NoHostGiven)?;
 
     let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
@@ -1291,7 +1304,7 @@ impl Proxy {
       return Err(ConnectionError::InvalidHost);
     };
 
-    let rl:RRequestLine = session.http().and_then(|h| h.state().get_request_line())
+    let rl:RRequestLine = session.http().and_then(|h| h.request.as_ref()).and_then(|r| r.get_request_line())
       .ok_or(ConnectionError::NoRequestLineGiven)?;
     match self.listeners.get(&session.listen_token).as_ref()
       .and_then(|l| l.frontend_from_request(&host, &rl.uri))
@@ -1331,16 +1344,21 @@ impl ProxyConfiguration<Session> for Proxy {
   }
 
   fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout)
-    -> Result<(Rc<RefCell<Session>>,bool), AcceptError> {
+    -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
     if let Some(ref listener) = self.listeners.get(&Token(token.0)) {
-      frontend_sock.set_nodelay(true);
+      if let Err(e) = frontend_sock.set_nodelay(true) {
+        error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
+      }
       if let Ok(ssl) = Ssl::new(&listener.default_context) {
-        poll.register(
+        if let Err(e) = poll.register(
           &frontend_sock,
           session_token,
           Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
           PollOpt::edge()
-          );
+          ) {
+          error!("error registering front socket({:?}): {:?}", frontend_sock, e);
+        }
+
         let c = Session::new(ssl, frontend_sock, session_token, Rc::downgrade(&self.pool),
         listener.config.public_address, listener.config.expect_proxy, listener.config.sticky_name.clone(), timeout, Token(token.0));
 
@@ -1395,7 +1413,8 @@ impl ProxyConfiguration<Session> for Proxy {
 
     session.app_id = Some(app_id.clone());
 
-    let sticky_session = session.http().and_then(|http| http.state.as_ref()).unwrap().get_request_sticky_session();
+    let sticky_session = session.http().and_then(|http| http.request.as_ref())
+      .and_then(|r| r.get_sticky_session());
     let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
     let socket = self.backend_from_request(session, &app_id, front_should_stick, sticky_session)?;
 
@@ -1404,7 +1423,9 @@ impl ProxyConfiguration<Session> for Proxy {
       http.reset_log_context();
     });
 
-    socket.set_nodelay(true);
+    if let Err(e) = socket.set_nodelay(true) {
+      error!("error setting nodelay on back socket({:?}): {:?}", socket, e);
+    }
     session.back_readiness().map(|r| {
       r.interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
     });
@@ -1413,22 +1434,26 @@ impl ProxyConfiguration<Session> for Proxy {
     session.back_connected = BackendConnectionStatus::Connecting;
     if let Some(back_token) = old_back_token {
       session.set_back_token(back_token);
-      poll.register(
+      if let Err(e) = poll.register(
         &socket,
         back_token,
         Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
         PollOpt::edge()
-      );
+      ) {
+        error!("error registering back socket({:?}): {:?}", socket, e);
+      }
 
       session.set_back_socket(socket);
       Ok(BackendConnectAction::Replace)
     } else {
-      poll.register(
+      if let Err(e) = poll.register(
         &socket,
         back_token,
         Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
         PollOpt::edge()
-      );
+      ) {
+        error!("error registering back socket({:?}): {:?}", socket, e);
+      }
 
       session.set_back_socket(socket);
       session.set_back_token(back_token);
@@ -1505,20 +1530,24 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::SoftStop => {
         info!("{} processing soft shutdown", message.id);
-        self.listeners.iter_mut().map(|(token, l)| {
+        for (_, l) in self.listeners.iter_mut() {
           l.listener.take().map(|sock| {
-            event_loop.deregister(&sock);
-          })
-        });
+            if let Err(e) = event_loop.deregister(&sock) {
+              error!("error deregistering listen socket({:?}): {:?}", sock, e);
+            }
+          });
+        }
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Processing, data: None }
       },
       ProxyRequestData::HardStop => {
         info!("{} hard shutdown", message.id);
-        self.listeners.drain().map(|(token, mut l)| {
+        for (_, mut l) in self.listeners.drain(){
           l.listener.take().map(|sock| {
-            event_loop.deregister(&sock);
-          })
-        });
+            if let Err(e) = event_loop.deregister(&sock) {
+              error!("error dereginstering listen socket({:?}): {:?}", sock, e);
+            }
+          });
+        }
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Processing, data: None }
       },
       ProxyRequestData::Status => {
@@ -1604,10 +1633,9 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
   use server::{self,ProxySessionCast};
 
   let mut event_loop  = Poll::new().expect("could not create event loop");
-  let max_listeners   = 1;
 
   let pool = Rc::new(RefCell::new(
-    Pool::with_capacity(2*max_buffers, 0, || BufferQueue::with_capacity(buffer_size))
+    Pool::with_capacity(2*max_buffers, 0, || Buffer::with_capacity(buffer_size))
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
 
@@ -1636,7 +1664,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
 
   let mut configuration = Proxy::new(pool.clone(), backends.clone());
   let front = config.front.clone();
-  if configuration.add_listener(config, pool.clone(), token).is_some() {
+  if configuration.add_listener(config, token).is_some() {
     if configuration.activate_listener(&mut event_loop, &front, None).is_some() {
 
       let (scm_server, _scm_client) = UnixStream::pair().unwrap();

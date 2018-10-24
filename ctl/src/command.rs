@@ -976,7 +976,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
               let mut header = Vec::new();
               header.push(cell!("backend id"));
               header.push(cell!("IP address"));
-              header.push(cell!("port"));
+              header.push(cell!("Backup"));
               for ref key in data.keys() {
                 header.push(cell!(&key));
               }
@@ -1082,8 +1082,10 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
 
               for (ref key, ref values) in backend_data.iter() {
                 let mut row = Vec::new();
+                let backend_backup = key.backup.map(|b| if b { "X" } else { "" }).unwrap_or("");
                 row.push(cell!(key.backend_id));
                 row.push(cell!(format!("{}", key.address)));
+                row.push(cell!(backend_backup));
 
                 for val in values.iter() {
                   if keys.contains(val) {

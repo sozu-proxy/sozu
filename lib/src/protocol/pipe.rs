@@ -3,12 +3,10 @@ use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use uuid::Uuid;
+use sozu_command::buffer::Buffer;
 use {SessionResult,Readiness,SessionMetrics};
-use buffer_queue::BufferQueue;
 use socket::{SocketHandler,SocketResult};
 use pool::Checkout;
-
-type BackendToken = Token;
 
 #[derive(PartialEq)]
 pub enum SessionStatus {
@@ -21,10 +19,8 @@ pub struct Pipe<Front:SocketHandler> {
   backend:            Option<TcpStream>,
   frontend_token:     Token,
   backend_token:      Option<Token>,
-  pub front_buf:      Checkout<BufferQueue>,
-  back_buf:           Checkout<BufferQueue>,
-  front_buf_position: usize,
-  back_buf_position:  usize,
+  pub front_buf:      Checkout<Buffer>,
+  back_buf:           Checkout<Buffer>,
   pub app_id:         Option<String>,
   pub request_id:     String,
   pub front_readiness:Readiness,
@@ -34,7 +30,7 @@ pub struct Pipe<Front:SocketHandler> {
 }
 
 impl<Front:SocketHandler> Pipe<Front> {
-  pub fn new(frontend: Front, frontend_token: Token, backend: Option<TcpStream>, front_buf: Checkout<BufferQueue>, back_buf: Checkout<BufferQueue>, public_address: Option<IpAddr>) -> Pipe<Front> {
+  pub fn new(frontend: Front, frontend_token: Token, backend: Option<TcpStream>, front_buf: Checkout<Buffer>, back_buf: Checkout<Buffer>, public_address: Option<IpAddr>) -> Pipe<Front> {
     let request_id = Uuid::new_v4().hyphenated().to_string();
     let log_ctx    = format!("{}\tunknown\t", &request_id);
     let session = Pipe {
@@ -44,8 +40,6 @@ impl<Front:SocketHandler> Pipe<Front> {
       backend_token:      None,
       front_buf:          front_buf,
       back_buf:           back_buf,
-      front_buf_position: 0,
-      back_buf_position:  0,
       app_id:             None,
       request_id:         request_id,
       front_readiness:    Readiness {
@@ -115,7 +109,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   }
 
   pub fn back_hup(&mut self) -> SessionResult {
-    if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
+    if self.back_buf.available_data() == 0 {
       if self.back_readiness.event.is_readable() {
         self.back_readiness().interest.insert(Ready::readable());
         error!("Pipe::back_hup: backend connection closed but the kernel still holds some data. readiness: {:?} -> {:?}", self.front_readiness, self.back_readiness);
@@ -135,26 +129,23 @@ impl<Front:SocketHandler> Pipe<Front> {
   // Read content from the session
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("pipe readable");
-    if self.front_buf.buffer.available_space() == 0 {
+    if self.front_buf.available_space() == 0 {
       self.front_readiness.interest.remove(Ready::readable());
       self.back_readiness.interest.insert(Ready::writable());
       return SessionResult::Continue;
     }
 
-    let (sz, res) = self.frontend.socket_read(self.front_buf.buffer.space());
+    let (sz, res) = self.frontend.socket_read(self.front_buf.space());
     debug!("{}\tFRONT [{:?}]: read {} bytes", self.log_ctx, self.frontend_token, sz);
 
     if sz > 0 {
       //FIXME: replace with copy()
-      self.front_buf.buffer.fill(sz);
-      self.front_buf.sliced_input(sz);
-      self.front_buf.consume_parsed_data(sz);
-      self.front_buf.slice_output(sz);
+      self.front_buf.fill(sz);
 
       count!("bytes_in", sz as i64);
       metrics.bin += sz;
 
-      if self.front_buf.buffer.available_space() == 0 {
+      if self.front_buf.available_space() == 0 {
         self.front_readiness.interest.remove(Ready::readable());
       }
       self.back_readiness.interest.insert(Ready::writable());
@@ -190,7 +181,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   // Forward content to session
   pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("pipe writable");
-    if self.back_buf.output_data_size() == 0 || self.back_buf.next_output_data().len() == 0 {
+    if self.back_buf.available_data() == 0 {
       self.back_readiness.interest.insert(Ready::readable());
       self.front_readiness.interest.remove(Ready::writable());
       return SessionResult::Continue;
@@ -198,17 +189,16 @@ impl<Front:SocketHandler> Pipe<Front> {
 
     let mut sz = 0usize;
     let mut res = SocketResult::Continue;
-    while res == SocketResult::Continue && self.back_buf.output_data_size() > 0 {
+    while res == SocketResult::Continue {
       // no more data in buffer, stop here
-      if self.back_buf.next_output_data().len() == 0 {
+      if self.back_buf.available_data() == 0 {
         self.back_readiness.interest.insert(Ready::readable());
         self.front_readiness.interest.remove(Ready::writable());
         return SessionResult::Continue;
       }
-      let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.next_output_data());
+      let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.data());
       res = current_res;
-      self.back_buf.consume_output_data(current_sz);
-      self.back_buf_position += current_sz;
+      self.back_buf.consume(current_sz);
       sz += current_sz;
     }
 
@@ -219,9 +209,8 @@ impl<Front:SocketHandler> Pipe<Front> {
     }
 
     if let Some((front,back)) = self.tokens() {
-      debug!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}, buffer position {} restart position {}",
-        self.log_ctx, front.0, back.0, sz, self.back_buf.output_data_size(),
-        self.back_buf.buffer_position, self.back_buf.start_parsing_position);
+      debug!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}",
+        self.log_ctx, front.0, back.0, sz, self.back_buf.available_data());
     }
 
     match res {
@@ -245,31 +234,30 @@ impl<Front:SocketHandler> Pipe<Front> {
   // Forward content to application
   pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("pipe back_writable");
-    if self.front_buf.output_data_size() == 0 || self.front_buf.next_output_data().len() == 0 {
+    if self.front_buf.available_data() == 0 {
       self.front_readiness.interest.insert(Ready::readable());
       self.back_readiness.interest.remove(Ready::writable());
       return SessionResult::Continue;
     }
 
     let tokens = self.tokens().clone();
-    let output_size = self.front_buf.output_data_size();
+    let output_size = self.front_buf.available_data();
 
     let mut sz = 0usize;
     let mut socket_res = SocketResult::Continue;
 
     if let Some(ref mut backend) = self.backend {
-      while socket_res == SocketResult::Continue && self.front_buf.output_data_size() > 0 {
+      while socket_res == SocketResult::Continue {
         // no more data in buffer, stop here
-        if self.front_buf.next_output_data().len() == 0 {
+        if self.front_buf.available_data() == 0 {
           self.front_readiness.interest.insert(Ready::readable());
           self.back_readiness.interest.remove(Ready::writable());
           return SessionResult::Continue;
         }
 
-        let (current_sz, current_res) = backend.socket_write(self.front_buf.next_output_data());
+        let (current_sz, current_res) = backend.socket_write(self.front_buf.data());
         socket_res = current_res;
-        self.front_buf.consume_output_data(current_sz);
-        self.front_buf_position += current_sz;
+        self.front_buf.consume(current_sz);
         sz += current_sz;
       }
     }
@@ -300,7 +288,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   // Read content from application
   pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     trace!("pipe back_readable");
-    if self.back_buf.buffer.available_space() == 0 {
+    if self.back_buf.available_space() == 0 {
       self.back_readiness.interest.remove(Ready::readable());
       return SessionResult::Continue;
     }
@@ -308,11 +296,8 @@ impl<Front:SocketHandler> Pipe<Front> {
     let tokens     = self.tokens().clone();
 
     if let Some(ref mut backend) = self.backend {
-      let (sz, r) = backend.socket_read(&mut self.back_buf.buffer.space());
-      self.back_buf.buffer.fill(sz);
-      self.back_buf.sliced_input(sz);
-      self.back_buf.consume_parsed_data(sz);
-      self.back_buf.slice_output(sz);
+      let (sz, r) = backend.socket_read(&mut self.back_buf.space());
+      self.back_buf.fill(sz);
 
       if let Some((front,back)) = tokens {
         debug!("{}\tBACK  [{}<-{}]: read {} bytes", self.log_ctx, front.0, back.0, sz);

@@ -98,7 +98,7 @@ impl SocketHandler for SslStream<TcpStream> {
             ErrorCode::ZERO_RETURN => {
               return (size, SocketResult::Closed)
             },
-            err => {
+            _ => {
               error!("SOCKET-TLS\treadable TLS socket error={:?}", e);
               return (size, SocketResult::Error)
             }
@@ -132,7 +132,7 @@ impl SocketHandler for SslStream<TcpStream> {
             ErrorCode::ZERO_RETURN => {
               return (size, SocketResult::Closed)
             },
-            err => {
+            _ => {
               error!("SOCKET-TLS\twritable TLS socket error={:?}", e);
               return (size, SocketResult::Error)
             }

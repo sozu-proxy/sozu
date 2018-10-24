@@ -114,13 +114,17 @@ impl NetworkDrain {
 
           send_count += 1;
           if send_count >= 10 {
-            self.remote.flush();
+            if let Err(e) = self.remote.flush() {
+              error!("error flushing metrics socket: {:?}", e);
+            }
             send_count = 0;
           }
         },
         Err(e) => match e.kind() {
           ErrorKind::WriteZero => {
-            self.remote.flush();
+            if let Err(e) = self.remote.flush() {
+              error!("error flushing metrics socket: {:?}", e);
+            }
           },
           ErrorKind::WouldBlock => {
             error!("WouldBlock while writing global metrics to socket");
@@ -136,7 +140,9 @@ impl NetworkDrain {
     }
     }
 
-    self.remote.flush();
+    if let Err(e) = self.remote.flush() {
+      error!("error flushing metrics socket: {:?}", e);
+    }
 
     if self.is_writable {
     for (ref key, ref mut stored_metric) in self.app_data.iter_mut().filter(|&(_, ref value)| now.duration_since(value.last_sent) > secs) {
@@ -177,13 +183,17 @@ impl NetworkDrain {
 
           send_count += 1;
           if send_count >= 10 {
-            self.remote.flush();
+            if let Err(e) = self.remote.flush() {
+              error!("error flushing metrics socket: {:?}", e);
+            }
             send_count = 0;
           }
         },
         Err(e) => match e.kind() {
           ErrorKind::WriteZero => {
-            self.remote.flush();
+            if let Err(e) = self.remote.flush() {
+              error!("error flushing metrics socket: {:?}", e);
+            }
           },
           ErrorKind::WouldBlock => {
             error!("WouldBlock while writing app metrics to socket");
@@ -199,7 +209,9 @@ impl NetworkDrain {
     }
     }
 
-    self.remote.flush();
+    if let Err(e) = self.remote.flush() {
+      error!("error flushing metrics socket: {:?}", e);
+    }
 
     if self.is_writable {
     for (ref key, ref mut stored_metric) in self.backend_data.iter_mut().filter(|&(_, ref value)| now.duration_since(value.last_sent) > secs) {
@@ -240,13 +252,17 @@ impl NetworkDrain {
 
           send_count += 1;
           if send_count >= 10 {
-            self.remote.flush();
+            if let Err(e) = self.remote.flush() {
+              error!("error flushing metrics socket: {:?}", e);
+            }
             send_count = 0;
           }
         },
         Err(e) => match e.kind() {
           ErrorKind::WriteZero => {
-            self.remote.flush();
+            if let Err(e) =self.remote.flush() {
+              error!("error flushing metrics socket: {:?}", e);
+            }
           },
           ErrorKind::WouldBlock => {
             error!("WouldBlock while writing backend metrics to socket");
@@ -261,7 +277,9 @@ impl NetworkDrain {
       }
     }
     }
-    self.remote.flush();
+    if let Err(e) = self.remote.flush() {
+      error!("error flushing metrics socket: {:?}", e);
+    }
 
     if self.is_writable {
     for metric in self.queue.drain(..) {
@@ -300,13 +318,17 @@ impl NetworkDrain {
         Ok(()) => {
           send_count += 1;
           if send_count >= 10 {
-            self.remote.flush();
+            if let Err(e) = self.remote.flush() {
+              error!("error flushing metrics socket: {:?}", e);
+            }
             send_count = 0;
           }
         },
         Err(e) => match e.kind() {
           ErrorKind::WriteZero => {
-            self.remote.flush();
+            if let Err(e) = self.remote.flush() {
+              error!("error flushing metrics socket: {:?}", e);
+            }
           },
           ErrorKind::WouldBlock => {
             error!("WouldBlock while writing timing metrics to socket");
@@ -320,7 +342,10 @@ impl NetworkDrain {
         }
       }
     }
-    self.remote.flush();
+
+    if let Err(e) = self.remote.flush() {
+      error!("error flushing metrics socket: {:?}", e);
+    }
     }
   }
 }

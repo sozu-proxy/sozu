@@ -487,6 +487,14 @@ pub enum TransferEncodingValue {
 }
 
 #[derive(PartialEq,Debug)]
+pub struct ConnectionValue {
+  pub has_close: bool,
+  pub has_keep_alive: bool,
+  pub has_upgrade: bool,
+  pub to_delete: Option<HashSet<Vec<u8>>>,
+}
+
+#[derive(PartialEq,Debug)]
 pub enum HeaderResult<T> {
   Value(T),
   None,
@@ -524,9 +532,63 @@ impl<'a> Header<'a> {
         HeaderValue::Encoding(TransferEncodingValue::Unknown)
       }
     } else if compare_no_case(self.name, b"connection") {
-      match comma_separated_header_values(self.value) {
-        Some(tokens) => HeaderValue::Connection(tokens),
-        None         => HeaderValue::Error
+      let mut has_close = false;
+      let mut has_upgrade = false;
+      let mut has_keep_alive = false;
+      let mut to_delete = None;
+
+      match single_header_value(self.value) {
+        Ok((mut input, first)) => {
+          if compare_no_case(first, b"upgrade") {
+            has_upgrade = true;
+          } else if compare_no_case(first, b"close") {
+            has_close = true;
+          } else if compare_no_case(first, b"keep-alive") {
+            has_keep_alive = true;
+          } else {
+            if to_delete.is_none() {
+              to_delete = Some(HashSet::new());
+            }
+
+            to_delete.as_mut().map(|h| h.insert(Vec::from(first)));
+          }
+
+          while input.len() != 0 {
+            match do_parse!(input,
+              opt!(complete!(sp)) >>
+              complete!(char!(',')) >>
+              opt!(sp) >>
+              v: single_header_value >> (v)
+            ) {
+              Ok((i, v)) => {
+                if compare_no_case(v, b"upgrade") {
+                  has_upgrade = true;
+                } else if compare_no_case(v, b"close") {
+                  has_close = true;
+                } else if compare_no_case(v, b"keep-alive") {
+                  has_keep_alive = true;
+                } else {
+                  if to_delete.is_none() {
+                    to_delete = Some(HashSet::new());
+                  }
+
+                  to_delete.as_mut().map(|h| h.insert(Vec::from(v)));
+                }
+
+                input = i;
+              },
+              Err(_) => {
+                return HeaderValue::Error;
+              }
+            }
+          }
+          let r = ConnectionValue {
+            has_close, has_keep_alive, has_upgrade, to_delete
+          };
+          //println!("returning: {:?}", r);
+          HeaderValue::Connection(r)
+        },
+        Err(_) => HeaderValue::Error
       }
     } else if compare_no_case(self.name, b"upgrade") {
       HeaderValue::Upgrade(self.value)
@@ -554,9 +616,8 @@ impl<'a> Header<'a> {
   pub fn should_delete(&self, conn: &Connection, sticky_name: &str) -> bool {
     //FIXME: we should delete this header anyway, and add a Connection: Upgrade if we detected an upgrade
     if compare_no_case(&self.name, b"connection") {
-
       match single_header_value(self.value) {
-        Ok((input, first)) => {
+        Ok((mut input, first)) => {
           if compare_no_case(first, b"upgrade") {
             return false;
           } else {
@@ -571,6 +632,7 @@ impl<'a> Header<'a> {
                   if compare_no_case(v, b"upgrade") {
                     return false;
                   }
+                  input = i;
                 },
                 Err(_) => {
                   return true;
@@ -594,10 +656,12 @@ impl<'a> Header<'a> {
       compare_no_case(&self.name, b"sozu-id")           ||
       {
         let mut res = false;
-        for ref header_value in &conn.to_delete {
-          if compare_no_case(&self.value, header_value.as_bytes()) {
-            res = true;
-            break;
+        if let Some(ref to_delete) = conn.to_delete {
+          for ref header_value in to_delete {
+            if compare_no_case(&self.value, &header_value) {
+              res = true;
+              break;
+            }
           }
         }
 
@@ -700,7 +764,7 @@ pub enum HeaderValue<'a> {
   ContentLength(usize),
   Encoding(TransferEncodingValue),
   //FIXME: are the references in Connection still valid after we delete that part of the headers?
-  Connection(Vec<&'a [u8]>),
+  Connection(ConnectionValue),
   Upgrade(&'a[u8]),
   Cookie(Vec<RequestCookie<'a>>),
   Other(&'a[u8],&'a[u8]),
@@ -744,7 +808,7 @@ pub struct Connection {
   pub keep_alive:     Option<bool>,
   pub has_upgrade:    bool,
   pub upgrade:        Option<String>,
-  pub to_delete:      HashSet<String>,
+  pub to_delete:      Option<HashSet<Vec<u8>>>,
   pub continues:      Continue,
   pub sticky_session: Option<String>,
 }
@@ -756,7 +820,7 @@ impl Connection {
       has_upgrade:    false,
       upgrade:        None,
       continues:      Continue::None,
-      to_delete:      HashSet::new(),
+      to_delete:      None,
       sticky_session: None,
     }
   }
@@ -767,7 +831,7 @@ impl Connection {
       has_upgrade:    false,
       upgrade:        None,
       continues:      Continue::None,
-      to_delete:      HashSet::new(),
+      to_delete:      None,
       sticky_session: None,
     }
   }
@@ -778,7 +842,7 @@ impl Connection {
       has_upgrade:    false,
       upgrade:        None,
       continues:      Continue::None,
-      to_delete:      HashSet::new(),
+      to_delete:      None,
       sticky_session: None
     }
   }
@@ -809,6 +873,18 @@ impl RequestState {
       RequestState::RequestWithBodyChunks(rl, conn, host, chunk) => RequestState::Error(Some(rl), Some(conn), Some(host), None, Some(chunk)),
       err => err,
     }
+  }
+
+  pub fn is_front_error(&self) -> bool {
+    if let RequestState::Error(_,_,_,_,_) = self {
+      true
+    } else {
+      false
+    }
+  }
+
+  pub fn get_sticky_session(&self) -> Option<String> {
+    self.get_keep_alive().and_then(|con| con.sticky_session)
   }
 
   pub fn has_host(&self) -> bool {
@@ -973,6 +1049,14 @@ impl ResponseState {
     }
   }
 
+  pub fn is_back_error(&self) -> bool {
+    if let ResponseState::Error(_,_,_,_,_) = self {
+      true
+    } else {
+      false
+    }
+  }
+
   pub fn get_status_line(&self) -> Option<RStatusLine> {
     match *self {
       ResponseState::HasStatusLine(ref sl, _)             |
@@ -997,6 +1081,20 @@ impl ResponseState {
       ResponseState::ResponseWithBody(_, ref conn, _)       |
       ResponseState::ResponseWithBodyChunks(_, ref conn, _) => Some(conn.clone()),
       ResponseState::Error(_, ref conn, _, _, _)            => conn.clone(),
+      _                                                     => None
+    }
+  }
+
+  pub fn get_mut_connection(&mut self) -> Option<&mut Connection> {
+    match *self {
+      ResponseState::HasStatusLine(_, ref mut conn)             |
+      ResponseState::HasLength(_, ref mut conn, _)              |
+      ResponseState::HasUpgrade(_, ref mut conn, _)             |
+      ResponseState::Response(_, ref mut conn)                  |
+      ResponseState::ResponseUpgrade(_, ref mut conn, _)        |
+      ResponseState::ResponseWithBody(_, ref mut conn, _)       |
+      ResponseState::ResponseWithBodyChunks(_, ref mut conn, _) => Some(conn),
+      ResponseState::Error(_, ref mut conn, _, _, _)            => conn.as_mut(),
       _                                                     => None
     }
   }
@@ -1035,138 +1133,6 @@ impl ResponseState {
 pub type HeaderEndPosition = Option<usize>;
 
 #[derive(Debug,PartialEq)]
-pub struct HttpState {
-  pub request:        Option<RequestState>,
-  pub response:       Option<ResponseState>,
-  pub req_header_end: HeaderEndPosition,
-  pub res_header_end: HeaderEndPosition,
-  pub added_req_header: String,
-  pub added_res_header: String,
-}
-
-impl HttpState {
-  pub fn new() -> HttpState {
-    HttpState {
-      request:        Some(RequestState::Initial),
-      response:       Some(ResponseState::Initial),
-      req_header_end: None,
-      res_header_end: None,
-      added_req_header: String::from(""),
-      added_res_header: String::from(""),
-    }
-  }
-
-  pub fn reset(&mut self) {
-    self.request        = Some(RequestState::Initial);
-    self.response       = Some(ResponseState::Initial);
-    self.req_header_end = None;
-    self.res_header_end = None;
-    self.added_req_header = String::from("");
-    self.added_res_header = String::from("");
-  }
-
-  pub fn has_host(&self) -> bool {
-    self.request.as_ref().map(|r| r.has_host()).expect("there should be a request")
-  }
-
-  pub fn is_front_error(&self) -> bool {
-    if let Some(RequestState::Error(_,_,_,_,_)) = self.request {
-      true
-    } else {
-      false
-    }
-  }
-
-  pub fn is_front_proxying(&self) -> bool {
-    self.request.as_ref().map(|r| r.is_proxying()).expect("there should be a request")
-  }
-
-  pub fn get_host(&self) -> Option<String> {
-    self.request.as_ref().map(|r| r.get_host()).expect("there should be a request")
-  }
-
-  pub fn get_uri(&self) -> Option<String> {
-    self.request.as_ref().map(|r| r.get_uri()).expect("there should be a request")
-  }
-
-  pub fn get_request_line(&self) -> Option<RRequestLine> {
-    self.request.as_ref().map(|r| r.get_request_line()).expect("there should be a request")
-  }
-
-  pub fn get_front_keep_alive(&self) -> Option<Connection> {
-    self.request.as_ref().map(|r| r.get_keep_alive()).expect("there should be a request")
-  }
-
-  pub fn get_request_sticky_session(&self) -> Option<String> {
-    self.request.as_ref().and_then(|r| r.get_keep_alive()).and_then(|con| con.sticky_session)
-  }
-
-  pub fn must_continue(&self) -> Option<usize> {
-    if let Some(Continue::Expects(sz)) = self.request.as_ref().and_then(|r| r.get_keep_alive().map(|conn| conn.continues)) {
-      if self.response.as_ref().and_then(|r| r.get_status_line().map(|st| st.status == 100)).unwrap_or(false) {
-        return Some(sz);
-      }
-    }
-    None
-  }
-  /*
-  pub fn front_should_copy(&self) -> Option<usize> {
-    if self.req_position == 0 {
-      None
-    } else {
-      Some(self.req_position)
-    }
-  }
-
-  pub fn front_copied(&mut self, copied: usize) {
-    if copied > self.req_position {
-      self.request = RequestState::Error(ErrorState::TooMuchDataCopied)
-    } else {
-      self.req_position = self.req_position - copied
-    }
-  }
-  */
-
-  pub fn front_should_keep_alive(&self) -> bool {
-    self.request.as_ref().map(|r| r.should_keep_alive()).expect("there should be a request")
-  }
-
-  pub fn is_back_error(&self) -> bool {
-    if let Some(ResponseState::Error(_,_,_,_,_)) = self.response {
-      true
-    } else {
-      false
-    }
-  }
-
-  pub fn is_back_proxying(&self) -> bool {
-    self.response.as_ref().map(|r| r.is_proxying()).expect("there should be a response")
-  }
-
-  pub fn get_status_line(&self) -> Option<RStatusLine> {
-    self.response.as_ref().map(|r| r.get_status_line()).expect("there should be a response")
-  }
-
-  pub fn get_back_keep_alive(&self) -> Option<Connection> {
-    self.response.as_ref().map(|ref r| r.get_keep_alive()).expect("there should be a response")
-  }
-
-  /*
-  pub fn back_copied(&mut self, copied: usize) {
-    if copied > self.res_position {
-      self.request = RequestState::Error(ErrorState::TooMuchDataCopied)
-    } else {
-      self.res_position = self.res_position - copied
-    }
-  }
-  */
-
-  pub fn back_should_keep_alive(&self) -> bool {
-    self.response.as_ref().map(|ref r| r.should_keep_alive()).expect("there should be a response")
-  }
-}
-
-#[derive(Debug,PartialEq)]
 pub enum BufferMove {
   None,
   /// length
@@ -1185,7 +1151,7 @@ pub fn default_request_result<O>(state: RequestState, res: IResult<&[u8], O>) ->
   }
 }
 
-pub fn validate_request_header(state: RequestState, header: &Header, sticky_name: &str) -> RequestState {
+pub fn validate_request_header(mut state: RequestState, header: &Header, sticky_name: &str) -> RequestState {
   match header.value() {
     HeaderValue::Host(host) => {
       match state {
@@ -1213,38 +1179,29 @@ pub fn validate_request_header(state: RequestState, header: &Header, sticky_name
     },
     // FIXME: for now, we don't remember if we cancel indications from a previous Connection Header
     HeaderValue::Connection(c) => {
-      let mut conn = state.get_keep_alive().unwrap_or_else(Connection::new);
-      for value in c {
-      trace!("PARSER\tgot Connection header: \"{:?}\"", str::from_utf8(value).expect("could not make string from value"));
-        if compare_no_case(&value, b"close") { conn.keep_alive = Some(false); }
-        else if compare_no_case(&value, b"keep-alive") { conn.keep_alive = Some(true); }
-        else if compare_no_case(&value, b"upgrade") { conn.has_upgrade    = true; }
-        else {
-          conn.to_delete.insert(unsafe { str::from_utf8_unchecked(value).to_string() });
-        };
-      }
-      match state {
-        RequestState::HasRequestLine(rl, _)                 => RequestState::HasRequestLine(rl, conn),
-        RequestState::HasHost(rl, _, host)                  => RequestState::HasHost(rl, conn, host),
-        RequestState::HasLength(rl, _, length)              => RequestState::HasLength(rl, conn, length),
-        RequestState::HasHostAndLength(rl, _, host, length) => RequestState::HasHostAndLength(rl, conn, host, length),
-        RequestState::Request(rl, _, host)                  => RequestState::Request(rl, conn, host),
-        RequestState::RequestWithBody(rl, _, host, length)  => RequestState::RequestWithBody(rl, conn, host, length),
-        s                                                   => s.into_error()
+      if state.get_mut_connection().map(|conn| {
+        if c.has_close {
+          conn.keep_alive = Some(false);
+        }
+        if c.has_keep_alive {
+          conn.keep_alive = Some(true);
+        }
+        if c.has_upgrade {
+          conn.has_upgrade = true;
+        }
+      }).is_some() {
+        state
+      } else {
+        state.into_error()
       }
     },
     HeaderValue::ExpectContinue => {
-      let mut conn = state.get_keep_alive().unwrap_or_else(Connection::new);
-      conn.continues = Continue::Expects(0);
-
-      match state {
-        RequestState::HasRequestLine(rl, _)                 => RequestState::HasRequestLine(rl, conn),
-        RequestState::HasHost(rl, _, host)                  => RequestState::HasHost(rl, conn, host),
-        RequestState::HasLength(rl, _, length)              => RequestState::HasLength(rl, conn, length),
-        RequestState::HasHostAndLength(rl, _, host, length) => RequestState::HasHostAndLength(rl, conn, host, length),
-        RequestState::Request(rl, _, host)                  => RequestState::Request(rl, conn, host),
-        RequestState::RequestWithBody(rl, _, host, length)  => RequestState::RequestWithBody(rl, conn, host, length),
-        s                                                   => s.into_error()
+      if state.get_mut_connection().map(|conn| {
+        conn.continues = Continue::Expects(0);
+      }).is_some() {
+        state
+      } else {
+        state.into_error()
       }
     }
 
@@ -1424,7 +1381,7 @@ pub fn default_response_result<O>(state: ResponseState, res: IResult<&[u8], O>) 
   }
 }
 
-pub fn validate_response_header(state: ResponseState, header: &Header, is_head: bool) -> ResponseState {
+pub fn validate_response_header(mut state: ResponseState, header: &Header, is_head: bool) -> ResponseState {
   match header.value() {
     HeaderValue::ContentLength(sz) => {
       match state {
@@ -1446,27 +1403,28 @@ pub fn validate_response_header(state: ResponseState, header: &Header, is_head: 
     },
     // FIXME: for now, we don't remember if we cancel indications from a previous Connection Header
     HeaderValue::Connection(c) => {
-      let mut conn = state.get_keep_alive().unwrap_or(Connection::new());
-      for value in c {
-      trace!("PARSER\tgot Connection header: \"{:?}\"", str::from_utf8(value).expect("could not make string from value"));
-        if compare_no_case(&value, b"close") { conn.keep_alive = Some(false); }
-          else if compare_no_case(&value, b"keep-alive") { conn.keep_alive = Some(true); }
-          else if compare_no_case(&value, b"upgrade") { conn.has_upgrade    = true; }
-          else { conn.to_delete.insert(unsafe { str::from_utf8_unchecked(value).to_string() }); }
-      }
-      match state {
-        ResponseState::HasStatusLine(rl, _)     => ResponseState::HasStatusLine(rl, conn),
-        ResponseState::HasLength(rl, _, length) => ResponseState::HasLength(rl, conn, length),
-        ResponseState::HasUpgrade(rl, _, proto) => {
-          trace!("has upgrade, got conn: \"{:?}\"", conn);
-          //FIXME: verify here if the Upgrade header we got is the same as the request Upgrade header
+      if state.get_mut_connection().map(|conn| {
+        if c.has_close {
+          conn.keep_alive = Some(false);
+        }
+        if c.has_keep_alive {
+          conn.keep_alive = Some(true);
+        }
+        if c.has_upgrade {
+          conn.has_upgrade = true;
+        }
+      }).is_some() {
+        if let ResponseState::HasUpgrade(rl, conn, proto) = state {
           if conn.has_upgrade {
             ResponseState::HasUpgrade(rl, conn, proto)
           } else {
             ResponseState::Error(Some(rl), Some(conn), Some(proto), None, None)
           }
+        } else {
+          state
         }
-        s                                       => s.into_error(),
+      } else {
+        state.into_error()
       }
     },
     HeaderValue::Upgrade(protocol) => {
@@ -1834,9 +1792,8 @@ fn add_sticky_session_to_response(buf: &mut BufferQueue,
 mod tests {
   use super::*;
   use nom::{Err,ErrorKind,HexDisplay};
-  use buffer_queue::{BufferQueue,OutputElement};
+  use buffer_queue::{BufferQueue,OutputElement,buf_with_capacity};
   use std::io::Write;
-
 
   #[test]
   fn request_line_test() {
@@ -1920,7 +1877,7 @@ mod tests {
             Content-Length: 200\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
@@ -1959,7 +1916,7 @@ mod tests {
             Content-Length: 200\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
@@ -1994,7 +1951,7 @@ mod tests {
             Content-Length: 200\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
@@ -2041,7 +1998,7 @@ mod tests {
           Connection::keep_alive()
         );
 
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       println!("skipping input:\n{}", (&input[..26]).to_hex(16));
       buf.write(&input[..]).unwrap();
       println!("unparsed data:\n{}", buf.unparsed_data().to_hex(16));
@@ -2086,7 +2043,7 @@ mod tests {
             Accept: */*\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2119,7 +2076,7 @@ mod tests {
             \r\n";
       let initial = RequestState::Initial;
 
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       let result = parse_request_until_stop(initial, None, &mut buf, "", "SOZUBALANCEID");
@@ -2150,7 +2107,7 @@ mod tests {
             Accept: */*\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2180,7 +2137,7 @@ mod tests {
             Connection: close\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2213,7 +2170,7 @@ mod tests {
             Host: localhost:8888\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2243,7 +2200,7 @@ mod tests {
             Connection: keep-alive\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2277,7 +2234,7 @@ mod tests {
             Host: localhost:8888\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2311,7 +2268,7 @@ mod tests {
             Host: localhost:8888\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2347,7 +2304,7 @@ mod tests {
             Content-Length: 200\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       let new_header = b"Sozu-Id: 123456789\r\n";
@@ -2446,7 +2403,7 @@ mod tests {
             0\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
 
       //let result = parse_request(initial, input);
@@ -2485,7 +2442,7 @@ mod tests {
             0\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..125]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
@@ -2561,7 +2518,7 @@ mod tests {
             0\r\n\
             \r\n";
       let initial = ResponseState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..78]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
@@ -2659,7 +2616,7 @@ mod tests {
         Connection::keep_alive(),
         LengthInformation::Chunked
       );
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
 
       buf.write(&input[..74]).unwrap();
       buf.consume_parsed_data(72);
@@ -2749,7 +2706,7 @@ mod tests {
           Connection: close\r\n\
           \r\n";
     let initial = ResponseState::Initial;
-    let mut buf = BufferQueue::with_capacity(2048);
+    let (pool, mut buf) = buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     let new_header = b"Sozu-Id: 123456789\r\n";
@@ -2791,7 +2748,7 @@ mod tests {
           Connection: close\r\n\
           \r\n";
     let initial = ResponseState::Initial;
-    let mut buf = BufferQueue::with_capacity(2048);
+    let (pool, mut buf) = buf_with_capacity(2048);
     buf.write(&input[..]).unwrap();
 
     let new_header = b"Sozu-Id: 123456789\r\n";
@@ -2864,7 +2821,7 @@ mod tests {
             \r\n";
       let initial = ResponseState::Initial;
       let is_head = true;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
@@ -2901,7 +2858,7 @@ mod tests {
             Connection: keep-alive, Upgrade\r\n\
             \r\n";
       let initial = RequestState::Initial;
-      let mut buf = BufferQueue::with_capacity(2048);
+      let (pool, mut buf) = buf_with_capacity(2048);
       buf.write(&input[..]).unwrap();
       println!("buffer input: {:?}", buf.input_queue);
 
@@ -2926,7 +2883,7 @@ mod tests {
               has_upgrade: true,
               upgrade:     Some("WebSocket".to_string()),
               continues:   Continue::None,
-              to_delete:   HashSet::new(),
+              to_delete:   None,
               sticky_session: None
             },
             String::from("localhost:8888"),

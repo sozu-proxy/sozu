@@ -166,7 +166,6 @@ impl LocalDrain {
 impl Subscriber for LocalDrain {
   fn receive_metric(&mut self, key: &'static str, app_id: Option<&str>, backend_id: Option<&str>, metric: MetricData) {
     if let Some(id) = app_id {
-      let k = String::from(id);
       if !self.app_data.contains_key(id) {
         self.app_data.insert(
           String::from(id),
