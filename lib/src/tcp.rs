@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use std::net::{SocketAddr,Shutdown};
 use time::{Duration,SteadyTime};
-use uuid::{Uuid, adapter::Hyphenated};
+use uuid::adapter::Hyphenated;
 use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::scm_socket::ScmSocket;
@@ -56,7 +56,6 @@ pub struct Session {
   back_connected:     BackendConnectionStatus,
   accept_token:       Token,
   app_id:             Option<String>,
-  request_id:         Hyphenated,
   metrics:            SessionMetrics,
   protocol:           Option<State>,
   front_buf:          Option<Checkout<Buffer>>,
@@ -106,7 +105,6 @@ impl Session {
       back_connected:     BackendConnectionStatus::NotConnected,
       accept_token:       accept_token,
       app_id:             None,
-      request_id:         Uuid::new_v4().to_hyphenated(),
       metrics:            SessionMetrics::new(),
       protocol,
       front_buf:          frontend_buffer,
@@ -167,12 +165,19 @@ impl Session {
     }
   }
 
+  fn request_id(&self) -> Option<&Hyphenated> {
+    match self.protocol {
+      Some(State::Pipe(ref pipe)) => Some(&pipe.request_id),
+      _ => None,
+    }
+  }
 
   fn log_context(&self) -> String {
-    if let Some(ref app_id) = self.app_id {
-      format!("{}\t{}\t", self.request_id, app_id)
-    } else {
-      format!("{}\tunknown\t", self.request_id)
+    match (self.app_id.as_ref(), self.request_id()) {
+      (Some(app_id), Some(request_id)) => format!("{}\t{}\t", request_id, app_id),
+      (None, Some(request_id)) => format!("{}\tunknown\t", request_id),
+      (Some(app_id), None) => format!("unknown\t{}\t", app_id),
+      (None, None) => String::from("unknown\tunknown\t"),
     }
   }
 
@@ -1046,7 +1051,7 @@ mod tests {
     assert_size!(RelayProxyProtocol<mio::net::TcpStream>, 136);
     assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 504);
     assert_size!(State, 512);
-    assert_size!(Session, 808);
+    assert_size!(Session, 792);
   }
 
   #[test]
