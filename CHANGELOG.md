@@ -4,6 +4,34 @@
 
 ### Changed
 
+## 0.10.0 - 2018-10-25
+
+breaking change: modules have been moved around in sozu-lib
+
+### Added
+
+- sozuctl has a "config check" command
+- sozuctl shows the backup flag for backends
+- sozuctl shows more info for TCP proxys
+
+### Removed
+
+- sozuctl displays an address column for backends, instead of IP and port
+
+### Changed
+
+- new code organization for sozu-lib, with everything related to protocol implementations in src/protocol
+- refactoring of the HTTP protocol implementation
+- in preparation for HTTP/2, the pool now handles instances of Buffer, not BufferQueue
+
+### Fixed
+
+- work on TCP proxy stability
+- reduce allocations in the HTTP parser
+- integer underflow when counting backends in the master state
+- get the correct client IP in the HTTPS proxys logs
+- do not panic when the client disconnects while we're in the Send proxy protocol implementation
+
 ## 0.9.0 - 2018-09-27
 
 ### Added
@@ -110,7 +138,8 @@ Started implementation:
 - control with command line app sozuctl
 - command library
 
-[Unreleased]: https://github.com/sozu-proxy/sozu/compare/0.9.0...HEAD
+[Unreleased]: https://github.com/sozu-proxy/sozu/compare/0.10.0...HEAD
+[0.10.0]: https://github.com/sozu-proxy/sozu/compare/0.9.0...0.10.0
 [0.9.0]: https://github.com/sozu-proxy/sozu/compare/0.8.0...0.9.0
 [0.8.0]: https://github.com/sozu-proxy/sozu/compare/0.7.0...0.8.0
 [0.7.0]: https://github.com/sozu-proxy/sozu/compare/0.6.0...0.7.0
