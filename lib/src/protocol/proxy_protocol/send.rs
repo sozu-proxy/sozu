@@ -4,6 +4,7 @@ use std::io::Read;
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
+use uuid::adapter::Hyphenated;
 use sozu_command::buffer::Buffer;
 use {
   SessionMetrics,
@@ -20,6 +21,7 @@ use super::header::*;
 pub struct SendProxyProtocol<Front:SocketHandler> {
   pub header:         Option<Vec<u8>>,
   pub frontend:       Front,
+  pub request_id:     Hyphenated,
   pub backend:        Option<TcpStream>,
   pub frontend_token: Token,
   pub backend_token:  Option<Token>,
@@ -29,10 +31,12 @@ pub struct SendProxyProtocol<Front:SocketHandler> {
 }
 
 impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
-  pub fn new(frontend: Front, frontend_token: Token, backend: Option<TcpStream>) -> Self {
+  pub fn new(frontend: Front, frontend_token: Token, request_id: Hyphenated,
+    backend: Option<TcpStream>) -> Self {
     SendProxyProtocol {
       header: None,
       frontend,
+      request_id,
       backend,
       frontend_token,
       backend_token:  None,
@@ -138,6 +142,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
     let mut pipe = Pipe::new(
       self.frontend,
       self.frontend_token,
+      self.request_id,
       Some(backend_socket),
       front_buf,
       back_buf,
@@ -169,6 +174,7 @@ mod send_test {
   use mio::net::{TcpListener, TcpStream};
   use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
   use std::os::unix::io::{FromRawFd,IntoRawFd};
+  use uuid::Uuid;
 
   #[test]
   fn it_should_send_a_proxy_protocol_header_to_the_upstream_backend() {
@@ -205,7 +211,8 @@ mod send_test {
     let fd = backend_stream.into_raw_fd();
     let backend_stream = unsafe { TcpStream::from_raw_fd(fd) };
 
-    let mut send_pp = SendProxyProtocol::new(client_stream, Token(0), Some(backend_stream));
+    let mut send_pp = SendProxyProtocol::new(client_stream, Token(0),
+      Uuid::new_v4().to_hyphenated(), Some(backend_stream));
     let mut session_metrics = SessionMetrics::new();
 
     send_pp.set_back_connected(BackendConnectionStatus::Connected);

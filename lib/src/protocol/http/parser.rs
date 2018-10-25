@@ -1792,7 +1792,7 @@ fn add_sticky_session_to_response(buf: &mut BufferQueue,
 mod tests {
   use super::*;
   use nom::{Err,ErrorKind,HexDisplay};
-  use buffer_queue::{BufferQueue,OutputElement,buf_with_capacity};
+  use buffer_queue::{OutputElement,buf_with_capacity};
   use std::io::Write;
 
   #[test]

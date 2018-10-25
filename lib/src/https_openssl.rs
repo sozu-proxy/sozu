@@ -7,6 +7,7 @@ use mio::*;
 use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
+use uuid::Uuid;
 use std::io::ErrorKind;
 use std::collections::HashMap;
 use slab::Slab;
@@ -64,7 +65,7 @@ pub enum State {
 }
 
 pub struct Session {
-  frontend_token: Token,
+  frontend_token:     Token,
   backend:            Option<Rc<RefCell<Backend>>>,
   back_connected:     BackendConnectionStatus,
   protocol:           Option<State>,
@@ -91,13 +92,14 @@ impl Session {
       sock.peer_addr().ok()
     };
 
+    let request_id = Uuid::new_v4().to_hyphenated();
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);
-      Some(State::Expect(ExpectProxyProtocol::new(sock, token), ssl))
+      Some(State::Expect(ExpectProxyProtocol::new(sock, token, request_id), ssl))
     } else {
       gauge_add!("protocol.tls.handshake", 1);
-      Some(State::Handshake(TlsHandshake::new(ssl, sock)))
+      Some(State::Handshake(TlsHandshake::new(ssl, sock, request_id)))
     };
 
     let mut session = Session {
@@ -150,8 +152,8 @@ impl Session {
           self.public_address = Some(public_address.ip());
           self.peer_address = Some(session_address);
 
-          let ExpectProxyProtocol { frontend, readiness, .. } = expect;
-          let mut tls = TlsHandshake::new(ssl, frontend);
+          let ExpectProxyProtocol { frontend, readiness, request_id, .. } = expect;
+          let mut tls = TlsHandshake::new(ssl, frontend, request_id);
           tls.readiness.event = readiness.event;
 
           gauge_add!("protocol.proxy.expect", -1);
@@ -177,8 +179,9 @@ impl Session {
         ssl.current_cipher().map(|c| incr!(c.name()));
       });
 
-      let http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), pool,
-        self.public_address.clone(), self.peer_address, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
+      let http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(),
+        handshake.request_id, pool, self.public_address.clone(), self.peer_address,
+        self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
 
         http.front_readiness = readiness;
         http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
@@ -231,8 +234,8 @@ impl Session {
       gauge_add!("http.active_requests", -1);
       gauge_add!("protocol.wss", 1);
 
-      let mut pipe = Pipe::new(http.frontend, front_token, Some(unwrap_msg!(http.backend)),
-        front_buf, back_buf, http.public_address);
+      let mut pipe = Pipe::new(http.frontend, front_token, http.request_id,
+        Some(unwrap_msg!(http.backend)), front_buf, back_buf, http.public_address);
 
       pipe.front_readiness.event = http.front_readiness.event;
       pipe.back_readiness.event  = http.back_readiness.event;
@@ -1705,8 +1708,8 @@ mod tests {
 
   #[test]
   fn size_test() {
-    assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 504);
-    assert_size!(TlsHandshake, 200);
+    assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 520);
+    assert_size!(TlsHandshake, 216);
     assert_size!(Http<SslStream<mio::net::TcpStream>>, 968);
     assert_size!(Pipe<SslStream<mio::net::TcpStream>>, 216);
     assert_size!(State, 976);

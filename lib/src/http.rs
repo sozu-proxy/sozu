@@ -9,6 +9,7 @@ use mio::*;
 use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
+use uuid::Uuid;
 use time::{SteadyTime,Duration};
 use slab::Slab;
 use mio_extras::timer::{Timer, Timeout};
@@ -64,13 +65,15 @@ impl Session {
   pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout,
     listen_token: Token) -> Option<Session> {
+    let request_id = Uuid::new_v4().to_hyphenated();
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);
-      Some(State::Expect(ExpectProxyProtocol::new(sock, token)))
+      Some(State::Expect(ExpectProxyProtocol::new(sock, token, request_id)))
     } else {
       gauge_add!("protocol.http", 1);
-      Http::new(sock, token, pool.clone(), public_address,None, sticky_name.clone(), Protocol::HTTP).map(|http| State::Http(http))
+      Http::new(sock, token, request_id, pool.clone(), public_address,
+        None, sticky_name.clone(), Protocol::HTTP).map(|http| State::Http(http))
     };
 
     protocol.map(|pr| {
@@ -132,8 +135,8 @@ impl Session {
       gauge_add!("protocol.http", -1);
       gauge_add!("protocol.ws", 1);
       gauge_add!("http.active_requests", -1);
-      let mut pipe = Pipe::new(http.frontend, front_token, Some(unwrap_msg!(http.backend)),
-        front_buf, back_buf, http.public_address);
+      let mut pipe = Pipe::new(http.frontend, front_token, http.request_id,
+        Some(unwrap_msg!(http.backend)), front_buf, back_buf, http.public_address);
 
       pipe.front_readiness.event = http.front_readiness.event;
       pipe.back_readiness.event  = http.back_readiness.event;
@@ -147,7 +150,7 @@ impl Session {
       if let Some((Some(public_address), Some(session_address))) = expect.addresses.as_ref().map(|add| {
         (add.destination().clone(), add.source().clone())
       }) {
-        let http = Http::new(expect.frontend, expect.frontend_token,
+        let http = Http::new(expect.frontend, expect.frontend_token, expect.request_id,
           self.pool.clone(), Some(public_address.ip()), Some(session_address),
           self.sticky_name.clone(), Protocol::HTTP).map(|mut http| {
             http.front_readiness.event = readiness.event;
@@ -1302,7 +1305,7 @@ mod tests {
 
   #[test]
   fn size_test() {
-    assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 504);
+    assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 520);
     assert_size!(Http<mio::net::TcpStream>, 968);
     assert_size!(Pipe<mio::net::TcpStream>, 216);
     assert_size!(State, 976);

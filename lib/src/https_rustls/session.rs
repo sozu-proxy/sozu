@@ -7,6 +7,7 @@ use mio::unix::UnixReady;
 use std::io::{ErrorKind,Read};
 use std::net::IpAddr;
 use time::{SteadyTime, Duration};
+use uuid::Uuid;
 use rustls::{ServerSession,Session as ClientSession,ProtocolVersion,SupportedCipherSuite,CipherSuite};
 use mio_extras::timer::{Timer, Timeout};
 use sozu_command::buffer::Buffer;
@@ -58,13 +59,14 @@ impl Session {
       sock.peer_addr().ok()
     };
 
+    let request_id = Uuid::new_v4().to_hyphenated();
     let state = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);
-      Some(State::Expect(ExpectProxyProtocol::new(sock, token), ssl))
+      Some(State::Expect(ExpectProxyProtocol::new(sock, token, request_id), ssl))
     } else {
       gauge_add!("protocol.tls.handshake", 1);
-      Some(State::Handshake(TlsHandshake::new(ssl, sock)))
+      Some(State::Handshake(TlsHandshake::new(ssl, sock, request_id)))
     };
 
     let mut session = Session {
@@ -116,9 +118,9 @@ impl Session {
           self.peer_address = Some(session_address);
 
           let ExpectProxyProtocol {
-            frontend, readiness, .. } = expect;
+            frontend, readiness, request_id, .. } = expect;
 
-          let mut tls = TlsHandshake::new(ssl, frontend);
+          let mut tls = TlsHandshake::new(ssl, frontend, request_id);
           tls.readiness.event = readiness.event;
           tls.readiness.event.insert(Ready::readable());
 
@@ -154,8 +156,9 @@ impl Session {
       };
 
       let readiness = handshake.readiness.clone();
-      let http = Http::new(front_stream, self.frontend_token, self.pool.clone(),
-        self.public_address.clone(), self.peer_address, self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
+      let http = Http::new(front_stream, self.frontend_token, handshake.request_id,
+        self.pool.clone(), self.public_address.clone(), self.peer_address,
+        self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
 
         let res = http.frontend.session.read(front_buf.space());
         match res {
@@ -222,8 +225,8 @@ impl Session {
         }
       };
 
-      let mut pipe = Pipe::new(http.frontend, front_token, http.backend,
-        front_buf, back_buf, http.public_address);
+      let mut pipe = Pipe::new(http.frontend, front_token, http.request_id,
+        http.backend, front_buf, back_buf, http.public_address);
 
       pipe.front_readiness.event = http.front_readiness.event;
       pipe.back_readiness.event  = http.back_readiness.event;
@@ -751,8 +754,8 @@ mod tests {
   #[test]
   fn size_test() {
     assert_size!(Session, 2456);
-    assert_size!(ExpectProxyProtocol<TcpStream>, 504);
-    assert_size!(TlsHandshake, 1216);
+    assert_size!(ExpectProxyProtocol<TcpStream>, 520);
+    assert_size!(TlsHandshake, 1232);
     assert_size!(Http<FrontRustls>, 2152);
     assert_size!(Pipe<FrontRustls>, 1400);
     assert_size!(State, 2160);

@@ -2,7 +2,7 @@ use std::net::IpAddr;
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
-use uuid::{Uuid, adapter::Hyphenated};
+use uuid::adapter::Hyphenated;
 use sozu_command::buffer::Buffer;
 use {SessionResult,Readiness,SessionMetrics};
 use socket::{SocketHandler,SocketResult};
@@ -30,8 +30,9 @@ pub struct Pipe<Front:SocketHandler> {
 }
 
 impl<Front:SocketHandler> Pipe<Front> {
-  pub fn new(frontend: Front, frontend_token: Token, backend: Option<TcpStream>, front_buf: Checkout<Buffer>, back_buf: Checkout<Buffer>, public_address: Option<IpAddr>) -> Pipe<Front> {
-    let request_id = Uuid::new_v4().to_hyphenated();
+  pub fn new(frontend: Front, frontend_token: Token, request_id: Hyphenated,
+    backend: Option<TcpStream>, front_buf: Checkout<Buffer>,
+    back_buf: Checkout<Buffer>, public_address: Option<IpAddr>) -> Pipe<Front> {
     let log_ctx    = format!("{}\tunknown\t", &request_id);
     let session = Pipe {
       frontend:           frontend,

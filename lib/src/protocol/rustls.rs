@@ -1,6 +1,7 @@
 use mio::*;
 use mio::net::*;
 use mio::unix::UnixReady;
+use uuid::adapter::Hyphenated;
 use std::io::ErrorKind;
 use {SessionResult,Readiness};
 use protocol::ProtocolResult;
@@ -17,18 +18,20 @@ pub struct TlsHandshake {
   pub stream:    TcpStream,
   pub session:   ServerSession,
   pub readiness: Readiness,
+  pub request_id: Hyphenated,
 }
 
 impl TlsHandshake {
-  pub fn new(session: ServerSession, stream: TcpStream) -> TlsHandshake {
+  pub fn new(session: ServerSession, stream: TcpStream, request_id: Hyphenated) -> TlsHandshake {
     TlsHandshake {
-      stream:   stream,
-      session:   session,
+      stream,
+      session,
       readiness: Readiness {
         interest:  UnixReady::from(Ready::readable())
                            | UnixReady::hup() | UnixReady::error(),
         event: UnixReady::from(Ready::empty()),
       },
+      request_id,
     }
   }
 

@@ -77,11 +77,10 @@ pub struct Http<Front:SocketHandler> {
 }
 
 impl<Front:SocketHandler> Http<Front> {
-  pub fn new(sock: Front, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
+  pub fn new(sock: Front, token: Token, request_id: Hyphenated, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: Option<IpAddr>, session_address: Option<SocketAddr>, sticky_name: String,
     protocol: Protocol) -> Option<Http<Front>> {
 
-    let request_id = Uuid::new_v4().to_hyphenated();
     let log_ctx    = format!("{} unknown\t", &request_id);
     let mut session = Http {
       frontend:           sock,
@@ -1153,3 +1152,4 @@ fn save_http_status_metric(rs_status_line : Option<RStatusLine>) {
     }
   }
 }
+

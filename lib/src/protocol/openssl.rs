@@ -1,6 +1,7 @@
 use mio::*;
 use mio::net::*;
 use mio::unix::UnixReady;
+use uuid::adapter::Hyphenated;
 use {SessionResult,Readiness};
 use protocol::ProtocolResult;
 use openssl::ssl::{HandshakeError,MidHandshakeSslStream,Ssl,SslStream};
@@ -15,6 +16,7 @@ pub enum TlsState {
 pub struct TlsHandshake {
   pub readiness:       Readiness,
   pub front:           Option<TcpStream>,
+  pub request_id:      Hyphenated,
   pub ssl:             Option<Ssl>,
   pub stream:          Option<SslStream<TcpStream>>,
   mid:                 Option<MidHandshakeSslStream<TcpStream>>,
@@ -22,7 +24,7 @@ pub struct TlsHandshake {
 }
 
 impl TlsHandshake {
-  pub fn new(ssl:Ssl, sock: TcpStream) -> TlsHandshake {
+  pub fn new(ssl:Ssl, sock: TcpStream, request_id: Hyphenated) -> TlsHandshake {
     TlsHandshake {
       front:          Some(sock),
       ssl:            Some(ssl),
@@ -33,6 +35,7 @@ impl TlsHandshake {
                         interest: UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
                         event:    UnixReady::from(Ready::empty()),
       },
+      request_id,
     }
   }
 

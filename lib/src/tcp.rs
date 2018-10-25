@@ -9,6 +9,7 @@ use slab::Slab;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::net::{SocketAddr,Shutdown};
+use uuid::Uuid;
 use time::{Duration,SteadyTime};
 use uuid::adapter::Hyphenated;
 use mio_extras::timer::{Timer,Timeout};
@@ -73,27 +74,29 @@ impl Session {
     let mut frontend_buffer = None;
     let mut backend_buffer = None;
 
-      let protocol = match proxy_protocol {
+    let request_id = Uuid::new_v4().to_hyphenated();
+    let protocol = match proxy_protocol {
       Some(ProxyProtocolConfig::RelayHeader) => {
         backend_buffer = Some(back_buf);
         gauge_add!("protocol.proxy.relay", 1);
-        Some(State::RelayProxyProtocol(RelayProxyProtocol::new(s, frontend_token, None, front_buf)))
+        Some(State::RelayProxyProtocol(RelayProxyProtocol::new(s, frontend_token,
+          request_id, None, front_buf)))
       },
       Some(ProxyProtocolConfig::ExpectHeader) => {
         frontend_buffer = Some(front_buf);
         backend_buffer = Some(back_buf);
         gauge_add!("protocol.proxy.expect", 1);
-        Some(State::ExpectProxyProtocol(ExpectProxyProtocol::new(s, frontend_token)))
+        Some(State::ExpectProxyProtocol(ExpectProxyProtocol::new(s, frontend_token, request_id)))
       },
       Some(ProxyProtocolConfig::SendHeader) => {
         frontend_buffer = Some(front_buf);
         backend_buffer = Some(back_buf);
         gauge_add!("protocol.proxy.send", 1);
-        Some(State::SendProxyProtocol(SendProxyProtocol::new(s, frontend_token, None)))
+        Some(State::SendProxyProtocol(SendProxyProtocol::new(s, frontend_token, request_id, None)))
       },
       None => {
         gauge_add!("protocol.tcp", 1);
-        Some(State::Pipe(Pipe::new(s, frontend_token, None, front_buf, back_buf, addr)))
+        Some(State::Pipe(Pipe::new(s, frontend_token, request_id, None, front_buf, back_buf, addr)))
       }
     };
 
@@ -1047,11 +1050,11 @@ mod tests {
   #[test]
   fn size_test() {
     assert_size!(Pipe<mio::net::TcpStream>, 216);
-    assert_size!(SendProxyProtocol<mio::net::TcpStream>, 128);
-    assert_size!(RelayProxyProtocol<mio::net::TcpStream>, 136);
-    assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 504);
-    assert_size!(State, 512);
-    assert_size!(Session, 792);
+    assert_size!(SendProxyProtocol<mio::net::TcpStream>, 144);
+    assert_size!(RelayProxyProtocol<mio::net::TcpStream>, 152);
+    assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 520);
+    assert_size!(State, 528);
+    assert_size!(Session, 808);
   }
 
   #[test]
