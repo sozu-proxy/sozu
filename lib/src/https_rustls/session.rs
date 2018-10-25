@@ -743,3 +743,21 @@ fn ciphersuite_str(cipher: &'static SupportedCipherSuite) -> &'static str {
     _ => "tls.cipher.Unsupported",
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn size_test() {
+    assert_size!(Session, 2464);
+    assert_size!(ExpectProxyProtocol<TcpStream>, 504);
+    assert_size!(TlsHandshake, 1216);
+    assert_size!(Http<FrontRustls>, 2160);
+    assert_size!(Pipe<FrontRustls>, 1408);
+    assert_size!(State, 2168);
+
+    assert_size!(FrontRustls, 1200);
+    assert_size!(ServerSession, 1184);
+  }
+}

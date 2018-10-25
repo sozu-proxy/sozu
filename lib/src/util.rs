@@ -28,3 +28,10 @@ impl<T,E:Debug> UnwrapLog<T> for Result<T,E> {
     }
   }
 }
+
+#[macro_export]
+macro_rules! assert_size (
+  ($t:ty, $sz:expr) => (
+    assert_eq!(::std::mem::size_of::<$t>(), $sz);
+  );
+);

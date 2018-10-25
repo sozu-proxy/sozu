@@ -425,7 +425,6 @@ impl Reset for BufferQueue {
 
 impl fmt::Debug for BufferQueue {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    use std::ops::Deref;
     let b: &Buffer = &self.buffer;
     write!(f, "BufferQueue {{\nbuffer_position: {},\nparsed_position: {},\nstart_parsing_position: {},\ninput_queue: {:?},\noutput_queue:{:?},\nbuffer: {:?}\n}}",
     self.buffer_position, self.parsed_position, self.start_parsing_position,
@@ -446,6 +445,12 @@ mod tests {
   use sozu_command::buffer::Buffer;
   use nom::HexDisplay;
   use std::io::Write;
+
+  #[test]
+  fn size_test() {
+    assert_size!(BufferQueue, 88);
+    assert_size!(Buffer, 48);
+  }
 
   #[test]
   fn consume() {

@@ -1301,6 +1301,13 @@ mod tests {
   use sozu_command::channel::Channel;
 
   #[test]
+  fn size_test() {
+    assert_size!(Http<mio::net::TcpStream>, 976);
+    assert_size!(State, 984);
+    assert_size!(Session, 1232);
+  }
+
+  #[test]
   fn mi() {
     setup_test_logger!();
     let barrier = Arc::new(Barrier::new(2));

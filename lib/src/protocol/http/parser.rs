@@ -1796,6 +1796,13 @@ mod tests {
   use std::io::Write;
 
   #[test]
+  fn size_test() {
+    assert_size!(RequestState, 224);
+    assert_size!(ResponseState, 192);
+    assert_size!(StickySession, 24);
+  }
+
+  #[test]
   fn request_line_test() {
       let input = b"GET /index.html HTTP/1.1\r\n";
       let result = request_line(input);

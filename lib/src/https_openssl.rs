@@ -1704,6 +1704,18 @@ mod tests {
   use openssl::ssl::{SslContext, SslMethod};
 
   #[test]
+  fn size_test() {
+    assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 504);
+    assert_size!(TlsHandshake, 200);
+    assert_size!(Http<SslStream<mio::net::TcpStream>>, 976);
+    assert_size!(Pipe<SslStream<mio::net::TcpStream>>, 224);
+    assert_size!(State, 984);
+    assert_size!(Session, 1296);
+
+    assert_size!(SslStream<mio::net::TcpStream>, 16);
+  }
+
+  #[test]
   fn frontend_from_request_test() {
     let app_id1 = "app_1".to_owned();
     let app_id2 = "app_2".to_owned();

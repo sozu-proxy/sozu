@@ -1040,6 +1040,16 @@ mod tests {
   static TEST_FINISHED: AtomicBool = ATOMIC_BOOL_INIT;
 
   #[test]
+  fn size_test() {
+    assert_size!(Pipe<mio::net::TcpStream>, 224);
+    assert_size!(SendProxyProtocol<mio::net::TcpStream>, 128);
+    assert_size!(RelayProxyProtocol<mio::net::TcpStream>, 136);
+    assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 504);
+    assert_size!(State, 512);
+    assert_size!(Session, 816);
+  }
+
+  #[test]
   fn mi() {
     setup_test_logger!();
     let barrier = Arc::new(Barrier::new(2));
