@@ -48,7 +48,7 @@ hex = "^0.3"
 quickcheck = "^0.6"
 
 [dependencies.uuid]
-version = "^0.6.0"
+version = "^0.7.0"
 features = ["v4"]
 
 [features]

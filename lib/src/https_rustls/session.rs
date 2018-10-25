@@ -750,12 +750,12 @@ mod tests {
 
   #[test]
   fn size_test() {
-    assert_size!(Session, 2464);
+    assert_size!(Session, 2456);
     assert_size!(ExpectProxyProtocol<TcpStream>, 504);
     assert_size!(TlsHandshake, 1216);
-    assert_size!(Http<FrontRustls>, 2160);
-    assert_size!(Pipe<FrontRustls>, 1408);
-    assert_size!(State, 2168);
+    assert_size!(Http<FrontRustls>, 2152);
+    assert_size!(Pipe<FrontRustls>, 1400);
+    assert_size!(State, 2160);
 
     assert_size!(FrontRustls, 1200);
     assert_size!(ServerSession, 1184);

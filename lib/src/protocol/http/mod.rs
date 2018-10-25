@@ -5,7 +5,7 @@ use std::net::{SocketAddr,IpAddr};
 use mio::*;
 use mio::unix::UnixReady;
 use mio::tcp::TcpStream;
-use uuid::Uuid;
+use uuid::{Uuid, adapter::Hyphenated};
 use sozu_command::buffer::Buffer;
 use super::super::{SessionResult,Protocol,Readiness,SessionMetrics, LogDuration};
 use buffer_queue::BufferQueue;
@@ -58,7 +58,7 @@ pub struct Http<Front:SocketHandler> {
   pub front_buf:      Option<BufferQueue>,
   pub back_buf:       Option<BufferQueue>,
   pub app_id:         Option<String>,
-  pub request_id:     String,
+  pub request_id:     Hyphenated,
   pub front_readiness:Readiness,
   pub back_readiness: Readiness,
   pub log_ctx:        String,
@@ -81,7 +81,7 @@ impl<Front:SocketHandler> Http<Front> {
     public_address: Option<IpAddr>, session_address: Option<SocketAddr>, sticky_name: String,
     protocol: Protocol) -> Option<Http<Front>> {
 
-    let request_id = Uuid::new_v4().hyphenated().to_string();
+    let request_id = Uuid::new_v4().to_hyphenated();
     let log_ctx    = format!("{} unknown\t", &request_id);
     let mut session = Http {
       frontend:           sock,
@@ -116,7 +116,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn reset(&mut self) {
-    let request_id = Uuid::new_v4().hyphenated().to_string();
+    let request_id = Uuid::new_v4().to_hyphenated();
     //info!("{} RESET TO {}", self.log_ctx, request_id);
     gauge_add!("http.active_requests", -1);
 

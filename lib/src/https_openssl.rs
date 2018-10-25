@@ -1707,12 +1707,13 @@ mod tests {
   fn size_test() {
     assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 504);
     assert_size!(TlsHandshake, 200);
-    assert_size!(Http<SslStream<mio::net::TcpStream>>, 976);
-    assert_size!(Pipe<SslStream<mio::net::TcpStream>>, 224);
-    assert_size!(State, 984);
-    assert_size!(Session, 1296);
+    assert_size!(Http<SslStream<mio::net::TcpStream>>, 968);
+    assert_size!(Pipe<SslStream<mio::net::TcpStream>>, 216);
+    assert_size!(State, 976);
+    assert_size!(Session, 1288);
 
     assert_size!(SslStream<mio::net::TcpStream>, 16);
+    assert_size!(Ssl, 8);
   }
 
   #[test]

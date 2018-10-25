@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 use std::net::{SocketAddr,Shutdown};
 use time::{Duration,SteadyTime};
-use uuid::Uuid;
+use uuid::{Uuid, adapter::Hyphenated};
 use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::scm_socket::ScmSocket;
@@ -56,7 +56,7 @@ pub struct Session {
   back_connected:     BackendConnectionStatus,
   accept_token:       Token,
   app_id:             Option<String>,
-  request_id:         String,
+  request_id:         Hyphenated,
   metrics:            SessionMetrics,
   protocol:           Option<State>,
   front_buf:          Option<Checkout<Buffer>>,
@@ -106,7 +106,7 @@ impl Session {
       back_connected:     BackendConnectionStatus::NotConnected,
       accept_token:       accept_token,
       app_id:             None,
-      request_id:         Uuid::new_v4().hyphenated().to_string(),
+      request_id:         Uuid::new_v4().to_hyphenated(),
       metrics:            SessionMetrics::new(),
       protocol,
       front_buf:          frontend_buffer,
@@ -1041,12 +1041,12 @@ mod tests {
 
   #[test]
   fn size_test() {
-    assert_size!(Pipe<mio::net::TcpStream>, 224);
+    assert_size!(Pipe<mio::net::TcpStream>, 216);
     assert_size!(SendProxyProtocol<mio::net::TcpStream>, 128);
     assert_size!(RelayProxyProtocol<mio::net::TcpStream>, 136);
     assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 504);
     assert_size!(State, 512);
-    assert_size!(Session, 816);
+    assert_size!(Session, 808);
   }
 
   #[test]

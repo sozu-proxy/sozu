@@ -1302,9 +1302,11 @@ mod tests {
 
   #[test]
   fn size_test() {
-    assert_size!(Http<mio::net::TcpStream>, 976);
-    assert_size!(State, 984);
-    assert_size!(Session, 1232);
+    assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 504);
+    assert_size!(Http<mio::net::TcpStream>, 968);
+    assert_size!(Pipe<mio::net::TcpStream>, 216);
+    assert_size!(State, 976);
+    assert_size!(Session, 1224);
   }
 
   #[test]
