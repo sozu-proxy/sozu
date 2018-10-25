@@ -5,7 +5,7 @@ repository = "https://github.com/sozu-proxy/sozu"
 readme = "README.md"
 documentation = "https://docs.rs/sozuctl"
 homepage = "http://sozu.io"
-version = "0.9.0"
+version = "0.10.0"
 license = "AGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
@@ -16,7 +16,7 @@ name = "sozuctl"
 [dependencies]
 rand    = "^0.5"
 prettytable-rs = { version = "^0.7", default-features = false}
-sozu-command-lib = { version = "^0.9", path = "../command" }
+sozu-command-lib = { version = "^0.10", path = "../command" }
 structopt = "^0.2"
 structopt-derive = "^0.2"
 serde = "1.0"
