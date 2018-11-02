@@ -274,7 +274,15 @@ impl<Front:SocketHandler> Http<Front> {
     self.protocol
   }
 
-  fn must_continue(&self) -> Option<usize> {
+  fn must_continue_request(&self) -> bool {
+    if let Some(Continue::Expects(sz)) = self.request.as_ref().and_then(|r| r.get_keep_alive().map(|conn| conn.continues)) {
+      true
+    } else {
+      false
+    }
+  }
+
+  fn must_continue_response(&self) -> Option<usize> {
     if let Some(Continue::Expects(sz)) = self.request.as_ref().and_then(|r| r.get_keep_alive().map(|conn| conn.continues)) {
       if self.response.as_ref().and_then(|r| r.get_status_line().map(|st| st.status == 100)).unwrap_or(false) {
         return Some(sz);
@@ -749,27 +757,33 @@ impl<Front:SocketHandler> Http<Front> {
     }
 
     //handle this case separately as its cumbersome to do from the pattern match
-    if let Some(sz) = self.must_continue() {
+    if let Some(sz) = self.must_continue_response() {
       self.front_readiness.interest.insert(Ready::readable());
       self.front_readiness.interest.remove(Ready::writable());
 
-      if self.front_buf.is_some() {
-        // we must now copy the body from front to back
-        trace!("100-Continue => copying {} of body from front to back", sz);
-        self.front_buf.as_mut().map(|buf| {
-          buf.slice_output(sz);
-          buf.consume_parsed_data(sz);
-        });
-
-        self.response = Some(ResponseState::Initial);
-        self.res_header_end = None;
-        self.request.as_mut().map(|r| r.get_mut_connection().map(|conn| conn.continues = Continue::None));
-
-        return SessionResult::Continue;
-      } else {
-        error!("got 100 continue but front buffer was already removed");
-        return SessionResult::CloseSession;
+      if self.front_buf.is_none() {
+        if let Some(p) = self.pool.upgrade() {
+          if let Some(buf) = p.borrow_mut().checkout() {
+            self.front_buf = Some(BufferQueue::with_buffer(buf));
+          } else {
+            error!("cannot get front buffer from pool, closing");
+            return SessionResult::CloseSession;
+          }
+        }
       }
+
+      // we must now copy the body from front to back
+      trace!("100-Continue => copying {} of body from front to back", sz);
+      self.front_buf.as_mut().map(|buf| {
+        buf.slice_output(sz);
+        buf.consume_parsed_data(sz);
+      });
+
+      self.response = Some(ResponseState::Initial);
+      self.res_header_end = None;
+      self.request.as_mut().map(|r| r.get_mut_connection().map(|conn| conn.continues = Continue::None));
+
+      return SessionResult::Continue;
     }
 
 
@@ -900,7 +914,7 @@ impl<Front:SocketHandler> Http<Front> {
         Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
           // return the buffer to the pool
           // if there's still data in there, keep it for pipelining
-          if self.must_continue().is_none() {
+          if self.must_continue_request() {
             if self.front_buf.as_ref().map(|buf| buf.empty()) == Some(true) {
               self.front_buf = None;
             }
@@ -911,7 +925,7 @@ impl<Front:SocketHandler> Http<Front> {
           SessionResult::Continue
         },
         Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Initial)) => {
-          if self.must_continue().is_none() {
+          if !self.must_continue_request() {
             self.front_readiness.interest.insert(Ready::readable());
             SessionResult::Continue
           } else {
