@@ -59,9 +59,9 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
 
     // Generate the proxy protocol header if not already exist.
     if self.header.is_none() {
-      if let Some(backend_addr) = self.back_socket().and_then(|s| s.peer_addr().ok()) {
+      if let Ok(local_addr) = self.front_socket().local_addr() {
         if let Ok(frontend_addr) = self.front_socket().peer_addr() {
-          self.header = Some(ProxyProtocolHeader::V2(HeaderV2::new(Command::Proxy, frontend_addr, backend_addr)).into_bytes());
+          self.header = Some(ProxyProtocolHeader::V2(HeaderV2::new(Command::Proxy, frontend_addr, local_addr)).into_bytes());
         } else {
           return (ProtocolResult::Continue, SessionResult::CloseSession);
         }
