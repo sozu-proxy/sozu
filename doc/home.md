@@ -49,3 +49,4 @@ TODO
 [ar]: ./architecture.md
 [tl]: ./tools_libraries.md
 [ws]: ./why_you_should_use.md
+[dm]: ./design_motivation.md
