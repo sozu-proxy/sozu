@@ -3,7 +3,7 @@ use std::io::ErrorKind;
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
 use std::os::unix::io::IntoRawFd;
-use std::net::{SocketAddr,IpAddr,Shutdown};
+use std::net::{SocketAddr,Shutdown};
 use std::str::from_utf8_unchecked;
 use mio::*;
 use mio::net::*;
@@ -63,7 +63,7 @@ pub struct Session {
 
 impl Session {
   pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
-    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout,
+    public_address: Option<SocketAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout,
     listen_token: Token) -> Option<Session> {
     let request_id = Uuid::new_v4().to_hyphenated();
     let protocol = if expect_proxy {
@@ -147,11 +147,11 @@ impl Session {
     } else if let State::Expect(expect) = protocol {
       debug!("switching to HTTP");
       let readiness = expect.readiness;
-      if let Some((Some(public_address), Some(session_address))) = expect.addresses.as_ref().map(|add| {
+      if let Some((Some(public_address), Some(client_address))) = expect.addresses.as_ref().map(|add| {
         (add.destination().clone(), add.source().clone())
       }) {
         let http = Http::new(expect.frontend, expect.frontend_token, expect.request_id,
-          self.pool.clone(), Some(public_address.ip()), Some(session_address),
+          self.pool.clone(), Some(public_address), Some(client_address),
           self.sticky_name.clone(), Protocol::HTTP).map(|mut http| {
             http.front_readiness.event = readiness.event;
 
@@ -1307,10 +1307,10 @@ mod tests {
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
     assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 520);
-    assert_size!(Http<mio::net::TcpStream>, 968);
-    assert_size!(Pipe<mio::net::TcpStream>, 216);
-    assert_size!(State, 976);
-    assert_size!(Session, 1224);
+    assert_size!(Http<mio::net::TcpStream>, 984);
+    assert_size!(Pipe<mio::net::TcpStream>, 224);
+    assert_size!(State, 992);
+    assert_size!(Session, 1240);
   }
 
   #[test]

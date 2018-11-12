@@ -62,7 +62,7 @@ pub struct Http<Front:SocketHandler> {
   pub front_readiness:Readiness,
   pub back_readiness: Readiness,
   pub log_ctx:        String,
-  pub public_address: Option<IpAddr>,
+  pub public_address: Option<SocketAddr>,
   pub session_address: Option<SocketAddr>,
   pub sticky_name:    String,
   pub sticky_session: Option<StickySession>,
@@ -78,7 +78,7 @@ pub struct Http<Front:SocketHandler> {
 
 impl<Front:SocketHandler> Http<Front> {
   pub fn new(sock: Front, token: Token, request_id: Hyphenated, pool: Weak<RefCell<Pool<Buffer>>>,
-    public_address: Option<IpAddr>, session_address: Option<SocketAddr>, sticky_name: String,
+    public_address: Option<SocketAddr>, session_address: Option<SocketAddr>, sticky_name: String,
     protocol: Protocol) -> Option<Http<Front>> {
 
     let log_ctx    = format!("{} unknown\t", &request_id);
@@ -177,11 +177,11 @@ impl<Front:SocketHandler> Http<Front> {
 
   }
 
-  pub fn added_request_header(&self, public_address: Option<IpAddr>, session_address: Option<SocketAddr>) -> String {
-    let peer = session_address.or(self.front_socket().peer_addr().ok()).map(|addr| (addr.ip(), addr.port()));
-    let front = public_address.or(self.front_socket().local_addr().map(|addr| addr.ip()).ok());
-    let session_port = self.front_socket().local_addr().map(|addr| addr.port()).ok();
-    if let (Some((peer_ip, peer_port)), Some(front), Some(session_port)) = (peer, front, session_port) {
+  pub fn added_request_header(&self, public_address: Option<SocketAddr>, client_address: Option<SocketAddr>) -> String {
+    let peer = client_address.or(self.front_socket().peer_addr().ok()).map(|addr| (addr.ip(), addr.port()));
+    let front = public_address.or(self.front_socket().local_addr().ok()).map(|addr| addr.ip());
+    let front_port = public_address.or(self.front_socket().local_addr().ok()).map(|addr| addr.port());
+    if let (Some((peer_ip, peer_port)), Some(front), Some(front_port)) = (peer, front, front_port) {
       let proto = match self.protocol() {
         Protocol::HTTP  => "http",
         Protocol::HTTPS => "https",
@@ -193,22 +193,22 @@ impl<Front:SocketHandler> Http<Front> {
         (IpAddr::V4(p), peer_port, IpAddr::V4(f)) => {
           format!("Forwarded: proto={};for={}:{};by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
                   X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
-            proto, peer_ip, peer_port, front, proto, peer_ip, session_port, self.request_id)
+            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id)
         },
         (IpAddr::V4(p), peer_port, IpAddr::V6(f)) => {
           format!("Forwarded: proto={};for={}:{};by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
                   X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
-            proto, peer_ip, peer_port, front, proto, peer_ip, session_port, self.request_id)
+            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id)
         },
         (IpAddr::V6(p), peer_port, IpAddr::V4(f)) => {
           format!("Forwarded: proto={};for=\"{}:{}\";by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
                   X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
-            proto, peer_ip, peer_port, front, proto, peer_ip, session_port, self.request_id)
+            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id)
         },
         (IpAddr::V6(p), peer_port, IpAddr::V6(f)) => {
           format!("Forwarded: proto={};for=\"{}:{}\";by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
                   X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
-            proto, peer_ip, peer_port, front, proto, peer_ip, session_port, self.request_id)
+            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id)
         },
       }
     } else {

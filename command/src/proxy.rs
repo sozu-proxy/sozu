@@ -5,7 +5,7 @@ use std::fmt;
 use std::cmp::Ordering;
 use std::convert::From;
 use std::default::Default;
-use std::net::{IpAddr,SocketAddr};
+use std::net::SocketAddr;
 use std::collections::{BTreeMap,HashSet};
 
 
@@ -417,7 +417,7 @@ pub struct DeactivateListener {
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpListener {
     pub front:          SocketAddr,
-    pub public_address: Option<IpAddr>,
+    pub public_address: Option<SocketAddr>,
     pub answer_404:     String,
     pub answer_503:     String,
     #[serde(default)]
@@ -467,7 +467,7 @@ pub enum TlsVersion {
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpsListener {
     pub front:              SocketAddr,
-    pub public_address:     Option<IpAddr>,
+    pub public_address:     Option<SocketAddr>,
     pub answer_404:         String,
     pub answer_503:         String,
     pub versions:           Vec<TlsVersion>,
@@ -514,7 +514,7 @@ impl Default for HttpsListener {
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct TcpListener {
   pub front:          SocketAddr,
-  pub public_address: Option<IpAddr>,
+  pub public_address: Option<SocketAddr>,
   #[serde(default)]
   pub expect_proxy:   bool,
 }

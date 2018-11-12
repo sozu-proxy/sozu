@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
@@ -26,13 +26,13 @@ pub struct Pipe<Front:SocketHandler> {
   pub front_readiness:Readiness,
   pub back_readiness: Readiness,
   pub log_ctx:        String,
-  public_address:     Option<IpAddr>,
+  public_address:     Option<SocketAddr>,
 }
 
 impl<Front:SocketHandler> Pipe<Front> {
   pub fn new(frontend: Front, frontend_token: Token, request_id: Hyphenated,
     backend: Option<TcpStream>, front_buf: Checkout<Buffer>,
-    back_buf: Checkout<Buffer>, public_address: Option<IpAddr>) -> Pipe<Front> {
+    back_buf: Checkout<Buffer>, public_address: Option<SocketAddr>) -> Pipe<Front> {
     let log_ctx    = format!("{}\tunknown\t", &request_id);
     let session = Pipe {
       frontend:           frontend,

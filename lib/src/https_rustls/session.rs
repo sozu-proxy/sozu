@@ -5,7 +5,6 @@ use mio::*;
 use mio::net::*;
 use mio::unix::UnixReady;
 use std::io::{ErrorKind,Read};
-use std::net::IpAddr;
 use time::{SteadyTime, Duration};
 use uuid::Uuid;
 use rustls::{ServerSession,Session as ClientSession,ProtocolVersion,SupportedCipherSuite,CipherSuite};
@@ -37,7 +36,7 @@ pub struct Session {
   pub backend:        Option<Rc<RefCell<Backend>>>,
   pub back_connected: BackendConnectionStatus,
   protocol:           Option<State>,
-  pub public_address: Option<IpAddr>,
+  pub public_address: Option<SocketAddr>,
   pool:               Weak<RefCell<Pool<Buffer>>>,
   pub metrics:        SessionMetrics,
   pub app_id:         Option<String>,
@@ -51,7 +50,7 @@ pub struct Session {
 
 impl Session {
   pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
-    public_address: Option<IpAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout, listen_token: Token) -> Session {
+    public_address: Option<SocketAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout, listen_token: Token) -> Session {
     let peer_address = if expect_proxy {
       // Will be defined later once the expect proxy header has been received and parsed
       None
@@ -114,7 +113,7 @@ impl Session {
       debug!("switching to TLS handshake");
       if let Some(ref addresses) = expect.addresses {
         if let (Some(public_address), Some(session_address)) = (addresses.destination(), addresses.source()) {
-          self.public_address = Some(public_address.ip());
+          self.public_address = Some(public_address);
           self.peer_address = Some(session_address);
 
           let ExpectProxyProtocol {
@@ -754,12 +753,12 @@ mod tests {
   #[test]
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
-    assert_size!(Session, 2456);
+    assert_size!(Session, 2488);
     assert_size!(ExpectProxyProtocol<TcpStream>, 520);
     assert_size!(TlsHandshake, 1232);
-    assert_size!(Http<FrontRustls>, 2152);
-    assert_size!(Pipe<FrontRustls>, 1400);
-    assert_size!(State, 2160);
+    assert_size!(Http<FrontRustls>, 2168);
+    assert_size!(Pipe<FrontRustls>, 1408);
+    assert_size!(State, 2176);
 
     assert_size!(FrontRustls, 1200);
     assert_size!(ServerSession, 1184);

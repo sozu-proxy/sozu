@@ -131,7 +131,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
     backend_socket: Option<TcpStream>, backend_token: Option<Token>) -> Pipe<Front> {
 
     let addr = if let Some(ref backend_socket) = backend_socket {
-      backend_socket.peer_addr().map(|s| s.ip()).ok()
+      backend_socket.peer_addr().ok()
     } else {
       None
     };

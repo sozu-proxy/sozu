@@ -23,7 +23,7 @@ use command::{CommandRequestData,CommandRequest,PROTOCOL_VERSION};
 pub struct Listener {
   pub address:            SocketAddr,
   pub protocol:           FileListenerProtocolConfig,
-  pub public_address:     Option<String>,
+  pub public_address:     Option<SocketAddr>,
   pub answer_404:         Option<String>,
   pub answer_503:         Option<String>,
   pub cipher_list:        Option<String>,
@@ -73,13 +73,12 @@ impl Listener {
       }
     };
     */
-    let public_address = self.public_address.as_ref().and_then(|addr| FromStr::from_str(&addr).ok());
     let http_proxy_configuration = Some(self.address);
 
     http_proxy_configuration.map(|addr| {
       let mut configuration = HttpListener {
         front:          addr,
-        public_address,
+        public_address: self.public_address,
         expect_proxy:   self.expect_proxy.unwrap_or(false),
         sticky_name:    self.sticky_name.clone(),
         ..Default::default()
@@ -110,7 +109,6 @@ impl Listener {
       return None;
     }
 
-    let public_address     = self.public_address.as_ref().and_then(|addr| FromStr::from_str(&addr).ok());
     let cipher_list:String = self.cipher_list.clone().unwrap_or_else(||
       String::from(
         "ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:\
@@ -160,7 +158,7 @@ impl Listener {
       let mut configuration = HttpsListener {
         front:           addr,
         sticky_name:     self.sticky_name.clone(),
-        public_address,
+        public_address:  self.public_address,
         cipher_list,
         versions,
         expect_proxy,
@@ -196,7 +194,6 @@ impl Listener {
     address.push_str(&self.port.to_string());
     */
 
-    let public_address = self.public_address.as_ref().and_then(|addr| FromStr::from_str(&addr).ok());
     /*let addr_parsed = match address.parse() {
       Ok(addr) => Some(addr),
       Err(err) => {
@@ -210,7 +207,7 @@ impl Listener {
     addr_parsed.map(|addr| {
       TcpListener {
         front:          addr,
-        public_address,
+        public_address: self.public_address,
         expect_proxy:   self.expect_proxy.unwrap_or(false),
       }
     })
@@ -739,6 +736,10 @@ impl FileConfig {
         known_addresses.insert(listener.address, listener.protocol);
         if listener.expect_proxy == Some(true) {
           expect_proxy.insert(listener.address);
+        }
+
+        if listener.public_address.is_some() && listener.expect_proxy == Some(true) {
+          panic!("the listener on {} has incompatible options: it cannot use the expect proxy protocol and have a public_address field at the same time", &listener.address);
         }
 
         match listener.protocol {

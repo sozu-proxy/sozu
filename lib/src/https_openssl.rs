@@ -11,7 +11,7 @@ use uuid::Uuid;
 use std::io::ErrorKind;
 use std::collections::HashMap;
 use slab::Slab;
-use std::net::{IpAddr,SocketAddr};
+use std::net::SocketAddr;
 use std::str::from_utf8_unchecked;
 use time::{SteadyTime, Duration};
 use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod, SslAlert,
@@ -69,7 +69,7 @@ pub struct Session {
   backend:            Option<Rc<RefCell<Backend>>>,
   back_connected:     BackendConnectionStatus,
   protocol:           Option<State>,
-  public_address:     Option<IpAddr>,
+  public_address:     Option<SocketAddr>,
   ssl:                Option<Ssl>,
   pool:               Weak<RefCell<Pool<Buffer>>>,
   sticky_name:        String,
@@ -83,7 +83,7 @@ pub struct Session {
 }
 
 impl Session {
-  pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>, public_address: Option<IpAddr>,
+  pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>, public_address: Option<SocketAddr>,
     expect_proxy: bool, sticky_name: String, timeout: Timeout, listen_token: Token) -> Session {
     let peer_address = if expect_proxy {
       // Will be defined later once the expect proxy header has been received and parsed
@@ -149,7 +149,7 @@ impl Session {
       debug!("switching to TLS handshake");
       if let Some(ref addresses) = expect.addresses {
         if let (Some(public_address), Some(session_address)) = (addresses.destination(), addresses.source()) {
-          self.public_address = Some(public_address.ip());
+          self.public_address = Some(public_address);
           self.peer_address = Some(session_address);
 
           let ExpectProxyProtocol { frontend, readiness, request_id, .. } = expect;
@@ -1711,10 +1711,10 @@ mod tests {
   fn size_test() {
     assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 520);
     assert_size!(TlsHandshake, 216);
-    assert_size!(Http<SslStream<mio::net::TcpStream>>, 968);
-    assert_size!(Pipe<SslStream<mio::net::TcpStream>>, 216);
-    assert_size!(State, 976);
-    assert_size!(Session, 1288);
+    assert_size!(Http<SslStream<mio::net::TcpStream>>, 984);
+    assert_size!(Pipe<SslStream<mio::net::TcpStream>>, 224);
+    assert_size!(State, 992);
+    assert_size!(Session, 1320);
 
     assert_size!(SslStream<mio::net::TcpStream>, 16);
     assert_size!(Ssl, 8);

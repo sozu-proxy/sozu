@@ -70,7 +70,7 @@ impl Session {
   fn new(sock: TcpStream, frontend_token: Token, accept_token: Token, front_buf: Checkout<Buffer>,
     back_buf: Checkout<Buffer>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Session {
     let s = sock.try_clone().expect("could not clone the socket");
-    let addr = sock.peer_addr().map(|s| s.ip()).ok();
+    let addr = sock.local_addr().ok();
     let mut frontend_buffer = None;
     let mut backend_buffer = None;
 
@@ -1050,7 +1050,7 @@ mod tests {
   #[test]
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
-    assert_size!(Pipe<mio::net::TcpStream>, 216);
+    assert_size!(Pipe<mio::net::TcpStream>, 224);
     assert_size!(SendProxyProtocol<mio::net::TcpStream>, 144);
     assert_size!(RelayProxyProtocol<mio::net::TcpStream>, 152);
     assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 520);
