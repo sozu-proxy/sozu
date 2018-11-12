@@ -1304,6 +1304,7 @@ mod tests {
   use sozu_command::channel::Channel;
 
   #[test]
+  #[cfg(target_pointer_width = "64")]
   fn size_test() {
     assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 520);
     assert_size!(Http<mio::net::TcpStream>, 968);

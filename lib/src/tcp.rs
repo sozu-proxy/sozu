@@ -1048,6 +1048,7 @@ mod tests {
   static TEST_FINISHED: AtomicBool = ATOMIC_BOOL_INIT;
 
   #[test]
+  #[cfg(target_pointer_width = "64")]
   fn size_test() {
     assert_size!(Pipe<mio::net::TcpStream>, 216);
     assert_size!(SendProxyProtocol<mio::net::TcpStream>, 144);

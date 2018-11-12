@@ -1707,6 +1707,7 @@ mod tests {
   use openssl::ssl::{SslContext, SslMethod};
 
   #[test]
+  #[cfg(target_pointer_width = "64")]
   fn size_test() {
     assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 520);
     assert_size!(TlsHandshake, 216);

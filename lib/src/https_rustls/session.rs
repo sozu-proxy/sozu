@@ -752,6 +752,7 @@ mod tests {
   use super::*;
 
   #[test]
+  #[cfg(target_pointer_width = "64")]
   fn size_test() {
     assert_size!(Session, 2456);
     assert_size!(ExpectProxyProtocol<TcpStream>, 520);

@@ -1167,3 +1167,20 @@ fn save_http_status_metric(rs_status_line : Option<RStatusLine>) {
   }
 }
 
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  #[cfg(target_pointer_width = "64")]
+  fn size_test() {
+    assert_size!(SessionStatus, 24);
+    assert_size!(String, 24);
+    assert_size!(Rc<String>, 8);
+    assert_size!(Option<String>, 24);
+    assert_size!(Vec<u8>, 24);
+    assert_size!(Rc<Vec<u8>>, 8);
+    assert_size!(DefaultAnswerStatus, 1);
+    assert_size!(Readiness, 16);
+  }
+}

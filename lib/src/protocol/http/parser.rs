@@ -1796,6 +1796,7 @@ mod tests {
   use std::io::Write;
 
   #[test]
+  #[cfg(target_pointer_width = "64")]
   fn size_test() {
     assert_size!(RequestState, 224);
     assert_size!(ResponseState, 192);
