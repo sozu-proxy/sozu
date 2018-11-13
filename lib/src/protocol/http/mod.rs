@@ -1065,15 +1065,11 @@ impl<Front:SocketHandler> Http<Front> {
 
           {
             let sticky_session = self.sticky_session.as_ref().and_then(|session| {
-              if self.request.as_ref()
-                .and_then(|request| request.get_keep_alive())
-                .and_then(|conn| conn.sticky_session)
-                .map(|sticky_client| sticky_client != session.sticky_id)
-                .unwrap_or(true) {
-                  Some(session)
-                } else {
-                  None
-                }
+              if self.should_add_sticky_header(session) {
+                Some(session)
+              } else {
+                None
+              }
             });
 
             let (response_state, header_end) = parse_response_until_stop(
@@ -1107,15 +1103,11 @@ impl<Front:SocketHandler> Http<Front> {
 
         {
           let sticky_session = self.sticky_session.as_ref().and_then(|session| {
-            if self.request.as_ref()
-              .and_then(|request| request.get_keep_alive())
-              .and_then(|conn| conn.sticky_session)
-              .map(|sticky_client| sticky_client != session.sticky_id)
-              .unwrap_or(true) {
-                Some(session)
-              } else {
-                None
-              }
+            if self.should_add_sticky_header(session) {
+              Some(session)
+            } else {
+              None
+            }
           });
 
           let (response_state2, header_end2) = parse_response_until_stop(
@@ -1150,6 +1142,19 @@ impl<Front:SocketHandler> Http<Front> {
         (ProtocolResult::Continue, SessionResult::Continue)
       }
     }
+  }
+
+  // Check if the connection already has a sticky session header
+  // The connection will have a sticky session header if the client sent one
+  // If it's the same as the one we want to set, don't set it.
+  // If the connection doesn't have a sticky session header or if it's different
+  // from the one we want to set, then it should be set.
+  fn should_add_sticky_header(&self, session: &StickySession) -> bool {
+    self.request.as_ref()
+      .and_then(|request| request.get_keep_alive())
+      .and_then(|conn| conn.sticky_session)
+      .map(|sticky_client| sticky_client != session.sticky_id)
+      .unwrap_or(true)
   }
 }
 
