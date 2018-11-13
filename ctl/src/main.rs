@@ -76,11 +76,19 @@ fn main() {
     SubCmd::Frontend{ cmd } => {
       match cmd {
         FrontendCmd::Http{ cmd } => match cmd {
-          HttpFrontendCmd::Add{ id, hostname, path_begin, path_to_certificate, address } => {
-            add_http_frontend(channel, timeout, &id, address, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate)
+          HttpFrontendCmd::Add{ id, hostname, path_begin, address } => {
+            add_http_frontend(channel, timeout, &id, address, &hostname, &path_begin.unwrap_or("".to_string()), false)
           },
-          HttpFrontendCmd::Remove{ id, hostname, path_begin, path_to_certificate, address } => {
-            remove_http_frontend(channel, timeout, &id, address, &hostname, &path_begin.unwrap_or("".to_string()), path_to_certificate)
+          HttpFrontendCmd::Remove{ id, hostname, path_begin, address } => {
+            remove_http_frontend(channel, timeout, &id, address, &hostname, &path_begin.unwrap_or("".to_string()), false)
+          },
+        },
+        FrontendCmd::Https{ cmd } => match cmd {
+          HttpFrontendCmd::Add{ id, hostname, path_begin, address } => {
+            add_http_frontend(channel, timeout, &id, address, &hostname, &path_begin.unwrap_or("".to_string()), true)
+          },
+          HttpFrontendCmd::Remove{ id, hostname, path_begin, address } => {
+            remove_http_frontend(channel, timeout, &id, address, &hostname, &path_begin.unwrap_or("".to_string()), true)
           },
         },
         FrontendCmd::Tcp { cmd } => match cmd {

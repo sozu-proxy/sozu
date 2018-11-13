@@ -13,7 +13,6 @@ use trie::TrieNode;
 
 struct TlsData {
   pub cert:     CertifiedKey,
-  pub refcount: usize,
 }
 
 pub struct CertificateResolver {
@@ -49,7 +48,6 @@ impl CertificateResolver {
 
       let data = TlsData {
         cert:     certified_key,
-        refcount: 0,
       };
 
       let fingerprint = CertFingerprint(fingerprint);
@@ -65,8 +63,6 @@ impl CertificateResolver {
   }
 
   pub fn remove_certificate(&mut self, remove_certificate: RemoveCertificate) {
-    let must_delete = self.certificates.get(&remove_certificate.fingerprint).map(|data| data.refcount == 0).unwrap_or(false);
-
     if let Some(_data) = self.certificates.get(&remove_certificate.fingerprint) {
       //let cert = &data.cert.cert[0];
       if remove_certificate.names.is_empty() {
@@ -88,27 +84,7 @@ impl CertificateResolver {
       }
     }
 
-    if must_delete {
-      self.certificates.remove(&remove_certificate.fingerprint);
-    }
-  }
-
-  pub fn add_front(&mut self, fingerprint: &CertFingerprint) -> bool {
-    if self.certificates.contains_key(fingerprint) {
-      self.certificates.get_mut(fingerprint).map(|data| data.refcount += 1);
-      true
-    } else {
-      false
-    }
-  }
-
-  pub fn remove_front(&mut self, fingerprint: &CertFingerprint) {
-    self.certificates.get_mut(fingerprint).map(|data| data.refcount -= 1);
-
-    let must_delete = self.certificates.get(fingerprint).map(|data| data.refcount == 0).unwrap_or(false);
-    if must_delete {
-      self.certificates.remove(fingerprint);
-    }
+    self.certificates.remove(&remove_certificate.fingerprint);
   }
 }
 
@@ -132,20 +108,6 @@ impl CertificateResolverWrapper {
       resolver.remove_certificate(remove_certificate)
     }
 
-  }
-
-  pub fn add_front(&self, fingerprint: &CertFingerprint) -> bool {
-    if let Ok(ref mut resolver) = self.0.try_lock() {
-      resolver.add_front(fingerprint)
-    } else {
-      false
-    }
-  }
-
-  pub fn remove_front(&self, fingerprint: &CertFingerprint) {
-    if let Ok(ref mut resolver) = self.0.try_lock() {
-      resolver.remove_front(fingerprint)
-    }
   }
 }
 

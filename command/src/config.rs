@@ -8,10 +8,10 @@ use std::net::SocketAddr;
 use std::collections::{HashMap,HashSet};
 use std::io::{self,Error,ErrorKind,Read};
 
-use certificate::{calculate_fingerprint,split_certificate_chain};
+use certificate::split_certificate_chain;
 use toml;
 
-use proxy::{CertFingerprint,CertificateAndKey,ProxyRequestData,HttpFront,HttpsFront,TcpFront,Backend,
+use proxy::{CertificateAndKey,ProxyRequestData,HttpFront,TcpFront,Backend,
   HttpListener,HttpsListener,TcpListener,AddCertificate,TlsProvider,LoadBalancingParams,
   Application, TlsVersion,ActivateListener,ListenerType};
 
@@ -482,17 +482,12 @@ impl HttpFrontendConfig {
         names: vec!(self.hostname.clone()),
       }));
 
-      if let Some(f) = calculate_fingerprint(&self.certificate.as_ref().unwrap().as_bytes()[..]) {
-        v.push(ProxyRequestData::AddHttpsFront(HttpsFront {
-          app_id:      app_id.to_string(),
-          address:     self.address,
-          hostname:    self.hostname.clone(),
-          path_begin:  self.path_begin.clone(),
-          fingerprint: CertFingerprint(f),
-        }));
-      } else {
-        error!("cannot obtain the certificate's fingerprint");
-      }
+      v.push(ProxyRequestData::AddHttpsFront(HttpFront {
+        app_id:      app_id.to_string(),
+        address:     self.address,
+        hostname:    self.hostname.clone(),
+        path_begin:  self.path_begin.clone(),
+      }));
     } else {
       //create the front both for HTTP and HTTPS if possible
       v.push(ProxyRequestData::AddHttpFront(HttpFront {

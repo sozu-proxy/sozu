@@ -125,8 +125,8 @@ pub enum ProxyRequestData {
     AddHttpFront(HttpFront),
     RemoveHttpFront(HttpFront),
 
-    AddHttpsFront(HttpsFront),
-    RemoveHttpsFront(HttpsFront),
+    AddHttpsFront(HttpFront),
+    RemoveHttpsFront(HttpFront),
 
     AddCertificate(AddCertificate),
     ReplaceCertificate(ReplaceCertificate),
@@ -284,31 +284,6 @@ pub struct ReplaceCertificate {
     #[serde(default)]
     #[serde(skip_serializing_if="Vec::is_empty")]
     pub new_names: Vec<String>,
-}
-
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct HttpsFront {
-    pub app_id:      String,
-    pub address:    SocketAddr,
-    pub hostname:    String,
-    pub path_begin:  String,
-    pub fingerprint: CertFingerprint,
-}
-
-impl Ord for HttpsFront {
-  fn cmp(&self, o: &HttpsFront) -> Ordering {
-    self.app_id.cmp(&o.app_id)
-      .then(self.hostname.cmp(&o.hostname))
-      .then(self.path_begin.cmp(&o.path_begin))
-      .then(self.fingerprint.cmp(&o.fingerprint))
-      .then(socketaddr_cmp(&self.address, &o.address))
-  }
-}
-
-impl PartialOrd for HttpsFront {
-  fn partial_cmp(&self, other: &HttpsFront) -> Option<Ordering> {
-    Some(self.cmp(other))
-  }
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -555,7 +530,7 @@ pub enum QueryAnswer {
 pub struct QueryAnswerApplication {
   pub configuration:   Option<Application>,
   pub http_frontends:  Vec<HttpFront>,
-  pub https_frontends: Vec<HttpsFront>,
+  pub https_frontends: Vec<HttpFront>,
   pub tcp_frontends:   Vec<TcpFront>,
   pub backends:        Vec<Backend>,
 }

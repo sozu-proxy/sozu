@@ -18,7 +18,7 @@ use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners, ScmSocket};
 use sozu_command::proxy::{ProxyRequestData, ProxyRequest, Query, QueryAnswer, QueryApplicationType,
-MetricsData, AggregatedMetricsData, ProxyResponseData, HttpsFront, HttpFront, TcpFront};
+MetricsData, AggregatedMetricsData, ProxyResponseData, HttpFront, TcpFront};
 use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
 use sozu_command::state::get_application_ids_by_domain;
 use sozu_command::logging;
@@ -198,13 +198,6 @@ impl CommandServer {
               let diff = self.state.diff(&new_state);
               for order in diff {
                 self.state.handle_order(&order);
-
-                /* if let &ProxyRequestData::AddHttpsFront(ref data) = &order {
-                  info!("load state AddHttpsFront(HttpsFront {{ app_id: {}, hostname: {}, path_begin: {} }})",
-                    data.app_id, data.hostname, data.path_begin);
-                } else {
-                  info!("load state {:?}", order);
-                } */
 
                 let mut found = false;
                 let id = format!("LOAD-STATE-{}-{}", message_id, counter);
@@ -610,7 +603,7 @@ impl CommandServer {
             return;
           },
           ProxyRequestData::RemoveHttpFront(HttpFront{ ref app_id, ref address, .. })
-          | ProxyRequestData::RemoveHttpsFront(HttpsFront{ ref app_id, ref address, .. })
+          | ProxyRequestData::RemoveHttpsFront(HttpFront{ ref app_id, ref address, .. })
           | ProxyRequestData::RemoveTcpFront(TcpFront{ ref app_id, ref address }) => {
             let msg = format!("No such frontend at {} for the application {}", address, app_id);
             error!("{}", msg);

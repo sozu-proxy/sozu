@@ -6,7 +6,7 @@ use std::iter::{repeat,FromIterator};
 use certificate::calculate_fingerprint;
 
 use proxy::{Application,CertFingerprint,CertificateAndKey,ProxyRequestData,
-  HttpFront,HttpsFront,TcpFront,Backend,QueryAnswerApplication,
+  HttpFront,TcpFront,Backend,QueryAnswerApplication,
   AddCertificate, RemoveCertificate, RemoveBackend,
   HttpListener,HttpsListener,TcpListener,ListenerType,
   ActivateListener,RemoveListener};
@@ -24,7 +24,7 @@ pub struct HttpProxy {
 pub struct HttpsProxy {
   address:      SocketAddr,
   certificates: HashMap<CertFingerprint, CertificateAndKey>,
-  fronts:       HashMap<AppId, Vec<HttpsFront>>,
+  fronts:       HashMap<AppId, Vec<HttpFront>>,
   backends:     HashMap<AppId, Vec<Backend>>,
 }
 
@@ -36,7 +36,7 @@ pub struct ConfigState {
   pub https_listeners: HashMap<SocketAddr, (HttpsListener, bool)>,
   pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
   pub http_fronts:     HashMap<AppId, Vec<HttpFront>>,
-  pub https_fronts:    HashMap<AppId, Vec<HttpsFront>>,
+  pub https_fronts:    HashMap<AppId, Vec<HttpFront>>,
   pub tcp_fronts:      HashMap<AppId, Vec<TcpFront>>,
   // certificate and names
   pub certificates:    HashMap<SocketAddr, HashMap<CertFingerprint, (CertificateAndKey, Vec<String>)>>,
@@ -368,13 +368,13 @@ impl ConfigState {
     let removed_http_fronts = my_fronts.difference(&their_fronts);
     let added_http_fronts   = their_fronts.difference(&my_fronts);
 
-    let mut my_fronts: HashSet<(&AppId, &HttpsFront)> = HashSet::new();
+    let mut my_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
     for (ref app_id, ref front_list) in self.https_fronts.iter() {
       for ref front in front_list.iter() {
         my_fronts.insert((&app_id, &front));
       }
     }
-    let mut their_fronts: HashSet<(&AppId, &HttpsFront)> = HashSet::new();
+    let mut their_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
     for (ref app_id, ref front_list) in other.https_fronts.iter() {
       for ref front in front_list.iter() {
         their_fronts.insert((&app_id, &front));
@@ -653,11 +653,10 @@ mod tests {
       address: "0.0.0.0:8080".parse().unwrap(),
     };
 
-    let https_front_app1 = HttpsFront {
+    let https_front_app1 = HttpFront {
       app_id: String::from("MyApp_1"),
       hostname: String::from("lolcatho.st"),
       path_begin: String::from(""),
-      fingerprint: CertFingerprint(vec!(0x00)),
       address: "0.0.0.0:8443".parse().unwrap(),
     };
 
@@ -668,11 +667,10 @@ mod tests {
       address: "0.0.0.0:8080".parse().unwrap(),
     };
 
-    let https_front_app2 = HttpsFront {
+    let https_front_app2 = HttpFront {
       app_id: String::from("MyApp_2"),
       hostname: String::from("lolcatho.st"),
       path_begin: String::from("/api"),
-      fingerprint: CertFingerprint(vec!(0x00)),
       address: "0.0.0.0:8443".parse().unwrap(),
     };
 

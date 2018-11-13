@@ -2,7 +2,7 @@ use sozu_command::config::{Config, ProxyProtocolConfig, LoadBalancingAlgorithms}
 use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
-use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFront, HttpsFront, TcpFront,
+use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
   AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend};
 
@@ -745,25 +745,14 @@ pub fn remove_application(channel: Channel<CommandRequest,CommandResponse>, time
 }
 
 pub fn add_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
-  address: SocketAddr, hostname: &str, path_begin: &str, certificate: Option<String>) {
-  if let Some(certificate_path) = certificate {
-    match Config::load_file_bytes(&certificate_path) {
-      Ok(data) => {
-        match calculate_fingerprint(&data) {
-          None              => println!("could not calculate fingerprint for certificate"),
-          Some(fingerprint) => {
-            order_command(channel, timeout, ProxyRequestData::AddHttpsFront(HttpsFront {
-              app_id: String::from(app_id),
-              address,
-              hostname: String::from(hostname),
-              path_begin: String::from(path_begin),
-              fingerprint: CertFingerprint(fingerprint),
-            }));
-          },
-        }
-      },
-      Err(e) => println!("could not load file: {:?}", e)
-    }
+  address: SocketAddr, hostname: &str, path_begin: &str, https: bool) {
+  if https {
+    order_command(channel, timeout, ProxyRequestData::AddHttpsFront(HttpFront {
+      app_id: String::from(app_id),
+      address,
+      hostname: String::from(hostname),
+      path_begin: String::from(path_begin),
+    }));
   } else {
     order_command(channel, timeout, ProxyRequestData::AddHttpFront(HttpFront {
       app_id: String::from(app_id),
@@ -775,25 +764,14 @@ pub fn add_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeo
 }
 
 pub fn remove_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
-  address: SocketAddr, hostname: &str, path_begin: &str, certificate: Option<String>) {
-  if let Some(certificate_path) = certificate {
-    match Config::load_file_bytes(&certificate_path) {
-      Ok(data) => {
-        match calculate_fingerprint(&data) {
-          None              => println!("could not calculate fingerprint for certificate"),
-          Some(fingerprint) => {
-            order_command(channel, timeout, ProxyRequestData::RemoveHttpsFront(HttpsFront {
-              app_id: String::from(app_id),
-              address,
-              hostname: String::from(hostname),
-              path_begin: String::from(path_begin),
-              fingerprint: CertFingerprint(fingerprint),
-            }));
-          },
-        }
-      },
-      Err(e) => println!("could not load file: {:?}", e)
-    }
+  address: SocketAddr, hostname: &str, path_begin: &str, https: bool) {
+  if https {
+    order_command(channel, timeout, ProxyRequestData::RemoveHttpsFront(HttpFront {
+      app_id: String::from(app_id),
+      address,
+      hostname: String::from(hostname),
+      path_begin: String::from(path_begin),
+    }));
   } else {
     order_command(channel, timeout, ProxyRequestData::RemoveHttpFront(HttpFront {
       app_id: String::from(app_id),
@@ -947,7 +925,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
               let mut http_headers = vec!["id", "hostname", "path begin"];
               let mut frontend_table = create_queried_application_table(http_headers, &data);
 
-              let mut https_headers = vec!["id", "hostname", "path begin", "fingerprint"];
+              let mut https_headers = vec!["id", "hostname", "path begin"];
               let mut https_frontend_table = create_queried_application_table(https_headers, &data);
 
               let mut tcp_headers = vec!["id", "address"];
@@ -1043,7 +1021,6 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
                 row.push(cell!(key.app_id));
                 row.push(cell!(key.hostname));
                 row.push(cell!(key.path_begin));
-                row.push(cell!(format!("{}", key.fingerprint)));
 
                 for val in values.iter() {
                   if keys.contains(val) {

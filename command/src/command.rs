@@ -308,7 +308,7 @@ mod tests {
   use serde_json;
   use hex::FromHex;
   use certificate::split_certificate_chain;
-  use proxy::{Application,CertificateAndKey,CertFingerprint,ProxyRequestData,HttpFront,HttpsFront,Backend,
+  use proxy::{Application,CertificateAndKey,CertFingerprint,ProxyRequestData,HttpFront,Backend,
     AppMetricsData,MetricsData,FilteredData,Percentiles,RemoveBackend,
     AddCertificate,RemoveCertificate,LoadBalancingParams};
   use config::{LoadBalancingAlgorithms,ProxyProtocolConfig};
@@ -418,11 +418,10 @@ mod tests {
   test_message!(add_https_front, "../assets/add_https_front.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::Proxy(ProxyRequestData::AddHttpsFront(HttpsFront{
+      data:     CommandRequestData::Proxy(ProxyRequestData::AddHttpsFront(HttpFront{
                   app_id: String::from("xxx"),
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
-                  fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
                   address: "0.0.0.0:8443".parse().unwrap(),
       })),
       worker_id: None
@@ -431,11 +430,10 @@ mod tests {
   test_message!(remove_https_front, "../assets/remove_https_front.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::Proxy(ProxyRequestData::RemoveHttpsFront(HttpsFront{
+      data:     CommandRequestData::Proxy(ProxyRequestData::RemoveHttpsFront(HttpFront{
                   app_id: String::from("xxx"),
                   hostname: String::from("yyy"),
                   path_begin: String::from("xxx"),
-                  fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
                   address: "0.0.0.0:8443".parse().unwrap(),
       })),
       worker_id: None

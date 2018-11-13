@@ -109,12 +109,11 @@ fn main() {
     })
   });
 
-  let tls_front = proxy::HttpsFront {
+  let tls_front = proxy::HttpFront {
     app_id:      String::from("app_1"),
     address:     "127.0.0.1:8443".parse().unwrap(),
     hostname:    String::from("lolcatho.st"),
     path_begin:  String::from("/"),
-    fingerprint: proxy::CertFingerprint(hex::FromHex::from_hex("AB2618B674E15243FD02A5618C66509E4840BA60E7D64CEBEC84CDBFECEEE0C5").unwrap()),
   };
 
   command2.write_message(&proxy::ProxyRequest {
@@ -153,12 +152,11 @@ fn main() {
     })
   });
 
-  let tls_front2 = proxy::HttpsFront {
+  let tls_front2 = proxy::HttpFront {
     app_id:      String::from("app_2"),
     address:     "127.0.0.1:8443".parse().unwrap(),
     hostname:    String::from("test.local"),
     path_begin:  String::from("/"),
-    fingerprint: proxy::CertFingerprint(hex::FromHex::from_hex("7E8EBF9AD0645AB755A2E51EB3734B91D4ACACEF1F28AD9D96D9385487FAE6E6").unwrap()),
   };
 
   command2.write_message(&proxy::ProxyRequest {

@@ -27,7 +27,7 @@ use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,CertFingerprint,CertificateAndKey,
-  ProxyRequestData,HttpsFront,HttpsListener,ProxyRequest,ProxyResponse,
+  ProxyRequestData,HttpFront,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,TlsVersion};
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
@@ -54,7 +54,6 @@ pub struct TlsApp {
   pub app_id:           String,
   pub hostname:         String,
   pub path_begin:       String,
-  pub cert_fingerprint: CertFingerprint,
 }
 
 pub enum State {
@@ -738,8 +737,6 @@ pub type PathBegin = String;
 pub struct TlsData {
   context:     SslContext,
   certificate: Vec<u8>,
-  refcount:    usize,
-  initialized: bool,
 }
 
 pub struct Listener {
@@ -876,12 +873,7 @@ impl Listener {
           debug!("looking for context for {:?} with fingerprint {:?}", servername, kv.1);
           if let Some(ref tls_data) = contexts.get(&kv.1) {
             debug!("found context for {:?}", servername);
-            if !tls_data.initialized {
-              //FIXME: couldn't we skip to the next cert?
-              error!("no application is using that certificate (looking up {})", servername);
-              *alert = SslAlert::UNRECOGNIZED_NAME;
-              return Err(SniError::ALERT_FATAL);
-            }
+
             let context: &SslContext = &tls_data.context;
             if let Ok(()) = ssl.set_ssl_context(context) {
               debug!("servername is now {:?}", ssl.servername(NameType::HOST_NAME));
@@ -900,27 +892,12 @@ impl Listener {
     Some((context.build(), ssl_options))
   }
 
-  pub fn add_https_front(&mut self, tls_front: HttpsFront) -> bool {
-    {
-      let mut contexts = unwrap_msg!(self.contexts.lock());
-
-      if contexts.contains_key(&tls_front.fingerprint) {
-        contexts.get_mut(&tls_front.fingerprint).map(|data| {
-          data.refcount    += 1;
-          data.initialized  = true;
-        });
-      } else {
-        //FIXME return error here, no available certificate
-        return false
-      }
-    }
-
+  pub fn add_https_front(&mut self, tls_front: HttpFront) -> bool {
     //FIXME: should clone he hostname then do a into() here
     let app = TlsApp {
       app_id:           tls_front.app_id.clone(),
       hostname:         tls_front.hostname.clone(),
       path_begin:       tls_front.path_begin.clone(),
-      cert_fingerprint: tls_front.fingerprint.clone(),
     };
 
     if let Some((_, ref mut fronts)) = self.fronts.domain_lookup_mut(&tls_front.hostname.clone().into_bytes()) {
@@ -928,6 +905,7 @@ impl Listener {
           fronts.push(app.clone());
         }
     }
+
     if self.fronts.domain_lookup(&tls_front.hostname.clone().into_bytes()).is_none() {
       self.fronts.domain_insert(tls_front.hostname.into_bytes(), vec![app]);
     }
@@ -935,25 +913,18 @@ impl Listener {
     true
   }
 
-  pub fn remove_https_front(&mut self, front: HttpsFront) {
+  pub fn remove_https_front(&mut self, front: HttpFront) {
     debug!("removing tls_front {:?}", front);
 
     let should_delete = {
       let fronts_opt = self.fronts.domain_lookup_mut(front.hostname.as_bytes());
       if let Some((_, fronts)) = fronts_opt {
-        if let Some(pos) = fronts.iter().position(|f| &f.app_id == &front.app_id && &f.cert_fingerprint == &front.fingerprint) {
+        if let Some(pos) = fronts.iter().position(|f| {
+          &f.app_id == &front.app_id &&
+          &f.hostname == &front.hostname &&
+          &f.path_begin == &front.path_begin
+        }) {
           let front = fronts.remove(pos);
-
-          {
-            let mut contexts = unwrap_msg!(self.contexts.lock());
-            let domains  = unwrap_msg!(self.domains.lock());
-            let must_delete = contexts.get_mut(&front.cert_fingerprint).map(|tls_data| {
-              if tls_data.refcount > 0 {
-                tls_data.refcount -= 1;
-              }
-              tls_data.refcount == 0
-            });
-          }
         }
       }
 
@@ -1031,12 +1002,7 @@ impl Listener {
             debug!("looking for context for {:?} with fingerprint {:?}", servername, kv.1);
             if let Some(ref tls_data) = contexts.get(&kv.1) {
               debug!("found context for {:?}", servername);
-              if !tls_data.initialized {
-                //FIXME: couldn't we skip to the next cert?
-                error!("no application is using that certificate (looking up {})", servername);
-                *alert = SslAlert::UNRECOGNIZED_NAME;
-                return Err(SniError::ALERT_FATAL);
-              }
+
               let context: &SslContext = &tls_data.context;
               if let Ok(()) = ssl.set_ssl_context(context) {
                 debug!("servername is now {:?}", ssl.servername(NameType::HOST_NAME));
@@ -1056,8 +1022,6 @@ impl Listener {
       let tls_data = TlsData {
         context:     ctx.build(),
         certificate: cert_read.to_vec(),
-        refcount:    0,
-        initialized: false,
       };
 
       // if the name or the fingerprint are already used,
@@ -1093,28 +1057,22 @@ impl Listener {
     debug!("removing certificate {:?}", fingerprint);
     let mut contexts = unwrap_msg!(self.contexts.lock());
     let mut domains  = unwrap_msg!(self.domains.lock());
-    let must_delete = contexts.get_mut(&fingerprint).map(|tls_data| {
-      if tls_data.refcount > 0 { tls_data.refcount -= 1; }
-      tls_data.refcount == 0 || !tls_data.initialized
-    });
 
-    if must_delete == Some(true) {
-      if let Some(data) = contexts.remove(&fingerprint) {
-        if let Ok(cert) = X509::from_pem(&data.certificate) {
-          let common_name: Option<String> = get_cert_common_name(&cert);
-          //info!("got common name: {:?}", common_name);
-          if let Some(name) = common_name {
-            domains.domain_remove(&name.into_bytes());
-          }
+    if let Some(data) = contexts.remove(&fingerprint) {
+      if let Ok(cert) = X509::from_pem(&data.certificate) {
+        let common_name: Option<String> = get_cert_common_name(&cert);
+        //info!("got common name: {:?}", common_name);
+        if let Some(name) = common_name {
+          domains.domain_remove(&name.into_bytes());
+        }
 
-          let names: Vec<String> = cert.subject_alt_names().map(|names| {
-            names.iter().filter_map(|general_name|
-                                    general_name.dnsname().map(|name| String::from(name))
-                                   ).collect()
-          }).unwrap_or(vec!());
-          for name in names {
-            domains.domain_remove(&name.into_bytes());
-          }
+        let names: Vec<String> = cert.subject_alt_names().map(|names| {
+          names.iter().filter_map(|general_name|
+                                  general_name.dnsname().map(|name| String::from(name))
+                                 ).collect()
+        }).unwrap_or(vec!());
+        for name in names {
+          domains.domain_remove(&name.into_bytes());
         }
       }
     }
@@ -1537,7 +1495,7 @@ impl ProxyConfiguration<Session> for Proxy {
         }
       },
       ProxyRequestData::RemoveListener(remove) => {
-        info!("removing https listener att address: {:?}", remove.front);
+        info!("removing https listener at address: {:?}", remove.front);
         fixme!();
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
@@ -1733,21 +1691,17 @@ mod tests {
     fronts.domain_insert(Vec::from(&b"lolcatho.st"[..]), vec![
       TlsApp {
         app_id: app_id1, hostname: "lolcatho.st".to_owned(), path_begin: uri1,
-        cert_fingerprint: CertFingerprint(vec!()),
       },
       TlsApp {
         app_id: app_id2, hostname: "lolcatho.st".to_owned(), path_begin: uri2,
-        cert_fingerprint: CertFingerprint(vec!()),
       },
       TlsApp {
         app_id: app_id3, hostname: "lolcatho.st".to_owned(), path_begin: uri3,
-        cert_fingerprint: CertFingerprint(vec!()),
       }
     ]);
     fronts.domain_insert(Vec::from(&b"other.domain"[..]), vec![
       TlsApp {
         app_id: "app_1".to_owned(), hostname: "other.domain".to_owned(), path_begin: "/test".to_owned(),
-        cert_fingerprint: CertFingerprint(vec!()),
       },
     ]);
 

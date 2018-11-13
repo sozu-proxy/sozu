@@ -16,8 +16,8 @@ use rustls::{ServerConfig, ServerSession, NoClientAuth, ProtocolVersion,
 use mio_extras::timer::Timeout;
 
 use sozu_command::scm_socket::ScmSocket;
-use sozu_command::proxy::{Application,CertFingerprint,
-  ProxyRequestData,HttpsFront,HttpsListener,ProxyRequest,ProxyResponse,
+use sozu_command::proxy::{Application,
+  ProxyRequestData,HttpFront,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
   TlsVersion};
 use sozu_command::logging;
@@ -44,7 +44,6 @@ pub struct TlsApp {
   pub app_id:           String,
   pub hostname:         String,
   pub path_begin:       String,
-  pub cert_fingerprint: CertFingerprint,
 }
 
 pub type HostName  = String;
@@ -145,17 +144,12 @@ impl Listener {
     Some(self.token)
   }
 
-  pub fn add_https_front(&mut self, tls_front: HttpsFront) -> bool {
-    if !(*self.resolver).add_front(&tls_front.fingerprint) {
-      return false;
-    }
-
+  pub fn add_https_front(&mut self, tls_front: HttpFront) -> bool {
     //FIXME: should clone he hostname then do a into() here
     let app = TlsApp {
       app_id:           tls_front.app_id.clone(),
       hostname:         tls_front.hostname.clone(),
       path_begin:       tls_front.path_begin.clone(),
-      cert_fingerprint: tls_front.fingerprint.clone(),
     };
 
     if let Some((_,fronts)) = self.fronts.domain_lookup_mut(&tls_front.hostname.as_bytes()) {
@@ -170,17 +164,20 @@ impl Listener {
     true
   }
 
-  pub fn remove_https_front(&mut self, front: HttpsFront) {
+  pub fn remove_https_front(&mut self, front: HttpFront) {
     debug!("removing tls_front {:?}", front);
 
     let should_delete = {
       let fronts_opt = self.fronts.domain_lookup_mut(front.hostname.as_bytes());
       if let Some((_, fronts)) = fronts_opt {
         if let Some(pos) = fronts.iter()
-          .position(|f| &f.app_id == &front.app_id && &f.cert_fingerprint == &front.fingerprint) {
+          .position(|f| {
+            &f.app_id == &front.app_id &&
+            &f.hostname == &front.hostname &&
+            &f.path_begin == &front.path_begin
+          }) {
 
           let front = fronts.remove(pos);
-          (*self.resolver).remove_front(&front.cert_fingerprint) 
         }
       }
 

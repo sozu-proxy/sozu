@@ -150,8 +150,13 @@ pub enum BackendCmd {
 
 #[derive(StructOpt, PartialEq, Debug)]
 pub enum FrontendCmd {
-  #[structopt(name = "http", about = "HTTP/HTTPS frontend management")]
+  #[structopt(name = "http", about = "HTTP frontend management")]
   Http {
+    #[structopt(subcommand)]
+    cmd: HttpFrontendCmd,
+  },
+  #[structopt(name = "https", about = "HTTPS frontend management")]
+  Https {
     #[structopt(subcommand)]
     cmd: HttpFrontendCmd,
   },
@@ -174,8 +179,6 @@ pub enum HttpFrontendCmd {
     hostname: String,
     #[structopt(short = "p", long = "path", help="URL prefix of the frontend")]
     path_begin: Option<String>,
-    #[structopt(long = "certificate", help="path to a certificate file")]
-    path_to_certificate: Option<String>,
   },
   #[structopt(name = "remove")]
   Remove {
@@ -187,8 +190,6 @@ pub enum HttpFrontendCmd {
     hostname: String,
     #[structopt(short = "p", long = "path", help="URL prefix of the frontend")]
     path_begin: Option<String>,
-    #[structopt(long = "certificate", help="path to a certificate file")]
-    path_to_certificate: Option<String>,
   },
 }
 
