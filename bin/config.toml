@@ -129,6 +129,7 @@ protocol = "http"
 address = "0.0.0.0:8080"
 
 # specify a different IP than the one the socket sees, for logs and forwarded headers
+# this option is incompatible with expect_proxy
 # public_address = "1.2.3.4:80"
 
 # path to custom 404 and 503 answers
@@ -142,6 +143,7 @@ address = "0.0.0.0:8080"
 # sticky_name = "SOZUBALANCEID"
 #
 # Configures the client socket to receive a PROXY protocol header
+# this option is incompatible with public_addresss
 # expect_proxy = false
 
 # Example for a HTTPS (OpenSSL based or rustls based) listener
@@ -151,13 +153,15 @@ protocol = "https"
 address = "0.0.0.0:8443"
 
 # specify a different IP than the one the socket sees, for logs and forwarded headers
+# this option is incompatible with expect_proxy
 # public_address = "1.2.3.4:80"
 
-#answer_404 = "../lib/assets/404.html"
-#answer_503 = "../lib/assets/503.html"
+# answer_404 = "../lib/assets/404.html"
+# answer_503 = "../lib/assets/503.html"
 # sticky_name = "SOZUBALANCEID"
 
 # Configures the client socket to receive a PROXY protocol header
+# this option is incompatible with public_addresss
 # expect_proxy = false
 
 # supported TLS versions. Possible values are "SSLv2", "SSLv3", "TLSv1",
@@ -177,9 +181,13 @@ tls_versions = ["TLSv1.2"]
 #[[listeners]]
 # protocol = "tcp"
 # address = "127.0.0.1:8081"
+#
 # specify a different IP than the one the socket sees, for logs and forwarded headers
+# this option is incompatible with expect_proxy
 # public_address = "1.2.3.4:81"
+#
 # Configures the client socket to receive a PROXY protocol header
+# this option is incompatible with public_addresss
 # expect_proxy = false
 
 # static configuration for applications
