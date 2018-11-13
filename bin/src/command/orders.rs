@@ -245,12 +245,14 @@ impl CommandServer {
             //FIXME: join_all will stop at the first error, and we will end up accumulating messages
             join_all(futures).map(move |v| {
               info!("load_state: {} messages loaded", v.len());
-              executor::Executor::send_client(token_opt.unwrap(), CommandResponse::new(
-                id,
-                CommandStatus::Ok,
-                format!("ok: {} messages, error: 0", v.len()),
-                None
-              ));
+              if let Some(token) = token_opt {
+                executor::Executor::send_client(token, CommandResponse::new(
+                  id,
+                  CommandStatus::Ok,
+                  format!("ok: {} messages, error: 0", v.len()),
+                  None
+                ));
+              }
             }).map_err(|e| {
               error!("load_state error: {}", e);
             })
