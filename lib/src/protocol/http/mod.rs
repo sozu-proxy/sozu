@@ -1069,7 +1069,7 @@ impl<Front:SocketHandler> Http<Front> {
                 .and_then(|request| request.get_keep_alive())
                 .and_then(|conn| conn.sticky_session)
                 .map(|sticky_client| sticky_client != session.sticky_id)
-                .unwrap_or(false) {
+                .unwrap_or(true) {
                   Some(session)
                 } else {
                   None
@@ -1111,7 +1111,7 @@ impl<Front:SocketHandler> Http<Front> {
               .and_then(|request| request.get_keep_alive())
               .and_then(|conn| conn.sticky_session)
               .map(|sticky_client| sticky_client != session.sticky_id)
-              .unwrap_or(false) {
+              .unwrap_or(true) {
                 Some(session)
               } else {
                 None
