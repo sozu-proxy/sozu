@@ -15,7 +15,8 @@ use slab::Slab;
 use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::scm_socket::{Listeners,ScmSocket};
-use sozu_command::proxy::{Application,ProxyRequestData,HttpFront,HttpListener,ProxyRequest,ProxyResponse,ProxyResponseStatus};
+use sozu_command::proxy::{Application,ProxyRequestData,HttpFront,HttpListener,
+  ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyResponseData,ProxyEvent};
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
 
@@ -27,7 +28,8 @@ use super::pool::Pool;
 use super::protocol::{ProtocolResult,StickySession,Http,Pipe};
 use super::protocol::http::DefaultAnswerStatus;
 use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use super::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
+use super::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,
+  ListenSession, CONN_RETRIES, push_event};
 use super::socket::server_bind;
 use super::retry::RetryPolicy;
 use super::protocol::http::parser::{hostname_and_port, RequestState};
@@ -384,6 +386,8 @@ impl Session {
       if !already_unavailable && backend.retry_policy.is_down() {
         error!("backend server {} at {} is down", backend.backend_id, backend.address);
         incr!("backend.down");
+
+        push_event(ProxyEvent::BackendDown(backend.backend_id.clone(), backend.address));
       }
     });
   }

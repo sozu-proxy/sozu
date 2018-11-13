@@ -10,6 +10,7 @@ use uuid::Uuid;
 use rustls::{ServerSession,Session as ClientSession,ProtocolVersion,SupportedCipherSuite,CipherSuite};
 use mio_extras::timer::{Timer, Timeout};
 use sozu_command::buffer::Buffer;
+use sozu_command::proxy::ProxyEvent;
 
 use protocol::http::parser::RequestState;
 use pool::Pool;
@@ -23,6 +24,7 @@ use protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use retry::RetryPolicy;
 use util::UnwrapLog;
 use buffer_queue::BufferQueue;
+use server::push_event;
 
 pub enum State {
   Expect(ExpectProxyProtocol<TcpStream>, ServerSession),
@@ -442,6 +444,8 @@ impl Session {
       if !already_unavailable && backend.retry_policy.is_down() {
         error!("backend server {} at {} is down", backend.backend_id, backend.address);
         incr!("backend.down");
+
+        push_event(ProxyEvent::BackendDown(backend.backend_id.clone(), backend.address));
       }
     });
   }

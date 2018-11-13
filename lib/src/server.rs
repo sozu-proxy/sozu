@@ -15,7 +15,7 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::state::{ConfigState,get_application_ids_by_domain};
-use sozu_command::proxy::{ProxyRequestData,MessageId,ProxyResponse,
+use sozu_command::proxy::{ProxyRequestData,MessageId,ProxyResponse, ProxyEvent,
   ProxyResponseData,ProxyResponseStatus,ProxyRequest,Topic,Query,QueryAnswer,
   QueryApplicationType,TlsProvider,ListenerType,HttpsListener};
 use sozu_command::buffer::Buffer;
@@ -31,6 +31,26 @@ use backends::BackendMap;
 pub const CONN_RETRIES: u8 = 3;
 
 pub type ProxyChannel = Channel<ProxyResponse,ProxyRequest>;
+
+thread_local! {
+  pub static QUEUE: RefCell<VecDeque<ProxyResponse>> = RefCell::new(VecDeque::new());
+}
+
+pub fn push_queue(message: ProxyResponse) {
+  QUEUE.with(|queue| {
+    (*queue.borrow_mut()).push_back(message);
+  });
+}
+
+pub fn push_event(event: ProxyEvent) {
+  QUEUE.with(|queue| {
+    (*queue.borrow_mut()).push_back(ProxyResponse {
+      id:     "EVENT".to_string(),
+      status: ProxyResponseStatus::Processing,
+      data:   Some(ProxyResponseData::Event(event))
+    });
+  });
+}
 
 #[derive(PartialEq)]
 pub enum ListenPortState {
@@ -102,7 +122,6 @@ pub struct Server {
   accept_ready:    HashSet<ListenToken>,
   can_accept:      bool,
   channel:         ProxyChannel,
-  queue:           VecDeque<ProxyResponse>,
   http:            http::Proxy,
   https:           HttpsProvider,
   tcp:             tcp::Proxy,
@@ -195,7 +214,6 @@ impl Server {
       accept_ready:    HashSet::new(),
       can_accept:      true,
       channel,
-      queue:           VecDeque::new(),
       http:            http.unwrap_or(http::Proxy::new(pool.clone(), backends.clone())),
       https:           https.unwrap_or(HttpsProvider::new(false, pool.clone(), backends.clone())),
       tcp:             tcp.unwrap_or(tcp::Proxy::new(backends.clone())),
@@ -232,7 +250,9 @@ impl Server {
         counter += 1;
       }
       // do not send back answers to the initialization messages
-      server.queue.clear();
+      QUEUE.with(|queue| {
+        (*queue.borrow_mut()).clear();
+      });
     }
 
     info!("will try to receive listeners");
@@ -245,6 +265,8 @@ impl Server {
     server
   }
 }
+
+use std::net::{IpAddr, Ipv4Addr};
 
 impl Server {
   pub fn run(&mut self) {
@@ -270,6 +292,8 @@ impl Server {
         current_poll_errors = 0;
       }
 
+      self.send_queue();
+
       for event in events.iter() {
         if event.token() == Token(0) {
           let kind = event.readiness();
@@ -285,9 +309,11 @@ impl Server {
 
           // loop here because iterations has borrow issues
           loop {
-            if !self.queue.is_empty() {
-              self.channel.interest.insert(Ready::writable());
-            }
+            QUEUE.with(|queue| {
+              if !(*queue.borrow()).is_empty() {
+                self.channel.interest.insert(Ready::writable());
+              }
+            });
 
             //trace!("WORKER[{}] channel readiness={:?}, interest={:?}, queue={} elements",
             //  line!(), self.channel.readiness, self.channel.interest, self.queue.len());
@@ -336,34 +362,13 @@ impl Server {
               }
             }
 
-            if !self.queue.is_empty() {
-              self.channel.interest.insert(Ready::writable());
-            }
-            if self.channel.readiness.is_writable() {
-
-              loop {
-
-                if let Some(msg) = self.queue.pop_front() {
-                  if !self.channel.write_message(&msg) {
-                    self.queue.push_front(msg);
-                  }
-                }
-
-                if self.channel.back_buf.available_data() > 0 {
-                  if let Err(e) = self.channel.writable() {
-                    error!("error writing to channel: {:?}", e);
-                  }
-                }
-
-                if !self.channel.readiness.is_writable() {
-                  break;
-                }
-
-                if self.channel.back_buf.available_data() == 0 && self.queue.len() == 0 {
-                  break;
-                }
+            QUEUE.with(|queue| {
+              if !(*queue.borrow()).is_empty() {
+                self.channel.interest.insert(Ready::writable());
               }
-            }
+            });
+
+            self.send_queue();
           }
 
         } else if event.token() == Token(1) {
@@ -450,12 +455,40 @@ impl Server {
     }
   }
 
+  fn send_queue(&mut self) {
+    if self.channel.readiness.is_writable() {
+      QUEUE.with(|q| {
+        let mut queue = q.borrow_mut();
+        loop {
+          if let Some(msg) = queue.pop_front() {
+            if !self.channel.write_message(&msg) {
+              queue.push_front(msg);
+            }
+          }
+
+          if self.channel.back_buf.available_data() > 0 {
+            if let Err(e) = self.channel.writable() {
+              error!("error writing to channel: {:?}", e);
+            }
+          }
+
+          if !self.channel.readiness.is_writable() {
+            break;
+          }
+
+          if self.channel.back_buf.available_data() == 0 && queue.len() == 0 {
+            break;
+          }
+        }
+      });
+    }
+  }
+
   fn notify(&mut self, message: ProxyRequest) {
     if let ProxyRequestData::Metrics = message.order {
-      let q = &mut self.queue;
       //let id = message.id.clone();
       METRICS.with(|metrics| {
-        q.push_back(ProxyResponse {
+        push_queue(ProxyResponse {
           id:     message.id.clone(),
           status: ProxyResponseStatus::Ok,
           data:   Some(ProxyResponseData::Metrics(
@@ -469,7 +502,7 @@ impl Server {
     if let ProxyRequestData::Query(ref query) = message.order {
       match query {
         &Query::ApplicationsHashes => {
-          self.queue.push_back(ProxyResponse {
+          push_queue(ProxyResponse {
             id:     message.id.clone(),
             status: ProxyResponseStatus::Ok,
             data:   Some(ProxyResponseData::Query(
@@ -490,7 +523,7 @@ impl Server {
             }
           };
 
-          self.queue.push_back(ProxyResponse {
+          push_queue(ProxyResponse {
             id:     message.id.clone(),
             status: ProxyResponseStatus::Ok,
             data:   Some(ProxyResponseData::Query(answer))
@@ -518,14 +551,14 @@ impl Server {
         self.backends.borrow_mut().add_backend(&backend.app_id, new_backend);
 
         let answer = ProxyResponse { id: id.to_string(), status: ProxyResponseStatus::Ok, data: None };
-        self.queue.push_back(answer);
+        push_queue(answer);
         return;
       },
       ProxyRequest { ref id, order: ProxyRequestData::RemoveBackend(ref backend) } => {
         self.backends.borrow_mut().remove_backend(&backend.app_id, &backend.address);
 
         let answer = ProxyResponse { id: id.to_string(), status: ProxyResponseStatus::Ok, data: None };
-        self.queue.push_back(answer);
+        push_queue(answer);
         return;
       },
       _ => {},
@@ -541,7 +574,7 @@ impl Server {
           /*FIXME
           if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
             error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
-            self.queue.push_back(ProxyResponse {
+            push_queue(ProxyResponse {
               id,
               status: ProxyResponseStatus::Error(String::from("Couldn't add TCP front: port already in use")),
               data: None
@@ -552,7 +585,7 @@ impl Server {
           let entry = self.sessions.vacant_entry();
 
           if entry.is_none() {
-            self.queue.push_back(ProxyResponse {
+            push_queue(ProxyResponse {
               id: id.to_string(),
               status: ProxyResponseStatus::Error(String::from("session list is full, cannot add a listener")),
               data: None
@@ -573,13 +606,13 @@ impl Server {
           };
 
           let answer = ProxyResponse { id: id.to_string(), status, data: None };
-          self.queue.push_back(answer);
+          push_queue(answer);
         },
         ProxyRequest { ref id, order: ProxyRequestData::RemoveListener(ref remove) } => {
           if remove.proxy == ListenerType::HTTP {
             debug!("{} remove http listener {:?}", id, remove);
             self.base_sessions_count -= 1;
-            self.queue.push_back(self.http.notify(&mut self.poll, ProxyRequest {
+            push_queue(self.http.notify(&mut self.poll, ProxyRequest {
               id: id.to_string(),
               order: ProxyRequestData::RemoveListener(remove.clone())
             }));
@@ -602,10 +635,10 @@ impl Server {
             };
 
             let answer = ProxyResponse { id: id.to_string(), status, data: None };
-            self.queue.push_back(answer);
+            push_queue(answer);
           }
         },
-        ref m => self.queue.push_back(self.http.notify(&mut self.poll, m.clone())),
+        ref m => push_queue(self.http.notify(&mut self.poll, m.clone())),
       }
     }
     if topics.contains(&Topic::HttpsProxyConfig) {
@@ -616,7 +649,7 @@ impl Server {
           /*FIXME
           if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
             error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
-            self.queue.push_back(ProxyResponse {
+            push_queue(ProxyResponse {
               id,
               status: ProxyResponseStatus::Error(String::from("Couldn't add TCP front: port already in use")),
               data: None
@@ -627,7 +660,7 @@ impl Server {
           let entry = self.sessions.vacant_entry();
 
           if entry.is_none() {
-            self.queue.push_back(ProxyResponse {
+            push_queue(ProxyResponse {
               id: id.to_string(),
               status: ProxyResponseStatus::Error(String::from("session list is full, cannot add a listener")),
               data: None
@@ -648,13 +681,13 @@ impl Server {
           };
 
           let answer = ProxyResponse { id: id.to_string(), status, data: None };
-          self.queue.push_back(answer);
+          push_queue(answer);
         },
         ProxyRequest { ref id, order: ProxyRequestData::RemoveListener(ref remove) } => {
           if remove.proxy == ListenerType::HTTPS {
             debug!("{} remove https listener {:?}", id, remove);
             self.base_sessions_count -= 1;
-            self.queue.push_back(self.https.notify(&mut self.poll, ProxyRequest {
+            push_queue(self.https.notify(&mut self.poll, ProxyRequest {
               id: id.to_string(),
               order: ProxyRequestData::RemoveListener(remove.clone())
             }));
@@ -677,10 +710,10 @@ impl Server {
             };
 
             let answer = ProxyResponse { id: id.to_string(), status, data: None };
-            self.queue.push_back(answer);
+            push_queue(answer);
           }
         },
-        ref m => self.queue.push_back(self.https.notify(&mut self.poll, m.clone())),
+        ref m => push_queue(self.https.notify(&mut self.poll, m.clone())),
       }
     }
     if topics.contains(&Topic::TcpProxyConfig) {
@@ -690,7 +723,7 @@ impl Server {
           debug!("{} add tcp listener {:?}", id, listener);
           /*if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
             error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
-            self.queue.push_back(ProxyResponse {
+            push_queue(ProxyResponse {
               id,
               status: ProxyResponseStatus::Error(String::from("Couldn't add TCP front: port already in use")),
               data: None
@@ -702,7 +735,7 @@ impl Server {
           let entry = self.sessions.vacant_entry();
 
           if entry.is_none() {
-            self.queue.push_back(ProxyResponse {
+            push_queue(ProxyResponse {
               id,
               status: ProxyResponseStatus::Error(String::from("session list is full, cannot add a listener")),
               data: None
@@ -722,13 +755,13 @@ impl Server {
             ProxyResponseStatus::Error(String::from("cannot add TCP listener"))
           };
           let answer = ProxyResponse { id, status, data: None };
-          self.queue.push_back(answer);
+          push_queue(answer);
         },
         ProxyRequest { ref id, order: ProxyRequestData::RemoveListener(ref remove) } => {
           if remove.proxy == ListenerType::TCP {
             debug!("{} remove tcp listener {:?}", id, remove);
             self.base_sessions_count -= 1;
-            self.queue.push_back(self.tcp.notify(&mut self.poll, ProxyRequest {
+            push_queue(self.tcp.notify(&mut self.poll, ProxyRequest {
               id: id.to_string(),
               order: ProxyRequestData::RemoveListener(remove.clone())
             }));
@@ -751,10 +784,10 @@ impl Server {
             };
 
             let answer = ProxyResponse { id: id.to_string(), status, data: None };
-            self.queue.push_back(answer);
+            push_queue(answer);
           }
         },
-        m => self.queue.push_back(self.tcp.notify(&mut self.poll, m)),
+        m => push_queue(self.tcp.notify(&mut self.poll, m)),
       }
     }
   }

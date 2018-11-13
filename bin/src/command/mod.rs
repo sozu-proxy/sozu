@@ -17,8 +17,8 @@ use sozu::metrics::METRICS;
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
-use sozu_command::command::{CommandRequest,CommandResponse,CommandStatus,RunState};
-use sozu_command::proxy::{ProxyRequest,ProxyResponse};
+use sozu_command::command::{self,CommandRequest,CommandResponse,CommandResponseData,CommandStatus,RunState};
+use sozu_command::proxy::{ProxyRequest,ProxyResponse,ProxyResponseData};
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 
 pub mod executor;
@@ -94,22 +94,23 @@ pub struct ProxyConfiguration {
 }
 
 pub struct CommandServer {
-  sock:            UnixListener,
-  buffer_size:     usize,
-  max_buffer_size: usize,
-  clients:         Slab<CommandClient,FrontToken>,
-  workers:         HashMap<Token, Worker>,
-  next_id:         u32,
-  state:           ConfigState,
-  pub poll:        Poll,
-  config:          Config,
-  token_count:     usize,
-  must_stop:       bool,
-  executable_path: String,
+  sock:              UnixListener,
+  buffer_size:       usize,
+  max_buffer_size:   usize,
+  clients:           Slab<CommandClient,FrontToken>,
+  workers:           HashMap<Token, Worker>,
+  event_subscribers: Vec<FrontToken>,
+  next_id:           u32,
+  state:             ConfigState,
+  pub poll:          Poll,
+  config:            Config,
+  token_count:       usize,
+  must_stop:         bool,
+  executable_path:   String,
   //caching the number of backends instead of going through the whole state.backends hashmap
-  backends_count:  usize,
+  backends_count:    usize,
   //caching the number of frontends instead of going through the whole state.http/hhtps/tcp_fronts hashmaps
-  frontends_count: usize,
+  frontends_count:   usize,
 }
 
 impl CommandServer {
@@ -175,20 +176,21 @@ impl CommandServer {
     let frontends_count = state.count_frontends();
 
     CommandServer {
-      sock:            srv,
-      buffer_size:     config.command_buffer_size,
-      max_buffer_size: config.max_command_buffer_size,
-      clients:         Slab::with_capacity(128),
-      workers:         workers,
-      next_id:         next_id as u32,
-      state:           state,
-      poll:            poll,
-      config:          config,
-      token_count:     token_count,
-      must_stop:       false,
-      executable_path: path,
-      backends_count:  backends_count,
-      frontends_count:  frontends_count,
+      sock:              srv,
+      buffer_size:       config.command_buffer_size,
+      max_buffer_size:   config.max_command_buffer_size,
+      clients:           Slab::with_capacity(128),
+      event_subscribers: Vec::new(),
+      workers:           workers,
+      next_id:           next_id as u32,
+      state:             state,
+      poll:              poll,
+      config:            config,
+      token_count:       token_count,
+      must_stop:         false,
+      executable_path:   path,
+      backends_count:    backends_count,
+      frontends_count:   frontends_count,
     }
   }
 
@@ -454,7 +456,13 @@ impl CommandServer {
         let _ = self.poll.deregister(&self.clients[conn_token].channel.sock).map_err(|e| {
           error!("could not unregister client socket: {:?}", e);
         });
+
         self.clients.remove(conn_token);
+
+        if let Some(pos) = self.event_subscribers.iter().position(|t| t == &conn_token) {
+          let _ = self.event_subscribers.remove(pos);
+        }
+
         trace!("closed client [{}]", conn_token.0);
       } else {
         loop {
@@ -525,7 +533,21 @@ impl CommandServer {
   }
 
   fn handle_worker_message(&mut self, token: Token, msg: ProxyResponse) {
-    Executor::handle_message(token, msg);
+    if let Some(ProxyResponseData::Event(data)) = msg.data {
+      let event: command::Event = data.into();
+      for client_token in self.event_subscribers.iter() {
+        let event = CommandResponse::new(
+          msg.id.to_string(),
+          CommandStatus::Processing,
+          format!("{}", token.0),
+          Some(CommandResponseData::Event(event.clone()))
+        );
+
+        self.clients.get_mut(*client_token).map(|cl| cl.push_message(event));
+      }
+    } else {
+      Executor::handle_message(token, msg);
+    }
   }
 
   pub fn check_worker_status(&mut self, token: Token) {

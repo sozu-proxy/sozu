@@ -1159,6 +1159,41 @@ pub fn logging_filter(channel: Channel<CommandRequest,CommandResponse>, timeout:
   order_command(channel, timeout, ProxyRequestData::Logging(String::from(filter)));
 }
 
+pub fn events(mut channel: Channel<CommandRequest,CommandResponse>) {
+  let id = generate_id();
+  channel.write_message(&CommandRequest::new(
+    id.clone(),
+    CommandRequestData::SubscribeEvents,
+    None,
+  ));
+
+  loop {
+    match channel.read_message() {
+      None          => {
+        eprintln!("the proxy didn't answer");
+        exit(1);
+      },
+      Some(message) => {
+        match message.status {
+          CommandStatus::Processing => {
+            if let Some(CommandResponseData::Event(event)) = message.data {
+              println!("got event from worker({}): {:?}", message.message, event);
+            }
+          },
+          CommandStatus::Error => {
+            eprintln!("could not get proxy events: {}", message.message);
+            exit(1);
+          },
+          CommandStatus::Ok => {
+            println!("{}", message.message);
+            return;
+          }
+        }
+      }
+    }
+  }
+}
+
 fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, order: ProxyRequestData) {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(

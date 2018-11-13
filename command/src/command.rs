@@ -2,10 +2,11 @@ use serde;
 use serde::ser::SerializeMap;
 use serde_json;
 use std::fmt;
+use std::net::SocketAddr;
 use std::collections::BTreeMap;
 
 use state::ConfigState;
-use proxy::{AggregatedMetricsData,ProxyRequestData,QueryAnswer};
+use proxy::{AggregatedMetricsData,ProxyRequestData,QueryAnswer,ProxyEvent};
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
@@ -19,6 +20,7 @@ pub enum CommandRequestData {
   LaunchWorker(String),
   UpgradeMaster,
   UpgradeWorker(u32),
+  SubscribeEvents,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
@@ -55,6 +57,7 @@ pub enum CommandResponseData {
   Metrics(AggregatedMetricsData),
   Query(BTreeMap<String, QueryAnswer>),
   State(ConfigState),
+  Event(Event),
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Serialize,Deserialize)]
@@ -97,6 +100,22 @@ pub struct WorkerInfo {
 #[derive(Deserialize)]
 struct SaveStateData {
   path : String
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Event {
+  BackendDown(String, SocketAddr),
+  NoAvailableBackends(String),
+}
+
+impl From<ProxyEvent> for Event {
+  fn from(e: ProxyEvent) -> Self {
+    match e {
+      ProxyEvent::BackendDown(id, addr) => Event::BackendDown(id, addr),
+      ProxyEvent::NoAvailableBackends(app_id) => Event::NoAvailableBackends(app_id),
+    }
+  }
 }
 
 enum CommandRequestField {
@@ -222,6 +241,8 @@ impl<'de> serde::de::Visitor<'de> for CommandRequestVisitor {
         None => return Err(serde::de::Error::missing_field("data")),
       };
       CommandRequestData::UpgradeWorker(try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("upgrade worker")))))
+    } else if config_type == "SUBSCRIBE_EVENTS" {
+      CommandRequestData::SubscribeEvents
     } else {
       return Err(serde::de::Error::custom("unrecognized command"));
     };
@@ -294,6 +315,9 @@ impl serde::Serialize for CommandRequest {
       CommandRequestData::UpgradeWorker(ref id) => {
         try!(map.serialize_entry("type", "UPGRADE_WORKER"));
         try!(map.serialize_entry("data", id));
+      },
+      CommandRequestData::SubscribeEvents => {
+        try!(map.serialize_entry("type", "SUBSCRIBE_EVENTS"));
       },
     };
 

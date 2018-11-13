@@ -7,6 +7,7 @@ use mio::net::TcpStream;
 use sozu_command::{proxy, config::LoadBalancingAlgorithms};
 
 use super::{AppId,Backend,ConnectionError,load_balancing::*};
+use server::push_event;
 
 #[derive(Debug)]
 pub struct BackendMap {
@@ -85,6 +86,8 @@ impl BackendMap {
         if self.available {
           error!("no more available backends for app {}", app_id);
           self.available = false;
+
+          push_event(proxy::ProxyEvent::NoAvailableBackends(app_id.to_string()));
         }
         return Err(ConnectionError::NoBackendAvailable);
       }

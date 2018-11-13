@@ -21,7 +21,8 @@ use command::{add_application,remove_application,dump_state,load_state,
   save_state, soft_stop, hard_stop, upgrade_master, status,metrics,
   remove_backend, add_backend, remove_http_frontend, add_http_frontend,
   remove_tcp_frontend, add_tcp_frontend, add_certificate, remove_certificate,
-  replace_certificate, query_application, logging_filter, upgrade_worker};
+  replace_certificate, query_application, logging_filter, upgrade_worker,
+  events};
 
 use cli::*;
 
@@ -117,7 +118,8 @@ fn main() {
         QueryCmd::Applications{ id, domain } => query_application(channel, json, id, domain),
       }
     },
-    SubCmd::Config{ cmd: _ } => {} // noop, handled at the beginning of the method
+    SubCmd::Config{ cmd: _ } => {}, // noop, handled at the beginning of the method
+    SubCmd::Events => events(channel),
   }
 }
 

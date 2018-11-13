@@ -28,7 +28,7 @@ use mio_extras::timer::{Timer,Timeout};
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,CertFingerprint,CertificateAndKey,
   ProxyRequestData,HttpFront,HttpsListener,ProxyRequest,ProxyResponse,
-  ProxyResponseStatus,TlsVersion};
+  ProxyResponseStatus,TlsVersion,ProxyEvent};
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
 
@@ -38,7 +38,8 @@ use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetri
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use backends::BackendMap;
-use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession, CONN_RETRIES};
+use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,
+  ListenSession, CONN_RETRIES, push_event};
 use http::{DefaultAnswers, CustomAnswers};
 use socket::server_bind;
 use trie::*;
@@ -437,6 +438,8 @@ impl Session {
       if !already_unavailable && backend.retry_policy.is_down() {
         error!("backend server {} at {} is down", backend.backend_id, backend.address);
         incr!("backend.down");
+
+        push_event(ProxyEvent::BackendDown(backend.backend_id.clone(), backend.address));
       }
     });
   }

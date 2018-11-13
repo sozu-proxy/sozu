@@ -70,6 +70,9 @@ impl CommandServer {
       CommandRequestData::UpgradeWorker(id) => {
         self.upgrade_worker(token, &message.id, id);
       },
+      CommandRequestData::SubscribeEvents => {
+        self.event_subscribers.push(token);
+      },
     }
   }
 
@@ -834,23 +837,24 @@ impl CommandServer {
 
     let path = unsafe { get_executable_path() };
     CommandServer {
-      sock:            listener,
-      poll:            poll,
-      config:          config,
-      buffer_size:     buffer_size,
-      max_buffer_size: max_buffer_size,
+      sock:              listener,
+      poll:              poll,
+      config:            config,
+      buffer_size:       buffer_size,
+      max_buffer_size:   max_buffer_size,
       //FIXME: deserialize client connections as well, otherwise they might leak?
-      clients:         Slab::with_capacity(128),
-      workers:         workers,
-      next_id:         next_id,
-      state:           config_state,
-      token_count:     token_count,
+      clients:           Slab::with_capacity(128),
+      event_subscribers: Vec::new(),
+      workers:           workers,
+      next_id:           next_id,
+      state:             config_state,
+      token_count:       token_count,
 
       //FIXME: deserialize this as well
-      must_stop:       false,
-      executable_path: path,
-      backends_count:  backends_count,
-      frontends_count: frontends_count,
+      must_stop:         false,
+      executable_path:   path,
+      backends_count:    backends_count,
+      frontends_count:   frontends_count,
     }
   }
 }

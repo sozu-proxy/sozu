@@ -76,7 +76,9 @@ pub enum SubCmd {
   Config {
     #[structopt(subcommand)]
     cmd: ConfigCmd
-  }
+  },
+  #[structopt(name = "events", about = "receive sozu events")]
+  Events
 }
 
 #[derive(StructOpt, PartialEq, Debug)]

@@ -39,6 +39,7 @@ pub enum ProxyResponseData {
   //placeholder for now
   Metrics(MetricsData),
   Query(QueryAnswer),
+  Event(ProxyEvent),
 }
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
@@ -102,6 +103,13 @@ pub struct BackendMetricsData {
   pub bytes_in:  usize,
   pub bytes_out: usize,
   pub percentiles: Percentiles,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ProxyEvent {
+  BackendDown(String, SocketAddr),
+  NoAvailableBackends(String),
 }
 
 #[derive(Debug,Clone,Serialize,Deserialize)]
