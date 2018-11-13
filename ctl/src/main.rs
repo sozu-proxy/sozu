@@ -102,13 +102,13 @@ fn main() {
     SubCmd::Certificate{ cmd } => {
       match cmd {
         CertificateCmd::Add{ certificate, chain, key, address } => {
-          add_certificate(channel, timeout, address, &certificate, &chain, key.unwrap_or("missing key path".to_string()).as_str())
+          add_certificate(channel, timeout, address, &certificate, &chain, &key)
         },
         CertificateCmd::Remove{ certificate, address } => {
           remove_certificate(channel, timeout, address, &certificate)
         },
         CertificateCmd::Replace{ certificate, chain, key, old_certificate, address } => {
-          replace_certificate(channel, timeout, address, &certificate, &chain, &key.unwrap_or("missing key path".to_string()).as_str(), &old_certificate)
+          replace_certificate(channel, timeout, address, &certificate, &chain, &key, &old_certificate)
         },
       }
     },

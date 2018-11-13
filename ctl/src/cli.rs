@@ -222,7 +222,7 @@ pub enum CertificateCmd {
     #[structopt(long = "certificate-chain", help = "path to the certificate chain")]
     chain: String,
     #[structopt(long = "key", help = "path to the key")]
-    key: Option<String>,
+    key: String,
   },
   #[structopt(name = "remove")]
   Remove {
@@ -240,7 +240,7 @@ pub enum CertificateCmd {
     #[structopt(long = "new-certificate-chain", help = "path to the new certificate chain")]
     chain: String,
     #[structopt(long = "new-key", help = "path to the new key")]
-    key: Option<String>,
+    key: String,
     #[structopt(short = "old-cert", long = "old-certificate", help = "path to the old certificate")]
     old_certificate: String,
   }
