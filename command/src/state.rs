@@ -303,10 +303,6 @@ impl ConfigState {
       }
     }
 
-    for app in self.applications.values() {
-      v.push(ProxyRequestData::AddApplication(app.clone()));
-    }
-
     v
   }
 
