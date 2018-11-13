@@ -72,12 +72,12 @@ pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
   command_timeout!(timeout, {
     match channel.read_message() {
       None          => {
-        println!("the proxy didn't answer");
+        eprintln!("the proxy didn't answer");
         exit(1);
       },
       Some(message) => {
         if id != message.id {
-          println!("received message with invalid id: {:?}", message);
+          eprintln!("received message with invalid id: {:?}", message);
           exit(1);
         }
         match message.status {
@@ -87,7 +87,7 @@ pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
             // until an error or ok message was sent
           },
           CommandStatus::Error => {
-            println!("could not save proxy state: {}", message.message);
+            eprintln!("could not save proxy state: {}", message.message);
             exit(1);
           },
           CommandStatus::Ok => {
@@ -110,12 +110,12 @@ pub fn load_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
   command_timeout!(timeout, {
     match channel.read_message() {
       None          => {
-        println!("the proxy didn't answer");
+        eprintln!("the proxy didn't answer");
         exit(1);
       },
       Some(message) => {
         if id != message.id {
-          println!("received message with invalid id: {:?}", message);
+          eprintln!("received message with invalid id: {:?}", message);
           exit(1);
         }
         match message.status {
@@ -125,7 +125,7 @@ pub fn load_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
             // until an error or ok message was sent
           },
           CommandStatus::Error => {
-            println!("could not load proxy state: {}", message.message);
+            eprintln!("could not load proxy state: {}", message.message);
             exit(1);
           },
           CommandStatus::Ok => {
@@ -148,12 +148,12 @@ pub fn dump_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
   command_timeout!(timeout, {
     match channel.read_message() {
       None          => {
-        println!("the proxy didn't answer");
+        eprintln!("the proxy didn't answer");
         exit(1);
       },
       Some(message) => {
         if id != message.id {
-          println!("received message with invalid id: {:?}", message);
+          eprintln!("received message with invalid id: {:?}", message);
           exit(1);
         }
         match message.status {
@@ -166,7 +166,7 @@ pub fn dump_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
             if json {
               print_json_response(&message.message);
             } else {
-              println!("could not dump proxy state: {}", message.message);
+              eprintln!("could not dump proxy state: {}", message.message);
             }
             exit(1);
           },
@@ -178,7 +178,7 @@ pub fn dump_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
                 println!("{:#?}", state);
               }
             } else {
-              println!("state dump was empty");
+              eprintln!("state dump was empty");
               exit(1);
             }
           }
@@ -199,21 +199,25 @@ pub fn soft_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id:
 
   loop {
     match channel.read_message() {
-      None          => println!("the proxy didn't answer"),
+      None          => {
+        eprintln!("the proxy didn't answer");
+        exit(1);
+      },
       Some(message) => {
         if &id != &message.id {
-          println!("received message with invalid id: {:?}", message);
-          return;
+          eprintln!("received message with invalid id: {:?}", message);
+          exit(1);
         }
         match message.status {
           CommandStatus::Processing => {
             println!("Proxy is processing: {}", message.message);
           },
           CommandStatus::Error => {
-            println!("could not stop the proxy: {}", message.message);
+            eprintln!("could not stop the proxy: {}", message.message);
+            exit(1);
           },
           CommandStatus::Ok => {
-            println!("Proxy shut down: {}", message.message);
+            println!("Proxy shut down with message: \"{}\"", message.message);
             break;
           }
         }
@@ -234,14 +238,18 @@ pub fn hard_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id:
   command_timeout!(timeout,
     loop {
       match channel.read_message() {
-        None          => println!("the proxy didn't answer"),
+        None          => {
+          eprintln!("the proxy didn't answer");
+          exit(1);
+        },
         Some(message) => {
           match message.status {
             CommandStatus::Processing => {
               println!("Proxy is processing: {}", message.message);
             },
             CommandStatus::Error => {
-              println!("could not stop the proxy: {}", message.message);
+              eprintln!("could not stop the proxy: {}", message.message);
+              exit(1);
             },
             CommandStatus::Ok => {
               if &id == &message.id {
@@ -268,20 +276,23 @@ pub fn upgrade_master(mut channel: Channel<CommandRequest,CommandResponse>,
   ));
 
   match channel.read_message() {
-    None          => println!("Error: the proxy didn't list workers"),
+    None          => {
+      eprintln!("Error: the proxy didn't list workers");
+      exit(1);
+    },
     Some(message) => {
       if id != message.id {
-        println!("Error: received unexpected message: {:?}", message);
-        return;
+        eprintln!("Error: received unexpected message: {:?}", message);
+        exit(1);
       }
       match message.status {
         CommandStatus::Processing => {
-          println!("Error: the proxy didn't return list of workers immediately");
-          return;
+          eprintln!("Error: the proxy didn't return list of workers immediately");
+          exit(1);
         },
         CommandStatus::Error => {
-          println!("Error: failed to get the list of worker: {}", message.message);
-          return
+          eprintln!("Error: failed to get the list of worker: {}", message.message);
+          exit(1);
         },
         CommandStatus::Ok => {
           if let Some(CommandResponseData::Workers(ref workers)) = message.data {
@@ -306,19 +317,19 @@ pub fn upgrade_master(mut channel: Channel<CommandRequest,CommandResponse>,
             loop {
               match channel.read_message() {
                 None          => {
-                  println!("Error: the proxy didn't start master upgrade");
-                  return;
+                  eprintln!("Error: the proxy didn't start master upgrade");
+                  exit(1);
                 },
                 Some(message) => {
                   if &id != &message.id {
-                    println!("Error: received unexpected message: {:?}", message);
-                    return;
+                    eprintln!("Error: received unexpected message: {:?}", message);
+                    exit(1);
                   }
                   match message.status {
                     CommandStatus::Processing => {},
                     CommandStatus::Error => {
-                      println!("Error: failed to upgrade the master: {}", message.message);
-                      return;
+                      eprintln!("Error: failed to upgrade the master: {}", message.message);
+                      exit(1);
                     },
                     CommandStatus::Ok => {
                       println!("Master process upgrade succeeded: {}", message.message);
@@ -370,15 +381,19 @@ pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, time
   let timeout_thread = thread::spawn(move || {
     loop {
       match channel.read_message() {
-        None          => println!("the proxy didn't answer"),
+        None          => {
+          eprintln!("the proxy didn't answer");
+          exit(1);
+        },
         Some(message) => {
           match message.status {
             CommandStatus::Processing => {
-              println!("Proxy is processing: {}", message.message);
+              eprintln!("Proxy is processing: {}", message.message);
+              exit(1);
             },
             CommandStatus::Error => {
-              println!("could not stop the proxy: {}", message.message);
-              break;
+              eprintln!("could not stop the proxy: {}", message.message);
+              exit(1);
             },
             CommandStatus::Ok => {
               if &id == &message.id {
@@ -396,6 +411,7 @@ pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, time
 
   if timeout > 0 && recv.recv_timeout(Duration::from_millis(timeout)).is_err() {
     eprintln!("Command timeout. The proxy didn't send answer");
+    exit(1);
   }
 
   timeout_thread.join().expect("upgrade_worker: Timeout thread should correctly terminate")
@@ -411,24 +427,24 @@ pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
 
   match channel.read_message() {
     None          => {
-      println!("the proxy didn't answer");
+      eprintln!("the proxy didn't answer");
       exit(1);
     },
     Some(message) => {
       if id != message.id {
-        println!("received message with invalid id: {:?}", message);
+        eprintln!("received message with invalid id: {:?}", message);
         exit(1);
       }
       match message.status {
         CommandStatus::Processing => {
-          println!("should have obtained an answer immediately");
+          eprintln!("should have obtained an answer immediately");
           exit(1);
         },
         CommandStatus::Error => {
           if json {
             print_json_response(&message.message);
           } else {
-            println!("could not get the worker list: {}", message.message);
+            eprintln!("could not get the worker list: {}", message.message);
           }
           exit(1);
         },
@@ -463,7 +479,7 @@ pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
                 }
                 match channel.read_message() {
                   None          => {
-                    println!("the proxy didn't answer");
+                    eprintln!("the proxy didn't answer");
                     exit(1);
                   },
                   Some(message) => {
@@ -472,7 +488,7 @@ pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
                       CommandStatus::Processing => {
                       },
                       CommandStatus::Error => {
-                        println!("error for message[{}]: {}", message.id, message.message);
+                        eprintln!("error for message[{}]: {}", message.id, message.message);
                         if expecting.contains(&message.id) {
                           expecting.remove(&message.id);
                           //println!("status message with ID {} done", message.id);
@@ -482,6 +498,7 @@ pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
                             }
                           }
                         }
+                        exit(1);
                       },
                       CommandStatus::Ok => {
                         if expecting.contains(&message.id) {
@@ -563,7 +580,10 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
 
   loop {
     match channel.read_message() {
-      None          => println!("the proxy didn't answer"),
+      None          => {
+        eprintln!("the proxy didn't answer");
+        exit(1);
+      },
       Some(message) => {
         match message.status {
           CommandStatus::Processing => {
@@ -573,7 +593,8 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
             if json {
               print_json_response(&message.message);
             } else {
-              println!("could not stop the proxy: {}", message.message);
+              eprintln!("could not stop the proxy: {}", message.message);
+              exit(1);
             }
           },
           CommandStatus::Ok => {
@@ -860,8 +881,8 @@ pub fn remove_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, tim
 
 pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, json: bool, application_id: Option<String>, domain: Option<String>) {
   if application_id.is_some() && domain.is_some() {
-    println!("Error: Either request an application ID or a domain name");
-    return;
+    eprintln!("Error: Either request an application ID or a domain name");
+    exit(1);
   }
 
   let command = if let Some(ref app_id) = application_id {
@@ -870,8 +891,8 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
     let splitted: Vec<String> = domain.splitn(2, "/").map(|elem| elem.to_string()).collect();
 
     if splitted.len() == 0 {
-      println!("Domain can't be empty");
-      return;
+      eprintln!("Domain can't be empty");
+      exit(1);
     }
 
     let query_domain = QueryApplicationDomain {
@@ -892,11 +913,14 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
   ));
 
   match channel.read_message() {
-    None          => println!("the proxy didn't answer"),
+    None          => {
+      eprintln!("the proxy didn't answer");
+      exit(1);
+    },
     Some(message) => {
       if id != message.id {
-        println!("received message with invalid id: {:?}", message);
-        return;
+        eprintln!("received message with invalid id: {:?}", message);
+        exit(1);
       }
       match message.status {
         CommandStatus::Processing => {
@@ -908,8 +932,9 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
           if json {
             print_json_response(&message.message);
           } else {
-            println!("could not query proxy state: {}", message.message);
+            eprintln!("could not query proxy state: {}", message.message);
           }
+          exit(1);
         },
         CommandStatus::Ok => {
           if let Some(needle) = application_id.or(domain) {
@@ -1144,11 +1169,14 @@ fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: 
 
   command_timeout!(timeout, {
     match channel.read_message() {
-      None          => println!("the proxy didn't answer"),
+      None          => {
+        eprintln!("the proxy didn't answer");
+        exit(1);
+      },
       Some(message) => {
         if id != message.id {
-          println!("received message with invalid id: {:?}", message);
-          return;
+          eprintln!("received message with invalid id: {:?}", message);
+          exit(1);
         }
         match message.status {
           CommandStatus::Processing => {
@@ -1157,7 +1185,7 @@ fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: 
             // until an error or ok message was sent
           },
           CommandStatus::Error => {
-            println!("could not execute order: {}", message.message);
+            eprintln!("could not execute order: {}", message.message);
             exit(1);
           },
           CommandStatus::Ok => {
@@ -1197,20 +1225,20 @@ fn print_json_response<T: ::serde::Serialize>(input: &T) {
 fn load_full_certificate(certificate_path: &str, certificate_chain_path: &str, key_path: &str) -> Option<CertificateAndKey> {
   match Config::load_file(certificate_path) {
     Err(e) => {
-      println!("could not load certificate: {:?}", e);
-      None
+      eprintln!("could not load certificate: {:?}", e);
+      exit(1);
     },
     Ok(certificate) => {
       match Config::load_file(certificate_chain_path).map(split_certificate_chain) {
         Err(e) => {
-          println!("could not load certificate chain: {:?}", e);
-          None
+          eprintln!("could not load certificate chain: {:?}", e);
+          exit(1);
         },
         Ok(certificate_chain) => {
           match Config::load_file(key_path) {
             Err(e) => {
-              println!("could not load key: {:?}", e);
-              None
+              eprintln!("could not load key: {:?}", e);
+              exit(1);
             },
             Ok(key) => {
               Some(CertificateAndKey {
@@ -1232,14 +1260,14 @@ fn get_certificate_fingerprint(certificate_path: &str) -> Option<CertFingerprint
       match calculate_fingerprint(&data) {
         Some(fingerprint) => Some(CertFingerprint(fingerprint)),
         None              => {
-          println!("could not calculate finrprint for certificate");
-          None
+          eprintln!("could not calculate finrprint for certificate");
+          exit(1);
         }
       }
     },
     Err(e) => {
-      println!("could not load file: {:?}", e);
-      None
+      eprintln!("could not load file: {:?}", e);
+      exit(1);
     }
   }
 }
