@@ -635,6 +635,7 @@ pub struct FileConfig {
   pub max_buffers:              Option<usize>,
   pub buffer_size:              Option<usize>,
   pub saved_state:              Option<String>,
+  pub automatic_state_save:     Option<bool>,
   pub log_level:                Option<String>,
   pub log_target:               Option<String>,
   #[serde(default)]
@@ -844,6 +845,11 @@ impl FileConfig {
       path.to_str().map(|s| s.to_string()).unwrap()
     });
 
+    match (&self.saved_state, &self.automatic_state_save) {
+      (None, Some(true)) => panic!("cannot activate automatic state save if the 'saved_state` option is not set"),
+      _ => {}
+    }
+
     Config {
       config_path:    config_path.to_string(),
       command_socket: command_socket_path,
@@ -853,6 +859,7 @@ impl FileConfig {
       max_buffers: self.max_buffers.unwrap_or(1000),
       buffer_size: self.buffer_size.unwrap_or(16384),
       saved_state: self.saved_state,
+      automatic_state_save: self.automatic_state_save.unwrap_or(false),
       log_level: self.log_level.unwrap_or_else(|| String::from("info")),
       log_target: self.log_target.unwrap_or_else(|| String::from("stdout")),
       log_access_target: self.log_access_target,
@@ -886,6 +893,7 @@ pub struct Config {
   pub max_buffers:              usize,
   pub buffer_size:              usize,
   pub saved_state:              Option<String>,
+  pub automatic_state_save:     bool,
   pub log_level:                String,
   pub log_target:               String,
   #[serde(default)]
@@ -1126,6 +1134,7 @@ mod tests {
     let config = FileConfig {
       command_socket: Some(String::from("./command_folder/sock")),
       saved_state: None,
+      automatic_state_save: None,
       worker_count: Some(2),
       worker_automatic_restart: Some(true),
       handle_process_affinity: None,

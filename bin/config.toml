@@ -7,6 +7,11 @@
 # the command `sozuctl state save -f state.json`
 saved_state = "./state.json"
 
+# save the configuration to the saved_state file every time we receive a
+# configuration message on the configuration socket
+# defaults to false, and will not work if the 'saved_state' option is not set
+# automatic_state_save = false
+
 # logging verbosity. Possible values are "error", "warn", "info", "debug" and
 # "trace". For performance reasons, the logs at "debug" or "trace" level are
 # not compiled by default. To activate them, pass the "logs-debug" and

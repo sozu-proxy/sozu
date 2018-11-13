@@ -101,30 +101,7 @@ impl CommandServer {
   pub fn save_state(&mut self, token: FrontToken, message_id: &str, path: &str) {
     if let Ok(mut f) = fs::File::create(&path) {
 
-      let mut counter = 0usize;
-      let orders = self.state.generate_orders();
-
-      let res: io::Result<usize> = (move || {
-        for command in orders {
-          let message = CommandRequest::new(
-            format!("SAVE-{}", counter),
-            CommandRequestData::Proxy(command),
-            None
-          );
-
-          f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()))?;
-          f.write_all(&b"\n\0"[..])?;
-
-          if counter % 1000 == 0 {
-            info!("writing command {}", counter);
-            f.sync_all()?;
-          }
-          counter += 1;
-        }
-        f.sync_all()?;
-
-        Ok(counter)
-      })();
+      let res = self.save_state_to_file(&mut f);
 
       match res {
         Ok(counter) => {
@@ -140,6 +117,35 @@ impl CommandServer {
       error!("could not open file: {}", &path);
       self.answer_error(token, message_id, "could not open file", None);
     }
+  }
+
+  pub fn save_state_to_file(&mut self, f: &mut fs::File) -> io::Result<usize> {
+    let mut counter = 0usize;
+    let orders = self.state.generate_orders();
+
+    let res: io::Result<usize> = (move || {
+      for command in orders {
+        let message = CommandRequest::new(
+          format!("SAVE-{}", counter),
+          CommandRequestData::Proxy(command),
+          None
+        );
+
+        f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()))?;
+        f.write_all(&b"\n\0"[..])?;
+
+        if counter % 1000 == 0 {
+          info!("writing command {}", counter);
+          f.sync_all()?;
+        }
+        counter += 1;
+      }
+      f.sync_all()?;
+
+      Ok(counter)
+    })();
+
+    res
   }
 
   pub fn dump_state(&mut self, token: FrontToken, message_id: &str) {
@@ -612,6 +618,18 @@ impl CommandServer {
           },
           _ => {},
         };
+      }
+    }
+
+    if self.config.automatic_state_save {
+      if order != ProxyRequestData::SoftStop || order != ProxyRequestData::HardStop {
+        if let Some(path) = self.config.saved_state.clone() {
+          if let Ok(mut f) = fs::File::create(&path) {
+            let _ = self.save_state_to_file(&mut f).map_err(|e| {
+              error!("could not save state automatically to {}: {:?}", path, e);
+            });
+          }
+        }
       }
     }
 
