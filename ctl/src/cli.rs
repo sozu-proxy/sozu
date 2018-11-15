@@ -93,7 +93,7 @@ pub enum StateCmd {
     #[structopt(short = "f", long = "file")]
     file: String,
   },
-  #[structopt(name = "dump")]
+  #[structopt(name = "dump", about = "Dump current state to STDOUT")]
   Dump {
     #[structopt(short = "j", long = "json", help = "Print the command result in JSON format")]
     json: bool
@@ -102,12 +102,12 @@ pub enum StateCmd {
 
 #[derive(StructOpt, PartialEq, Debug)]
 pub enum ApplicationCmd {
-  #[structopt(name = "remove")]
+  #[structopt(name = "remove", about = "Remove an application")]
   Remove {
     #[structopt(short = "i", long = "id")]
     id: String,
   },
-  #[structopt(name = "add")]
+  #[structopt(name = "add", about = "Add an application")]
   Add{
     #[structopt(short = "i", long = "id")]
     id: String,
@@ -126,7 +126,7 @@ pub enum ApplicationCmd {
 
 #[derive(StructOpt, PartialEq, Debug)]
 pub enum BackendCmd {
-  #[structopt(name = "remove")]
+  #[structopt(name = "remove", about = "Remove a backend")]
   Remove {
     #[structopt(short = "i", long = "id")]
     id: String,
@@ -135,7 +135,7 @@ pub enum BackendCmd {
     #[structopt(short = "a", long = "address", help = "server address, format: IP:port")]
     address: SocketAddr,
   },
-  #[structopt(name = "add")]
+  #[structopt(name = "add", about = "Add a backend")]
   Add {
     #[structopt(short = "i", long = "id")]
     id: String,
@@ -215,7 +215,7 @@ pub enum TcpFrontendCmd {
 
 #[derive(StructOpt, PartialEq, Debug)]
 pub enum CertificateCmd {
-  #[structopt(name = "add")]
+  #[structopt(name = "add", about = "Add a certificate")]
   Add {
     #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
     address: SocketAddr,
@@ -226,14 +226,14 @@ pub enum CertificateCmd {
     #[structopt(long = "key", help = "path to the key")]
     key: String,
   },
-  #[structopt(name = "remove")]
+  #[structopt(name = "remove", about = "Remove a certificate")]
   Remove {
     #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
     address: SocketAddr,
     #[structopt(short = "cert", long = "certificate", help = "path to the certificate")]
     certificate: String,
   },
-  #[structopt(name = "replace")]
+  #[structopt(name = "replace", about = "Replace an existing certificate")]
   Replace {
     #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
     address: SocketAddr,
@@ -250,7 +250,7 @@ pub enum CertificateCmd {
 
 #[derive(StructOpt, PartialEq, Debug)]
 pub enum QueryCmd {
-  #[structopt(name = "applications")]
+  #[structopt(name = "applications", about = "Query applications matching a specific filter")]
   Applications {
     #[structopt(short = "i", long="id", help="application identifier")]
     id: Option<String>,
