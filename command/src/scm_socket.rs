@@ -49,12 +49,12 @@ impl ScmSocket {
 
   pub fn send_listeners(&self, listeners: Listeners) -> NixResult<()> {
     let listeners_count = ListenersCount {
-      http: listeners.http.iter().map(|t| t.0.clone()).collect(),
-      tls:  listeners.tls.iter().map(|t| t.0.clone()).collect(),
-      tcp:  listeners.tcp.iter().map(|t| t.0.clone()).collect(),
+      http: listeners.http.iter().map(|t| t.0).collect(),
+      tls:  listeners.tls.iter().map(|t| t.0).collect(),
+      tcp:  listeners.tcp.iter().map(|t| t.0).collect(),
     };
 
-    let message = serde_json::to_string(&listeners_count).map(|s| s.into_bytes()).unwrap_or(vec!());
+    let message = serde_json::to_string(&listeners_count).map(|s| s.into_bytes()).unwrap_or_else(|_|Vec::new());
 
     let mut v: Vec<RawFd> = Vec::new();
 
@@ -122,7 +122,7 @@ impl ScmSocket {
       socket::MsgFlags::MSG_DONTWAIT
     };
 
-    if fds.len() > 0 {
+    if !fds.is_empty() {
       let cmsgs = [socket::ControlMessage::ScmRights(fds)];
       //println!("{} send with data", self.fd);
       socket::sendmsg(self.fd, &iov, &cmsgs, flags, None)?;

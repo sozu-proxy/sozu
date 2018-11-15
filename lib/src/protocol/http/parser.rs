@@ -39,7 +39,7 @@ fn is_status_token_char(i: u8) -> bool {
 named!(pub status_token, take_while!(is_status_token_char));
 
 fn is_ws(i: u8) -> bool {
-  i == ' ' as u8 && i == '\t' as u8
+  i == b' ' && i == b'\t'
 }
 
 named!(pub sp<char>, char!(' '));
@@ -178,7 +178,7 @@ impl RStatusLine {
         if let Ok(reason) = str::from_utf8(r.reason) {
           Some(RStatusLine {
             version: r.version,
-            status:  status,
+            status,
             reason:  String::from(reason),
           })
         } else {
@@ -347,7 +347,7 @@ pub fn is_hex_digit(chr: u8) -> bool {
 }
 pub fn chunk_size(input: &[u8]) -> IResult<&[u8], usize> {
   let (i, s) = try_parse!(input, map_res!(take_while!(is_hex_digit), from_utf8));
-  if i.len() == 0 {
+  if i.is_empty() {
     return Err(Err::Incomplete(Needed::Unknown));
   }
   match usize::from_str_radix(s, 16) {
@@ -398,8 +398,7 @@ impl Chunk {
       // we parse the first header, and advance the position to the end of chunk
       Chunk::Initial => {
         match chunk_header(buf) {
-          Ok((i, sz_str)) => {
-            let sz = usize::from(sz_str);
+          Ok((i, sz)) => {
             if sz == 0 {
               // size of header + 0 data
               (buf.offset(i), Chunk::CopyingLastHeader)
@@ -505,7 +504,7 @@ impl<'a> Header<'a> {
   pub fn value(&self) -> HeaderValue {
     if compare_no_case(self.name, b"host") {
       //FIXME: UTF8 conversion should be unchecked here, since we already checked the tokens?
-      if let Some(s) = str::from_utf8(self.value).map(|s| String::from(s)).ok() {
+      if let Some(s) = str::from_utf8(self.value).map(String::from).ok() {
         HeaderValue::Host(s)
       } else {
         HeaderValue::Error
@@ -619,7 +618,7 @@ impl<'a> Header<'a> {
       match single_header_value(self.value) {
         Ok((mut input, first)) => {
           if compare_no_case(first, b"upgrade") {
-            return false;
+            false
           } else {
             while input.len() != 0 {
               match do_parse!(input,
@@ -639,7 +638,7 @@ impl<'a> Header<'a> {
                 }
               }
             }
-            return true;
+            true
 
           }
         },
@@ -709,7 +708,7 @@ impl<'a> Header<'a> {
         // The current number of cookie parsed
         let mut current_cookie = 0;
         // If the cookie SOZUBALANCEID is the last of the cookie chain
-        let sozu_balance_is_last = if (sozu_balance_position + 1) == cookies.len() { true } else { false };
+        let sozu_balance_is_last = (sozu_balance_position + 1) == cookies.len();
 
         moves.push(BufferMove::Advance(header_length + length_until_value.len()));
 
@@ -1230,7 +1229,7 @@ pub fn validate_request_header(mut state: RequestState, header: &Header, sticky_
         return st;
       }
 
-      return state;
+      state
     },
     HeaderValue::Error       => state.into_error()
   }
@@ -1252,7 +1251,7 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
 
             let conn = Connection::new();
             //FIXME: what if it's not absolute path or complete URL, but an authority with CONNECT?
-            if rl.uri.len() > 0 && rl.uri.as_bytes()[0] != '/' as u8 {
+            if rl.uri.len() > 0 && rl.uri.as_bytes()[0] != b'/' {
               if let Some(host) = Url::parse(&rl.uri).ok().and_then(|u| u.host_str().map(|s| s.to_string())) {
                 (BufferMove::Advance(buf.offset(i)), RequestState::HasHost(rl, conn, host))
               } else {
@@ -1265,8 +1264,7 @@ pub fn parse_request(state: RequestState, buf: &[u8], sticky_name: &str) -> (Buf
                 Connection::close()
               };
               */
-              let s = (BufferMove::Advance(buf.offset(i)), RequestState::HasRequestLine(rl, conn));
-              s
+              (BufferMove::Advance(buf.offset(i)), RequestState::HasRequestLine(rl, conn))
             }
           } else {
             (BufferMove::None, (RequestState::Initial).into_error())
@@ -1473,8 +1471,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
               Connection::close()
             };
             */
-            let s = (BufferMove::Advance(buf.offset(i)), ResponseState::HasStatusLine(rl, conn));
-            s
+            (BufferMove::Advance(buf.offset(i)), ResponseState::HasStatusLine(rl, conn))
           } else {
             (BufferMove::None, ResponseState::Error(None, None, None, None, None))
           }

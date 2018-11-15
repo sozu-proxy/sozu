@@ -8,7 +8,7 @@ use std::io::{self,LineWriter,Write,ErrorKind};
 
 use super::{Subscriber,MetricData,StoredMetricData};
 
-const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug,Clone,PartialEq)]
 pub struct MetricLine {
@@ -54,7 +54,7 @@ impl NetworkDrain {
   pub fn new(prefix: String, socket: UdpSocket, addr: SocketAddr) -> Self {
     NetworkDrain {
       queue:  VecDeque::new(),
-      prefix: prefix,
+      prefix,
       remote: LineWriter::with_capacity(2048, MetricSocket {
         addr, socket
       }),
@@ -362,45 +362,41 @@ impl Subscriber for NetworkDrain {
           duration: millis,
         });
       }
-    } else {
-      if let Some(id) = app_id {
-        if let Some(bid) = backend_id {
-          let k = (String::from(id), String::from(bid), String::from(key));
-          if !self.backend_data.contains_key(&k) {
-            self.backend_data.insert(
-              k,
-              StoredMetricData::new(self.created, metric)
+    } else if let Some(id) = app_id {
+      if let Some(bid) = backend_id {
+        let k = (String::from(id), String::from(bid), String::from(key));
+        if !self.backend_data.contains_key(&k) {
+          self.backend_data.insert(
+            k,
+            StoredMetricData::new(self.created, metric)
             );
-          } else {
-            self.backend_data.get_mut(&k).map(|stored_metric| {
-              stored_metric.data.update(key, metric);
-            });
-          }
         } else {
-          let k = (String::from(id), String::from(key));
-          if !self.app_data.contains_key(&k) {
-            self.app_data.insert(
-              k,
-              StoredMetricData::new(self.created, metric)
-            );
-          } else {
-            self.app_data.get_mut(&k).map(|stored_metric| {
-              stored_metric.data.update(key, metric);
-            });
-          }
+          self.backend_data.get_mut(&k).map(|stored_metric| {
+            stored_metric.data.update(key, metric);
+          });
         }
       } else {
-        if !self.data.contains_key(key) {
-          self.data.insert(
-            String::from(key),
+        let k = (String::from(id), String::from(key));
+        if !self.app_data.contains_key(&k) {
+          self.app_data.insert(
+            k,
             StoredMetricData::new(self.created, metric)
-          );
+            );
         } else {
-          self.data.get_mut(key).map(|stored_metric| {
+          self.app_data.get_mut(&k).map(|stored_metric| {
             stored_metric.data.update(key, metric);
           });
         }
       }
+    } else if !self.data.contains_key(key) {
+      self.data.insert(
+        String::from(key),
+        StoredMetricData::new(self.created, metric)
+        );
+    } else {
+      self.data.get_mut(key).map(|stored_metric| {
+        stored_metric.data.update(key, metric);
+      });
     }
   }
 }

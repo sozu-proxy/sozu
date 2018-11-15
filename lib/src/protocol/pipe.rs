@@ -35,14 +35,14 @@ impl<Front:SocketHandler> Pipe<Front> {
     back_buf: Checkout<Buffer>, public_address: Option<SocketAddr>) -> Pipe<Front> {
     let log_ctx    = format!("{}\tunknown\t", &request_id);
     let session = Pipe {
-      frontend:           frontend,
-      backend:            backend,
-      frontend_token:     frontend_token,
+      frontend,
+      backend,
+      frontend_token,
       backend_token:      None,
-      front_buf:          front_buf,
-      back_buf:           back_buf,
+      front_buf,
+      back_buf,
       app_id:             None,
-      request_id:         request_id,
+      request_id,
       front_readiness:    Readiness {
                             interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
                             event: UnixReady::from(Ready::empty()),
@@ -51,8 +51,8 @@ impl<Front:SocketHandler> Pipe<Front> {
                             interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
                             event: UnixReady::from(Ready::empty()),
       },
-      log_ctx:            log_ctx,
-      public_address:     public_address,
+      log_ctx,
+      public_address,
     };
 
     trace!("created pipe");
@@ -241,7 +241,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       return SessionResult::Continue;
     }
 
-    let tokens = self.tokens().clone();
+    let tokens = self.tokens();
     let output_size = self.front_buf.available_data();
 
     let mut sz = 0usize;
@@ -294,7 +294,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       return SessionResult::Continue;
     }
 
-    let tokens     = self.tokens().clone();
+    let tokens     = self.tokens();
 
     if let Some(ref mut backend) = self.backend {
       let (sz, r) = backend.socket_read(&mut self.back_buf.space());

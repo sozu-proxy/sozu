@@ -65,7 +65,7 @@ pub struct StoredMetricData {
 impl StoredMetricData {
   pub fn new(last_sent: Instant, data: MetricData) -> StoredMetricData {
     StoredMetricData {
-      last_sent: last_sent,
+      last_sent,
       data: if let MetricData::GaugeAdd(v) = data {
         MetricData::Gauge(v as usize)
       } else { data }

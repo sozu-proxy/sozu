@@ -291,7 +291,7 @@ impl SocketHandler for FrontRustls {
       }
     }
 
-    let res = if is_error {
+    if is_error {
       (buffered_size, SocketResult::Error)
     } else if is_closed {
       (buffered_size, SocketResult::Closed)
@@ -299,8 +299,7 @@ impl SocketHandler for FrontRustls {
       (buffered_size, SocketResult::WouldBlock)
     } else {
       (buffered_size, SocketResult::Continue)
-    };
-    res
+    }
   }
 
   fn socket_ref(&self) -> &TcpStream { &self.stream }

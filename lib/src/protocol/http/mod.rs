@@ -91,15 +91,15 @@ impl<Front:SocketHandler> Http<Front> {
       front_buf:          None,
       back_buf:           None,
       app_id:             None,
-      request_id:         request_id,
+      request_id,
       front_readiness:    Readiness::new(),
       back_readiness:     Readiness::new(),
-      log_ctx:            log_ctx,
-      public_address:     public_address,
-      session_address:     session_address,
-      sticky_name:        sticky_name,
+      log_ctx,
+      public_address,
+      session_address,
+      sticky_name,
       sticky_session:     None,
-      protocol:           protocol,
+      protocol,
       request:        Some(RequestState::Initial),
       response:       Some(ResponseState::Initial),
       req_header_end: None,
@@ -178,9 +178,9 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn added_request_header(&self, public_address: Option<SocketAddr>, client_address: Option<SocketAddr>) -> String {
-    let peer = client_address.or(self.front_socket().peer_addr().ok()).map(|addr| (addr.ip(), addr.port()));
-    let front = public_address.or(self.front_socket().local_addr().ok()).map(|addr| addr.ip());
-    let front_port = public_address.or(self.front_socket().local_addr().ok()).map(|addr| addr.port());
+    let peer = client_address.or_else(|| self.front_socket().peer_addr().ok()).map(|addr| (addr.ip(), addr.port()));
+    let front = public_address.or_else(|| self.front_socket().local_addr().ok()).map(|addr| addr.ip());
+    let front_port = public_address.or_else(|| self.front_socket().local_addr().ok()).map(|addr| addr.port());
     if let (Some((peer_ip, peer_port)), Some(front), Some(front_port)) = (peer, front, front_port) {
       let proto = match self.protocol() {
         Protocol::HTTP  => "http",
@@ -293,7 +293,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   pub fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
     debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.log_ctx, self.frontend_token.0,
-      self.backend_token.map(|t| format!("{}", t.0)).unwrap_or("-".to_string()));
+      self.backend_token.map(|t| format!("{}", t.0)).unwrap_or_else(|| "-".to_string()));
     let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
     self.backend       = None;
     self.backend_token = None;
@@ -307,7 +307,7 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn back_hup(&mut self) -> SessionResult {
     if let Some(ref mut buf) = self.back_buf {
       //FIXME: closing the session might not be a good idea if we do keep alive on the front here?
-      if buf.output_data_size() == 0 || buf.next_output_data().len() == 0 {
+      if buf.output_data_size() == 0 || buf.next_output_data().is_empty() {
         if self.back_readiness.event.is_readable() {
           self.back_readiness.interest.insert(Ready::readable());
           SessionResult::Continue
@@ -340,7 +340,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn get_session_address(&self) -> Option<SocketAddr> {
-    self.session_address.or(self.frontend.socket_ref().peer_addr().ok())
+    self.session_address.or_else(|| self.frontend.socket_ref().peer_addr().ok())
   }
 
   pub fn get_backend_address(&self) -> Option<SocketAddr> {
@@ -360,14 +360,14 @@ impl<Front:SocketHandler> Http<Front> {
       Some(SocketAddr::V6(addr)) => format!("{}", addr),
     };
 
-    let host         = self.get_host().unwrap_or(String::from("-"));
-    let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or(String::from("-"));
-    let status_line  = self.get_response_status().map(|line| format!("{} {}", line.status, line.reason)).unwrap_or(String::from("-"));
+    let host         = self.get_host().unwrap_or_else(|| String::from("-"));
+    let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or_else(|| String::from("-"));
+    let status_line  = self.get_response_status().map(|line| format!("{} {}", line.status, line.reason)).unwrap_or_else(|| String::from("-"));
 
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
 
-    let app_id = self.app_id.clone().unwrap_or(String::from("-"));
+    let app_id = self.app_id.clone().unwrap_or_else(|| String::from("-"));
     time!("request_time", &app_id, response_time.num_milliseconds());
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
@@ -399,8 +399,8 @@ impl<Front:SocketHandler> Http<Front> {
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer413, _, _) => "413 Payload Too Large",
     };
 
-    let host         = self.get_host().unwrap_or(String::from("-"));
-    let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or(String::from("-"));
+    let host         = self.get_host().unwrap_or_else(|| String::from("-"));
+    let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or_else(|| String::from("-"));
 
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
@@ -434,9 +434,9 @@ impl<Front:SocketHandler> Http<Front> {
       Some(SocketAddr::V6(addr)) => format!("{}", addr),
     };
 
-    let host         = self.get_host().unwrap_or(String::from("-"));
-    let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or(String::from("-"));
-    let status_line  = self.get_response_status().map(|line| format!("{} {}", line.status, line.reason)).unwrap_or(String::from("-"));
+    let host         = self.get_host().unwrap_or_else(|| String::from("-"));
+    let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or_else(|| String::from("-"));
+    let status_line  = self.get_response_status().map(|line| format!("{} {}", line.status, line.reason)).unwrap_or_else(|| String::from("-"));
 
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
@@ -691,9 +691,9 @@ impl<Front:SocketHandler> Http<Front> {
 
     if res == SocketResult::Error {
       self.log_request_error(metrics, "error writing default answer to front socket, closing");
-      return SessionResult::CloseSession;
+      SessionResult::CloseSession
     } else {
-      return SessionResult::Continue;
+      SessionResult::Continue
     }
   }
 
@@ -711,7 +711,7 @@ impl<Front:SocketHandler> Http<Front> {
     }
 
     let output_size = self.back_buf.as_ref().unwrap().output_data_size();
-    if self.back_buf.as_ref().map(|buf| buf.output_data_size() == 0 || buf.next_output_data().len() == 0).unwrap() {
+    if self.back_buf.as_ref().map(|buf| buf.output_data_size() == 0 || buf.next_output_data().is_empty()).unwrap() {
       self.back_readiness.interest.insert(Ready::readable());
       self.front_readiness.interest.remove(Ready::writable());
       return SessionResult::Continue;
@@ -721,7 +721,7 @@ impl<Front:SocketHandler> Http<Front> {
     let mut res = SocketResult::Continue;
     while res == SocketResult::Continue && self.back_buf.as_ref().unwrap().output_data_size() > 0 {
       // no more data in buffer, stop here
-      if self.back_buf.as_ref().unwrap().next_output_data().len() == 0 {
+      if self.back_buf.as_ref().unwrap().next_output_data().is_empty() {
         self.back_readiness.interest.insert(Ready::readable());
         self.front_readiness.interest.remove(Ready::writable());
         count!("bytes_out", sz as i64);
@@ -855,13 +855,13 @@ impl<Front:SocketHandler> Http<Front> {
       return SessionResult::Continue;
     }
 
-    if self.front_buf.as_ref().map(|buf| buf.output_data_size() == 0 || buf.next_output_data().len() == 0).unwrap() {
+    if self.front_buf.as_ref().map(|buf| buf.output_data_size() == 0 || buf.next_output_data().is_empty()).unwrap() {
       self.front_readiness.interest.insert(Ready::readable());
       self.back_readiness.interest.remove(Ready::writable());
       return SessionResult::Continue;
     }
 
-    let tokens = self.tokens().clone();
+    let tokens = self.tokens();
     let output_size = self.front_buf.as_ref().unwrap().output_data_size();
     if self.backend.is_none() {
       self.log_request_error(metrics, "back socket not found, closing connection");
@@ -875,7 +875,7 @@ impl<Front:SocketHandler> Http<Front> {
       let sock = unwrap_msg!(self.backend.as_mut());
       while socket_res == SocketResult::Continue && self.front_buf.as_ref().unwrap().output_data_size() > 0 {
         // no more data in buffer, stop here
-        if self.front_buf.as_ref().unwrap().next_output_data().len() == 0 {
+        if self.front_buf.as_ref().unwrap().next_output_data().is_empty() {
           self.front_readiness.interest.insert(Ready::readable());
           self.back_readiness.interest.remove(Ready::writable());
           metrics.backend_bout += sz;
@@ -914,10 +914,9 @@ impl<Front:SocketHandler> Http<Front> {
         Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
           // return the buffer to the pool
           // if there's still data in there, keep it for pipelining
-          if self.must_continue_request() {
-            if self.front_buf.as_ref().map(|buf| buf.empty()) == Some(true) {
+          if self.must_continue_request() &&
+            self.front_buf.as_ref().map(|buf| buf.empty()) == Some(true) {
               self.front_buf = None;
-            }
           }
           self.front_readiness.interest.remove(Ready::readable());
           self.back_readiness.interest.insert(Ready::readable());
@@ -985,7 +984,7 @@ impl<Front:SocketHandler> Http<Front> {
       return (ProtocolResult::Continue, SessionResult::Continue);
     }
 
-    let tokens     = self.tokens().clone();
+    let tokens     = self.tokens();
 
     if self.backend.is_none() {
       self.log_request_error(metrics, "back socket not found, closing connection");

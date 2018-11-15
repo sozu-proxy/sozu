@@ -32,7 +32,7 @@ impl BackendMap {
   }
 
   pub fn add_backend(&mut self, app_id: &str, backend: Backend) {
-    self.backends.entry(app_id.to_string()).or_insert(BackendList::new()).add_backend(backend);
+    self.backends.entry(app_id.to_string()).or_insert_with(BackendList::new).add_backend(backend);
   }
 
   pub fn remove_backend(&mut self, app_id: &str, backend_address: &SocketAddr) {
@@ -127,7 +127,7 @@ impl BackendMap {
   }
 
   pub fn get_or_create_backend_list_for_app(&mut self, app_id: &str) -> &mut BackendList {
-    self.backends.entry(app_id.to_string()).or_insert(BackendList::new())
+    self.backends.entry(app_id.to_string()).or_insert_with(BackendList::new)
   }
 }
 
@@ -150,7 +150,7 @@ impl BackendList {
   pub fn import_configuration_state(backend_vec: &Vec<proxy::Backend>) -> BackendList {
     let mut list = BackendList::new();
     for ref backend in backend_vec {
-      let backend = Backend::new(&backend.backend_id, backend.address.clone(), backend.sticky_id.clone(), backend.load_balancing_parameters.clone(), backend.backup);
+      let backend = Backend::new(&backend.backend_id, backend.address, backend.sticky_id.clone(), backend.load_balancing_parameters.clone(), backend.backup);
       list.add_backend(backend);
     }
 

@@ -206,7 +206,7 @@ impl<'de> Visitor<'de> for CertFingerprintVisitor {
   {
     FromHex::from_hex(value)
       .map_err(|e| E::custom(format!("could not deserialize hex: {:?}", e)))
-      .map(|v:Vec<u8>| CertFingerprint(v))
+      .map(CertFingerprint)
   }
 }
 

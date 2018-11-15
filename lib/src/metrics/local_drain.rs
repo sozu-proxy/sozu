@@ -87,8 +87,8 @@ pub struct BackendMetrics {
 impl BackendMetrics {
   pub fn new(app_id: String, h: Histogram<u32>) -> BackendMetrics {
     BackendMetrics {
-      app_id:    app_id,
-      data:      BTreeMap::new(),
+      app_id,
+      data: BTreeMap::new(),
     }
   }
 }
@@ -110,7 +110,7 @@ pub struct LocalDrain {
 impl LocalDrain {
   pub fn new(prefix: String) -> Self {
     LocalDrain {
-      prefix:      prefix,
+      prefix,
       created:     Instant::now(),
       data:        BTreeMap::new(),
       app_data:    BTreeMap::new(),
@@ -197,30 +197,26 @@ impl Subscriber for LocalDrain {
               });
             }
           });
+        } else if !app.data.contains_key(key) {
+          app.data.insert(
+            String::from(key),
+            AggregatedMetric::new(metric)
+          );
         } else {
-          if !app.data.contains_key(key) {
-            app.data.insert(
-              String::from(key),
-              AggregatedMetric::new(metric)
-            );
-          } else {
-            app.data.get_mut(key).map(|stored_metric| {
-              stored_metric.update(key, metric);
-            });
-          }
+          app.data.get_mut(key).map(|stored_metric| {
+            stored_metric.update(key, metric);
+          });
         }
       });
-    } else {
-      if !self.data.contains_key(key) {
-        self.data.insert(
-          String::from(key),
-          AggregatedMetric::new(metric)
+    } else if !self.data.contains_key(key) {
+      self.data.insert(
+        String::from(key),
+        AggregatedMetric::new(metric)
         );
-      } else {
-        self.data.get_mut(key).map(|stored_metric| {
-          stored_metric.update(key, metric);
-        });
-      }
+    } else {
+      self.data.get_mut(key).map(|stored_metric| {
+        stored_metric.update(key, metric);
+      });
     }
   }
 }

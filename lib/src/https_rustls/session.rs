@@ -75,16 +75,16 @@ impl Session {
       backend:        None,
       back_connected: BackendConnectionStatus::NotConnected,
       protocol:       state,
-      public_address: public_address,
-      pool:           pool,
+      public_address,
+      pool,
       metrics:        SessionMetrics::new(),
       app_id:         None,
-      sticky_name:    sticky_name,
+      sticky_name,
       timeout,
       last_event:     SteadyTime::now(),
       listen_token,
       connection_attempt: 0,
-      peer_address:   peer_address
+      peer_address
     };
     session.front_readiness().interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
     session
@@ -102,7 +102,7 @@ impl Session {
 
   pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Rc<Vec<u8>>)  {
     self.protocol.as_mut().map(|protocol| {
-      if let &mut State::Http(ref mut http) = protocol {
+      if let State::Http(ref mut http) = *protocol {
         http.set_answer(answer, buf);
       }
     });
@@ -158,7 +158,7 @@ impl Session {
 
       let readiness = handshake.readiness.clone();
       let http = Http::new(front_stream, self.frontend_token, handshake.request_id,
-        self.pool.clone(), self.public_address.clone(), self.peer_address,
+        self.pool.clone(), self.public_address, self.peer_address,
         self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
 
         let res = http.frontend.session.read(front_buf.space());
@@ -264,7 +264,7 @@ impl Session {
   }
 
   pub fn log_context(&self)  -> String {
-    if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
+    if let State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
       http.log_context()
     } else {
       "".to_string()
@@ -281,12 +281,10 @@ impl Session {
 
     if upgrade == ProtocolResult::Continue {
       result
+    } else if self.upgrade() {
+      self.readable()
     } else {
-      if self.upgrade() {
-        self.readable()
-      } else {
-        SessionResult::CloseSession
-      }
+      SessionResult::CloseSession
     }
   }
 
@@ -300,16 +298,14 @@ impl Session {
 
     if upgrade == ProtocolResult::Continue {
       result
-    } else {
-      if self.upgrade() {
-        if (self.front_readiness().event & self.front_readiness().interest).is_writable() {
+    } else if self.upgrade() {
+      if (self.front_readiness().event & self.front_readiness().interest).is_writable() {
         self.writable()
-        } else {
-          SessionResult::Continue
-        }
       } else {
-        SessionResult::CloseSession
+        SessionResult::Continue
       }
+    } else {
+      SessionResult::CloseSession
     }
   }
 
@@ -323,15 +319,13 @@ impl Session {
 
     if upgrade == ProtocolResult::Continue {
       result
-    } else {
-      if self.upgrade() {
-        match *unwrap_msg!(self.protocol.as_mut()) {
-          State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
-          _ => result
-        }
-      } else {
-        SessionResult::CloseSession
+    } else if self.upgrade() {
+      match *unwrap_msg!(self.protocol.as_mut()) {
+        State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
+        _ => result
       }
+    } else {
+      SessionResult::CloseSession
     }
   }
 
@@ -346,33 +340,33 @@ impl Session {
 
   pub fn front_socket(&self) -> &TcpStream {
     match unwrap_msg!(self.protocol.as_ref()) {
-      &State::Expect(ref expect,_)     => expect.front_socket(),
-      &State::Handshake(ref handshake) => &handshake.stream,
-      &State::Http(ref http)           => http.front_socket(),
-      &State::WebSocket(ref pipe)      => pipe.front_socket(),
+      State::Expect(ref expect,_)     => expect.front_socket(),
+      State::Handshake(ref handshake) => &handshake.stream,
+      State::Http(ref http)           => http.front_socket(),
+      State::WebSocket(ref pipe)      => pipe.front_socket(),
     }
   }
 
   pub fn back_socket(&self)  -> Option<&TcpStream> {
     match unwrap_msg!(self.protocol.as_ref()) {
-      &State::Expect(_,_)         => None,
-      &State::Handshake(_)        => None,
-      &State::Http(ref http)      => http.back_socket(),
-      &State::WebSocket(ref pipe) => pipe.back_socket(),
+      State::Expect(_,_)         => None,
+      State::Handshake(_)        => None,
+      State::Http(ref http)      => http.back_socket(),
+      State::WebSocket(ref pipe) => pipe.back_socket(),
     }
   }
 
   pub fn back_token(&self)   -> Option<Token> {
     match unwrap_msg!(self.protocol.as_ref()) {
-      &State::Expect(_,_)         => None,
-      &State::Handshake(_)        => None,
-      &State::Http(ref http)      => http.back_token(),
-      &State::WebSocket(ref pipe) => pipe.back_token(),
+      State::Expect(_,_)         => None,
+      State::Handshake(_)        => None,
+      State::Http(ref http)      => http.back_token(),
+      State::WebSocket(ref pipe) => pipe.back_token(),
     }
   }
 
   pub fn set_back_socket(&mut self, sock:TcpStream) {
-    if let &mut State::Http(ref mut http) = unwrap_msg!(self.protocol.as_mut()) {
+    if let State::Http(ref mut http) = unwrap_msg!(self.protocol.as_mut()) {
       http.set_back_socket(sock)
     }
   }
@@ -395,7 +389,7 @@ impl Session {
     if connected == BackendConnectionStatus::Connected {
       gauge_add!("backend.connections", 1);
       self.backend.as_ref().map(|backend| {
-        let ref mut backend = *backend.borrow_mut();
+        let backend = &mut (*backend.borrow_mut());
         backend.failures = 0;
         backend.retry_policy.succeed();
       });
@@ -415,22 +409,20 @@ impl Session {
   }
 
   pub fn front_readiness(&mut self)      -> &mut Readiness {
-    let r = match *unwrap_msg!(self.protocol.as_mut()) {
+    match *unwrap_msg!(self.protocol.as_mut()) {
       State::Expect(ref mut expect, _)    => &mut expect.readiness,
       State::Handshake(ref mut handshake) => &mut handshake.readiness,
       State::Http(ref mut http)           => http.front_readiness(),
       State::WebSocket(ref mut pipe)      => &mut pipe.front_readiness,
-    };
-    r
+    }
   }
 
   pub fn back_readiness(&mut self)      -> Option<&mut Readiness> {
-    let r = match *unwrap_msg!(self.protocol.as_mut()) {
+    match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)           => Some(http.back_readiness()),
       State::WebSocket(ref mut pipe)      => Some(&mut pipe.back_readiness),
       _ => None,
-    };
-    r
+    }
   }
 
   fn fail_backend_connection(&mut self) {
@@ -596,7 +588,7 @@ impl ProxySession for Session {
       }
     }
 
-    let token = self.frontend_token.clone();
+    let token = self.frontend_token;
     while counter < max_loop_iterations {
       let front_interest = self.front_readiness().interest & self.front_readiness().event;
       let back_interest  = self.back_readiness().map(|r| r.interest & r.event).unwrap_or(UnixReady::from(Ready::empty()));
@@ -678,7 +670,7 @@ impl ProxySession for Session {
       let front_interest = self.front_readiness().interest & self.front_readiness().event;
       let back_interest  = self.back_readiness().map(|r| r.interest & r.event);
 
-      let token = self.frontend_token.clone();
+      let token = self.frontend_token;
       let back = self.back_readiness().cloned();
       error!("PROXY\t{:?} readiness: front {:?} / back {:?} |front: {:?} | back: {:?} ", token,
         self.front_readiness(), back, front_interest, back_interest);

@@ -40,10 +40,10 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
 
   pub fn new(sock: UnixStream, buffer_size: usize, max_buffer_size: usize) -> Channel<Tx,Rx> {
     Channel {
-      sock:            sock,
+      sock,
       front_buf:       Buffer::with_capacity(buffer_size),
       back_buf:        Buffer::with_capacity(buffer_size),
-      max_buffer_size: max_buffer_size,
+      max_buffer_size,
       readiness:       Ready::empty(),
       interest:        Ready::readable(),
       blocking:        false,
@@ -87,7 +87,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
   }
 
   pub fn handle_events(&mut self, events: Ready) {
-    self.readiness = self.readiness | events;
+    self.readiness |=  events;
   }
 
   pub fn readiness(&self) -> Ready {
@@ -280,7 +280,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
   }
 
   pub fn write_message_nonblocking(&mut self, message: &Tx) -> bool {
-    let message = &serde_json::to_string(message).map(|s| s.into_bytes()).unwrap_or(vec!());
+    let message = &serde_json::to_string(message).map(|s| s.into_bytes()).unwrap_or_else(|_| Vec::new());
 
     let msg_len = message.len() + 1;
     if msg_len > self.back_buf.available_space() {
@@ -313,7 +313,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
   }
 
   pub fn write_message_blocking(&mut self, message: &Tx) -> bool {
-    let message = &serde_json::to_string(message).map(|s| s.into_bytes()).unwrap_or(vec!());
+    let message = &serde_json::to_string(message).map(|s| s.into_bytes()).unwrap_or_else(|_| Vec::new());
 
     let msg_len = message.len() + 1;
     if msg_len > self.back_buf.available_space() {

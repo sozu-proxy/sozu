@@ -129,7 +129,7 @@ impl<V:Debug> TrieNode<V> {
       }
     }
 
-    return InsertResult::Ok;
+    InsertResult::Ok
   }
 
   pub fn remove(&mut self, key: &Key) -> RemoveResult {
@@ -312,8 +312,8 @@ impl<V:Debug> TrieNode<V> {
     for (index, ref child_key) in self.keys.iter().enumerate() {
       let pos = partial_key.iter().zip(child_key.iter()).position(|(&a,&b)| a != b);
       match pos {
-        Some(0) => if child_key[0] == '*' as u8 {
-          let c = '.' as u8;
+        Some(0) => if child_key[0] == b'*' {
+          let c = b'.';
           if partial_key.contains(&c) {
             return None;
           } else {
@@ -322,8 +322,8 @@ impl<V:Debug> TrieNode<V> {
         },
         Some(i) => {
           // check for wildcard
-          if i+1 == child_key.len() && child_key[i] == '*' as u8 {
-            let c = '.' as u8;
+          if i+1 == child_key.len() && child_key[i] == b'*' {
+            let c = b'.';
             if (&partial_key[i..]).contains(&c) {
               return None;
             } else {

@@ -214,9 +214,9 @@ impl Server {
       accept_ready:    HashSet::new(),
       can_accept:      true,
       channel,
-      http:            http.unwrap_or(http::Proxy::new(pool.clone(), backends.clone())),
-      https:           https.unwrap_or(HttpsProvider::new(false, pool.clone(), backends.clone())),
-      tcp:             tcp.unwrap_or(tcp::Proxy::new(backends.clone())),
+      http:            http.unwrap_or_else(|| http::Proxy::new(pool.clone(), backends.clone())),
+      https:           https.unwrap_or_else(|| HttpsProvider::new(false, pool.clone(), backends.clone())),
+      tcp:             tcp.unwrap_or_else(|| tcp::Proxy::new(backends.clone())),
       config_state:    ConfigState::new(),
       scm,
       sessions,
@@ -239,10 +239,7 @@ impl Server {
 
       for order in state.generate_orders() {
         let id = format!("INIT-{}", counter);
-        let message = ProxyRequest {
-          id:    id,
-          order: order,
-        };
+        let message = ProxyRequest { id, order };
 
         trace!("generating initial config order: {:#?}", message);
         server.notify_proxys(message);
@@ -265,8 +262,6 @@ impl Server {
     server
   }
 }
-
-use std::net::{IpAddr, Ipv4Addr};
 
 impl Server {
   pub fn run(&mut self) {
@@ -396,7 +391,7 @@ impl Server {
         let mut frontend_tokens = HashSet::new();
 
         let mut count = 0;
-        let duration = self.zombie_check_interval.clone();
+        let duration = self.zombie_check_interval;
         for session in self.sessions.iter_mut().filter(|c| {
           now - c.borrow().last_event() > duration
         }) {
@@ -540,13 +535,13 @@ impl Server {
     self.config_state.handle_order(&message.order);
 
     match message {
-      ProxyRequest { id: _, order: ProxyRequestData::AddApplication(ref application) } => {
+      ProxyRequest { order: ProxyRequestData::AddApplication(ref application), .. } => {
         self.backends.borrow_mut().set_load_balancing_policy_for_app(&application.app_id,
           application.load_balancing_policy);
         //not returning because the message must still be handled by each proxy
       },
       ProxyRequest { ref id, order: ProxyRequestData::AddBackend(ref backend) } => {
-        let new_backend = Backend::new(&backend.backend_id, backend.address.clone(),
+        let new_backend = Backend::new(&backend.backend_id, backend.address,
           backend.sticky_id.clone(), backend.load_balancing_parameters.clone(), backend.backup);
         self.backends.borrow_mut().add_backend(&backend.app_id, new_backend);
 
@@ -927,7 +922,7 @@ impl Server {
         error!("not enough memory to accept another session, flushing the accept queue");
         error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
         self.can_accept = false;
-        return false;
+        false
       },
       Some(entry) => {
         let session_token = Token(entry.index().0);
@@ -1125,14 +1120,12 @@ impl Server {
           (Protocol::HTTP, {
             let mut b = cl2.borrow_mut();
             let session: &mut http::Session = b.as_http() ;
-            let r = self.http.connect_to_backend(&mut self.poll, session, back_token);
-            r
+            self.http.connect_to_backend(&mut self.poll, session, back_token)
           })
         },
         Protocol::HTTPS => {
           (Protocol::HTTPS, {
-            let r = self.https.connect_to_backend(&mut self.poll, cl2, back_token);
-            r
+            self.https.connect_to_backend(&mut self.poll, cl2, back_token)
           })
         },
         _ => {

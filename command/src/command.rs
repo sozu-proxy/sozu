@@ -248,10 +248,10 @@ impl<'de> serde::de::Visitor<'de> for CommandRequestVisitor {
     };
 
     Ok(CommandRequest {
-      id:      id,
+      id,
       version: PROTOCOL_VERSION,
-      data:    data,
-      worker_id: worker_id,
+      data,
+      worker_id,
     })
   }
 }

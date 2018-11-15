@@ -139,16 +139,12 @@ impl TlsHandshake {
       self.readiness.interest.insert(Ready::readable());
     }
 
-    if self.session.is_handshaking() {
+    if self.session.is_handshaking() || self.session.wants_read() {
       (ProtocolResult::Continue, SessionResult::Continue)
     } else {
-      if self.session.wants_read() {
-        (ProtocolResult::Continue, SessionResult::Continue)
-      } else {
-        self.readiness.interest.insert(Ready::writable());
-        self.readiness.interest.insert(Ready::readable());
-        (ProtocolResult::Upgrade, SessionResult::Continue)
-      }
+      self.readiness.interest.insert(Ready::writable());
+      self.readiness.interest.insert(Ready::readable());
+      (ProtocolResult::Upgrade, SessionResult::Continue)
     }
   }
 }

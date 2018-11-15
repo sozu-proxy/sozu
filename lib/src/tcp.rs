@@ -102,12 +102,12 @@ impl Session {
     };
 
     Session {
-      sock:               sock,
+      sock,
       backend:            None,
-      frontend_token:     frontend_token,
+      frontend_token,
       backend_token:      None,
       back_connected:     BackendConnectionStatus::NotConnected,
-      accept_token:       accept_token,
+      accept_token,
       app_id:             None,
       metrics:            SessionMetrics::new(),
       protocol,
@@ -136,7 +136,7 @@ impl Session {
 
     let response_time = self.metrics.response_time().num_milliseconds();
     let service_time  = self.metrics.service_time().num_milliseconds();
-    let app_id = self.app_id.clone().unwrap_or(String::from("-"));
+    let app_id = self.app_id.clone().unwrap_or_else(|| String::from("-"));
     time!("request_time", &app_id, response_time);
 
     if let Some(backend_id) = self.metrics.backend_id.as_ref() {
@@ -522,7 +522,7 @@ impl ProxySession for Session {
         self.connection_attempt += 1;
         self.fail_backend_connection();
 
-        let backend_token = self.backend_token.clone();
+        let backend_token = self.backend_token;
         return SessionResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.back_readiness().unwrap().event != UnixReady::from(Ready::empty()) {
         self.reset_connection_attempt();
@@ -625,8 +625,10 @@ impl ProxySession for Session {
       let front_interest = self.front_readiness().interest & self.front_readiness().event;
       let back_interest  = self.back_readiness().map(|r| r.interest & r.event).unwrap_or(UnixReady::from(Ready::empty()));
 
+      let front_token = self.frontend_token;
       let back = self.back_readiness().cloned();
-      error!("PROXY\t{:?} readiness: front {:?} / back {:?} | front: {:?} | back: {:?} ", self.frontend_token.clone(),
+      error!("PROXY\t{:?} readiness: front {:?} / back {:?} | front: {:?} | back: {:?} ",
+        front_token,
         self.front_readiness(), back, front_interest, back_interest);
 
       return SessionResult::CloseSession;
@@ -753,7 +755,7 @@ impl Proxy {
       None
     } else {
       let listener = Listener::new(config, pool, token);
-      self.listeners.insert(listener.token.clone(), listener);
+      self.listeners.insert(listener.token, listener);
       Some(token)
     }
   }
@@ -768,11 +770,10 @@ impl Proxy {
   }
 
   pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
-    let res = self.listeners.values_mut()
+    self.listeners.values_mut()
       .filter(|app_listener| app_listener.listener.is_some())
-      .map(|app_listener| (app_listener.address.clone(), app_listener.listener.take().unwrap()))
-      .collect();
-    res
+      .map(|app_listener| (app_listener.address, app_listener.listener.take().unwrap()))
+      .collect()
   }
 
   pub fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr) -> bool {
@@ -862,7 +863,7 @@ impl ProxyConfiguration<Session> for Proxy {
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
       ProxyRequestData::RemoveTcpFront(front) => {
-        let _ = self.remove_tcp_front(front.address.clone());
+        let _ = self.remove_tcp_front(front.address);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
       ProxyRequestData::SoftStop => {
@@ -1019,7 +1020,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
     Token(e.index().0)
   };
 
-  let front = config.front.clone();
+  let front = config.front;
   let mut configuration = Proxy::new(backends.clone());
   let _ = configuration.add_listener(config, pool.clone(), token);
   let _ = configuration.activate_listener(&mut poll, &front, None);

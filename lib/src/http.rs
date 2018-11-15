@@ -16,7 +16,7 @@ use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::proxy::{Application,ProxyRequestData,HttpFront,HttpListener,
-  ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyResponseData,ProxyEvent};
+  ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent};
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
 
@@ -84,10 +84,10 @@ impl Session {
         back_connected:     BackendConnectionStatus::NotConnected,
         protocol:           Some(pr),
         frontend_token:     token,
-        pool:               pool,
+        pool,
         metrics:            SessionMetrics::new(),
         app_id:             None,
-        sticky_name:        sticky_name,
+        sticky_name,
         front_timeout:      timeout,
         last_event:         SteadyTime::now(),
         listen_token,
@@ -150,7 +150,7 @@ impl Session {
       debug!("switching to HTTP");
       let readiness = expect.readiness;
       if let Some((Some(public_address), Some(client_address))) = expect.addresses.as_ref().map(|add| {
-        (add.destination().clone(), add.source().clone())
+        (add.destination(), add.source())
       }) {
         let http = Http::new(expect.frontend, expect.frontend_token, expect.request_id,
           self.pool.clone(), Some(public_address), Some(client_address),
@@ -231,16 +231,14 @@ impl Session {
 
     if upgrade == ProtocolResult::Continue {
       result
-    } else {
-      if self.upgrade() {
-        match *unwrap_msg!(self.protocol.as_mut()) {
-          State::Http(ref mut http) => http.readable(&mut self.metrics),
-          _ => result
-        }
-      } else {
-        error!("failed protocol upgrade");
-        SessionResult::CloseSession
+    } else if self.upgrade() {
+      match *unwrap_msg!(self.protocol.as_mut()) {
+        State::Http(ref mut http) => http.readable(&mut self.metrics),
+        _ => result
       }
+    } else {
+      error!("failed protocol upgrade");
+      SessionResult::CloseSession
     }
   }
 
@@ -272,16 +270,14 @@ impl Session {
 
     if upgrade == ProtocolResult::Continue {
       result
-    } else {
-      if self.upgrade() {
-        match *unwrap_msg!(self.protocol.as_mut()) {
-          State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
-          _ => result
-        }
-      } else {
-        error!("failed protocol upgrade");
-        SessionResult::CloseSession
+    } else if self.upgrade() {
+      match *unwrap_msg!(self.protocol.as_mut()) {
+        State::WebSocket(ref mut pipe) => pipe.back_readable(&mut self.metrics),
+        _ => result
       }
+    } else {
+      error!("failed protocol upgrade");
+      SessionResult::CloseSession
     }
   }
 
@@ -349,8 +345,8 @@ impl Session {
 
   fn remove_backend(&mut self) {
     debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND",
-      self.http().map(|h| h.log_ctx.clone()).unwrap_or("".to_string()), self.frontend_token.0,
-      self.back_token().map(|t| format!("{}", t.0)).unwrap_or("-".to_string()));
+      self.http().map(|h| h.log_ctx.clone()).unwrap_or_else(|| "".to_string()), self.frontend_token.0,
+      self.back_token().map(|t| format!("{}", t.0)).unwrap_or_else(|| "-".to_string()));
 
     if let Some(backend) = self.backend.take() {
       self.http().map(|h| h.clear_back_token());
@@ -535,7 +531,7 @@ impl ProxySession for Session {
       }
     }
 
-    let token = self.frontend_token.clone();
+    let token = self.frontend_token;
     while counter < max_loop_iterations {
       let front_interest = self.front_readiness().interest & self.front_readiness().event;
       let back_interest  = self.back_readiness().map(|r| r.interest & r.event).unwrap_or(UnixReady::from(Ready::empty()));
@@ -618,7 +614,7 @@ impl ProxySession for Session {
       let front_interest = self.front_readiness().interest & self.front_readiness().event;
       let back_interest  = self.back_readiness().map(|r| r.interest & r.event);
 
-      let token = self.frontend_token.clone();
+      let token = self.frontend_token;
       let back = self.back_readiness().cloned();
       error!("PROXY\t{:?} readiness: {:?} -> {:?} | front: {:?} | back: {:?} ", token,
         self.front_readiness(), back, front_interest, back_interest);
@@ -715,7 +711,7 @@ impl Proxy {
       None
     } else {
      let listener = Listener::new(config, token);
-      self.listeners.insert(listener.token.clone(), listener);
+      self.listeners.insert(listener.token, listener);
       Some(token)
     }
   }
@@ -731,7 +727,7 @@ impl Proxy {
 
   pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
     self.listeners.values_mut().filter(|l| l.listener.is_some()).map(|l| {
-      (l.address.clone(), l.listener.take().unwrap())
+      (l.address, l.listener.take().unwrap())
     }).collect()
   }
 
@@ -768,7 +764,7 @@ impl Proxy {
 
     match res {
       Err(e) => {
-        let answer = self.get_service_unavailable_answer(Some(app_id), &session.listen_token);
+        let answer = self.get_service_unavailable_answer(Some(app_id), session.listen_token);
         session.set_answer(DefaultAnswerStatus::Answer503, answer);
         Err(e)
       },
@@ -777,7 +773,8 @@ impl Proxy {
           let sticky_name =  self.listeners[&session.listen_token].config.sticky_name.clone();
           session.http().map(|http| {
             http.sticky_session =
-              Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or(backend.borrow().backend_id.clone())));
+              Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or_else(|| {
+                backend.borrow().backend_id.clone()})));
             http.sticky_name = sticky_name;
           });
         }
@@ -846,7 +843,7 @@ impl Proxy {
   fn check_circuit_breaker(&mut self, session: &mut Session) -> Result<(), ConnectionError> {
     if session.connection_attempt == CONN_RETRIES {
       error!("{} max connection attempt reached", session.log_context());
-      let answer = self.get_service_unavailable_answer(session.app_id.as_ref().map(|app_id| app_id.as_str()), &session.listen_token);
+      let answer = self.get_service_unavailable_answer(session.app_id.as_ref().map(|app_id| app_id.as_str()), session.listen_token);
       session.set_answer(DefaultAnswerStatus::Answer503, answer);
       Err(ConnectionError::NoBackendAvailable)
     } else {
@@ -854,7 +851,7 @@ impl Proxy {
     }
   }
 
-  fn get_service_unavailable_answer(&self, app_id: Option<&str>, listen_token: &Token) -> Rc<Vec<u8>> {
+  fn get_service_unavailable_answer(&self, app_id: Option<&str>, listen_token: Token) -> Rc<Vec<u8>> {
     if let Some(answer_service_unavailable) = app_id.and_then(|app_id| self.custom_answers.get(app_id).and_then(|c| c.ServiceUnavailable.as_ref())) {
       answer_service_unavailable.clone()
     } else {
@@ -944,7 +941,7 @@ impl Listener {
             fronts.retain(|f| f != &front);
           }
 
-          fronts_opt.as_ref().map(|(_,fronts)| fronts.len() == 0).unwrap_or(false)
+          fronts_opt.as_ref().map(|(_,fronts)| fronts.is_empty()).unwrap_or(false)
         };
 
         if should_delete {
@@ -1037,14 +1034,12 @@ impl ProxyConfiguration<Session> for Proxy {
         session.metrics.backend_id = session.backend.as_ref().map(|i| i.borrow().backend_id.clone());
         session.metrics.backend_start();
         return Ok(BackendConnectAction::Reuse);
-      } else {
-        if let Some(token) = session.back_token() {
-          session.close_backend(token, poll);
+      } else if let Some(token) = session.back_token() {
+        session.close_backend(token, poll);
 
-          //reset the back token here so we can remove it
-          //from the slab after backend_from* fails
-          session.set_back_token(token);
-        }
+        //reset the back token here so we can remove it
+        //from the slab after backend_from* fails
+        session.set_back_token(token);
       }
     }
 
@@ -1266,7 +1261,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
     Token(e.index().0)
   };
 
-  let front = config.front.clone();
+  let front = config.front;
   let mut proxy = Proxy::new(pool.clone(), backends.clone());
   let _ = proxy.add_listener(config, token);
   let _ = proxy.activate_listener(&mut event_loop, &front, None);
@@ -1326,7 +1321,7 @@ mod tests {
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
     let config = HttpListener {
-      front: front,
+      front,
       ..Default::default()
     };
 
@@ -1382,7 +1377,7 @@ mod tests {
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1031").expect("could not parse address");
     let config = HttpListener {
-      front: front,
+      front,
       ..Default::default()
     };
 
@@ -1459,7 +1454,7 @@ mod tests {
     setup_test_logger!();
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1041").expect("could not parse address");
     let config = HttpListener {
-      front: front,
+      front,
       ..Default::default()
     };
 

@@ -89,7 +89,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       Ok((rest, header)) => {
         trace!("got expect header: {:?}, rest.len() = {}", header, rest.len());
         self.addresses = Some(header.addr);
-        return (ProtocolResult::Upgrade, SessionResult::Continue);
+        (ProtocolResult::Upgrade, SessionResult::Continue)
       },
       Err(Err::Incomplete(_)) => {
         match self.header_len {
@@ -107,16 +107,16 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
             return (ProtocolResult::Continue, SessionResult::CloseSession)
           }
         };
-        return (ProtocolResult::Continue, SessionResult::Continue)
+        (ProtocolResult::Continue, SessionResult::Continue)
       },
       Err(e) => {
         error!("[{:?}] front socket parse error, closing the connection: {:?}", self.frontend_token, e);
         metrics.service_stop();
         incr!("proxy_protocol.errors");
         self.readiness.reset();
-        return (ProtocolResult::Continue, SessionResult::CloseSession)
+        (ProtocolResult::Continue, SessionResult::CloseSession)
       }
-    };
+    }
   }
 
   pub fn front_socket(&self) -> &TcpStream {

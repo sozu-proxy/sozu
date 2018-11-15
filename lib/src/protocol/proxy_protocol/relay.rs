@@ -98,7 +98,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
       return SessionResult::Continue
     }
 
-    return SessionResult::Continue;
+    SessionResult::Continue
   }
 
   // The header is send immediately at once upon the connection is establish

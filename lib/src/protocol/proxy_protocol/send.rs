@@ -71,7 +71,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
     if let Some(ref mut socket) = self.backend {
       if let Some(ref mut header) = self.header {
         loop {
-          match socket.write(&mut header[self.cursor_header..]) {
+          match socket.write(&header[self.cursor_header..]) {
             Ok(sz) => {
               self.cursor_header += sz;
               metrics.backend_bout += sz;

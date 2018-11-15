@@ -288,7 +288,7 @@ impl FileAppFrontendConfig {
       .map(split_certificate_chain);
 
     Ok(HttpFrontendConfig {
-      address:           self.address.clone(),
+      address:           self.address,
       hostname:          self.hostname.clone().unwrap(),
       path_begin:        self.path_begin.clone().unwrap_or_default(),
       certificate:       certificate_opt,

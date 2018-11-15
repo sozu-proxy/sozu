@@ -172,16 +172,16 @@ impl Listener {
       if let Some((_, fronts)) = fronts_opt {
         if let Some(pos) = fronts.iter()
           .position(|f| {
-            &f.app_id == &front.app_id &&
-            &f.hostname == &front.hostname &&
-            &f.path_begin == &front.path_begin
+            f.app_id == front.app_id &&
+            f.hostname == front.hostname &&
+            f.path_begin == front.path_begin
           }) {
 
           let front = fronts.remove(pos);
         }
       }
 
-      fronts_opt.as_ref().map(|(_,fronts)| fronts.len() == 0).unwrap_or(false)
+      fronts_opt.as_ref().map(|(_,fronts)| fronts.is_empty()).unwrap_or(false)
     };
 
     if should_delete {
@@ -299,7 +299,7 @@ impl Proxy {
       None
     } else {
       let listener = Listener::new(config, token);
-      self.listeners.insert(listener.token.clone(), listener);
+      self.listeners.insert(listener.token, listener);
       Some(token)
     }
   }
@@ -315,7 +315,7 @@ impl Proxy {
 
   pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
     self.listeners.values_mut().filter(|l| l.listener.is_some()).map(|l| {
-      (l.address.clone(), l.listener.take().unwrap())
+      (l.address, l.listener.take().unwrap())
     }).collect()
   }
 
@@ -498,14 +498,12 @@ impl ProxyConfiguration<Session> for Proxy {
         session.metrics.backend_id = session.backend.as_ref().map(|i| i.borrow().backend_id.clone());
         session.metrics.backend_start();
         return Ok(BackendConnectAction::Reuse);
-      } else {
-        if let Some(token) = session.back_token() {
-          session.close_backend(token, poll);
+      } else if let Some(token) = session.back_token() {
+        session.close_backend(token, poll);
 
-          //reset the back token here so we can remove it
-          //from the slab after backend_from* fails
-          session.set_back_token(token);
-        }
+        //reset the back token here so we can remove it
+        //from the slab after backend_from* fails
+        session.set_back_token(token);
       }
     }
 
@@ -716,18 +714,17 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
 
   let front = config.front.clone();
   let mut configuration = Proxy::new(pool.clone(), backends.clone());
-  if configuration.add_listener(config, token).is_some() {
-    if configuration.activate_listener(&mut event_loop, &front, None).is_some() {
+  if configuration.add_listener(config, token).is_some() &&
+    configuration.activate_listener(&mut event_loop, &front, None).is_some() {
       let (scm_server, _scm_client) = UnixStream::pair().unwrap();
       let mut server_config: server::ServerConfig = Default::default();
       server_config.max_connections = max_buffers;
       let mut server  = Server::new(event_loop, channel, ScmSocket::new(scm_server.as_raw_fd()),
-        sessions, pool, backends, None, Some(HttpsProvider::Rustls(configuration)), None, server_config, None);
+      sessions, pool, backends, None, Some(HttpsProvider::Rustls(configuration)), None, server_config, None);
 
       info!("starting event loop");
       server.run();
       info!("ending event loop");
-    }
   }
 }
 

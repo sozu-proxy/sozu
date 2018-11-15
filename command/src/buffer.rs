@@ -17,7 +17,7 @@ impl Buffer {
     v.extend(repeat(0).take(capacity));
     Buffer {
       memory:   v,
-      capacity: capacity,
+      capacity,
       position: 0,
       end:      0
     }
@@ -136,13 +136,13 @@ impl Buffer {
         ptr::copy(data.as_ptr(), (&mut self.memory[begin..slice_end]).as_mut_ptr(), data_len);
 
         ptr::copy((&self.memory[start+length..self.end]).as_ptr(), (&mut self.memory[slice_end..]).as_mut_ptr(), self.end - (start + length));
-        self.end = self.end - (length - data_len);
+        self.end -= length - data_len;
 
       // we put more data in the buffer
       } else {
         ptr::copy((&self.memory[start+length..self.end]).as_ptr(), (&mut self.memory[start+data_len..]).as_mut_ptr(), self.end - (start + length));
         ptr::copy(data.as_ptr(), (&mut self.memory[begin..slice_end]).as_mut_ptr(), data_len);
-        self.end = self.end + data_len - length;
+        self.end += data_len - length;
       }
     }
     Some(self.available_data())
@@ -160,7 +160,7 @@ impl Buffer {
       let slice_end = begin + data_len;
       ptr::copy((&self.memory[start..self.end]).as_ptr(), (&mut self.memory[start+data_len..]).as_mut_ptr(), self.end - start);
       ptr::copy(data.as_ptr(), (&mut self.memory[begin..slice_end]).as_mut_ptr(), data_len);
-      self.end = self.end + data_len;
+      self.end += data_len;
     }
     Some(self.available_data())
   }

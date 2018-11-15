@@ -86,7 +86,7 @@ impl ConfigState {
         if self.http_listeners.contains_key(&listener.front) {
           false
         } else {
-          self.http_listeners.insert(listener.front.clone(), (listener.clone(), false));
+          self.http_listeners.insert(listener.front, (listener.clone(), false));
           true
         }
       },
@@ -94,7 +94,7 @@ impl ConfigState {
         if self.https_listeners.contains_key(&listener.front) {
           false
         } else {
-          self.https_listeners.insert(listener.front.clone(), (listener.clone(), false));
+          self.https_listeners.insert(listener.front, (listener.clone(), false));
           true
         }
       },
@@ -102,7 +102,7 @@ impl ConfigState {
         if self.tcp_listeners.contains_key(&listener.front) {
           false
         } else {
-          self.tcp_listeners.insert(listener.front.clone(), (listener.clone(), false));
+          self.tcp_listeners.insert(listener.front, (listener.clone(), false));
           true
         }
       },
@@ -128,7 +128,7 @@ impl ConfigState {
         }
       },
       &ProxyRequestData::AddHttpFront(ref front) => {
-        let front_vec = self.http_fronts.entry(front.app_id.clone()).or_insert(vec!());
+        let front_vec = self.http_fronts.entry(front.app_id.clone()).or_insert_with(Vec::new);
         if !front_vec.contains(front) {
           front_vec.push(front.clone());
           true
@@ -188,7 +188,7 @@ impl ConfigState {
         }
       },
       &ProxyRequestData::AddHttpsFront(ref front) => {
-        let front_vec = self.https_fronts.entry(front.app_id.clone()).or_insert(vec!());
+        let front_vec = self.https_fronts.entry(front.app_id.clone()).or_insert_with(Vec::new);
         if !front_vec.contains(front) {
           front_vec.push(front.clone());
           true
@@ -206,7 +206,7 @@ impl ConfigState {
         }
       },
       &ProxyRequestData::AddTcpFront(ref front) => {
-        let front_vec = self.tcp_fronts.entry(front.app_id.clone()).or_insert(vec!());
+        let front_vec = self.tcp_fronts.entry(front.app_id.clone()).or_insert_with(Vec::new);
         if !front_vec.contains(front) {
           front_vec.push(front.clone());
           true
@@ -224,7 +224,7 @@ impl ConfigState {
         }
       },
       &ProxyRequestData::AddBackend(ref backend)  => {
-        let backend_vec = self.backends.entry(backend.app_id.clone()).or_insert(vec!());
+        let backend_vec = self.backends.entry(backend.app_id.clone()).or_insert_with(Vec::new);
         if !backend_vec.contains(&backend) {
           backend_vec.push(backend.clone());
           true
@@ -278,7 +278,7 @@ impl ConfigState {
     for (ref front, ref certs) in self.certificates.iter() {
       for &(ref certificate_and_key, ref names) in certs.values() {
         v.push(ProxyRequestData::AddCertificate(AddCertificate{
-          front: (*front).clone(),
+          front: **front,
           certificate: certificate_and_key.clone(),
           names: names.clone(),
         }));
@@ -308,24 +308,24 @@ impl ConfigState {
 
   pub fn generate_activate_orders(&self) -> Vec<ProxyRequestData> {
     let mut v = Vec::new();
-    for addr in self.http_listeners.iter().filter(|(_,t)| t.1).map(|(k,_)| k) {
+    for front in self.http_listeners.iter().filter(|(_,t)| t.1).map(|(k,_)| k) {
       v.push(ProxyRequestData::ActivateListener(ActivateListener {
-        front: addr.clone(),
+        front: *front,
         proxy: ListenerType::HTTP,
         from_scm: false,
       }));
     }
 
-    for addr in self.https_listeners.iter().filter(|(_,t)| t.1).map(|(k,_)| k) {
+    for front in self.https_listeners.iter().filter(|(_,t)| t.1).map(|(k,_)| k) {
       v.push(ProxyRequestData::ActivateListener(ActivateListener {
-        front: addr.clone(),
+        front: *front,
         proxy: ListenerType::HTTPS,
         from_scm: false,
       }));
     }
-    for addr in self.tcp_listeners.iter().filter(|(_,t)| t.1).map(|(k,_)| k) {
+    for front in self.tcp_listeners.iter().filter(|(_,t)| t.1).map(|(k,_)| k) {
       v.push(ProxyRequestData::ActivateListener(ActivateListener {
-        front: addr.clone(),
+        front: *front,
         proxy: ListenerType::TCP,
         from_scm: false,
       }));
@@ -414,11 +414,11 @@ impl ConfigState {
 
     let my_certificates:    HashSet<(SocketAddr, &CertFingerprint, &(CertificateAndKey, Vec<String>))> =
       HashSet::from_iter(self.certificates.iter().flat_map(|(addr, certs)| {
-        certs.iter().zip(repeat(addr.clone())).map(|((k, v), addr)| (addr, k, v))
+        certs.iter().zip(repeat(*addr)).map(|((k, v), addr)| (addr, k, v))
       }));
     let their_certificates: HashSet<(SocketAddr, &CertFingerprint, &(CertificateAndKey, Vec<String>))> =
       HashSet::from_iter(other.certificates.iter().flat_map(|(addr, certs)| {
-        certs.iter().zip(repeat(addr.clone())).map(|((k, v), addr)| (addr, k, v))
+        certs.iter().zip(repeat(*addr)).map(|((k, v), addr)| (addr, k, v))
       }));
 
     let removed_certificates = my_certificates.difference(&their_certificates);
@@ -428,7 +428,7 @@ impl ConfigState {
 
     for address in removed_tcp_listeners {
       v.push(ProxyRequestData::RemoveListener(RemoveListener {
-        front: *address.clone(),
+        front: **address,
         proxy: ListenerType::TCP
       }));
     }
@@ -447,7 +447,7 @@ impl ConfigState {
 
     for &(front, _, &(ref certificate_and_key, ref names)) in added_certificates {
       v.push(ProxyRequestData::AddCertificate(AddCertificate{
-        front: front.clone(),
+        front,
         certificate: certificate_and_key.clone(),
         names: names.clone(),
       }));
@@ -473,7 +473,7 @@ impl ConfigState {
       v.push(ProxyRequestData::RemoveBackend(RemoveBackend{
         app_id: backend.app_id.clone(),
         backend_id: backend.backend_id.clone(),
-        address:    backend.address.clone(),
+        address:    backend.address,
       }));
     }
 
@@ -491,7 +491,7 @@ impl ConfigState {
 
     for  &(front, fingerprint, _) in removed_certificates {
       v.push(ProxyRequestData::RemoveCertificate(RemoveCertificate {
-        front: front.clone(),
+        front,
         fingerprint: fingerprint.clone(),
         names: Vec::new(),
       }));
@@ -516,10 +516,10 @@ impl ConfigState {
   pub fn application_state(&self, app_id: &str) -> QueryAnswerApplication {
     QueryAnswerApplication {
       configuration:   self.applications.get(app_id).cloned(),
-      http_frontends:  self.http_fronts.get(app_id).cloned().unwrap_or(vec!()),
-      https_frontends: self.https_fronts.get(app_id).cloned().unwrap_or(vec!()),
-      tcp_frontends:   self.tcp_fronts.get(app_id).cloned().unwrap_or(vec!()),
-      backends:        self.backends.get(app_id).cloned().unwrap_or(vec!()),
+      http_frontends:  self.http_fronts.get(app_id).cloned().unwrap_or_else(Vec::new),
+      https_frontends: self.https_fronts.get(app_id).cloned().unwrap_or_else(Vec::new),
+      tcp_frontends:   self.tcp_fronts.get(app_id).cloned().unwrap_or_else(Vec::new),
+      backends:        self.backends.get(app_id).cloned().unwrap_or_else(Vec::new),
     }
   }
 
@@ -536,13 +536,12 @@ impl ConfigState {
 
 pub fn get_application_ids_by_domain(state: &ConfigState, hostname: String, path_begin: Option<String>) -> HashSet<AppId> {
   let domain_check = |front_hostname: &str, front_path_begin: &str, hostname: &str, path_begin: &Option<String>| -> bool {
-    let domain_matches = if hostname == front_hostname { true } else { false };
-    if !domain_matches {
+    if hostname != front_hostname {
       return false;
     }
 
     match path_begin {
-      &Some(ref path_begin) => if path_begin == front_path_begin { true } else { false }
+      &Some(ref path_begin) => path_begin == front_path_begin,
       &None => true
     }
   };

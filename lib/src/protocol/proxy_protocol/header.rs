@@ -47,7 +47,7 @@ pub struct HeaderV1 {
   pub addr_dst: SocketAddr,
 }
 
-const PROXY_PROTO_IDENTIFIER: &'static str = "PROXY";
+const PROXY_PROTO_IDENTIFIER: &str = "PROXY";
 
 impl HeaderV1 {
 
@@ -134,7 +134,7 @@ impl HeaderV2 {
     let addr = ProxyAddr::from(addr_src, addr_dst);
 
     HeaderV2 {
-      command: command,
+      command,
       family: get_family(&addr),
       addr,
     }
@@ -203,25 +203,25 @@ impl ProxyAddr {
 
   fn len(&self) -> u16 {
     match *self {
-      ProxyAddr::Ipv4Addr{ src_addr: _, dst_addr: _ } => 12,
-      ProxyAddr::Ipv6Addr{ src_addr: _, dst_addr: _ } => 36,
-      ProxyAddr::UnixAddr{ src_addr: _, dst_addr: _ } => 216,
+      ProxyAddr::Ipv4Addr{ .. } => 12,
+      ProxyAddr::Ipv6Addr{ .. } => 36,
+      ProxyAddr::UnixAddr{ .. } => 216,
       ProxyAddr::AfUnspec => 0,
     }
   }
 
   pub fn source(&self) -> Option<SocketAddr> {
     match self {
-      &ProxyAddr::Ipv4Addr { src_addr: src, dst_addr: _ } => Some(SocketAddr::V4(src)),
-      &ProxyAddr::Ipv6Addr { src_addr: src, dst_addr: _ } => Some(SocketAddr::V6(src)),
+      &ProxyAddr::Ipv4Addr { src_addr: src, .. } => Some(SocketAddr::V4(src)),
+      &ProxyAddr::Ipv6Addr { src_addr: src, .. } => Some(SocketAddr::V6(src)),
       _                              => None,
     }
   }
 
   pub fn destination(&self) -> Option<SocketAddr> {
     match self {
-      &ProxyAddr::Ipv4Addr { src_addr: _, dst_addr: dst } => Some(SocketAddr::V4(dst)),
-      &ProxyAddr::Ipv6Addr { src_addr: _, dst_addr: dst } => Some(SocketAddr::V6(dst)),
+      &ProxyAddr::Ipv4Addr { dst_addr: dst, .. } => Some(SocketAddr::V4(dst)),
+      &ProxyAddr::Ipv6Addr { dst_addr: dst, .. } => Some(SocketAddr::V6(dst)),
       _                              => None,
     }
   }
@@ -267,24 +267,24 @@ impl PartialEq for ProxyAddr {
     match *self {
       ProxyAddr::Ipv4Addr{src_addr, dst_addr} => {
         match other {
-          &ProxyAddr::Ipv4Addr{src_addr: src_other, dst_addr: dst_other} => src_other == src_addr && dst_other == dst_addr,
+          ProxyAddr::Ipv4Addr{src_addr: src_other, dst_addr: dst_other} => *src_other == src_addr && *dst_other == dst_addr,
           _ => false,
         }
       },
       ProxyAddr::Ipv6Addr{src_addr, dst_addr} => {
         match other {
-          &ProxyAddr::Ipv6Addr{src_addr: src_other, dst_addr: dst_other} => src_other == src_addr && dst_other == dst_addr,
+          ProxyAddr::Ipv6Addr{src_addr: src_other, dst_addr: dst_other} => *src_other == src_addr && *dst_other == dst_addr,
           _ => false,
         }
       },
       ProxyAddr::UnixAddr{src_addr, dst_addr} => {
         match other {
-          &ProxyAddr::UnixAddr{src_addr: src_other, dst_addr: dst_other} => src_other[..] == src_addr[..] && dst_other[..] == dst_addr[..],
+          ProxyAddr::UnixAddr{src_addr: src_other, dst_addr: dst_other} => src_other[..] == src_addr[..] && dst_other[..] == dst_addr[..],
           _ => false,
         }
       },
       ProxyAddr::AfUnspec => {
-        if let &ProxyAddr::AfUnspec = other {
+        if let ProxyAddr::AfUnspec = other {
           return true
         }
         false
@@ -294,18 +294,18 @@ impl PartialEq for ProxyAddr {
 }
 
 fn get_family(addr: &ProxyAddr) -> u8 {
-  match addr {
-    &ProxyAddr::Ipv4Addr{ src_addr: _, dst_addr: _ } => 0x10 | 0x01, // AF_INET  = 1 + STREAM = 1
-    &ProxyAddr::Ipv6Addr{ src_addr: _, dst_addr: _ } => 0x20 | 0x01, // AF_INET6 = 2 + STREAM = 1
-    &ProxyAddr::UnixAddr{ src_addr: _, dst_addr: _ } => 0x30 | 0x01, // AF_UNIX  = 3 + STREAM = 1
-    &ProxyAddr::AfUnspec => 0x00, // AF_UNSPEC + UNSPEC
+  match *addr {
+    ProxyAddr::Ipv4Addr{ .. } => 0x10 | 0x01, // AF_INET  = 1 + STREAM = 1
+    ProxyAddr::Ipv6Addr{ .. } => 0x20 | 0x01, // AF_INET6 = 2 + STREAM = 1
+    ProxyAddr::UnixAddr{ .. } => 0x30 | 0x01, // AF_UNIX  = 3 + STREAM = 1
+    ProxyAddr::AfUnspec => 0x00, // AF_UNSPEC + UNSPEC
   }
 }
 
 fn u16_to_array_of_u8(x: u16) -> [u8; 2] {
     let b1 : u8 = ((x >> 8) & 0xff) as u8;
     let b2 : u8 = (x & 0xff) as u8;
-    return [b1, b2]
+    [b1, b2]
 }
 
 #[cfg(test)]
