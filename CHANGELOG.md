@@ -4,6 +4,25 @@
 
 ### Changed
 
+## 0.11 - 2018-11-15
+
+breaking changes:
+- the `public_address` field for listeners is now an `Option<SocketAddr>`, so it's configuration file format is `IP:port` instead of just an IP address
+- the `AddHttpsFront` message does not use a certificate fingerprint anymore, so HTTPS frontends do not depend on certificate anymore
+
+### Added
+
+- unit tests checking for structure size changes
+- more error handling in sozuctl
+- new `automatic_state_save` option to store the configuration state automatically after changes
+- event notification system: by sending the `SUBSCRIBE_EVENTS` message, configuration clients can get regular notifications, like messages indicating backend servers are down
+
+### Fixed
+
+- 100 continue behaviour was broken in 0.10 and fixed in 0.10.1
+- sticky session cookies are now sent again
+- Forwarded headers now indicates correct adresses
+
 ## 0.10.0 - 2018-10-25
 
 breaking change: modules have been moved around in sozu-lib
