@@ -1,5 +1,4 @@
-use rand;
-use rand::distributions::{Distribution, Range};
+use rand::{self, Rng};
 
 use std::{cmp, time};
 use std::fmt::Debug;
@@ -72,8 +71,7 @@ impl RetryPolicy for ExponentialBackoffPolicy {
             1
         } else {
             let mut rng = rand::thread_rng();
-            let range = Range::new(1, max_secs);
-            range.sample(&mut rng)
+            rng.gen_range(1, max_secs)
         };
 
         self.wait = time::Duration::from_secs(wait);

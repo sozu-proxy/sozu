@@ -15,8 +15,7 @@ use std::time::Duration;
 use std::sync::mpsc;
 use std::net::SocketAddr;
 use rand::{thread_rng, Rng};
-use prettytable::Table;
-use prettytable::row::Row;
+use prettytable::{Table, Row};
 use super::create_channel;
 use rand::distributions::Alphanumeric;
 

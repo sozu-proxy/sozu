@@ -1,4 +1,4 @@
-use rand::{thread_rng, Rng};
+use rand::{thread_rng, seq::SliceRandom};
 
 use Backend;
 
@@ -44,7 +44,7 @@ impl LoadBalancingAlgorithm for RandomAlgorithm {
   fn next_available_backend(&mut self, backends: &Vec<Rc<RefCell<Backend>>>) -> Option<Rc<RefCell<Backend>>> {
     let mut rng = thread_rng();
 
-    rng.choose(backends)
+    (*backends).choose(&mut rng)
       .map(|backend| (*backend).clone())
   }
 
