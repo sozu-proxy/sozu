@@ -67,7 +67,7 @@ docker run \
   -v /my/state/:/var/lib/sozu \
   -p 8080:80 \
   -p 8443:443 \
-  sozu
+  clevercloud/sozu
 ```
 
 #### Using a custom `config.toml` configuration file
