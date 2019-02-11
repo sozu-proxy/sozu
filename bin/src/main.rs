@@ -12,13 +12,12 @@ extern crate rand;
 extern crate nix;
 extern crate tempfile;
 extern crate futures;
+extern crate regex;
 #[macro_use] extern crate sozu_lib as sozu;
 #[macro_use] extern crate sozu_command_lib as sozu_command;
 
 #[cfg(target_os = "linux")]
 extern crate num_cpus;
-#[cfg(target_os = "linux")]
-extern crate procinfo;
 
 mod command;
 mod worker;
@@ -31,6 +30,7 @@ use std::env;
 use std::panic;
 use sozu_command::config::Config;
 use clap::ArgMatches;
+use regex::Regex;
 
 #[cfg(target_os = "linux")]
 use libc::{cpu_set_t,pid_t};
@@ -195,25 +195,28 @@ fn set_process_affinity(pid: pid_t, cpu: usize) {
 // We check the hard_limit. The soft_limit can be changed at runtime
 // by the process or any user. hard_limit can only be changed by root
 fn check_process_limits(config: &Config) -> Result<(), StartupError> {
-  let process_limits = procinfo::pid::limits_self()
+  let process_limits_file = sozu_command::config::Config::load_file("/proc/self/limits")
     .expect("Couldn't read /proc/self/limits to determine max open file descriptors limit");
 
-  // If limit is "unlimited"
-  if process_limits.max_open_files.hard.is_none() {
-    return Ok(());
+  let re = Regex::new(r"Max open files\s*\d*\s*(\d*)\s*files").unwrap();
+
+  if let Some(hard_limit) = re.captures(&process_limits_file).and_then(|c| c.get(1))
+    .and_then(|m| m.as_str().parse::<usize>().ok()) {
+    if config.max_connections > hard_limit {
+      let error = format!("At least one worker can't have that many connections. \
+              Current max file descriptor hard limit is: {}", hard_limit);
+      return Err(StartupError::TooManyAllowedConnectionsForWorker(error));
+    }
   }
 
-  let hard_limit = process_limits.max_open_files.hard.unwrap();
+  let f = sozu_command::config::Config::load_file("/proc/sys/fs/file-max")
+    .expect("Couldn't read /proc/sys/fs/file-max");
 
-  // check if all proxies are under the hard limit
-  if config.max_connections > hard_limit {
-    let error = format!("At least one worker can't have that many connections. \
-            Current max file descriptor hard limit is: {}", hard_limit);
-    return Err(StartupError::TooManyAllowedConnectionsForWorker(error));
-  }
+  let re_max = Regex::new(r"(\d*)").unwrap();
 
-  let system_max_fd = procinfo::sys::fs::file_max::file_max()
-    .expect("Couldn't read /proc/sys/fs/file-max") as usize;
+  let system_max_fd = re_max.captures(&f).and_then(|c| c.get(1))
+    .and_then(|m| m.as_str().parse::<usize>().ok())
+    .expect("Couldn't parse /proc/sys/fs/file-max");
 
   if config.max_connections > system_max_fd {
     let error = format!("Proxies total max_connections can't be higher than system's file-max limit. \
