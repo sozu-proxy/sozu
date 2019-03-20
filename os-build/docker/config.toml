@@ -163,4 +163,4 @@ tls_versions = ["TLSv1.2", "TLSv1.3"]
 # static configuration for applications
 #
 # those applications will be routed by sozu directly from start
-applications]
+[applications]
