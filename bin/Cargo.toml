@@ -36,6 +36,7 @@ tempfile = "^3.0"
 futures = "^0.1"
 lazy_static = "^1.1"
 regex = "1.0"
+jemallocator = "^0.1"
 sozu-lib = { version = "^0.11", path = "../lib" }
 sozu-command-lib = { version = "^0.11", path = "../command" }
 

@@ -1,2 +1,6 @@
 [workspace]
 members = ["lib/", "command/", "bin/", "ctl/", "futures/"]
+
+[profile.release]
+lto = true
+codegen-units = 1
