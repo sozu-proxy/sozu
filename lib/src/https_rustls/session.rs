@@ -752,12 +752,12 @@ mod tests {
     // fails depending on the platform?
     //assert_size!(Session, 2488);
     assert_size!(ExpectProxyProtocol<TcpStream>, 520);
-    assert_size!(TlsHandshake, 1232);
-    assert_size!(Http<FrontRustls>, 2168);
-    assert_size!(Pipe<FrontRustls>, 1408);
-    assert_size!(State, 2176);
+    assert_size!(TlsHandshake, 1488);
+    assert_size!(Http<FrontRustls>, 2424);
+    assert_size!(Pipe<FrontRustls>, 1664);
+    assert_size!(State, 2432);
 
-    assert_size!(FrontRustls, 1200);
-    assert_size!(ServerSession, 1184);
+    assert_size!(FrontRustls, 1456);
+    assert_size!(ServerSession, 1440);
   }
 }
