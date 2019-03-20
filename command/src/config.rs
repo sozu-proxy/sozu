@@ -635,6 +635,7 @@ pub struct FileConfig {
   pub max_buffers:              Option<usize>,
   pub buffer_size:              Option<usize>,
   pub saved_state:              Option<String>,
+  #[serde(default)]
   pub automatic_state_save:     Option<bool>,
   pub log_level:                Option<String>,
   pub log_target:               Option<String>,
@@ -893,6 +894,7 @@ pub struct Config {
   pub max_buffers:              usize,
   pub buffer_size:              usize,
   pub saved_state:              Option<String>,
+  #[serde(default)]
   pub automatic_state_save:     bool,
   pub log_level:                String,
   pub log_target:               String,
