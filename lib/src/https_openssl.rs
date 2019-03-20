@@ -1454,7 +1454,7 @@ impl ProxyConfiguration<Session> for Proxy {
           listener.add_https_front(front);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
-          panic!();
+          panic!("adding front {:?} to unknown listener", front);
         }
       },
       ProxyRequestData::RemoveHttpsFront(front) => {
