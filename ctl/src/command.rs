@@ -264,7 +264,7 @@ pub fn hard_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id:
 }
 
 pub fn upgrade_master(mut channel: Channel<CommandRequest,CommandResponse>,
-                  socket_path: &str) {
+                  config: &Config) {
   println!("Preparing to upgrade proxy...");
 
   let id = generate_tagged_id("LIST-WORKERS");
@@ -341,7 +341,7 @@ pub fn upgrade_master(mut channel: Channel<CommandRequest,CommandResponse>,
 
             // Reconnect to the new master
             println!("Reconnecting to new master process...");
-            let mut channel = create_channel(socket_path).expect("could not reconnect to the command unix socket");
+            let mut channel = create_channel(&config).expect("could not reconnect to the command unix socket");
 
             // Do a rolling restart of the workers
             let running_workers = workers.iter()

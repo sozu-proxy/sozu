@@ -39,7 +39,7 @@ fn main() {
     std::process::exit(0);
   }
 
-  let channel = create_channel(&config.command_socket_path()).expect("could not connect to the command unix socket");
+  let channel = create_channel(&config).expect("could not connect to the command unix socket");
   let timeout: u64 = matches.timeout.unwrap_or(config.ctl_command_timeout);
 
   match matches.cmd {
@@ -50,7 +50,7 @@ fn main() {
         soft_stop(channel, worker);
       }
     },
-    SubCmd::Upgrade { worker: None } => upgrade_master(channel, &config.command_socket_path()),
+    SubCmd::Upgrade { worker: None } => upgrade_master(channel, &config),
     SubCmd::Upgrade { worker: Some(id) } => { upgrade_worker(channel, timeout, id); },
     SubCmd::Status{ json } => status(channel, json),
     SubCmd::Metrics{ json } => metrics(channel, json),
@@ -123,8 +123,8 @@ fn main() {
   }
 }
 
-pub fn create_channel(path: &str) -> Result<Channel<CommandRequest,CommandResponse>,io::Error> {
-  Channel::from_path(path, 10_000, 2_000_000)
+pub fn create_channel(config: &Config) -> Result<Channel<CommandRequest,CommandResponse>,io::Error> {
+  Channel::from_path(&config.command_socket_path(), config.command_buffer_size, config.max_command_buffer_size)
     .and_then(|mut channel| {
       channel.set_nonblocking(false);
       Ok(channel)
