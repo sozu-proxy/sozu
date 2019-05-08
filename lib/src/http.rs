@@ -30,7 +30,7 @@ use super::protocol::http::DefaultAnswerStatus;
 use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use super::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,
   ListenSession, CONN_RETRIES, push_event};
-use super::socket::server_bind;
+use super::socket::{server_bind,server_unbind};
 use super::retry::RetryPolicy;
 use super::protocol::http::parser::{hostname_and_port, RequestState};
 use super::trie::TrieNode;
@@ -725,6 +725,15 @@ impl Proxy {
     None
   }
 
+  pub fn deactivate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr) -> Option<TcpListener> {
+    for listener in self.listeners.values_mut() {
+      if &listener.address == addr {
+        return listener.deactivate(event_loop);
+      }
+    }
+    None
+  }
+
   pub fn give_back_listeners(&mut self) -> Vec<(SocketAddr, TcpListener)> {
     self.listeners.values_mut().filter(|l| l.listener.is_some()).map(|l| {
       (l.address, l.listener.take().unwrap())
@@ -902,6 +911,27 @@ impl Listener {
     self.listener = listener;
     self.active = true;
     Some(self.token)
+  }
+
+  pub fn deactivate(&mut self, event_loop: &mut Poll) -> Option<TcpListener> {
+    if !self.active {
+      return None;
+    }
+
+    if let Some(listener) = self.listener.take() {
+      if let Err(e) = event_loop.deregister(&listener) {
+        error!("error deregistering socket({:?}: {:?})", listener, e);
+        self.listener = Some(listener);
+        return None;
+      } else {
+        if let Err(e) = server_unbind(&listener) {
+          error!("Failed to unbind socket {:?} with error {:?}", listener, e);
+        }
+        self.active = false;
+        return Some(listener);
+      }
+    }
+    return None;
   }
 
   pub fn add_http_front(&mut self, mut http_front: HttpFront) -> Result<(), String> {

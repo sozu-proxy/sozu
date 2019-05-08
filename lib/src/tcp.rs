@@ -28,7 +28,7 @@ use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,
   ListenSession, CONN_RETRIES, push_event};
 use pool::{Pool,Checkout};
-use socket::server_bind;
+use socket::{server_bind,server_unbind};
 use protocol::{Pipe, ProtocolResult};
 use protocol::proxy_protocol::send::SendProxyProtocol;
 use protocol::proxy_protocol::relay::RelayProxyProtocol;
@@ -724,6 +724,27 @@ impl Listener {
     self.active = true;
     Some(self.token)
   }
+
+  pub fn deactivate(&mut self, event_loop: &mut Poll) -> Option<TcpListener> {
+    if !self.active {
+      return None;
+    }
+
+    if let Some(listener) = self.listener.take() {
+      if let Err(e) = event_loop.deregister(&listener) {
+        error!("error deregistering socket({:?}: {:?})", listener, e);
+        self.listener = Some(listener);
+        return None;
+      } else {
+        if let Err(e) = server_unbind(&listener) {
+          error!("Failed to unbind socket {:?} with error {:?}", listener, e);
+        }
+        self.active = false;
+        return Some(listener);
+      }
+    }
+    return None;
+  }
 }
 
 #[derive(Debug)]
@@ -764,6 +785,15 @@ impl Proxy {
     for listener in self.listeners.values_mut() {
       if &listener.address == addr {
         return listener.activate(event_loop, tcp_listener);
+      }
+    }
+    None
+  }
+
+  pub fn deactivate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr) -> Option<TcpListener> {
+    for listener in self.listeners.values_mut() {
+      if &listener.address == addr {
+        return listener.deactivate(event_loop);
       }
     }
     None

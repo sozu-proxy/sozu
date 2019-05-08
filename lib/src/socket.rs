@@ -1,5 +1,6 @@
 use std::io::{self,ErrorKind,Read,Write};
 use std::net::SocketAddr;
+use std::os::unix::io::AsRawFd;
 use mio::tcp::{TcpListener,TcpStream};
 use rustls::{ServerSession, Session};
 use net2::TcpBuilder;
@@ -327,3 +328,10 @@ pub fn server_bind(addr: &SocketAddr) -> io::Result<TcpListener> {
   TcpListener::from_std(listener)
 }
 
+
+pub fn server_unbind(listener: &TcpListener) -> io::Result<()> {
+  match unsafe { libc::close(listener.as_raw_fd()) } {
+    0 => Ok(()),
+    _ => Err(io::Error::last_os_error())
+  }
+}
