@@ -433,7 +433,7 @@ impl ConfigState {
       }));
     }
 
-    for address in added_tcp_listeners {
+    for address in added_tcp_listeners.clone() {
       v.push(ProxyRequestData::AddTcpListener(other.tcp_listeners[address].0.clone()));
     }
 
@@ -496,6 +496,18 @@ impl ConfigState {
         names: Vec::new(),
       }));
     }
+
+    for address in added_tcp_listeners {
+      let listener = &other.tcp_listeners[address];
+      if listener.1 {
+        v.push(ProxyRequestData::ActivateListener(ActivateListener {
+          front: listener.0.front.clone(),
+          proxy: ListenerType::TCP,
+          from_scm: false
+        }));
+      }
+    }
+
     v
   }
 
