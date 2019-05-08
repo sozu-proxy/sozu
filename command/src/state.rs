@@ -343,7 +343,7 @@ impl ConfigState {
 
     //pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
     let my_tcp_listeners: HashSet<&SocketAddr> = self.tcp_listeners.keys().collect();
-    let their_tcp_listeners: HashSet<&SocketAddr> = self.tcp_listeners.keys().collect();
+    let their_tcp_listeners: HashSet<&SocketAddr> = other.tcp_listeners.keys().collect();
     let removed_tcp_listeners = my_tcp_listeners.difference(&their_tcp_listeners);
     let added_tcp_listeners: Vec<&SocketAddr> = their_tcp_listeners.difference(&my_tcp_listeners)
       .cloned().collect();
