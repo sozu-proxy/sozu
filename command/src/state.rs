@@ -261,8 +261,15 @@ impl ConfigState {
       v.push(ProxyRequestData::AddHttpsListener(listener.clone()));
     }
 
-    for &(ref listener, _) in self.tcp_listeners.values() {
+    for &(ref listener, active) in self.tcp_listeners.values() {
       v.push(ProxyRequestData::AddTcpListener(listener.clone()));
+      if active {
+        v.push(ProxyRequestData::ActivateListener(ActivateListener {
+          front: listener.front.clone(),
+          proxy: ListenerType::TCP,
+          from_scm: false
+        }));
+      }
     }
 
     for app in self.applications.values() {
