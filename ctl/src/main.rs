@@ -17,13 +17,14 @@ use structopt::StructOpt;
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::command::{CommandRequest,CommandResponse};
+use sozu_command::proxy::ListenerType;
 
 use command::{add_application,remove_application,dump_state,load_state,
   save_state, soft_stop, hard_stop, upgrade_master, status,metrics,
   remove_backend, add_backend, remove_http_frontend, add_http_frontend,
   remove_tcp_frontend, add_tcp_frontend, add_certificate, remove_certificate,
   replace_certificate, query_application, logging_filter, upgrade_worker,
-  events, query_certificate, add_tcp_listener, add_http_listener, add_https_listener};
+  events, query_certificate, add_tcp_listener, add_http_listener, add_https_listener, remove_listener};
 
 use cli::*;
 
@@ -107,15 +108,18 @@ fn main() {
           HttpListenerCmd::Add { address, public_address, answer_404, answer_503, expect_proxy, sticky_name } => {
             add_http_listener(channel, timeout, address, public_address, answer_404, answer_503, expect_proxy, sticky_name)
           },
+          HttpListenerCmd::Remove { address } => remove_listener(channel, timeout, address, ListenerType::HTTP),
         },
         ListenerCmd::Https { cmd } => match cmd {
           HttpsListenerCmd::Add { address, public_address, answer_404, answer_503, tls_versions, cipher_list,
             rustls_cipher_list, expect_proxy, sticky_name } => {
             add_https_listener(channel, timeout, address, public_address, answer_404, answer_503, tls_versions, cipher_list, rustls_cipher_list, expect_proxy, sticky_name)
-          }
+          },
+          HttpsListenerCmd::Remove { address } => remove_listener(channel, timeout, address, ListenerType::HTTPS),
         },
         ListenerCmd::Tcp { cmd } => match cmd {
-          TcpListenerCmd::Add{ address, public_address, expect_proxy } => add_tcp_listener(channel, timeout, address, public_address, expect_proxy)
+          TcpListenerCmd::Add{ address, public_address, expect_proxy } => add_tcp_listener(channel, timeout, address, public_address, expect_proxy),
+          TcpListenerCmd::Remove{ address } => remove_listener(channel, timeout, address, ListenerType::TCP)
         }
       }
     }

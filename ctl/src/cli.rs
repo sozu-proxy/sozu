@@ -254,6 +254,11 @@ pub enum HttpListenerCmd {
     expect_proxy: bool,
     #[structopt(long = "sticky-name", help = "sticky session cookie name")]
     sticky_name: Option<String>
+  },
+  #[structopt(name = "remove")]
+  Remove {
+    #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
+    address: SocketAddr,
   }
 }
 
@@ -279,6 +284,11 @@ pub enum HttpsListenerCmd {
     expect_proxy: bool,
     #[structopt(long = "sticky-name", help = "sticky session cookie name")]
     sticky_name: Option<String>
+  },
+  #[structopt(name = "remove")]
+  Remove {
+    #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
+    address: SocketAddr,
   }
 }
 
@@ -292,6 +302,11 @@ pub enum TcpListenerCmd {
     public_address: Option<SocketAddr>,
     #[structopt(long = "expect-proxy", help = "Configures the client socket to receive a PROXY protocol header")]
     expect_proxy: bool
+  },
+  #[structopt(name = "remove")]
+  Remove {
+    #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
+    address: SocketAddr,
   }
 }
 
