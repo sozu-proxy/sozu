@@ -1,4 +1,5 @@
 use sozu_command::config::LoadBalancingAlgorithms;
+use sozu_command::proxy::TlsVersion;
 use std::net::SocketAddr;
 
 #[derive(StructOpt, PartialEq, Debug)]
@@ -59,6 +60,11 @@ pub enum SubCmd {
   Frontend {
     #[structopt(subcommand)]
     cmd: FrontendCmd,
+  },
+  #[structopt(name  = "listener", about = "listener management")]
+  Listener {
+    #[structopt(subcommand)]
+    cmd: ListenerCmd
   },
   #[structopt(name = "certificate", about = "certificate management")]
   Certificate {
@@ -211,6 +217,82 @@ pub enum TcpFrontendCmd {
     #[structopt(short = "a", long = "address", help = "frontend address, format: IP:port")]
     address: SocketAddr,
   },
+}
+
+#[derive(StructOpt, PartialEq, Debug)]
+pub enum ListenerCmd {
+  #[structopt(name = "http", about = "HTTP listener management")]
+  Http {
+    #[structopt(subcommand)]
+    cmd: HttpListenerCmd,
+  },
+  #[structopt(name = "https", about = "HTTPS listener management")]
+  Https {
+    #[structopt(subcommand)]
+    cmd: HttpsListenerCmd,
+  },
+  #[structopt(name = "tcp", about = "TCP listener management")]
+  Tcp {
+    #[structopt(subcommand)]
+    cmd: TcpListenerCmd,
+  },
+}
+
+#[derive(StructOpt, PartialEq, Debug)]
+pub enum HttpListenerCmd {
+  #[structopt(name = "add")]
+  Add {
+    #[structopt(short = "a")]
+    address: SocketAddr,
+    #[structopt(long = "public-address", help = "a different IP than the one the socket sees, for logs and forwarded headers")]
+    public_address: Option<SocketAddr>,
+    #[structopt(long = "answer-404", help = "path to file of the 404 answer sent to the client when a frontend is not found")]
+    answer_404: Option<String>,
+    #[structopt(long = "answer-503", help = "path to file of the 503 answer sent to the client when an application has no backends available")]
+    answer_503: Option<String>,
+    #[structopt(long = "expect-proxy", help = "Configures the client socket to receive a PROXY protocol header")]
+    expect_proxy: bool,
+    #[structopt(long = "sticky-name", help = "sticky session cookie name")]
+    sticky_name: Option<String>
+  }
+}
+
+#[derive(StructOpt, PartialEq, Debug)]
+pub enum HttpsListenerCmd {
+  #[structopt(name = "add")]
+  Add {
+    #[structopt(short = "a")]
+    address: SocketAddr,
+    #[structopt(long = "public-address", help = "a different IP than the one the socket sees, for logs and forwarded headers")]
+    public_address: Option<SocketAddr>,
+    #[structopt(long = "answer-404", help = "path to file of the 404 answer sent to the client when a frontend is not found")]
+    answer_404: Option<String>,
+    #[structopt(long = "answer-503", help = "path to file of the 503 answer sent to the client when an application has no backends available")]
+    answer_503: Option<String>,
+    #[structopt(long = "tls-versions", help = "list of TLS versions to use")]
+    tls_versions: Vec<TlsVersion>,
+    #[structopt(long = "tls-ciphers-list", help = "list of OpenSSL TLS ciphers to use")]
+    cipher_list: Option<String>,
+    #[structopt(long = "rustls-cipher-list", help = "list of RustTLS ciphers to use")]
+    rustls_cipher_list: Vec<String>,
+    #[structopt(long = "expect-proxy", help = "Configures the client socket to receive a PROXY protocol header")]
+    expect_proxy: bool,
+    #[structopt(long = "sticky-name", help = "sticky session cookie name")]
+    sticky_name: Option<String>
+  }
+}
+
+#[derive(StructOpt, PartialEq, Debug)]
+pub enum TcpListenerCmd {
+  #[structopt(name = "add")]
+  Add {
+    #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
+    address: SocketAddr,
+    #[structopt(long = "public-address", help = "a different IP than the one the socket sees, for logs and forwarded headers")]
+    public_address: Option<SocketAddr>,
+    #[structopt(long = "expect-proxy", help = "Configures the client socket to receive a PROXY protocol header")]
+    expect_proxy: bool
+  }
 }
 
 #[derive(StructOpt, PartialEq, Debug)]
