@@ -259,6 +259,11 @@ pub enum HttpListenerCmd {
   Remove {
     #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
     address: SocketAddr,
+  },
+  #[structopt(name = "activate")]
+  Activate {
+    #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
+    address: SocketAddr
   }
 }
 
@@ -289,6 +294,11 @@ pub enum HttpsListenerCmd {
   Remove {
     #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
     address: SocketAddr,
+  },
+  #[structopt(name = "activate")]
+  Activate {
+    #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
+    address: SocketAddr
   }
 }
 
@@ -307,6 +317,11 @@ pub enum TcpListenerCmd {
   Remove {
     #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
     address: SocketAddr,
+  },
+  #[structopt(name = "activate")]
+  Activate {
+    #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
+    address: SocketAddr
   }
 }
 
