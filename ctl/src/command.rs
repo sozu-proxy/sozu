@@ -1,11 +1,12 @@
-use sozu_command::config::{Config, ProxyProtocolConfig, LoadBalancingAlgorithms};
+use sozu_command::config::{Config, ProxyProtocolConfig, LoadBalancingAlgorithms, Listener, FileListenerProtocolConfig};
 use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
 use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
-  AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend,
-  QueryCertificateType, QueryAnswerCertificate, FilteredData};
+  FilteredData,
+  AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend, TcpListener, ListenerType,
+  TlsVersion, QueryCertificateType, QueryAnswerCertificate};
 
 use serde_json;
 use std::collections::{HashMap,HashSet,BTreeMap};
@@ -1095,6 +1096,53 @@ pub fn remove_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, tim
   order_command(channel, timeout, ProxyRequestData::RemoveTcpFront(TcpFront {
     app_id: String::from(app_id),
     address,
+  }));
+}
+
+pub fn add_http_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, public_address: Option<SocketAddr>,
+  answer_404: Option<String>, answer_503: Option<String>, expect_proxy: bool, sticky_name: Option<String>) {
+  let mut listener = Listener::new(address, FileListenerProtocolConfig::Http);
+  listener.public_address = public_address;
+  listener.answer_404 = answer_404;
+  listener.answer_503 = answer_503;
+  listener.expect_proxy = Some(expect_proxy);
+  if let Some(sticky_name) = sticky_name {
+    listener.sticky_name = sticky_name;
+  }
+
+  match listener.to_http() {
+    Some(conf) => order_command(channel, timeout, ProxyRequestData::AddHttpListener(conf)),
+    None => eprintln!("Error creating HTTP listener")
+  };
+}
+
+pub fn add_https_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, public_address: Option<SocketAddr>,
+  answer_404: Option<String>, answer_503: Option<String>, tls_versions: Vec<TlsVersion>, cipher_list: Option<String>,
+  rustls_cipher_list: Vec<String>, expect_proxy: bool, sticky_name: Option<String>) {
+  let mut listener = Listener::new(address, FileListenerProtocolConfig::Https);
+  listener.public_address = public_address;
+  listener.answer_404 = answer_404;
+  listener.answer_503 = answer_503;
+  listener.expect_proxy = Some(expect_proxy);
+  if let Some(sticky_name) = sticky_name {
+    listener.sticky_name = sticky_name;
+  }
+  listener.cipher_list = cipher_list;
+  listener.tls_versions = if tls_versions.len() == 0 { None } else { Some(tls_versions) };
+  listener.rustls_cipher_list = if rustls_cipher_list.len() == 0 { None } else { Some(rustls_cipher_list) };
+
+  match listener.to_tls() {
+    Some(conf) => order_command(channel, timeout, ProxyRequestData::AddHttpsListener(conf)),
+    None => eprintln!("Error creating HTTPS listener")
+  };
+}
+
+pub fn add_tcp_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
+  public_address: Option<SocketAddr>, expect_proxy: bool) {
+  order_command(channel, timeout, ProxyRequestData::AddTcpListener(TcpListener {
+    front: address,
+    public_address,
+    expect_proxy
   }));
 }
 

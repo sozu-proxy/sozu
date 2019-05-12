@@ -23,7 +23,7 @@ use command::{add_application,remove_application,dump_state,load_state,
   remove_backend, add_backend, remove_http_frontend, add_http_frontend,
   remove_tcp_frontend, add_tcp_frontend, add_certificate, remove_certificate,
   replace_certificate, query_application, logging_filter, upgrade_worker,
-  events,query_certificate};
+  events, query_certificate, add_tcp_listener, add_http_listener, add_https_listener};
 
 use cli::*;
 
@@ -101,6 +101,24 @@ fn main() {
         }
       }
     },
+    SubCmd::Listener{ cmd } => {
+      match cmd {
+        ListenerCmd::Http { cmd } => match cmd {
+          HttpListenerCmd::Add { address, public_address, answer_404, answer_503, expect_proxy, sticky_name } => {
+            add_http_listener(channel, timeout, address, public_address, answer_404, answer_503, expect_proxy, sticky_name)
+          },
+        },
+        ListenerCmd::Https { cmd } => match cmd {
+          HttpsListenerCmd::Add { address, public_address, answer_404, answer_503, tls_versions, cipher_list,
+            rustls_cipher_list, expect_proxy, sticky_name } => {
+            add_https_listener(channel, timeout, address, public_address, answer_404, answer_503, tls_versions, cipher_list, rustls_cipher_list, expect_proxy, sticky_name)
+          }
+        },
+        ListenerCmd::Tcp { cmd } => match cmd {
+          TcpListenerCmd::Add{ address, public_address, expect_proxy } => add_tcp_listener(channel, timeout, address, public_address, expect_proxy)
+        }
+      }
+    }
     SubCmd::Certificate{ cmd } => {
       match cmd {
         CertificateCmd::Add{ certificate, chain, key, address } => {
