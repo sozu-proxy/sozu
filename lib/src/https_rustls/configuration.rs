@@ -19,7 +19,7 @@ use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,
   ProxyRequestData,HttpFront,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
-  TlsVersion};
+  TlsVersion,RemoveListener};
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
 
@@ -322,6 +322,27 @@ impl Proxy {
       let listener = Listener::new(config, token);
       self.listeners.insert(listener.token, listener);
       Some(token)
+    }
+  }
+
+  pub fn remove_listener(&mut self, remove: RemoveListener) -> bool {
+    let token = self.listeners.iter()
+      .find(|(_, listener)| listener.address == remove.front)
+      .and_then(|(token, listener)| {
+        match listener.active {
+          false => Some(token.clone()),
+          true => {
+            error!("Listener {:?} is still active, not removing", listener.address);
+            None
+          }
+        }
+      });
+
+    if let Some(t) = token {
+      self.listeners.remove_entry(&t);
+      return true;
+    } else {
+      return false;
     }
   }
 
@@ -657,8 +678,10 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::RemoveListener(remove) => {
         info!("removing https listener at address: {:?}", remove.front);
-        fixme!();
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+        match self.remove_listener(remove) {
+          true => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
+          false => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("failed to remove listener")), data: None }
+        }
       },
       ProxyRequestData::SoftStop => {
         info!("{} processing soft shutdown", message.id);

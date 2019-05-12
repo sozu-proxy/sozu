@@ -16,7 +16,7 @@ use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
-use sozu_command::proxy::{ProxyRequestData,ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent};
+use sozu_command::proxy::{ProxyRequestData,ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent,RemoveListener};
 use sozu_command::proxy::TcpListener as TcpListenerConfig;
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
@@ -781,6 +781,27 @@ impl Proxy {
     }
   }
 
+  pub fn remove_listener(&mut self, remove: RemoveListener) -> bool {
+    let token = self.listeners.iter()
+      .find(|(_, listener)| listener.address == remove.front)
+      .and_then(|(token, listener)| {
+        match listener.active {
+          false => Some(token.clone()),
+          true => {
+            error!("Listener {:?} is still active, not removing", listener.address);
+            None
+          }
+        }
+      });
+
+    if let Some(t) = token {
+      self.listeners.remove_entry(&t);
+      return true;
+    } else {
+      return false;
+    }
+  }
+
   pub fn activate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr, tcp_listener: Option<TcpListener>) -> Option<Token> {
     for listener in self.listeners.values_mut() {
       if &listener.address == addr {
@@ -935,8 +956,10 @@ impl ProxyConfiguration<Session> for Proxy {
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::RemoveListener(remove) => {
-        fixme!();
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unimplemented")), data: None }
+        match self.remove_listener(remove) {
+          true => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
+          false => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("failed to remove listener")), data: None }
+        }
       },
       command => {
         error!("{} unsupported message for TCP proxy, ignoring {:?}", message.id, command);
