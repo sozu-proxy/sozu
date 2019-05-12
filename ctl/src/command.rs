@@ -6,7 +6,7 @@ use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFront, Tcp
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
   FilteredData,
   AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend, TcpListener, ListenerType,
-  TlsVersion, QueryCertificateType, QueryAnswerCertificate, RemoveListener};
+  TlsVersion, QueryCertificateType, QueryAnswerCertificate, RemoveListener, ActivateListener};
 
 use serde_json;
 use std::collections::{HashMap,HashSet,BTreeMap};
@@ -1150,6 +1150,14 @@ pub fn remove_listener(channel: Channel<CommandRequest,CommandResponse>, timeout
   order_command(channel, timeout, ProxyRequestData::RemoveListener(RemoveListener {
     front: address,
     proxy
+  }));
+}
+
+pub fn activate_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType) {
+  order_command(channel, timeout, ProxyRequestData::ActivateListener(ActivateListener {
+    front: address,
+    proxy,
+    from_scm: false
   }));
 }
 
