@@ -1,13 +1,13 @@
 use serde;
 use serde::de::{self, Visitor};
 use hex::{self,FromHex};
-use std::fmt;
+use std::{error,fmt};
 use std::cmp::Ordering;
 use std::convert::From;
 use std::default::Default;
 use std::net::SocketAddr;
 use std::collections::{HashMap,BTreeMap,HashSet};
-
+use std::str::FromStr;
 
 use config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
 
@@ -445,6 +445,41 @@ pub enum TlsVersion {
   TLSv1_2,
   #[serde(rename = "TLSv1.3")]
   TLSv1_3,
+}
+
+impl FromStr for TlsVersion {
+  type Err = ParseErrorTlsVersion;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    match s {
+      "SSLv2"   => Ok(TlsVersion::SSLv2),
+      "SSLv3"   => Ok(TlsVersion::SSLv3),
+      "TLSv1"   => Ok(TlsVersion::TLSv1_0),
+      "TLSv1.1" => Ok(TlsVersion::TLSv1_1),
+      "TLSv1.2" => Ok(TlsVersion::TLSv1_2),
+      "TLSv1.3" => Ok(TlsVersion::TLSv1_3),
+      _ => Err(ParseErrorTlsVersion{})
+    }
+  }
+}
+
+#[derive(Debug)]
+pub struct ParseErrorTlsVersion;
+
+impl fmt::Display for ParseErrorTlsVersion {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    write!(f, "Cannot find the TLS version")
+  }
+}
+
+impl error::Error for ParseErrorTlsVersion {
+  fn description(&self) -> &str {
+    "Cannot find the TLS version"
+  }
+
+  fn cause(&self) -> Option<&error::Error> {
+    None
+  }
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
