@@ -1672,9 +1672,9 @@ mod tests {
   fn size_test() {
     assert_size!(ExpectProxyProtocol<mio::net::TcpStream>, 520);
     assert_size!(TlsHandshake, 216);
-    assert_size!(Http<SslStream<mio::net::TcpStream>>, 984);
+    assert_size!(Http<SslStream<mio::net::TcpStream>>, 1016);
     assert_size!(Pipe<SslStream<mio::net::TcpStream>>, 224);
-    assert_size!(State, 992);
+    assert_size!(State, 1024);
     // fails depending on the platform?
     //assert_size!(Session, 1320);
 

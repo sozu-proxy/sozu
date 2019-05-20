@@ -753,9 +753,9 @@ mod tests {
     //assert_size!(Session, 2488);
     assert_size!(ExpectProxyProtocol<TcpStream>, 520);
     assert_size!(TlsHandshake, 1488);
-    assert_size!(Http<FrontRustls>, 2424);
+    assert_size!(Http<FrontRustls>, 2456);
     assert_size!(Pipe<FrontRustls>, 1664);
-    assert_size!(State, 2432);
+    assert_size!(State, 2464);
 
     assert_size!(FrontRustls, 1456);
     assert_size!(ServerSession, 1440);

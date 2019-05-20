@@ -1795,8 +1795,8 @@ mod tests {
   #[test]
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
-    assert_size!(RequestState, 224);
-    assert_size!(ResponseState, 192);
+    assert_size!(RequestState, 240);
+    assert_size!(ResponseState, 208);
     assert_size!(StickySession, 24);
   }
 
