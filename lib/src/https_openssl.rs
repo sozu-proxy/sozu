@@ -1756,6 +1756,31 @@ mod tests {
     assert_eq!(frontend5, None);
    // assert!(false);
   }
+
+  #[test]
+  fn wildcard_certificate_names() {
+    let data = include_bytes!("../assets/services.crt");
+    let cert = X509::from_pem(data).unwrap();
+
+    let names = get_cert_names(&cert);
+
+    assert_eq!(names, ["services.clever-cloud.com", "*.services.clever-cloud.com"].iter().map(|s| String::from(*s)).collect());
+
+    println!("got names: {:?}", names);
+
+    let mut trie = TrieNode::root();
+
+    trie.domain_insert("services.clever-cloud.com".as_bytes().to_vec(), 0u8);
+    trie.domain_insert("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8);
+    trie.domain_insert("services.clever-cloud.com".as_bytes().to_vec(), 2u8);
+
+    let res = trie.domain_lookup(b"test.services.clever-cloud.com");
+    println!("query result: {:?}", res);
+
+    assert_eq!(
+      trie.domain_lookup(b"pgstudio.services.clever-cloud.com"),
+      Some(&("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8)));
+  }
 }
 
 #[cfg(not(ossl111))]
