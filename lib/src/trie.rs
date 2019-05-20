@@ -261,9 +261,7 @@ impl<V:Debug> TrieNode<V> {
         Some(0) => {
           if child_key[0] == '*' as u8 {
             let c = '.' as u8;
-            if partial_key.contains(&c) {
-              return None;
-            } else {
+            if !partial_key.contains(&c) {
               wildcard_res = self.children[index].key_value.as_ref();
             }
           }
@@ -272,9 +270,7 @@ impl<V:Debug> TrieNode<V> {
           // check for wildcard
           if i+1 == child_key.len() && child_key[i] == '*' as u8 {
             let c = '.' as u8;
-            if (&partial_key[i..]).contains(&c) {
-              return None;
-            } else {
+            if !(&partial_key[i..]).contains(&c) {
               wildcard_res = self.children[index].key_value.as_ref();
             }
           }
