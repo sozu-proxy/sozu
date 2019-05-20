@@ -9,7 +9,7 @@ use mio_uds::UnixStream;
 use mio::unix::UnixReady;
 use uuid::Uuid;
 use std::io::ErrorKind;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use slab::Slab;
 use std::net::SocketAddr;
 use std::str::from_utf8_unchecked;
@@ -735,6 +735,26 @@ fn get_cert_common_name(cert: &X509) -> Option<String> {
     cert.subject_name().entries_by_nid(nid::Nid::COMMONNAME).next().and_then(|name| name.data().as_utf8().ok().map(|name| (&*name).to_string()))
 }
 
+fn get_cert_names(cert: &X509) -> HashSet<String> {
+  let mut  h = HashSet::new();
+
+  // warning: we should not use the common name anymore
+  if let Some(name) = get_cert_common_name(&cert) {
+    h.insert(name);
+  }
+
+  if let Some(names) = cert.subject_alt_names() {
+    for name in names.iter().filter_map(|general_name|
+        general_name.dnsname().map(|name| String::from(name))
+      ) {
+      h.insert(name);
+    }
+  }
+
+  h
+}
+
+
 pub type HostName  = String;
 pub type PathBegin = String;
 pub struct TlsData {
@@ -969,15 +989,8 @@ impl Listener {
 
       //FIXME
       let fingerprint = CertFingerprint(unwrap_msg!(cert.digest(MessageDigest::sha256()).map(|d| d.to_vec())));
-      let common_name: Option<String> = get_cert_common_name(&cert);
-      debug!("got common name: {:?}", common_name);
-
-      let names: Vec<String> = cert.subject_alt_names().map(|names| {
-        names.iter().filter_map(|general_name|
-          general_name.dnsname().map(|name| String::from(name))
-        ).collect()
-      }).unwrap_or(vec!());
-      debug!("got subject alt names: {:?}", names);
+      let names = get_cert_names(&cert);
+      debug!("got certificate names: {:?}", names);
 
       if let Err(e) = ctx.set_certificate(&cert) {
         error!("error adding certificate to context: {:?}", e);
@@ -1041,9 +1054,7 @@ impl Listener {
       }
       {
         let mut domains = unwrap_msg!(self.domains.lock());
-        if let Some(name) = common_name {
-          domains.domain_insert(name.into_bytes(), fingerprint.clone());
-        }
+
         for name in names {
           domains.domain_insert(name.into_bytes(), fingerprint.clone());
         }
@@ -1063,17 +1074,8 @@ impl Listener {
 
     if let Some(data) = contexts.remove(&fingerprint) {
       if let Ok(cert) = X509::from_pem(&data.certificate) {
-        let common_name: Option<String> = get_cert_common_name(&cert);
-        //info!("got common name: {:?}", common_name);
-        if let Some(name) = common_name {
-          domains.domain_remove(&name.into_bytes());
-        }
+        let names = get_cert_names(&cert);
 
-        let names: Vec<String> = cert.subject_alt_names().map(|names| {
-          names.iter().filter_map(|general_name|
-                                  general_name.dnsname().map(|name| String::from(name))
-                                 ).collect()
-        }).unwrap_or(vec!());
         for name in names {
           domains.domain_remove(&name.into_bytes());
         }
