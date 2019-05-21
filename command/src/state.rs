@@ -261,8 +261,15 @@ impl ConfigState {
       v.push(ProxyRequestData::AddHttpsListener(listener.clone()));
     }
 
-    for &(ref listener, _) in self.tcp_listeners.values() {
+    for &(ref listener, active) in self.tcp_listeners.values() {
       v.push(ProxyRequestData::AddTcpListener(listener.clone()));
+      if active {
+        v.push(ProxyRequestData::ActivateListener(ActivateListener {
+          front: listener.front.clone(),
+          proxy: ListenerType::TCP,
+          from_scm: false
+        }));
+      }
     }
 
     for app in self.applications.values() {
@@ -343,7 +350,7 @@ impl ConfigState {
 
     //pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
     let my_tcp_listeners: HashSet<&SocketAddr> = self.tcp_listeners.keys().collect();
-    let their_tcp_listeners: HashSet<&SocketAddr> = self.tcp_listeners.keys().collect();
+    let their_tcp_listeners: HashSet<&SocketAddr> = other.tcp_listeners.keys().collect();
     let removed_tcp_listeners = my_tcp_listeners.difference(&their_tcp_listeners);
     let added_tcp_listeners: Vec<&SocketAddr> = their_tcp_listeners.difference(&my_tcp_listeners)
       .cloned().collect();
@@ -433,7 +440,7 @@ impl ConfigState {
       }));
     }
 
-    for address in added_tcp_listeners {
+    for address in added_tcp_listeners.clone() {
       v.push(ProxyRequestData::AddTcpListener(other.tcp_listeners[address].0.clone()));
     }
 
@@ -496,6 +503,18 @@ impl ConfigState {
         names: Vec::new(),
       }));
     }
+
+    for address in added_tcp_listeners {
+      let listener = &other.tcp_listeners[address];
+      if listener.1 {
+        v.push(ProxyRequestData::ActivateListener(ActivateListener {
+          front: listener.0.front.clone(),
+          proxy: ListenerType::TCP,
+          from_scm: false
+        }));
+      }
+    }
+
     v
   }
 
