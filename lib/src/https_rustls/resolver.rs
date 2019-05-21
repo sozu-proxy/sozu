@@ -77,7 +77,7 @@ impl CertificateResolver {
         unimplemented!("the rustls proxy cannot extract the names from the certificate");
       }
 
-      let mut names = remove_certificate.names;
+      let names = remove_certificate.names;
 
       for name in names {
         self.domains.domain_remove(&name.into_bytes());

@@ -34,7 +34,6 @@ use std::env;
 use std::panic;
 use sozu_command::config::Config;
 use clap::ArgMatches;
-use regex::Regex;
 
 #[cfg(target_os = "linux")]
 use libc::{cpu_set_t,pid_t};

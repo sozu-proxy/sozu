@@ -1119,7 +1119,7 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::AddHttpFront(front) => {
         debug!("{} add front {:?}", message.id, front);
-        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
+        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
           match listener.add_http_front(front) {
             Ok(_) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None },
             Err(err) => ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(err), data: None }

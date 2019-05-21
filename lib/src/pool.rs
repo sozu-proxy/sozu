@@ -10,9 +10,9 @@
 
 use pool_crate;
 use std::ops;
-use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-static BUFFER_COUNT: AtomicUsize = ATOMIC_USIZE_INIT;
+static BUFFER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub type Reset = pool_crate::Reset;
 

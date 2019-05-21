@@ -136,7 +136,7 @@ impl Session {
       self.protocol = Some(State::Expect(expect, ssl));
       false
     } else if let State::Handshake(handshake) = protocol {
-      let mut front_buf = self.pool.upgrade().and_then(|p| p.borrow_mut().checkout());
+      let front_buf = self.pool.upgrade().and_then(|p| p.borrow_mut().checkout());
       if front_buf.is_none() {
         self.protocol = Some(State::Handshake(handshake));
         return false;
@@ -151,7 +151,7 @@ impl Session {
         incr!(ciphersuite_str(cipher));
       });
 
-      let mut front_stream = FrontRustls {
+      let front_stream = FrontRustls {
         stream:  handshake.stream,
         session: handshake.session,
       };

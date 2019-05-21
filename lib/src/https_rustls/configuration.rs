@@ -583,7 +583,7 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::AddHttpsFront(front) => {
         //info!("HTTPS\t{} add front {:?}", id, front);
-        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
+        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
           listener.add_https_front(front);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
@@ -592,7 +592,7 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::RemoveHttpsFront(front) => {
         //info!("HTTPS\t{} remove front {:?}", id, front);
-        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
+        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
           listener.remove_https_front(front);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
@@ -600,7 +600,7 @@ impl ProxyConfiguration<Session> for Proxy {
         }
       },
       ProxyRequestData::AddCertificate(add_certificate) => {
-        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == add_certificate.front) {
+        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == add_certificate.front) {
           listener.add_certificate(add_certificate);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
@@ -609,7 +609,7 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::RemoveCertificate(remove_certificate) => {
         //FIXME: should return an error if certificate still has fronts referencing it
-        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == remove_certificate.front) {
+        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == remove_certificate.front) {
           listener.remove_certificate(remove_certificate);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
@@ -618,7 +618,7 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::ReplaceCertificate(replace_certificate) => {
         //FIXME: should return an error if certificate still has fronts referencing it
-        if let Some(mut listener) = self.listeners.values_mut().find(|l| l.address == replace_certificate.front) {
+        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == replace_certificate.front) {
           listener.replace_certificate(replace_certificate);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {

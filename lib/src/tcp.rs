@@ -280,7 +280,7 @@ impl Session {
         error!("Missing the frontend or backend buffer queue, we can't switch to a pipe");
         UpgradeResult::Close
       }
-    } else if let Some(State::RelayProxyProtocol(mut pp)) = protocol {
+    } else if let Some(State::RelayProxyProtocol(pp)) = protocol {
       if self.back_buf.is_some() {
         self.protocol = Some(
           State::Pipe(pp.into_pipe(self.back_buf.take().unwrap()))
@@ -292,7 +292,7 @@ impl Session {
         error!("Missing the backend buffer queue, we can't switch to a pipe");
         UpgradeResult::Close
       }
-    } else if let Some(State::ExpectProxyProtocol(mut pp)) = protocol {
+    } else if let Some(State::ExpectProxyProtocol(pp)) = protocol {
       if self.front_buf.is_some() && self.back_buf.is_some() {
         self.protocol = Some(
           State::Pipe(pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap(), None, None))
