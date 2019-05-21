@@ -909,7 +909,7 @@ impl ProxyConfiguration<Session> for Proxy {
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unimplemented")), data: None }
       },
       command => {
-        error!("{} unsupported message, ignoring {:?}", message.id, command);
+        error!("{} unsupported message for TCP proxy, ignoring {:?}", message.id, command);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None}
       }
     }

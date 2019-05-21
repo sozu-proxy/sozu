@@ -1182,7 +1182,7 @@ impl ProxyConfiguration<Session> for Proxy {
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       command => {
-        debug!("{} unsupported message, ignoring: {:?}", message.id, command);
+        debug!("{} unsupported message for HTTP proxy, ignoring: {:?}", message.id, command);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None }
       }
     }
