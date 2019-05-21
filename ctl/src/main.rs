@@ -24,7 +24,8 @@ use command::{add_application,remove_application,dump_state,load_state,
   remove_backend, add_backend, remove_http_frontend, add_http_frontend,
   remove_tcp_frontend, add_tcp_frontend, add_certificate, remove_certificate,
   replace_certificate, query_application, logging_filter, upgrade_worker,
-  events, query_certificate, add_tcp_listener, add_http_listener, add_https_listener, remove_listener, activate_listener};
+  events, query_certificate, add_tcp_listener, add_http_listener, add_https_listener,
+  remove_listener, activate_listener, deactivate_listener};
 
 use cli::*;
 
@@ -110,6 +111,7 @@ fn main() {
           },
           HttpListenerCmd::Remove { address } => remove_listener(channel, timeout, address, ListenerType::HTTP),
           HttpListenerCmd::Activate{ address } => activate_listener(channel, timeout, address, ListenerType::HTTP),
+          HttpListenerCmd::Deactivate{ address } => deactivate_listener(channel, timeout, address, ListenerType::HTTP)
         },
         ListenerCmd::Https { cmd } => match cmd {
           HttpsListenerCmd::Add { address, public_address, answer_404, answer_503, tls_versions, cipher_list,
@@ -118,11 +120,13 @@ fn main() {
           },
           HttpsListenerCmd::Remove { address } => remove_listener(channel, timeout, address, ListenerType::HTTPS),
           HttpsListenerCmd::Activate{ address } => activate_listener(channel, timeout, address, ListenerType::HTTPS),
+          HttpsListenerCmd::Deactivate{ address } => deactivate_listener(channel, timeout, address, ListenerType::HTTPS),
         },
         ListenerCmd::Tcp { cmd } => match cmd {
           TcpListenerCmd::Add{ address, public_address, expect_proxy } => add_tcp_listener(channel, timeout, address, public_address, expect_proxy),
           TcpListenerCmd::Remove{ address } => remove_listener(channel, timeout, address, ListenerType::TCP),
-          TcpListenerCmd::Activate{ address } => activate_listener(channel, timeout, address, ListenerType::TCP)
+          TcpListenerCmd::Activate{ address } => activate_listener(channel, timeout, address, ListenerType::TCP),
+          TcpListenerCmd::Deactivate{ address } => deactivate_listener(channel, timeout, address, ListenerType::TCP)
         }
       }
     }
