@@ -1770,9 +1770,9 @@ mod tests {
 
     let mut trie = TrieNode::root();
 
+    trie.domain_insert("*.clever-cloud.com".as_bytes().to_vec(), 2u8);
     trie.domain_insert("services.clever-cloud.com".as_bytes().to_vec(), 0u8);
     trie.domain_insert("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8);
-    trie.domain_insert("services.clever-cloud.com".as_bytes().to_vec(), 2u8);
 
     let res = trie.domain_lookup(b"test.services.clever-cloud.com");
     println!("query result: {:?}", res);
