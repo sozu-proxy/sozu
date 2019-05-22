@@ -526,7 +526,7 @@ pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
               String::from("timeout")
             };
 
-            let mut h2: HashMap<u32, String> = if let Ok(mut state) = st.try_lock() {
+            let h2: HashMap<u32, String> = if let Ok(state) = st.try_lock() {
               state.values().map(|&(ref id, ref status)| {
                 (*id, String::from(match *status {
                   CommandStatus::Processing => if finished {
@@ -601,7 +601,7 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
             if &id == &message.id {
               //println!("Sozu metrics:\n{}\n{:#?}", message.message, message.data);
 
-              if let Some(CommandResponseData::Metrics(mut data)) = message.data {
+              if let Some(CommandResponseData::Metrics(data)) = message.data {
                 if json {
                   print_json_response(&data);
                   return;
@@ -944,19 +944,19 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
                 return;
               }
 
-              let mut application_headers = vec!["id", "sticky_session", "https_redirect"];
+              let application_headers = vec!["id", "sticky_session", "https_redirect"];
               let mut application_table = create_queried_application_table(application_headers, &data);
 
-              let mut http_headers = vec!["id", "hostname", "path begin"];
+              let http_headers = vec!["id", "hostname", "path begin"];
               let mut frontend_table = create_queried_application_table(http_headers, &data);
 
-              let mut https_headers = vec!["id", "hostname", "path begin"];
+              let https_headers = vec!["id", "hostname", "path begin"];
               let mut https_frontend_table = create_queried_application_table(https_headers, &data);
 
-              let mut tcp_headers = vec!["id", "address"];
+              let tcp_headers = vec!["id", "address"];
               let mut tcp_frontend_table = create_queried_application_table(tcp_headers, &data);
 
-              let mut backend_headers = vec!["backend id", "IP address", "Backup"];
+              let backend_headers = vec!["backend id", "IP address", "Backup"];
               let mut backend_table = create_queried_application_table(backend_headers, &data);
 
               let keys : HashSet<&String> = data.keys().collect();
@@ -971,26 +971,26 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
                 //let m: u8 = metrics;
                 if let &QueryAnswer::Applications(ref apps) = *metrics {
                   for app in apps.iter() {
-                    let mut entry = application_data.entry(app).or_insert(Vec::new());
+                    let entry = application_data.entry(app).or_insert(Vec::new());
                     entry.push((*key).clone());
 
                     for frontend in app.http_frontends.iter() {
-                      let mut entry = frontend_data.entry(frontend).or_insert(Vec::new());
+                      let entry = frontend_data.entry(frontend).or_insert(Vec::new());
                       entry.push((*key).clone());
                     }
 
                     for frontend in app.https_frontends.iter() {
-                      let mut entry = https_frontend_data.entry(frontend).or_insert(Vec::new());
+                      let entry = https_frontend_data.entry(frontend).or_insert(Vec::new());
                       entry.push((*key).clone());
                     }
 
                     for frontend in app.tcp_frontends.iter() {
-                      let mut entry = tcp_frontend_data.entry(frontend).or_insert(Vec::new());
+                      let entry = tcp_frontend_data.entry(frontend).or_insert(Vec::new());
                       entry.push((*key).clone());
                     }
 
                     for backend in app.backends.iter() {
-                      let mut entry = backend_data.entry(backend).or_insert(Vec::new());
+                      let entry = backend_data.entry(backend).or_insert(Vec::new());
                       entry.push((*key).clone());
                     }
                   }
