@@ -242,7 +242,7 @@ impl ConfigState {
         }
       },
       // This is to avoid the error message
-      &ProxyRequestData::Logging(_) | &ProxyRequestData::Status => {false},
+      &ProxyRequestData::Logging(_) | &ProxyRequestData::Status | &ProxyRequestData::Query(_) => {false},
       o => {
         error!("state cannot handle order message: {:#?}", o);
         false
@@ -584,6 +584,11 @@ pub fn get_application_ids_by_domain(state: &ConfigState, hostname: String, path
     });
 
   app_ids
+}
+
+pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<(String, Vec<String>)> {
+  state.certificates.values().filter_map(|h| h.get(&CertFingerprint(fingerprint.to_vec())))
+    .map(|(c, names)| (c.certificate.clone(), names.clone())).next()
 }
 
 #[cfg(test)]

@@ -14,10 +14,11 @@ use mio_extras::timer::{Timer, Timeout};
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
-use sozu_command::state::{ConfigState,get_application_ids_by_domain};
+use sozu_command::state::{ConfigState,get_application_ids_by_domain, get_certificate};
 use sozu_command::proxy::{ProxyRequestData,MessageId,ProxyResponse, ProxyEvent,
   ProxyResponseData,ProxyResponseStatus,ProxyRequest,Topic,Query,QueryAnswer,
-  QueryApplicationType,TlsProvider,ListenerType,HttpsListener};
+  QueryApplicationType,TlsProvider,ListenerType,HttpsListener,QueryAnswerCertificate,
+  QueryCertificateType};
 use sozu_command::buffer::Buffer;
 
 use {SessionResult,ConnectionError,Protocol,ProxySession,
@@ -504,6 +505,7 @@ impl Server {
               QueryAnswer::ApplicationsHashes(self.config_state.hash_state())
             ))
           });
+          return;
         },
         &Query::Applications(ref query_type) => {
           let answer = match query_type {
@@ -523,9 +525,27 @@ impl Server {
             status: ProxyResponseStatus::Ok,
             data:   Some(ProxyResponseData::Query(answer))
           });
+          return;
+        },
+        &Query::Certificates(ref q) => {
+          match q {
+            // forward the query to the TLS implementation
+            QueryCertificateType::Domain(_) => {},
+            // forward the query to the TLS implementation
+            QueryCertificateType::All => {},
+            QueryCertificateType::Fingerprint(f) => {
+              push_queue(ProxyResponse {
+                id:     message.id.clone(),
+                status: ProxyResponseStatus::Ok,
+                data:   Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::Fingerprint(
+                  get_certificate(&self.config_state, &f)
+                ))))
+              });
+              return
+            },
+          }
         }
       }
-      return
     }
 
     self.notify_proxys(message);

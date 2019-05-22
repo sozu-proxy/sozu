@@ -256,6 +256,14 @@ pub enum QueryCmd {
     id: Option<String>,
     #[structopt(short = "d", long="domain", help="application domain name")]
     domain: Option<String>
+  },
+
+  #[structopt(name = "certificates", about = "Query certificates matching a specific filter")]
+  Certificates {
+    #[structopt(short = "f", long="fingerprint", help="certificate fingerprint")]
+    fingerprint: Option<String>,
+    #[structopt(short = "d", long="domain", help="domain name")]
+    domain: Option<String>
   }
 }
 

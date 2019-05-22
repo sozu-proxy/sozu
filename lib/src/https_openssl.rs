@@ -28,7 +28,8 @@ use mio_extras::timer::{Timer,Timeout};
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,CertFingerprint,CertificateAndKey,
   ProxyRequestData,HttpFront,HttpsListener,ProxyRequest,ProxyResponse,
-  ProxyResponseStatus,TlsVersion,ProxyEvent};
+  ProxyResponseStatus,TlsVersion,ProxyEvent,Query,QueryCertificateType,
+  QueryAnswer,QueryAnswerCertificate,ProxyResponseData};
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
 
@@ -1538,6 +1539,32 @@ impl ProxyConfiguration<Session> for Proxy {
         });
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
+      ProxyRequestData::Query(Query::Certificates(QueryCertificateType::All)) => {
+        let res = self.listeners.iter().map(|(addr, listener)| {
+          let domains  = unwrap_msg!(listener.domains.lock());
+          (listener.address, domains.to_hashmap().drain().map(|(k, v)| {
+            (String::from_utf8(k).unwrap(), v.0)
+          }).collect())
+        }).collect::<HashMap<_,_>>();
+
+        info!("got Certificates::All query, answering with {:?}", res);
+
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok,
+          data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::All(res)))) }
+      },
+      ProxyRequestData::Query(Query::Certificates(QueryCertificateType::Domain(d))) => {
+        let res = self.listeners.iter().map(|(addr, listener)| {
+          let domains  = unwrap_msg!(listener.domains.lock());
+          (listener.address, domains.domain_lookup(d.as_bytes()).map(|(k, v)| {
+            (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())
+          }))
+        }).collect::<HashMap<_,_>>();
+
+        info!("got Certificates::Domain({}) query, answering with {:?}", d, res);
+
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok,
+          data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::Domain(res)))) }
+      }
       command => {
         error!("{} unsupported message for OpenSSL proxy, ignoring {:?}", message.id, command);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None }
@@ -1576,7 +1603,6 @@ fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
 #[cfg(ossl110)]
 fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
   use openssl::ec::EcKey;
-  use openssl::nid;
 
   let curve = try!(EcKey::from_curve_name(nid::Nid::X9_62_PRIME256V1));
   ctx.set_tmp_ecdh(&curve)

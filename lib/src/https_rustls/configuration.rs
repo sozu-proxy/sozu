@@ -19,7 +19,8 @@ use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,
   ProxyRequestData,HttpFront,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
-  TlsVersion};
+  TlsVersion,ProxyResponseData,Query, QueryCertificateType,QueryAnswer,
+  QueryAnswerCertificate};
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
 
@@ -663,6 +664,28 @@ impl ProxyConfiguration<Session> for Proxy {
           l.borrow_mut().set_directives(directives);
         });
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+      },
+      ProxyRequestData::Query(Query::Certificates(QueryCertificateType::All)) => {
+        let res = self.listeners.iter().map(|(addr, listener)| {
+          let domains  = &unwrap_msg!(listener.resolver.0.lock()).domains;
+          (listener.address, domains.to_hashmap().drain().map(|(k, v)| {
+            (String::from_utf8(k).unwrap(), v.0)
+          }).collect())
+        }).collect::<HashMap<_,_>>();
+
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok,
+          data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::All(res)))) }
+      },
+      ProxyRequestData::Query(Query::Certificates(QueryCertificateType::Domain(d))) => {
+        let res = self.listeners.iter().map(|(addr, listener)| {
+          let domains  = &unwrap_msg!(listener.resolver.0.lock()).domains;
+          (listener.address, domains.domain_lookup(d.as_bytes()).map(|(k, v)| {
+            (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())
+          }))
+        }).collect::<HashMap<_,_>>();
+
+        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok,
+          data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::Domain(res)))) }
       },
       command => {
         error!("{} unsupported message for rustls proxy, ignoring {:?}", message.id, command);

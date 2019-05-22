@@ -4,7 +4,8 @@ use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
 use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
-  AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend};
+  AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend,
+  QueryCertificateType, QueryAnswerCertificate};
 
 use serde_json;
 use std::collections::{HashMap,HashSet,BTreeMap};
@@ -1148,6 +1149,126 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
               table.printstd();
             }
           }
+        }
+      }
+    }
+  }
+}
+
+pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, json: bool, fingerprint: Option<String>, domain: Option<String>) {
+
+  let query = match (fingerprint, domain) {
+    (None, None) => QueryCertificateType::All,
+    (Some(f), None) => {
+      match hex::decode(f) {
+        Err(e) => {
+          eprintln!("invalid fingerprint: {:?}", e);
+          exit(1);
+        },
+        Ok(f) => QueryCertificateType::Fingerprint(f),
+      }
+    },
+    (None, Some(d)) => QueryCertificateType::Domain(d),
+    (Some(_), Some(_)) => {
+      eprintln!("Error: Either request a fingerprint or a domain name");
+      exit(1);
+    }
+  };
+
+  let command = CommandRequestData::Proxy(ProxyRequestData::Query(Query::Certificates(query)));
+
+  let id = generate_id();
+  channel.write_message(&CommandRequest::new(
+    id.clone(),
+    command,
+    None,
+  ));
+
+  match channel.read_message() {
+    None          => {
+      eprintln!("the proxy didn't answer");
+      exit(1);
+    },
+    Some(message) => {
+      if id != message.id {
+        eprintln!("received message with invalid id: {:?}", message);
+        exit(1);
+      }
+      match message.status {
+        CommandStatus::Processing => {
+          // do nothing here
+          // for other messages, we would loop over read_message
+          // until an error or ok message was sent
+        },
+        CommandStatus::Error => {
+          if json {
+            print_json_response(&message.message);
+          } else {
+            eprintln!("could not query proxy state: {}", message.message);
+          }
+          exit(1);
+        },
+        CommandStatus::Ok => {
+            if let Some(CommandResponseData::Query(data)) = message.data {
+              if json {
+                print_json_response(&data);
+                return;
+              }
+
+              //println!("received: {:?}", data);
+              let it = data.iter().map(|(k,v)| {
+                match v {
+                  QueryAnswer::Certificates(c) => (k, c),
+                  v => {
+                    eprintln!("unexpected certificates query answer: {:?}", v);
+                    exit(1);
+                  }
+                }});
+
+              for (k, v) in it {
+                println!("process '{}':", k);
+
+                match v {
+                  QueryAnswerCertificate::All(h) => {
+                    for (addr, h2) in  h.iter() {
+                      println!("\t{}:", addr);
+
+                      for (domain, fingerprint) in h2.iter() {
+                        println!("\t\t{}:\t{}", domain, hex::encode(fingerprint));
+                      }
+
+                      println!("");
+                    }
+                  },
+                  QueryAnswerCertificate::Domain(h) => {
+                    for (addr, opt) in  h.iter() {
+                      println!("\t{}:", addr);
+                      if let Some((key, fingerprint)) = opt {
+                        println!("\t\t{}:\t{}", key, hex::encode(fingerprint));
+                      } else {
+                        println!("\t\tnot found");
+                      }
+
+                      println!("");
+                    }
+
+                  },
+                  QueryAnswerCertificate::Fingerprint(opt) => {
+                    if let Some((s, v)) = opt {
+                      println!("\tfrontends: {:?}\ncertificate:\n{}", v, s);
+                    } else {
+                      println!("\tnot found");
+                    }
+                  }
+                }
+                println!("");
+              }
+
+            } else {
+              eprintln!("unexpected response: {:?}", message.data);
+              exit(1);
+
+            }
         }
       }
     }

@@ -1,5 +1,6 @@
 use std::{iter,str};
 use std::fmt::Debug;
+use std::collections::HashMap;
 
 pub type Key = Vec<u8>;
 pub type KeyValue<K,V> = (K,V);
@@ -24,7 +25,7 @@ pub enum RemoveResult {
   NotFound,
 }
 
-impl<V:Debug> TrieNode<V> {
+impl<V:Debug+Clone> TrieNode<V> {
   pub fn new(key: Key, value: V) -> TrieNode<V> {
     TrieNode {
       key_value:      Some((key, value)),
@@ -360,7 +361,26 @@ impl<V:Debug> TrieNode<V> {
       child.print_recursive(&child_key, indent+1);
     }
   }
+
+  pub fn to_hashmap(&self) -> HashMap<Key, V> {
+    let mut h = HashMap::new();
+
+    self.to_hashmap_recursive(&mut h);
+
+    h
+  }
+
+  pub fn to_hashmap_recursive(&self, h: &mut HashMap<Key, V>) {
+    if let Some((ref key, ref value)) = self.key_value {
+      h.insert(key.clone(), value.clone());
+    }
+
+    for (_, ref child) in self.keys.iter().zip(self.children.iter()) {
+      child.to_hashmap_recursive(h);
+    }
+  }
 }
+
 #[cfg(test)]
 mod tests {
   use super::*;

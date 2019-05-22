@@ -16,7 +16,7 @@ struct TlsData {
 }
 
 pub struct CertificateResolver {
-  domains:      TrieNode<CertFingerprint>,
+  pub domains:  TrieNode<CertFingerprint>,
   certificates: HashMap<CertFingerprint, TlsData>,
 }
 
@@ -88,7 +88,7 @@ impl CertificateResolver {
   }
 }
 
-pub struct CertificateResolverWrapper(Mutex<CertificateResolver>);
+pub struct CertificateResolverWrapper(pub Mutex<CertificateResolver>);
 
 impl CertificateResolverWrapper {
   pub fn new() -> CertificateResolverWrapper {

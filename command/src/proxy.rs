@@ -6,7 +6,7 @@ use std::cmp::Ordering;
 use std::convert::From;
 use std::default::Default;
 use std::net::SocketAddr;
-use std::collections::{BTreeMap,HashSet};
+use std::collections::{HashMap,BTreeMap,HashSet};
 
 
 use config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
@@ -503,9 +503,11 @@ pub struct TcpListener {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct QueryApplicationDomain {
-  pub hostname: String,
-  pub path_begin: Option<String>
+#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Query {
+  Applications(QueryApplicationType),
+  Certificates(QueryCertificateType),
+  ApplicationsHashes,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -516,22 +518,26 @@ pub enum QueryApplicationType {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum Query {
-  Applications(QueryApplicationType),
-  //Certificate(CertFingerprint),
-  //Certificates,
-  ApplicationsHashes,
+pub struct QueryApplicationDomain {
+  pub hostname: String,
+  pub path_begin: Option<String>
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum QueryCertificateType {
+  All,
+  Domain(String),
+  Fingerprint(Vec<u8>),
+}
+
+#[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryAnswer {
   Applications(Vec<QueryAnswerApplication>),
-  //Certificate(QueryAnswerCertificate),
-  //Certificates(Vec<CertFingerprint>),
   /// application id, hash of application information
   ApplicationsHashes(BTreeMap<String, u64>),
+  Certificates(QueryAnswerCertificate),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -553,6 +559,16 @@ impl Default for QueryAnswerApplication {
       backends: vec!()
     }
   }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueryAnswerCertificate {
+  /// returns a list of domain -> fingerprint
+  All(HashMap<SocketAddr, BTreeMap<String, Vec<u8>>>),
+  /// returns a fingerprint
+  Domain(HashMap<SocketAddr, Option<(String, Vec<u8>)>>),
+  /// returns the certificate
+  Fingerprint(Option<(String, Vec<String>)>),
 }
 
 impl ProxyRequestData {
@@ -577,7 +593,7 @@ impl ProxyRequestData {
       ProxyRequestData::RemoveListener(_)      => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::ActivateListener(_)    => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::DeactivateListener(_)  => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      ProxyRequestData::Query(_)               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::Query(_)               => [Topic::HttpsProxyConfig].iter().cloned().collect(),
       ProxyRequestData::SoftStop               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::HardStop               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::Status                 => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),

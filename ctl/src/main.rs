@@ -6,6 +6,7 @@ extern crate structopt;
 extern crate serde;
 extern crate serde_json;
 #[macro_use] extern crate serde_derive;
+extern crate hex;
 
 mod command;
 mod cli;
@@ -22,7 +23,7 @@ use command::{add_application,remove_application,dump_state,load_state,
   remove_backend, add_backend, remove_http_frontend, add_http_frontend,
   remove_tcp_frontend, add_tcp_frontend, add_certificate, remove_certificate,
   replace_certificate, query_application, logging_filter, upgrade_worker,
-  events};
+  events,query_certificate};
 
 use cli::*;
 
@@ -116,6 +117,7 @@ fn main() {
     SubCmd::Query{ cmd, json } => {
       match cmd {
         QueryCmd::Applications{ id, domain } => query_application(channel, json, id, domain),
+        QueryCmd::Certificates{ fingerprint, domain } => query_certificate(channel, json, fingerprint, domain),
       }
     },
     SubCmd::Config{ cmd: _ } => {}, // noop, handled at the beginning of the method

@@ -581,7 +581,22 @@ impl CommandServer {
           //FIXME: send back errors
           error!("metrics error: {}", e);
         }));
-      }
+      },
+      &Query::Certificates(ref query_type) => {
+        executor::Executor::execute(f.map(move |data| {
+          info!("certificates query received: {:?}", data);
+
+          executor::Executor::send_client(token, CommandResponse::new(
+            id,
+            CommandStatus::Ok,
+            String::new(),
+            Some(CommandResponseData::Query(data))
+          ));
+        }).map_err(|e| {
+          //FIXME: send back errors
+          error!("certificates query error: {}", e);
+        }));
+      },
     };
   }
 
