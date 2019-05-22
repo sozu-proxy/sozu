@@ -667,10 +667,12 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::Query(Query::Certificates(QueryCertificateType::All)) => {
         let res = self.listeners.iter().map(|(addr, listener)| {
-          let domains  = &unwrap_msg!(listener.resolver.0.lock()).domains;
-          (listener.address, domains.to_hashmap().drain().map(|(k, v)| {
+          let mut domains = (&unwrap_msg!(listener.resolver.0.lock()).domains).to_hashmap();
+          let res = domains.drain().map(|(k, v)| {
             (String::from_utf8(k).unwrap(), v.0)
-          }).collect())
+          }).collect();
+
+          (listener.address, res)
         }).collect::<HashMap<_,_>>();
 
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok,

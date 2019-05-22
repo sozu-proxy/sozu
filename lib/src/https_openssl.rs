@@ -1541,9 +1541,9 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::Query(Query::Certificates(QueryCertificateType::All)) => {
         let res = self.listeners.iter().map(|(addr, listener)| {
-          let domains  = unwrap_msg!(listener.domains.lock());
-          (listener.address, domains.to_hashmap().drain().map(|(k, v)| {
-            (String::from_utf8(k).unwrap(), v.0)
+          let domains  = unwrap_msg!(listener.domains.lock()).to_hashmap();
+          (listener.address, domains.drain().map(|(k, v)| {
+            (String::from_utf8(k).unwrap(), v.0.clone())
           }).collect())
         }).collect::<HashMap<_,_>>();
 
