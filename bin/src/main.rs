@@ -19,6 +19,8 @@ extern crate jemallocator;
 
 #[cfg(target_os = "linux")]
 extern crate num_cpus;
+#[cfg(target_os="linux")]
+use regex::Regex;
 
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
