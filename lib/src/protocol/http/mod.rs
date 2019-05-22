@@ -1175,6 +1175,7 @@ fn save_http_status_metric(rs_status_line : Option<RStatusLine>) {
 mod tests {
   use super::*;
 
+  /*
   #[test]
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
@@ -1187,4 +1188,5 @@ mod tests {
     assert_size!(DefaultAnswerStatus, 1);
     assert_size!(Readiness, 16);
   }
+  */
 }

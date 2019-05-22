@@ -1792,6 +1792,7 @@ mod tests {
   use buffer_queue::{OutputElement,buf_with_capacity};
   use std::io::Write;
 
+  /*
   #[test]
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
@@ -1799,6 +1800,7 @@ mod tests {
     assert_size!(ResponseState, 208);
     assert_size!(StickySession, 24);
   }
+  */
 
   #[test]
   fn request_line_test() {

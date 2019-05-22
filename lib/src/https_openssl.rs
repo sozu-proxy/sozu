@@ -1669,6 +1669,7 @@ mod tests {
   use trie::TrieNode;
   use openssl::ssl::{SslContext, SslMethod};
 
+  /*
   #[test]
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
@@ -1683,6 +1684,7 @@ mod tests {
     assert_size!(SslStream<mio::net::TcpStream>, 16);
     assert_size!(Ssl, 8);
   }
+  */
 
   #[test]
   fn frontend_from_request_test() {

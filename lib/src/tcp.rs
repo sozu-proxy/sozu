@@ -1051,6 +1051,7 @@ mod tests {
   use std::os::unix::io::IntoRawFd;
   static TEST_FINISHED: AtomicBool = ATOMIC_BOOL_INIT;
 
+  /*
   #[test]
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
@@ -1061,7 +1062,7 @@ mod tests {
     assert_size!(State, 528);
     // fails depending on the platform?
     //assert_size!(Session, 808);
-  }
+  }*/
 
   #[test]
   fn mi() {

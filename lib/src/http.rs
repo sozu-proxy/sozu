@@ -1302,6 +1302,7 @@ mod tests {
   use sozu_command::config::LoadBalancingAlgorithms;
   use sozu_command::channel::Channel;
 
+  /*
   #[test]
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
@@ -1312,6 +1313,7 @@ mod tests {
     // fails depending on the platform?
     //assert_size!(Session, 1240);
   }
+  */
 
   #[test]
   fn mi() {
