@@ -1,12 +1,12 @@
 use rand::{self, Rng};
 
-use std::{cmp, time};
 use std::fmt::Debug;
+use std::{cmp, time};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RetryAction {
     OKAY,
-    WAIT
+    WAIT,
 }
 
 pub trait RetryPolicy: Debug + PartialEq + Eq {
@@ -29,7 +29,7 @@ pub trait RetryPolicy: Debug + PartialEq + Eq {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum RetryPolicyWrapper {
-    ExponentialBackoff(ExponentialBackoffPolicy)
+    ExponentialBackoff(ExponentialBackoffPolicy),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -37,7 +37,7 @@ pub struct ExponentialBackoffPolicy {
     max_tries: usize,
     current_tries: usize,
     last_try: time::Instant,
-    wait: time::Duration
+    wait: time::Duration,
 }
 
 impl ExponentialBackoffPolicy {
@@ -46,7 +46,7 @@ impl ExponentialBackoffPolicy {
             max_tries,
             current_tries: 0,
             last_try: time::Instant::now(),
-            wait: time::Duration::default()
+            wait: time::Duration::default(),
         }
     }
 }
@@ -62,8 +62,8 @@ impl RetryPolicy for ExponentialBackoffPolicy {
 
     fn fail(&mut self) {
         if self.last_try.elapsed().lt(&self.wait) {
-          //we're already in back off
-          return;
+            //we're already in back off
+            return;
         }
 
         let max_secs = cmp::max(1, 1u64.wrapping_shl(self.current_tries as u32));
@@ -77,7 +77,6 @@ impl RetryPolicy for ExponentialBackoffPolicy {
         self.wait = time::Duration::from_secs(wait);
         self.last_try = time::Instant::now();
         self.current_tries = cmp::min(self.current_tries + 1, self.max_tries);
-
     }
 
     fn succeed(&mut self) {
@@ -87,7 +86,6 @@ impl RetryPolicy for ExponentialBackoffPolicy {
     }
 
     fn can_try(&self) -> Option<RetryAction> {
-
         let action = if self.last_try.elapsed().gt(&self.wait) {
             RetryAction::OKAY
         } else {
@@ -98,7 +96,7 @@ impl RetryPolicy for ExponentialBackoffPolicy {
     }
 
     fn is_down(&self) -> bool {
-      self.current_tries() >= self.max_tries()
+        self.current_tries() >= self.max_tries()
     }
 }
 
@@ -111,44 +109,50 @@ impl Into<RetryPolicyWrapper> for ExponentialBackoffPolicy {
 impl RetryPolicy for RetryPolicyWrapper {
     fn max_tries(&self) -> usize {
         match *self {
-            RetryPolicyWrapper::ExponentialBackoff(ref policy) => policy
-        }.max_tries()
+            RetryPolicyWrapper::ExponentialBackoff(ref policy) => policy,
+        }
+        .max_tries()
     }
 
     fn current_tries(&self) -> usize {
         match *self {
-            RetryPolicyWrapper::ExponentialBackoff(ref policy) => policy
-        }.current_tries()
+            RetryPolicyWrapper::ExponentialBackoff(ref policy) => policy,
+        }
+        .current_tries()
     }
 
     fn fail(&mut self) {
         match *self {
-            RetryPolicyWrapper::ExponentialBackoff(ref mut policy) => policy
-        }.fail()
+            RetryPolicyWrapper::ExponentialBackoff(ref mut policy) => policy,
+        }
+        .fail()
     }
 
     fn succeed(&mut self) {
         match *self {
-            RetryPolicyWrapper::ExponentialBackoff(ref mut policy) => policy
-        }.succeed()
+            RetryPolicyWrapper::ExponentialBackoff(ref mut policy) => policy,
+        }
+        .succeed()
     }
 
     fn can_try(&self) -> Option<RetryAction> {
         match *self {
-            RetryPolicyWrapper::ExponentialBackoff(ref policy) => policy
-        }.can_try()
+            RetryPolicyWrapper::ExponentialBackoff(ref policy) => policy,
+        }
+        .can_try()
     }
 
     fn is_down(&self) -> bool {
         match *self {
-            RetryPolicyWrapper::ExponentialBackoff(ref policy) => policy
-        }.is_down()
+            RetryPolicyWrapper::ExponentialBackoff(ref policy) => policy,
+        }
+        .is_down()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RetryAction, RetryPolicy, ExponentialBackoffPolicy};
+    use super::{ExponentialBackoffPolicy, RetryAction, RetryPolicy};
 
     const MAX_FAILS: usize = 10;
 

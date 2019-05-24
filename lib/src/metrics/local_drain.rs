@@ -1,224 +1,239 @@
-use std::str;
-use std::time::{Duration,Instant};
-use std::iter::repeat;
+use hdrhistogram::Histogram;
+use sozu_command::proxy::{
+    AppMetricsData, FilteredData, FilteredTimeSerie, MetricsData, Percentiles,
+};
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
-use hdrhistogram::Histogram;
-use sozu_command::proxy::{FilteredData,MetricsData,Percentiles,FilteredTimeSerie,AppMetricsData};
+use std::iter::repeat;
+use std::str;
+use std::time::{Duration, Instant};
 
-use super::{MetricData,Subscriber};
+use super::{MetricData, Subscriber};
 
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub enum AggregatedMetric {
-  Gauge(usize),
-  Count(i64),
-  Time(Histogram<u32>)
+    Gauge(usize),
+    Count(i64),
+    Time(Histogram<u32>),
 }
 
 impl AggregatedMetric {
-  fn new(metric: MetricData) -> AggregatedMetric {
-    match metric {
-      MetricData::Gauge(value) => AggregatedMetric::Gauge(value),
-      MetricData::GaugeAdd(value) => AggregatedMetric::Gauge(value as usize),
-      MetricData::Count(value) => AggregatedMetric::Count(value),
-      MetricData::Time(value)  => {
-        //FIXME: do not unwrap here
-        let mut h = ::hdrhistogram::Histogram::new(3).unwrap();
-        h.record(value as u64);
-        AggregatedMetric::Time(h)
-      }
+    fn new(metric: MetricData) -> AggregatedMetric {
+        match metric {
+            MetricData::Gauge(value) => AggregatedMetric::Gauge(value),
+            MetricData::GaugeAdd(value) => AggregatedMetric::Gauge(value as usize),
+            MetricData::Count(value) => AggregatedMetric::Count(value),
+            MetricData::Time(value) => {
+                //FIXME: do not unwrap here
+                let mut h = ::hdrhistogram::Histogram::new(3).unwrap();
+                h.record(value as u64);
+                AggregatedMetric::Time(h)
+            }
+        }
     }
-  }
 
-  fn update(&mut self, key: &'static str, m: MetricData) {
-    match (self, m) {
-      (&mut AggregatedMetric::Gauge(ref mut v1), MetricData::Gauge(v2)) => {
-        *v1 = v2;
-      },
-      (&mut AggregatedMetric::Gauge(ref mut v1), MetricData::GaugeAdd(v2)) => {
-        *v1 = (*v1 as i64 + v2) as usize;
-      },
-      (&mut AggregatedMetric::Count(ref mut v1), MetricData::Count(v2)) => {
-        *v1 += v2;
-      },
-      (&mut AggregatedMetric::Time(ref mut v1), MetricData::Time(v2)) => {
-        (*v1).record(v2 as u64);
-      },
-      (s,m) => panic!("tried to update metric {} of value {:?} with an incompatible metric: {:?}", key, s, m)
+    fn update(&mut self, key: &'static str, m: MetricData) {
+        match (self, m) {
+            (&mut AggregatedMetric::Gauge(ref mut v1), MetricData::Gauge(v2)) => {
+                *v1 = v2;
+            }
+            (&mut AggregatedMetric::Gauge(ref mut v1), MetricData::GaugeAdd(v2)) => {
+                *v1 = (*v1 as i64 + v2) as usize;
+            }
+            (&mut AggregatedMetric::Count(ref mut v1), MetricData::Count(v2)) => {
+                *v1 += v2;
+            }
+            (&mut AggregatedMetric::Time(ref mut v1), MetricData::Time(v2)) => {
+                (*v1).record(v2 as u64);
+            }
+            (s, m) => panic!(
+                "tried to update metric {} of value {:?} with an incompatible metric: {:?}",
+                key, s, m
+            ),
+        }
     }
-  }
 }
 
 pub fn histogram_to_percentiles(hist: &Histogram<u32>) -> Percentiles {
-  Percentiles {
-    samples:  hist.len(),
-    p_50:     hist.value_at_percentile(50.0),
-    p_90:     hist.value_at_percentile(90.0),
-    p_99:     hist.value_at_percentile(99.0),
-    p_99_9:   hist.value_at_percentile(99.9),
-    p_99_99:  hist.value_at_percentile(99.99),
-    p_99_999: hist.value_at_percentile(99.999),
-    p_100:    hist.value_at_percentile(100.0),
-  }
+    Percentiles {
+        samples: hist.len(),
+        p_50: hist.value_at_percentile(50.0),
+        p_90: hist.value_at_percentile(90.0),
+        p_99: hist.value_at_percentile(99.0),
+        p_99_9: hist.value_at_percentile(99.9),
+        p_99_99: hist.value_at_percentile(99.99),
+        p_99_999: hist.value_at_percentile(99.999),
+        p_100: hist.value_at_percentile(100.0),
+    }
 }
 
 pub fn aggregated_to_filtered(value: &AggregatedMetric) -> FilteredData {
-  match value {
-    &AggregatedMetric::Gauge(i) => FilteredData::Gauge(i),
-    &AggregatedMetric::Count(i) => FilteredData::Count(i),
-    &AggregatedMetric::Time(ref hist) => {
-      FilteredData::Percentiles(histogram_to_percentiles(&hist))
-    },
-  }
+    match value {
+        &AggregatedMetric::Gauge(i) => FilteredData::Gauge(i),
+        &AggregatedMetric::Count(i) => FilteredData::Count(i),
+        &AggregatedMetric::Time(ref hist) => {
+            FilteredData::Percentiles(histogram_to_percentiles(&hist))
+        }
+    }
 }
 
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 pub struct AppMetrics {
-  pub data: BTreeMap<String, AggregatedMetric>,
-  pub backend_data: BTreeMap<String, BTreeMap<String, AggregatedMetric>>,
+    pub data: BTreeMap<String, AggregatedMetric>,
+    pub backend_data: BTreeMap<String, BTreeMap<String, AggregatedMetric>>,
 }
 
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 pub struct BackendMetrics {
-  pub app_id: String,
-  pub data:   BTreeMap<String, AggregatedMetric>,
+    pub app_id: String,
+    pub data: BTreeMap<String, AggregatedMetric>,
 }
 
 impl BackendMetrics {
-  pub fn new(app_id: String, h: Histogram<u32>) -> BackendMetrics {
-    BackendMetrics {
-      app_id,
-      data: BTreeMap::new(),
+    pub fn new(app_id: String, h: Histogram<u32>) -> BackendMetrics {
+        BackendMetrics {
+            app_id,
+            data: BTreeMap::new(),
+        }
     }
-  }
 }
 
 #[derive(Debug)]
 pub struct LocalDrain {
-  pub prefix:          String,
-  pub created:         Instant,
-  pub data:            BTreeMap<String, AggregatedMetric>,
-  /// app_id -> response time histogram (in ms)
-  pub app_data:        BTreeMap<String, AppMetrics>,
-  // backend_id -> response time histogram (in ms)
-//  pub backend_data:    BTreeMap<String, BackendMetrics>,
-  //pub request_counter: TimeSerie,
-  use_tagged_metrics:  bool,
-  origin:              String,
+    pub prefix: String,
+    pub created: Instant,
+    pub data: BTreeMap<String, AggregatedMetric>,
+    /// app_id -> response time histogram (in ms)
+    pub app_data: BTreeMap<String, AppMetrics>,
+    // backend_id -> response time histogram (in ms)
+    //  pub backend_data:    BTreeMap<String, BackendMetrics>,
+    //pub request_counter: TimeSerie,
+    use_tagged_metrics: bool,
+    origin: String,
 }
 
 impl LocalDrain {
-  pub fn new(prefix: String) -> Self {
-    LocalDrain {
-      prefix,
-      created:     Instant::now(),
-      data:        BTreeMap::new(),
-      app_data:    BTreeMap::new(),
- //     backend_data: BTreeMap::new(),
-      //request_counter: TimeSerie::new(),
-      use_tagged_metrics: false,
-      origin:      String::from("x"),
+    pub fn new(prefix: String) -> Self {
+        LocalDrain {
+            prefix,
+            created: Instant::now(),
+            data: BTreeMap::new(),
+            app_data: BTreeMap::new(),
+            //     backend_data: BTreeMap::new(),
+            //request_counter: TimeSerie::new(),
+            use_tagged_metrics: false,
+            origin: String::from("x"),
+        }
     }
-  }
 
-  pub fn dump_metrics_data(&mut self) -> MetricsData {
-    MetricsData {
-      proxy:        self.dump_process_data(),
-      applications: self.dump_app_data(),
+    pub fn dump_metrics_data(&mut self) -> MetricsData {
+        MetricsData {
+            proxy: self.dump_process_data(),
+            applications: self.dump_app_data(),
+        }
     }
-  }
 
-  pub fn dump_process_data(&mut self) -> BTreeMap<String, FilteredData> {
-    let data: BTreeMap<String, FilteredData> = self.data.iter().map(|(ref key, ref value)| {
-      (key.to_string(), aggregated_to_filtered(value))
-    }).collect();
+    pub fn dump_process_data(&mut self) -> BTreeMap<String, FilteredData> {
+        let data: BTreeMap<String, FilteredData> = self
+            .data
+            .iter()
+            .map(|(ref key, ref value)| (key.to_string(), aggregated_to_filtered(value)))
+            .collect();
 
-    self.data.clear();
+        self.data.clear();
 
-    //data.insert(String::from("requests"), FilteredData::TimeSerie(self.request_counter.filtered()));
+        //data.insert(String::from("requests"), FilteredData::TimeSerie(self.request_counter.filtered()));
 
-    data
-  }
+        data
+    }
 
-  pub fn dump_app_data(&mut self) -> BTreeMap<String,AppMetricsData> {
-    let data = self.app_data.iter().map(|(ref app_id, ref app)| {
-      let data = app.data.iter().map(|(ref key, ref value)| {
-         (key.to_string(), aggregated_to_filtered(value))
-       }).collect();
-      let backends = app.backend_data.iter().map(|(ref backend_id, ref backend_data)| {
-        let b = backend_data.iter().map(|(ref key, ref value)| {
-         (key.to_string(), aggregated_to_filtered(value))
-        }).collect();
+    pub fn dump_app_data(&mut self) -> BTreeMap<String, AppMetricsData> {
+        let data = self
+            .app_data
+            .iter()
+            .map(|(ref app_id, ref app)| {
+                let data = app
+                    .data
+                    .iter()
+                    .map(|(ref key, ref value)| (key.to_string(), aggregated_to_filtered(value)))
+                    .collect();
+                let backends = app
+                    .backend_data
+                    .iter()
+                    .map(|(ref backend_id, ref backend_data)| {
+                        let b = backend_data
+                            .iter()
+                            .map(|(ref key, ref value)| {
+                                (key.to_string(), aggregated_to_filtered(value))
+                            })
+                            .collect();
 
-        (backend_id.to_string(), b)
-      }).collect();
+                        (backend_id.to_string(), b)
+                    })
+                    .collect();
 
-      (app_id.to_string(), AppMetricsData { data, backends })
-    }).collect();
+                (app_id.to_string(), AppMetricsData { data, backends })
+            })
+            .collect();
 
-    self.app_data.clear();
+        self.app_data.clear();
 
-    data
-  }
+        data
+    }
 }
 
-
 impl Subscriber for LocalDrain {
-  fn receive_metric(&mut self, key: &'static str, app_id: Option<&str>, backend_id: Option<&str>, metric: MetricData) {
-    if let Some(id) = app_id {
-      if !self.app_data.contains_key(id) {
-        self.app_data.insert(
-          String::from(id),
-          AppMetrics {
-            data: BTreeMap::new(),
-            backend_data: BTreeMap::new(),
-          }
-        );
-      }
-
-      self.app_data.get_mut(id).map(|app| {
-        if let Some(bid) = backend_id {
-          if !app.backend_data.contains_key(bid) {
-            app.backend_data.insert(
-              String::from(bid),
-              BTreeMap::new()
-            );
-          }
-
-          app.backend_data.get_mut(bid).map(|backend_data| {
-            if !backend_data.contains_key(key) {
-              backend_data.insert(
-                String::from(key),
-                AggregatedMetric::new(metric)
-              );
-            } else {
-              backend_data.get_mut(key).map(|stored_metric| {
-                stored_metric.update(key, metric);
-              });
+    fn receive_metric(
+        &mut self,
+        key: &'static str,
+        app_id: Option<&str>,
+        backend_id: Option<&str>,
+        metric: MetricData,
+    ) {
+        if let Some(id) = app_id {
+            if !self.app_data.contains_key(id) {
+                self.app_data.insert(
+                    String::from(id),
+                    AppMetrics {
+                        data: BTreeMap::new(),
+                        backend_data: BTreeMap::new(),
+                    },
+                );
             }
-          });
-        } else if !app.data.contains_key(key) {
-          app.data.insert(
-            String::from(key),
-            AggregatedMetric::new(metric)
-          );
+
+            self.app_data.get_mut(id).map(|app| {
+                if let Some(bid) = backend_id {
+                    if !app.backend_data.contains_key(bid) {
+                        app.backend_data.insert(String::from(bid), BTreeMap::new());
+                    }
+
+                    app.backend_data.get_mut(bid).map(|backend_data| {
+                        if !backend_data.contains_key(key) {
+                            backend_data.insert(String::from(key), AggregatedMetric::new(metric));
+                        } else {
+                            backend_data.get_mut(key).map(|stored_metric| {
+                                stored_metric.update(key, metric);
+                            });
+                        }
+                    });
+                } else if !app.data.contains_key(key) {
+                    app.data
+                        .insert(String::from(key), AggregatedMetric::new(metric));
+                } else {
+                    app.data.get_mut(key).map(|stored_metric| {
+                        stored_metric.update(key, metric);
+                    });
+                }
+            });
+        } else if !self.data.contains_key(key) {
+            self.data
+                .insert(String::from(key), AggregatedMetric::new(metric));
         } else {
-          app.data.get_mut(key).map(|stored_metric| {
-            stored_metric.update(key, metric);
-          });
+            self.data.get_mut(key).map(|stored_metric| {
+                stored_metric.update(key, metric);
+            });
         }
-      });
-    } else if !self.data.contains_key(key) {
-      self.data.insert(
-        String::from(key),
-        AggregatedMetric::new(metric)
-        );
-    } else {
-      self.data.get_mut(key).map(|stored_metric| {
-        stored_metric.update(key, metric);
-      });
     }
-  }
 }
 
 /*
@@ -323,86 +338,86 @@ impl ProxyMetrics {
 }
 */
 
-#[derive(Debug,Clone)]
+#[derive(Debug, Clone)]
 pub struct TimeSerie {
-  sent_at:           Instant,
-  updated_second_at: Instant,
-  updated_minute_at: Instant,
-  last_sent:         u32,
-  last_second:       u32,
-  last_minute:       VecDeque<u32>,
-  last_hour:         VecDeque<u32>,
+    sent_at: Instant,
+    updated_second_at: Instant,
+    updated_minute_at: Instant,
+    last_sent: u32,
+    last_second: u32,
+    last_minute: VecDeque<u32>,
+    last_hour: VecDeque<u32>,
 }
 
 impl TimeSerie {
-  pub fn new() -> TimeSerie {
-    TimeSerie {
-      sent_at:           Instant::now(),
-      updated_second_at: Instant::now(),
-      updated_minute_at: Instant::now(),
-      last_sent:         0,
-      last_second:       0,
-      last_minute:       repeat(0).take(60).collect(),
-      last_hour:         repeat(0).take(60).collect(),
-    }
-  }
-
-  pub fn add(&mut self, value: u32) {
-    let now = Instant::now();
-
-    if now - self.updated_minute_at > Duration::from_secs(60) {
-      self.updated_minute_at = now;
-      let _ = self.last_hour.pop_front();
-
-      self.last_hour.push_back( self.last_minute.iter().sum() );
+    pub fn new() -> TimeSerie {
+        TimeSerie {
+            sent_at: Instant::now(),
+            updated_second_at: Instant::now(),
+            updated_minute_at: Instant::now(),
+            last_sent: 0,
+            last_second: 0,
+            last_minute: repeat(0).take(60).collect(),
+            last_hour: repeat(0).take(60).collect(),
+        }
     }
 
-    if now - self.updated_second_at > Duration::from_secs(1) {
-      self.updated_second_at = now;
-      let _ = self.last_minute.pop_front();
+    pub fn add(&mut self, value: u32) {
+        let now = Instant::now();
 
-      self.last_minute.push_back( self.last_second );
+        if now - self.updated_minute_at > Duration::from_secs(60) {
+            self.updated_minute_at = now;
+            let _ = self.last_hour.pop_front();
 
-      self.last_second = value;
-    } else {
-      self.last_second += value;
+            self.last_hour.push_back(self.last_minute.iter().sum());
+        }
+
+        if now - self.updated_second_at > Duration::from_secs(1) {
+            self.updated_second_at = now;
+            let _ = self.last_minute.pop_front();
+
+            self.last_minute.push_back(self.last_second);
+
+            self.last_second = value;
+        } else {
+            self.last_second += value;
+        }
+
+        self.last_sent += value;
     }
 
-    self.last_sent += value;
-  }
-
-  pub fn increment(&mut self) {
-    self.add(1);
-  }
-
-  pub fn filtered(&mut self) -> FilteredTimeSerie {
-    let now = Instant::now();
-
-    if now - self.updated_minute_at > Duration::from_secs(60) {
-      self.updated_minute_at = now;
-      let _ = self.last_hour.pop_front();
-
-      self.last_hour.push_back( self.last_minute.iter().sum() );
+    pub fn increment(&mut self) {
+        self.add(1);
     }
 
-    if now - self.updated_second_at > Duration::from_secs(1) {
-      self.updated_second_at = now;
-      let _ = self.last_minute.pop_front();
+    pub fn filtered(&mut self) -> FilteredTimeSerie {
+        let now = Instant::now();
 
-      self.last_minute.push_back( self.last_second );
+        if now - self.updated_minute_at > Duration::from_secs(60) {
+            self.updated_minute_at = now;
+            let _ = self.last_hour.pop_front();
 
-      self.last_second = 0;
+            self.last_hour.push_back(self.last_minute.iter().sum());
+        }
+
+        if now - self.updated_second_at > Duration::from_secs(1) {
+            self.updated_second_at = now;
+            let _ = self.last_minute.pop_front();
+
+            self.last_minute.push_back(self.last_second);
+
+            self.last_second = 0;
+        }
+
+        FilteredTimeSerie {
+            last_second: self.last_second,
+            last_minute: self.last_minute.iter().cloned().collect(),
+            last_hour: self.last_hour.iter().cloned().collect(),
+        }
     }
 
-    FilteredTimeSerie {
-      last_second: self.last_second,
-      last_minute: self.last_minute.iter().cloned().collect(),
-      last_hour:   self.last_hour.iter().cloned().collect(),
+    pub fn update_sent_at(&mut self, now: Instant) {
+        self.sent_at = now;
+        self.last_sent = 0;
     }
-  }
-
-  pub fn update_sent_at(&mut self, now: Instant) {
-    self.sent_at   = now;
-    self.last_sent = 0;
-  }
 }

@@ -2,7 +2,7 @@ use std::env;
 
 // Configuration defaults.
 
-fn main(){
+fn main() {
     // Export defaults as compile time environment variables.
     // These variables are to be set by package managers in their build script.
     // `export SOZU_CONFIG=<default configuration file> && cargo build`.
