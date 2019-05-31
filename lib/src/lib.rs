@@ -173,6 +173,7 @@ extern crate hdrhistogram;
 extern crate idna;
 extern crate webpki;
 extern crate mio_extras;
+extern crate hashbrown;
 #[cfg(test)]
 #[macro_use]
 extern crate quickcheck;
