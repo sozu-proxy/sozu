@@ -174,7 +174,7 @@ extern crate webpki;
 extern crate poule;
 extern crate lazycell;
 extern crate hashbrown;
-
+extern crate regex;
 #[cfg(test)]
 #[macro_use]
 extern crate quickcheck;
