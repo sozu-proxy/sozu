@@ -173,6 +173,8 @@ extern crate idna;
 extern crate webpki;
 extern crate poule;
 extern crate lazycell;
+extern crate hashbrown;
+
 #[cfg(test)]
 #[macro_use]
 extern crate quickcheck;
