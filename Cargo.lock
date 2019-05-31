@@ -1268,6 +1268,7 @@ dependencies = [
  "pool",
  "quickcheck",
  "rand",
+ "regex",
  "rustls",
  "slab 0.3.0",
  "sozu-command-lib",

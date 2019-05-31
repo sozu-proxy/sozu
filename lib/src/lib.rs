@@ -174,6 +174,8 @@ extern crate idna;
 extern crate webpki;
 extern crate mio_extras;
 extern crate hashbrown;
+extern crate regex;
+
 #[cfg(test)]
 #[macro_use]
 extern crate quickcheck;
