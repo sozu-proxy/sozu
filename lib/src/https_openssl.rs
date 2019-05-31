@@ -39,7 +39,7 @@ use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,SessionToken,
   ListenSession, CONN_RETRIES, push_event};
 use socket::server_bind;
-use trie::*;
+use router::trie::*;
 use protocol::{ProtocolResult,Http,Pipe,StickySession};
 use protocol::openssl::TlsHandshake;
 use protocol::http::DefaultAnswerStatus;

@@ -29,7 +29,7 @@ use super::server::{Server,ProxyChannel,ListenToken,
 use super::socket::server_bind;
 use super::retry::RetryPolicy;
 use super::protocol::http::parser::{hostname_and_port, RequestState};
-use super::trie::TrieNode;
+use router::trie::TrieNode;
 use util::UnwrapLog;
 use timer::TimeoutContainer;
 use sozu_command::ready::Ready;
