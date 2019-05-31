@@ -29,7 +29,7 @@ use {AppId,ConnectionError,Protocol,
 use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,SessionToken,ListenSession,CONN_RETRIES};
 use socket::server_bind;
-use trie::*;
+use router::trie::*;
 use protocol::StickySession;
 use protocol::http::DefaultAnswerStatus;
 use util::UnwrapLog;
