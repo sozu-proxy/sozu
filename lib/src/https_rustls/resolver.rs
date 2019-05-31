@@ -9,7 +9,7 @@ use rustls::internal::pemfile;
 use sozu_command::proxy::{CertificateAndKey, CertFingerprint, AddCertificate, RemoveCertificate};
 use sozu_command::certificate::calculate_fingerprint_from_der;
 
-use trie::TrieNode;
+use router::trie::TrieNode;
 
 struct TlsData {
   pub cert:     CertifiedKey,
