@@ -1564,6 +1564,7 @@ dependencies = [
  "poule",
  "quickcheck",
  "rand",
+ "regex",
  "rustls",
  "rusty_ulid",
  "slab",

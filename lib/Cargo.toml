@@ -44,6 +44,7 @@ foreign-types-shared = "0.1"
 poule = "0.3.2"
 lazycell = "1.2"
 hashbrown = "0.1"
+regex = "1.1"
 
 [dev-dependencies]
 tiny_http = "^0.8"
