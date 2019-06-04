@@ -8,7 +8,10 @@
       "app_id": "xxx",
       "address": "0.0.0.0:8443",
       "hostname": "yyy",
-      "path_begin": "xxx"
+      "path": {
+        "PREFIX": "xxx"
+      },
+      "position": "TREE"
     }
   }
 }
