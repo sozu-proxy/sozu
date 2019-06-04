@@ -13,7 +13,7 @@ use toml;
 
 use proxy::{CertificateAndKey,ProxyRequestData,HttpFront,TcpFront,Backend,
   HttpListener,HttpsListener,TcpListener,AddCertificate,TlsProvider,LoadBalancingParams,
-  Application, TlsVersion,ActivateListener,ListenerType};
+  Application, TlsVersion,ActivateListener,ListenerType,RulePosition,PathRule};
 
 use command::{CommandRequestData,CommandRequest,PROTOCOL_VERSION};
 
@@ -234,15 +234,27 @@ pub enum ProxyProtocolConfig {
   SendHeader,
   RelayHeader,
 }
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[serde(deny_unknown_fields)]
+pub enum PathRuleType {
+  Prefix,
+  Regex,
+}
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileAppFrontendConfig {
   pub address:           SocketAddr,
   pub hostname:          Option<String>,
-  pub path_begin:        Option<String>,
+  pub path:              Option<String>,
+  pub path_type:         Option<PathRuleType>,
   pub certificate:       Option<String>,
   pub key:               Option<String>,
   pub certificate_chain: Option<String>,
+  #[serde(default)]
+  pub position:          RulePosition,
 }
 
 impl FileAppFrontendConfig {
@@ -250,8 +262,8 @@ impl FileAppFrontendConfig {
     if self.hostname.is_some() {
       return Err(String::from("invalid 'hostname' field for TCP frontend"));
     }
-    if self.path_begin.is_some() {
-      return Err(String::from("invalid 'path_begin' field for TCP frontend"));
+    if self.path.is_some() {
+      return Err(String::from("invalid 'path_prefix' field for TCP frontend"));
     }
     if self.certificate.is_some() {
       return Err(String::from("invalid 'certificate' field for TCP frontend"));
@@ -287,13 +299,21 @@ impl FileAppFrontendConfig {
     }).ok())
       .map(split_certificate_chain);
 
+    let path = match (self.path.as_ref(), self.path_type.as_ref()) {
+      (None, _) => PathRule::Prefix("".to_string()),
+      (Some(s), Some(PathRuleType::Prefix)) => PathRule::Prefix(s.to_string()),
+      (Some(s), Some(PathRuleType::Regex)) => PathRule::Regex(s.to_string()),
+      (Some(s), None) => PathRule::Prefix(s.clone()),
+    };
+
     Ok(HttpFrontendConfig {
       address:           self.address,
       hostname:          self.hostname.clone().unwrap(),
-      path_begin:        self.path_begin.clone().unwrap_or_default(),
       certificate:       certificate_opt,
       key:               key_opt,
       certificate_chain: chain_opt,
+      position:          self.position,
+      path
     })
   }
 }
@@ -460,10 +480,12 @@ impl FileAppConfig {
 pub struct HttpFrontendConfig {
   pub address:           SocketAddr,
   pub hostname:          String,
-  pub path_begin:        String,
+  pub path:              PathRule,
   pub certificate:       Option<String>,
   pub key:               Option<String>,
   pub certificate_chain: Option<Vec<String>>,
+  #[serde(default)]
+  pub position:          RulePosition,
 }
 
 impl HttpFrontendConfig {
@@ -486,7 +508,8 @@ impl HttpFrontendConfig {
         app_id:      app_id.to_string(),
         address:     self.address,
         hostname:    self.hostname.clone(),
-        path_begin:  self.path_begin.clone(),
+        path:        self.path.clone(),
+        position:    self.position.clone(),
       }));
     } else {
       //create the front both for HTTP and HTTPS if possible
@@ -494,7 +517,8 @@ impl HttpFrontendConfig {
         app_id:     app_id.to_string(),
         address:    self.address,
         hostname:   self.hostname.clone(),
-        path_begin: self.path_begin.clone(),
+        path:       self.path.clone(),
+        position:   self.position.clone(),
       }));
     }
 

@@ -13,6 +13,7 @@ extern crate serde_json;
 extern crate mio_uds;
 extern crate libc;
 extern crate time;
+extern crate regex;
 
 #[macro_use] pub mod logging;
 pub mod certificate;

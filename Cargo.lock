@@ -1239,6 +1239,7 @@ dependencies = [
  "nix",
  "pem",
  "pool",
+ "regex",
  "serde",
  "serde_derive",
  "serde_json",
