@@ -109,7 +109,7 @@ impl<V:Debug+Clone> TrieNode<V> {
   }
 
   pub fn insert_recursive(&mut self, partial_key: &[u8], key: &Key, value: V) -> InsertResult {
-    println!("insert_rec: key == {}", std::str::from_utf8(partial_key).unwrap());
+    //println!("insert_rec: key == {}", std::str::from_utf8(partial_key).unwrap());
     assert_ne!(partial_key, &b""[..]);
 
     if partial_key[partial_key.len() - 1] == b'/' {
@@ -263,7 +263,7 @@ impl<V:Debug+Clone> TrieNode<V> {
   }
 
   pub fn lookup(&self, partial_key: &[u8]) -> Option<&KeyValue<Key,V>> {
-    println!("lookup: key == {}", std::str::from_utf8(partial_key).unwrap());
+    //println!("lookup: key == {}", std::str::from_utf8(partial_key).unwrap());
 
     if partial_key.len() == 0 {
       return self.key_value.as_ref();
@@ -279,8 +279,8 @@ impl<V:Debug+Clone> TrieNode<V> {
     match self.children.get(suffix) {
       Some(child) => child.lookup(prefix),
       None => {
-        println!("no child found, testing wildcard and regexps");
-        self.print();
+        //println!("no child found, testing wildcard and regexps");
+        //self.print();
 
         if prefix.is_empty() && self.wildcard.is_some() {
           //println!("no dot, wildcard applies");
@@ -294,10 +294,10 @@ impl<V:Debug+Clone> TrieNode<V> {
             } else {
               suffix
             };
-            println!("testing regexp: {} on suffix {}", r.as_str(), str::from_utf8(s).unwrap());
+            //println!("testing regexp: {} on suffix {}", r.as_str(), str::from_utf8(s).unwrap());
 
             if r.is_match(s) {
-              println!("matched");
+              //println!("matched");
               return child.lookup(prefix);
             }
           }
@@ -309,7 +309,7 @@ impl<V:Debug+Clone> TrieNode<V> {
   }
 
   pub fn lookup_mut(&mut self, partial_key: &[u8]) -> Option<&mut KeyValue<Key,V>> {
-    println!("lookup: key == {}", std::str::from_utf8(partial_key).unwrap());
+    //println!("lookup: key == {}", std::str::from_utf8(partial_key).unwrap());
 
     if partial_key.len() == 0 {
       return self.key_value.as_mut();
@@ -325,7 +325,7 @@ impl<V:Debug+Clone> TrieNode<V> {
     match self.children.get_mut(suffix) {
       Some(child) => child.lookup_mut(prefix),
       None => {
-        println!("no child found, testing wildcard and regexps");
+        //println!("no child found, testing wildcard and regexps");
 
         if prefix.is_empty() && self.wildcard.is_some() {
           //println!("no dot, wildcard applies");
@@ -339,10 +339,10 @@ impl<V:Debug+Clone> TrieNode<V> {
             } else {
               suffix
             };
-            println!("testing regexp: {} on suffix {}", r.as_str(), str::from_utf8(s).unwrap());
+            //println!("testing regexp: {} on suffix {}", r.as_str(), str::from_utf8(s).unwrap());
 
             if r.is_match(s) {
-              println!("matched");
+              //println!("matched");
               return child.lookup_mut(prefix);
             }
           }
