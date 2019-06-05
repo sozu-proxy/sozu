@@ -106,12 +106,17 @@ impl Router {
 
     match ::idna::domain_to_ascii(hostname) {
       Ok(hostname) => {
+        //FIXME: necessary ti build on stable rust (1.35), can be removed once 1.36 is there
+        let mut empty = true;
         if let Some((_, ref mut paths)) = self.tree.domain_lookup_mut(hostname.as_bytes(), false) {
+          empty = false;
           if paths.iter().find(|(p, _)| *p == path).is_none() {
             paths.push((path, app_id));
             return true;
           }
-        } else {
+        }
+
+        if empty {
           self.tree.domain_insert(hostname.into_bytes(), vec![(path, app_id)]);
           return true;
         }
