@@ -262,7 +262,7 @@ impl<V:Debug+Clone> TrieNode<V> {
     RemoveResult::Ok
   }
 
-  pub fn lookup(&self, partial_key: &[u8]) -> Option<&KeyValue<Key,V>> {
+  pub fn lookup(&self, partial_key: &[u8], accept_wildcard: bool) -> Option<&KeyValue<Key,V>> {
     //println!("lookup: key == {}", std::str::from_utf8(partial_key).unwrap());
 
     if partial_key.len() == 0 {
@@ -277,12 +277,12 @@ impl<V:Debug+Clone> TrieNode<V> {
     //println!("lookup: prefix|suffix: {} | {}", std::str::from_utf8(prefix).unwrap(), std::str::from_utf8(suffix).unwrap());
 
     match self.children.get(suffix) {
-      Some(child) => child.lookup(prefix),
+      Some(child) => child.lookup(prefix, accept_wildcard),
       None => {
         //println!("no child found, testing wildcard and regexps");
         //self.print();
 
-        if prefix.is_empty() && self.wildcard.is_some() {
+        if prefix.is_empty() && self.wildcard.is_some() && accept_wildcard {
           //println!("no dot, wildcard applies");
           self.wildcard.as_ref()
         } else {
@@ -298,7 +298,7 @@ impl<V:Debug+Clone> TrieNode<V> {
 
             if r.is_match(s) {
               //println!("matched");
-              return child.lookup(prefix);
+              return child.lookup(prefix, accept_wildcard);
             }
           }
 
@@ -308,7 +308,7 @@ impl<V:Debug+Clone> TrieNode<V> {
     }
   }
 
-  pub fn lookup_mut(&mut self, partial_key: &[u8]) -> Option<&mut KeyValue<Key,V>> {
+  pub fn lookup_mut(&mut self, partial_key: &[u8], accept_wildcard: bool) -> Option<&mut KeyValue<Key,V>> {
     //println!("lookup: key == {}", std::str::from_utf8(partial_key).unwrap());
 
     if partial_key.len() == 0 {
@@ -323,11 +323,11 @@ impl<V:Debug+Clone> TrieNode<V> {
     //println!("lookup: prefix|suffix: {} | {}", std::str::from_utf8(prefix).unwrap(), std::str::from_utf8(suffix).unwrap());
 
     match self.children.get_mut(suffix) {
-      Some(child) => child.lookup_mut(prefix),
+      Some(child) => child.lookup_mut(prefix, accept_wildcard),
       None => {
         //println!("no child found, testing wildcard and regexps");
 
-        if prefix.is_empty() && self.wildcard.is_some() {
+        if prefix.is_empty() && self.wildcard.is_some() && accept_wildcard {
           //println!("no dot, wildcard applies");
           self.wildcard.as_mut()
         } else {
@@ -343,7 +343,7 @@ impl<V:Debug+Clone> TrieNode<V> {
 
             if r.is_match(s) {
               //println!("matched");
-              return child.lookup_mut(prefix);
+              return child.lookup_mut(prefix, accept_wildcard);
             }
           }
 
@@ -393,12 +393,12 @@ impl<V:Debug+Clone> TrieNode<V> {
     self.remove(key)
   }
 
-  pub fn domain_lookup(&self, key: &[u8]) -> Option<&KeyValue<Key,V>> {
-    self.lookup(key)
+  pub fn domain_lookup(&self, key: &[u8], accept_wildcard: bool) -> Option<&KeyValue<Key,V>> {
+    self.lookup(key, accept_wildcard)
   }
 
-  pub fn domain_lookup_mut(&mut self, key: &[u8]) -> Option<&mut KeyValue<Key,V>> {
-    self.lookup_mut(key)
+  pub fn domain_lookup_mut(&mut self, key: &[u8], accept_wildcard: bool) -> Option<&mut KeyValue<Key,V>> {
+    self.lookup_mut(key, accept_wildcard)
   }
 
   pub fn size(&self) -> usize {
@@ -446,7 +446,7 @@ mod tests {
     assert_eq!(root.domain_insert(Vec::from(&b"abgh"[..]), 3), InsertResult::Ok);
     root.print();
 
-    assert_eq!(root.domain_lookup(&b"abce"[..]), Some(&((&b"abce"[..]).to_vec(), 2)));
+    assert_eq!(root.domain_lookup(&b"abce"[..], true), Some(&((&b"abce"[..]).to_vec(), 2)));
     //assert!(false);
   }
 
@@ -554,27 +554,27 @@ mod tests {
     assert_eq!(root.domain_insert(Vec::from(&b"/test[0-9]+/.www.hello.com"[..]), 9), InsertResult::Ok);
     root.print();
 
-    assert_eq!(root.domain_lookup(&b"example.com"[..]), None);
-    assert_eq!(root.domain_lookup(&b"blah.test.example.com"[..]), None);
-    assert_eq!(root.domain_lookup(&b"www.example.com"[..]), Some(&((&b"www.example.com"[..]).to_vec(), 1)));
-    assert_eq!(root.domain_lookup(&b"alldomains.org"[..]), Some(&((&b"alldomains.org"[..]).to_vec(), 4)));
-    assert_eq!(root.domain_lookup(&b"test.hello.com"[..]), Some(&((&b"*.hello.com"[..]).to_vec(), 7)));
-    assert_eq!(root.domain_lookup(&b"images.cdn10.hello.com"[..]), Some(&((&b"images./cdn[0-9]+/.hello.com"[..]).to_vec(), 8)));
-    assert_eq!(root.domain_lookup(&b"test42.www.hello.com"[..]), Some(&((&b"/test[0-9]+/.www.hello.com"[..]).to_vec(), 9)));
-    assert_eq!(root.domain_lookup(&b"test.alldomains.org"[..]), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
-    assert_eq!(root.domain_lookup(&b"hello.alldomains.org"[..]), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
-    assert_eq!(root.domain_lookup(&b"pouet.alldomains.org"[..]), Some(&((&b"pouet.alldomains.org"[..]).to_vec(), 5)));
-    assert_eq!(root.domain_lookup(&b"blah.test.alldomains.org"[..]), None);
+    assert_eq!(root.domain_lookup(&b"example.com"[..], true), None);
+    assert_eq!(root.domain_lookup(&b"blah.test.example.com"[..], true), None);
+    assert_eq!(root.domain_lookup(&b"www.example.com"[..], true), Some(&((&b"www.example.com"[..]).to_vec(), 1)));
+    assert_eq!(root.domain_lookup(&b"alldomains.org"[..], true), Some(&((&b"alldomains.org"[..]).to_vec(), 4)));
+    assert_eq!(root.domain_lookup(&b"test.hello.com"[..], true), Some(&((&b"*.hello.com"[..]).to_vec(), 7)));
+    assert_eq!(root.domain_lookup(&b"images.cdn10.hello.com"[..], true), Some(&((&b"images./cdn[0-9]+/.hello.com"[..]).to_vec(), 8)));
+    assert_eq!(root.domain_lookup(&b"test42.www.hello.com"[..], true), Some(&((&b"/test[0-9]+/.www.hello.com"[..]).to_vec(), 9)));
+    assert_eq!(root.domain_lookup(&b"test.alldomains.org"[..], true), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
+    assert_eq!(root.domain_lookup(&b"hello.alldomains.org"[..], true), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
+    assert_eq!(root.domain_lookup(&b"pouet.alldomains.org"[..], true), Some(&((&b"pouet.alldomains.org"[..]).to_vec(), 5)));
+    assert_eq!(root.domain_lookup(&b"blah.test.alldomains.org"[..], true), None);
 
     assert_eq!(root.domain_remove(&Vec::from(&b"alldomains.org"[..])), RemoveResult::Ok);
     println!("after remove");
     root.print();
-    assert_eq!(root.domain_lookup(&b"alldomains.org"[..]), None);
-    assert_eq!(root.domain_lookup(&b"test.alldomains.org"[..]), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
-    assert_eq!(root.domain_lookup(&b"hello.alldomains.org"[..]), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
-    assert_eq!(root.domain_lookup(&b"pouet.alldomains.org"[..]), Some(&((&b"pouet.alldomains.org"[..]).to_vec(), 5)));
-    assert_eq!(root.domain_lookup(&b"test.hello.com"[..]), Some(&((&b"*.hello.com"[..]).to_vec(), 7)));
-    assert_eq!(root.domain_lookup(&b"blah.test.alldomains.org"[..]), None);
+    assert_eq!(root.domain_lookup(&b"alldomains.org"[..], true), None);
+    assert_eq!(root.domain_lookup(&b"test.alldomains.org"[..], true), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
+    assert_eq!(root.domain_lookup(&b"hello.alldomains.org"[..], true), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
+    assert_eq!(root.domain_lookup(&b"pouet.alldomains.org"[..], true), Some(&((&b"pouet.alldomains.org"[..]).to_vec(), 5)));
+    assert_eq!(root.domain_lookup(&b"test.hello.com"[..], true), Some(&((&b"*.hello.com"[..]).to_vec(), 7)));
+    assert_eq!(root.domain_lookup(&b"blah.test.alldomains.org"[..], true), None);
   }
 
   #[test]
@@ -585,11 +585,11 @@ mod tests {
     root.domain_insert("services.clever-cloud.com".as_bytes().to_vec(), 0u8);
     root.domain_insert("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8);
 
-    let res = root.domain_lookup(b"test.services.clever-cloud.com");
+    let res = root.domain_lookup(b"test.services.clever-cloud.com", true);
     println!("query result: {:?}", res);
 
     assert_eq!(
-      root.domain_lookup(b"pgstudio.services.clever-cloud.com"),
+      root.domain_lookup(b"pgstudio.services.clever-cloud.com", true),
       Some(&("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8)));
   }
 
@@ -630,7 +630,7 @@ mod tests {
       }
 
       //match root.domain_lookup(k.as_bytes()) {
-      match root.lookup(k.as_bytes()) {
+      match root.lookup(k.as_bytes(), false) {
         None => {
           println!("did not find key '{}'", k);
           return false;

@@ -6,7 +6,8 @@ use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFront, Tcp
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
   FilteredData,
   AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend, TcpListener, ListenerType,
-  TlsVersion, QueryCertificateType, QueryAnswerCertificate, RemoveListener, ActivateListener, DeactivateListener};
+  TlsVersion, QueryCertificateType, QueryAnswerCertificate, RemoveListener, ActivateListener, DeactivateListener,
+  PathRule, RulePosition};
 
 use serde_json;
 use std::collections::{HashMap,HashSet,BTreeMap};
@@ -986,39 +987,43 @@ pub fn remove_application(channel: Channel<CommandRequest,CommandResponse>, time
 }
 
 pub fn add_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
-  address: SocketAddr, hostname: &str, path_begin: &str, https: bool) {
+  address: SocketAddr, hostname: &str, path: &str, https: bool) {
   if https {
     order_command(channel, timeout, ProxyRequestData::AddHttpsFront(HttpFront {
       app_id: String::from(app_id),
       address,
       hostname: String::from(hostname),
-      path_begin: String::from(path_begin),
+      path: PathRule::Prefix(String::from(path)),
+      position: RulePosition::Tree,
     }));
   } else {
     order_command(channel, timeout, ProxyRequestData::AddHttpFront(HttpFront {
       app_id: String::from(app_id),
       address,
       hostname: String::from(hostname),
-      path_begin: String::from(path_begin),
+      path: PathRule::Prefix(String::from(path)),
+      position: RulePosition::Tree,
     }));
   }
 }
 
 pub fn remove_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
-  address: SocketAddr, hostname: &str, path_begin: &str, https: bool) {
+  address: SocketAddr, hostname: &str, path: &str, https: bool) {
   if https {
     order_command(channel, timeout, ProxyRequestData::RemoveHttpsFront(HttpFront {
       app_id: String::from(app_id),
       address,
       hostname: String::from(hostname),
-      path_begin: String::from(path_begin),
+      path: PathRule::Prefix(String::from(path)),
+      position: RulePosition::Tree,
     }));
   } else {
     order_command(channel, timeout, ProxyRequestData::RemoveHttpFront(HttpFront {
       app_id: String::from(app_id),
       address,
       hostname: String::from(hostname),
-      path_begin: String::from(path_begin),
+      path: PathRule::Prefix(String::from(path)),
+      position: RulePosition::Tree,
     }));
   }
 }
@@ -1187,7 +1192,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
 
     let query_domain = QueryApplicationDomain {
       hostname: splitted.get(0).expect("Domain can't be empty").clone(),
-      path_begin: splitted.get(1).cloned().map(|path| format!("/{}", path)) // We add the / again because of the splitn removing it
+      path: splitted.get(1).cloned().map(|path| format!("/{}", path)) // We add the / again because of the splitn removing it
     };
 
     CommandRequestData::Proxy(ProxyRequestData::Query(Query::Applications(QueryApplicationType::Domain(query_domain))))
@@ -1237,10 +1242,10 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
               let application_headers = vec!["id", "sticky_session", "https_redirect"];
               let mut application_table = create_queried_application_table(application_headers, &data);
 
-              let http_headers = vec!["id", "hostname", "path begin"];
+              let http_headers = vec!["id", "hostname", "path"];
               let mut frontend_table = create_queried_application_table(http_headers, &data);
 
-              let https_headers = vec!["id", "hostname", "path begin"];
+              let https_headers = vec!["id", "hostname", "path"];
               let mut https_frontend_table = create_queried_application_table(https_headers, &data);
 
               let tcp_headers = vec!["id", "address"];
@@ -1314,7 +1319,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
                 let mut row = Vec::new();
                 row.push(cell!(key.app_id));
                 row.push(cell!(key.hostname));
-                row.push(cell!(key.path_begin));
+                row.push(cell!(key.path));
 
                 for val in values.iter() {
                   if keys.contains(val) {
@@ -1335,7 +1340,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
                 let mut row = Vec::new();
                 row.push(cell!(key.app_id));
                 row.push(cell!(key.hostname));
-                row.push(cell!(key.path_begin));
+                row.push(cell!(key.path));
 
                 for val in values.iter() {
                   if keys.contains(val) {

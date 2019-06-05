@@ -542,7 +542,7 @@ impl Server {
               QueryAnswer::Applications(vec!(self.config_state.application_state(app_id)))
             },
             &QueryApplicationType::Domain(ref domain) => {
-              let app_ids = get_application_ids_by_domain(&self.config_state, domain.hostname.clone(), domain.path_begin.clone());
+              let app_ids = get_application_ids_by_domain(&self.config_state, domain.hostname.clone(), domain.path.clone());
               let answer = app_ids.iter().map(|ref app_id| self.config_state.application_state(app_id)).collect();
 
               QueryAnswer::Applications(answer)

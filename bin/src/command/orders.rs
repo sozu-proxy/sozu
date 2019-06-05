@@ -571,7 +571,7 @@ impl CommandServer {
         let master = match query_type {
           QueryApplicationType::AppId(ref app_id) => vec!(self.state.application_state(app_id)),
           QueryApplicationType::Domain(ref domain) => {
-            let app_ids = get_application_ids_by_domain(&self.state, domain.hostname.clone(), domain.path_begin.clone());
+            let app_ids = get_application_ids_by_domain(&self.state, domain.hostname.clone(), domain.path.clone());
             app_ids.iter().map(|ref app_id| self.state.application_state(app_id)).collect()
           }
         };

@@ -254,6 +254,15 @@ pub enum PathRule {
   Regex(String),
 }
 
+impl std::fmt::Display for PathRule {
+  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    match self {
+      PathRule::Prefix(s) => write!(f, "prefix '{}'", s),
+      PathRule::Regex(r) => write!(f, "regexp '{}'", r.as_str()),
+    }
+  }
+}
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpFront {
     pub app_id:     String,
