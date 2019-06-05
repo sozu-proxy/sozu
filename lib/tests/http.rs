@@ -8,7 +8,7 @@ extern crate ureq;
 use std::thread;
 use sozu_command::proxy;
 use sozu_command::channel::Channel;
-use sozu_command::proxy::LoadBalancingParams;
+use sozu_command::proxy::{LoadBalancingParams, PathRule, RulePosition};
 use sozu_command::logging::{Logger,LoggerBackend};
 use tiny_http::{Server, Response};
 use std::{
@@ -70,7 +70,8 @@ fn test() {
         app_id:     String::from("test"),
         address:    "127.0.0.1:8080".parse().unwrap(),
         hostname:   String::from("example.com"),
-        path_begin: String::from("/"),
+        path:       PathRule::Prefix(String::from("/")),
+        position:   RulePosition::Tree,
     };
 
     command.write_message(&proxy::ProxyRequest {
