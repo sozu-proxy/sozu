@@ -903,12 +903,18 @@ impl Listener {
               debug!("servername is now {:?}", ssl.servername(NameType::HOST_NAME));
               return Ok(());
             } else {
-              error!("no context found for {:?}", servername);
-              *alert = SslAlert::UNRECOGNIZED_NAME;
+              error!("could not set context for {:?}", servername);
             }
+          } else {
+            error!("no context found for {:?}", servername);
           }
+        } else {
+          error!("unrecognized server name: {}", servername);
         }
+      } else {
+        error!("no server name information found");
       }
+
       *alert = SslAlert::UNRECOGNIZED_NAME;
       return Err(SniError::ALERT_FATAL);
     });
@@ -1025,12 +1031,18 @@ impl Listener {
                 debug!("servername is now {:?}", ssl.servername(NameType::HOST_NAME));
                 return Ok(());
               } else {
-                error!("no context found for {:?}", servername);
-                *alert = SslAlert::UNRECOGNIZED_NAME;
+                error!("could not set context for {:?}", servername);
               }
+            } else {
+              error!("no context found for {:?}", servername);
             }
+          } else {
+            error!("unrecognized server name: {}", servername);
           }
+        } else {
+          error!("no server name information found");
         }
+
         *alert = SslAlert::UNRECOGNIZED_NAME;
         return Err(SniError::ALERT_FATAL);
       });
