@@ -915,6 +915,7 @@ impl Listener {
         error!("no server name information found");
       }
 
+      incr!("openssl.sni.error");
       *alert = SslAlert::UNRECOGNIZED_NAME;
       return Err(SniError::ALERT_FATAL);
     });
@@ -1043,6 +1044,7 @@ impl Listener {
           error!("no server name information found");
         }
 
+        incr!("openssl.sni.error");
         *alert = SslAlert::UNRECOGNIZED_NAME;
         return Err(SniError::ALERT_FATAL);
       });
