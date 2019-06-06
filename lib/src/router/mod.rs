@@ -38,7 +38,7 @@ impl Router {
       for (rule, app_id) in path_rules.iter() {
         match rule.matches(path) {
           PathRuleResult::Regex => return Some(app_id.clone()),
-          PathRuleResult::Prefix(sz) => if sz > prefix_length {
+          PathRuleResult::Prefix(sz) => if sz >= prefix_length {
             prefix_length = sz;
             res = Some(app_id);
           },
