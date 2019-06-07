@@ -278,7 +278,9 @@ impl<V:Debug+Clone> TrieNode<V> {
         },
         None    => {
           if partial_key.len() > child_key.len() {
-            return self.children[index].domain_lookup_recursive(&partial_key[child_key.len()..]);
+            if let Some(r) = self.children[index].domain_lookup_recursive(&partial_key[child_key.len()..]) {
+              return Some(r);
+            }
           } else if partial_key.len() == child_key.len() {
             return self.children[index].key_value.as_ref();
           } else {

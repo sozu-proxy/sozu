@@ -1814,15 +1814,20 @@ mod tests {
 
     let mut trie = TrieNode::root();
 
+    trie.domain_insert("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8);
     trie.domain_insert("*.clever-cloud.com".as_bytes().to_vec(), 2u8);
     trie.domain_insert("services.clever-cloud.com".as_bytes().to_vec(), 0u8);
-    trie.domain_insert("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8);
+    trie.domain_insert("abprefix.services.clever-cloud.com".as_bytes().to_vec(), 3u8);
+    trie.domain_insert("cdprefix.services.clever-cloud.com".as_bytes().to_vec(), 4u8);
 
     let res = trie.domain_lookup(b"test.services.clever-cloud.com");
     println!("query result: {:?}", res);
 
     assert_eq!(
       trie.domain_lookup(b"pgstudio.services.clever-cloud.com"),
+      Some(&("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8)));
+    assert_eq!(
+      trie.domain_lookup(b"test-prefix.services.clever-cloud.com"),
       Some(&("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8)));
   }
 }
