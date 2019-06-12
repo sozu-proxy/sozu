@@ -630,6 +630,7 @@ impl ProxySession for Session {
       error!("PROXY\t{:?} readiness: front {:?} / back {:?} | front: {:?} | back: {:?} ",
         front_token,
         self.front_readiness(), back, front_interest, back_interest);
+      self.print_state();
 
       return SessionResult::CloseSession;
     }

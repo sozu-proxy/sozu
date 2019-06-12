@@ -618,6 +618,7 @@ impl ProxySession for Session {
       let back = self.back_readiness().cloned();
       error!("PROXY\t{:?} readiness: {:?} -> {:?} | front: {:?} | back: {:?} ", token,
         self.front_readiness(), back, front_interest, back_interest);
+      self.print_state();
 
       return SessionResult::CloseSession;
     }
