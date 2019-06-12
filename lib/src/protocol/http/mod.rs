@@ -521,7 +521,8 @@ impl<Front:SocketHandler> Http<Front> {
         let front_readiness = self.front_readiness.clone();
         let back_readiness  = self.back_readiness.clone();
         self.log_request_error(metrics,
-          &format!("front socket error, closing the connection. Readiness: {:?} -> {:?}", front_readiness, back_readiness));
+          &format!("front socket error, closing the session. Readiness: {:?} -> {:?}, read {} bytes",
+            front_readiness, back_readiness, sz));
         return SessionResult::CloseSession;
       },
       SocketResult::Closed => {
@@ -536,7 +537,8 @@ impl<Front:SocketHandler> Http<Front> {
           let front_readiness = self.front_readiness.clone();
           let back_readiness  = self.back_readiness.clone();
           self.log_request_error(metrics,
-            &format!("front socket error, closing the connection. Readiness: {:?} -> {:?}", front_readiness, back_readiness));
+            &format!("front socket was closed, closing the session. Readiness: {:?} -> {:?}, read {} bytes",
+              front_readiness, back_readiness, sz));
           return SessionResult::CloseSession;
         }
       },
