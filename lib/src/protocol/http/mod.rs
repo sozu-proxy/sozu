@@ -18,7 +18,8 @@ pub mod parser;
 mod cookies;
 
 use self::parser::{parse_request_until_stop, parse_response_until_stop,
-  RequestState, ResponseState, Chunk, Continue, RRequestLine, RStatusLine};
+  RequestState, ResponseState, Chunk, Continue, RRequestLine, RStatusLine,
+  compare_no_case};
 
 #[derive(Clone)]
 pub struct StickySession {
@@ -1021,7 +1022,7 @@ impl<Front:SocketHandler> Http<Front> {
     // isolate that here because the "ref protocol" and the self.state = " make borrowing conflicts
     if let Some(ResponseState::ResponseUpgrade(_,_, ref protocol)) = self.response {
       debug!("got an upgrade state[{}]: {:?}", line!(), protocol);
-      if protocol == "websocket" {
+      if compare_no_case(protocol.as_bytes(), "websocket".as_bytes()) {
         return (ProtocolResult::Upgrade, SessionResult::Continue);
       } else {
         //FIXME: should we upgrade to a pipe or send an error?
@@ -1131,7 +1132,7 @@ impl<Front:SocketHandler> Http<Front> {
 
         if let Some(ResponseState::ResponseUpgrade(_,_, ref protocol)) = self.response {
           debug!("got an upgrade state[{}]: {:?}", line!(), protocol);
-          if protocol == "websocket" {
+          if compare_no_case(protocol.as_bytes(), "websocket".as_bytes()) {
             return (ProtocolResult::Upgrade, SessionResult::Continue);
           } else {
             //FIXME: should we upgrade to a pipe or send an error?
