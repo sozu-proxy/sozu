@@ -666,6 +666,7 @@ impl ProxySession for Session {
 
     if counter == max_loop_iterations {
       error!("PROXY\thandling session {:?} went through {} iterations, there's a probable infinite loop bug, closing the connection", self.frontend_token, max_loop_iterations);
+      incr!("https_rustls.infinite_loop.error");
 
       let front_interest = self.front_readiness().interest & self.front_readiness().event;
       let back_interest  = self.back_readiness().map(|r| r.interest & r.event);
