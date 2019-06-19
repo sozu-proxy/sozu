@@ -377,11 +377,17 @@ impl<Front:SocketHandler> Http<Front> {
       }
     }
 
-    info_access!("{}{} -> {}\t{} {} {} {}\t{} {} {}",
+    let proto = match self.protocol() {
+      Protocol::HTTP  => "HTTP",
+      Protocol::HTTPS => "HTTPS",
+      _               => unreachable!()
+    };
+
+    info_access!("{}{} -> {}\t{} {} {} {}\t{} {} {}\t{}",
       self.log_ctx, session, backend,
       LogDuration(response_time), LogDuration(service_time),
       metrics.bin, metrics.bout,
-      status_line, host, request_line);
+      proto, host, request_line, status_line);
   }
 
   pub fn log_default_answer_success(&self, metrics: &SessionMetrics) {
@@ -411,11 +417,17 @@ impl<Front:SocketHandler> Http<Front> {
     }
     incr!("http.errors");
 
-    info_access!("{}{} -> X\t{} {} {} {}\t{} {} {}",
+    let proto = match self.protocol() {
+      Protocol::HTTP  => "HTTP",
+      Protocol::HTTPS => "HTTPS",
+      _               => unreachable!()
+    };
+
+    info_access!("{}{} -> X\t{} {} {} {}\t{} {} {}\t{}",
       self.log_ctx, session,
       LogDuration(response_time), LogDuration(service_time),
       metrics.bin, metrics.bout,
-      status_line, host, request_line);
+      proto, host, request_line, status_line);
   }
 
   pub fn log_request_error(&mut self, metrics: &mut SessionMetrics, message: &str) {
@@ -453,10 +465,16 @@ impl<Front:SocketHandler> Http<Front> {
       }
     }*/
 
-    error_access!("{}{} -> {}\t{} {} {} {}\t{} {} {} | {}",
+    let proto = match self.protocol() {
+      Protocol::HTTP  => "HTTP",
+      Protocol::HTTPS => "HTTPS",
+      _               => unreachable!()
+    };
+
+    error_access!("{}{} -> {}\t{} {} {} {}\t{} {} {}\t{} | {}",
       self.log_ctx, session, backend,
       LogDuration(response_time), LogDuration(service_time), metrics.bin, metrics.bout,
-      status_line, host, request_line, message);
+      proto, host, request_line, status_line, message);
   }
 
   // Read content from the session
