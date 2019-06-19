@@ -49,7 +49,7 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
     }
   } else if target.starts_with("unix://") {
     let path = Path::new(&target[7..]);
-    if !path.is_file() {
+    if !path.exists() {
       println!("invalid log target configuration: {} is not a file", &target[7..]);
       LoggerBackend::Stdout(stdout())
     } else {
