@@ -71,6 +71,8 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       if self.index == self.buf.len() {
         self.readiness.interest.remove(Ready::readable());
       }
+    } else {
+      self.readiness.event.remove(Ready::readable());
     }
 
     if res == SocketResult::Error {
