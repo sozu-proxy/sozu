@@ -225,12 +225,12 @@ impl ConfigState {
       },
       &ProxyRequestData::AddBackend(ref backend)  => {
         let backend_vec = self.backends.entry(backend.app_id.clone()).or_insert_with(Vec::new);
-        if !backend_vec.contains(&backend) {
-          backend_vec.push(backend.clone());
-          true
-        } else {
-          false
-        }
+
+        // we might be modifying the sticky id or load balancing parameters
+        backend_vec.retain(|b| b.backend_id != backend.backend_id);
+        backend_vec.push(backend.clone());
+
+        true
       },
       &ProxyRequestData::RemoveBackend(ref backend) => {
         if let Some(backend_list) = self.backends.get_mut(&backend.app_id) {
@@ -715,4 +715,31 @@ mod tests {
     assert_eq!(get_application_ids_by_domain(&config, String::from("lolcathost"), None), empty);
     assert_eq!(get_application_ids_by_domain(&config, String::from("lolcathost"), Some(String::from("/sozu"))), empty);
   }
+
+  #[test]
+  fn duplicate_backends() {
+    let mut state:ConfigState = Default::default();
+    state.handle_order(&ProxyRequestData::AddBackend(Backend {
+      app_id: String::from("app_1"),
+      backend_id: String::from("app_1-0"),
+      address: "127.0.0.1:1026".parse().unwrap(),
+      load_balancing_parameters: Some(LoadBalancingParams::default()),
+      sticky_id: None,
+      backup: None
+    }));
+
+    let b = Backend {
+      app_id: String::from("app_1"),
+      backend_id: String::from("app_1-0"),
+      address: "127.0.0.1:1026".parse().unwrap(),
+      load_balancing_parameters: Some(LoadBalancingParams::default()),
+      sticky_id: Some("sticky".to_string()),
+      backup: None
+    };
+
+    state.handle_order(&ProxyRequestData::AddBackend(b.clone()));
+
+    assert_eq!(state.backends.get("app_1").unwrap(), &vec![b]);
+  }
+
 }
