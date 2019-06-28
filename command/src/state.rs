@@ -355,53 +355,53 @@ impl ConfigState {
     let added_tcp_listeners: Vec<&SocketAddr> = their_tcp_listeners.difference(&my_tcp_listeners)
       .cloned().collect();
 
-    let mut my_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
+    let mut my_http_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
     for (ref app_id, ref front_list) in self.http_fronts.iter() {
       for ref front in front_list.iter() {
-        my_fronts.insert((&app_id, &front));
+        my_http_fronts.insert((&app_id, &front));
       }
     }
-    let mut their_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
+    let mut their_http_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
     for (ref app_id, ref front_list) in other.http_fronts.iter() {
       for ref front in front_list.iter() {
-        their_fronts.insert((&app_id, &front));
+        their_http_fronts.insert((&app_id, &front));
       }
     }
 
-    let removed_http_fronts = my_fronts.difference(&their_fronts);
-    let added_http_fronts   = their_fronts.difference(&my_fronts);
+    let removed_http_fronts = my_http_fronts.difference(&their_http_fronts);
+    let added_http_fronts   = their_http_fronts.difference(&my_http_fronts);
 
-    let mut my_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
+    let mut my_https_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
     for (ref app_id, ref front_list) in self.https_fronts.iter() {
       for ref front in front_list.iter() {
-        my_fronts.insert((&app_id, &front));
+        my_https_fronts.insert((&app_id, &front));
       }
     }
-    let mut their_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
+    let mut their_https_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
     for (ref app_id, ref front_list) in other.https_fronts.iter() {
       for ref front in front_list.iter() {
-        their_fronts.insert((&app_id, &front));
+        their_https_fronts.insert((&app_id, &front));
       }
     }
 
-    let removed_https_fronts = my_fronts.difference(&their_fronts);
-    let added_https_fronts   = their_fronts.difference(&my_fronts);
+    let removed_https_fronts = my_https_fronts.difference(&their_https_fronts);
+    let added_https_fronts   = their_https_fronts.difference(&my_https_fronts);
 
-    let mut my_fronts: HashSet<(&AppId, &TcpFront)> = HashSet::new();
+    let mut my_tcp_fronts: HashSet<(&AppId, &TcpFront)> = HashSet::new();
     for (ref app_id, ref front_list) in self.tcp_fronts.iter() {
       for ref front in front_list.iter() {
-        my_fronts.insert((&app_id, &front));
+        my_tcp_fronts.insert((&app_id, &front));
       }
     }
-    let mut their_fronts: HashSet<(&AppId, &TcpFront)> = HashSet::new();
+    let mut their_tcp_fronts: HashSet<(&AppId, &TcpFront)> = HashSet::new();
     for (ref app_id, ref front_list) in other.tcp_fronts.iter() {
       for ref front in front_list.iter() {
-        their_fronts.insert((&app_id, &front));
+        their_tcp_fronts.insert((&app_id, &front));
       }
     }
 
-    let removed_tcp_fronts = my_fronts.difference(&their_fronts);
-    let added_tcp_fronts   = their_fronts.difference(&my_fronts);
+    let removed_tcp_fronts = my_tcp_fronts.difference(&their_tcp_fronts);
+    let added_tcp_fronts   = their_tcp_fronts.difference(&my_tcp_fronts);
 
     let mut my_backends: HashSet<(&AppId, &Backend)> = HashSet::new();
     for (ref app_id, ref backend_list) in self.backends.iter() {

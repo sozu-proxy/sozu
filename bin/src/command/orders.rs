@@ -169,12 +169,15 @@ impl CommandServer {
 
         info!("starting to load state from {}", path);
 
-        let mut counter = 0;
+        let mut message_counter = 0;
+        let mut diff_counter = 0;
+
         let mut futures = Vec::new();
         loop {
           let previous = buffer.available_data();
           //FIXME: we should read in streaming here
           if let Ok(sz) = file.read(buffer.space()) {
+            error!("load_state read {} bytes from file", sz);
             buffer.fill(sz);
           } else {
             error!("error reading state file");
@@ -192,6 +195,7 @@ impl CommandServer {
               if i.len() > 0 {
                 //info!("could not parse {} bytes", i.len());
                 if previous == buffer.available_data() {
+                  error!("error consuming load state message");
                   break;
                 }
               }
@@ -200,16 +204,18 @@ impl CommandServer {
               let mut new_state = self.state.clone();
               for message in orders {
                 if let CommandRequestData::Proxy(order) = message.data {
+                  message_counter += 1;
                   new_state.handle_order(&order);
                 }
               }
 
               let diff = self.state.diff(&new_state);
               for order in diff {
+                diff_counter += 1;
                 self.state.handle_order(&order);
 
                 let mut found = false;
-                let id = format!("LOAD-STATE-{}-{}", message_id, counter);
+                let id = format!("LOAD-STATE-{}-{}", message_id, diff_counter);
 
                 for ref mut worker in self.workers.values_mut()
                   .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
@@ -220,7 +226,6 @@ impl CommandServer {
                   found = true;
 
                 }
-                counter += 1;
 
                 if !found {
                   // FIXME: should send back error here
@@ -240,9 +245,13 @@ impl CommandServer {
             },
           }
           buffer.consume(offset);
+          error!("load_state consumed {} bytes from buffer", offset);
         }
-        if counter > 0 {
-          info!("state loaded from {}, will start sending {} messages to workers", path, counter);
+
+        error!("stopped loading data from file, remaining: {} bytes, saw {} messages, generated {} diff messages",
+          buffer.available_data(), message_counter, diff_counter);
+        if diff_counter > 0 {
+          info!("state loaded from {}, will start sending {} messages to workers", path, diff_counter);
           let id = message_id.to_string();
           executor::Executor::execute(
             //FIXME: join_all will stop at the first error, and we will end up accumulating messages
