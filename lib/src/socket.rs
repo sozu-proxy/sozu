@@ -92,7 +92,6 @@ impl SocketHandler for SslStream<TcpStream> {
               return (size, SocketResult::Error)
             },
             ErrorCode::SYSCALL    => {
-              error!("SOCKET-TLS\treadable TLS socket syscall error: {:?}", e);
               return (size, SocketResult::Error)
             },
             ErrorCode::ZERO_RETURN => {

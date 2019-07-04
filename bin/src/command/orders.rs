@@ -177,7 +177,6 @@ impl CommandServer {
           let previous = buffer.available_data();
           //FIXME: we should read in streaming here
           if let Ok(sz) = file.read(buffer.space()) {
-            error!("load_state read {} bytes from file", sz);
             buffer.fill(sz);
           } else {
             error!("error reading state file");
@@ -245,7 +244,6 @@ impl CommandServer {
             },
           }
           buffer.consume(offset);
-          error!("load_state consumed {} bytes from buffer", offset);
         }
 
         error!("stopped loading data from file, remaining: {} bytes, saw {} messages, generated {} diff messages",
