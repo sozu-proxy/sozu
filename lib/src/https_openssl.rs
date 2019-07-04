@@ -1374,10 +1374,14 @@ impl ProxyConfiguration<Session> for Proxy {
     let app_id = self.app_id_from_request(session)?;
 
     if (session.http().and_then(|h| h.app_id.as_ref()) == Some(&app_id)) && session.back_connected == BackendConnectionStatus::Connected {
-      if session.backend.as_ref().map(|backend| {
+      let has_backend = session.backend.as_ref().map(|backend| {
          let ref backend = *backend.borrow();
          self.backends.borrow().has_backend(&app_id, backend)
-      }).unwrap_or(false) {
+        }).unwrap_or(false);
+
+      let is_valid_backend_socket = has_backend && session.http().map(|h| h.test_back_socket()).unwrap_or(false);
+
+      if is_valid_backend_socket {
         //matched on keepalive
         session.metrics.backend_id = session.backend.as_ref().map(|i| i.borrow().backend_id.clone());
         session.metrics.backend_start();

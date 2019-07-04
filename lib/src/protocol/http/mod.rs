@@ -233,6 +233,28 @@ impl<Front:SocketHandler> Http<Front> {
     self.backend_token
   }
 
+  pub fn test_back_socket(&mut self) -> bool {
+    match self.backend {
+      Some(ref mut s) => {
+        let mut tmp = [0u8; 1];
+        let res = s.peek(&mut tmp[..]);
+
+        match res {
+          // if the socket is half open, it will report 0 bytes read (EOF)
+          Ok(0) => false,
+          Ok(_) => true,
+          Err(e) => match e.kind() {
+             std::io::ErrorKind::WouldBlock => true,
+             _ => false,
+          }
+        }
+      },
+      None => {
+        false
+      }
+    }
+  }
+
   pub fn close(&mut self) {
   }
 
