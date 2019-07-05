@@ -26,7 +26,7 @@ use super::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,Sessi
 use super::backends::BackendMap;
 use super::pool::Pool;
 use super::protocol::{ProtocolResult,StickySession,Http,Pipe};
-use super::protocol::http::{DefaultAnswerStatus, answers::{DefaultAnswers, CustomAnswers, HttpAnswers}};
+use super::protocol::http::{DefaultAnswerStatus, TimeoutStatus, answers::{DefaultAnswers, CustomAnswers, HttpAnswers}};
 use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use super::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,
   ListenSession, CONN_RETRIES, push_event};
@@ -61,12 +61,13 @@ pub struct Session {
   last_event:         SteadyTime,
   pub listen_token:   Token,
   connection_attempt: u8,
+  answers:            Rc<RefCell<HttpAnswers>>,
 }
 
 impl Session {
   pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: Option<SocketAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout,
-    listen_token: Token) -> Option<Session> {
+    answers: Rc<RefCell<HttpAnswers>>, listen_token: Token) -> Option<Session> {
     let request_id = Uuid::new_v4().to_hyphenated();
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
@@ -92,6 +93,7 @@ impl Session {
         last_event:         SteadyTime::now(),
         listen_token,
         connection_attempt: 0,
+        answers,
       };
 
       session.front_readiness().interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
@@ -434,14 +436,28 @@ impl ProxySession for Session {
     result
   }
 
-  fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult {
+  fn timeout(&mut self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult {
     if self.frontend_token == token {
       let dur = SteadyTime::now() - self.last_event;
       if dur < *front_timeout {
         timer.set_timeout((*front_timeout - dur).to_std().unwrap(), token);
         SessionResult::Continue
       } else {
-        SessionResult::CloseSession
+        match self.http().map(|h| h.timeout_status()) {
+          Some(TimeoutStatus::Request) => {
+            let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer408, None);
+            self.set_answer(DefaultAnswerStatus::Answer408, answer);
+            self.writable()
+          },
+          Some(TimeoutStatus::Response) => {
+            let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer504, None);
+            self.set_answer(DefaultAnswerStatus::Answer504, answer);
+            self.writable()
+          },
+          _ => {
+            SessionResult::CloseSession
+          }
+        }
       }
     } else {
       SessionResult::Continue
@@ -1180,7 +1196,7 @@ impl ProxyConfiguration<Session> for Proxy {
       }
       if let Some(c) = Session::new(frontend_sock, session_token, Rc::downgrade(&self.pool),
       listener.config.public_address, listener.config.expect_proxy, listener.config.sticky_name.clone(), timeout,
-      listener.token) {
+      listener.answers.clone(), listener.token) {
         if let Err(e) = poll.register(
           c.front_socket(),
           session_token,

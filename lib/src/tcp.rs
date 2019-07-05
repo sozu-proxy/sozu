@@ -449,7 +449,7 @@ impl ProxySession for Session {
     result
   }
 
-  fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult {
+  fn timeout(&mut self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult {
     if self.frontend_token == token {
       let dur = SteadyTime::now() - self.last_event;
       if dur < *front_timeout {

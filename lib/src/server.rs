@@ -1359,7 +1359,7 @@ impl ProxySession for ListenSession {
   fn close_backend(&mut self, _token: Token, _poll: &mut Poll) {
   }
 
-  fn timeout(&self, _token: Token, _timer: &mut Timer<Token>, _front_timeout: &time::Duration) -> SessionResult {
+  fn timeout(&mut self, _token: Token, _timer: &mut Timer<Token>, _front_timeout: &time::Duration) -> SessionResult {
     unimplemented!();
   }
 

@@ -19,7 +19,7 @@ use {Backend,SessionResult,Protocol,Readiness,SessionMetrics, ProxySession,
 use socket::FrontRustls;
 use protocol::{ProtocolResult,Http,Pipe};
 use protocol::rustls::TlsHandshake;
-use protocol::http::DefaultAnswerStatus;
+use protocol::http::{DefaultAnswerStatus, TimeoutStatus, answers::HttpAnswers};
 use protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use retry::RetryPolicy;
 use util::UnwrapLog;
@@ -48,11 +48,13 @@ pub struct Session {
   pub listen_token:   Token,
   pub connection_attempt: u8,
   peer_address:       Option<SocketAddr>,
+  answers:            Rc<RefCell<HttpAnswers>>,
 }
 
 impl Session {
   pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
-    public_address: Option<SocketAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout, listen_token: Token) -> Session {
+    public_address: Option<SocketAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout,
+    answers: Rc<RefCell<HttpAnswers>>, listen_token: Token) -> Session {
     let peer_address = if expect_proxy {
       // Will be defined later once the expect proxy header has been received and parsed
       None
@@ -84,7 +86,8 @@ impl Session {
       last_event:     SteadyTime::now(),
       listen_token,
       connection_attempt: 0,
-      peer_address
+      peer_address,
+      answers,
     };
     session.front_readiness().interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
     session
@@ -491,14 +494,28 @@ impl ProxySession for Session {
     result
   }
 
-  fn timeout(&self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult {
+  fn timeout(&mut self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult {
     if self.frontend_token == token {
       let dur = SteadyTime::now() - self.last_event;
       if dur < *front_timeout {
         timer.set_timeout((*front_timeout - dur).to_std().unwrap(), token);
         SessionResult::Continue
       } else {
-        SessionResult::CloseSession
+        match self.http().map(|h| h.timeout_status()) {
+          Some(TimeoutStatus::Request) => {
+            let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer408, None);
+            self.set_answer(DefaultAnswerStatus::Answer408, answer);
+            self.writable()
+          },
+          Some(TimeoutStatus::Response) => {
+            let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer504, None);
+            self.set_answer(DefaultAnswerStatus::Answer504, answer);
+            self.writable()
+          },
+          _ => {
+            SessionResult::CloseSession
+          }
+        }
       }
     } else {
       //invalid token, obsolete timeout triggered

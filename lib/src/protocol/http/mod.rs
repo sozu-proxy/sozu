@@ -53,6 +53,12 @@ pub enum DefaultAnswerStatus {
   Answer504,
 }
 
+#[derive(Debug,Clone,Copy,PartialEq)]
+pub enum TimeoutStatus {
+  Request,
+  Response,
+}
+
 pub struct Http<Front:SocketHandler> {
   pub frontend:       Front,
   pub backend:        Option<TcpStream>,
@@ -317,6 +323,16 @@ impl<Front:SocketHandler> Http<Front> {
       }
     }
     None
+  }
+
+  pub fn timeout_status(&self) -> TimeoutStatus {
+    match self.request.as_ref() {
+      Some(RequestState::Request(_,_,_)) | Some(RequestState::RequestWithBody(_,_,_,_)) |
+        Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
+          TimeoutStatus::Response
+      },
+      _ => TimeoutStatus::Request,
+    }
   }
 
   pub fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
