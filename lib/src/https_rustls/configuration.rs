@@ -24,13 +24,12 @@ use sozu_command::proxy::{Application,
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
 
-use protocol::http::parser::{RRequestLine,hostname_and_port};
+use protocol::http::{parser::{RRequestLine,hostname_and_port}, answers::{DefaultAnswers, CustomAnswers, HttpAnswers}};
 use pool::Pool;
 use {AppId,ConnectionError,Protocol,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus};
 use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession,CONN_RETRIES};
-use http::{DefaultAnswers, CustomAnswers};
 use socket::server_bind;
 use trie::*;
 use protocol::StickySession;
@@ -54,7 +53,7 @@ pub struct Listener {
   listener:   Option<TcpListener>,
   address:    SocketAddr,
   fronts:     TrieNode<Vec<TlsApp>>,
-  answers:    DefaultAnswers,
+  answers:    Rc<RefCell<HttpAnswers>>,
   config:     HttpsListener,
   ssl_config: Arc<ServerConfig>,
   resolver:   Arc<CertificateResolverWrapper>,
@@ -64,14 +63,6 @@ pub struct Listener {
 
 impl Listener {
   pub fn new(config: HttpsListener, token: Token) -> Listener {
-
-    let default = DefaultAnswers {
-      NotFound: Rc::new(Vec::from(config.answer_404.as_bytes())),
-      ServiceUnavailable: Rc::new(Vec::from(config.answer_503.as_bytes())),
-      BadRequest: Rc::new(Vec::from(
-        &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-      )),
-    };
 
     let mut server_config = ServerConfig::new(NoClientAuth::new());
     server_config.versions = config.versions.iter().map(|version| {
@@ -112,7 +103,7 @@ impl Listener {
     Listener {
       address:    config.front.clone(),
       fronts:     TrieNode::root(),
-      answers:    default,
+      answers:    Rc::new(RefCell::new(HttpAnswers::new(&config.answer_404, &config.answer_503))),
       ssl_config: Arc::new(server_config),
       listener: None,
       config,
@@ -279,7 +270,6 @@ impl Listener {
 pub struct Proxy {
   listeners:      HashMap<Token, Listener>,
   applications:   HashMap<AppId, Application>,
-  custom_answers: HashMap<AppId, CustomAnswers>,
   backends:       Rc<RefCell<BackendMap>>,
   pool:           Rc<RefCell<Pool<Buffer>>>,
 }
@@ -289,7 +279,6 @@ impl Proxy {
     Proxy {
       listeners : HashMap::new(),
       applications: HashMap::new(),
-      custom_answers: HashMap::new(),
       backends,
       pool,
     }
@@ -322,10 +311,9 @@ impl Proxy {
 
   pub fn add_application(&mut self, mut application: Application) {
     if let Some(answer_503) = application.answer_503.take() {
-      self.custom_answers
-        .entry(application.app_id.clone())
-        .and_modify(|c| c.ServiceUnavailable = Some(Rc::new(answer_503.clone().into_bytes())))
-        .or_insert(CustomAnswers{ ServiceUnavailable: Some(Rc::new(answer_503.into_bytes())) });
+      for l in self.listeners.values_mut() {
+        l.answers.borrow_mut().add_custom_answer(&application.app_id, &answer_503);
+      }
     }
 
     self.applications.insert(application.app_id.clone(), application);
@@ -333,7 +321,10 @@ impl Proxy {
 
   pub fn remove_application(&mut self, app_id: &str) {
     self.applications.remove(app_id);
-    self.custom_answers.remove(app_id);
+
+    for l in self.listeners.values_mut() {
+      l.answers.borrow_mut().remove_custom_answer(app_id);
+    }
   }
 
   pub fn backend_from_request(&mut self, session: &mut Session, app_id: &str,
@@ -381,7 +372,7 @@ impl Proxy {
     let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("invalid remaining chars after hostname");
-        let answer = self.listeners[&session.listen_token].answers.BadRequest.clone();
+        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
         session.set_answer(DefaultAnswerStatus::Answer400, answer);
         return Err(ConnectionError::InvalidHost);
       }
@@ -396,7 +387,7 @@ impl Proxy {
         .and_then(|h| h.frontend.session.get_sni_hostname()).map(|s| s.to_string());
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
         error!("TLS SNI hostname '{:?}' and Host header '{}' don't match", servername, hostname_str);
-        let answer = self.listeners[&session.listen_token].answers.NotFound.clone();
+        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
         unwrap_msg!(session.http()).set_answer(DefaultAnswerStatus::Answer404, answer);
         return Err(ConnectionError::HostNotFound);
       }
@@ -410,7 +401,7 @@ impl Proxy {
       }
     } else {
       error!("hostname parsing failed");
-      let answer = self.listeners[&session.listen_token].answers.BadRequest.clone();
+      let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
       session.set_answer(DefaultAnswerStatus::Answer400, answer);
       return Err(ConnectionError::InvalidHost);
     };
@@ -423,7 +414,7 @@ impl Proxy {
       .map(|ref front| front.app_id.clone()) {
       Some(app_id) => Ok(app_id),
       None => {
-        let answer = self.listeners[&session.listen_token].answers.NotFound.clone();
+        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
         session.set_answer(DefaultAnswerStatus::Answer404, answer);
         Err(ConnectionError::HostNotFound)
       }
@@ -442,11 +433,7 @@ impl Proxy {
   }
 
   fn get_service_unavailable_answer(&self, app_id: Option<&str>, listen_token: &Token) -> Rc<Vec<u8>> {
-    if let Some(answer_service_unavailable) = app_id.and_then(|app_id| self.custom_answers.get(app_id).and_then(|c| c.ServiceUnavailable.as_ref())) {
-      answer_service_unavailable.clone()
-    } else {
-      self.listeners[&listen_token].answers.ServiceUnavailable.clone()
-    }
+    self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer503, app_id)
   }
 }
 

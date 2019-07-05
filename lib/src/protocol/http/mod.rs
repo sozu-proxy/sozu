@@ -16,6 +16,7 @@ use util::UnwrapLog;
 
 pub mod parser;
 mod cookies;
+pub mod answers;
 
 use self::parser::{parse_request_until_stop, parse_response_until_stop,
   RequestState, ResponseState, Chunk, Continue, RRequestLine, RStatusLine,
@@ -46,8 +47,10 @@ pub enum DefaultAnswerStatus {
   Answer301,
   Answer400,
   Answer404,
-  Answer503,
+  Answer408,
   Answer413,
+  Answer503,
+  Answer504,
 }
 
 pub struct Http<Front:SocketHandler> {
@@ -167,8 +170,10 @@ impl<Front:SocketHandler> Http<Front> {
         DefaultAnswerStatus::Answer301 => incr!("http.301.redirection"),
         DefaultAnswerStatus::Answer400 => incr!("http.400.errors"),
         DefaultAnswerStatus::Answer404 => incr!("http.404.errors"),
+        DefaultAnswerStatus::Answer408 => incr!("http.408.errors"),
         DefaultAnswerStatus::Answer413 => incr!("http.413.errors"),
         DefaultAnswerStatus::Answer503 => incr!("http.503.errors"),
+        DefaultAnswerStatus::Answer504 => incr!("http.504.errors"),
       };
     }
 
@@ -424,8 +429,10 @@ impl<Front:SocketHandler> Http<Front> {
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer301, _, _) => "301 Moved Permanently",
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer400, _, _) => "400 Bad Request",
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer404, _, _) => "404 Not Found",
-      SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer503, _, _) => "503 Service Unavailable",
+      SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer408, _, _) => "408 Request Timeout",
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer413, _, _) => "413 Payload Too Large",
+      SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer503, _, _) => "503 Service Unavailable",
+      SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer504, _, _) => "504 Gateway Timeout",
     };
 
     let host         = self.get_host().unwrap_or_else(|| String::from("-"));

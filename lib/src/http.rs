@@ -26,7 +26,7 @@ use super::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,Sessi
 use super::backends::BackendMap;
 use super::pool::Pool;
 use super::protocol::{ProtocolResult,StickySession,Http,Pipe};
-use super::protocol::http::DefaultAnswerStatus;
+use super::protocol::http::{DefaultAnswerStatus, answers::{DefaultAnswers, CustomAnswers, HttpAnswers}};
 use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use super::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,
   ListenSession, CONN_RETRIES, push_event};
@@ -664,37 +664,23 @@ impl ProxySession for Session {
   }
 }
 
-#[allow(non_snake_case)]
-pub struct DefaultAnswers {
-  pub NotFound:           Rc<Vec<u8>>,
-  pub ServiceUnavailable: Rc<Vec<u8>>,
-  pub BadRequest:         Rc<Vec<u8>>,
-}
-
-
-#[allow(non_snake_case)]
-pub struct CustomAnswers {
-  pub ServiceUnavailable: Option<Rc<Vec<u8>>>,
-}
-
 pub type Hostname = String;
 
 pub struct Listener {
   listener:       Option<TcpListener>,
   pub address:    SocketAddr,
   fronts:         TrieNode<Vec<HttpFront>>,
-  answers:        DefaultAnswers,
+  answers:        Rc<RefCell<HttpAnswers>>,
   config:         HttpListener,
   pub token:      Token,
   pub active:     bool,
 }
 
 pub struct Proxy {
-  listeners:      HashMap<Token,Listener>,
-  backends:       Rc<RefCell<BackendMap>>,
-  applications:   HashMap<AppId, Application>,
-  custom_answers: HashMap<AppId, CustomAnswers>,
-  pool:           Rc<RefCell<Pool<Buffer>>>,
+  listeners:    HashMap<Token,Listener>,
+  backends:     Rc<RefCell<BackendMap>>,
+  applications: HashMap<AppId, Application>,
+  pool:         Rc<RefCell<Pool<Buffer>>>,
 }
 
 impl Proxy {
@@ -702,7 +688,6 @@ impl Proxy {
     Proxy {
       listeners:      HashMap::new(),
       applications:   HashMap::new(),
-      custom_answers: HashMap::new(),
       backends,
       pool,
     }
@@ -734,11 +719,10 @@ impl Proxy {
   }
 
   pub fn add_application(&mut self, mut application: Application) {
-    if let Some(answer_503) = application.answer_503.take() {
-      self.custom_answers
-        .entry(application.app_id.clone())
-        .and_modify(|c| c.ServiceUnavailable = Some(Rc::new(answer_503.clone().into_bytes())))
-        .or_insert(CustomAnswers{ ServiceUnavailable: Some(Rc::new(answer_503.into_bytes())) });
+    if let Some(answer_503) = application.answer_503.as_ref() {
+      for l in self.listeners.values_mut() {
+        l.answers.borrow_mut().add_custom_answer(&application.app_id, &answer_503);
+      }
     }
 
     self.applications.insert(application.app_id.clone(), application);
@@ -746,7 +730,10 @@ impl Proxy {
 
   pub fn remove_application(&mut self, app_id: &str) {
     self.applications.remove(app_id);
-    self.custom_answers.remove(app_id);
+
+    for l in self.listeners.values_mut() {
+      l.answers.borrow_mut().remove_custom_answer(app_id);
+    }
   }
 
   pub fn backend_from_request(&mut self, session: &mut Session, app_id: &str,
@@ -796,7 +783,7 @@ impl Proxy {
     let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
-        let answer = self.listeners[&session.listen_token].answers.BadRequest.clone();
+        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
         session.set_answer(DefaultAnswerStatus::Answer400, answer);
         return Err(ConnectionError::InvalidHost);
       }
@@ -813,7 +800,7 @@ impl Proxy {
       }
     } else {
       error!("hostname parsing failed for: '{}'", h);
-      let answer = self.listeners[&session.listen_token].answers.BadRequest.clone();
+      let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
       session.set_answer(DefaultAnswerStatus::Answer400, answer);
       return Err(ConnectionError::InvalidHost);
     };
@@ -826,7 +813,7 @@ impl Proxy {
       .map(|ref front| front.app_id.clone()) {
       Some(app_id) => app_id,
       None => {
-        let answer = self.listeners[&session.listen_token].answers.NotFound.clone();
+        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
         session.set_answer(DefaultAnswerStatus::Answer404, answer);
         return Err(ConnectionError::HostNotFound);
       }
@@ -854,30 +841,17 @@ impl Proxy {
   }
 
   fn get_service_unavailable_answer(&self, app_id: Option<&str>, listen_token: Token) -> Rc<Vec<u8>> {
-    if let Some(answer_service_unavailable) = app_id.and_then(|app_id| self.custom_answers.get(app_id).and_then(|c| c.ServiceUnavailable.as_ref())) {
-      answer_service_unavailable.clone()
-    } else {
-      self.listeners[&listen_token].answers.ServiceUnavailable.clone()
-    }
+    self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer503, app_id)
   }
 }
 
 impl Listener {
   pub fn new(config: HttpListener, token: Token) -> Listener {
-
-    let default = DefaultAnswers {
-      NotFound: Rc::new(Vec::from(config.answer_404.as_bytes())),
-      ServiceUnavailable: Rc::new(Vec::from(config.answer_503.as_bytes())),
-      BadRequest: Rc::new(Vec::from(
-          &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-        )),
-    };
-
     Listener {
       listener: None,
       address: config.front,
       fronts:  TrieNode::root(),
-      answers: default,
+      answers: Rc::new(RefCell::new(HttpAnswers::new(&config.answer_404, &config.answer_503))),
       config,
       token,
       active: false,
@@ -1566,13 +1540,7 @@ mod tests {
       listener: None,
       address:  front,
       fronts,
-      answers:   DefaultAnswers {
-        NotFound: Rc::new(Vec::from(&b"HTTP/1.1 404 Not Found\r\n\r\n"[..])),
-        ServiceUnavailable: Rc::new(Vec::from(&b"HTTP/1.1 503 your application is in deployment\r\n\r\n"[..])),
-        BadRequest: Rc::new(Vec::from(
-          &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
-        )),
-      },
+      answers: Rc::new(RefCell::new(HttpAnswers::new("HTTP/1.1 404 Not Found\r\n\r\n", "HTTP/1.1 503 your application is in deployment\r\n\r\n"))),
       config: Default::default(),
       token: Token(0),
       active: true,
