@@ -581,17 +581,22 @@ impl ProxySession for Session {
 
     self.metrics().service_start();
 
-    if self.back_connected() == BackendConnectionStatus::Connecting {
-      if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) {
+    if self.back_connected() == BackendConnectionStatus::Connecting &&
+      self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
+
+      if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) ||
+        !self.http().map(|h| h.test_back_socket()).unwrap_or(false) {
+
         //retry connecting the backend
         error!("{} error connecting to backend, trying again", self.log_context());
         self.metrics().service_stop();
         self.connection_attempt += 1;
-         self.fail_backend_connection();
+        self.fail_backend_connection();
 
         let backend_token = self.back_token();
         return SessionResult::ReconnectBackend(Some(self.frontend_token), backend_token);
-      } else if self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
+      } else {
+
         self.reset_connection_attempt();
         self.set_back_connected(BackendConnectionStatus::Connected);
       }
