@@ -224,7 +224,14 @@ macro_rules! count (
 
 #[macro_export]
 macro_rules! incr (
-  ($key:expr) => (count!($key, 1);)
+  ($key:expr) => (count!($key, 1););
+  ($key:expr, $app_id:expr, $backend_id:expr) => {
+    use $crate::metrics::Subscriber;
+
+    $crate::metrics::METRICS.with(|metrics| {
+      (*metrics.borrow_mut()).receive_metric($key, $app_id, $backend_id, $crate::metrics::MetricData::Count(1));
+    });
+  }
 );
 
 #[macro_export]
@@ -249,7 +256,15 @@ macro_rules! gauge_add (
     $crate::metrics::METRICS.with(|metrics| {
       (*metrics.borrow_mut()).gauge_add($key, v);
     });
-  })
+  });
+  ($key:expr, $value:expr, $app_id:expr, $backend_id:expr) => {
+    use $crate::metrics::Subscriber;
+    let v = $value;
+
+    $crate::metrics::METRICS.with(|metrics| {
+      (*metrics.borrow_mut()).receive_metric($key, $app_id, $backend_id, $crate::metrics::MetricData::GaugeAdd(v));
+    });
+  }
 );
 
 #[macro_export]

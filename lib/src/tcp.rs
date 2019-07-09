@@ -367,7 +367,7 @@ impl Session {
   fn set_back_connected(&mut self, status: BackendConnectionStatus) {
     self.back_connected = status;
     if status == BackendConnectionStatus::Connected {
-      gauge_add!("backend.connections", 1);
+      gauge_add!("backend.connections", 1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
       if let Some(State::SendProxyProtocol(ref mut pp)) = self.protocol {
         pp.set_back_connected(BackendConnectionStatus::Connected);
       }
@@ -400,10 +400,10 @@ impl Session {
 
       let already_unavailable = backend.retry_policy.is_down();
       backend.retry_policy.fail();
-      incr!("backend.connections.error");
+      incr!("backend.connections.error", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
       if !already_unavailable && backend.retry_policy.is_down() {
         error!("backend server {} at {} is down", backend.backend_id, backend.address);
-        incr!("backend.down");
+        incr!("backend.down", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
 
         push_event(ProxyEvent::BackendDown(backend.backend_id.clone(), backend.address));
       }
@@ -487,7 +487,7 @@ impl ProxySession for Session {
     }
 
     if back_connected == BackendConnectionStatus::Connected {
-      gauge_add!("backend.connections", -1);
+      gauge_add!("backend.connections", -1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
     }
 
     self.set_back_connected(BackendConnectionStatus::NotConnected);

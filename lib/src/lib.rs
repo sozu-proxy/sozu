@@ -591,7 +591,7 @@ impl SessionMetrics {
     self.bin           = 0;
     self.bout          = 0;
     self.service_start = None;
-    self.backend_id    = None;
+    //self.backend_id    = None;
     self.backend_start = None;
     self.backend_stop  = None;
     self.backend_bin   = 0;
