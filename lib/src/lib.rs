@@ -564,6 +564,7 @@ pub struct SessionMetrics {
 
   pub backend_id:    Option<String>,
   pub backend_start: Option<SteadyTime>,
+  pub backend_connected: Option<SteadyTime>,
   pub backend_stop:  Option<SteadyTime>,
   pub backend_bin:   usize,
   pub backend_bout:  usize,
@@ -579,6 +580,7 @@ impl SessionMetrics {
       service_start: None,
       backend_id:    None,
       backend_start: None,
+      backend_connected: None,
       backend_stop:  None,
       backend_bin:   0,
       backend_bout:  0,
@@ -591,17 +593,11 @@ impl SessionMetrics {
     self.bin           = 0;
     self.bout          = 0;
     self.service_start = None;
-    //self.backend_id    = None;
     self.backend_start = None;
+    self.backend_connected = None;
     self.backend_stop  = None;
     self.backend_bin   = 0;
     self.backend_bout  = 0;
-  }
-
-  pub fn start(&mut self) {
-    if self.start.is_none() {
-      self.start = Some(SteadyTime::now());
-    }
   }
 
   pub fn service_start(&mut self) {
@@ -641,16 +637,29 @@ impl SessionMetrics {
     self.backend_start = Some(SteadyTime::now());
   }
 
+  pub fn backend_connected(&mut self) {
+    self.backend_connected = Some(SteadyTime::now());
+  }
+
   pub fn backend_stop(&mut self) {
     self.backend_stop = Some(SteadyTime::now());
   }
 
   pub fn backend_response_time(&self) -> Option<Duration> {
-    match (self.backend_start, self.backend_stop) {
+    match (self.backend_connected, self.backend_stop) {
       (Some(start), Some(end)) => {
         Some(end - start)
       },
       (Some(start), None) => Some(SteadyTime::now() - start),
+      _ => None
+    }
+  }
+
+  pub fn backend_connection_time(&self) -> Option<Duration> {
+    match (self.backend_start, self.backend_connected) {
+      (Some(start), Some(end)) => {
+        Some(end - start)
+      },
       _ => None
     }
   }

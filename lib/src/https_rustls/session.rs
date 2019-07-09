@@ -591,7 +591,7 @@ impl ProxySession for Session {
         let backend_token = self.back_token();
         return SessionResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else {
-
+        self.metrics().backend_connected();
         self.reset_connection_attempt();
         self.set_back_connected(BackendConnectionStatus::Connected);
       }

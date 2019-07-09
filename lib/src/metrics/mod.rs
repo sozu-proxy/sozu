@@ -292,7 +292,7 @@ macro_rules! time (
 
 #[macro_export]
 macro_rules! record_backend_metrics (
-  ($app_id:expr, $backend_id:expr, $response_time: expr, $bin: expr, $bout: expr) => {
+  ($app_id:expr, $backend_id:expr, $response_time: expr, $backend_connection_time: expr, $bin: expr, $bout: expr) => {
     use $crate::metrics::{MetricData,Subscriber};
     $crate::metrics::METRICS.with(|metrics| {
       let ref mut m = *metrics.borrow_mut();
@@ -302,6 +302,9 @@ macro_rules! record_backend_metrics (
       m.receive_metric("bytes_in", Some(app_id), Some(backend_id), MetricData::Count($bin as i64));
       m.receive_metric("bytes_out", Some(app_id), Some(backend_id), MetricData::Count($bout as i64));
       m.receive_metric("response_time", Some(app_id), Some(backend_id), MetricData::Time($response_time as usize));
+      if let Some(t) = $backend_connection_time {
+        m.receive_metric("connection_time", Some(app_id), Some(backend_id), MetricData::Time(t.num_milliseconds() as usize));
+      }
     });
   }
 );

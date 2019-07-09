@@ -424,7 +424,8 @@ impl<Front:SocketHandler> Http<Front> {
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
-        record_backend_metrics!(app_id, backend_id, backend_response_time.num_milliseconds(), metrics.backend_bin, metrics.backend_bout);
+        record_backend_metrics!(app_id, backend_id, backend_response_time.num_milliseconds(),
+          metrics.backend_connection_time(), metrics.backend_bin, metrics.backend_bout);
       }
     }
 
@@ -514,7 +515,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
-        record_backend_metrics!(app_id, backend_id, backend_response_time.num_milliseconds(), metrics.backend_bin, metrics.backend_bout);
+        record_backend_metrics!(app_id, backend_id, backend_response_time.num_milliseconds(), metrics.backend_connection_time(), metrics.backend_bin, metrics.backend_bout);
       }
     }*/
 
@@ -1109,6 +1110,7 @@ impl<Front:SocketHandler> Http<Front> {
       Some(ResponseState::ResponseWithBody(_,_,_)) => {
         self.front_readiness.interest.insert(Ready::writable());
         if ! self.back_buf.as_ref().unwrap().needs_input() {
+          metrics.backend_stop();
           self.back_readiness.interest.remove(Ready::readable());
         }
         (ProtocolResult::Continue, SessionResult::Continue)
@@ -1162,6 +1164,7 @@ impl<Front:SocketHandler> Http<Front> {
           }
 
           if let Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) = self.response {
+            metrics.backend_stop();
             self.back_readiness.interest.remove(Ready::readable());
           }
         }
@@ -1198,6 +1201,7 @@ impl<Front:SocketHandler> Http<Front> {
         }
 
         if let Some(ResponseState::Response(_,_)) = self.response {
+          metrics.backend_stop();
           self.back_readiness.interest.remove(Ready::readable());
         }
 
