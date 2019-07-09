@@ -78,7 +78,8 @@ impl NetworkDrain {
     let mut send_count = 0;
 
     if self.is_writable {
-    for (ref key, ref mut stored_metric) in self.data.iter_mut().filter(|&(_, ref value)| now.duration_since(value.last_sent) > secs) {
+
+    for (ref key, ref mut stored_metric) in self.data.iter_mut().filter(|&(_, ref value)| value.updated && now.duration_since(value.last_sent) > secs) {
       //info!("will write {} -> {:#?}", key, stored_metric);
       let res = match stored_metric.data {
         MetricData::Gauge(value) => {
@@ -111,6 +112,7 @@ impl NetworkDrain {
       match res {
         Ok(()) => {
           stored_metric.last_sent = now;
+          stored_metric.updated = false;
 
           send_count += 1;
           if send_count >= 10 {
@@ -145,8 +147,8 @@ impl NetworkDrain {
     }
 
     if self.is_writable {
-    for (ref key, ref mut stored_metric) in self.app_data.iter_mut().filter(|&(_, ref value)| now.duration_since(value.last_sent) > secs) {
-      //info!("will write {} -> {:#?}", key, stored_metric);
+    for (ref key, ref mut stored_metric) in self.app_data.iter_mut().filter(|&(_, ref value)| value.updated && now.duration_since(value.last_sent) > secs) {
+      //info!("will write {:?} -> {:#?}", key, stored_metric);
       let res = match stored_metric.data {
         MetricData::Gauge(value) => {
           if self.use_tagged_metrics {
@@ -180,6 +182,7 @@ impl NetworkDrain {
       match res {
         Ok(()) => {
           stored_metric.last_sent = now;
+          stored_metric.updated = false;
 
           send_count += 1;
           if send_count >= 10 {
@@ -214,8 +217,8 @@ impl NetworkDrain {
     }
 
     if self.is_writable {
-    for (ref key, ref mut stored_metric) in self.backend_data.iter_mut().filter(|&(_, ref value)| now.duration_since(value.last_sent) > secs) {
-      //info!("will write {} -> {:#?}", key, stored_metric);
+    for (ref key, ref mut stored_metric) in self.backend_data.iter_mut().filter(|&(_, ref value)| value.updated && now.duration_since(value.last_sent) > secs) {
+      //info!("will write {:?} -> {:#?}", key, stored_metric);
       let res = match stored_metric.data {
         MetricData::Gauge(value) => {
           if self.use_tagged_metrics {
@@ -249,6 +252,7 @@ impl NetworkDrain {
       match res {
         Ok(()) => {
           stored_metric.last_sent = now;
+          stored_metric.updated = false;
 
           send_count += 1;
           if send_count >= 10 {
@@ -372,7 +376,7 @@ impl Subscriber for NetworkDrain {
             );
         } else {
           self.backend_data.get_mut(&k).map(|stored_metric| {
-            stored_metric.data.update(key, metric);
+            stored_metric.update(key, metric);
           });
         }
       } else {
@@ -384,7 +388,7 @@ impl Subscriber for NetworkDrain {
             );
         } else {
           self.app_data.get_mut(&k).map(|stored_metric| {
-            stored_metric.data.update(key, metric);
+            stored_metric.update(key, metric);
           });
         }
       }
@@ -395,7 +399,7 @@ impl Subscriber for NetworkDrain {
         );
     } else {
       self.data.get_mut(key).map(|stored_metric| {
-        stored_metric.data.update(key, metric);
+        stored_metric.update(key, metric);
       });
     }
   }

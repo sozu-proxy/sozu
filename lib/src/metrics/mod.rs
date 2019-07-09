@@ -33,23 +33,30 @@ impl MetricData {
     }
   }
 
-  fn update(&mut self, key: &'static str, m: MetricData) {
+  fn update(&mut self, key: &'static str, m: MetricData) -> bool {
     match (self, m) {
       (&mut MetricData::Gauge(ref mut v1), MetricData::Gauge(v2)) => {
+        let changed = *v1 != v2;
         *v1 = v2;
+        changed
       },
       (&mut MetricData::Gauge(ref mut v1), MetricData::GaugeAdd(v2)) => {
         debug_assert!(*v1 as i64 + v2 >= 0, "metric {} underflow: previous value: {}, adding: {}", key, v1, v2);
+        let changed = v2 != 0;
         let res = *v1 as i64 + v2;
         *v1 = if res >= 0 {
           res as usize
         } else {
           error!("metric {} underflow: previous value: {}, adding: {}", key, v1, v2);
           0
-        }
+        };
+
+        changed
       },
       (&mut MetricData::Count(ref mut v1), MetricData::Count(v2)) => {
+        let changed = v2 != 0;
         *v1 += v2;
+        changed
       },
       (s,m) => panic!("tried to update metric {} of value {:?} with an incompatible metric: {:?}", key, s, m)
     }
@@ -59,6 +66,7 @@ impl MetricData {
 #[derive(Debug,Clone)]
 pub struct StoredMetricData {
   last_sent: Instant,
+  updated:   bool,
   data:      MetricData,
 }
 
@@ -66,10 +74,16 @@ impl StoredMetricData {
   pub fn new(last_sent: Instant, data: MetricData) -> StoredMetricData {
     StoredMetricData {
       last_sent,
+      updated: true,
       data: if let MetricData::GaugeAdd(v) = data {
         MetricData::Gauge(v as usize)
       } else { data }
     }
+  }
+
+  pub fn update(&mut self, key: &'static str, m: MetricData) {
+    let updated = self.data.update(key, m);
+    self.updated = updated;
   }
 }
 
