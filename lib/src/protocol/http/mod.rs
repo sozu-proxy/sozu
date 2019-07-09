@@ -57,6 +57,7 @@ pub enum DefaultAnswerStatus {
 pub enum TimeoutStatus {
   Request,
   Response,
+  WaitingForNewRequest,
 }
 
 pub struct Http<Front:SocketHandler> {
@@ -83,6 +84,7 @@ pub struct Http<Front:SocketHandler> {
   pub res_header_end: Option<usize>,
   pub added_req_header: String,
   pub added_res_header: String,
+  pub keepalive_count: usize,
   pool:                Weak<RefCell<Pool<Buffer>>>,
 }
 
@@ -116,6 +118,7 @@ impl<Front:SocketHandler> Http<Front> {
       res_header_end: None,
       added_req_header: String::from(""),
       added_res_header: String::from(""),
+      keepalive_count: 0,
       pool,
     };
     session.added_req_header = session.added_request_header(public_address, session_address);
@@ -146,6 +149,7 @@ impl<Front:SocketHandler> Http<Front> {
     self.back_buf = None;
     self.request_id = request_id;
     self.reset_log_context();
+    self.keepalive_count += 1;
   }
 
   pub fn reset_log_context(&mut self) {
@@ -331,7 +335,11 @@ impl<Front:SocketHandler> Http<Front> {
         Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
           TimeoutStatus::Response
       },
-      _ => TimeoutStatus::Request,
+      _ => if self.keepalive_count > 0 {
+        TimeoutStatus::WaitingForNewRequest
+      } else {
+        TimeoutStatus::Request
+      },
     }
   }
 
