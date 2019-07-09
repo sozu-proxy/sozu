@@ -234,7 +234,7 @@ impl NetworkDrain {
           }
 
           let res = if self.use_tagged_metrics {
-            self.remote.write_fmt(format_args!("{}.app.{},origin={},version={},app_id={},backend_id={}:{}|c\n",
+            self.remote.write_fmt(format_args!("{}.backend.{},origin={},version={},app_id={},backend_id={}:{}|c\n",
               self.prefix, key.2, self.origin, VERSION, key.0, key.1, value))
           } else {
             self.remote.write_fmt(format_args!("{}.{}.app.{}.backend.{}.{}:{}|c\n", self.prefix, self.origin, key.0, key.1, key.2, value))

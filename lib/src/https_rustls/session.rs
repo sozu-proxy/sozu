@@ -390,7 +390,7 @@ impl Session {
     self.back_connected = connected;
 
     if connected == BackendConnectionStatus::Connected {
-      gauge_add!("backend.connections", 1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      gauge_add!("connections", 1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
       self.backend.as_ref().map(|backend| {
         let backend = &mut (*backend.borrow_mut());
         backend.failures = 0;
@@ -435,10 +435,10 @@ impl Session {
 
       let already_unavailable = backend.retry_policy.is_down();
       backend.retry_policy.fail();
-      incr!("backend.connections.error", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      incr!("connections.error", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
       if !already_unavailable && backend.retry_policy.is_down() {
         error!("backend server {} at {} is down", backend.backend_id, backend.address);
-        incr!("backend.down", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+        incr!("down", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
 
         push_event(ProxyEvent::BackendDown(backend.backend_id.clone(), backend.address));
       }
@@ -547,7 +547,7 @@ impl ProxySession for Session {
     }
 
     if back_connected == BackendConnectionStatus::Connected {
-      gauge_add!("backend.connections", -1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      gauge_add!("connections", -1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
     }
 
     self.set_back_connected(BackendConnectionStatus::NotConnected);
