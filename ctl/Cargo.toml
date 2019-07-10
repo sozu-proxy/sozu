@@ -26,6 +26,8 @@ hex = "^0.3"
 
 [features]
 unstable = []
+logs-debug = ["sozu-command-lib/logs-debug"]
+logs-trace = ["sozu-command-lib/logs-trace"]
 
 [badges]
 travis-ci = { repository = "sozu-proxy/sozu" }
