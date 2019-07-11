@@ -83,7 +83,9 @@ impl StoredMetricData {
 
   pub fn update(&mut self, key: &'static str, m: MetricData) {
     let updated = self.data.update(key, m);
-    self.updated = updated;
+    if ! self.updated {
+      self.updated = updated;
+    }
   }
 }
 
