@@ -156,7 +156,7 @@ impl<Front:SocketHandler> Pipe<Front> {
 
     match res {
       SocketResult::Error => {
-        error!("{}\t[{:?}] front socket error, closing the connection", self.log_ctx, self.frontend_token);
+        error!("{}\t[{:?}] (pipe) front socket error, closing the connection (read {} wrote {})", self.log_ctx, self.frontend_token, metrics.bin, metrics.bout);
         metrics.service_stop();
         incr!("pipe.errors");
         self.front_readiness.reset();

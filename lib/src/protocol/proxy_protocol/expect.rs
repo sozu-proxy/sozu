@@ -76,7 +76,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
     }
 
     if res == SocketResult::Error {
-      error!("[{:?}] front socket error, closing the connection", self.frontend_token);
+      error!("[{:?}] (expect proxy) front socket error, closing the connection(read {}, wrote {})", self.frontend_token, metrics.bin, metrics.bout);
       metrics.service_stop();
       incr!("proxy_protocol.errors");
       self.readiness.reset();
