@@ -869,9 +869,9 @@ impl Listener {
 
 
     let mut ssl_options = ssl::SslOptions::CIPHER_SERVER_PREFERENCE | ssl::SslOptions::NO_COMPRESSION | ssl::SslOptions::NO_TICKET;
-    let mut versions = ssl::SslOptions::NO_SSLV2 |
-      ssl::SslOptions::NO_SSLV3 | ssl::SslOptions::NO_TLSV1 |
-      ssl::SslOptions::NO_TLSV1_1 | ssl::SslOptions::NO_TLSV1_2;
+    let mut versions = ssl::SslOptions::NO_SSLV2 | ssl::SslOptions::NO_SSLV3 |
+      ssl::SslOptions::NO_TLSV1 | ssl::SslOptions::NO_TLSV1_1 |
+      ssl::SslOptions::NO_TLSV1_2 | ssl::SslOptions::NO_TLSV1_3;
 
     for version in config.versions.iter() {
       match version {
@@ -880,6 +880,7 @@ impl Listener {
         TlsVersion::TLSv1_0 => versions.remove(ssl::SslOptions::NO_TLSV1),
         TlsVersion::TLSv1_1 => versions.remove(ssl::SslOptions::NO_TLSV1_1),
         TlsVersion::TLSv1_2 => versions.remove(ssl::SslOptions::NO_TLSV1_2),
+        TlsVersion::TLSv1_3 => versions.remove(ssl::SslOptions::NO_TLSV1_3),
         s         => error!("unrecognized TLS version: {:?}", s)
       };
     }

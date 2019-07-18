@@ -147,7 +147,7 @@ impl Listener {
     let tls_proxy_configuration = Some(self.address);
 
     let versions = match self.tls_versions {
-      None    => vec!(TlsVersion::TLSv1_1, TlsVersion::TLSv1_2),
+      None    => vec!(TlsVersion::TLSv1_2, TlsVersion::TLSv1_3),
       Some(ref v) => v.clone(),
     };
 
