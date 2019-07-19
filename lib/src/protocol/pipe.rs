@@ -85,12 +85,14 @@ impl<Front:SocketHandler> Pipe<Front> {
   pub fn close(&mut self) {
   }
 
-  pub fn log_context(&self) -> String {
-    if let Some(ref app_id) = self.app_id {
-      format!("{}\t{}\t", self.request_id, app_id)
+  pub fn set_app_id(&mut self, app_id: Option<String>) {
+    if let Some(ref app_id) = app_id {
+      self.log_ctx = format!("{}\t{}\t", self.request_id, app_id);
     } else {
-      format!("{}\tunknown\t", self.request_id)
+      self.log_ctx = format!("{}\tunknown\t", self.request_id);
     }
+
+    self.app_id = app_id;
   }
 
   pub fn set_back_token(&mut self, token: Token) {

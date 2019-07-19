@@ -145,6 +145,7 @@ impl Session {
       pipe.front_readiness.event = http.front_readiness.event;
       pipe.back_readiness.event  = http.back_readiness.event;
       pipe.set_back_token(back_token);
+      pipe.set_app_id(self.app_id.clone());
 
       self.protocol = Some(State::WebSocket(pipe));
       true

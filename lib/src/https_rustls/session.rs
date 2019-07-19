@@ -235,6 +235,7 @@ impl Session {
       pipe.front_readiness.event = http.front_readiness.event;
       pipe.back_readiness.event  = http.back_readiness.event;
       pipe.set_back_token(back_token);
+      pipe.set_app_id(self.app_id.clone());
 
       gauge_add!("protocol.https", -1);
       gauge_add!("protocol.wss", 1);
