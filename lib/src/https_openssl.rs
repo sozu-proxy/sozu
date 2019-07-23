@@ -905,6 +905,18 @@ impl Listener {
       error!("could not set context cipher list: {:?}", e);
     }
 
+    let mut cert_read = &include_bytes!("../assets/certificate.pem")[..];
+    let mut key_read  = &include_bytes!("../assets/key.pem")[..];
+
+    if let (Ok(cert), Ok(key)) = (X509::from_pem(&mut cert_read), PKey::private_key_from_pem(&mut key_read)) {
+      if let Err(e) = context.set_certificate(&cert) {
+        error!("error adding certificate to context: {:?}", e);
+      }
+      if let Err(e) = context.set_private_key(&key) {
+        error!("error adding private key to context: {:?}", e);
+      }
+    }
+
     context.set_servername_callback(move |ssl: &mut SslRef, alert: &mut SslAlert| {
       let contexts = unwrap_msg!(ref_ctx.lock());
       let domains  = unwrap_msg!(ref_domains.lock());
