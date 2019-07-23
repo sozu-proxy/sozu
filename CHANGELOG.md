@@ -4,6 +4,134 @@
 
 ### Changed
 
+## 0.11.16 - 2019-07-23
+
+### Fixed
+
+- detect application level configuration changes in state diff
+- TLS 1.3 is now working properly with OpenSSL
+
+## 0.11.15 - 2019-07-19
+
+### Fixed
+
+- pass the app id from HTTP protocol to Pipe protocol when in  websocket
+
+## 0.11.14 - 2019-07-18
+
+### Added
+
+- more info in logs about socket errors
+
+## 0.11.13 - 2019-07-12
+
+### Added
+
+- more logs and metrics around socket errors
+
+### Fixed
+
+- do not clear the metric update flag too soon
+
+## 0.11.12 - 2019-07-10
+
+### Fixed
+
+- add logs-debug and logs-trace options to sozuctl to fix build on Exherbo
+
+## 0.11.11 - 2019-07-09
+ 
+### Added
+
+- send 408 or 504 HTTP errors in case of timeouts
+- backend connection time and response time metrics
+
+### Fixed
+
+- test back socket connections before reusing them
+
+### Changed
+
+- a metric is not sent again if its value did not change
+- the backend id is added as matedata to backend metrics
+
+## 0.11.10 - 2019-07-04
+
+### Fixed
+
+- test if the backend socket is still valid before reusing it
+
+## 0.11.9 - 2019-06-28
+
+debug release
+
+## 0.11.8 - 2019-06-28
+
+### Fixed
+
+- do not duplicate backend if we modified a backend's parameters
+
+## 0.11.7 - 2019-06-26
+
+### Fixed
+
+- fix infinite loop with front socket
+
+## 0.11.6 - 2019-06-19
+
+### Fixed
+
+- check for existence of the unix logging socket
+
+### Changed
+
+- access log format: indicate if we got the log from HTTP or HTTPS sessions
+
+## 0.11.5 - 2019-06-13
+
+### Added
+
+- will print the session's state if handling it resulted in an infinite loop
+
+### Fixed
+
+- websocket protocol upgrade
+
+## 0.11.4 - 2019-06-07
+
+### Fixed
+
+- wildcard matching
+
+## 0.11.3 - 2019-06-06
+
+### Added
+
+- sozuctl commands to query certificates
+- more logs and metrics aroundSNI in OpenSSL
+
+## 0.11.2 - 2019-05-21
+
+### Added
+
+- ActivateListener message for TCP proxies
+
+### Fixed
+
+- wildcard certificate mtching with multiple subdomains in configuration
+- diff of TCP listener configuration
+
+## 0.11.1 - 2019-05-06
+
+### Changed
+
+- activate jemallocator and link time optimization
+- sozuctl now uses the buffer size defined in the configuration file
+
+### Removed
+
+- procinfo dependency
+
 ## 0.11 - 2018-11-15
 
 breaking changes:
