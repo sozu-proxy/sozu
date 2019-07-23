@@ -345,8 +345,16 @@ impl ConfigState {
     let my_apps: HashSet<&AppId>    = self.applications.keys().collect();
     let their_apps: HashSet<&AppId> = other.applications.keys().collect();
 
-    let removed_apps = my_apps.difference(&their_apps);
-    let added_apps: Vec<&Application> = their_apps.difference(&my_apps).filter_map(|app_id| other.applications.get(app_id.as_str())).collect();
+    let mut removed_apps: HashSet<&AppId> = my_apps.difference(&their_apps).cloned().collect();
+    let mut added_apps: Vec<&Application> = their_apps.difference(&my_apps).filter_map(|app_id| other.applications.get(app_id.as_str())).collect();
+
+    let common_apps: HashSet<&AppId> = my_apps.intersection(&their_apps).cloned().collect();
+    for app in common_apps {
+      if self.applications.get(app) != other.applications.get(app) {
+        removed_apps.insert(app);
+        added_apps.push(other.applications.get(app).as_ref().unwrap());
+      }
+    }
 
     //pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
     let my_tcp_listeners: HashSet<&SocketAddr> = self.tcp_listeners.keys().collect();
