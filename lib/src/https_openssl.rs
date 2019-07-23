@@ -1859,18 +1859,6 @@ mod tests {
   }
 }
 
-#[cfg(not(ossl111))]
-fn version_str(version: SslVersion) -> &'static str {
-  match version {
-    SslVersion::SSL3 => "tls.version.SSLv3",
-    SslVersion::TLS1 => "tls.version.TLSv1_0",
-    SslVersion::TLS1_1 => "tls.version.TLSv1_1",
-    SslVersion::TLS1_2 => "tls.version.TLSv1_2",
-    _ => "tls.version.Unknown",
-  }
-}
-
-#[cfg(ossl111)]
 fn version_str(version: SslVersion) -> &'static str {
   match version {
     SslVersion::SSL3 => "tls.version.SSLv3",
