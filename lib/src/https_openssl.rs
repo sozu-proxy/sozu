@@ -1306,9 +1306,11 @@ impl Proxy {
 
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
         error!("TLS SNI hostname '{:?}' and Host header '{}' don't match", servername, hostname_str);
+        /*FIXME: deactivate this check for a temporary test
         let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
         unwrap_msg!(session.http()).set_answer(DefaultAnswerStatus::Answer404, answer);
         return Err(ConnectionError::HostNotFound);
+        */
       }
 
       //FIXME: we should check that the port is right too
