@@ -4,6 +4,18 @@
 
 ### Changed
 
+## 0.11.17 - 2019-07-24
+
+debug release
+
+### Fixed
+
+- TLS 1.3 metric
+
+### Changed
+
+- removed domain fronting check (temporary)
+
 ## 0.11.16 - 2019-07-23
 
 ### Fixed
