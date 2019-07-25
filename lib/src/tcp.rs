@@ -97,7 +97,7 @@ impl Session {
       },
       None => {
         gauge_add!("protocol.tcp", 1);
-        Some(State::Pipe(Pipe::new(s, frontend_token, request_id, None, front_buf, back_buf, addr)))
+        Some(State::Pipe(Pipe::new(s, frontend_token, request_id, None, front_buf, back_buf, addr, Protocol::TCP)))
       }
     };
 
@@ -155,7 +155,7 @@ impl Session {
     self.log_request();
 
     match self.protocol {
-      Some(State::Pipe(ref mut pipe)) => pipe.front_hup(),
+      Some(State::Pipe(ref mut pipe)) => pipe.front_hup(&mut self.metrics),
       _ => SessionResult::CloseSession,
     }
   }
@@ -164,7 +164,7 @@ impl Session {
     self.log_request();
 
     match self.protocol {
-      Some(State::Pipe(ref mut pipe)) => pipe.back_hup(),
+      Some(State::Pipe(ref mut pipe)) => pipe.back_hup(&mut self.metrics),
       _ => SessionResult::CloseSession,
     }
   }

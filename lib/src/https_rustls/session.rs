@@ -230,7 +230,7 @@ impl Session {
       };
 
       let mut pipe = Pipe::new(http.frontend, front_token, http.request_id,
-        http.backend, front_buf, back_buf, http.public_address);
+        http.backend, front_buf, back_buf, http.session_address, Protocol::HTTPS);
 
       pipe.front_readiness.event = http.front_readiness.event;
       pipe.back_readiness.event  = http.back_readiness.event;
@@ -249,13 +249,22 @@ impl Session {
   }
 
   fn front_hup(&mut self)     -> SessionResult {
-    self.http().map(|h| h.front_hup()).unwrap_or(SessionResult::CloseSession)
+    match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Http(ref mut http)      => http.front_hup(),
+      State::WebSocket(ref mut pipe) => pipe.front_hup(&mut self.metrics),
+      State::Handshake(_)            => {
+        SessionResult::CloseSession
+      },
+      State::Expect(_,_)             => {
+        SessionResult::CloseSession
+      }
+    }
   }
 
   fn back_hup(&mut self)      -> SessionResult {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.back_hup(),
-      State::WebSocket(ref mut pipe) => pipe.back_hup(),
+      State::WebSocket(ref mut pipe) => pipe.back_hup(&mut self.metrics),
       State::Handshake(_)            => {
         error!("why a backend HUP event while still in frontend handshake?");
         SessionResult::CloseSession

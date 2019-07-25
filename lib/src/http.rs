@@ -140,7 +140,7 @@ impl Session {
       gauge_add!("protocol.ws", 1);
       gauge_add!("http.active_requests", -1);
       let mut pipe = Pipe::new(http.frontend, front_token, http.request_id,
-        Some(unwrap_msg!(http.backend)), front_buf, back_buf, http.public_address);
+        Some(unwrap_msg!(http.backend)), front_buf, back_buf, http.session_address, Protocol::HTTP);
 
       pipe.front_readiness.event = http.front_readiness.event;
       pipe.back_readiness.event  = http.back_readiness.event;
@@ -199,13 +199,17 @@ impl Session {
   }
 
   fn front_hup(&mut self) -> SessionResult {
-    SessionResult::CloseSession
+    match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Http(ref mut http)      => http.front_hup(),
+      State::WebSocket(ref mut pipe) => pipe.front_hup(&mut self.metrics),
+      _                              => SessionResult::CloseSession,
+    }
   }
 
   fn back_hup(&mut self) -> SessionResult {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.back_hup(),
-      State::WebSocket(ref mut pipe) => pipe.back_hup(),
+      State::WebSocket(ref mut pipe) => pipe.back_hup(&mut self.metrics),
       _                              => SessionResult::CloseSession,
     }
   }

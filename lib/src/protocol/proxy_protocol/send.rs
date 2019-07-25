@@ -15,6 +15,7 @@ use {
   socket::SocketHandler,
   pool::Checkout,
 };
+use Protocol;
 
 use super::header::*;
 
@@ -147,6 +148,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
       front_buf,
       back_buf,
       addr,
+      Protocol::TCP
     );
 
     pipe.front_readiness = self.front_readiness;

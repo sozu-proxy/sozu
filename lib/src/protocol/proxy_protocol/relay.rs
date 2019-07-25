@@ -15,6 +15,7 @@ use SessionMetrics;
 use protocol::pipe::Pipe;
 use super::parser::parse_v2_header;
 use pool::Checkout;
+use Protocol;
 
 pub struct RelayProxyProtocol<Front:SocketHandler> {
   pub header_size:    Option<usize>,
@@ -176,6 +177,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
       self.front_buf,
       back_buf,
       addr,
+      Protocol::TCP
     );
 
     pipe.front_readiness.event = self.front_readiness.event;

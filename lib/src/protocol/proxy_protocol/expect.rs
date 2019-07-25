@@ -15,6 +15,7 @@ use pool::Checkout;
 use sozu_command::buffer::Buffer;
 use super::parser::parse_v2_header;
 use super::header::ProxyAddr;
+use Protocol;
 
 #[derive(Clone,Copy)]
 pub enum HeaderLen {
@@ -146,6 +147,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       front_buf,
       back_buf,
       addr,
+      Protocol::TCP
     );
 
     pipe.front_readiness.event = self.readiness.event;
