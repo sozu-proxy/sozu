@@ -908,7 +908,7 @@ impl Listener {
         http_front.hostname = hostname;
         let front2 = http_front.clone();
         let front3 = http_front.clone();
-        if let Some((_, ref mut fronts)) = self.fronts.domain_lookup_mut(&http_front.hostname.clone().into_bytes()) {
+        if let Some((_, ref mut fronts)) = self.fronts.domain_lookup_mut(&http_front.hostname.clone().into_bytes(), false) {
             if !fronts.contains(&front2) {
               fronts.push(front2);
             }
@@ -917,7 +917,7 @@ impl Listener {
         // FIXME: check that http front port matches the listener's port
         // FIXME: separate the port and hostname, match the hostname separately
 
-        if self.fronts.domain_lookup(&http_front.hostname.clone().into_bytes()).is_none() {
+        if self.fronts.domain_lookup(&http_front.hostname.clone().into_bytes(), false).is_none() {
           self.fronts.domain_insert(http_front.hostname.into_bytes(), vec![front3]);
         }
         Ok(())
@@ -933,7 +933,7 @@ impl Listener {
         front.hostname = hostname;
 
         let should_delete = {
-          let fronts_opt = self.fronts.domain_lookup_mut(front.hostname.as_bytes());
+          let fronts_opt = self.fronts.domain_lookup_mut(front.hostname.as_bytes(), false);
 
           if let Some((_, fronts)) = fronts_opt {
             fronts.retain(|f| f != &front);
@@ -974,7 +974,7 @@ impl Listener {
       return None;
     };
 
-    if let Some((_, http_fronts)) = self.fronts.domain_lookup(host.as_bytes()) {
+    if let Some((_, http_fronts)) = self.fronts.domain_lookup(host.as_bytes(), true) {
       let matching_fronts = http_fronts.iter().filter(|f| uri.starts_with(&f.path_begin)); // ToDo match on uri
       let mut front = None;
 

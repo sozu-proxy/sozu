@@ -126,7 +126,7 @@ impl ResolvesServerCert for CertificateResolverWrapper {
     trace!("trying to resolve name: {:?} for signature scheme: {:?}", name, sigschemes);
     if let Ok(ref mut resolver) = self.0.try_lock() {
       //resolver.domains.print();
-      if let Some(kv) = resolver.domains.domain_lookup(name.as_bytes()) {
+      if let Some(kv) = resolver.domains.domain_lookup(name.as_bytes(), true) {
          trace!("looking for certificate for {:?} with fingerprint {:?}", name, kv.1);
          return resolver.certificates.get(&kv.1).as_ref().map(|data| data.cert.clone());
       }

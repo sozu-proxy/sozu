@@ -144,12 +144,12 @@ impl Listener {
       path_begin:       tls_front.path_begin.clone(),
     };
 
-    if let Some((_,fronts)) = self.fronts.domain_lookup_mut(&tls_front.hostname.as_bytes()) {
+    if let Some((_,fronts)) = self.fronts.domain_lookup_mut(&tls_front.hostname.as_bytes(), false) {
         if ! fronts.contains(&app) {
           fronts.push(app.clone());
         }
     }
-    if self.fronts.domain_lookup(&tls_front.hostname.as_bytes()).is_none() {
+    if self.fronts.domain_lookup(&tls_front.hostname.as_bytes(), false).is_none() {
       self.fronts.domain_insert(tls_front.hostname.into_bytes(), vec![app]);
     }
 
@@ -160,7 +160,7 @@ impl Listener {
     debug!("removing tls_front {:?}", front);
 
     let should_delete = {
-      let fronts_opt = self.fronts.domain_lookup_mut(front.hostname.as_bytes());
+      let fronts_opt = self.fronts.domain_lookup_mut(front.hostname.as_bytes(), false);
       if let Some((_, fronts)) = fronts_opt {
         if let Some(pos) = fronts.iter()
           .position(|f| {
@@ -244,7 +244,7 @@ impl Listener {
       return None;
     };
 
-    if let Some((_,http_fronts)) = self.fronts.domain_lookup(host.as_bytes()) {
+    if let Some((_,http_fronts)) = self.fronts.domain_lookup(host.as_bytes(), true) {
       let matching_fronts = http_fronts.iter().filter(|f| uri.starts_with(&f.path_begin)); // ToDo match on uri
       let mut front = None;
 
@@ -671,7 +671,7 @@ impl ProxyConfiguration<Session> for Proxy {
       ProxyRequestData::Query(Query::Certificates(QueryCertificateType::Domain(d))) => {
         let res = self.listeners.iter().map(|(addr, listener)| {
           let domains  = &unwrap_msg!(listener.resolver.0.lock()).domains;
-          (listener.address, domains.domain_lookup(d.as_bytes()).map(|(k, v)| {
+          (listener.address, domains.domain_lookup(d.as_bytes(), true).map(|(k, v)| {
             (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())
           }))
         }).collect::<HashMap<_,_>>();
