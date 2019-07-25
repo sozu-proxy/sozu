@@ -195,6 +195,8 @@ impl<Front:SocketHandler> Pipe<Front> {
     while res == SocketResult::Continue {
       // no more data in buffer, stop here
       if self.back_buf.available_data() == 0 {
+        count!("bytes_out", sz as i64);
+        metrics.bout += sz;
         self.back_readiness.interest.insert(Ready::readable());
         self.front_readiness.interest.remove(Ready::writable());
         return SessionResult::Continue;
