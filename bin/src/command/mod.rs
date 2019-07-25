@@ -121,7 +121,7 @@ impl CommandServer {
     if let Ok(Some((sock, _))) = acc {
       let conn = CommandClient::new(sock, self.buffer_size, self.max_buffer_size);
       let tok = self.clients.insert(conn)
-        .ok().expect("could not add connection to slab");
+        .map_err(|_| io::Error::new(ErrorKind::ConnectionRefused, "could not add client to slab"))?;
 
       // Register the connection
       let token = self.from_front(tok);
@@ -179,7 +179,7 @@ impl CommandServer {
       sock:              srv,
       buffer_size:       config.command_buffer_size,
       max_buffer_size:   config.max_command_buffer_size,
-      clients:           Slab::with_capacity(128),
+      clients:           Slab::with_capacity(1024),
       event_subscribers: Vec::new(),
       workers:           workers,
       next_id:           next_id as u32,

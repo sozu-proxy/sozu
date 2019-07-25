@@ -865,7 +865,7 @@ impl CommandServer {
       buffer_size:       buffer_size,
       max_buffer_size:   max_buffer_size,
       //FIXME: deserialize client connections as well, otherwise they might leak?
-      clients:           Slab::with_capacity(128),
+      clients:           Slab::with_capacity(1024),
       event_subscribers: Vec::new(),
       workers:           workers,
       next_id:           next_id,
