@@ -101,7 +101,7 @@ impl Session {
       Some(State::Expect(ExpectProxyProtocol::new(sock, token, request_id), ssl))
     } else {
       gauge_add!("protocol.tls.handshake", 1);
-      Some(State::Handshake(TlsHandshake::new(ssl, sock, request_id)))
+      Some(State::Handshake(TlsHandshake::new(ssl, sock, request_id, peer_address.clone())))
     };
 
     let mut session = Session {
@@ -156,7 +156,7 @@ impl Session {
           self.peer_address = Some(session_address);
 
           let ExpectProxyProtocol { frontend, readiness, request_id, .. } = expect;
-          let mut tls = TlsHandshake::new(ssl, frontend, request_id);
+          let mut tls = TlsHandshake::new(ssl, frontend, request_id, self.peer_address.clone());
           tls.readiness.event = readiness.event;
 
           gauge_add!("protocol.proxy.expect", -1);
@@ -292,7 +292,7 @@ impl Session {
   fn readable(&mut self)      -> SessionResult {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Expect(ref mut expect,_)     => expect.readable(&mut self.metrics),
-      State::Handshake(ref mut handshake) => handshake.readable(),
+      State::Handshake(ref mut handshake) => handshake.readable(&mut self.metrics),
       State::Http(ref mut http)           => (ProtocolResult::Continue, http.readable(&mut self.metrics)),
       State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.readable(&mut self.metrics)),
     };
@@ -949,10 +949,10 @@ impl Listener {
             error!("no context found for {:?}", servername);
           }
         } else {
-          error!("unrecognized server name: {}", servername);
+          //error!("unrecognized server name: {}", servername);
         }
       } else {
-        error!("no server name information found");
+        //error!("no server name information found");
       }
 
       incr!("openssl.sni.error");

@@ -4,7 +4,10 @@ use mio::unix::UnixReady;
 use uuid::adapter::Hyphenated;
 use {SessionResult,Readiness};
 use protocol::ProtocolResult;
-use openssl::ssl::{HandshakeError,MidHandshakeSslStream,Ssl,SslStream};
+use openssl::ssl::{HandshakeError,MidHandshakeSslStream,Ssl,SslStream,NameType};
+use std::net::SocketAddr;
+use LogDuration;
+use SessionMetrics;
 
 pub enum TlsState {
   Initial,
@@ -21,10 +24,11 @@ pub struct TlsHandshake {
   pub stream:          Option<SslStream<TcpStream>>,
   mid:                 Option<MidHandshakeSslStream<TcpStream>>,
   state:               TlsState,
+  address:             Option<SocketAddr>,
 }
 
 impl TlsHandshake {
-  pub fn new(ssl:Ssl, sock: TcpStream, request_id: Hyphenated) -> TlsHandshake {
+  pub fn new(ssl:Ssl, sock: TcpStream, request_id: Hyphenated, address: Option<SocketAddr>) -> TlsHandshake {
     TlsHandshake {
       front:          Some(sock),
       ssl:            Some(ssl),
@@ -36,10 +40,11 @@ impl TlsHandshake {
                         event:    UnixReady::from(Ready::empty()),
       },
       request_id,
+      address,
     }
   }
 
-  pub fn readable(&mut self) -> (ProtocolResult,SessionResult) {
+  pub fn readable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult,SessionResult) {
     match self.state {
       TlsState::Error(_) => return (ProtocolResult::Continue, SessionResult::CloseSession),
       TlsState::Initial => {
@@ -70,6 +75,9 @@ impl TlsHandshake {
                   } else if errors[0].code() == 0x1407609C {
                     //someone tried to connect in plain HTTP to a TLS server
                     incr!("openssl.http_request.error");
+                  } else if errors[0].code() == 0x1422E0EA {
+                    // SNI error
+                    self.log_request_error(metrics, &e);
                   } else {
                     error!("accept: handshake failed: {:?}", e);
                   }
@@ -140,6 +148,32 @@ impl TlsHandshake {
         }
       }
     }
+  }
+
+  pub fn log_request_error(&mut self, metrics: &mut SessionMetrics, handshake: &MidHandshakeSslStream<TcpStream>) {
+    metrics.service_stop();
+
+    let session = match self.address.or_else(|| handshake.get_ref().peer_addr().ok()) {
+      None => String::from("-"),
+      Some(SocketAddr::V4(addr)) => format!("{}", addr),
+      Some(SocketAddr::V6(addr)) => format!("{}", addr),
+    };
+
+    let backend = "-";
+
+    let response_time = metrics.response_time();
+    let service_time  = metrics.service_time();
+
+    let proto = "HTTPS";
+
+    let message = handshake.ssl().servername(NameType::HOST_NAME)
+      .map(|s| format!("unknown server name: {}", s))
+      .unwrap_or("no SNI".to_string());
+
+    error_access!("{} unknown\t{} -> {}\t{} {} {} {}\t{} | {}",
+      self.request_id, session, backend,
+      LogDuration(response_time), LogDuration(service_time), metrics.bin, metrics.bout,
+      proto, message);
   }
 }
 
