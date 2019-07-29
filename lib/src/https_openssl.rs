@@ -1531,7 +1531,8 @@ impl ProxyConfiguration<Session> for Proxy {
           listener.add_certificate(add_certificate.certificate);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
-          panic!();
+          error!("adding certificate to unknown listener");
+          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None }
         }
       },
       ProxyRequestData::RemoveCertificate(remove_certificate) => {
