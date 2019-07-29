@@ -591,29 +591,34 @@ impl<Front:SocketHandler> Http<Front> {
 
     match res {
       SocketResult::Error => {
-        let front_readiness = self.front_readiness.clone();
-        let back_readiness  = self.back_readiness.clone();
-        self.log_request_error(metrics,
-          &format!("front socket error, closing the session. Readiness: {:?} -> {:?}, read {} bytes",
-            front_readiness, back_readiness, sz));
-        return SessionResult::CloseSession;
-      },
-      SocketResult::Closed => {
         //we were in keep alive but the peer closed the connection
-        //FIXME: what happens if the connection was just opened but no data came?
         if self.request == Some(RequestState::Initial) {
           metrics.service_stop();
           self.front_readiness.reset();
           self.back_readiness.reset();
-          return SessionResult::CloseSession;
+        } else {
+          let front_readiness = self.front_readiness.clone();
+          let back_readiness  = self.back_readiness.clone();
+          self.log_request_error(metrics,
+            &format!("front socket error, closing the session. Readiness: {:?} -> {:?}, read {} bytes",
+              front_readiness, back_readiness, sz));
+        }
+        return SessionResult::CloseSession;
+      },
+      SocketResult::Closed => {
+        //we were in keep alive but the peer closed the connection
+        if self.request == Some(RequestState::Initial) {
+          metrics.service_stop();
+          self.front_readiness.reset();
+          self.back_readiness.reset();
         } else {
           let front_readiness = self.front_readiness.clone();
           let back_readiness  = self.back_readiness.clone();
           self.log_request_error(metrics,
             &format!("front socket was closed, closing the session. Readiness: {:?} -> {:?}, read {} bytes",
               front_readiness, back_readiness, sz));
-          return SessionResult::CloseSession;
         }
+        return SessionResult::CloseSession;
       },
       SocketResult::WouldBlock => {
         self.front_readiness.event.remove(Ready::readable());
