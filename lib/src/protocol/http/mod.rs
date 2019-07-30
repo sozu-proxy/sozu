@@ -421,6 +421,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     let app_id = self.app_id.clone().unwrap_or_else(|| String::from("-"));
     time!("request_time", &app_id, response_time.num_milliseconds());
+    time!("service_time", &app_id, service_time.num_milliseconds());
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
