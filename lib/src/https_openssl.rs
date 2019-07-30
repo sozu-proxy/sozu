@@ -1877,7 +1877,8 @@ fn version_str(version: SslVersion) -> &'static str {
     SslVersion::TLS1 => "tls.version.TLSv1_0",
     SslVersion::TLS1_1 => "tls.version.TLSv1_1",
     SslVersion::TLS1_2 => "tls.version.TLSv1_2",
-    SslVersion::TLS1_3 => "tls.version.TLSv1_3",
-    _ => "tls.version.Unknown",
+    //SslVersion::TLS1_3 => "tls.version.TLSv1_3",
+    _ => "tls.version.TLSv1_3",
+    //_ => "tls.version.Unknown",
   }
 }
