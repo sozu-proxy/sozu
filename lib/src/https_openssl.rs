@@ -1859,14 +1859,14 @@ mod tests {
     trie.domain_insert("abprefix.services.clever-cloud.com".as_bytes().to_vec(), 3u8);
     trie.domain_insert("cdprefix.services.clever-cloud.com".as_bytes().to_vec(), 4u8);
 
-    let res = trie.domain_lookup(b"test.services.clever-cloud.com");
+    let res = trie.domain_lookup(b"test.services.clever-cloud.com", true);
     println!("query result: {:?}", res);
 
     assert_eq!(
-      trie.domain_lookup(b"pgstudio.services.clever-cloud.com"),
+      trie.domain_lookup(b"pgstudio.services.clever-cloud.com", true),
       Some(&("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8)));
     assert_eq!(
-      trie.domain_lookup(b"test-prefix.services.clever-cloud.com"),
+      trie.domain_lookup(b"test-prefix.services.clever-cloud.com", true),
       Some(&("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8)));
   }
 }
