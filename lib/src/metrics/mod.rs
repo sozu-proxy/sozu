@@ -280,7 +280,7 @@ macro_rules! time (
       m.receive_metric($key, None, None, MetricData::Time(v as usize));
     });
   };
-  ($key:expr, $app_id:expr, $value: expr) => {
+  ($key:expr, $app_id:expr, $value: expr) => ({
     use $crate::metrics::{MetricData,Subscriber};
     let v = $value;
     $crate::metrics::METRICS.with(|metrics| {
@@ -289,7 +289,7 @@ macro_rules! time (
 
       m.receive_metric($key, Some(app), None, MetricData::Time(v as usize));
     });
-  }
+  })
 );
 
 #[macro_export]
