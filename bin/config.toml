@@ -152,10 +152,6 @@ protocol = "https"
 # listening address
 address = "0.0.0.0:8443"
 
-# specify a different IP than the one the socket sees, for logs and forwarded headers
-# this option is incompatible with expect_proxy
-# public_address = "1.2.3.4:80"
-
 # answer_404 = "../lib/assets/404.html"
 # answer_503 = "../lib/assets/503.html"
 # sticky_name = "SOZUBALANCEID"
