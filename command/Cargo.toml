@@ -23,8 +23,8 @@ include = [
 [dependencies]
 hex = "^0.3"
 log = "^0.4"
-pem = "^0.5"
-nix = "^0.13"
+pem = "^0.6"
+nix = "^0.15"
 mio = "^0.6"
 mio-uds = "^0.6"
 libc = "^0.2"
