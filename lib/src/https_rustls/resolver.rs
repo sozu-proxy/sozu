@@ -30,6 +30,7 @@ impl CertificateResolver {
 
   pub fn add_certificate(&mut self, add_certificate: AddCertificate) -> Option<CertFingerprint> {
     if let Some(certified_key) = generate_certified_key(add_certificate.certificate) {
+      let fingerprint = calculate_fingerprint_from_der(&certified_key.cert[0].0);
       if add_certificate.names.is_empty() {
         //FIXME: waiting for https://github.com/briansmith/webpki/pull/65 to merge to get the DNS names
         // create a untrusted::Input
@@ -39,11 +40,11 @@ impl CertificateResolver {
         // get names
         // let dns_names = ee.list_dns_names()
         // names.extend(dns_names.drain(..).map(|name| name.to_String()));
-        unimplemented!("the rustls proxy cannot extract the names from the certificate");
+        error!("the rustls proxy cannot extract the names from the certificate (fingerprint={:?})", fingerprint);
+        return None;
       }
 
       let mut names = add_certificate.names;
-      let fingerprint = calculate_fingerprint_from_der(&certified_key.cert[0].0);
       //info!("cert fingerprint: {:?}", fingerprint);
 
       let data = TlsData {
