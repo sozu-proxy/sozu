@@ -1869,6 +1869,25 @@ mod tests {
       trie.domain_lookup(b"test-prefix.services.clever-cloud.com", true),
       Some(&("*.services.clever-cloud.com".as_bytes().to_vec(), 1u8)));
   }
+
+  #[test]
+  fn wildcard_with_subdomains() {
+
+    let mut trie = TrieNode::root();
+
+    trie.domain_insert("*.test.example.com".as_bytes().to_vec(), 1u8);
+    trie.domain_insert("hello.sub.test.example.com".as_bytes().to_vec(), 2u8);
+
+    let res = trie.domain_lookup(b"sub.test.example.com", true);
+    println!("query result: {:?}", res);
+
+    assert_eq!(
+      trie.domain_lookup(b"sub.test.example.com", true),
+      Some(&("*.test.example.com".as_bytes().to_vec(), 1u8)));
+    assert_eq!(
+      trie.domain_lookup(b"hello.sub.test.example.com", true),
+      Some(&("hello.sub.test.example.com".as_bytes().to_vec(), 2u8)));
+  }
 }
 
 fn version_str(version: SslVersion) -> &'static str {
