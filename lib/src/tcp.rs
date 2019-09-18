@@ -65,6 +65,7 @@ pub struct Session {
   timeout:            Timeout,
   last_event:         SteadyTime,
   connection_attempt: u8,
+  frontend_address:   Option<SocketAddr>,
 }
 
 impl Session {
@@ -101,6 +102,8 @@ impl Session {
       }
     };
 
+    let frontend_address = sock.peer_addr().ok();
+
     Session {
       sock,
       backend:            None,
@@ -116,11 +119,12 @@ impl Session {
       timeout,
       last_event:         SteadyTime::now(),
       connection_attempt: 0,
+      frontend_address,
     }
   }
 
   fn log_request(&self) {
-    let frontend = match self.sock.peer_addr().ok() {
+    let frontend = match self.frontend_address {
       None => String::from("-"),
       Some(SocketAddr::V4(addr)) => format!("{}", addr),
       Some(SocketAddr::V6(addr)) => format!("{}", addr),
