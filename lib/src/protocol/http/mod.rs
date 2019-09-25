@@ -907,6 +907,17 @@ impl<Front:SocketHandler> Http<Front> {
           SessionResult::CloseSession
         }
       },
+      Some(ResponseState::ResponseWithBodyCloseDelimited(_,_, back_closed)) => {
+        self.back_readiness.interest.insert(Ready::readable());
+        if back_closed {
+          save_http_status_metric(self.get_response_status());
+          self.log_request_success(&metrics);
+
+          SessionResult::CloseSession
+        } else {
+          SessionResult::Continue
+        }
+      },
       // restart parsing, since there will be other chunks next
       Some(ResponseState::ResponseWithBodyChunks(_,_,_)) => {
         self.back_readiness.interest.insert(Ready::readable());
@@ -1175,6 +1186,32 @@ impl<Front:SocketHandler> Http<Front> {
           }
         }
         self.front_readiness.interest.insert(Ready::writable());
+        (ProtocolResult::Continue, SessionResult::Continue)
+      },
+      Some(ResponseState::ResponseWithBodyCloseDelimited(_,_,_)) => {
+        self.front_readiness.interest.insert(Ready::writable());
+        if sz > 0 {
+          self.back_buf.as_mut().map(|buf| {
+            buf.slice_output(sz);
+            buf.consume_parsed_data(sz);
+          });
+        }
+
+        if let ResponseState::ResponseWithBodyCloseDelimited(rl, conn, back_closed) = self.response.take().unwrap() {
+          if r == SocketResult::Error || r == SocketResult::Closed || sz == 0 {
+            self.response = Some(ResponseState::ResponseWithBodyCloseDelimited(rl, conn, true));
+
+            // if the back buffer is already empty, we can stop here
+            if self.back_buf.as_ref().map(|buf| buf.output_data_size() == 0 || buf.next_output_data().is_empty()).unwrap() {
+              save_http_status_metric(self.get_response_status());
+              self.log_request_success(&metrics);
+              return (ProtocolResult::Continue, SessionResult::CloseSession);
+            }
+          } else {
+            self.response = Some(ResponseState::ResponseWithBodyCloseDelimited(rl, conn, back_closed));
+          }
+        }
+
         (ProtocolResult::Continue, SessionResult::Continue)
       },
       Some(ResponseState::Error(_,_,_,_,_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),

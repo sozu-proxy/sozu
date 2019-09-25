@@ -1024,6 +1024,8 @@ pub enum ResponseState {
   ResponseUpgrade(RStatusLine, Connection, UpgradeProtocol),
   ResponseWithBody(RStatusLine, Connection, usize),
   ResponseWithBodyChunks(RStatusLine, Connection, Chunk),
+  // the boolean indicates if the backend connection is closed
+  ResponseWithBodyCloseDelimited(RStatusLine, Connection, bool),
 }
 
 impl ResponseState {
@@ -1037,14 +1039,19 @@ impl ResponseState {
       ResponseState::ResponseUpgrade(sl, conn, upgrade) => ResponseState::Error(Some(sl), Some(conn), Some(upgrade), None, None),
       ResponseState::ResponseWithBody(sl, conn, len) => ResponseState::Error(Some(sl), Some(conn), None, Some(LengthInformation::Length(len)), None),
       ResponseState::ResponseWithBodyChunks(sl, conn, chunk) => ResponseState::Error(Some(sl), Some(conn), None, None, Some(chunk)),
+      ResponseState::ResponseWithBodyCloseDelimited(sl, conn, _) => ResponseState::Error(Some(sl), Some(conn), None, None, None),
       err => err
     }
   }
 
   pub fn is_proxying(&self) -> bool {
     match *self {
-      ResponseState::Response(_, _) | ResponseState::ResponseWithBody(_, _, _) => true,
-      _                                                                        => false
+        ResponseState::Response(_, _)
+      | ResponseState::ResponseWithBody(_, _, _)
+      | ResponseState::ResponseWithBodyChunks(_, _, _)
+      | ResponseState::ResponseWithBodyCloseDelimited(_, _, _)
+        => true,
+      _ => false
     }
   }
 
@@ -1064,6 +1071,7 @@ impl ResponseState {
       ResponseState::Response(ref sl, _)                  |
       ResponseState::ResponseUpgrade(ref sl, _, _)        |
       ResponseState::ResponseWithBody(ref sl, _, _)       |
+      ResponseState::ResponseWithBodyCloseDelimited(ref sl, _, _) |
       ResponseState::ResponseWithBodyChunks(ref sl, _, _) => Some(sl.clone()),
       ResponseState::Error(ref sl, _, _, _, _)            => sl.clone(),
       _                                                   => None
@@ -1078,6 +1086,7 @@ impl ResponseState {
       ResponseState::Response(_, ref conn)                  |
       ResponseState::ResponseUpgrade(_, ref conn, _)        |
       ResponseState::ResponseWithBody(_, ref conn, _)       |
+      ResponseState::ResponseWithBodyCloseDelimited(_, ref conn, _) |
       ResponseState::ResponseWithBodyChunks(_, ref conn, _) => Some(conn.clone()),
       ResponseState::Error(_, ref conn, _, _, _)            => conn.clone(),
       _                                                     => None
@@ -1092,6 +1101,7 @@ impl ResponseState {
       ResponseState::Response(_, ref mut conn)                  |
       ResponseState::ResponseUpgrade(_, ref mut conn, _)        |
       ResponseState::ResponseWithBody(_, ref mut conn, _)       |
+      ResponseState::ResponseWithBodyCloseDelimited(_, ref mut conn, _) |
       ResponseState::ResponseWithBodyChunks(_, ref mut conn, _) => Some(conn),
       ResponseState::Error(_, ref mut conn, _, _, _)            => conn.as_mut(),
       _                                                     => None
@@ -1494,7 +1504,11 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
           match crlf(buf) {
             Ok((i, _)) => {
               debug!("PARSER\theaders parsed, stopping");
-              (BufferMove::Advance(buf.offset(i)), ResponseState::Response(sl, conn))
+              if conn.keep_alive == Some(false) {
+                (BufferMove::Advance(buf.offset(i)), ResponseState::ResponseWithBodyCloseDelimited(sl, conn, false))
+              } else {
+                (BufferMove::Advance(buf.offset(i)), ResponseState::Response(sl, conn))
+              }
             },
             res => {
               error!("PARSER\tHasResponseLine could not parse header for input:\n{}\n", buf.to_hex(16));
@@ -1560,6 +1574,9 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
     ResponseState::ResponseWithBodyChunks(rl, conn, ch) => {
       let (advance, chunk_state) = ch.parse(buf);
       (advance, ResponseState::ResponseWithBodyChunks(rl, conn, chunk_state))
+    },
+    ResponseState::ResponseWithBodyCloseDelimited(rl, conn, b) => {
+      (BufferMove::Advance(buf.len()), ResponseState::ResponseWithBodyCloseDelimited(rl, conn, b))
     },
     _ => {
       error!("PARSER\tunimplemented state: {:?}", state);
@@ -1682,7 +1699,7 @@ pub fn parse_response_until_stop(mut current_state: ResponseState, mut header_en
   loop {
     //trace!("PARSER\t{}\tpos[{}]: {:?}", request_id, position, current_state);
     let (mv, new_state) = parse_response(current_state, buf.unparsed_data(), is_head, sticky_name);
-    //trace!("PARSER\t{}\tinput:\n{}\nmv: {:?}, new state: {:?}\n", request_id, buf.unparsed_data().to_hex(16), mv, new_state);
+    //trace!("PARSER\tinput:\n{}\nmv: {:?}, new state: {:?}\n", buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
     current_state = new_state;
 
@@ -1713,6 +1730,26 @@ pub fn parse_response_until_stop(mut current_state: ResponseState, mut header_en
 
               buf.slice_output(sz+content_length);
               buf.consume_parsed_data(content_length);
+            },
+            ResponseState::ResponseWithBodyCloseDelimited(_,ref conn, _) => {
+              buf.insert_output(Vec::from(added_res_header.as_bytes()));
+              add_sticky_session_to_response(buf, sticky_name, sticky_session);
+
+              // special case: some servers send responses with no body,
+              // no content length, and Connection: close
+              // since we deleted the Connection header, we'll add a new one
+              if conn.keep_alive == Some(false) {
+                buf.insert_output(Vec::from(&b"Connection: close"[..]));
+              }
+
+              buf.consume_parsed_data(sz);
+              header_end = Some(buf.start_parsing_position);
+
+              buf.slice_output(sz);
+
+              let len = buf.available_input_data();
+              buf.consume_parsed_data(len);
+              buf.slice_output(len);
             },
             _ => {
               buf.consume_parsed_data(sz);
@@ -1767,7 +1804,8 @@ pub fn parse_response_until_stop(mut current_state: ResponseState, mut header_en
       }
       ResponseState::Response(_,_) | ResponseState::ResponseWithBody(_,_,_) |
         ResponseState::ResponseUpgrade(_,_,_) |
-        ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended) => break,
+        ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended) |
+        ResponseState::ResponseWithBodyCloseDelimited(_,_,_) => break,
       _ => ()
     }
     //println!("move: {:?}, new state: {:?}, input_queue {:?}, output_queue: {:?}", mv, current_state, buf.input_queue, buf.output_queue);
