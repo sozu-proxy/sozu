@@ -1739,7 +1739,7 @@ pub fn parse_response_until_stop(mut current_state: ResponseState, mut header_en
               // no content length, and Connection: close
               // since we deleted the Connection header, we'll add a new one
               if conn.keep_alive == Some(false) {
-                buf.insert_output(Vec::from(&b"Connection: close"[..]));
+                buf.insert_output(Vec::from(&b"Connection: close\r\n"[..]));
               }
 
               buf.consume_parsed_data(sz);
