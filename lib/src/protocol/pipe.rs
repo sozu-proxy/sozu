@@ -15,6 +15,14 @@ pub enum SessionStatus {
   DefaultAnswer,
 }
 
+#[derive(Copy, Clone, Debug)]
+enum ConnectionStatus {
+  Normal,
+  ReadOpen,
+  WriteOpen,
+  Closed,
+}
+
 pub struct Pipe<Front:SocketHandler> {
   pub frontend:       Front,
   backend:            Option<TcpStream>,
@@ -29,6 +37,8 @@ pub struct Pipe<Front:SocketHandler> {
   pub log_ctx:        String,
   session_address:    Option<SocketAddr>,
   protocol:           Protocol,
+  frontend_status:    ConnectionStatus,
+  backend_status:     ConnectionStatus,
 }
 
 impl<Front:SocketHandler> Pipe<Front> {
@@ -36,6 +46,13 @@ impl<Front:SocketHandler> Pipe<Front> {
     backend: Option<TcpStream>, front_buf: Checkout<Buffer>,
     back_buf: Checkout<Buffer>, session_address: Option<SocketAddr>, protocol: Protocol) -> Pipe<Front> {
     let log_ctx    = format!("{}\tunknown\t", &request_id);
+    let frontend_status = ConnectionStatus::Normal;
+    let backend_status = if backend.is_none() {
+      ConnectionStatus::Closed
+    } else {
+      ConnectionStatus::Normal
+    };
+
     let session = Pipe {
       frontend,
       backend,
@@ -56,6 +73,8 @@ impl<Front:SocketHandler> Pipe<Front> {
       log_ctx,
       session_address,
       protocol,
+      frontend_status,
+      backend_status,
     };
 
     trace!("created pipe");
@@ -79,6 +98,7 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   pub fn set_back_socket(&mut self, socket: TcpStream) {
     self.backend = Some(socket);
+    self.backend_status = ConnectionStatus::Normal;
   }
 
   pub fn back_token(&self)   -> Option<Token> {
@@ -198,12 +218,55 @@ impl<Front:SocketHandler> Pipe<Front> {
       proto, message);
   }
 
+  pub fn check_connections(&self) -> bool {
+
+    let res = match (self.frontend_status, self.backend_status) {
+
+      //(ConnectionStatus::Normal, ConnectionStatus::Normal) => true,
+      //(ConnectionStatus::Normal, ConnectionStatus::ReadOpen) => true,
+      (ConnectionStatus::Normal, ConnectionStatus::WriteOpen) => {
+        // technically we should keep it open, but we'll assume that if the front
+        // is not readable and there is no in flight data front -> back,
+        // we'll close the session, otherwise it interacts badly with HTTP connections
+        // with Connection: close header and no Content-length
+        self.front_readiness.event.is_readable() || self.front_buf.available_data() > 0
+      },
+      (ConnectionStatus::Normal, ConnectionStatus::Closed) => self.back_buf.available_data() > 0,
+
+      (ConnectionStatus::WriteOpen, ConnectionStatus::Normal) => {
+        // technically we should keep it open, but we'll assume that if the back
+        // is not readable and there is no in flight data back -> front, we'll close the session
+        self.back_readiness.event.is_readable() || self.back_buf.available_data() > 0
+      },
+      //(ConnectionStatus::WriteOpen, ConnectionStatus::ReadOpen) => true,
+      (ConnectionStatus::WriteOpen, ConnectionStatus::WriteOpen) => self.front_buf.available_data() >= 0 || self.back_buf.available_data() > 0,
+      (ConnectionStatus::WriteOpen, ConnectionStatus::Closed) => self.back_buf.available_data() > 0,
+
+      //(ConnectionStatus::ReadOpen, ConnectionStatus::Normal) => true,
+      (ConnectionStatus::ReadOpen, ConnectionStatus::ReadOpen) => false,
+      //(ConnectionStatus::ReadOpen, ConnectionStatus::WriteOpen) => true,
+      (ConnectionStatus::ReadOpen, ConnectionStatus::Closed) => false,
+
+      (ConnectionStatus::Closed, ConnectionStatus::Normal) => self.front_buf.available_data() > 0,
+      (ConnectionStatus::Closed, ConnectionStatus::ReadOpen) => false,
+      (ConnectionStatus::Closed, ConnectionStatus::WriteOpen) => self.front_buf.available_data() > 0,
+      (ConnectionStatus::Closed, ConnectionStatus::Closed) => false,
+
+      _ => true,
+    };
+
+    //info!("check_connections: front = {:?}, back = {:?} => {}", self.frontend_status, self.backend_status, res);
+    res
+  }
+
   pub fn front_hup(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     self.log_request_success(metrics);
+    self.frontend_status = ConnectionStatus::Closed;
     SessionResult::CloseSession
   }
 
   pub fn back_hup(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    self.backend_status = ConnectionStatus::Closed;
     if self.back_buf.available_data() == 0 {
       if self.back_readiness.event.is_readable() {
         self.back_readiness().interest.insert(Ready::readable());
@@ -247,6 +310,20 @@ impl<Front:SocketHandler> Pipe<Front> {
       self.back_readiness.interest.insert(Ready::writable());
     } else {
       self.front_readiness.event.remove(Ready::readable());
+
+      self.frontend_status = match self.frontend_status {
+        ConnectionStatus::Normal => ConnectionStatus::WriteOpen,
+        ConnectionStatus::ReadOpen => ConnectionStatus::Closed,
+        s => s,
+      };
+    }
+
+    if !self.check_connections() {
+      metrics.service_stop();
+      self.front_readiness.reset();
+      self.back_readiness.reset();
+      self.log_request_success(metrics);
+      return SessionResult::CloseSession;
     }
 
     match res {
@@ -299,6 +376,24 @@ impl<Front:SocketHandler> Pipe<Front> {
       res = current_res;
       self.back_buf.consume(current_sz);
       sz += current_sz;
+
+      if current_sz == 0 {
+        self.frontend_status = match self.frontend_status {
+          ConnectionStatus::Normal => ConnectionStatus::ReadOpen,
+          ConnectionStatus::WriteOpen => ConnectionStatus::Closed,
+          s => s,
+        };
+      }
+
+      if !self.check_connections() {
+        metrics.bout += sz;
+        count!("bytes_out", sz as i64);
+        metrics.service_stop();
+        self.front_readiness.reset();
+        self.back_readiness.reset();
+        self.log_request_success(metrics);
+        return SessionResult::CloseSession;
+      }
     }
 
     if sz > 0 {
@@ -365,10 +460,28 @@ impl<Front:SocketHandler> Pipe<Front> {
         socket_res = current_res;
         self.front_buf.consume(current_sz);
         sz += current_sz;
+
+        if current_sz == 0 {
+          self.backend_status = match self.backend_status {
+            ConnectionStatus::Normal => ConnectionStatus::ReadOpen,
+            ConnectionStatus::WriteOpen => ConnectionStatus::Closed,
+            s => s,
+          };
+
+        }
+
       }
     }
 
     metrics.backend_bout += sz;
+
+    if !self.check_connections() {
+      metrics.service_stop();
+      self.front_readiness.reset();
+      self.back_readiness.reset();
+      self.log_request_success(metrics);
+      return SessionResult::CloseSession;
+    }
 
     if let Some((front,back)) = tokens {
       debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", self.log_ctx, front.0, back.0, sz, output_size);
@@ -422,6 +535,21 @@ impl<Front:SocketHandler> Pipe<Front> {
       if sz > 0 {
         self.front_readiness.interest.insert(Ready::writable());
         metrics.backend_bin += sz;
+      } else {
+        self.backend_status = match self.backend_status {
+          ConnectionStatus::Normal => ConnectionStatus::WriteOpen,
+          ConnectionStatus::ReadOpen => ConnectionStatus::Closed,
+          s => s,
+        };
+
+        if !self.check_connections() {
+          metrics.service_stop();
+          self.front_readiness.reset();
+          self.back_readiness.reset();
+          self.log_request_success(metrics);
+          return SessionResult::CloseSession;
+        }
+
       }
 
       match r {
