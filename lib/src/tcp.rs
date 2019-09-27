@@ -72,7 +72,7 @@ impl Session {
   fn new(sock: TcpStream, frontend_token: Token, accept_token: Token, front_buf: Checkout<Buffer>,
     back_buf: Checkout<Buffer>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Session {
     let s = sock.try_clone().expect("could not clone the socket");
-    let addr = sock.local_addr().ok();
+    let frontend_address = sock.peer_addr().ok();
     let mut frontend_buffer = None;
     let mut backend_buffer = None;
 
@@ -98,11 +98,11 @@ impl Session {
       },
       None => {
         gauge_add!("protocol.tcp", 1);
-        Some(State::Pipe(Pipe::new(s, frontend_token, request_id, None, front_buf, back_buf, addr, Protocol::TCP)))
+        Some(State::Pipe(Pipe::new(s, frontend_token, request_id, None, front_buf, back_buf, frontend_address,
+          Protocol::TCP)))
       }
     };
 
-    let frontend_address = sock.peer_addr().ok();
 
     Session {
       sock,
@@ -156,20 +156,22 @@ impl Session {
   }
 
   fn front_hup(&mut self) -> SessionResult {
-    self.log_request();
-
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.front_hup(&mut self.metrics),
-      _ => SessionResult::CloseSession,
+      _ => {
+        self.log_request();
+        SessionResult::CloseSession
+      },
     }
   }
 
   fn back_hup(&mut self) -> SessionResult {
-    self.log_request();
-
     match self.protocol {
       Some(State::Pipe(ref mut pipe)) => pipe.back_hup(&mut self.metrics),
-      _ => SessionResult::CloseSession,
+      _ => {
+        self.log_request();
+        SessionResult::CloseSession
+      }
     }
   }
 
