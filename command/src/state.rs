@@ -254,12 +254,26 @@ impl ConfigState {
   pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
     let mut v = Vec::new();
 
-    for &(ref listener, _) in self.http_listeners.values() {
+    for &(ref listener, active) in self.http_listeners.values() {
       v.push(ProxyRequestData::AddHttpListener(listener.clone()));
+      if active {
+        v.push(ProxyRequestData::ActivateListener(ActivateListener {
+          front: listener.front.clone(),
+          proxy: ListenerType::HTTP,
+          from_scm: false
+        }));
+      }
     }
 
-    for &(ref listener, _) in self.https_listeners.values() {
+    for &(ref listener, active) in self.https_listeners.values() {
       v.push(ProxyRequestData::AddHttpsListener(listener.clone()));
+      if active {
+        v.push(ProxyRequestData::ActivateListener(ActivateListener {
+          front: listener.front.clone(),
+          proxy: ListenerType::HTTPS,
+          from_scm: false
+        }));
+      }
     }
 
     for &(ref listener, active) in self.tcp_listeners.values() {
