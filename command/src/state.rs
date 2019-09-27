@@ -9,7 +9,7 @@ use proxy::{Application,CertFingerprint,CertificateAndKey,ProxyRequestData,
   HttpFront,TcpFront,Backend,QueryAnswerApplication,
   AddCertificate, RemoveCertificate, RemoveBackend,
   HttpListener,HttpsListener,TcpListener,ListenerType,
-  ActivateListener,RemoveListener};
+  ActivateListener,RemoveListener, DeactivateListener};
 
 pub type AppId = String;
 
@@ -32,6 +32,7 @@ pub struct HttpsProxy {
 pub struct ConfigState {
   pub applications:    HashMap<AppId, Application>,
   pub backends:        HashMap<AppId, Vec<Backend>>,
+  /// the bool indicates if it is active or not
   pub http_listeners:  HashMap<SocketAddr, (HttpListener, bool)>,
   pub https_listeners: HashMap<SocketAddr, (HttpsListener, bool)>,
   pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
@@ -363,6 +364,18 @@ impl ConfigState {
     let added_tcp_listeners: Vec<&SocketAddr> = their_tcp_listeners.difference(&my_tcp_listeners)
       .cloned().collect();
 
+    let my_http_listeners: HashSet<&SocketAddr> = self.http_listeners.keys().collect();
+    let their_http_listeners: HashSet<&SocketAddr> = other.http_listeners.keys().collect();
+    let removed_http_listeners = my_http_listeners.difference(&their_http_listeners);
+    let added_http_listeners: Vec<&SocketAddr> = their_http_listeners.difference(&my_http_listeners)
+      .cloned().collect();
+
+    let my_https_listeners: HashSet<&SocketAddr> = self.https_listeners.keys().collect();
+    let their_https_listeners: HashSet<&SocketAddr> = other.https_listeners.keys().collect();
+    let removed_https_listeners = my_https_listeners.difference(&their_https_listeners);
+    let added_https_listeners: Vec<&SocketAddr> = their_https_listeners.difference(&my_https_listeners)
+      .cloned().collect();
+
     let mut my_http_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
     for (ref app_id, ref front_list) in self.http_fronts.iter() {
       for ref front in front_list.iter() {
@@ -442,6 +455,14 @@ impl ConfigState {
     let mut v = vec!();
 
     for address in removed_tcp_listeners {
+      if self.tcp_listeners[address].1 {
+        v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
+          front: **address,
+          proxy: ListenerType::TCP,
+          to_scm: false,
+        }));
+      }
+
       v.push(ProxyRequestData::RemoveListener(RemoveListener {
         front: **address,
         proxy: ListenerType::TCP
@@ -450,7 +471,160 @@ impl ConfigState {
 
     for address in added_tcp_listeners.clone() {
       v.push(ProxyRequestData::AddTcpListener(other.tcp_listeners[address].0.clone()));
+
+      if other.http_listeners[address].1 {
+        v.push(ProxyRequestData::ActivateListener(ActivateListener {
+          front: *address,
+          proxy: ListenerType::TCP,
+          from_scm: false,
+        }));
+      }
     }
+
+    for address in removed_http_listeners {
+      if self.http_listeners[address].1 {
+        v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
+          front: **address,
+          proxy: ListenerType::HTTP,
+          to_scm: false,
+        }));
+      }
+
+      v.push(ProxyRequestData::RemoveListener(RemoveListener {
+        front: **address,
+        proxy: ListenerType::HTTP
+      }));
+    }
+
+    for address in added_http_listeners.clone() {
+      v.push(ProxyRequestData::AddHttpListener(other.http_listeners[address].0.clone()));
+
+      if other.http_listeners[address].1 {
+        v.push(ProxyRequestData::ActivateListener(ActivateListener {
+          front: *address,
+          proxy: ListenerType::TCP,
+          from_scm: false,
+        }));
+      }
+    }
+
+    for address in removed_https_listeners {
+      if self.https_listeners[address].1 {
+        v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
+          front: **address,
+          proxy: ListenerType::HTTP,
+          to_scm: false,
+        }));
+      }
+
+      v.push(ProxyRequestData::RemoveListener(RemoveListener {
+        front: **address,
+        proxy: ListenerType::HTTPS
+      }));
+    }
+
+    for address in added_https_listeners.clone() {
+      v.push(ProxyRequestData::AddHttpsListener(other.https_listeners[address].0.clone()));
+
+      if other.http_listeners[address].1 {
+        v.push(ProxyRequestData::ActivateListener(ActivateListener {
+          front: *address,
+          proxy: ListenerType::TCP,
+          from_scm: false,
+        }));
+      }
+    }
+
+    for addr in my_tcp_listeners.intersection(&their_tcp_listeners) {
+      let (my_listener, my_active) = &self.tcp_listeners[addr];
+      let (their_listener, their_active) = &other.tcp_listeners[addr];
+
+      if my_listener != their_listener {
+        v.push(ProxyRequestData::RemoveListener(RemoveListener {
+          front: **addr,
+          proxy: ListenerType::TCP
+        }));
+
+        v.push(ProxyRequestData::AddTcpListener(their_listener.clone()));
+      }
+
+      if *my_active && !*their_active {
+        v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
+          front: **addr,
+          proxy: ListenerType::TCP,
+          to_scm: false,
+        }));
+      }
+
+      if !*my_active && *their_active {
+        v.push(ProxyRequestData::ActivateListener(ActivateListener {
+          front: **addr,
+          proxy: ListenerType::TCP,
+          from_scm: false,
+        }));
+      }
+    }
+
+    for addr in my_http_listeners.intersection(&their_http_listeners) {
+      let (my_listener, my_active) = &self.http_listeners[addr];
+      let (their_listener, their_active) = &other.http_listeners[addr];
+
+      if my_listener != their_listener {
+        v.push(ProxyRequestData::RemoveListener(RemoveListener {
+          front: **addr,
+          proxy: ListenerType::HTTP
+        }));
+
+        v.push(ProxyRequestData::AddHttpListener(their_listener.clone()));
+      }
+
+      if *my_active && !*their_active {
+        v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
+          front: **addr,
+          proxy: ListenerType::HTTP,
+          to_scm: false,
+        }));
+      }
+
+      if !*my_active && *their_active {
+        v.push(ProxyRequestData::ActivateListener(ActivateListener {
+          front: **addr,
+          proxy: ListenerType::HTTP,
+          from_scm: false,
+        }));
+      }
+    }
+
+    for addr in my_https_listeners.intersection(&their_https_listeners) {
+      let (my_listener, my_active) = &self.https_listeners[addr];
+      let (their_listener, their_active) = &other.https_listeners[addr];
+
+      if my_listener != their_listener {
+        v.push(ProxyRequestData::RemoveListener(RemoveListener {
+          front: **addr,
+          proxy: ListenerType::HTTPS
+        }));
+
+        v.push(ProxyRequestData::AddHttpsListener(their_listener.clone()));
+      }
+
+      if *my_active && !*their_active {
+        v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
+          front: **addr,
+          proxy: ListenerType::HTTPS,
+          to_scm: false,
+        }));
+      }
+
+      if !*my_active && *their_active {
+        v.push(ProxyRequestData::ActivateListener(ActivateListener {
+          front: **addr,
+          proxy: ListenerType::HTTPS,
+          from_scm: false,
+        }));
+      }
+    }
+
 
     for app_id in removed_apps {
       v.push(ProxyRequestData::RemoveApplication(app_id.to_string()));
@@ -603,7 +777,7 @@ pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<(Strin
 mod tests {
   use super::*;
   use config::LoadBalancingAlgorithms;
-  use proxy::{ProxyRequestData,HttpFront,Backend,LoadBalancingParams};
+  use proxy::{ProxyRequestData,HttpFront,Backend,LoadBalancingParams,TlsProvider};
 
   #[test]
   fn serialize() {
@@ -748,6 +922,143 @@ mod tests {
     state.handle_order(&ProxyRequestData::AddBackend(b.clone()));
 
     assert_eq!(state.backends.get("app_1").unwrap(), &vec![b]);
+  }
+
+  #[test]
+  fn listener_diff() {
+    let mut state:ConfigState = Default::default();
+    state.handle_order(&ProxyRequestData::AddTcpListener(TcpListener {
+      front: "0.0.0.0:1234".parse().unwrap(),
+      public_address: None,
+      expect_proxy: false,
+    }));
+    state.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
+      front: "0.0.0.0:1234".parse().unwrap(),
+      proxy: ListenerType::TCP,
+      from_scm: false,
+    }));
+    state.handle_order(&ProxyRequestData::AddHttpListener(HttpListener {
+      front: "0.0.0.0:8080".parse().unwrap(),
+      public_address: None,
+      expect_proxy: false,
+      answer_404: String::new(),
+      answer_503: String::new(),
+      sticky_name: String::new(),
+    }));
+    state.handle_order(&ProxyRequestData::AddHttpsListener(HttpsListener {
+      front: "0.0.0.0:8443".parse().unwrap(),
+      public_address: None,
+      expect_proxy: false,
+      answer_404: String::new(),
+      answer_503: String::new(),
+      sticky_name: String::new(),
+      versions: Vec::new(),
+      cipher_list: String::new(),
+      rustls_cipher_list: Vec::new(),
+      tls_provider: TlsProvider::Openssl,
+    }));
+    state.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
+      front: "0.0.0.0:8443".parse().unwrap(),
+      proxy: ListenerType::HTTPS,
+      from_scm: false,
+    }));
+
+    let mut state2:ConfigState = Default::default();
+    state2.handle_order(&ProxyRequestData::AddTcpListener(TcpListener {
+      front: "0.0.0.0:1234".parse().unwrap(),
+      public_address: None,
+      expect_proxy: true,
+    }));
+    state2.handle_order(&ProxyRequestData::AddHttpListener(HttpListener {
+      front: "0.0.0.0:8080".parse().unwrap(),
+      public_address: None,
+      expect_proxy: false,
+      answer_404: "test".to_string(),
+      answer_503: String::new(),
+      sticky_name: String::new(),
+    }));
+    state2.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
+      front: "0.0.0.0:8080".parse().unwrap(),
+      proxy: ListenerType::HTTP,
+      from_scm: false,
+    }));
+    state2.handle_order(&ProxyRequestData::AddHttpsListener(HttpsListener {
+      front: "0.0.0.0:8443".parse().unwrap(),
+      public_address: None,
+      expect_proxy: false,
+      answer_404: String::from("test"),
+      answer_503: String::new(),
+      sticky_name: String::new(),
+      versions: Vec::new(),
+      cipher_list: String::new(),
+      rustls_cipher_list: Vec::new(),
+      tls_provider: TlsProvider::Openssl,
+    }));
+    state2.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
+      front: "0.0.0.0:8443".parse().unwrap(),
+      proxy: ListenerType::HTTPS,
+      from_scm: false,
+    }));
+
+    let e = vec!(
+      ProxyRequestData::RemoveListener(RemoveListener {
+        front: "0.0.0.0:1234".parse().unwrap(),
+        proxy: ListenerType::TCP,
+      }),
+      ProxyRequestData::AddTcpListener(TcpListener {
+        front: "0.0.0.0:1234".parse().unwrap(),
+        public_address: None,
+        expect_proxy: true,
+      }),
+      ProxyRequestData::DeactivateListener(DeactivateListener {
+        front: "0.0.0.0:1234".parse().unwrap(),
+        proxy: ListenerType::TCP,
+        to_scm: false,
+      }),
+      ProxyRequestData::RemoveListener(RemoveListener {
+        front: "0.0.0.0:8080".parse().unwrap(),
+        proxy: ListenerType::HTTP,
+      }),
+      ProxyRequestData::AddHttpListener(HttpListener {
+        front: "0.0.0.0:8080".parse().unwrap(),
+        public_address: None,
+        expect_proxy: false,
+        answer_404: String::from("test"),
+        answer_503: String::new(),
+        sticky_name: String::new(),
+      }),
+      ProxyRequestData::ActivateListener(ActivateListener {
+        front: "0.0.0.0:8080".parse().unwrap(),
+        proxy: ListenerType::HTTP,
+        from_scm: false,
+      }),
+      ProxyRequestData::RemoveListener(RemoveListener {
+        front: "0.0.0.0:8443".parse().unwrap(),
+        proxy: ListenerType::HTTPS,
+      }),
+      ProxyRequestData::AddHttpsListener(HttpsListener {
+        front: "0.0.0.0:8443".parse().unwrap(),
+        public_address: None,
+        expect_proxy: false,
+        answer_404: String::from("test"),
+        answer_503: String::new(),
+        sticky_name: String::new(),
+        versions: Vec::new(),
+        cipher_list: String::new(),
+        rustls_cipher_list: Vec::new(),
+        tls_provider: TlsProvider::Openssl,
+      }),
+    );
+
+    let diff = state.diff(&state2);
+    //let diff: HashSet<&ProxyRequestData> = HashSet::from_iter(d.iter());
+    println!("expected diff orders:\n{:#?}\n", e);
+    println!("diff orders:\n{:#?}\n", diff);
+
+    let hash1 = state.hash_state();
+    let hash2 = state2.hash_state();
+
+    assert_eq!(diff, e);
   }
 
 }
