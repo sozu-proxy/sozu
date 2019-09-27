@@ -502,7 +502,7 @@ impl ConfigState {
       if other.http_listeners[address].1 {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
           front: *address,
-          proxy: ListenerType::TCP,
+          proxy: ListenerType::HTTP,
           from_scm: false,
         }));
       }
@@ -512,7 +512,7 @@ impl ConfigState {
       if self.https_listeners[address].1 {
         v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
           front: **address,
-          proxy: ListenerType::HTTP,
+          proxy: ListenerType::HTTPS,
           to_scm: false,
         }));
       }
@@ -529,7 +529,7 @@ impl ConfigState {
       if other.http_listeners[address].1 {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
           front: *address,
-          proxy: ListenerType::TCP,
+          proxy: ListenerType::HTTPS,
           from_scm: false,
         }));
       }
