@@ -486,7 +486,7 @@ impl ConfigState {
     for address in added_tcp_listeners.clone() {
       v.push(ProxyRequestData::AddTcpListener(other.tcp_listeners[address].0.clone()));
 
-      if other.http_listeners[address].1 {
+      if other.tcp_listeners[address].1 {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
           front: *address,
           proxy: ListenerType::TCP,
@@ -540,7 +540,7 @@ impl ConfigState {
     for address in added_https_listeners.clone() {
       v.push(ProxyRequestData::AddHttpsListener(other.https_listeners[address].0.clone()));
 
-      if other.http_listeners[address].1 {
+      if other.https_listeners[address].1 {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
           front: *address,
           proxy: ListenerType::HTTPS,
