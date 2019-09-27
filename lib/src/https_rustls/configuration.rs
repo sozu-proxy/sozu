@@ -115,7 +115,7 @@ impl Listener {
 
   pub fn activate(&mut self, event_loop: &mut Poll, tcp_listener: Option<TcpListener>) -> Option<Token> {
     if self.active {
-      return None;
+      return Some(self.token);
     }
 
     let listener = tcp_listener.or_else(|| server_bind(&self.config.front).map_err(|e| {
