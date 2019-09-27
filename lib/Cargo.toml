@@ -44,7 +44,7 @@ mio-extras = "^2.0"
 
 [dev-dependencies]
 tiny_http = "^0.6"
-quickcheck = "^0.8"
+quickcheck = "^0.9"
 
 [dependencies.uuid]
 version = "^0.7.0"
