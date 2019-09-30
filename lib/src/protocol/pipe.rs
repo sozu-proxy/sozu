@@ -315,11 +315,13 @@ impl<Front:SocketHandler> Pipe<Front> {
     } else {
       self.front_readiness.event.remove(Ready::readable());
 
-      self.frontend_status = match self.frontend_status {
-        ConnectionStatus::Normal => ConnectionStatus::WriteOpen,
-        ConnectionStatus::ReadOpen => ConnectionStatus::Closed,
-        s => s,
-      };
+      if res == SocketResult::Continue {
+        self.frontend_status = match self.frontend_status {
+          ConnectionStatus::Normal => ConnectionStatus::WriteOpen,
+          ConnectionStatus::ReadOpen => ConnectionStatus::Closed,
+          s => s,
+        };
+      }
     }
 
     if !self.check_connections() {
@@ -381,7 +383,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       self.back_buf.consume(current_sz);
       sz += current_sz;
 
-      if current_sz == 0 {
+      if current_sz == 0 && res == SocketResult::Continue {
         self.frontend_status = match self.frontend_status {
           ConnectionStatus::Normal => ConnectionStatus::ReadOpen,
           ConnectionStatus::WriteOpen => ConnectionStatus::Closed,
@@ -465,7 +467,8 @@ impl<Front:SocketHandler> Pipe<Front> {
         self.front_buf.consume(current_sz);
         sz += current_sz;
 
-        if current_sz == 0 {
+
+        if current_sz == 0 && current_res == SocketResult::Continue {
           self.backend_status = match self.backend_status {
             ConnectionStatus::Normal => ConnectionStatus::ReadOpen,
             ConnectionStatus::WriteOpen => ConnectionStatus::Closed,
@@ -539,7 +542,9 @@ impl<Front:SocketHandler> Pipe<Front> {
       if sz > 0 {
         self.front_readiness.interest.insert(Ready::writable());
         metrics.backend_bin += sz;
-      } else {
+      }
+
+      if sz == 0 && r == SocketResult::Continue {
         self.backend_status = match self.backend_status {
           ConnectionStatus::Normal => ConnectionStatus::WriteOpen,
           ConnectionStatus::ReadOpen => ConnectionStatus::Closed,
