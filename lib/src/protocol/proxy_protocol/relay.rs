@@ -145,6 +145,10 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
     self.backend.as_ref()
   }
 
+  pub fn back_socket_mut(&mut self)  -> Option<&mut TcpStream> {
+    self.backend.as_mut()
+  }
+
   pub fn set_back_socket(&mut self, socket: TcpStream) {
     self.backend = Some(socket);
   }

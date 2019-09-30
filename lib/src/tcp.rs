@@ -271,6 +271,17 @@ impl Session {
     }
   }
 
+  fn back_socket_mut(&mut self)  -> Option<&mut TcpStream> {
+    match self.protocol {
+      Some(State::Pipe(ref mut pipe)) => pipe.back_socket_mut(),
+      Some(State::SendProxyProtocol(ref mut pp)) => pp.back_socket_mut(),
+      Some(State::RelayProxyProtocol(ref mut pp)) => pp.back_socket_mut(),
+      Some(State::ExpectProxyProtocol(_)) => None,
+      _ => unreachable!(),
+    }
+  }
+
+
   pub fn upgrade(&mut self) -> UpgradeResult {
     let protocol = self.protocol.take();
 
@@ -419,6 +430,28 @@ impl Session {
   fn reset_connection_attempt(&mut self) {
     self.connection_attempt = 0;
   }
+
+  pub fn test_back_socket(&mut self) -> bool {
+    match self.back_socket_mut() {
+      Some(ref mut s) => {
+        let mut tmp = [0u8; 1];
+        let res = s.peek(&mut tmp[..]);
+
+        match res {
+          // if the socket is half open, it will report 0 bytes read (EOF)
+          Ok(0) => false,
+          Ok(_) => true,
+          Err(e) => match e.kind() {
+             std::io::ErrorKind::WouldBlock => true,
+             _ => false,
+          }
+        }
+      },
+      None => {
+        false
+      }
+    }
+  }
 }
 
 impl ProxySession for Session {
@@ -521,7 +554,7 @@ impl ProxySession for Session {
     self.metrics().service_start();
 
     if self.back_connected() == BackendConnectionStatus::Connecting {
-      if self.back_readiness().unwrap().event.is_hup() {
+      if self.back_readiness().unwrap().event.is_hup() || !self.test_back_socket() {
         //retry connecting the backend
         error!("error connecting to backend, trying again");
         self.metrics().service_stop();
