@@ -609,6 +609,10 @@ mod tests {
         continue;
       }
 
+      if k == "*" {
+        continue;
+      }
+
       //println!("inserting key: '{}', value: '{}'", k, v);
       //assert_eq!(root.domain_insert(Vec::from(k.as_bytes()), *v), InsertResult::Ok);
       assert_eq!(root.insert(Vec::from(k.as_bytes()), *v), InsertResult::Ok, "could not insert ({}, {})", k, v);
@@ -626,6 +630,10 @@ mod tests {
       }
 
       if k.contains('/') {
+        continue;
+      }
+
+      if k == "*" {
         continue;
       }
 
