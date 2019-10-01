@@ -325,24 +325,24 @@ impl SocketHandler for FrontRustls {
 }
 
 pub fn server_bind(addr: &SocketAddr) -> io::Result<TcpListener> {
-  let sock = try!(match *addr {
-    SocketAddr::V4(..) => TcpBuilder::new_v4(),
-    SocketAddr::V6(..) => TcpBuilder::new_v6(),
-  });
+  let sock = match *addr {
+    SocketAddr::V4(..) => TcpBuilder::new_v4()?,
+    SocketAddr::V6(..) => TcpBuilder::new_v6()?,
+  };
 
   // set so_reuseaddr, but only on unix (mirrors what libstd does)
   if cfg!(unix) {
-    try!(sock.reuse_address(true));
+    sock.reuse_address(true)?;
   }
 
-  try!(sock.reuse_port(true));
+  sock.reuse_port(true)?;
 
   // bind the socket
-  try!(sock.bind(addr));
+  sock.bind(addr)?;
 
   // listen
   // FIXME: make the backlog configurable?
-  let listener = try!(sock.listen(1024));
+  let listener = sock.listen(1024)?;
   TcpListener::from_std(listener)
 }
 

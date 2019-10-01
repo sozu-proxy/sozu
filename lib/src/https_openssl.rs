@@ -1644,7 +1644,7 @@ pub fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
   use openssl::ec::EcKey;
   use openssl::nid;
 
-  let curve = try!(EcKey::from_curve_name(nid::X9_62_PRIME256V1));
+  let curve = EcKey::from_curve_name(nid::X9_62_PRIME256V1)?;
   ctx.set_tmp_ecdh(&curve)
 }
 
@@ -1663,7 +1663,7 @@ fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
 fn setup_curves(ctx: &mut SslContextBuilder) -> Result<(), ErrorStack> {
   use openssl::ec::EcKey;
 
-  let curve = try!(EcKey::from_curve_name(nid::Nid::X9_62_PRIME256V1));
+  let curve = EcKey::from_curve_name(nid::Nid::X9_62_PRIME256V1)?;
   ctx.set_tmp_ecdh(&curve)
 }
 

@@ -171,12 +171,12 @@ impl<'de> serde::de::Visitor<'de> for CommandRequestVisitor {
     let mut data:Option<serde_json::Value> = None;
 
     loop {
-      match try!(visitor.next_key()) {
-        Some(CommandRequestField::Type)    => { config_type = Some(try!(visitor.next_value())); }
-        Some(CommandRequestField::Id)      => { id = Some(try!(visitor.next_value())); }
-        Some(CommandRequestField::Version) => { version = Some(try!(visitor.next_value())); }
-        Some(CommandRequestField::WorkerId) => { worker_id = Some(try!(visitor.next_value())); }
-        Some(CommandRequestField::Data)    => { data = Some(try!(visitor.next_value())); }
+      match visitor.next_key()? {
+        Some(CommandRequestField::Type)    => { config_type = Some(visitor.next_value()?); }
+        Some(CommandRequestField::Id)      => { id = Some(visitor.next_value()?); }
+        Some(CommandRequestField::Version) => { version = Some(visitor.next_value()?); }
+        Some(CommandRequestField::WorkerId) => { worker_id = Some(visitor.next_value()?); }
+        Some(CommandRequestField::Data)    => { data = Some(visitor.next_value()?); }
         None => { break; }
       }
     }
@@ -207,14 +207,14 @@ impl<'de> serde::de::Visitor<'de> for CommandRequestVisitor {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
-      let command = try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("proxy configuration command"))));
+      let command = serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("proxy configuration command")))?;
       CommandRequestData::Proxy(command)
     } else if config_type == "SAVE_STATE" {
       let data = match data {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
-      let state: SaveStateData = try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("save state"))));
+      let state: SaveStateData = serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("save state")))?;
       CommandRequestData::SaveState(state.path)
     } else if config_type == "DUMP_STATE" {
       CommandRequestData::DumpState
@@ -223,7 +223,7 @@ impl<'de> serde::de::Visitor<'de> for CommandRequestVisitor {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
-      let state: SaveStateData = try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("save state"))));
+      let state: SaveStateData = serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("save state")))?;
       CommandRequestData::LoadState(state.path)
     } else if config_type == "LIST_WORKERS" {
       CommandRequestData::ListWorkers
@@ -232,7 +232,7 @@ impl<'de> serde::de::Visitor<'de> for CommandRequestVisitor {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
-      CommandRequestData::LaunchWorker(try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("launch worker")))))
+      CommandRequestData::LaunchWorker(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("launch worker")))?)
     } else if config_type == "UPGRADE_MASTER" {
       CommandRequestData::UpgradeMaster
     } else if config_type == "UPGRADE_WORKER" {
@@ -240,7 +240,7 @@ impl<'de> serde::de::Visitor<'de> for CommandRequestVisitor {
         Some(data) => data,
         None => return Err(serde::de::Error::missing_field("data")),
       };
-      CommandRequestData::UpgradeWorker(try!(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("upgrade worker")))))
+      CommandRequestData::UpgradeWorker(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("upgrade worker")))?)
     } else if config_type == "SUBSCRIBE_EVENTS" {
       CommandRequestData::SubscribeEvents
     } else {
@@ -277,47 +277,47 @@ impl serde::Serialize for CommandRequest {
     if self.worker_id.is_some() {
       count += 1;
     }
-    let mut map = try!(serializer.serialize_map(Some(count)));
+    let mut map = serializer.serialize_map(Some(count))?;
 
-    try!(map.serialize_entry("id", &self.id));
-    try!(map.serialize_entry("version", &self.version));
+    map.serialize_entry("id", &self.id)?;
+    map.serialize_entry("version", &self.version)?;
 
     if self.worker_id.is_some() {
-      try!(map.serialize_entry("worker_id", self.worker_id.as_ref().unwrap()));
+      map.serialize_entry("worker_id", self.worker_id.as_ref().unwrap())?;
     }
 
     match self.data {
       CommandRequestData::Proxy(ref order) => {
-        try!(map.serialize_entry("type", "PROXY"));
-        try!(map.serialize_entry("data", order));
+        map.serialize_entry("type", "PROXY")?;
+        map.serialize_entry("data", order)?;
       },
       CommandRequestData::SaveState(ref path) => {
-        try!(map.serialize_entry("type", "SAVE_STATE"));
-        try!(map.serialize_entry("data", &StatePath { path: path.to_string() }));
+        map.serialize_entry("type", "SAVE_STATE")?;
+        map.serialize_entry("data", &StatePath { path: path.to_string() })?;
       },
       CommandRequestData::LoadState(ref path) => {
-        try!(map.serialize_entry("type", "LOAD_STATE"));
-        try!(map.serialize_entry("data", &StatePath { path: path.to_string() }));
+        map.serialize_entry("type", "LOAD_STATE")?;
+        map.serialize_entry("data", &StatePath { path: path.to_string() })?;
       },
       CommandRequestData::DumpState => {
-        try!(map.serialize_entry("type", "DUMP_STATE"));
+        map.serialize_entry("type", "DUMP_STATE")?;
       },
       CommandRequestData::ListWorkers => {
-        try!(map.serialize_entry("type", "LIST_WORKERS"));
+        map.serialize_entry("type", "LIST_WORKERS")?;
       },
       CommandRequestData::LaunchWorker(ref tag) => {
-        try!(map.serialize_entry("type", "LAUNCH_WORKER"));
-        try!(map.serialize_entry("data", tag));
+        map.serialize_entry("type", "LAUNCH_WORKER")?;
+        map.serialize_entry("data", tag)?;
       },
       CommandRequestData::UpgradeMaster => {
-        try!(map.serialize_entry("type", "UPGRADE_MASTER"));
+        map.serialize_entry("type", "UPGRADE_MASTER")?;
       },
       CommandRequestData::UpgradeWorker(ref id) => {
-        try!(map.serialize_entry("type", "UPGRADE_WORKER"));
-        try!(map.serialize_entry("data", id));
+        map.serialize_entry("type", "UPGRADE_WORKER")?;
+        map.serialize_entry("data", id)?;
       },
       CommandRequestData::SubscribeEvents => {
-        try!(map.serialize_entry("type", "SUBSCRIBE_EVENTS"));
+        map.serialize_entry("type", "SUBSCRIBE_EVENTS")?;
       },
     };
 

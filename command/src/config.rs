@@ -662,7 +662,7 @@ pub struct FileConfig {
 
 impl FileConfig {
   pub fn load_from_path(path: &str) -> io::Result<FileConfig> {
-    let data = try!(Config::load_file(path));
+    let data = Config::load_file(path)?;
 
     match toml::from_str(&data) {
       Err(e)     => {
@@ -1072,16 +1072,16 @@ impl Config {
   }
 
   pub fn load_file(path: &str) -> io::Result<String> {
-    let mut f = try!(File::open(path));
+    let mut f = File::open(path)?;
     let mut data = String::new();
-    try!(f.read_to_string(&mut data));
+    f.read_to_string(&mut data)?;
     Ok(data)
   }
 
   pub fn load_file_bytes(path: &str) -> io::Result<Vec<u8>> {
-    let mut f = try!(File::open(path));
+    let mut f = File::open(path)?;
     let mut data = Vec::new();
-    try!(f.read_to_end(&mut data));
+    f.read_to_end(&mut data)?;
     Ok(data)
   }
 }
