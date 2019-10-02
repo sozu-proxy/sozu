@@ -820,7 +820,7 @@ impl Proxy {
   pub fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr) -> bool {
     if let Some(listener) = self.listeners.values_mut().find(|l| l.address == *front) {
       self.fronts.insert(app_id.to_string(), listener.token);
-      info!("add_tcp_front: fronts are now: {:?}", self.fronts);
+      //info!("add_tcp_front: fronts are now: {:?}", self.fronts);
       listener.app_id = Some(app_id.to_string());
       true
     } else {
