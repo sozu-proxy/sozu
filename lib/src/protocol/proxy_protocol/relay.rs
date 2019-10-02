@@ -171,7 +171,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
 
   pub fn into_pipe(mut self, back_buf: Checkout<Buffer>) -> Pipe<Front> {
     let backend_socket = self.backend.take().unwrap();
-    let addr = backend_socket.peer_addr().ok();
+    let addr = self.front_socket().peer_addr().ok();
 
     let mut pipe = Pipe::new(
       self.frontend.take(0).into_inner(),

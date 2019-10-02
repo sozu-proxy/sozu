@@ -133,11 +133,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
   pub fn into_pipe(self, front_buf: Checkout<Buffer>, back_buf: Checkout<Buffer>,
     backend_socket: Option<TcpStream>, backend_token: Option<Token>) -> Pipe<Front> {
 
-    let addr = if let Some(ref backend_socket) = backend_socket {
-      backend_socket.peer_addr().ok()
-    } else {
-      None
-    };
+    let addr = self.front_socket().peer_addr().ok();
 
     let mut pipe = Pipe::new(
       self.frontend,
