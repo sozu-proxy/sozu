@@ -105,7 +105,7 @@ dependencies = [
  "concurrent-queue",
  "futures-lite",
  "libc",
- "log",
+ "log 0.4.14",
  "once_cell",
  "parking",
  "polling",
@@ -342,6 +342,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "245097e9a4535ee1e3e3931fcfcd55a796a44c643e8596ff6566d68f09b87bbc"
 
 [[package]]
+name = "cookie-factory"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98a479f8099cc5ac64915a3dd76c87be27f929ba406ad705aacb13f19b791207"
+
+[[package]]
 name = "cpufeatures"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -417,7 +423,7 @@ version = "0.8.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a19187fea3ac7e84da7dacf48de0c45d63c6a76f9490dae389aead16c243fce3"
 dependencies = [
- "log",
+ "log 0.4.14",
  "regex",
 ]
 
@@ -429,7 +435,7 @@ checksum = "0b2cf0344971ee6c64c31be0d530793fba457d322dfec2810c453d0ef228f9c3"
 dependencies = [
  "atty",
  "humantime",
- "log",
+ "log 0.4.14",
  "regex",
  "termcolor",
 ]
@@ -688,6 +694,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hpack"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c68f61350ad23817dd207b035b5258d91ac5eaef69e96f906628aaed8854dda"
+dependencies = [
+ "log 0.3.9",
+]
+
+[[package]]
 name = "humantime"
 version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -791,6 +806,15 @@ dependencies = [
 
 [[package]]
 name = "log"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e19e8d5c34a3e0e2223db8e060f9e8264aeeb5c5fc64a4ee9965c062211c024b"
+dependencies = [
+ "log 0.4.14",
+]
+
+[[package]]
+name = "log"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51b9bbe6c47d51fc3e1a9b945965946b4c44142ab8792c50835a980d362c2710"
@@ -842,7 +866,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8c2bdb6314ec10835cd3293dd268473a835c02b7b352e788be788b3c6ca6bb16"
 dependencies = [
  "libc",
- "log",
+ "log 0.4.14",
  "miow",
  "ntapi",
  "winapi",
@@ -1056,7 +1080,7 @@ checksum = "92341d779fa34ea8437ef4d82d440d5e1ce3f3ff7f824aa64424cd481f9a1f25"
 dependencies = [
  "cfg-if 1.0.0",
  "libc",
- "log",
+ "log 0.4.14",
  "wepoll-ffi",
  "winapi",
 ]
@@ -1147,7 +1171,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "588f6378e4dd99458b60ec275b4477add41ce4fa9f64dcba6f15adccb19b50d6"
 dependencies = [
  "env_logger 0.8.4",
- "log",
+ "log 0.4.14",
  "rand",
 ]
 
@@ -1301,7 +1325,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35edb675feee39aec9c99fa5ff985081995a06d594114ae14cbe797ad7b7a6d7"
 dependencies = [
  "base64",
- "log",
+ "log 0.4.14",
  "ring",
  "sct",
  "webpki 0.21.4",
@@ -1488,7 +1512,7 @@ dependencies = [
  "jemallocator",
  "lazy_static",
  "libc",
- "log",
+ "log 0.4.14",
  "mio",
  "nix",
  "nom 7.0.0",
@@ -1513,7 +1537,7 @@ dependencies = [
  "bytes",
  "env_logger 0.9.0",
  "futures",
- "log",
+ "log 0.4.14",
  "serde",
  "serde_json",
  "sozu-command-lib",
@@ -1527,7 +1551,7 @@ version = "0.13.6"
 dependencies = [
  "hex",
  "libc",
- "log",
+ "log 0.4.14",
  "memchr",
  "mio",
  "nix",
@@ -1548,13 +1572,15 @@ dependencies = [
 name = "sozu-lib"
 version = "0.13.6"
 dependencies = [
+ "cookie-factory",
  "foreign-types-shared",
  "hashbrown",
  "hdrhistogram",
+ "hpack",
  "idna",
  "lazycell",
  "libc",
- "log",
+ "log 0.4.14",
  "memchr",
  "mio",
  "net2",
@@ -1800,7 +1826,7 @@ dependencies = [
  "ascii",
  "chrono",
  "chunked_transfer",
- "log",
+ "log 0.4.14",
  "url",
 ]
 
@@ -1859,7 +1885,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
- "log",
+ "log 0.4.14",
  "pin-project-lite",
  "tokio",
 ]
@@ -1935,7 +1961,7 @@ checksum = "2475a6781e9bc546e7b64f4013d2f4032c8c6a40fcffd7c6f4ee734a890972ab"
 dependencies = [
  "base64",
  "chunked_transfer",
- "log",
+ "log 0.4.14",
  "once_cell",
  "rustls",
  "url",
@@ -2009,7 +2035,7 @@ checksum = "3b33f6a0694ccfea53d94db8b2ed1c3a8a4c86dd936b13b9f0a15ec4a451b900"
 dependencies = [
  "bumpalo",
  "lazy_static",
- "log",
+ "log 0.4.14",
  "proc-macro2",
  "quote",
  "syn",
