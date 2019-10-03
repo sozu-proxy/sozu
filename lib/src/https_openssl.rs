@@ -15,7 +15,8 @@ use std::net::SocketAddr;
 use std::str::from_utf8_unchecked;
 use time::{SteadyTime, Duration};
 use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod, SslAlert,
-                   Ssl, SslOptions, SslRef, SslStream, SniError, NameType, SslSessionCacheMode};
+                   Ssl, SslOptions, SslRef, SslStream, SniError, NameType, SslSessionCacheMode,
+                   select_next_proto, AlpnError};
 use openssl::x509::X509;
 use openssl::dh::Dh;
 use openssl::pkey::PKey;
@@ -47,8 +48,13 @@ use protocol::{ProtocolResult,Http,Pipe,StickySession};
 use protocol::openssl::TlsHandshake;
 use protocol::http::{DefaultAnswerStatus, TimeoutStatus};
 use protocol::proxy_protocol::expect::ExpectProxyProtocol;
+use protocol::h2::Http2;
 use retry::RetryPolicy;
 use util::UnwrapLog;
+
+//const SERVER_PROTOS: &'static [u8] = b"\x02h2\x08http/1.1";
+//const SERVER_PROTOS: &'static [u8] = b"\x08http/1.1\x02h2";
+const SERVER_PROTOS: &'static [u8] = b"\x08http/1.1";
 
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct TlsApp {
@@ -61,7 +67,13 @@ pub enum State {
   Expect(ExpectProxyProtocol<TcpStream>, Ssl),
   Handshake(TlsHandshake),
   Http(Http<SslStream<TcpStream>>),
-  WebSocket(Pipe<SslStream<TcpStream>>)
+  WebSocket(Pipe<SslStream<TcpStream>>),
+  Http2(Http2<SslStream<TcpStream>>),
+}
+
+pub enum AlpnProtocols {
+    H2,
+    Http11,
 }
 
 pub struct Session {
@@ -196,27 +208,64 @@ impl Session {
         ssl.current_cipher().map(|c| incr!(c.name()));
       });
 
-      let http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(),
-        handshake.request_id, pool, self.public_address.clone(), self.peer_address,
-        self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
+      let selected_protocol = {
+        let s = handshake.stream.as_ref().and_then(|s| s.ssl().selected_alpn_protocol());
+        trace!("selected: {}", unsafe { from_utf8_unchecked(s.unwrap_or(&b""[..])) });
 
-        http.front_readiness = readiness;
-        http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-        State::Http(http)
-      });
+        match s {
+          Some(b"h2") => {
+            AlpnProtocols::H2
+          },
+          Some(b"http/1.1") | None => {
+            AlpnProtocols::Http11
+          }
+          Some(s) => {
+            error!("unknown alpn protocol: {:?}", s);
+            return false;
+          }
+        }
+      };
 
-      if http.is_none() {
-        error!("could not upgrade to HTTP");
-        //we cannot put back the protocol since we moved the stream
-        //self.protocol = Some(State::Handshake(handshake));
-        return false;
+      match selected_protocol {
+        AlpnProtocols::H2 => {
+          info!("got h2");
+          let mut http = Http2::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), pool,
+          self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS);
+
+          http.frontend.readiness = readiness;
+          http.frontend.readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+
+          gauge_add!("protocol.tls.handshake", -1);
+          gauge_add!("protocol.http2s", 1);
+
+          self.ssl = handshake.ssl;
+          self.protocol = Some(State::Http2(http));
+          return true;
+        },
+        AlpnProtocols::Http11 => {
+          let http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(),
+            handshake.request_id, pool, self.public_address.clone(), self.peer_address,
+            self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
+
+            http.front_readiness = readiness;
+            http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+            State::Http(http)
+          });
+
+          if http.is_none() {
+            error!("could not upgrade to HTTP");
+            //we cannot put back the protocol since we moved the stream
+            //self.protocol = Some(State::Handshake(handshake));
+            return false;
+          }
+          gauge_add!("protocol.tls.handshake", -1);
+          gauge_add!("protocol.https", 1);
+
+          self.ssl = handshake.ssl;
+          self.protocol = http;
+          return true;
+        }
       }
-      gauge_add!("protocol.tls.handshake", -1);
-      gauge_add!("protocol.https", 1);
-
-      self.ssl = handshake.ssl;
-      self.protocol = http;
-      return true;
     } else if let State::Http(http) = protocol {
       debug!("https switching to wss");
       let front_token = self.frontend_token;
@@ -271,6 +320,7 @@ impl Session {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.front_hup(),
       State::WebSocket(ref mut pipe) => pipe.front_hup(&mut self.metrics),
+      State::Http2(ref mut http)     => http.front_hup(),
       State::Handshake(_)            => {
         SessionResult::CloseSession
       },
@@ -284,6 +334,7 @@ impl Session {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.back_hup(),
       State::WebSocket(ref mut pipe) => pipe.back_hup(&mut self.metrics),
+      State::Http2(ref mut http)     => http.back_hup(),
       State::Handshake(_)            => {
         error!("why a backend HUP event while still in frontend handshake?");
         SessionResult::CloseSession
@@ -308,6 +359,7 @@ impl Session {
       State::Expect(ref mut expect,_)     => expect.readable(&mut self.metrics),
       State::Handshake(ref mut handshake) => handshake.readable(&mut self.metrics),
       State::Http(ref mut http)           => (ProtocolResult::Continue, http.readable(&mut self.metrics)),
+      State::Http2(ref mut http)          => (ProtocolResult::Continue, http.readable(&mut self.metrics)),
       State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.readable(&mut self.metrics)),
     };
 
@@ -316,7 +368,8 @@ impl Session {
     } else {
         if self.upgrade() {
         match *unwrap_msg!(self.protocol.as_mut()) {
-          State::Http(ref mut http) => http.readable(&mut self.metrics),
+          State::Http(ref mut http)  => http.readable(&mut self.metrics),
+          State::Http2(ref mut http) => http.readable(&mut self.metrics),
           _ => result
         }
       } else {
@@ -330,6 +383,7 @@ impl Session {
       State::Expect(_,_)             => SessionResult::CloseSession,
       State::Handshake(_)            => SessionResult::CloseSession,
       State::Http(ref mut http)      => http.writable(&mut self.metrics),
+      State::Http2(ref mut http)     => http.writable(&mut self.metrics),
       State::WebSocket(ref mut pipe) => pipe.writable(&mut self.metrics),
     }
   }
@@ -338,6 +392,7 @@ impl Session {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Expect(_,_)             => (ProtocolResult::Continue, SessionResult::CloseSession),
       State::Http(ref mut http)      => http.back_readable(&mut self.metrics),
+      State::Http2(ref mut http)     => (ProtocolResult::Continue, http.back_readable(&mut self.metrics)),
       State::Handshake(_)            => (ProtocolResult::Continue, SessionResult::CloseSession),
       State::WebSocket(ref mut pipe) => (ProtocolResult::Continue, pipe.back_readable(&mut self.metrics)),
     };
@@ -361,6 +416,7 @@ impl Session {
       State::Expect(_,_)             => SessionResult::CloseSession,
       State::Handshake(_)            => SessionResult::CloseSession,
       State::Http(ref mut http)      => http.back_writable(&mut self.metrics),
+      State::Http2(ref mut http)     => http.back_writable(&mut self.metrics),
       State::WebSocket(ref mut pipe) => pipe.back_writable(&mut self.metrics),
     }
   }
@@ -370,6 +426,7 @@ impl Session {
       &State::Expect(ref expect,_)     => Some(expect.front_socket()),
       &State::Handshake(ref handshake) => handshake.socket(),
       &State::Http(ref http)           => Some(http.front_socket()),
+      &State::Http2(ref http)          => Some(http.front_socket()),
       &State::WebSocket(ref pipe)      => Some(pipe.front_socket()),
     }
   }
@@ -379,6 +436,7 @@ impl Session {
       &State::Expect(_,_)         => None,
       &State::Handshake(_)        => None,
       &State::Http(ref http)      => http.back_socket(),
+      &State::Http2(ref http)     => http.back_socket(),
       &State::WebSocket(ref pipe) => pipe.back_socket(),
     }
   }
@@ -388,6 +446,7 @@ impl Session {
       &State::Expect(_,_)         => None,
       &State::Handshake(_)        => None,
       &State::Http(ref http)      => http.back_token(),
+      &State::Http2(ref http)     => http.back_token(),
       &State::WebSocket(ref pipe) => pipe.back_token(),
     }
   }
@@ -400,6 +459,7 @@ impl Session {
   fn set_back_token(&mut self, token: Token) {
      match *unwrap_msg!(self.protocol.as_mut()) {
        State::Http(ref mut http)      => http.set_back_token(token),
+       State::Http2(ref mut http)     => http.set_back_token(token),
        State::WebSocket(ref mut pipe) => pipe.set_back_token(token),
        _ => {}
      }
@@ -439,6 +499,7 @@ impl Session {
       State::Expect(ref mut expect, _)    => &mut expect.readiness,
       State::Handshake(ref mut handshake) => &mut handshake.readiness,
       State::Http(ref mut http)           => http.front_readiness(),
+      State::Http2(ref mut http)          => http.front_readiness(),
       State::WebSocket(ref mut pipe)      => &mut pipe.front_readiness,
     };
     //info!("current readiness: {:?}", r);
@@ -448,6 +509,7 @@ impl Session {
   fn back_readiness(&mut self)      -> Option<&mut Readiness> {
     let r = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)           => Some(http.back_readiness()),
+      State::Http2(ref mut http)          => Some(http.back_readiness()),
       State::WebSocket(ref mut pipe)      => Some(&mut pipe.back_readiness),
       _ => None,
     };
@@ -514,6 +576,7 @@ impl ProxySession for Session {
       Some(State::Expect(_,_)) => gauge_add!("protocol.proxy.expect", -1),
       Some(State::Handshake(_)) => gauge_add!("protocol.tls.handshake", -1),
       Some(State::Http(_)) => gauge_add!("protocol.https", -1),
+      Some(State::Http2(_)) => gauge_add!("protocol.http2s", -1),
       Some(State::WebSocket(_)) => gauge_add!("protocol.wss", -1),
       None => {}
     }
@@ -761,6 +824,7 @@ impl ProxySession for Session {
       Some(State::Expect(_,_))  => String::from("Expect"),
       Some(State::Handshake(_)) => String::from("Handshake"),
       Some(State::Http(h))      => h.print_state("HTTPS"),
+      Some(State::Http2(h))     => format!("HTTP2S: {:?}", h.state),
       Some(State::WebSocket(_)) => String::from("WSS"),
       None                      => String::from("None"),
     };
@@ -769,10 +833,12 @@ impl ProxySession for Session {
       State::Expect(ref expect, _)    => &expect.readiness,
       State::Handshake(ref handshake) => &handshake.readiness,
       State::Http(ref http)           => &http.front_readiness,
+      State::Http2(ref http)          => &http.frontend.readiness,
       State::WebSocket(ref pipe)      => &pipe.front_readiness,
     };
     let rb = match *unwrap_msg!(self.protocol.as_ref()) {
       State::Http(ref http)           => Some(&http.back_readiness),
+      State::Http2(ref http)          => Some(&http.back_readiness),
       State::WebSocket(ref pipe)      => Some(&pipe.back_readiness),
       _ => None,
     };
@@ -942,6 +1008,21 @@ impl Listener {
       error!("could not set context cipher list: {:?}", e);
     }
 
+    if let Err(e) = context.set_alpn_protos(SERVER_PROTOS) {
+      error!("could not set ALPN protocols: {:?}", e);
+    }
+
+    context.set_alpn_select_callback(move |ssl: &mut SslRef, client_protocols: &[u8]| {
+      debug!("got protocols list from client: {:?}", unsafe { from_utf8_unchecked(client_protocols) });
+      match select_next_proto(SERVER_PROTOS, client_protocols) {
+        None => Err(AlpnError::ALERT_FATAL),
+        Some(selected) => {
+          debug!("selected protocol with ALPN: {:?}", unsafe { from_utf8_unchecked(selected) });
+          Ok(selected)
+        }
+      }
+    });
+
     let mut cert_read = &include_bytes!("../assets/certificate.pem")[..];
     let mut key_read  = &include_bytes!("../assets/key.pem")[..];
 
@@ -1021,6 +1102,21 @@ impl Listener {
     if let Err(e) = ctx.set_cipher_list(&self.config.cipher_list) {
       error!("cannot set context cipher list: {:?}", e);
     }
+
+    if let Err(e) = ctx.set_alpn_protos(SERVER_PROTOS) {
+      error!("could not set ALPN protocols: {:?}", e);
+    }
+
+    ctx.set_alpn_select_callback(move |ssl: &mut SslRef, client_protocols: &[u8]| {
+      debug!("got protocols list from client: {:?}", unsafe { from_utf8_unchecked(client_protocols) });
+      match select_next_proto(SERVER_PROTOS, client_protocols) {
+        None => Err(AlpnError::ALERT_FATAL),
+        Some(selected) => {
+          debug!("selected protocol with ALPN: {:?}", unsafe { from_utf8_unchecked(selected) });
+          Ok(selected)
+        }
+      }
+    });
 
     let mut cert_read  = &certificate_and_key.certificate.as_bytes()[..];
     let mut key_read   = &certificate_and_key.key.as_bytes()[..];

@@ -33,14 +33,14 @@ pub struct Http2<Front:SocketHandler> {
   pub request_id:      Hyphenated,
   pub back_readiness:  Readiness,
   pub log_ctx:         String,
-  public_address:      Option<IpAddr>,
+  public_address:      Option<SocketAddr>,
   pub state:           Option<state::State>,
   pool:                Weak<RefCell<Pool<Buffer>>>,
 }
 
 impl<Front:SocketHandler> Http2<Front> {
   pub fn new(frontend: Front, frontend_token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
-  public_address: Option<IpAddr>, client_address: Option<SocketAddr>, sticky_name: String,
+  public_address: Option<SocketAddr>, client_address: Option<SocketAddr>, sticky_name: String,
   protocol: Protocol) -> Http2<Front> {
     let request_id = Uuid::new_v4().to_hyphenated();
     let log_ctx    = format!("{}\tunknown\t", &request_id);
