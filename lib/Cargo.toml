@@ -45,6 +45,8 @@ poule = "0.3.2"
 lazycell = "1.2"
 hashbrown = "0.1"
 regex = "1.1"
+cookie-factory = "^0.2"
+hpack = "^0.3"
 
 [dev-dependencies]
 tiny_http = "^0.8"

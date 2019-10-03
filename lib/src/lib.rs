@@ -175,6 +175,8 @@ extern crate poule;
 extern crate lazycell;
 extern crate hashbrown;
 extern crate regex;
+extern crate hpack;
+extern crate cookie_factory;
 #[cfg(test)]
 #[macro_use]
 extern crate quickcheck;
