@@ -78,8 +78,8 @@ max_buffers = 500
 # memory usage. If you plan to use sozu's runtime upgrade feature, you should
 # leave enough memory for one more worker (also for the kernel, etc), so total
 # RAM should be larger than (worker count + 1) * max_buffers * 2 * buffer_size bytes
-# defaults to 16384
-buffer_size = 16384
+# defaults to 16393 (minimum size for HTTP/2 is a 16384 bytes frame + 9 bytes of header
+buffer_size = 16393
 
 # how much time (in milliseconds) sozuctl will wait for a command to complete.
 # Defaults to 1000 milliseconds
