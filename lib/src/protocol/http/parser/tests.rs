@@ -1003,7 +1003,7 @@ fn parse_incomplete_chunk_header_test() {
 }
 
 #[test]
-fn parse_response_302_test() {
+fn parse_response_302() {
   let input =
       b"HTTP/1.1 302 Found\r\n\
         Cache-Control: no-cache\r\n\
@@ -1045,7 +1045,7 @@ fn parse_response_302_test() {
 }
 
 #[test]
-fn parse_response_303_test() {
+fn parse_response_303() {
   let input =
       b"HTTP/1.1 303 See Other\r\n\
         Cache-Control: no-cache\r\n\
