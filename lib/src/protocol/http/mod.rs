@@ -16,7 +16,7 @@ use pool::Pool;
 use util::UnwrapLog;
 
 pub mod parser;
-mod cookies;
+pub mod cookies;
 pub mod answers;
 
 use self::parser::{parse_request_until_stop, parse_response_until_stop,
