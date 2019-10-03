@@ -45,8 +45,9 @@ impl<Front:SocketHandler> Http2<Front> {
     let request_id = Uuid::new_v4().to_hyphenated();
     let log_ctx    = format!("{}\tunknown\t", &request_id);
     let (read, write) = {
-      let p = pool.upgrade().unwrap();
-      let res = (p.borrow_mut().checkout().unwrap(), p.borrow_mut().checkout().unwrap());
+      let p0 = pool.upgrade().unwrap();
+      let mut p = p0.borrow_mut();
+      let res = (p.checkout().unwrap(), p.checkout().unwrap());
       res
     };
     let session = Http2 {

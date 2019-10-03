@@ -230,7 +230,7 @@ impl Session {
         AlpnProtocols::H2 => {
           info!("got h2");
           let mut http = Http2::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(), pool,
-          self.public_address.clone(), None, self.sticky_name.clone(), Protocol::HTTPS);
+          Some(self.public_address.clone()), None, self.sticky_name.clone(), Protocol::HTTPS);
 
           http.frontend.readiness = readiness;
           http.frontend.readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
