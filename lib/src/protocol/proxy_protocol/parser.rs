@@ -1,4 +1,4 @@
-use nom::{be_u8, be_u16};
+use nom::number::streaming::{be_u8, be_u16};
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::convert::From;
@@ -20,7 +20,7 @@ named!(pub parse_v2_header<HeaderV2>,
     command: parse_command >>
     family: be_u8 >>
     len: be_u16 >>
-    addr: flat_map!(take!(len), apply!(parse_addr_v2, family)) >>
+    addr: flat_map!(take!(len), call!(parse_addr_v2, family)) >>
     (
       HeaderV2 {
         command,
@@ -37,7 +37,7 @@ named!(unspec<ProxyAddr>, value!(ProxyAddr::AfUnspec));
 
 named_args!(parse_addr_v2(family: u8)<ProxyAddr>,
   // family: 4 bits for address family and 4 bits for transport protocol
-  switch!(apply!(address_family, family),
+  switch!(call!(address_family, family),
     0x00 => call!(unspec) |
     0x01 => call!(parse_ipv4_on_v2) |
     0x02 => call!(parse_ipv6_on_v2)

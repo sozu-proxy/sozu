@@ -6,7 +6,7 @@ use features::FEATURES;
 
 use nom::{HexDisplay,IResult,Offset};
 
-use nom::{AsChar, is_alphanumeric, is_space};
+use nom::{AsChar, character::{is_alphanumeric, is_space}};
 
 use url::Url;
 
@@ -343,7 +343,7 @@ pub fn chunk_size(input: &[u8]) -> IResult<&[u8], usize> {
   }
   match usize::from_str_radix(s, 16) {
     Ok(sz) => Ok((i, sz)),
-    Err(_) => Err(Err::Error(error_position!(input, ::nom::ErrorKind::MapRes)))
+    Err(_) => Err(Err::Error(error_position!(input, ::nom::error::ErrorKind::MapRes)))
   }
 }
 
@@ -689,7 +689,8 @@ impl<'a> Header<'a> {
         // +1 is to count ":"
         let header_length = self.name.len() + 1;
         // we calculate how much chars there is between the : and the first cookie
-        let length_until_value = match take_while!(&buf[header_length..buf.len()], is_space) {
+        let res: IResult<_,_> = take_while!(&buf[header_length..buf.len()], is_space);
+        let length_until_value = match res {
           Ok((_, spaces)) => spaces,
           Err(_) => {
             // if there is not enough data or an error, we completely remove the header.
@@ -1833,7 +1834,7 @@ fn add_sticky_session_to_response(buf: &mut BufferQueue,
 #[cfg(test)]
 mod tests {
   use super::*;
-  use nom::{Err,ErrorKind,HexDisplay};
+  use nom::{Err,error::ErrorKind,HexDisplay};
   use buffer_queue::{OutputElement,buf_with_capacity};
   use std::io::Write;
 

@@ -1,4 +1,5 @@
-use nom::{Err, ErrorKind, HexDisplay, IResult, Offset, be_u8, be_u16, be_u24, be_u32};
+use nom::{Err, error::ErrorKind, HexDisplay, IResult, Offset, number::streaming::{be_u8, be_u16, be_u24, be_u32}, error::ParseError};
+use std::convert::From;
 
 #[derive(Clone,Debug,PartialEq)]
 pub struct FrameHeader {
@@ -22,6 +23,71 @@ pub enum FrameType {
   Continuation,
 }
 
+/*
+const NO_ERROR: u32 = 0x0;
+const PROTOCOL_ERROR: u32 = 0x1;
+const INTERNAL_ERROR: u32 = 0x2;
+const FLOW_CONTROL_ERROR: u32 = 0x3;
+const SETTINGS_TIMEOUT: u32 = 0x4;
+const STREAM_CLOSED: u32 = 0x5;
+const FRAME_SIZE_ERROR: u32 = 0x6;
+const REFUSED_STREAM: u32 = 0x7;
+const CANCEL: u32 = 0x8;
+const COMPRESSION_ERROR: u32 = 0x9;
+const CONNECT_ERROR: u32 = 0xa;
+const ENHANCE_YOUR_CALM: u32 = 0xb;
+const INADEQUATE_SECURITY: u32 = 0xc;
+const HTTP_1_1_REQUIRED: u32 = 0xd;
+*/
+
+#[derive(Clone,Debug,PartialEq)]
+pub struct Error<'a> {
+  pub input: &'a[u8],
+  pub error: InnerError,
+}
+
+#[derive(Clone,Debug,PartialEq)]
+pub enum InnerError {
+  Nom(ErrorKind),
+  NoError,
+  ProtocolError,
+  InternalError,
+  FlowControlError,
+  SettingsTimeout,
+  StreamClosed,
+  FrameSizeError,
+  RefusedStream,
+  Cancel,
+  CompressionError,
+  ConnectError,
+  EnhanceYourCalm,
+  InadequateSecurity,
+  HTTP11Required,
+}
+
+impl<'a> Error<'a> {
+  pub fn new(input: &'a[u8], error: InnerError) -> Error<'a> {
+    Error { input, error }
+  }
+}
+
+impl<'a> ParseError<&'a[u8]> for Error<'a> {
+  fn from_error_kind(input: &'a[u8], kind: ErrorKind) -> Self {
+    Error { input, error: InnerError::Nom(kind) }
+  }
+
+  fn append(input: &'a[u8], kind: ErrorKind, other: Self) -> Self {
+    Error { input, error: InnerError::Nom(kind) }
+  }
+}
+
+
+impl<'a> From<(&'a[u8], ErrorKind)> for Error<'a> {
+  fn from((input, kind): (&'a[u8], ErrorKind)) -> Self {
+    Error { input, error: InnerError::Nom(kind) }
+  }
+}
+
 named!(pub preface,
   tag!(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
 );
@@ -42,7 +108,7 @@ named!(pub preface,
 );
   */
 
-pub fn frame_header(input: &[u8]) -> IResult<&[u8], FrameHeader> {
+pub fn frame_header(input: &[u8]) -> IResult<&[u8], FrameHeader, Error> {
   let (i1, payload_len) = be_u24(input)?;
   let (i2, frame_type)  = map_opt!(i1, be_u8, convert_frame_type)?;
   let (i3, flags)       = be_u8(i2)?;
@@ -106,13 +172,13 @@ impl<'a> Frame<'a> {
   }
 }
 
-pub fn frame<'a>(input: &'a[u8], max_frame_size: u32) -> IResult<&'a[u8], Frame<'a>> {
+pub fn frame<'a>(input: &'a[u8], max_frame_size: u32) -> IResult<&'a[u8], Frame<'a>, Error<'a>> {
   let (i,header) = frame_header(input)?;
 
   info!("got frame header: {:?}", header);
 
   if header.payload_len > max_frame_size {
-    return Err(Err::Failure(error_position!(input, ErrorKind::Custom(FRAME_SIZE_ERROR))));
+    return Err(Err::Failure(Error::new(input, InnerError::FrameSizeError)));
   }
 
   let valid_stream_id = match header.frame_type {
@@ -124,7 +190,7 @@ pub fn frame<'a>(input: &'a[u8], max_frame_size: u32) -> IResult<&'a[u8], Frame<
   };
 
   if !valid_stream_id {
-    return Err(Err::Failure(error_position!(input, ErrorKind::Custom(PROTOCOL_ERROR))));
+    return Err(Err::Failure(Error::new(input, InnerError::ProtocolError)));
   }
 
   let f = match header.frame_type {
@@ -136,13 +202,13 @@ pub fn frame<'a>(input: &'a[u8], max_frame_size: u32) -> IResult<&'a[u8], Frame<
     },
     FrameType::Priority => {
       if header.payload_len != 5 {
-        return Err(Err::Failure(error_position!(input, ErrorKind::Custom(FRAME_SIZE_ERROR))));
+        return Err(Err::Failure(Error::new(input, InnerError::FrameSizeError)));
       }
       unimplemented!();
     },
     FrameType::RstStream => {
       if header.payload_len != 4 {
-        return Err(Err::Failure(error_position!(input, ErrorKind::Custom(FRAME_SIZE_ERROR))));
+        return Err(Err::Failure(Error::new(input, InnerError::FrameSizeError)));
       }
       rst_stream_frame(i, &header)?
     },
@@ -154,13 +220,13 @@ pub fn frame<'a>(input: &'a[u8], max_frame_size: u32) -> IResult<&'a[u8], Frame<
     },
     FrameType::Settings => {
       if header.payload_len % 6 != 0 {
-        return Err(Err::Failure(error_position!(input, ErrorKind::Custom(FRAME_SIZE_ERROR))));
+        return Err(Err::Failure(Error::new(input, InnerError::FrameSizeError)));
       }
       settings_frame(i, &header)?
     },
     FrameType::Ping => {
       if header.payload_len != 8 {
-        return Err(Err::Failure(error_position!(input, ErrorKind::Custom(FRAME_SIZE_ERROR))));
+        return Err(Err::Failure(Error::new(input, InnerError::FrameSizeError)));
       }
       ping_frame(i, &header)?
     },
@@ -169,7 +235,7 @@ pub fn frame<'a>(input: &'a[u8], max_frame_size: u32) -> IResult<&'a[u8], Frame<
     },
     FrameType::WindowUpdate => {
       if header.payload_len != 4 {
-        return Err(Err::Failure(error_position!(input, ErrorKind::Custom(FRAME_SIZE_ERROR))));
+        return Err(Err::Failure(Error::new(input, InnerError::FrameSizeError)));
       }
       window_update_frame(i, &header)?
     }
@@ -185,13 +251,13 @@ pub struct Data<'a> {
   pub end_stream: bool,
 }
 
-pub fn data_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>> {
+pub fn data_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>, Error<'a>> {
   let (remaining, i) = take!(input, header.payload_len)?;
 
   let (i1, pad_length) = cond!(i, header.flags & 0x8 != 0, be_u8)?;
 
   if pad_length.is_some() && i1.len() <= pad_length.unwrap() as usize {
-    return Err(Err::Failure(error_position!(input, ErrorKind::Custom(PROTOCOL_ERROR))));
+    return Err(Err::Failure(Error::new(input, InnerError::ProtocolError)));
   }
 
   let (_, payload) = take!(i1, i1.len() - pad_length.unwrap_or(0) as usize)?;
@@ -220,7 +286,7 @@ pub struct StreamDependency {
   pub stream_id: u32,
 }
 
-pub fn headers_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>> {
+pub fn headers_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>, Error<'a>> {
   let (remaining, i) = take!(input, header.payload_len)?;
 
   let (i1, pad_length) = cond!(i, header.flags & 0x8 != 0, be_u8)?;
@@ -234,7 +300,7 @@ pub fn headers_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<
   let(i3, weight) = cond!(i2, header.flags & 0x20 != 0, be_u8)?;
 
   if pad_length.is_some() && i3.len() <= pad_length.unwrap() as usize {
-    return Err(Err::Failure(error_position!(input, ErrorKind::Custom(PROTOCOL_ERROR))));
+    return Err(Err::Failure(Error::new(input, InnerError::ProtocolError)));
   }
 
   let (_, header_block_fragment) = take!(i3, i3.len() - pad_length.unwrap_or(0) as usize)?;
@@ -260,7 +326,7 @@ pub struct RstStream {
   pub error_code: u32,
 }
 
-pub fn rst_stream_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>> {
+pub fn rst_stream_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>, Error<'a>> {
   map!(input,
     be_u32,
     |error_code| {
@@ -282,7 +348,7 @@ pub struct Setting {
   pub value: u32,
 }
 
-pub fn settings_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>> {
+pub fn settings_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>, Error<'a>> {
   flat_map!(input,
     take!(header.payload_len),
     map!(
@@ -305,7 +371,7 @@ pub struct Ping {
   pub payload: [u8; 8],
 }
 
-pub fn ping_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>> {
+pub fn ping_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>, Error<'a>> {
   map!(input,
     take!(8),
     |data| {
@@ -328,13 +394,13 @@ pub struct WindowUpdate {
   pub increment: u32,
 }
 
-pub fn window_update_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>> {
+pub fn window_update_frame<'a,'b>(input: &'a[u8], header: &'b FrameHeader) -> IResult<&'a [u8], Frame<'a>, Error<'a>> {
   let (i, increment) = be_u32(input)?;
   let increment = increment & 0x7FFF;
 
   //FIXME: if stream id is 0, trat it as connection error?
   if increment == 0 {
-    return Err(Err::Failure(error_position!(input, ErrorKind::Custom(PROTOCOL_ERROR))));
+    return Err(Err::Failure(Error::new(input, InnerError::ProtocolError)));
   }
 
   Ok((i, Frame::WindowUpdate(WindowUpdate {
@@ -352,17 +418,3 @@ macro_rules! map_err(
   );
 );
 
-const NO_ERROR: u32 = 0x0;
-const PROTOCOL_ERROR: u32 = 0x1;
-const INTERNAL_ERROR: u32 = 0x2;
-const FLOW_CONTROL_ERROR: u32 = 0x3;
-const SETTINGS_TIMEOUT: u32 = 0x4;
-const STREAM_CLOSED: u32 = 0x5;
-const FRAME_SIZE_ERROR: u32 = 0x6;
-const REFUSED_STREAM: u32 = 0x7;
-const CANCEL: u32 = 0x8;
-const COMPRESSION_ERROR: u32 = 0x9;
-const CONNECT_ERROR: u32 = 0xa;
-const ENHANCE_YOUR_CALM: u32 = 0xb;
-const INADEQUATE_SECURITY: u32 = 0xc;
-const HTTP_1_1_REQUIRED: u32 = 0xd;
