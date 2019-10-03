@@ -175,6 +175,8 @@ extern crate webpki;
 extern crate mio_extras;
 extern crate hashbrown;
 extern crate regex;
+extern crate hpack;
+extern crate cookie_factory;
 
 #[cfg(test)]
 #[macro_use]

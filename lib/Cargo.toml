@@ -46,6 +46,8 @@ iovec = "0.1.4"
 memchr = "2.3"
 hashbrown = "0.1"
 regex = "1.1"
+cookie-factory = "^0.2"
+hpack = "^0.3"
 
 [dev-dependencies]
 tiny_http = "^0.6"
