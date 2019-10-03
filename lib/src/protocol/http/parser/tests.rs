@@ -962,7 +962,7 @@ fn parse_incomplete_chunk_header_test() {
 }
 
 #[test]
-fn parse_response_302_test() {
+fn parse_response_302() {
   let input =
       b"HTTP/1.1 302 Found\r\n\
         Cache-Control: no-cache\r\n\
@@ -1004,7 +1004,7 @@ fn parse_response_302_test() {
 }
 
 #[test]
-fn parse_response_303_test() {
+fn parse_response_303() {
   let input =
       b"HTTP/1.1 303 See Other\r\n\
         Cache-Control: no-cache\r\n\
@@ -1039,6 +1039,48 @@ fn parse_response_303_test() {
       Some(129)
     )
   );
+}
+
+#[test]
+fn parse_response_304() {
+    let input =
+          b"HTTP/1.1 304 Not Modified\r\n\
+            Connection: keep-alive\r\n\
+            ETag: hello\r\n\
+            \r\n";
+    let initial = ResponseState::Initial;
+    let is_head = true;
+    let (pool, mut buf) = buf_with_capacity(2048);
+    buf.write(&input[..]).unwrap();
+    println!("buffer input: {:?}", buf.input_queue);
+
+    //let result = parse_request(initial, input);
+    let result = parse_response_until_stop(initial, None, &mut buf, is_head, "", "SOZUBALANCEID", None);
+    println!("result: {:?}", result);
+    println!("input length: {}", input.len());
+    println!("buffer input: {:?}", buf.input_queue);
+    println!("buffer output: {:?}", buf.output_queue);
+    assert_eq!(buf.output_queue, vec!(
+      OutputElement::Slice(27), OutputElement::Delete(24), OutputElement::Slice(13),
+      OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+    assert_eq!(buf.start_parsing_position, 66);
+    assert_eq!(
+      result,
+      (
+        ResponseState::Response(
+          RStatusLine { version: Version::V11, status: 304, reason: String::from("Not Modified") },
+          Connection {
+            keep_alive:  Some(true),
+            has_upgrade: false,
+            upgrade:     None,
+            continues:   Continue::None,
+            to_delete:   None,
+            sticky_session: None,
+          },
+        ),
+        Some(66)
+      )
+    );
 }
 
 #[test]
