@@ -70,7 +70,7 @@ pub struct Session {
 
 impl Session {
   fn new(sock: TcpStream, frontend_token: Token, accept_token: Token, front_buf: Checkout<Buffer>,
-    back_buf: Checkout<Buffer>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Session {
+    back_buf: Checkout<Buffer>, app_id: Option<String>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Session {
     let s = sock.try_clone().expect("could not clone the socket");
     let frontend_address = sock.peer_addr().ok();
     let mut frontend_buffer = None;
@@ -98,8 +98,9 @@ impl Session {
       },
       None => {
         gauge_add!("protocol.tcp", 1);
-        Some(State::Pipe(Pipe::new(s, frontend_token, request_id, None, front_buf, back_buf, frontend_address,
-          Protocol::TCP)))
+        let mut pipe = Pipe::new(s, frontend_token, request_id, None, front_buf, back_buf, frontend_address, Protocol::TCP);
+        pipe.set_app_id(app_id.clone());
+        Some(State::Pipe(pipe))
       }
     };
 
@@ -111,7 +112,7 @@ impl Session {
       backend_token:      None,
       back_connected:     BackendConnectionStatus::NotConnected,
       accept_token,
-      app_id:             None,
+      app_id,
       metrics:            SessionMetrics::new(),
       protocol,
       front_buf:          frontend_buffer,
@@ -287,9 +288,9 @@ impl Session {
 
     if let Some(State::SendProxyProtocol(pp)) = protocol {
       if self.back_buf.is_some() && self.front_buf.is_some() {
-        self.protocol = Some(
-          State::Pipe(pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap()))
-        );
+        let mut pipe = pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap());
+        pipe.set_app_id(self.app_id.clone());
+        self.protocol = Some(State::Pipe(pipe));
         gauge_add!("protocol.proxy.send", -1);
         gauge_add!("protocol.tcp", 1);
         UpgradeResult::Continue
@@ -299,9 +300,9 @@ impl Session {
       }
     } else if let Some(State::RelayProxyProtocol(pp)) = protocol {
       if self.back_buf.is_some() {
-        self.protocol = Some(
-          State::Pipe(pp.into_pipe(self.back_buf.take().unwrap()))
-        );
+        let mut pipe = pp.into_pipe(self.back_buf.take().unwrap());
+        pipe.set_app_id(self.app_id.clone());
+        self.protocol = Some(State::Pipe(pipe));
         gauge_add!("protocol.proxy.relay", -1);
         gauge_add!("protocol.tcp", 1);
         UpgradeResult::Continue
@@ -311,9 +312,9 @@ impl Session {
       }
     } else if let Some(State::ExpectProxyProtocol(pp)) = protocol {
       if self.front_buf.is_some() && self.back_buf.is_some() {
-        self.protocol = Some(
-          State::Pipe(pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap(), None, None))
-        );
+        let mut pipe = pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap(), None, None);
+        pipe.set_app_id(self.app_id.clone());
+        self.protocol = Some(State::Pipe(pipe));
         gauge_add!("protocol.proxy.expect", -1);
         gauge_add!("protocol.tcp", 1);
         UpgradeResult::ConnectBackend
@@ -996,7 +997,7 @@ impl ProxyConfiguration<Session> for Proxy {
         if let Err(e) = frontend_sock.set_nodelay(true) {
           error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
         }
-        let c = Session::new(frontend_sock, session_token, internal_token, front_buf, back_buf, proxy_protocol.clone(),
+        let c = Session::new(frontend_sock, session_token, internal_token, front_buf, back_buf, listener.app_id.clone(), proxy_protocol.clone(),
         timeout);
         incr!("tcp.requests");
 
