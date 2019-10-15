@@ -230,20 +230,20 @@ impl<Front:SocketHandler> Pipe<Front> {
       //(ConnectionStatus::Normal, ConnectionStatus::ReadOpen) => true,
       (ConnectionStatus::Normal, ConnectionStatus::WriteOpen) => {
         // technically we should keep it open, but we'll assume that if the front
-        // is not readable and there is no in flight data front -> back,
+        // is not readable and there is no in flight data front -> back or back -> front,
         // we'll close the session, otherwise it interacts badly with HTTP connections
         // with Connection: close header and no Content-length
-        self.front_readiness.event.is_readable() || self.front_buf.available_data() > 0
+        self.front_readiness.event.is_readable() || self.front_buf.available_data() > 0 || self.back_buf.available_data() > 0
       },
       (ConnectionStatus::Normal, ConnectionStatus::Closed) => self.back_buf.available_data() > 0,
 
       (ConnectionStatus::WriteOpen, ConnectionStatus::Normal) => {
         // technically we should keep it open, but we'll assume that if the back
-        // is not readable and there is no in flight data back -> front, we'll close the session
-        self.back_readiness.event.is_readable() || self.back_buf.available_data() > 0
+        // is not readable and there is no in flight data back -> front or front -> back, we'll close the session
+        self.back_readiness.event.is_readable() || self.back_buf.available_data() > 0 || self.front_buf.available_data() > 0
       },
       //(ConnectionStatus::WriteOpen, ConnectionStatus::ReadOpen) => true,
-      (ConnectionStatus::WriteOpen, ConnectionStatus::WriteOpen) => self.front_buf.available_data() >= 0 || self.back_buf.available_data() > 0,
+      (ConnectionStatus::WriteOpen, ConnectionStatus::WriteOpen) => self.front_buf.available_data() > 0 || self.back_buf.available_data() > 0,
       (ConnectionStatus::WriteOpen, ConnectionStatus::Closed) => self.back_buf.available_data() > 0,
 
       //(ConnectionStatus::ReadOpen, ConnectionStatus::Normal) => true,
