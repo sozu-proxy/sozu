@@ -47,7 +47,7 @@ tiny_http = "^0.6"
 quickcheck = "^0.9"
 
 [dependencies.uuid]
-version = "^0.7.0"
+version = "^0.8.0"
 features = ["v4"]
 
 [features]
