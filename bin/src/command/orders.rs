@@ -455,24 +455,30 @@ impl CommandServer {
         "".to_string(),
         None
         ));
-    let (pid, mut channel) = start_new_master_process(self.executable_path.clone(), self.generate_upgrade_data());
-    channel.set_blocking(true);
-    let res = channel.read_message();
-    debug!("upgrade channel sent: {:?}", res);
-    if let Some(true) = res {
-      self.clients[token].channel.write_message(&CommandResponse::new(
-        message_id.into(),
-        CommandStatus::Ok,
-        format!("new master process launched with pid {}, closing the old one", pid),
-        None
-      ));
-      info!("wrote final message, closing");
-      //FIXME: should do some cleanup before exiting
-      sleep(Duration::from_secs(2));
-      process::exit(0);
-    } else {
-      self.answer_error(token, message_id, "could not upgrade master process", None);
-    }
+    match start_new_master_process(self.executable_path.clone(), self.generate_upgrade_data()) {
+          Ok((pid, mut channel)) => {
+              channel.set_blocking(true);
+              let res = channel.read_message();
+              debug!("upgrade channel sent: {:?}", res);
+              if let Some(true) = res {
+                  self.clients[token].channel.write_message(&CommandResponse::new(
+                      message_id.into(),
+                      CommandStatus::Ok,
+                      format!("new master process launched with pid {}, closing the old one", pid),
+                      None
+                  ));
+                  info!("wrote final message, closing");
+                  //FIXME: should do some cleanup before exiting
+                  sleep(Duration::from_secs(2));
+                  process::exit(0);
+              } else {
+                  self.answer_error(token, message_id, "could not upgrade master process", None);
+              } 
+          }
+        Err(e) => { error!("{}", e) }
+      }
+
+    
   }
 
   pub fn metrics(&mut self, token: FrontToken, message_id: &str) {
