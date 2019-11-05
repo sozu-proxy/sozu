@@ -70,6 +70,7 @@ pub struct Http<Front:SocketHandler> {
   pub back_buf:       Option<BufferQueue>,
   pub app_id:         Option<String>,
   pub request_id:     Hyphenated,
+  pub backend_id:     Option<String>,
   pub front_readiness:Readiness,
   pub back_readiness: Readiness,
   pub log_ctx:        String,
@@ -93,7 +94,7 @@ impl<Front:SocketHandler> Http<Front> {
     public_address: Option<SocketAddr>, session_address: Option<SocketAddr>, sticky_name: String,
     protocol: Protocol) -> Option<Http<Front>> {
 
-    let log_ctx    = format!("{} unknown\t", &request_id);
+    let log_ctx    = format!("{} - -\t", &request_id);
     let mut session = Http {
       frontend:           sock,
       backend:            None,
@@ -104,6 +105,7 @@ impl<Front:SocketHandler> Http<Front> {
       back_buf:           None,
       app_id:             None,
       request_id,
+      backend_id:         None,
       front_readiness:    Readiness::new(),
       back_readiness:     Readiness::new(),
       log_ctx,
@@ -153,8 +155,11 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn reset_log_context(&mut self) {
-    self.log_ctx = format!("{} {}\t",
-      self.request_id, self.app_id.as_ref().unwrap_or(&String::from("unknown")));
+    self.log_ctx = format!("{} {} {}\t",
+      self.request_id,
+      self.app_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),
+      self.backend_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-")
+      );
   }
 
   fn tokens(&self) -> Option<(Token,Token)> {
@@ -286,10 +291,13 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn set_app_id(&mut self, app_id: String) {
-    self.log_ctx = format!("{} {}\t",
-      self.request_id, &app_id);
-
     self.app_id  = Some(app_id);
+    self.reset_log_context();
+  }
+
+  pub fn set_backend_id(&mut self, backend_id: String) {
+    self.backend_id = Some(backend_id);
+    self.reset_log_context();
   }
 
   pub fn set_back_token(&mut self, token: Token) {

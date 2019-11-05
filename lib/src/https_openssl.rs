@@ -1285,6 +1285,9 @@ impl Proxy {
         }
         session.metrics.backend_id = Some(backend.borrow().backend_id.clone());
         session.metrics.backend_start();
+        session.http().map(|http| {
+          http.set_backend_id(backend.borrow().backend_id.clone());
+        });
         session.backend = Some(backend);
 
         Ok(conn)

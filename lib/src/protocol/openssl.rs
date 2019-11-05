@@ -170,7 +170,7 @@ impl TlsHandshake {
       .map(|s| format!("unknown server name: {}", s))
       .unwrap_or("no SNI".to_string());
 
-    error_access!("{} unknown\t{} -> {}\t{} {} {} {}\t{} | {}",
+    error_access!("{} - -\t{} -> {}\t{} {} {} {}\t{} | {}",
       self.request_id, session, backend,
       LogDuration(response_time), LogDuration(service_time), metrics.bin, metrics.bout,
       proto, message);
