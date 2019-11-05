@@ -1504,10 +1504,12 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
           match crlf(buf) {
             Ok((i, _)) => {
               debug!("PARSER\theaders parsed, stopping");
-              if conn.keep_alive == Some(false) {
-                (BufferMove::Advance(buf.offset(i)), ResponseState::ResponseWithBodyCloseDelimited(sl, conn, false))
-              } else {
+              // no content
+              if sl.status == 204 {
                 (BufferMove::Advance(buf.offset(i)), ResponseState::Response(sl, conn))
+              } else {
+                // no length information, so we'll assume that the response ends when the connection is closed
+                (BufferMove::Advance(buf.offset(i)), ResponseState::ResponseWithBodyCloseDelimited(sl, conn, false))
               }
             },
             res => {
