@@ -2382,6 +2382,53 @@ mod tests {
   }
 
   #[test]
+  fn parse_request_delete_forwarded_headers() {
+      setup_test_logger!();
+      let input =
+          b"GET /index.html HTTP/1.1\r\n\
+            Host: localhost:8888\r\n\
+            Forwarded: proto:https;for=27.0.0.1:1234;by:proxy\r\n\
+            X-forwarded-Proto: https\r\n\
+            X-Forwarded-For: 127.0.0.1\r\n\
+            X-Forwarded-Port: 1234\r\n\
+            \r\n";
+      let initial = RequestState::Initial;
+      let (pool, mut buf) = buf_with_capacity(2048);
+      buf.write(&input[..]).unwrap();
+
+      let new_header = b"Sozu-Id: 123456789\r\n";
+      let result = parse_request_until_stop(initial, None, &mut buf, "Sozu-Id: 123456789\r\n", "SOZUBALANCEID");
+      println!("result: {:?}", result);
+      println!("input length: {}", input.len());
+      println!("buffer output: {:?}", buf.output_queue);
+      assert_eq!(buf.output_queue, vec!(
+        OutputElement::Slice(26), OutputElement::Slice(22),
+        // Forwarded
+        OutputElement::Delete(51),
+        // X-Forwarded-Proto
+        OutputElement::Delete(26),
+        // X-Forwarded-For
+        OutputElement::Delete(28),
+        // X-Forwarded-Port
+        OutputElement::Delete(24),
+        OutputElement::Insert(Vec::from(&new_header[..])),
+      OutputElement::Slice(2)));
+      println!("buf:\n{}", buf.buffer.data().to_hex(16));
+      assert_eq!(buf.start_parsing_position, 179);
+      assert_eq!(
+        result,
+        (
+          RequestState::Request(
+            RRequestLine { method: Method::Get, uri: String::from("/index.html"), version: Version::V11 },
+            Connection::new(),
+            String::from("localhost:8888"),
+          ),
+          Some(179)
+        )
+      );
+  }
+
+  #[test]
   fn parse_chunk() {
     let input =
       b"4\r\n\
