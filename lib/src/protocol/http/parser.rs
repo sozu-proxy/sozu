@@ -1505,7 +1505,9 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
             Ok((i, _)) => {
               debug!("PARSER\theaders parsed, stopping");
               // no content
-              if sl.status == 204 {
+              if is_head ||
+                // all 1xx responses
+                sl.status / 100  == 1 || sl.status == 204 || sl.status == 304 {
                 (BufferMove::Advance(buf.offset(i)), ResponseState::Response(sl, conn))
               } else {
                 // no length information, so we'll assume that the response ends when the connection is closed
@@ -2744,7 +2746,7 @@ mod tests {
   }
 
   #[test]
-  fn parse_response_302_test() {
+  fn parse_response_302() {
     let input =
         b"HTTP/1.1 302 Found\r\n\
           Cache-Control: no-cache\r\n\
@@ -2786,7 +2788,7 @@ mod tests {
   }
 
   #[test]
-  fn parse_response_303_test() {
+  fn parse_response_303() {
     let input =
         b"HTTP/1.1 303 See Other\r\n\
           Cache-Control: no-cache\r\n\
@@ -2821,6 +2823,48 @@ mod tests {
         Some(129)
       )
     );
+  }
+
+  #[test]
+  fn parse_response_304() {
+      let input =
+          b"HTTP/1.1 304 Not Modified\r\n\
+            Connection: keep-alive\r\n\
+            ETag: hello\r\n\
+            \r\n";
+      let initial = ResponseState::Initial;
+      let is_head = true;
+      let (pool, mut buf) = buf_with_capacity(2048);
+      buf.write(&input[..]).unwrap();
+      println!("buffer input: {:?}", buf.input_queue);
+
+      //let result = parse_request(initial, input);
+      let result = parse_response_until_stop(initial, None, &mut buf, is_head, "", "SOZUBALANCEID", None);
+      println!("result: {:?}", result);
+      println!("input length: {}", input.len());
+      println!("buffer input: {:?}", buf.input_queue);
+      println!("buffer output: {:?}", buf.output_queue);
+      assert_eq!(buf.output_queue, vec!(
+        OutputElement::Slice(27), OutputElement::Delete(24), OutputElement::Slice(13),
+        OutputElement::Insert(vec!()), OutputElement::Slice(2)));
+      assert_eq!(buf.start_parsing_position, 66);
+      assert_eq!(
+        result,
+        (
+          ResponseState::Response(
+            RStatusLine { version: Version::V11, status: 304, reason: String::from("Not Modified") },
+            Connection {
+              keep_alive:  Some(true),
+              has_upgrade: false,
+              upgrade:     None,
+              continues:   Continue::None,
+              to_delete:   None,
+              sticky_session: None,
+            },
+          ),
+          Some(66)
+        )
+      );
   }
 
   #[test]
