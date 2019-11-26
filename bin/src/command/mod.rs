@@ -142,13 +142,16 @@ impl CommandServer {
   fn new(srv: UnixListener, config: Config, mut worker_vec: Vec<Worker>, poll: Poll) -> CommandServer {
     //FIXME: verify this
     poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-    METRICS.with(|metrics| {
-      if let Some(sock) = (*metrics.borrow()).socket() {
-        poll.register(sock, Token(1), Ready::writable(), PollOpt::edge()).expect("should register the metrics socket");
-      } else {
-        error!("could not register metrics socket");
-      }
-    });
+
+    if config.metrics.is_some() {
+      METRICS.with(|metrics| {
+        if let Some(sock) = (*metrics.borrow()).socket() {
+          poll.register(sock, Token(1), Ready::writable(), PollOpt::edge()).expect("should register the metrics socket");
+        } else {
+          error!("could not register metrics socket");
+        }
+      });
+    }
 
 
     let next_id = worker_vec.len();
