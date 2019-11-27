@@ -51,6 +51,7 @@ pub enum DefaultAnswerStatus {
   Answer404,
   Answer408,
   Answer413,
+  Answer502,
   Answer503,
   Answer504,
 }
@@ -192,6 +193,7 @@ impl<Front:SocketHandler> Http<Front> {
         DefaultAnswerStatus::Answer404 => incr!("http.404.errors"),
         DefaultAnswerStatus::Answer408 => incr!("http.408.errors"),
         DefaultAnswerStatus::Answer413 => incr!("http.413.errors"),
+        DefaultAnswerStatus::Answer502 => incr!("http.502.errors"),
         DefaultAnswerStatus::Answer503 => incr!("http.503.errors"),
         DefaultAnswerStatus::Answer504 => incr!("http.504.errors"),
       };
@@ -509,6 +511,7 @@ impl<Front:SocketHandler> Http<Front> {
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer404, _, _) => "404 Not Found",
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer408, _, _) => "408 Request Timeout",
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer413, _, _) => "413 Payload Too Large",
+      SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer502, _, _) => "502 Bad Gateway",
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer503, _, _) => "503 Service Unavailable",
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer504, _, _) => "504 Gateway Timeout",
     };
@@ -1303,7 +1306,9 @@ impl<Front:SocketHandler> Http<Front> {
 
         if unwrap_msg!(self.response.as_ref()).is_back_error() {
           self.log_request_error(metrics, "back socket parse error, closing connection");
-          return (ProtocolResult::Continue, SessionResult::CloseSession);
+          let answer_502 = "HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+          self.set_answer(DefaultAnswerStatus::Answer502, Rc::new(Vec::from(answer_502.as_bytes())));
+          return (ProtocolResult::Continue, self.writable(metrics));
         }
 
         if let Some(ResponseState::Response(_,_)) = self.response {

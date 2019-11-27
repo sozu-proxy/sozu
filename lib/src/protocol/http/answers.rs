@@ -15,6 +15,8 @@ pub struct DefaultAnswers {
   pub RequestTimeout:     Rc<Vec<u8>>,
   /// 413
   pub PayloadTooLarge:    Rc<Vec<u8>>,
+  /// 502
+  pub BadGateway:         Rc<Vec<u8>>,
   /// 503
   pub ServiceUnavailable: Rc<Vec<u8>>,
   /// 504
@@ -48,6 +50,9 @@ impl HttpAnswers {
         PayloadTooLarge: Rc::new(Vec::from(
           &b"HTTP/1.1 413 Payload Too Large\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
         )),
+        BadGateway: Rc::new(Vec::from(
+          &b"HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+        )),
         ServiceUnavailable: Rc::new(Vec::from(answer_503.as_bytes())),
         GatewayTimeout: Rc::new(Vec::from(
           &b"HTTP/1.1 504 Gateway Timeout\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
@@ -77,6 +82,7 @@ impl HttpAnswers {
       DefaultAnswerStatus::Answer404 => self.default.NotFound.clone(),
       DefaultAnswerStatus::Answer408 => self.default.RequestTimeout.clone(),
       DefaultAnswerStatus::Answer413 => self.default.PayloadTooLarge.clone(),
+      DefaultAnswerStatus::Answer502 => self.default.BadGateway.clone(),
       DefaultAnswerStatus::Answer503 => cluster_id.and_then(|id: &str| self.custom.get(id))
         .and_then(|c| c.ServiceUnavailable.clone()).unwrap_or_else(|| self.default.ServiceUnavailable.clone()),
       DefaultAnswerStatus::Answer504 => self.default.GatewayTimeout.clone(),
