@@ -87,7 +87,7 @@ static HTTPS_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUs
 
 impl std::ops::Drop for Session {
     fn drop(&mut self) {
-      decr!("openssl.leak.sessions");
+      gauge_add!("openssl.leak.sessions", -1);
       let count = HTTPS_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -96,7 +96,7 @@ impl Session {
   pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: Option<SocketAddr>, expect_proxy: bool, sticky_name: String,
     timeout: Timeout, answers: Rc<RefCell<HttpAnswers>>, listen_token: Token) -> Session {
-    incr!("openssl.leak.sessions");
+    gauge_add!("openssl.leak.sessions", 1);
     let count = HTTPS_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let peer_address = if expect_proxy {
