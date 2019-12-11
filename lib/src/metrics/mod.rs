@@ -174,6 +174,10 @@ impl Aggregator {
   pub fn dump_process_data(&mut self) -> BTreeMap<String, FilteredData> {
     self.local.dump_process_data()
   }
+
+  pub fn clear_local(&mut self) {
+    self.local.clear();
+  }
 }
 
 impl Subscriber for Aggregator {

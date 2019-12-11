@@ -160,6 +160,11 @@ impl LocalDrain {
 
     data
   }
+
+  pub fn clear(&mut self) {
+    self.data.clear();
+    self.app_data.clear();
+  }
 }
 
 

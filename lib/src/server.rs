@@ -426,6 +426,11 @@ impl Server {
           }
           info!("removing {} zombies ({} remaining tokens after close)", count, remaining);
         }
+
+        // regularly clear local metrics to prevent them from taking too much memory
+        METRICS.with(|metrics| {
+          (*metrics.borrow_mut()).clear_local();
+        });
       }
 
       gauge!("client.connections", self.nb_connections);
