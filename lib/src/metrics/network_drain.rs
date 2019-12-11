@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use mio::net::UdpSocket;
 use std::io::{self,LineWriter,Write,ErrorKind};
+use std::collections::HashMap;
 
 use super::{Subscriber,MetricData,StoredMetricData};
 
@@ -42,9 +43,9 @@ pub struct NetworkDrain {
   is_writable:        bool,
   data:               BTreeMap<String, StoredMetricData>,
   /// (app_id, key) -> metric
-  app_data:           BTreeMap<(String, String), StoredMetricData>,
+  app_data:           HashMap<(String, String), StoredMetricData>,
   /// (app_id, backend_id, key) -> metric
-  backend_data:       BTreeMap<(String, String, String), StoredMetricData>,
+  backend_data:       HashMap<(String, String, String), StoredMetricData>,
   pub use_tagged_metrics: bool,
   pub origin:         String,
   created:            Instant,
@@ -60,8 +61,8 @@ impl NetworkDrain {
       }),
       is_writable: true,
       data: BTreeMap::new(),
-      app_data: BTreeMap::new(),
-      backend_data: BTreeMap::new(),
+      app_data: HashMap::new(),
+      backend_data: HashMap::new(),
       use_tagged_metrics: false,
       origin: String::from("x"),
       created: Instant::now(),
@@ -76,6 +77,10 @@ impl NetworkDrain {
     let now  = Instant::now();
     let secs = Duration::new(2, 0);
     let mut send_count = 0;
+
+    // remove metrics that were not touched in the last 10mn
+    self.app_data.retain(|ref key, ref value| value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00));
+    self.backend_data.retain(|ref key, ref value| value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00));
 
     if self.is_writable {
 
