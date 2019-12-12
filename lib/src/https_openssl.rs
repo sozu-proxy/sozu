@@ -83,21 +83,10 @@ pub struct Session {
   answers:            Rc<RefCell<HttpAnswers>>,
 }
 
-static HTTPS_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-impl std::ops::Drop for Session {
-    fn drop(&mut self) {
-      gauge_add!("openssl.leak.sessions", -1);
-      let count = HTTPS_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
 impl Session {
   pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: Option<SocketAddr>, expect_proxy: bool, sticky_name: String,
     timeout: Timeout, answers: Rc<RefCell<HttpAnswers>>, listen_token: Token) -> Session {
-    gauge_add!("openssl.leak.sessions", 1);
-    let count = HTTPS_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let peer_address = if expect_proxy {
       // Will be defined later once the expect proxy header has been received and parsed
@@ -943,23 +932,17 @@ impl Listener {
       let domains  = unwrap_msg!(ref_domains.lock());
 
       trace!("ref: {:?}", ssl);
-      if let Some(servername) = ssl.servername(NameType::HOST_NAME).map(|s| {
-        incr!("openssl.leak.servername.allocated");
-        s.to_string()
-      }) {
+      if let Some(servername) = ssl.servername(NameType::HOST_NAME).map(|s| s.to_string()) {
         debug!("looking for fingerprint for {:?}", servername);
         if let Some(kv) = domains.domain_lookup(servername.as_bytes(), true) {
-          incr!("openssl.leak.servername.foundname");
           debug!("looking for context for {:?} with fingerprint {:?}", servername, kv.1);
           if let Some(ref tls_data) = contexts.get(&kv.1) {
             debug!("found context for {:?}", servername);
-            incr!("openssl.leak.servername.foundcontext");
 
             let context: &SslContext = &tls_data.context;
             if let Ok(()) = ssl.set_ssl_context(context) {
               debug!("servername is now {:?}", ssl.servername(NameType::HOST_NAME));
 
-              incr!("openssl.leak.servername.setcontext");
               return Ok(());
             } else {
               error!("could not set context for {:?}", servername);
@@ -971,7 +954,6 @@ impl Listener {
           //error!("unrecognized server name: {}", servername);
         }
       } else {
-        incr!("openssl.leak.servername.noname");
         //error!("no server name information found");
       }
 
@@ -1080,23 +1062,17 @@ impl Listener {
         let domains  = unwrap_msg!(ref_domains.lock());
 
         trace!("ref: {:?}", ssl);
-        if let Some(servername) = ssl.servername(NameType::HOST_NAME).map(|s| {
-          incr!("openssl.leak.servername.allocated");
-          s.to_string()
-        }) {
+        if let Some(servername) = ssl.servername(NameType::HOST_NAME).map(|s| s.to_string()) {
           debug!("looking for fingerprint for {:?}", servername);
           if let Some(kv) = domains.domain_lookup(servername.as_bytes(), true) {
-            incr!("openssl.leak.servername.foundname");
             debug!("looking for context for {:?} with fingerprint {:?}", servername, kv.1);
             if let Some(ref tls_data) = contexts.get(&kv.1) {
               debug!("found context for {:?}", servername);
-              incr!("openssl.leak.servername.foundcontext");
 
               let context: &SslContext = &tls_data.context;
               if let Ok(()) = ssl.set_ssl_context(context) {
                 debug!("servername is now {:?}", ssl.servername(NameType::HOST_NAME));
 
-                incr!("openssl.leak.servername.setcontext");
                 return Ok(());
               } else {
                 error!("could not set context for {:?}", servername);
@@ -1108,7 +1084,6 @@ impl Listener {
             //error!("unrecognized server name: {}", servername);
           }
         } else {
-          incr!("openssl.leak.servername.noname");
           //error!("no server name information found");
         }
 
@@ -1208,17 +1183,14 @@ impl Listener {
       sock.accept().map_err(|e| {
         match e.kind() {
           ErrorKind::WouldBlock => {
-            incr!("openssl.leak.accept.wouldblock");
             AcceptError::WouldBlock
           },
           _ => {
             error!("accept() IO error: {:?}", e);
-            incr!("openssl.leak.accept.error");
             AcceptError::IoError
           }
         }
       }).map(|(sock,_)| {
-        incr!("openssl.leak.accept.ok");
         sock
       })
     } else {
