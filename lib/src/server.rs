@@ -388,6 +388,8 @@ impl Server {
         info!("zombie check");
         last_zombie_check = now;
 
+        clear_ssl_error();
+
         let mut tokens = HashSet::new();
         let mut frontend_tokens = HashSet::new();
 
@@ -1612,5 +1614,14 @@ impl ProxySessionCast for https_openssl::Session {
   fn as_tcp(&mut self) -> &mut tcp::Session { panic!() }
   fn as_https_rustls(&mut self) -> &mut https_rustls::session::Session { panic!() }
   fn as_https_openssl(&mut self) -> &mut https_openssl::Session { self }
+}
+
+#[cfg(feature = "use-openssl")]
+fn clear_ssl_error() {
+  unsafe { ::openssl_sys::ERR_clear_error() };
+}
+
+#[cfg(not(feature = "use-openssl"))]
+fn clear_ssl_error() {
 }
 

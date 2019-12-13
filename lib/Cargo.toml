@@ -34,7 +34,8 @@ mio-uds = "^0.6"
 libc = "^0.2"
 slab = "^0.3.0"
 pool = "^0.1"
-openssl = {version="^0.10.24", optional = true}
+openssl = {version="^0.10.26", optional = true}
+openssl-sys = {version="^0.9", optional = true}
 rustls = "^0.16"
 webpki = "^0.21"
 hdrhistogram = "^6.0"
@@ -56,7 +57,7 @@ splice   = []
 unstable = []
 logs-debug = []
 logs-trace = []
-use-openssl = ["openssl"]
+use-openssl = ["openssl", "openssl-sys"]
 tolerant-http1-parser = []
 
 [badges]

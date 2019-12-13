@@ -176,6 +176,8 @@ extern crate mio_extras;
 #[cfg(test)]
 #[macro_use]
 extern crate quickcheck;
+#[cfg(feature = "use-openssl")]
+extern crate openssl_sys;
 
 #[macro_use] pub mod util;
 #[macro_use] pub mod metrics;

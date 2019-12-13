@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::str::from_utf8_unchecked;
 use time::{SteadyTime, Duration};
 use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod, SslAlert,
-                   Ssl, SslOptions, SslRef, SslStream, SniError, NameType};
+                   Ssl, SslOptions, SslRef, SslStream, SniError, NameType, SslSessionCacheMode};
 use openssl::x509::X509;
 use openssl::dh::Dh;
 use openssl::pkey::PKey;
@@ -902,6 +902,8 @@ impl Listener {
     trace!("parsed tls options: {:?}", ssl_options);
 
     context.set_options(ssl_options);
+    context.set_session_cache_size(1);
+    context.set_session_cache_mode(SslSessionCacheMode::OFF);
 
     if let Err(e) = setup_curves(&mut context) {
       error!("could not setup curves for openssl: {:?}", e);
@@ -1015,6 +1017,8 @@ impl Listener {
     if c.is_err() { return false; }
     let mut ctx = c.expect("should have built a correct SSL context");
     ctx.set_options(self.ssl_options);
+    ctx.set_session_cache_size(1);
+    ctx.set_session_cache_mode(SslSessionCacheMode::OFF);
 
     if let Err(e) = setup_curves(&mut ctx) {
       error!("could not setup curves for openssl: {:?}", e);
