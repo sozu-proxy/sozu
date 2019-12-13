@@ -1102,7 +1102,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 
 [[package]]
 name = "sozu"
-version = "0.11.33"
+version = "0.11.34"
 dependencies = [
  "clap 2.33.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "futures 0.1.29 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1120,15 +1120,15 @@ dependencies = [
  "serde_derive 1.0.103 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_json 1.0.44 (registry+https://github.com/rust-lang/crates.io-index)",
  "slab 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "sozu-command-lib 0.11.33",
- "sozu-lib 0.11.33",
+ "sozu-command-lib 0.11.34",
+ "sozu-lib 0.11.34",
  "tempfile 3.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "time 0.1.42 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "sozu-command-futures"
-version = "0.11.33"
+version = "0.11.34"
 dependencies = [
  "bytes 0.4.12 (registry+https://github.com/rust-lang/crates.io-index)",
  "env_logger 0.7.1 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1136,7 +1136,7 @@ dependencies = [
  "log 0.4.8 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde 1.0.103 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_json 1.0.44 (registry+https://github.com/rust-lang/crates.io-index)",
- "sozu-command-lib 0.11.33",
+ "sozu-command-lib 0.11.34",
  "tokio-codec 0.1.1 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio-core 0.1.17 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio-uds 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-command-lib"
-version = "0.11.33"
+version = "0.11.34"
 dependencies = [
  "hex 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "libc 0.2.66 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "sozu-lib"
-version = "0.11.33"
+version = "0.11.34"
 dependencies = [
  "hdrhistogram 6.3.4 (registry+https://github.com/rust-lang/crates.io-index)",
  "idna 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1182,7 +1182,7 @@ dependencies = [
  "rand 0.7.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "rustls 0.16.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "slab 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "sozu-command-lib 0.11.33",
+ "sozu-command-lib 0.11.34",
  "time 0.1.42 (registry+https://github.com/rust-lang/crates.io-index)",
  "tiny_http 0.6.2 (registry+https://github.com/rust-lang/crates.io-index)",
  "url 2.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1192,7 +1192,7 @@ dependencies = [
 
 [[package]]
 name = "sozuctl"
-version = "0.11.33"
+version = "0.11.34"
 dependencies = [
  "hex 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "prettytable-rs 0.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -1200,7 +1200,7 @@ dependencies = [
  "serde 1.0.103 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_derive 1.0.103 (registry+https://github.com/rust-lang/crates.io-index)",
  "serde_json 1.0.44 (registry+https://github.com/rust-lang/crates.io-index)",
- "sozu-command-lib 0.11.33",
+ "sozu-command-lib 0.11.34",
  "structopt 0.3.5 (registry+https://github.com/rust-lang/crates.io-index)",
  "structopt-derive 0.3.5 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
