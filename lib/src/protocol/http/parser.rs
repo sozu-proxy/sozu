@@ -173,23 +173,11 @@ pub struct RStatusLine {
 
 impl RStatusLine {
   pub fn from_status_line(r: StatusLine) -> Option<RStatusLine> {
-    if let Ok(status_str) = str::from_utf8(r.status) {
-      if let Ok(status) = status_str.parse::<u16>() {
-        if let Ok(reason) = str::from_utf8(r.reason) {
-          Some(RStatusLine {
-            version: r.version,
-            status,
-            reason:  String::from(reason),
-          })
-        } else {
-          None
-        }
-      } else {
-        None
-      }
-    } else {
-      None
-    }
+    let status = str::from_utf8(r.status).ok()?.parse().ok()?;
+    let reason = str::from_utf8(r.reason).ok()?.into();
+    let version = r.version;
+    
+    Ok(RStatusLine { version, status, reason })
   }
 }
 
