@@ -468,11 +468,12 @@ macro_rules! log {
           $crate::logging::LOGGER.with(|l| {
             let pid = l.borrow().pid;
 
+            let now = ::chrono::offset::Utc::now().to_rfc3339_opts(::chrono::SecondsFormat::Micros, true);
             l.borrow_mut().log(
               &_META,
               format_args!(
                 concat!("{} {} {} {} {}\t", $format, '\n'),
-                ::time::now_utc().rfc3339(), ::time::precise_time_ns(), pid, tag,
+                now, ::time::precise_time_ns(), pid, tag,
                 $level_tag $(, $final_args)*)
             );
           })
@@ -508,11 +509,12 @@ macro_rules! log_access {
           $crate::logging::LOGGER.with(|l| {
             let pid = l.borrow().pid;
 
+            let now = ::chrono::offset::Utc::now().to_rfc3339_opts(::chrono::SecondsFormat::Micros, true);
             l.borrow_mut().log_access(
               &_META,
               format_args!(
                 concat!("{} {} {} {} {}\t", $format, '\n'),
-                ::time::now_utc().rfc3339(), ::time::precise_time_ns(), pid, tag,
+                now, ::time::precise_time_ns(), pid, tag,
                 $level_tag $(, $final_args)*)
             );
           })
