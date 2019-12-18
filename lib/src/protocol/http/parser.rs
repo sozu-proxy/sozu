@@ -2,6 +2,7 @@ use sozu_command::buffer::Buffer;
 use buffer_queue::BufferQueue;
 use protocol::StickySession;
 use super::cookies::{RequestCookie, parse_request_cookies};
+use features::FEATURES;
 
 use nom::{HexDisplay,IResult,Offset};
 
@@ -647,11 +648,7 @@ impl<'a> Header<'a> {
     } else if compare_no_case(&self.name, b"set-cookie") {
       self.value.starts_with(sticky_name.as_bytes())
     } else {
-      (compare_no_case(&self.name, b"connection") && !compare_no_case(&self.value, b"upgrade")) ||
-      compare_no_case(&self.name, b"forwarded")         ||
-      compare_no_case(&self.name, b"x-forwarded-for")   ||
-      compare_no_case(&self.name, b"x-forwarded-proto") ||
-      compare_no_case(&self.name, b"x-forwarded-port")  ||
+      let mut b = (compare_no_case(&self.name, b"connection") && !compare_no_case(&self.value, b"upgrade")) ||
       compare_no_case(&self.name, b"sozu-id")           ||
       {
         let mut res = false;
@@ -665,7 +662,16 @@ impl<'a> Header<'a> {
         }
 
         res
+      };
+
+      if !FEATURES.with(|features| features.borrow().get("forwarded-fix").map(|f| f.is_true()).unwrap_or(false)) {
+        b |= compare_no_case(&self.name, b"forwarded")         ||
+             compare_no_case(&self.name, b"x-forwarded-for")   ||
+             compare_no_case(&self.name, b"x-forwarded-proto") ||
+             compare_no_case(&self.name, b"x-forwarded-port");
       }
+
+      b
     }
   }
 
