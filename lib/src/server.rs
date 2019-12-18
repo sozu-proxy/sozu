@@ -27,6 +27,7 @@ use {http,tcp};
 use pool::Pool;
 use metrics::METRICS;
 use backends::BackendMap;
+use features::FEATURES;
 
 // Number of retries to perform on a server after a connection failure
 pub const CONN_RETRIES: u8 = 3;
@@ -185,6 +186,10 @@ impl Server {
     tcp:  Option<tcp::Proxy>,
     server_config: ServerConfig,
     config_state: Option<ConfigState>) -> Self {
+
+    FEATURES.with(|features| {
+      // initializing feature flags
+    });
 
     poll.register(
       &channel,

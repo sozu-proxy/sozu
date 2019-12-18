@@ -192,6 +192,7 @@ pub mod http;
 pub mod backends;
 pub mod retry;
 pub mod load_balancing;
+pub mod features;
 
 #[cfg(feature = "splice")]
 mod splice;
