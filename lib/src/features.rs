@@ -17,7 +17,7 @@ impl FeatureFlags {
     if let Ok(val) = std::env::var("FEATURES") {
       for feature_val in val.split(",") {
         if let Some((key, f)) = parse_feature(feature_val) {
-          debug!("parsed feature flag ({}, {:?})", key, f);
+          info!("adding feature flag ({}, {:?})", key, f);
           features.insert(key, f);
         }
       }
