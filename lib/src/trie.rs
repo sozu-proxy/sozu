@@ -287,8 +287,6 @@ impl<V:Debug+Clone> TrieNode<V> {
             }
           } else if partial_key.len() == child_key.len() {
             return self.children[index].key_value.as_ref();
-          } else {
-            return wildcard_res;
           }
         }
       }
