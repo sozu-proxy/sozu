@@ -1411,7 +1411,11 @@ pub fn validate_response_header(mut state: ResponseState, header: &Header, is_he
     },
     HeaderValue::Encoding(TransferEncodingValue::Chunked) => {
       match state {
-        ResponseState::HasStatusLine(rl, conn) => ResponseState::HasLength(rl, conn, LengthInformation::Chunked),
+        ResponseState::HasStatusLine(sl, conn) => if is_head {
+          ResponseState::HasStatusLine(sl, conn)
+        } else {
+          ResponseState::HasLength(sl, conn, LengthInformation::Chunked)
+        },
         s                                      => s.into_error(),
       }
     },
