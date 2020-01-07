@@ -20,6 +20,13 @@ use std::iter::repeat;
 #[cfg(target_os = "macos")]
 use std::ptr::null_mut;
 
+#[cfg(target_os = "freebsd")]
+use std::ffi::c_void;
+#[cfg(target_os = "freebsd")]
+use std::iter::repeat;
+#[cfg(target_os = "freebsd")]
+use std::mem::size_of;
+
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
@@ -208,10 +215,60 @@ pub unsafe fn get_executable_path() -> String {
     if libc::realpath(ptr, ptr2) != null_mut() {
       let path = CString::from_raw(ptr2);
       path.to_str().expect("failed to convert CString to String").to_string()
+
     } else {
       panic!();
     }
   } else {
     panic!("buffer too small");
   }
+}
+
+#[cfg(target_os = "freebsd")]
+extern "C" {
+    // int
+    // sysctl(const int *name, u_int namelen, void *oldp, size_t *oldlenp,
+    // const void *newp, size_t newlen);
+    pub fn sysctl(
+        name: *const std::os::raw::c_int,
+        namelen: std::os::raw::c_uint,
+        oldp: *mut c_void,
+        oldlenp: *mut usize,
+        newp: *const c_void,
+        newlen: usize,
+    ) -> std::os::raw::c_int;
+    // char *
+    // realpath(const char * restrict pathname, char * restrict resolved_path);
+    pub fn realpath(
+        pathname: *const std::os::raw::c_char,
+        resolved_path: *mut std::os::raw::c_char,
+    ) -> *const std::os::raw::c_char;
+
+}
+
+
+#[cfg(target_os = "freebsd")]
+pub unsafe fn get_executable_path() -> String {
+    let mut capacity = 2000;
+    let mut path: Vec<u8> = Vec::with_capacity(capacity);
+    path.extend(repeat(0).take(capacity));
+
+    // [CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1];
+    let mib: Vec<i32> = vec![1, 14, 12, -1];
+    let len = mib.len() * size_of::<i32>();
+    let element_size = size_of::<i32>();
+
+    let res = sysctl(
+        mib.as_ptr(),
+        (len / element_size) as u32,
+        path.as_mut_ptr() as *mut c_void,
+        &mut capacity,
+        std::ptr::null() as *const c_void,
+        0,
+    );
+    if res != 0 {
+        panic!("Could not retrieve the path of the executable");
+    }
+
+    String::from_raw_parts(path.as_mut_ptr(), capacity - 1, path.len())
 }
