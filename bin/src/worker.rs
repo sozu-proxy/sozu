@@ -21,6 +21,8 @@ use std::iter::repeat;
 use std::ptr::null_mut;
 
 #[cfg(target_os = "freebsd")]
+use libc::sysctl;
+#[cfg(target_os = "freebsd")]
 use std::ffi::c_void;
 #[cfg(target_os = "freebsd")]
 use std::iter::repeat;
@@ -223,29 +225,6 @@ pub unsafe fn get_executable_path() -> String {
     panic!("buffer too small");
   }
 }
-
-#[cfg(target_os = "freebsd")]
-extern "C" {
-    // int
-    // sysctl(const int *name, u_int namelen, void *oldp, size_t *oldlenp,
-    // const void *newp, size_t newlen);
-    pub fn sysctl(
-        name: *const std::os::raw::c_int,
-        namelen: std::os::raw::c_uint,
-        oldp: *mut c_void,
-        oldlenp: *mut usize,
-        newp: *const c_void,
-        newlen: usize,
-    ) -> std::os::raw::c_int;
-    // char *
-    // realpath(const char * restrict pathname, char * restrict resolved_path);
-    pub fn realpath(
-        pathname: *const std::os::raw::c_char,
-        resolved_path: *mut std::os::raw::c_char,
-    ) -> *const std::os::raw::c_char;
-
-}
-
 
 #[cfg(target_os = "freebsd")]
 pub unsafe fn get_executable_path() -> String {
