@@ -21,7 +21,7 @@ use std::iter::repeat;
 use std::ptr::null_mut;
 
 #[cfg(target_os = "freebsd")]
-use libc::sysctl;
+use libc::{CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, sysctl};
 #[cfg(target_os = "freebsd")]
 use std::ffi::c_void;
 #[cfg(target_os = "freebsd")]
@@ -232,8 +232,7 @@ pub unsafe fn get_executable_path() -> String {
     let mut path: Vec<u8> = Vec::with_capacity(capacity);
     path.extend(repeat(0).take(capacity));
 
-    // [CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1];
-    let mib: Vec<i32> = vec![1, 14, 12, -1];
+    let mib: Vec<i32> = vec![CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1];
     let len = mib.len() * size_of::<i32>();
     let element_size = size_of::<i32>();
 
