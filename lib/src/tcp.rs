@@ -19,7 +19,7 @@ use sozu_command::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
 use sozu_command::proxy::{ProxyRequestData,ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent};
 use sozu_command::proxy::TcpListener as TcpListenerConfig;
 use sozu_command::logging;
-use sozu_command::buffer::Buffer;
+use sozu_command::buffer::fixed::Buffer;
 
 use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,

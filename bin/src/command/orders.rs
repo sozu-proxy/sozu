@@ -14,7 +14,7 @@ use mio_uds::{UnixListener,UnixStream};
 use mio::{Poll,PollOpt,Ready,Token};
 use nom::{Err,HexDisplay,Offset};
 
-use sozu_command::buffer::Buffer;
+use sozu_command::buffer::fixed::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners, ScmSocket};
 use sozu_command::proxy::{ProxyRequestData, ProxyRequest, Query, QueryAnswer, QueryApplicationType,

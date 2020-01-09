@@ -23,7 +23,7 @@ use sozu_command::proxy::{Application,
   TlsVersion,ProxyResponseData,Query, QueryCertificateType,QueryAnswer,
   QueryAnswerCertificate};
 use sozu_command::logging;
-use sozu_command::buffer::Buffer;
+use sozu_command::buffer::fixed::Buffer;
 
 use protocol::http::{parser::{RRequestLine,hostname_and_port}, answers::{DefaultAnswers, CustomAnswers, HttpAnswers}};
 use pool::Pool;

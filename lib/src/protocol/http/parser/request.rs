@@ -1,5 +1,5 @@
 
-use sozu_command::buffer::Buffer;
+use sozu_command::buffer::fixed::Buffer;
 use buffer_queue::BufferQueue;
 
 use nom::{HexDisplay,IResult,Offset,Err};

@@ -9,7 +9,7 @@ use time::{SteadyTime, Duration};
 use uuid::Uuid;
 use rustls::{ServerSession,Session as ClientSession,ProtocolVersion,SupportedCipherSuite,CipherSuite};
 use mio_extras::timer::{Timer, Timeout};
-use sozu_command::buffer::Buffer;
+use sozu_command::buffer::fixed::Buffer;
 use sozu_command::proxy::ProxyEvent;
 
 use protocol::http::parser::RequestState;

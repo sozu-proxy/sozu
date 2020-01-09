@@ -19,7 +19,7 @@ use sozu_command::proxy::{ProxyRequestData,MessageId,ProxyResponse, ProxyEvent,
   ProxyResponseData,ProxyResponseStatus,ProxyRequest,Topic,Query,QueryAnswer,
   QueryApplicationType,TlsProvider,ListenerType,HttpsListener,QueryAnswerCertificate,
   QueryCertificateType};
-use sozu_command::buffer::Buffer;
+use sozu_command::buffer::fixed::Buffer;
 
 use {SessionResult,ConnectionError,Protocol,ProxySession,
   CloseResult,AcceptError,BackendConnectAction,ProxyConfiguration,Backend};

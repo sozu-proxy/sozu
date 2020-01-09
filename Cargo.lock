@@ -1294,6 +1294,7 @@ dependencies = [
  "sha2",
  "time 0.2.16",
  "toml",
+ "trailer",
 ]
 
 [[package]]
@@ -1808,6 +1809,12 @@ checksum = "ffc92d160b1eef40665be3a05630d003936a3bc7da7421277846c2613e92c71a"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "trailer"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d61d37bd87407272521be2c632f558c183f6d02847e5845f663d01e310f2ce97"
 
 [[package]]
 name = "typenum"

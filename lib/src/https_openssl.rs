@@ -32,7 +32,7 @@ use sozu_command::proxy::{Application,CertFingerprint,CertificateAndKey,
   ProxyResponseStatus,TlsVersion,ProxyEvent,Query,QueryCertificateType,
   QueryAnswer,QueryAnswerCertificate,ProxyResponseData};
 use sozu_command::logging;
-use sozu_command::buffer::Buffer;
+use sozu_command::buffer::fixed::Buffer;
 
 use protocol::http::{parser::{RequestState,RRequestLine,hostname_and_port}, answers::{DefaultAnswers, CustomAnswers, HttpAnswers}};
 use pool::Pool;

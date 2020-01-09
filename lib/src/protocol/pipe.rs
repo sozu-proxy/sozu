@@ -3,7 +3,7 @@ use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use uuid::adapter::Hyphenated;
-use sozu_command::buffer::Buffer;
+use sozu_command::buffer::fixed::Buffer;
 use {SessionResult,Readiness,SessionMetrics};
 use socket::{SocketHandler,SocketResult,TransportProtocol};
 use pool::Checkout;

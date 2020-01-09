@@ -7,7 +7,7 @@ use mio::unix::UnixReady;
 use mio::tcp::TcpStream;
 use uuid::{Uuid, adapter::Hyphenated};
 use time::{SteadyTime, Duration};
-use sozu_command::buffer::Buffer;
+use sozu_command::buffer::fixed::Buffer;
 use super::super::{SessionResult,Protocol,Readiness,SessionMetrics, LogDuration};
 use buffer_queue::BufferQueue;
 use socket::{SocketHandler, SocketResult, TransportProtocol};

@@ -8,7 +8,7 @@ use uuid::{Uuid, adapter::Hyphenated};
 use {SessionResult,Readiness,SessionMetrics,Protocol};
 use socket::{SocketHandler,SocketResult};
 use pool::{Pool,Checkout};
-use sozu_command::buffer::Buffer;
+use sozu_command::buffer::fixed::Buffer;
 
 mod parser;
 mod serializer;
