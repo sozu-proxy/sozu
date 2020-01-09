@@ -14,14 +14,14 @@ use nix::unistd::*;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 #[cfg(target_os = "macos")]
-use libc::{c_char,uint32_t,int32_t};
+use libc::{PATH_MAX, c_char,uint32_t,int32_t};
 #[cfg(target_os = "macos")]
 use std::iter::repeat;
 #[cfg(target_os = "macos")]
 use std::ptr::null_mut;
 
 #[cfg(target_os = "freebsd")]
-use libc::{CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, sysctl};
+use libc::{CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, PATH_MAX, sysctl};
 #[cfg(target_os = "freebsd")]
 use std::ffi::c_void;
 #[cfg(target_os = "freebsd")]
@@ -201,7 +201,7 @@ extern {
 
 #[cfg(target_os = "macos")]
 pub unsafe fn get_executable_path() -> String {
-  let capacity = 2000;
+  let capacity = PATH_MAX as usize;
   let mut temp:Vec<u8> = Vec::with_capacity(capacity);
   temp.extend(repeat(0).take(capacity));
   let pathbuf = CString::from_vec_unchecked(temp);
@@ -229,7 +229,7 @@ pub unsafe fn get_executable_path() -> String {
 
 #[cfg(target_os = "freebsd")]
 pub unsafe fn get_executable_path() -> String {
-    let mut capacity = 2000;
+    let mut capacity = PATH_MAX as usize;
     let mut path: Vec<u8> = Vec::with_capacity(capacity);
     path.extend(repeat(0).take(capacity));
 
