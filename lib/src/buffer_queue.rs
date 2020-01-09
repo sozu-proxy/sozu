@@ -493,7 +493,7 @@ pub fn buf_with_capacity(capacity: usize) -> (Pool<Buffer>, BufferQueue) {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use sozu_command::buffer::Buffer;
+  use sozu_command::buffer::fixed::Buffer;
   use nom::HexDisplay;
   use std::io::Write;
 
