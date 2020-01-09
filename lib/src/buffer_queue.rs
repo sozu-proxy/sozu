@@ -1,4 +1,4 @@
-use sozu_command::buffer::Buffer;
+use sozu_command::buffer::fixed::Buffer;
 use pool_crate::Reset;
 use std::io::{self,Write};
 use std::cmp::{min,max};
@@ -488,7 +488,7 @@ pub fn buf_with_capacity(capacity: usize) -> (Pool<Buffer>, BufferQueue) {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use sozu_command::buffer::Buffer;
+  use sozu_command::buffer::fixed::Buffer;
   use nom::HexDisplay;
   use std::io::Write;
 
@@ -496,7 +496,7 @@ mod tests {
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
     assert_size!(BufferQueue, 88);
-    assert_size!(Buffer, 48);
+    assert_size!(Buffer, 16);
   }
 
   #[test]

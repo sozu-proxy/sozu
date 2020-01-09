@@ -18,7 +18,7 @@ use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::proxy::{Application,ProxyRequestData,HttpFront,HttpListener,
   ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent};
 use sozu_command::logging;
-use sozu_command::buffer::Buffer;
+use sozu_command::buffer::fixed::Buffer;
 
 use super::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
