@@ -9,7 +9,7 @@ use uuid::{Uuid, adapter::Hyphenated};
 use sozu_command::buffer::Buffer;
 use super::super::{SessionResult,Protocol,Readiness,SessionMetrics, LogDuration};
 use buffer_queue::BufferQueue;
-use socket::{SocketHandler,SocketResult};
+use socket::{SocketHandler, SocketResult, TransportProtocol};
 use protocol::ProtocolResult;
 use pool::Pool;
 use util::UnwrapLog;
@@ -407,6 +407,24 @@ impl<Front:SocketHandler> Http<Front> {
     self.backend.as_ref().and_then(|backend| backend.peer_addr().ok())
   }
 
+  fn protocol_string(&self) -> &'static str {
+    match self.protocol() {
+      Protocol::HTTP  => "HTTP",
+      Protocol::HTTPS => {
+        match self.frontend.protocol() {
+          TransportProtocol::Ssl2   => "HTTPS-SSL2",
+          TransportProtocol::Ssl3   => "HTTPS-SSL3",
+          TransportProtocol::Tls1_0 => "HTTPS-TLS1.0",
+          TransportProtocol::Tls1_1 => "HTTPS-TLS1.1",
+          TransportProtocol::Tls1_2 => "HTTPS-TLS1.2",
+          TransportProtocol::Tls1_3 => "HTTPS-TLS1.3",
+          _                         => unreachable!()
+        }
+      }
+      _ => unreachable!()
+    }
+  }
+
   pub fn log_request_success(&self, metrics: &SessionMetrics) {
     let session = match self.get_session_address() {
       None => String::from("-"),
@@ -438,11 +456,7 @@ impl<Front:SocketHandler> Http<Front> {
       }
     }
 
-    let proto = match self.protocol() {
-      Protocol::HTTP  => "HTTP",
-      Protocol::HTTPS => "HTTPS",
-      _               => unreachable!()
-    };
+    let proto = self.protocol_string();
 
     info_access!("{}{} -> {}\t{} {} {} {}\t{} {} {}\t{}",
       self.log_ctx, session, backend,
@@ -480,11 +494,7 @@ impl<Front:SocketHandler> Http<Front> {
     }
     incr!("http.errors");
 
-    let proto = match self.protocol() {
-      Protocol::HTTP  => "HTTP",
-      Protocol::HTTPS => "HTTPS",
-      _               => unreachable!()
-    };
+    let proto = self.protocol_string();
 
     info_access!("{}{} -> X\t{} {} {} {}\t{} {} {}\t{}",
       self.log_ctx, session,
@@ -528,11 +538,7 @@ impl<Front:SocketHandler> Http<Front> {
       }
     }*/
 
-    let proto = match self.protocol() {
-      Protocol::HTTP  => "HTTP",
-      Protocol::HTTPS => "HTTPS",
-      _               => unreachable!()
-    };
+    let proto = self.protocol_string();
 
     error_access!("{}{} -> {}\t{} {} {} {}\t{} {} {}\t{} | {}",
       self.log_ctx, session, backend,

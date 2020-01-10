@@ -5,7 +5,7 @@ use mio::unix::UnixReady;
 use uuid::adapter::Hyphenated;
 use sozu_command::buffer::Buffer;
 use {SessionResult,Readiness,SessionMetrics};
-use socket::{SocketHandler,SocketResult};
+use socket::{SocketHandler,SocketResult,TransportProtocol};
 use pool::Checkout;
 use {Protocol, LogDuration};
 
@@ -142,6 +142,25 @@ impl<Front:SocketHandler> Pipe<Front> {
     self.backend.as_ref().and_then(|backend| backend.peer_addr().ok())
   }
 
+  fn protocol_string(&self) -> &'static str {
+    match self.protocol {
+      Protocol::TCP  => "TCP",
+      Protocol::HTTP  => "HTTP+WS",
+      Protocol::HTTPS => {
+        match self.frontend.protocol() {
+          TransportProtocol::Ssl2   => "HTTPS-SSL2+WS",
+          TransportProtocol::Ssl3   => "HTTPS-SSL3+WS",
+          TransportProtocol::Tls1_0 => "HTTPS-TLS1.0+WS",
+          TransportProtocol::Tls1_1 => "HTTPS-TLS1.1+WS",
+          TransportProtocol::Tls1_2 => "HTTPS-TLS1.2+WS",
+          TransportProtocol::Tls1_3 => "HTTPS-TLS1.3+WS",
+          _                         => unreachable!()
+        }
+      }
+      _ => unreachable!()
+    }
+  }
+
   pub fn log_request_success(&self, metrics: &SessionMetrics) {
     let session = match self.get_session_address() {
       None => String::from("-"),
@@ -168,12 +187,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       }
     }
 
-    let proto = match self.protocol {
-      Protocol::HTTP  => "HTTP+WS",
-      Protocol::HTTPS => "HTTPS+WS",
-      Protocol::TCP   => "TCP",
-      _               => unreachable!()
-    };
+    let proto = self.protocol_string();
 
     info_access!("{}{} -> {}\t{} {} {} {}\t{}",
       self.log_ctx, session, backend,
@@ -208,12 +222,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       }
     }
 
-    let proto = match self.protocol {
-      Protocol::HTTP  => "HTTP+WS",
-      Protocol::HTTPS => "HTTPS+WS",
-      Protocol::TCP   => "TCP",
-      _               => unreachable!()
-    };
+    let proto = self.protocol_string();
 
     error_access!("{}{} -> {}\t{} {} {} {}\t{} | {}",
       self.log_ctx, session, backend,

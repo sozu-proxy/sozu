@@ -4,7 +4,7 @@ use mio::unix::UnixReady;
 use uuid::adapter::Hyphenated;
 use {SessionResult,Readiness};
 use protocol::ProtocolResult;
-use openssl::ssl::{HandshakeError,MidHandshakeSslStream,Ssl,SslStream,NameType};
+use openssl::ssl::{HandshakeError,MidHandshakeSslStream,Ssl,SslStream,NameType,SslVersion};
 use std::net::SocketAddr;
 use LogDuration;
 use SessionMetrics;
@@ -164,7 +164,13 @@ impl TlsHandshake {
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
 
-    let proto = "HTTPS";
+    let proto = handshake.ssl().version2().map(|version| match version {
+      SslVersion::SSL3 => "HTTPS-SSL3",
+      SslVersion::TLS1 => "HTTPS-TLS1.0",
+      SslVersion::TLS1_1 => "HTTPS-TLS1.1",
+      SslVersion::TLS1_2 => "HTTPS-TLS1.2",
+      _ => "HTTPS-TLS1.3",
+    }).unwrap_or("HTTPS");
 
     let message = handshake.ssl().servername(NameType::HOST_NAME)
       .map(|s| format!("unknown server name: {}", s))

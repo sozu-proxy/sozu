@@ -1,11 +1,11 @@
 use std::io::{self,ErrorKind,Read,Write};
 use std::net::SocketAddr;
 use mio::tcp::{TcpListener,TcpStream};
-use rustls::{ServerSession, Session};
+use rustls::{ServerSession, Session, ProtocolVersion};
 use net2::TcpBuilder;
 use net2::unix::UnixTcpBuilderExt;
 #[cfg(feature = "use-openssl")]
-use openssl::ssl::{ErrorCode, SslStream};
+use openssl::ssl::{ErrorCode, SslStream, SslVersion};
 
 #[derive(Debug,PartialEq,Copy,Clone)]
 pub enum SocketResult {
@@ -15,10 +15,22 @@ pub enum SocketResult {
   Error
 }
 
+#[derive(Debug,PartialEq,Copy,Clone)]
+pub enum TransportProtocol {
+  Tcp,
+  Ssl2,
+  Ssl3,
+  Tls1_0,
+  Tls1_1,
+  Tls1_2,
+  Tls1_3,
+}
+
 pub trait SocketHandler {
   fn socket_read(&mut self,  buf: &mut[u8]) -> (usize, SocketResult);
   fn socket_write(&mut self, buf: &[u8])    -> (usize, SocketResult);
   fn socket_ref(&self) -> &TcpStream;
+  fn protocol(&self) -> TransportProtocol;
 }
 
 impl SocketHandler for TcpStream {
@@ -74,6 +86,10 @@ impl SocketHandler for TcpStream {
   }
 
   fn socket_ref(&self) -> &TcpStream { self }
+
+  fn protocol(&self) -> TransportProtocol {
+    TransportProtocol::Tcp
+  }
 }
 
 #[cfg(feature = "use-openssl")]
@@ -154,6 +170,16 @@ impl SocketHandler for SslStream<TcpStream> {
   }
 
   fn socket_ref(&self) -> &TcpStream { self.get_ref() }
+
+  fn protocol(&self) -> TransportProtocol {
+    self.ssl().version2().map(|version| match version {
+      SslVersion::SSL3 => TransportProtocol::Ssl3,
+      SslVersion::TLS1 => TransportProtocol::Tls1_0,
+      SslVersion::TLS1_1 => TransportProtocol::Tls1_1,
+      SslVersion::TLS1_2 => TransportProtocol::Tls1_2,
+      _ => TransportProtocol::Tls1_3,
+    }).unwrap_or(TransportProtocol::Tcp)
+  }
 }
 
 pub struct FrontRustls {
@@ -322,6 +348,18 @@ impl SocketHandler for FrontRustls {
   }
 
   fn socket_ref(&self) -> &TcpStream { &self.stream }
+
+  fn protocol(&self) -> TransportProtocol {
+    self.session.get_protocol_version().map(|version| match version {
+      ProtocolVersion::SSLv2 => TransportProtocol::Ssl2,
+      ProtocolVersion::SSLv3 => TransportProtocol::Ssl3,
+      ProtocolVersion::TLSv1_0 => TransportProtocol::Tls1_0,
+      ProtocolVersion::TLSv1_1 => TransportProtocol::Tls1_1,
+      ProtocolVersion::TLSv1_2 => TransportProtocol::Tls1_2,
+      ProtocolVersion::TLSv1_3 => TransportProtocol::Tls1_3,
+      _ => TransportProtocol::Tls1_3,
+    }).unwrap_or(TransportProtocol::Tcp)
+  }
 }
 
 pub fn server_bind(addr: &SocketAddr) -> io::Result<TcpListener> {
