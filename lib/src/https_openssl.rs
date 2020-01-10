@@ -727,6 +727,14 @@ impl ProxySession for Session {
     SessionResult::Continue
   }
 
+  fn shutting_down(&mut self) -> SessionResult {
+    match &mut self.protocol {
+      Some(State::Http(h)) => h.shutting_down(),
+      Some(State::Handshake(_)) => SessionResult::Continue,
+      _    => SessionResult::CloseSession,
+    }
+  }
+
   fn last_event(&self) -> SteadyTime {
     self.last_event
   }

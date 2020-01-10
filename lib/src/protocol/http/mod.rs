@@ -386,6 +386,17 @@ impl<Front:SocketHandler> Http<Front> {
     }
   }
 
+  pub fn shutting_down(&mut self) -> SessionResult {
+    info!("trying to shut down {}", self.print_state(""));
+    if self.request.as_ref().map(|r| *r == RequestState::Initial).unwrap_or(false)
+      && self.front_buf.as_ref().map(|b| !b.empty()).unwrap_or(false)
+      && self.back_buf.as_ref().map(|b| !b.empty()).unwrap_or(false) {
+        SessionResult::CloseSession
+    } else {
+      SessionResult::Continue
+    }
+  }
+
   /// Retrieve the response status from the http response state
   pub fn get_response_status(&self) -> Option<RStatusLine> {
     self.response.as_ref().and_then(|r| r.get_status_line())

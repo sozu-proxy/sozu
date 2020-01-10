@@ -251,6 +251,7 @@ pub trait ProxySession {
   fn last_event(&self) -> SteadyTime;
   fn print_state(&self);
   fn tokens(&self) -> Vec<Token>;
+  fn shutting_down(&mut self) -> SessionResult;
 }
 
 #[derive(Clone,Copy,Debug,PartialEq)]

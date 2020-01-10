@@ -679,6 +679,10 @@ impl ProxySession for Session {
     SessionResult::Continue
   }
 
+  fn shutting_down(&mut self) -> SessionResult {
+    SessionResult::CloseSession
+  }
+
   fn last_event(&self) -> SteadyTime {
     self.last_event
   }

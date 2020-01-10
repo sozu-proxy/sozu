@@ -447,6 +447,22 @@ impl Server {
       });
 
       if self.shutting_down.is_some() {
+        let mut closing_tokens = HashSet::new();
+        for session in self.sessions.iter_mut() {
+          let res = session.borrow_mut().shutting_down();
+          if let SessionResult::CloseSession = res {
+            let t = session.borrow().tokens();
+            closing_tokens.insert(t[0]);
+          }
+        }
+
+        for tk in closing_tokens.iter() {
+          let cl = self.to_session(*tk);
+          self.close_session(cl);
+        }
+
+        info!("closed {} sessions", closing_tokens.len());
+
         let count = self.sessions.len();
         if count <= self.base_sessions_count {
           info!("last session stopped, shutting down!");
@@ -1359,6 +1375,10 @@ impl ProxySession for ListenSession {
   }
 
   fn ready(&mut self) -> SessionResult {
+    SessionResult::Continue
+  }
+
+  fn shutting_down(&mut self) -> SessionResult {
     SessionResult::Continue
   }
 
