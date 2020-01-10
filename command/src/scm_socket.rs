@@ -7,6 +7,7 @@ use std::str::from_utf8;
 use std::os::unix::net;
 use std::os::unix::io::{RawFd, FromRawFd, IntoRawFd};
 use serde_json;
+use mio::net::TcpListener;
 
 pub const MAX_FDS_OUT: usize = 200;
 pub const MAX_BYTES_OUT: usize = 4096;
@@ -47,7 +48,7 @@ impl ScmSocket {
     }
   }
 
-  pub fn send_listeners(&self, listeners: Listeners) -> NixResult<()> {
+  pub fn send_listeners(&self, listeners: &Listeners) -> NixResult<()> {
     let listeners_count = ListenersCount {
       http: listeners.http.iter().map(|t| t.0).collect(),
       tls:  listeners.tls.iter().map(|t| t.0).collect(),
@@ -199,6 +200,26 @@ impl Listeners {
       Some(self.tcp.remove(pos).1)
     } else {
       None
+    }
+  }
+
+  pub fn close(&self) {
+    for (_, ref fd) in &self.http {
+      unsafe {
+        let _ = TcpListener::from_raw_fd(*fd);
+      }
+    }
+
+    for (_, ref fd) in &self.tls {
+      unsafe {
+        let _ = TcpListener::from_raw_fd(*fd);
+      }
+    }
+
+    for (_, ref fd) in &self.tcp {
+      unsafe {
+        let _ = TcpListener::from_raw_fd(*fd);
+      }
     }
   }
 }

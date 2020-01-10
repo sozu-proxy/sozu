@@ -1283,7 +1283,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
   let _ = proxy.activate_listener(&mut event_loop, &front, None);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
   let scm = ScmSocket::new(scm_client.into_raw_fd());
-  if let Err(e) = scm.send_listeners(Listeners {
+  if let Err(e) = scm.send_listeners(&Listeners {
     http: Vec::new(),
     tls:  Vec::new(),
     tcp:  Vec::new(),

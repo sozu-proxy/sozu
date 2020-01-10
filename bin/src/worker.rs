@@ -133,8 +133,9 @@ pub fn start_worker_process(id: &str, config: &Config, executable_path: String, 
 
       if let Some(l) = listeners {
         info!("sending listeners to new worker: {:?}", l);
-        let res = scm_server.send_listeners(l);
+        let res = scm_server.send_listeners(&l);
         info!("sent listeners from master: {:?}", res);
+        l.close();
       };
       util::disable_close_on_exec(scm_server.fd);
 

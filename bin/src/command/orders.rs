@@ -324,7 +324,7 @@ impl CommandServer {
         PollOpt::edge()).unwrap();
       worker.token = Some(Token(worker_token));
 
-      info!("sending listeners: to the new worker: {:?}", worker.scm.send_listeners(Listeners {
+      info!("sending listeners: to the new worker: {:?}", worker.scm.send_listeners(&Listeners {
         http: Vec::new(),
         tls:  Vec::new(),
         tcp:  Vec::new(),
@@ -427,7 +427,8 @@ impl CommandServer {
 
     match listeners {
       Some(l) => {
-        info!("sending listeners: to the new worker: {:?}", worker.scm.send_listeners(l))
+        info!("sending listeners: to the new worker: {:?}", worker.scm.send_listeners(&l));
+        l.close();
       },
       None => error!("could not get the list of listeners from the previous worker"),
     };

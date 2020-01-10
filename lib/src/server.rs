@@ -865,7 +865,7 @@ impl Server {
       tcp:  tcp_listeners.into_iter().map(|(addr, listener)|   (addr, listener.into_raw_fd())).collect(),
     };
     info!("sending default listeners: {:?}", listeners);
-    let res = self.scm.send_listeners(listeners);
+    let res = self.scm.send_listeners(&listeners);
 
     self.scm.set_blocking(true);
 
