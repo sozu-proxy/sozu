@@ -1075,7 +1075,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
 
-  let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
+  let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
   {
     let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
     info!("taking token {:?} for channel", entry.index());
@@ -1122,12 +1122,12 @@ mod tests {
   use std::io::{Read,Write};
   use std::{thread,str};
   use std::sync::{Arc, Barrier};
-  use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
+  use std::sync::atomic::{AtomicBool, Ordering};
   use sozu_command::scm_socket::Listeners;
   use sozu_command::proxy::{self,TcpFront,LoadBalancingParams};
   use sozu_command::channel::Channel;
   use std::os::unix::io::IntoRawFd;
-  static TEST_FINISHED: AtomicBool = ATOMIC_BOOL_INIT;
+  static TEST_FINISHED: AtomicBool = AtomicBool::new(false);
 
   /*
   #[test]
@@ -1147,7 +1147,7 @@ mod tests {
     setup_test_logger!();
     let barrier = Arc::new(Barrier::new(2));
     start_server(barrier.clone());
-    let tx = start_proxy();
+    let _tx = start_proxy();
     barrier.wait();
 
     let mut s1 = TcpStream::connect("127.0.0.1:1234").expect("could not parse address");
@@ -1194,7 +1194,7 @@ mod tests {
     let listener = TcpListener::bind("127.0.0.1:5678").expect("could not parse address");
     fn handle_client(stream: &mut TcpStream, id: u8) {
       let mut buf = [0; 128];
-      let response = b" END";
+      let _response = b" END";
       while let Ok(sz) = stream.read(&mut buf[..]) {
         if sz > 0 {
           println!("ECHO[{}] got \"{:?}\"", id, str::from_utf8(&buf[..sz]));
@@ -1218,7 +1218,7 @@ mod tests {
               handle_client(&mut stream, count)
             });
           }
-          Err(e) => { println!("connection failed"); }
+          Err(e) => { println!("connection failed: {:?}", e); }
         }
         count += 1;
       }
@@ -1240,7 +1240,7 @@ mod tests {
       ));
       let backends = Rc::new(RefCell::new(BackendMap::new()));
 
-      let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
+      let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
       {
         let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
         info!("taking token {:?} for channel", entry.index());
@@ -1274,7 +1274,7 @@ mod tests {
 
       let (scm_server, scm_client) = UnixStream::pair().unwrap();
       let scm = ScmSocket::new(scm_client.into_raw_fd());
-      scm.send_listeners(&Listeners {
+      let _ = scm.send_listeners(&Listeners {
         http: Vec::new(),
         tls:  Vec::new(),
         tcp:  Vec::new(),

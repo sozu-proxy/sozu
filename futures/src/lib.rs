@@ -91,7 +91,7 @@ impl SozuCommandClient {
         }
     }
 
-    pub fn send(&mut self, message: CommandRequest)  -> Box<Future<Item = CommandResponse, Error = io::Error> + Send + 'static> {
+    pub fn send(&mut self, message: CommandRequest)  -> Box<dyn Future<Item = CommandResponse, Error = io::Error> + Send + 'static> {
         trace!("will send message: {:?}", message);
         let tr  = self.transport.clone();
         let tr2 = self.transport.clone();

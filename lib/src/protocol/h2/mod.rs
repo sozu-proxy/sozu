@@ -1,4 +1,6 @@
-use std::net::{SocketAddr,IpAddr};
+//FIXME: we disallow warnings for the HTTP/2 module temporarily
+#![allow(warnings)]
+use std::net::SocketAddr;
 use std::cell::RefCell;
 use std::rc::Weak;
 use mio::*;

@@ -340,7 +340,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   fn must_continue_request(&self) -> bool {
-    if let Some(Continue::Expects(sz)) = self.request.as_ref().and_then(|r| r.get_keep_alive().as_ref().map(|conn| conn.continues)) {
+    if let Some(Continue::Expects(_)) = self.request.as_ref().and_then(|r| r.get_keep_alive().as_ref().map(|conn| conn.continues)) {
       true
     } else {
       false
@@ -1343,11 +1343,11 @@ impl<Front:SocketHandler> Http<Front> {
 fn save_http_status_metric(rs_status_line : Option<&RStatusLine>) {
   if let Some(rs_status_line) = rs_status_line {
     match rs_status_line.status {
-      100...199 => { incr!("http.status.1xx"); },
-      200...299 => { incr!("http.status.2xx"); },
-      300...399 => { incr!("http.status.3xx"); },
-      400...499 => { incr!("http.status.4xx"); },
-      500...599 => { incr!("http.status.5xx"); },
+      100..=199 => { incr!("http.status.1xx"); },
+      200..=299 => { incr!("http.status.2xx"); },
+      300..=399 => { incr!("http.status.3xx"); },
+      400..=499 => { incr!("http.status.4xx"); },
+      500..=599 => { incr!("http.status.5xx"); },
       _ => { incr!("http.status.other"); }, // http responses with other codes (protocol error)
     }
   }
@@ -1445,11 +1445,10 @@ impl<'a> std::fmt::Display for OptionalStatus<'a> {
   }
 }
 
+/*
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  /*
   #[test]
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
@@ -1462,5 +1461,5 @@ mod tests {
     assert_size!(DefaultAnswerStatus, 1);
     assert_size!(Readiness, 16);
   }
-  */
 }
+*/

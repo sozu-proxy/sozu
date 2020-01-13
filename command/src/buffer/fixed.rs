@@ -1,6 +1,5 @@
 use std::{cmp, ptr};
 use std::io::{self,Write,Read};
-use std::iter::repeat;
 use pool::Reset;
 
 #[derive(Debug,PartialEq,Clone,Default)]

@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static BUFFER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-pub type Reset = pool_crate::Reset;
+pub type Reset = dyn pool_crate::Reset;
 
 pub struct Pool<T:pool_crate::Reset> {
   pub inner: pool_crate::Pool<T>,

@@ -243,7 +243,7 @@ mod send_test {
     thread::spawn(move|| {
       barrier.wait();
 
-      let stream = StdTcpStream::connect(&addr).unwrap();
+      let _stream = StdTcpStream::connect(&addr).unwrap();
 
       end_barrier.wait();
     });

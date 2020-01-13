@@ -82,11 +82,11 @@ impl Router {
   pub fn remove_http_front(&mut self, front: HttpFront) -> bool {
     match front.position {
       RulePosition::Pre => match (front.hostname.parse::<DomainRule>(), PathRule::from_config(front.path)) {
-        (Ok(domain), Some(path)) => self.remove_pre_rule(domain, path, front.app_id),
+        (Ok(domain), Some(path)) => self.remove_pre_rule(domain, path),
         _ => false,
       },
       RulePosition::Post => match (front.hostname.parse::<DomainRule>(), PathRule::from_config(front.path)) {
-        (Ok(domain), Some(path)) => self.remove_post_rule(domain, path, front.app_id),
+        (Ok(domain), Some(path)) => self.remove_post_rule(domain, path),
         _ => false,
       },
       RulePosition::Tree => {
@@ -127,7 +127,7 @@ impl Router {
     }
   }
 
-  pub fn remove_tree_rule(&mut self, hostname: &[u8], path: PathRule, app_id: AppId) -> bool {
+  pub fn remove_tree_rule(&mut self, hostname: &[u8], path: PathRule, _app_id: AppId) -> bool {
     let hostname = match from_utf8(hostname) {
       Err(_) => return false,
       Ok(h) => h,
@@ -156,7 +156,7 @@ impl Router {
   }
 
   pub fn add_pre_rule(&mut self, domain: DomainRule, path: PathRule, app_id: AppId) -> bool {
-    if self.pre.iter().position(|(d, p, a)| *d == domain && *p == path).is_none() {
+    if self.pre.iter().position(|(d, p, _)| *d == domain && *p == path).is_none() {
       self.pre.push((domain, path, app_id));
       true
     } else {
@@ -165,7 +165,7 @@ impl Router {
   }
 
   pub fn add_post_rule(&mut self, domain: DomainRule, path: PathRule, app_id: AppId) -> bool {
-    if self.post.iter().position(|(d, p, a)| *d == domain && *p == path).is_none() {
+    if self.post.iter().position(|(d, p, _)| *d == domain && *p == path).is_none() {
       self.post.push((domain, path, app_id));
       true
     } else {
@@ -173,8 +173,8 @@ impl Router {
     }
   }
 
-  pub fn remove_pre_rule(&mut self, domain: DomainRule, path: PathRule, app_id: AppId) -> bool {
-    match self.pre.iter().position(|(d, p, a)| *d == domain && *p == path) {
+  pub fn remove_pre_rule(&mut self, domain: DomainRule, path: PathRule) -> bool {
+    match self.pre.iter().position(|(d, p, _)| *d == domain && *p == path) {
       None => false,
       Some(index) => {
         self.pre.remove(index);
@@ -183,8 +183,8 @@ impl Router {
     }
   }
 
-  pub fn remove_post_rule(&mut self, domain: DomainRule, path: PathRule, app_id: AppId) -> bool {
-    match self.post.iter().position(|(d, p, a)| *d == domain && *p == path) {
+  pub fn remove_post_rule(&mut self, domain: DomainRule, path: PathRule) -> bool {
+    match self.post.iter().position(|(d, p, _)| *d == domain && *p == path) {
       None => false,
       Some(index) => {
         self.post.remove(index);

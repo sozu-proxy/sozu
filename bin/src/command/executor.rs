@@ -34,7 +34,7 @@ pub struct Executor {
 
 pub struct Runner {
   pub ready: HashSet<usize>,
-  pub tasks: Slab<Spawn<Box<Future<Item = (), Error = ()> + Send>>>,
+  pub tasks: Slab<Spawn<Box<dyn Future<Item = (), Error = ()> + Send>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]

@@ -280,7 +280,7 @@ impl FileAppFrontendConfig {
     })
   }
 
-  pub fn to_http_front(&self, app_id: &str) -> Result<HttpFrontendConfig, String> {
+  pub fn to_http_front(&self, _app_id: &str) -> Result<HttpFrontendConfig, String> {
     if self.hostname.is_none() {
       return Err(String::from("HTTP frontend should have a 'hostname' field"));
     }

@@ -61,10 +61,6 @@ fn status_token(i:&[u8]) -> IResult<&[u8], &[u8]> {
   take_while(is_status_token_char)(i)
 }
 
-fn is_ws(i: u8) -> bool {
-  i == b' ' && i == b'\t'
-}
-
 fn sp(i:&[u8]) -> IResult<&[u8], char> {
   char(' ')(i)
 }

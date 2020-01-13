@@ -4,7 +4,7 @@ extern crate log;
 extern crate hex;
 extern crate mio;
 extern crate pem;
-extern crate nix;
+#[macro_use] extern crate nix;
 extern crate toml;
 extern crate pool;
 extern crate sha2;

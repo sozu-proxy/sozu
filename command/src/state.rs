@@ -1074,8 +1074,8 @@ mod tests {
     println!("expected diff orders:\n{:#?}\n", e);
     println!("diff orders:\n{:#?}\n", diff);
 
-    let hash1 = state.hash_state();
-    let hash2 = state2.hash_state();
+    let _hash1 = state.hash_state();
+    let _hash2 = state2.hash_state();
 
     assert_eq!(diff, e);
   }

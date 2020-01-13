@@ -135,7 +135,7 @@ impl BackendMap {
 pub struct BackendList {
   pub backends:       Vec<Rc<RefCell<Backend>>>,
   pub next_id:        u32,
-  pub load_balancing: Box<LoadBalancingAlgorithm>,
+  pub load_balancing: Box<dyn LoadBalancingAlgorithm>,
 }
 
 impl BackendList {
@@ -232,7 +232,7 @@ mod backends_test {
 
     thread::spawn(move || {
       while run {
-        for stream in listener.incoming() {
+        for _stream in listener.incoming() {
           // accept connections
           if let Ok(()) = stopper.try_recv() {
             run = false;

@@ -1,10 +1,8 @@
 use std::str;
-use std::time::{Duration,Instant};
-use std::iter::repeat;
+use std::time::Instant;
 use std::collections::BTreeMap;
-use std::collections::VecDeque;
 use hdrhistogram::Histogram;
-use sozu_command::proxy::{FilteredData,MetricsData,Percentiles,FilteredTimeSerie,AppMetricsData};
+use sozu_command::proxy::{FilteredData,MetricsData,Percentiles,AppMetricsData};
 
 use super::{MetricData,Subscriber};
 
@@ -24,7 +22,9 @@ impl AggregatedMetric {
       MetricData::Time(value)  => {
         //FIXME: do not unwrap here
         let mut h = ::hdrhistogram::Histogram::new(3).unwrap();
-        h.record(value as u64);
+        if let Err(e) = h.record(value as u64) {
+          error!("could not create histogram with time metric {:?}: {:?}", value, e);
+        }
         AggregatedMetric::Time(h)
       }
     }
@@ -42,7 +42,9 @@ impl AggregatedMetric {
         *v1 += v2;
       },
       (&mut AggregatedMetric::Time(ref mut v1), MetricData::Time(v2)) => {
-        (*v1).record(v2 as u64);
+        if let Err(e) = (*v1).record(v2 as u64) {
+          error!("could not add time metric {}={:?} to histogram: {:?}", key, v2, e);
+        }
       },
       (s,m) => panic!("tried to update metric {} of value {:?} with an incompatible metric: {:?}", key, s, m)
     }
@@ -82,15 +84,6 @@ pub struct AppMetrics {
 pub struct BackendMetrics {
   pub app_id: String,
   pub data:   BTreeMap<String, AggregatedMetric>,
-}
-
-impl BackendMetrics {
-  pub fn new(app_id: String, h: Histogram<u32>) -> BackendMetrics {
-    BackendMetrics {
-      app_id,
-      data: BTreeMap::new(),
-    }
-  }
 }
 
 #[derive(Debug)]
@@ -323,6 +316,7 @@ impl ProxyMetrics {
 }
 */
 
+/*
 #[derive(Debug,Clone)]
 pub struct TimeSerie {
   sent_at:           Instant,
@@ -406,3 +400,4 @@ impl TimeSerie {
     self.last_sent = 0;
   }
 }
+*/

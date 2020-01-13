@@ -230,11 +230,11 @@ impl SocketHandler for FrontRustls {
       }
 
       match self.session.read_tls(&mut self.stream) {
-        Ok(0)  => {
+        Ok(0) => {
           can_read  = false;
           is_closed = true;
         },
-        Ok(sz) => {},
+        Ok(_sz) => {},
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => {
             can_read = false;
@@ -294,7 +294,7 @@ impl SocketHandler for FrontRustls {
 
   fn socket_write(&mut self,  buf: &[u8]) -> (usize, SocketResult) {
     let mut buffered_size = 0usize;
-    let mut sent_size     = 0usize;
+    let mut _sent_size    = 0usize;
     let mut can_write     = true;
     let mut is_error      = false;
     let mut is_closed     = false;
@@ -342,7 +342,7 @@ impl SocketHandler for FrontRustls {
             break;
           },
           Ok(sz) => {
-            sent_size += sz;
+            _sent_size += sz;
           },
           Err(e) => match e.kind() {
             ErrorKind::WouldBlock => can_write = false,

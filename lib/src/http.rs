@@ -26,7 +26,7 @@ use super::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,Sessi
 use super::backends::BackendMap;
 use super::pool::Pool;
 use super::protocol::{ProtocolResult,StickySession,Http,Pipe};
-use super::protocol::http::{DefaultAnswerStatus, TimeoutStatus, answers::{DefaultAnswers, CustomAnswers, HttpAnswers}};
+use super::protocol::http::{DefaultAnswerStatus, TimeoutStatus, answers::HttpAnswers};
 use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use super::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,
   ListenSession, CONN_RETRIES, push_event};
@@ -781,7 +781,7 @@ impl Proxy {
     })
   }
 
-  pub fn add_application(&mut self, mut application: Application) {
+  pub fn add_application(&mut self, application: Application) {
     if let Some(answer_503) = application.answer_503.as_ref() {
       for l in self.listeners.values_mut() {
         l.answers.borrow_mut().add_custom_answer(&application.app_id, &answer_503);
@@ -949,7 +949,7 @@ impl Listener {
     Some(self.token)
   }
 
-  pub fn add_http_front(&mut self, mut http_front: HttpFront) -> Result<(), String> {
+  pub fn add_http_front(&mut self, http_front: HttpFront) -> Result<(), String> {
     //FIXME: proper error reporting
     if self.fronts.add_http_front(http_front) {
       Ok(())
@@ -958,7 +958,7 @@ impl Listener {
     }
   }
 
-  pub fn remove_http_front(&mut self, mut http_front: HttpFront) -> Result<(), String> {
+  pub fn remove_http_front(&mut self, http_front: HttpFront) -> Result<(), String> {
     debug!("removing http_front {:?}", http_front);
     //FIXME: proper error reporting
     if self.fronts.remove_http_front(http_front) {
@@ -1244,7 +1244,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
     Pool::with_capacity(2*max_buffers, 0, || Buffer::with_capacity(buffer_size))
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
-  let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
+  let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
   {
     let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
     info!("taking token {:?} for channel", entry.index());
@@ -1335,7 +1335,7 @@ mod tests {
     };
 
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
-    let jg = thread::spawn(move || {
+    let _jg = thread::spawn(move || {
       setup_test_logger!();
       start(config, channel, 10, 16384);
     });
@@ -1351,7 +1351,7 @@ mod tests {
     let mut client = TcpStream::connect(("127.0.0.1", 1024)).expect("could not parse address");
 
     // 5 seconds of timeout
-    client.set_read_timeout(Some(Duration::new(5,0)));
+    client.set_read_timeout(Some(Duration::new(5,0))).unwrap();
     let w = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\nConnection: Close\r\n\r\n"[..]);
     println!("http client write: {:?}", w);
 
@@ -1392,7 +1392,7 @@ mod tests {
 
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
 
-    let jg = thread::spawn(move|| {
+    let _jg = thread::spawn(move|| {
       start(config, channel, 10, 16384);
     });
 
@@ -1406,7 +1406,7 @@ mod tests {
 
     let mut client = TcpStream::connect(("127.0.0.1", 1031)).expect("could not parse address");
     // 5 seconds of timeout
-    client.set_read_timeout(Some(Duration::new(5,0)));
+    client.set_read_timeout(Some(Duration::new(5,0))).unwrap();
 
     let w = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..]).unwrap();
     println!("http client write: {:?}", w);
@@ -1468,7 +1468,7 @@ mod tests {
     };
 
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
-    let jg = thread::spawn(move || {
+    let _jg = thread::spawn(move || {
       setup_test_logger!();
       start(config, channel, 10, 16384);
     });
@@ -1486,7 +1486,7 @@ mod tests {
 
     let mut client = TcpStream::connect(("127.0.0.1", 1041)).expect("could not parse address");
     // 5 seconds of timeout
-    client.set_read_timeout(Some(Duration::new(5,0)));
+    client.set_read_timeout(Some(Duration::new(5,0))).unwrap();
 
     let w = client.write(&b"GET /redirected?true HTTP/1.1\r\nHost: localhost\r\nConnection: Close\r\n\r\n"[..]);
     println!("http client write: {:?}", w);

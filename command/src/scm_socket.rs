@@ -135,7 +135,7 @@ impl ScmSocket {
   }
 
   pub fn rcv_msg(&self, buffer: &mut [u8], fds: &mut [RawFd]) -> NixResult<(usize, usize)> {
-    let mut cmsg = socket::CmsgSpace::<[RawFd; MAX_FDS_OUT]>::new();
+    let mut cmsg = cmsg_space!([RawFd; MAX_FDS_OUT]);
     let iov = [uio::IoVec::from_mut_slice(buffer)];
 
     let flags = if self.blocking {

@@ -506,8 +506,8 @@ mod tests {
 
   #[test]
   fn consume() {
-    let (pool, mut b) = buf_with_capacity(10);
-    b.buffer.write(&b"ABCDEFGHIJ"[..]);
+    let (_pool, mut b) = buf_with_capacity(10);
+    b.buffer.write(&b"ABCDEFGHIJ"[..]).unwrap();
     b.buffer.fill(10);
     b.input_queue.push(InputElement::Slice(10));
     /*let mut b = BufferQueue {
