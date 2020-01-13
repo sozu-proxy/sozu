@@ -501,7 +501,7 @@ mod tests {
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
     assert_size!(BufferQueue, 88);
-    assert_size!(Buffer, 48);
+    assert_size!(Buffer, 16);
   }
 
   #[test]
