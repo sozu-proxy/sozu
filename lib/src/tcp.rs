@@ -1330,7 +1330,7 @@ mod tests {
 
       let (scm_server, scm_client) = UnixStream::pair().unwrap();
       let scm = ScmSocket::new(scm_client.into_raw_fd());
-      scm.send_listeners(&Listeners {
+      let _ = scm.send_listeners(&Listeners {
         http: Vec::new(),
         tls:  Vec::new(),
         tcp:  Vec::new(),
