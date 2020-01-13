@@ -145,15 +145,15 @@ impl<Front:SocketHandler> Pipe<Front> {
   fn protocol_string(&self) -> &'static str {
     match self.protocol {
       Protocol::TCP  => "TCP",
-      Protocol::HTTP  => "HTTP+WS",
+      Protocol::HTTP  => "WS",
       Protocol::HTTPS => {
         match self.frontend.protocol() {
-          TransportProtocol::Ssl2   => "HTTPS-SSL2+WS",
-          TransportProtocol::Ssl3   => "HTTPS-SSL3+WS",
-          TransportProtocol::Tls1_0 => "HTTPS-TLS1.0+WS",
-          TransportProtocol::Tls1_1 => "HTTPS-TLS1.1+WS",
-          TransportProtocol::Tls1_2 => "HTTPS-TLS1.2+WS",
-          TransportProtocol::Tls1_3 => "HTTPS-TLS1.3+WS",
+          TransportProtocol::Ssl2   => "WSS-SSL2",
+          TransportProtocol::Ssl3   => "WSS-SSL3",
+          TransportProtocol::Tls1_0 => "WSS-TLS1.0",
+          TransportProtocol::Tls1_1 => "WSS-TLS1.1",
+          TransportProtocol::Tls1_2 => "WSS-TLS1.2",
+          TransportProtocol::Tls1_3 => "WSS-TLS1.3",
           _                         => unreachable!()
         }
       }
