@@ -1,11 +1,9 @@
 #![allow(dead_code)]
 use std::str;
-use std::time::{Duration,Instant};
-use std::iter::repeat;
+use std::time::Instant;
 use std::collections::BTreeMap;
-use std::collections::VecDeque;
 use hdrhistogram::Histogram;
-use sozu_command::proxy::{FilteredData,MetricsData,Percentiles,FilteredTimeSerie,AppMetricsData};
+use sozu_command::proxy::{FilteredData,MetricsData,Percentiles,AppMetricsData};
 
 use super::{MetricData,Subscriber};
 
@@ -87,15 +85,6 @@ pub struct AppMetrics {
 pub struct BackendMetrics {
   pub app_id: String,
   pub data:   BTreeMap<String, AggregatedMetric>,
-}
-
-impl BackendMetrics {
-  pub fn new(app_id: String, _h: Histogram<u32>) -> BackendMetrics {
-    BackendMetrics {
-      app_id,
-      data: BTreeMap::new(),
-    }
-  }
 }
 
 #[derive(Debug)]
@@ -328,6 +317,7 @@ impl ProxyMetrics {
 }
 */
 
+/*
 #[derive(Debug,Clone)]
 pub struct TimeSerie {
   sent_at:           Instant,
@@ -411,3 +401,4 @@ impl TimeSerie {
     self.last_sent = 0;
   }
 }
+*/

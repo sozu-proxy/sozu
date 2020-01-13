@@ -1127,7 +1127,7 @@ impl Listener {
       error!("could not set ALPN protocols: {:?}", e);
     }
 
-    context.set_alpn_select_callback(move |ssl: &mut SslRef, client_protocols: &[u8]| {
+    context.set_alpn_select_callback(move |_ssl: &mut SslRef, client_protocols: &[u8]| {
       debug!("got protocols list from client: {:?}", unsafe { from_utf8_unchecked(client_protocols) });
       match select_next_proto(SERVER_PROTOS, client_protocols) {
         None => Err(AlpnError::ALERT_FATAL),
@@ -1361,7 +1361,7 @@ impl Listener {
     self.fronts.lookup(host.as_bytes(), uri.as_bytes())
   }
 
-  fn accept(&mut self, _token: ListenToken) -> Result<TcpStream, AcceptError> {
+  fn accept(&mut self) -> Result<TcpStream, AcceptError> {
     if let Some(ref sock) = self.listener {
       sock.accept().map_err(|e| {
         match e.kind() {
@@ -1565,7 +1565,7 @@ impl Proxy {
 
 impl ProxyConfiguration<Session> for Proxy {
   fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
-    self.listeners.get_mut(&Token(token.0)).unwrap().accept(token)
+    self.listeners.get_mut(&Token(token.0)).unwrap().accept()
   }
 
   fn create_session(&mut self, mut frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token,
@@ -1955,7 +1955,6 @@ mod tests {
   use std::str::FromStr;
   use std::rc::Rc;
   use std::sync::{Arc,Mutex};
-  use protocol::http::answers::DefaultAnswers;
   use router::{trie::TrieNode,Router,PathRule};
   use openssl::ssl::{SslContext, SslMethod};
 
@@ -2154,7 +2153,7 @@ fn parse_sni_name_list(i: &[u8]) -> Option<&[u8]> {
         return None;
     }
 
-    match length_data::<_,_,(),_>(be_u16)(i).ok() {
+    match length_data::<_, _, (), _>(be_u16)(i).ok() {
         None => None,
         Some((i, o)) => {
             if !i.is_empty() {
@@ -2167,7 +2166,9 @@ fn parse_sni_name_list(i: &[u8]) -> Option<&[u8]> {
 }
 
 fn parse_sni_name(i: &[u8]) -> Option<(&[u8], &[u8])> {
-    use nom::{multi::length_data, sequence::preceded,
+    use nom::{
+      multi::length_data,
+      sequence::preceded,
       bytes::complete::tag,
       number::complete::be_u16
     };

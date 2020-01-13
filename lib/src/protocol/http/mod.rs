@@ -1707,11 +1707,10 @@ impl AddedRequestHeader {
     }
 }
 
-  /*
+/*
 #[cfg(test)]
 mod tests {
   use super::*;
-
   #[test]
   #[cfg(target_pointer_width = "64")]
   fn size_test() {
