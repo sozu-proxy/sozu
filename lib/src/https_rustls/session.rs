@@ -93,7 +93,17 @@ impl Session {
     session
   }
 
-  pub fn http(&mut self) -> Option<&mut Http<FrontRustls>> {
+  pub fn http(&self) -> Option<&Http<FrontRustls>> {
+    self.protocol.as_ref().and_then(|protocol| {
+      if let &State::Http(ref http) = protocol {
+        Some(http)
+      } else {
+        None
+      }
+    })
+  }
+
+  pub fn http_mut(&mut self) -> Option<&mut Http<FrontRustls>> {
     self.protocol.as_mut().and_then(|protocol| {
       if let &mut State::Http(ref mut http) = protocol {
         Some(http)
@@ -415,7 +425,7 @@ impl Session {
 
   fn remove_backend(&mut self) {
     if let Some(backend) = self.backend.take() {
-      self.http().map(|h| h.clear_back_token());
+      self.http_mut().map(|h| h.clear_back_token());
 
       (*backend.borrow_mut()).dec_connections();
     }
@@ -463,7 +473,7 @@ impl Session {
 impl ProxySession for Session {
   fn close(&mut self, poll: &mut Poll) -> CloseResult {
     //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
-    self.http().map(|http| http.close());
+    self.http_mut().map(|http| http.close());
     self.metrics.service_stop();
     if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
       if e.kind() != ErrorKind::NotConnected {
@@ -561,8 +571,10 @@ impl ProxySession for Session {
     }
 
     self.set_back_connected(BackendConnectionStatus::NotConnected);
-    self.http().map(|h| h.clear_back_token());
-    self.http().map(|h| h.remove_backend());
+    self.http_mut().map(|h| {
+      h.clear_back_token();
+      h.remove_backend();
+    });
   }
 
   fn protocol(&self) -> Protocol {
@@ -590,7 +602,7 @@ impl ProxySession for Session {
       self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
 
       if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) ||
-        !self.http().map(|h| h.test_back_socket()).unwrap_or(false) {
+        !self.http_mut().map(|h| h.test_back_socket()).unwrap_or(false) {
 
         //retry connecting the backend
         error!("{} error connecting to backend, trying again", self.log_context());

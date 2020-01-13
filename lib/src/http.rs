@@ -191,11 +191,18 @@ impl Session {
     }
   }
 
-  pub fn http(&mut self) -> Option<&mut Http<TcpStream>> {
-    match *unwrap_msg!(self.protocol.as_mut()) {
+  pub fn http(&self) -> Option<&Http<TcpStream>> {
+    self.protocol.as_ref().and_then(|protocol| match protocol {
+      State::Http(ref http) => Some(http),
+      _ => None
+    })
+  }
+
+  pub fn http_mut(&mut self) -> Option<&mut Http<TcpStream>> {
+    self.protocol.as_mut().and_then(|protocol| match protocol {
       State::Http(ref mut http) => Some(http),
       _ => None
-    }
+    })
   }
 
   fn front_hup(&mut self) -> SessionResult {
@@ -356,7 +363,7 @@ impl Session {
       self.back_token().map(|t| format!("{}", t.0)).unwrap_or_else(|| "-".to_string()));
 
     if let Some(backend) = self.backend.take() {
-      self.http().map(|h| h.clear_back_token());
+      self.http_mut().map(|h| h.clear_back_token());
 
       (*backend.borrow_mut()).dec_connections();
     }
@@ -498,8 +505,10 @@ impl ProxySession for Session {
 
     self.set_back_connected(BackendConnectionStatus::NotConnected);
 
-    self.http().map(|h| h.clear_back_token());
-    self.http().map(|h| h.remove_backend());
+    self.http_mut().map(|h| {
+      h.clear_back_token();
+      h.remove_backend();
+    });
   }
 
   fn protocol(&self) -> Protocol {
@@ -527,7 +536,7 @@ impl ProxySession for Session {
       self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
 
       if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) ||
-        !self.http().map(|h| h.test_back_socket()).unwrap_or(false) {
+        !self.http_mut().map(|h| h.test_back_socket()).unwrap_or(false) {
 
         //retry connecting the backend
         error!("{} error connecting to backend, trying again", self.log_context());
@@ -770,8 +779,12 @@ impl Proxy {
   }
 
   pub fn backend_from_request(&mut self, session: &mut Session, app_id: &str,
-  front_should_stick: bool, sticky_session: Option<String>) -> Result<TcpStream,ConnectionError> {
-    session.http().map(|h| h.set_app_id(String::from(app_id)));
+  front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
+    session.http_mut().map(|h| h.set_app_id(String::from(app_id)));
+
+    let sticky_session = session.http()
+      .and_then(|http| http.request.as_ref())
+      .and_then(|r| r.get_sticky_session());
 
     let res = match (front_should_stick, sticky_session) {
       (true, Some(sticky_session)) => {
@@ -793,7 +806,7 @@ impl Proxy {
       Ok((backend, conn))  => {
         if front_should_stick {
           let sticky_name =  self.listeners[&session.listen_token].config.sticky_name.clone();
-          session.http().map(|http| {
+          session.http_mut().map(|http| {
             http.sticky_session =
               Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or_else(|| {
                 backend.borrow().backend_id.clone()})));
@@ -802,7 +815,7 @@ impl Proxy {
         }
         session.metrics.backend_id = Some(backend.borrow().backend_id.clone());
         session.metrics.backend_start();
-        session.http().map(|http| {
+        session.http_mut().map(|http| {
           http.set_backend_id(backend.borrow().backend_id.clone());
         });
         session.backend = Some(backend);
@@ -1043,7 +1056,7 @@ impl ProxyConfiguration<Session> for Proxy {
           self.backends.borrow().has_backend(&app_id, backend)
         }).unwrap_or(false);
 
-      let is_valid_backend_socket = has_backend && session.http().map(|h| h.test_back_socket()).unwrap_or(false);
+      let is_valid_backend_socket = has_backend && session.http_mut().map(|h| h.test_back_socket()).unwrap_or(false);
 
       if is_valid_backend_socket {
         //matched on keepalive
@@ -1072,13 +1085,10 @@ impl ProxyConfiguration<Session> for Proxy {
 
     session.app_id = Some(app_id.clone());
 
-    let sticky_session = session.http()
-      .and_then(|http| http.request.as_ref())
-      .and_then(|r| r.get_sticky_session());
     let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
-    let socket = self.backend_from_request(session, &app_id, front_should_stick, sticky_session)?;
+    let socket = self.backend_from_request(session, &app_id, front_should_stick)?;
 
-    session.http().map(|http| {
+    session.http_mut().map(|http| {
       http.app_id = Some(app_id.clone());
       http.reset_log_context();
     });

@@ -328,8 +328,12 @@ impl Proxy {
   }
 
   pub fn backend_from_request(&mut self, session: &mut Session, app_id: &str,
-  front_should_stick: bool, sticky_session: Option<String>) -> Result<TcpStream,ConnectionError> {
-    session.http().map(|h| h.set_app_id(String::from(app_id)));
+  front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
+    session.http_mut().map(|h| h.set_app_id(String::from(app_id)));
+
+    let sticky_session = session.http()
+      .and_then(|http| http.request.as_ref())
+      .and_then(|r| r.get_sticky_session());
 
     let res = match (front_should_stick, sticky_session) {
       (true, Some(sticky_session)) => {
@@ -351,7 +355,7 @@ impl Proxy {
       Ok((backend, conn))  => {
         if front_should_stick {
           let sticky_name = self.listeners[&session.listen_token].config.sticky_name.clone();
-          session.http().map(|http| {
+          session.http_mut().map(|http| {
             http.sticky_session =
               Some(StickySession::new(backend.borrow().sticky_id.clone().unwrap_or(backend.borrow().backend_id.clone())));
             http.sticky_name = sticky_name;
@@ -360,7 +364,7 @@ impl Proxy {
         session.metrics.backend_id = Some(backend.borrow().backend_id.clone());
         session.metrics.backend_start();
 
-        session.http().map(|http| {
+        session.http_mut().map(|http| {
           http.set_backend_id(backend.borrow().backend_id.clone());
         });
 
@@ -372,12 +376,14 @@ impl Proxy {
   }
 
   fn app_id_from_request(&mut self, session: &mut Session) -> Result<String, ConnectionError> {
+    let listen_token = session.listen_token;
+
     let h = session.http().and_then(|h| h.request.as_ref()).and_then(|r| r.get_host()).ok_or(ConnectionError::NoHostGiven)?;
 
     let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("invalid remaining chars after hostname");
-        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
+        let answer = self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
         session.set_answer(DefaultAnswerStatus::Answer400, answer);
         return Err(ConnectionError::InvalidHost);
       }
@@ -392,8 +398,8 @@ impl Proxy {
         .and_then(|h| h.frontend.session.get_sni_hostname()).map(|s| s.to_string());
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
         error!("TLS SNI hostname '{:?}' and Host header '{}' don't match", servername, hostname_str);
-        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
-        unwrap_msg!(session.http()).set_answer(DefaultAnswerStatus::Answer404, answer);
+        let answer = self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
+        unwrap_msg!(session.http_mut()).set_answer(DefaultAnswerStatus::Answer404, answer);
         return Err(ConnectionError::HostNotFound);
       }
 
@@ -406,20 +412,20 @@ impl Proxy {
       }
     } else {
       error!("hostname parsing failed");
-      let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
+      let answer = self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
       session.set_answer(DefaultAnswerStatus::Answer400, answer);
       return Err(ConnectionError::InvalidHost);
     };
 
-    let rl:RRequestLine = session.http()
+    let rl:&RRequestLine = session.http()
       .and_then(|h| h.request.as_ref()).and_then(|r| r.get_request_line())
       .ok_or(ConnectionError::NoRequestLineGiven)?;
-    match self.listeners.get(&session.listen_token).as_ref()
+    match self.listeners.get(&listen_token).as_ref()
       .and_then(|l| l.frontend_from_request(&host, &rl.uri))
       .map(|ref front| front.app_id.clone()) {
       Some(app_id) => Ok(app_id),
       None => {
-        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
+        let answer = self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
         session.set_answer(DefaultAnswerStatus::Answer404, answer);
         Err(ConnectionError::HostNotFound)
       }
@@ -487,7 +493,7 @@ impl ProxyConfiguration<Session> for Proxy {
          let ref backend = *backend.borrow();
          self.backends.borrow().has_backend(&app_id, backend)
         }).unwrap_or(false);
-      let is_valid_backend_socket = has_backend && session.http().map(|h| h.test_back_socket()).unwrap_or(false);
+      let is_valid_backend_socket = has_backend && session.http_mut().map(|h| h.test_back_socket()).unwrap_or(false);
 
       if is_valid_backend_socket {
         //matched on keepalive
@@ -515,13 +521,10 @@ impl ProxyConfiguration<Session> for Proxy {
 
     session.app_id = Some(app_id.clone());
 
-    let sticky_session = session.http()
-      .and_then(|http| http.request.as_ref())
-      .and_then(|r| r.get_sticky_session());
     let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
-    let socket = self.backend_from_request(session, &app_id, front_should_stick, sticky_session)?;
+    let socket = self.backend_from_request(session, &app_id, front_should_stick)?;
 
-    session.http().map(|http| {
+    session.http_mut().map(|http| {
       http.app_id = Some(app_id.clone());
       http.reset_log_context();
     });

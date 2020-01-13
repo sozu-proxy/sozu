@@ -793,7 +793,7 @@ pub enum LengthInformation {
   //Compressed
 }
 
-#[derive(Debug,Clone,PartialEq)]
+#[derive(Debug,Clone,Copy,PartialEq)]
 pub enum Continue {
   None,
   Expects(usize),
@@ -888,8 +888,8 @@ impl RequestState {
     }
   }
 
-  pub fn get_sticky_session(&self) -> Option<String> {
-    self.get_keep_alive().and_then(|con| con.sticky_session)
+  pub fn get_sticky_session(&self) -> Option<&str> {
+    self.get_keep_alive().and_then(|con| con.sticky_session.as_ref()).map(|s| s.as_str())
   }
 
   pub fn has_host(&self) -> bool {
@@ -923,13 +923,13 @@ impl RequestState {
     }
   }
 
-  pub fn get_host(&self) -> Option<String> {
+  pub fn get_host(&self) -> Option<&str> {
     match *self {
       RequestState::HasHost(_, _, ref host)            |
       RequestState::Request(_, _, ref host)            |
       RequestState::RequestWithBody(_, _, ref host, _) |
-      RequestState::RequestWithBodyChunks(_, _, ref host, _) => Some(host.clone()),
-      RequestState::Error(_, _, ref host, _, _)              => host.clone(),
+      RequestState::RequestWithBodyChunks(_, _, ref host, _) => Some(host.as_str()),
+      RequestState::Error(_, _, ref host, _, _)              => host.as_ref().map(|s| s.as_str()),
       _                                                      => None
     }
   }
@@ -946,19 +946,19 @@ impl RequestState {
     }
   }
 
-  pub fn get_request_line(&self) -> Option<RRequestLine> {
+  pub fn get_request_line(&self) -> Option<&RRequestLine> {
     match *self {
       RequestState::HasRequestLine(ref rl, _)        |
       RequestState::HasHost(ref rl, _, _)            |
       RequestState::Request(ref rl, _, _)            |
       RequestState::RequestWithBody(ref rl, _, _, _) |
-      RequestState::RequestWithBodyChunks(ref rl, _, _, _) => Some(rl.clone()),
-      RequestState::Error(ref rl, _, _, _, _)              => rl.clone(),
-      _                                                    => None
+      RequestState::RequestWithBodyChunks(ref rl, _, _, _) => Some(rl),
+      RequestState::Error(ref rl, _, _, _, _) => rl.as_ref(),
+      _ => None
     }
   }
 
-  pub fn get_keep_alive(&self) -> Option<Connection> {
+  pub fn get_keep_alive(&self) -> Option<&Connection> {
     match *self {
       RequestState::HasRequestLine(_, ref conn)         |
       RequestState::HasHost(_, ref conn, _)             |
@@ -966,9 +966,9 @@ impl RequestState {
       RequestState::HasHostAndLength(_, ref conn, _, _) |
       RequestState::Request(_, ref conn, _)             |
       RequestState::RequestWithBody(_, ref conn, _, _)  |
-      RequestState::RequestWithBodyChunks(_, ref conn, _, _) => Some(conn.clone()),
-      RequestState::Error(_, ref conn, _, _, _)       => conn.clone(),
-      _                                                      => None
+      RequestState::RequestWithBodyChunks(_, ref conn, _, _) => Some(conn),
+      RequestState::Error(_, ref conn, _, _, _) => conn.as_ref(),
+      _ => None
     }
   }
 
@@ -1069,7 +1069,7 @@ impl ResponseState {
     }
   }
 
-  pub fn get_status_line(&self) -> Option<RStatusLine> {
+  pub fn get_status_line(&self) -> Option<&RStatusLine> {
     match *self {
       ResponseState::HasStatusLine(ref sl, _)             |
       ResponseState::HasLength(ref sl, _, _)              |
@@ -1078,8 +1078,8 @@ impl ResponseState {
       ResponseState::ResponseUpgrade(ref sl, _, _)        |
       ResponseState::ResponseWithBody(ref sl, _, _)       |
       ResponseState::ResponseWithBodyCloseDelimited(ref sl, _, _) |
-      ResponseState::ResponseWithBodyChunks(ref sl, _, _) => Some(sl.clone()),
-      ResponseState::Error(ref sl, _, _, _, _)            => sl.clone(),
+      ResponseState::ResponseWithBodyChunks(ref sl, _, _) => Some(sl),
+      ResponseState::Error(ref sl, _, _, _, _)            => sl.as_ref(),
       _                                                   => None
     }
   }

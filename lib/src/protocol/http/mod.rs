@@ -321,7 +321,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   fn must_continue_request(&self) -> bool {
-    if let Some(Continue::Expects(sz)) = self.request.as_ref().and_then(|r| r.get_keep_alive().map(|conn| conn.continues)) {
+    if let Some(Continue::Expects(sz)) = self.request.as_ref().and_then(|r| r.get_keep_alive().as_ref().map(|conn| conn.continues)) {
       true
     } else {
       false
@@ -398,15 +398,15 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   /// Retrieve the response status from the http response state
-  pub fn get_response_status(&self) -> Option<RStatusLine> {
+  pub fn get_response_status(&self) -> Option<&RStatusLine> {
     self.response.as_ref().and_then(|r| r.get_status_line())
   }
 
-  pub fn get_host(&self) -> Option<String> {
+  pub fn get_host(&self) -> Option<&str> {
     self.request.as_ref().and_then(|r| r.get_host())
   }
 
-  pub fn get_request_line(&self) -> Option<RRequestLine> {
+  pub fn get_request_line(&self) -> Option<&RRequestLine> {
     self.request.as_ref().and_then(|r| r.get_request_line())
   }
 
@@ -440,14 +440,14 @@ impl<Front:SocketHandler> Http<Front> {
     let session = SessionAddress(self.get_session_address());
     let backend = SessionAddress(self.get_backend_address());
 
-    let host         = OptionalString(self.get_host());
-    let request_line = OptionalRequest(self.get_request_line().map(|line| (line.method, line.uri)));
-    let status_line  = OptionalStatus(self.get_response_status().map(|line| (line.status, line.reason)));
+    let host         = OptionalString::new(self.get_host());
+    let request_line = OptionalRequest::new(self.get_request_line().map(|line| (&line.method, line.uri.as_str())));
+    let status_line  = OptionalStatus::new(self.get_response_status().map(|line| (line.status, line.reason.as_str())));
 
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
 
-    let app_id = OptionalString(self.app_id.clone());
+    let app_id = OptionalString::new(self.app_id.as_ref().map(|s| s.as_str()));
     time!("request_time", app_id.as_str(), response_time.num_milliseconds());
     time!("service_time", app_id.as_str(), service_time.num_milliseconds());
 
@@ -481,8 +481,8 @@ impl<Front:SocketHandler> Http<Front> {
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer504, _, _) => "504 Gateway Timeout",
     };
 
-    let host         = OptionalString(self.get_host());
-    let request_line = OptionalRequest(self.get_request_line().map(|line| (line.method, line.uri)));
+    let host         = OptionalString::new(self.get_host());
+    let request_line = OptionalRequest::new(self.get_request_line().map(|line| (&line.method, line.uri.as_str())));
 
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
@@ -509,9 +509,9 @@ impl<Front:SocketHandler> Http<Front> {
     let session = SessionAddress(self.get_session_address());
     let backend = SessionAddress(self.get_backend_address());
 
-    let host         = OptionalString(self.get_host());
-    let request_line = OptionalRequest(self.get_request_line().map(|line| (line.method, line.uri)));
-    let status_line  = OptionalStatus(self.get_response_status().map(|line| (line.status, line.reason)));
+    let host         = OptionalString::new(self.get_host());
+    let request_line = OptionalRequest::new(self.get_request_line().map(|line| (&line.method, line.uri.as_str())));
+    let status_line  = OptionalStatus::new(self.get_response_status().as_ref().map(|line| (line.status, line.reason.as_str())));
 
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
@@ -1275,14 +1275,14 @@ impl<Front:SocketHandler> Http<Front> {
   fn should_add_sticky_header(&self, session: &StickySession) -> bool {
     self.request.as_ref()
       .and_then(|request| request.get_keep_alive())
-      .and_then(|conn| conn.sticky_session)
-      .map(|sticky_client| sticky_client != session.sticky_id)
+      .and_then(|conn| conn.sticky_session.as_ref())
+      .map(|sticky_client| sticky_client != &session.sticky_id)
       .unwrap_or(true)
   }
 }
 
 /// Save the backend http response status code metric
-fn save_http_status_metric(rs_status_line : Option<RStatusLine>) {
+fn save_http_status_metric(rs_status_line : Option<&RStatusLine>) {
   if let Some(rs_status_line) = rs_status_line {
     match rs_status_line.status {
       100...199 => { incr!("http.status.1xx"); },
@@ -1307,42 +1307,64 @@ impl std::fmt::Display for SessionAddress {
   }
 }
 
-struct OptionalString(Option<String>);
+struct OptionalString<'a> {
+  inner: Option<&'a str>,
+}
 
-impl std::fmt::Display for OptionalString {
+impl<'a> std::fmt::Display for OptionalString<'a> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match &self.0 {
+    match &self.inner {
       None => write!(f, "-"),
       Some(s) => write!(f, "{}", s),
     }
   }
 }
 
-impl OptionalString {
+impl<'a> OptionalString<'a> {
+  fn new(s: Option<&'a str>) -> Self {
+    OptionalString { inner: s }
+  }
+
   fn as_str(&self) -> &str {
-    match &self.0 {
+    match &self.inner {
       None => "-",
-      Some(s) => s.as_str(),
+      Some(s) => s,
     }
   }
 }
 
-struct OptionalRequest(Option<(parser::Method, String)>);
+struct OptionalRequest<'a>{
+  inner: Option<(&'a parser::Method, &'a str)>
+}
 
-impl std::fmt::Display for OptionalRequest {
+impl<'a> OptionalRequest<'a> {
+  fn new(inner: Option<(&'a parser::Method, &'a str)>) -> Self {
+    OptionalRequest { inner }
+  }
+}
+
+impl<'a> std::fmt::Display for OptionalRequest<'a> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match &self.0 {
+    match &self.inner {
       None => write!(f, "-"),
       Some((s1, s2)) => write!(f, "{} {}", s1, s2),
     }
   }
 }
 
-struct OptionalStatus(Option<(u16, String)>);
+struct OptionalStatus<'a> {
+  inner: Option<(u16, &'a str)>,
+}
 
-impl std::fmt::Display for OptionalStatus {
+impl<'a> OptionalStatus<'a> {
+  fn new(inner: Option<(u16, &'a str)>) -> Self {
+    OptionalStatus { inner }
+  }
+}
+
+impl<'a> std::fmt::Display for OptionalStatus<'a> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match &self.0 {
+    match &self.inner {
       None => write!(f, "-"),
       Some((s1, s2)) => write!(f, "{} {}", s1, s2),
     }
