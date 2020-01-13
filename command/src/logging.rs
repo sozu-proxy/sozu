@@ -468,7 +468,7 @@ macro_rules! log {
           $crate::logging::LOGGER.with(|l| {
             let pid = l.borrow().pid;
 
-            let now = ::chrono::offset::Utc::now().to_rfc3339_opts(::chrono::SecondsFormat::Micros, true);
+            let now = $crate::logging::chrono_now();
             l.borrow_mut().log(
               &_META,
               format_args!(
@@ -509,7 +509,7 @@ macro_rules! log_access {
           $crate::logging::LOGGER.with(|l| {
             let pid = l.borrow().pid;
 
-            let now = ::chrono::offset::Utc::now().to_rfc3339_opts(::chrono::SecondsFormat::Micros, true);
+            let now = $crate::logging::chrono_now();
             l.borrow_mut().log_access(
               &_META,
               format_args!(
@@ -664,4 +664,25 @@ macro_rules! setup_test_logger {
   () => (
     $crate::logging::Logger::init(module_path!().to_string(), "error", $crate::logging::LoggerBackend::Stdout(::std::io::stdout()), None);
   );
+}
+
+use chrono::format::{*, Pad::Zero, Numeric::*};
+const PREFIX: &'static [Item<'static>] = &[
+              Item::Numeric(Year, Zero),
+              Item::Literal("-"),
+              Item::Numeric(Month, Zero),
+              Item::Literal("-"),
+              Item::Numeric(Day, Zero),
+              Item::Literal("T"),
+              Item::Numeric(Hour, Zero),
+              Item::Literal(":"),
+              Item::Numeric(Minute, Zero),
+              Item::Literal(":"),
+              Item::Numeric(Second, Zero),
+              Item::Fixed(Fixed::Nanosecond6),
+              Item::Fixed(Fixed::TimezoneOffsetColonZ),
+          ];
+
+pub fn chrono_now() -> DelayedFormat<std::slice::Iter<'static, Item<'static>>> {
+  ::chrono::offset::Utc::now().format_with_items(PREFIX.iter())
 }

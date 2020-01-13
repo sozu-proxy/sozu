@@ -437,28 +437,19 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn log_request_success(&self, metrics: &SessionMetrics) {
-    let session = match self.get_session_address() {
-      None => String::from("-"),
-      Some(SocketAddr::V4(addr)) => format!("{}", addr),
-      Some(SocketAddr::V6(addr)) => format!("{}", addr),
-    };
+    let session = SessionAddress(self.get_session_address());
+    let backend = SessionAddress(self.get_backend_address());
 
-    let backend = match self.get_backend_address() {
-      None => String::from("-"),
-      Some(SocketAddr::V4(addr)) => format!("{}", addr),
-      Some(SocketAddr::V6(addr)) => format!("{}", addr),
-    };
-
-    let host         = self.get_host().unwrap_or_else(|| String::from("-"));
-    let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or_else(|| String::from("-"));
-    let status_line  = self.get_response_status().map(|line| format!("{} {}", line.status, line.reason)).unwrap_or_else(|| String::from("-"));
+    let host         = OptionalString(self.get_host());
+    let request_line = OptionalRequest(self.get_request_line().map(|line| (line.method, line.uri)));
+    let status_line  = OptionalStatus(self.get_response_status().map(|line| (line.status, line.reason)));
 
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
 
-    let app_id = self.app_id.clone().unwrap_or_else(|| String::from("-"));
-    time!("request_time", &app_id, response_time.num_milliseconds());
-    time!("service_time", &app_id, service_time.num_milliseconds());
+    let app_id = OptionalString(self.app_id.clone());
+    time!("request_time", app_id.as_str(), response_time.num_milliseconds());
+    time!("service_time", app_id.as_str(), service_time.num_milliseconds());
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
@@ -477,11 +468,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn log_default_answer_success(&self, metrics: &SessionMetrics) {
-    let session = match self.get_session_address() {
-      None => String::from("-"),
-      Some(SocketAddr::V4(addr)) => format!("{}", addr),
-      Some(SocketAddr::V6(addr)) => format!("{}", addr),
-    };
+    let session = SessionAddress(self.get_session_address());
 
     let status_line = match self.status {
       SessionStatus::Normal => "-",
@@ -494,8 +481,8 @@ impl<Front:SocketHandler> Http<Front> {
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer504, _, _) => "504 Gateway Timeout",
     };
 
-    let host         = self.get_host().unwrap_or_else(|| String::from("-"));
-    let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or_else(|| String::from("-"));
+    let host         = OptionalString(self.get_host());
+    let request_line = OptionalRequest(self.get_request_line().map(|line| (line.method, line.uri)));
 
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
@@ -519,21 +506,12 @@ impl<Front:SocketHandler> Http<Front> {
     self.front_readiness.reset();
     self.back_readiness.reset();
 
-    let session = match self.get_session_address() {
-      None => String::from("-"),
-      Some(SocketAddr::V4(addr)) => format!("{}", addr),
-      Some(SocketAddr::V6(addr)) => format!("{}", addr),
-    };
+    let session = SessionAddress(self.get_session_address());
+    let backend = SessionAddress(self.get_backend_address());
 
-    let backend = match self.get_backend_address() {
-      None => String::from("-"),
-      Some(SocketAddr::V4(addr)) => format!("{}", addr),
-      Some(SocketAddr::V6(addr)) => format!("{}", addr),
-    };
-
-    let host         = self.get_host().unwrap_or_else(|| String::from("-"));
-    let request_line = self.get_request_line().map(|line| format!("{} {}", line.method, line.uri)).unwrap_or_else(|| String::from("-"));
-    let status_line  = self.get_response_status().map(|line| format!("{} {}", line.status, line.reason)).unwrap_or_else(|| String::from("-"));
+    let host         = OptionalString(self.get_host());
+    let request_line = OptionalRequest(self.get_request_line().map(|line| (line.method, line.uri)));
+    let status_line  = OptionalStatus(self.get_response_status().map(|line| (line.status, line.reason)));
 
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
@@ -1313,6 +1291,60 @@ fn save_http_status_metric(rs_status_line : Option<RStatusLine>) {
       400...499 => { incr!("http.status.4xx"); },
       500...599 => { incr!("http.status.5xx"); },
       _ => { incr!("http.status.other"); }, // http responses with other codes (protocol error)
+    }
+  }
+}
+
+struct SessionAddress(Option<SocketAddr>);
+
+impl std::fmt::Display for SessionAddress {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self.0 {
+      None => write!(f, "-"),
+      Some(SocketAddr::V4(addr)) => write!(f, "{}", addr),
+      Some(SocketAddr::V6(addr)) => write!(f, "{}", addr),
+    }
+  }
+}
+
+struct OptionalString(Option<String>);
+
+impl std::fmt::Display for OptionalString {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match &self.0 {
+      None => write!(f, "-"),
+      Some(s) => write!(f, "{}", s),
+    }
+  }
+}
+
+impl OptionalString {
+  fn as_str(&self) -> &str {
+    match &self.0 {
+      None => "-",
+      Some(s) => s.as_str(),
+    }
+  }
+}
+
+struct OptionalRequest(Option<(parser::Method, String)>);
+
+impl std::fmt::Display for OptionalRequest {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match &self.0 {
+      None => write!(f, "-"),
+      Some((s1, s2)) => write!(f, "{} {}", s1, s2),
+    }
+  }
+}
+
+struct OptionalStatus(Option<(u16, String)>);
+
+impl std::fmt::Display for OptionalStatus {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match &self.0 {
+      None => write!(f, "-"),
+      Some((s1, s2)) => write!(f, "{} {}", s1, s2),
     }
   }
 }
