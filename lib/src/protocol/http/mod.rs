@@ -387,7 +387,6 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn shutting_down(&mut self) -> SessionResult {
-    info!("trying to shut down {}", self.print_state(""));
     if self.request.as_ref().map(|r| *r == RequestState::Initial).unwrap_or(false)
       && self.front_buf.as_ref().map(|b| !b.empty()).unwrap_or(false)
       && self.back_buf.as_ref().map(|b| !b.empty()).unwrap_or(false) {
