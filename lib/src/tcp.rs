@@ -57,7 +57,9 @@ pub struct Session {
   backend_token:      Option<Token>,
   back_connected:     BackendConnectionStatus,
   accept_token:       Token,
+  request_id:         Hyphenated,
   app_id:             Option<String>,
+  backend_id:         Option<String>,
   metrics:            SessionMetrics,
   protocol:           Option<State>,
   front_buf:          Option<Checkout<Buffer>>,
@@ -70,7 +72,7 @@ pub struct Session {
 
 impl Session {
   fn new(sock: TcpStream, frontend_token: Token, accept_token: Token, front_buf: Checkout<Buffer>,
-    back_buf: Checkout<Buffer>, app_id: Option<String>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Session {
+    back_buf: Checkout<Buffer>, app_id: Option<String>, backend_id: Option<String>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Session {
     let s = sock.try_clone().expect("could not clone the socket");
     let frontend_address = sock.peer_addr().ok();
     let mut frontend_buffer = None;
@@ -98,7 +100,7 @@ impl Session {
       },
       None => {
         gauge_add!("protocol.tcp", 1);
-        let mut pipe = Pipe::new(s, frontend_token, request_id, None, front_buf, back_buf, frontend_address, Protocol::TCP);
+        let mut pipe = Pipe::new(s, frontend_token, request_id, app_id.clone(), backend_id.clone(), None, front_buf, back_buf, frontend_address, Protocol::TCP);
         pipe.set_app_id(app_id.clone());
         Some(State::Pipe(pipe))
       }
@@ -112,7 +114,9 @@ impl Session {
       backend_token:      None,
       back_connected:     BackendConnectionStatus::NotConnected,
       accept_token,
+      request_id,
       app_id,
+      backend_id,
       metrics:            SessionMetrics::new(),
       protocol,
       front_buf:          frontend_buffer,
@@ -184,12 +188,11 @@ impl Session {
   }
 
   fn log_context(&self) -> String {
-    match (self.app_id.as_ref(), self.request_id()) {
-      (Some(app_id), Some(request_id)) => format!("{}\t{}\t", request_id, app_id),
-      (None, Some(request_id)) => format!("{}\tunknown\t", request_id),
-      (Some(app_id), None) => format!("unknown\t{}\t", app_id),
-      (None, None) => String::from("unknown\tunknown\t"),
-    }
+    format!("{} {} {}\t",
+      self.request_id,
+      self.app_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),
+      self.backend_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-")
+    )
   }
 
   fn readable(&mut self) -> SessionResult {
@@ -375,6 +378,15 @@ impl Session {
       Some(State::RelayProxyProtocol(ref mut pp)) => pp.set_back_token(token),
       Some(State::ExpectProxyProtocol(_)) => self.backend_token = Some(token),
       _ => unreachable!()
+    }
+  }
+
+  fn set_backend_id(&mut self, id: String) {
+    self.backend_id = Some(id.clone());
+    match self.protocol {
+      Some(State::Pipe(ref mut pipe)) => pipe.set_backend_id(Some(id)),
+      //FIXME: do other cases
+      _ => {}
     }
   }
 
@@ -844,16 +856,6 @@ impl Proxy {
     }
   }
 
-  fn backend_from_app_id(&mut self, session: &mut Session, app_id: &str) -> Result<TcpStream,ConnectionError> {
-    match self.backends.borrow_mut().backend_from_app_id(app_id) {
-      Err(e) => Err(e),
-      Ok((backend, conn))  => {
-        session.backend = Some(backend);
-
-        Ok(conn)
-      }
-    }
-  }
 }
 
 impl ProxyConfiguration<Session> for Proxy {
@@ -874,9 +876,9 @@ impl ProxyConfiguration<Session> for Proxy {
       return Err(ConnectionError::NoBackendAvailable)
     }
 
-    let conn = self.backend_from_app_id(session, &app_id);
+    let conn = self.backends.borrow_mut().backend_from_app_id(&app_id);
     match conn {
-      Ok(stream) => {
+      Ok((backend,  stream)) => {
         if let Err(e) = stream.set_nodelay(true) {
           error!("error setting nodelay on back socket({:?}): {:?}", stream, e);
         }
@@ -893,6 +895,10 @@ impl ProxyConfiguration<Session> for Proxy {
 
         session.set_back_token(back_token);
         session.set_back_socket(stream);
+        session.metrics.backend_id = Some(backend.borrow().backend_id.clone());
+        session.metrics.backend_start();
+        session.set_backend_id(backend.borrow().backend_id.clone());
+
         Ok(BackendConnectAction::New)
       },
       Err(ConnectionError::NoBackendAvailable) => Err(ConnectionError::NoBackendAvailable),
@@ -1001,8 +1007,8 @@ impl ProxyConfiguration<Session> for Proxy {
         if let Err(e) = frontend_sock.set_nodelay(true) {
           error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
         }
-        let c = Session::new(frontend_sock, session_token, internal_token, front_buf, back_buf, listener.app_id.clone(), proxy_protocol.clone(),
-        timeout);
+        let c = Session::new(frontend_sock, session_token, internal_token,
+          front_buf, back_buf, listener.app_id.clone(), None, proxy_protocol.clone(), timeout);
         incr!("tcp.requests");
 
         if let Err(e) = poll.register(

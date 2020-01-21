@@ -148,6 +148,8 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
       self.frontend,
       self.frontend_token,
       self.request_id,
+      None,
+      None,
       Some(backend_socket),
       front_buf,
       back_buf,

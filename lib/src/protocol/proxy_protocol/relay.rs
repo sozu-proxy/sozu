@@ -177,6 +177,8 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
       self.frontend.take(0).into_inner(),
       self.frontend_token,
       self.request_id,
+      None,
+      None,
       Some(backend_socket),
       self.front_buf,
       back_buf,

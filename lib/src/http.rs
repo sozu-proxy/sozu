@@ -140,12 +140,13 @@ impl Session {
       gauge_add!("protocol.ws", 1);
       gauge_add!("http.active_requests", -1);
       let mut pipe = Pipe::new(http.frontend, front_token, http.request_id,
+        http.app_id, http.backend_id,
         Some(unwrap_msg!(http.backend)), front_buf, back_buf, http.session_address, Protocol::HTTP);
 
       pipe.front_readiness.event = http.front_readiness.event;
       pipe.back_readiness.event  = http.back_readiness.event;
       pipe.set_back_token(back_token);
-      pipe.set_app_id(self.app_id.clone());
+      //pipe.set_app_id(self.app_id.clone());
 
       self.protocol = Some(State::WebSocket(pipe));
       true

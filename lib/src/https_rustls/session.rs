@@ -239,7 +239,7 @@ impl Session {
         }
       };
 
-      let mut pipe = Pipe::new(http.frontend, front_token, http.request_id,
+      let mut pipe = Pipe::new(http.frontend, front_token, http.request_id, http.app_id, http.backend_id,
         http.backend, front_buf, back_buf, http.session_address, Protocol::HTTPS);
 
       pipe.front_readiness.event = http.front_readiness.event;

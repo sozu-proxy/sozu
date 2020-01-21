@@ -31,6 +31,7 @@ pub struct Pipe<Front:SocketHandler> {
   pub front_buf:      Checkout<Buffer>,
   back_buf:           Checkout<Buffer>,
   pub app_id:         Option<String>,
+  pub backend_id:     Option<String>,
   pub request_id:     Hyphenated,
   pub front_readiness:Readiness,
   pub back_readiness: Readiness,
@@ -43,9 +44,14 @@ pub struct Pipe<Front:SocketHandler> {
 
 impl<Front:SocketHandler> Pipe<Front> {
   pub fn new(frontend: Front, frontend_token: Token, request_id: Hyphenated,
+    app_id: Option<String>, backend_id: Option<String>,
     backend: Option<TcpStream>, front_buf: Checkout<Buffer>,
     back_buf: Checkout<Buffer>, session_address: Option<SocketAddr>, protocol: Protocol) -> Pipe<Front> {
-    let log_ctx    = format!("{}\tunknown\t", &request_id);
+    let log_ctx = format!("{} {} {}\t",
+      &request_id,
+      app_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),
+      backend_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-")
+    );
     let frontend_status = ConnectionStatus::Normal;
     let backend_status = if backend.is_none() {
       ConnectionStatus::Closed
@@ -60,7 +66,8 @@ impl<Front:SocketHandler> Pipe<Front> {
       backend_token:      None,
       front_buf,
       back_buf,
-      app_id:             None,
+      app_id,
+      backend_id,
       request_id,
       front_readiness:    Readiness {
                             interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
@@ -113,13 +120,21 @@ impl<Front:SocketHandler> Pipe<Front> {
   }
 
   pub fn set_app_id(&mut self, app_id: Option<String>) {
-    if let Some(ref app_id) = app_id {
-      self.log_ctx = format!("{} {}\t", self.request_id, app_id);
-    } else {
-      self.log_ctx = format!("{} unknown\t", self.request_id);
-    }
-
     self.app_id = app_id;
+    self.reset_log_context();
+  }
+
+  pub fn set_backend_id(&mut self, backend_id: Option<String>) {
+    self.backend_id = backend_id;
+    self.reset_log_context();
+  }
+
+  pub fn reset_log_context(&mut self) {
+    self.log_ctx = format!("{} {} {}\t",
+      self.request_id,
+      self.app_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),
+      self.backend_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-")
+      );
   }
 
   pub fn set_back_token(&mut self, token: Token) {
