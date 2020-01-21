@@ -100,7 +100,8 @@ impl Session {
       },
       None => {
         gauge_add!("protocol.tcp", 1);
-        let mut pipe = Pipe::new(s, frontend_token, request_id, app_id.clone(), backend_id.clone(), None, front_buf, back_buf, frontend_address, Protocol::TCP);
+        let mut pipe = Pipe::new(s, frontend_token, request_id, app_id.clone(), backend_id.clone(),
+          None, None, front_buf, back_buf, frontend_address, Protocol::TCP);
         pipe.set_app_id(app_id.clone());
         Some(State::Pipe(pipe))
       }

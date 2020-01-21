@@ -141,6 +141,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
       self.request_id,
       None,
       None,
+      None,
       backend_socket,
       front_buf,
       back_buf,

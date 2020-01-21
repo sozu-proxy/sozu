@@ -179,6 +179,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
       self.request_id,
       None,
       None,
+      None,
       Some(backend_socket),
       self.front_buf,
       back_buf,

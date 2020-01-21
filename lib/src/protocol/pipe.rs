@@ -33,6 +33,7 @@ pub struct Pipe<Front:SocketHandler> {
   pub app_id:         Option<String>,
   pub backend_id:     Option<String>,
   pub request_id:     Hyphenated,
+  pub websocket_context: Option<String>,
   pub front_readiness:Readiness,
   pub back_readiness: Readiness,
   pub log_ctx:        String,
@@ -44,7 +45,7 @@ pub struct Pipe<Front:SocketHandler> {
 
 impl<Front:SocketHandler> Pipe<Front> {
   pub fn new(frontend: Front, frontend_token: Token, request_id: Hyphenated,
-    app_id: Option<String>, backend_id: Option<String>,
+    app_id: Option<String>, backend_id: Option<String>, websocket_context: Option<String>,
     backend: Option<TcpStream>, front_buf: Checkout<Buffer>,
     back_buf: Checkout<Buffer>, session_address: Option<SocketAddr>, protocol: Protocol) -> Pipe<Front> {
     let log_ctx = format!("{} {} {}\t",
@@ -69,6 +70,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       app_id,
       backend_id,
       request_id,
+      websocket_context,
       front_readiness:    Readiness {
                             interest:  UnixReady::from(Ready::readable() | Ready::writable()) | UnixReady::hup() | UnixReady::error(),
                             event: UnixReady::from(Ready::empty()),
@@ -204,11 +206,11 @@ impl<Front:SocketHandler> Pipe<Front> {
 
     let proto = self.protocol_string();
 
-    info_access!("{}{} -> {}\t{} {} {} {}\t{}",
+    info_access!("{}{} -> {}\t{} {} {} {}\t{} {}",
       self.log_ctx, session, backend,
       LogDuration(response_time), LogDuration(service_time),
       metrics.bin, metrics.bout,
-      proto);
+      proto, self.websocket_context.as_ref().map(|s| s.as_str()).unwrap_or("-"));
   }
 
   pub fn log_request_error(&self, metrics: &SessionMetrics, message: &str) {
@@ -239,11 +241,11 @@ impl<Front:SocketHandler> Pipe<Front> {
 
     let proto = self.protocol_string();
 
-    error_access!("{}{} -> {}\t{} {} {} {}\t{} | {}",
+    error_access!("{}{} -> {}\t{} {} {} {}\t{} {} | {}",
       self.log_ctx, session, backend,
       LogDuration(response_time), LogDuration(service_time),
       metrics.bin, metrics.bout,
-      proto, message);
+      proto, self.websocket_context.as_ref().map(|s| s.as_str()).unwrap_or("-"), message);
   }
 
   pub fn check_connections(&self) -> bool {

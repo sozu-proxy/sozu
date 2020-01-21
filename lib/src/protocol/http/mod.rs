@@ -20,7 +20,7 @@ pub mod answers;
 
 use self::parser::{parse_request_until_stop, parse_response_until_stop,
   RequestState, ResponseState, Chunk, Continue, RRequestLine, RStatusLine,
-  compare_no_case};
+  Method, compare_no_case};
 
 #[derive(Clone)]
 pub struct StickySession {
@@ -416,6 +416,15 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn get_backend_address(&self) -> Option<SocketAddr> {
     self.backend.as_ref().and_then(|backend| backend.peer_addr().ok())
   }
+
+  pub fn websocket_context(&self) -> String {
+    let host         = self.get_host().unwrap_or("-");
+    let request_line = self.get_request_line().map(|line| (&line.method, line.uri.as_str())).unwrap_or((&Method::Get, "-"));
+    let status_line  = self.get_response_status().map(|line| (line.status, line.reason.as_str())).unwrap_or((0, "-"));
+
+    format!("{} {} {}\t{} {}", host, request_line.0, request_line.1, status_line.0, status_line.1)
+  }
+
 
   fn protocol_string(&self) -> &'static str {
     match self.protocol() {

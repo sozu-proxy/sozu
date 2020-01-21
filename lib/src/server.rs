@@ -461,7 +461,7 @@ impl Server {
           self.close_session(cl);
         }
 
-        info!("closed {} sessions", closing_tokens.len());
+        info!("closed {} sessions, {} sessions left", closing_tokens.len(), self.sessions.len());
 
         let count = self.sessions.len();
         if count <= self.base_sessions_count {

@@ -218,6 +218,7 @@ impl Session {
       debug!("https switching to wss");
       let front_token = self.frontend_token;
       let back_token  = unwrap_msg!(http.back_token());
+      let ws_context = http.websocket_context();
 
       let front_buf = match http.front_buf {
         Some(buf) => buf.buffer,
@@ -249,7 +250,7 @@ impl Session {
       gauge_add!("protocol.wss", 1);
 
       let mut pipe = Pipe::new(http.frontend, front_token, http.request_id, http.app_id, http.backend_id,
-        Some(unwrap_msg!(http.backend)), front_buf, back_buf, http.session_address, Protocol::HTTPS);
+        Some(ws_context), Some(unwrap_msg!(http.backend)), front_buf, back_buf, http.session_address, Protocol::HTTPS);
 
       pipe.front_readiness.event = http.front_readiness.event;
       pipe.back_readiness.event  = http.back_readiness.event;
