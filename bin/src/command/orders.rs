@@ -1063,7 +1063,7 @@ impl CommandServer {
                     ProxyRequestData::RemoveHttpFront(h) | ProxyRequestData::RemoveHttpsFront(h) => {
                         let msg = format!(
                             "cannot remove HTTP frontend: application {} has no frontends on {} for {} {}",
-                            h.app_id, h.address, h.hostname, h.path_begin,
+                            h.app_id, h.address, h.hostname, h.path,
                         );
                         error!("{}", msg);
                         self.answer_error(client_id, request_id, msg, None).await;

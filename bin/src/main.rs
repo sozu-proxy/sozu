@@ -1,7 +1,8 @@
 extern crate nom;
-#[macro_use] extern crate clap;
 #[macro_use] extern crate serde_derive;
 #[macro_use] extern crate lazy_static;
+#[macro_use] extern crate structopt_derive;
+#[macro_use] extern crate prettytable;
 #[macro_use] extern crate sozu_lib as sozu;
 #[macro_use] extern crate sozu_command_lib as sozu_command;
 
@@ -22,10 +23,11 @@ mod worker;
 mod upgrade;
 mod cli;
 mod util;
+mod ctl;
 
 use std::panic;
 use sozu_command::config::Config;
-use clap::ArgMatches;
+use structopt::StructOpt;
 
 #[cfg(target_os = "linux")]
 use libc::{cpu_set_t,pid_t};
@@ -49,13 +51,9 @@ pub enum StartupError {
 fn main() {
   register_panic_hook();
 
-  // Init parsing of arguments
-  let matches = cli::init();
-  // Check if we are upgrading workers or main
-  let upgrade = cli::upgrade_worker(&matches).or_else(|| cli::upgrade_main(&matches));
-            
-  // If we are not, then we want to start sozu
-  if upgrade == None {
+  let matches = cli::Sozu::from_args();
+
+  if let cli::SubCmd::Start = matches.cmd {
     match start(&matches) {
       Ok(_) => info!("main process stopped"), // Ok() is only called when the proxy exits
       Err(StartupError::ConfigurationFileNotSpecified) => {
@@ -80,10 +78,18 @@ fn main() {
         std::process::exit(1);
       }
     }
+  } else if let cli::SubCmd::Worker { fd, scm, configuration_state_fd, id, command_buffer_size, max_command_buffer_size } = matches.cmd {
+    let max_command_buffer_size = max_command_buffer_size.unwrap_or(command_buffer_size * 2);
+    worker::begin_worker_process(fd, scm, configuration_state_fd, id, command_buffer_size, max_command_buffer_size);
+  } else if let cli::SubCmd::Main { fd, upgrade_fd, command_buffer_size, max_command_buffer_size } = matches.cmd {
+    let max_command_buffer_size = max_command_buffer_size.unwrap_or(command_buffer_size * 2);
+    upgrade::begin_new_main_process(fd, upgrade_fd, command_buffer_size, max_command_buffer_size);
+  } else {
+    ctl::ctl(matches);
   }
 }
 
-fn start(matches: &ArgMatches) -> Result<(), StartupError> {
+fn start(matches: &cli::Sozu) -> Result<(), StartupError> {
 
   let config = load_configuration(get_config_file_path(&matches)?)?;
 
@@ -122,10 +128,9 @@ fn init_workers(config: &Config) -> Result<Vec<Worker>, StartupError> {
   }
 }
 
-fn get_config_file_path<'a>(matches: &'a ArgMatches<'a>) -> Result<&'a str, StartupError> {
-  let start_matches = matches.subcommand_matches("start").expect("unknown subcommand");
-  match start_matches.value_of("config") {
-    Some(config_file) => Ok(config_file),
+fn get_config_file_path(matches: &cli::Sozu) -> Result<&str, StartupError> {
+  match matches.config.as_ref() {
+    Some(config_file) => Ok(config_file.as_str()),
     None => option_env!("SOZU_CONFIG").ok_or(StartupError::ConfigurationFileNotSpecified)
   }
 }
