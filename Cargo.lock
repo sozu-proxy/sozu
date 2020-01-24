@@ -296,6 +296,7 @@ dependencies = [
  "libc",
  "num-integer",
  "num-traits",
+ "time 0.1.43",
  "winapi",
 ]
 
@@ -1121,6 +1122,17 @@ dependencies = [
 
 [[package]]
 name = "proc-macro-error"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aeccfe4d5d8ea175d5f0e4a2ad0637e0f4121d63bd99d356fb1f39ab2e7c6097"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
+name = "proc-macro-error"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da25490ff9892aab3fcf7c36f08cfb902dd3e71ca0f9f9517bea02a73a5ce38c"
@@ -1506,9 +1518,11 @@ dependencies = [
  "anyhow",
  "async-dup",
  "async-io",
+ "chrono",
  "clap",
  "futures",
  "futures-lite",
+ "hex",
  "jemallocator",
  "lazy_static",
  "libc",
@@ -1517,6 +1531,7 @@ dependencies = [
  "nix",
  "nom 7.0.0",
  "num_cpus",
+ "prettytable-rs",
  "rand",
  "regex",
  "serde",
@@ -1526,8 +1541,10 @@ dependencies = [
  "smol",
  "sozu-command-lib",
  "sozu-lib",
+ "structopt",
+ "structopt-derive 0.3.5",
  "tempfile",
- "time",
+ "time 0.2.27",
 ]
 
 [[package]]
@@ -1563,7 +1580,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "sha2",
- "time",
+ "time 0.2.27",
  "toml",
  "trailer",
 ]
@@ -1596,27 +1613,11 @@ dependencies = [
  "rusty_ulid",
  "slab",
  "sozu-command-lib",
- "time",
+ "time 0.2.27",
  "tiny_http",
  "ureq",
  "url",
  "webpki 0.22.0",
-]
-
-[[package]]
-name = "sozuctl"
-version = "0.13.6"
-dependencies = [
- "anyhow",
- "hex",
- "prettytable-rs",
- "rand",
- "serde",
- "serde_derive",
- "serde_json",
- "sozu-command-lib",
- "structopt",
- "structopt-derive",
 ]
 
 [[package]]
@@ -1703,7 +1704,20 @@ checksum = "69b041cdcb67226aca307e6e7be44c8806423d83e018bd662360a93dabce4d71"
 dependencies = [
  "clap",
  "lazy_static",
- "structopt-derive",
+ "structopt-derive 0.4.15",
+]
+
+[[package]]
+name = "structopt-derive"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea692d40005b3ceba90a9fe7a78fa8d4b82b0ce627eebbffc329aab850f3410e"
+dependencies = [
+ "heck",
+ "proc-macro-error 0.2.6",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -1713,7 +1727,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7813934aecf5f51a54775e00068c237de98489463968231a51746bbbc03f9c10"
 dependencies = [
  "heck",
- "proc-macro-error",
+ "proc-macro-error 1.0.4",
  "proc-macro2",
  "quote",
  "syn",
@@ -1777,6 +1791,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d326610f408c7a4eb6f51c37c330e496b08506c9457c9d34287ecc38809fb060"
 dependencies = [
  "unicode-width",
+]
+
+[[package]]
+name = "time"
+version = "0.1.43"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca8a50ef2360fbd1eeb0ecd46795a87a19024eb4b53c5dc916ca1fd95fe62438"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
