@@ -1,25 +1,14 @@
-#[macro_use] extern crate prettytable;
-extern crate rand;
-extern crate sozu_command_lib as sozu_command;
-extern crate structopt;
-#[macro_use] extern crate structopt_derive;
-extern crate serde;
-extern crate serde_json;
-#[macro_use] extern crate serde_derive;
-extern crate hex;
-
 mod command;
-mod cli;
 
 use std::io;
-use structopt::StructOpt;
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::command::{CommandRequest,CommandResponse};
 use sozu_command::proxy::ListenerType;
 
-use command::{add_application,remove_application,dump_state,load_state,
+use crate::cli::*;
+use self::command::{add_application,remove_application,dump_state,load_state,
   save_state, soft_stop, hard_stop, upgrade_master, status,metrics,
   remove_backend, add_backend, remove_http_frontend, add_http_frontend,
   remove_tcp_frontend, add_tcp_frontend, add_certificate, remove_certificate,
@@ -27,14 +16,12 @@ use command::{add_application,remove_application,dump_state,load_state,
   events, query_certificate, add_tcp_listener, add_http_listener, add_https_listener,
   remove_listener, activate_listener, deactivate_listener};
 
-use cli::*;
+pub fn ctl(matches: Sozu) {
 
-fn main() {
-  let matches = App::from_args();
-
-  let config_file = matches.config.or(option_env!("SOZU_CONFIG").map(|s| s.to_string())).expect("missing --config <configuration file> option");
-
-  let config  = Config::load_from_path(config_file.as_str()).expect("could not parse configuration file");
+  let config = matches.config.as_deref().or(option_env!("SOZU_CONFIG"))
+    .ok_or(std::io::Error::new(std::io::ErrorKind::InvalidInput, "configuration file path missing"))
+    .and_then(Config::load_from_path)
+    .expect("could not parse configuration file");
 
   // If the command is `config check` then exit because if we are here, the configuration is valid
   if let SubCmd::Config{ cmd: ConfigCmd::Check{} } = matches.cmd {
@@ -151,6 +138,9 @@ fn main() {
     },
     SubCmd::Config{ cmd: _ } => {}, // noop, handled at the beginning of the method
     SubCmd::Events => events(channel),
+    rest => {
+      panic!("that command should have been handled earlier: {:x?}", rest)
+    }
   }
 }
 

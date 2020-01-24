@@ -1,9 +1,11 @@
 #[macro_use] extern crate nom;
-#[macro_use] extern crate clap;
 #[macro_use] extern crate serde_derive;
 #[macro_use] extern crate lazy_static;
+#[macro_use] extern crate structopt_derive;
+#[macro_use] extern crate prettytable;
 extern crate mio;
 extern crate mio_uds;
+extern crate serde;
 extern crate serde_json;
 extern crate time;
 extern crate libc;
@@ -14,6 +16,9 @@ extern crate tempfile;
 extern crate futures;
 extern crate regex;
 extern crate jemallocator;
+extern crate chrono;
+extern crate structopt;
+extern crate hex;
 #[macro_use] extern crate sozu_lib as sozu;
 #[macro_use] extern crate sozu_command_lib as sozu_command;
 
@@ -31,11 +36,12 @@ mod logging;
 mod upgrade;
 mod util;
 mod cli;
+mod ctl;
 
 use std::env;
 use std::panic;
 use sozu_command::config::Config;
-use clap::ArgMatches;
+use structopt::StructOpt;
 
 #[cfg(target_os = "linux")]
 use libc::{cpu_set_t,pid_t};
@@ -59,14 +65,12 @@ fn main() {
   register_panic_hook();
 
   // Init parsing of arguments
-  let matches = cli::init();
-  // Check if we are upgrading workers or master
-  let upgrade = cli::upgrade_worker(&matches).or_else(|| cli::upgrade_master(&matches));
+  let matches = cli::Sozu::from_args();
 
   // If we are not, then we want to start sozu
-  if upgrade == None {
+  if let cli::SubCmd::Start = matches.cmd {
     let start = get_config_file_path(&matches)
-    .and_then(|config_file| load_configuration(config_file))
+    .and_then(load_configuration)
     .and_then(|config| {
       util::write_pid_file(&config)
         .map(|()| config)
@@ -113,6 +117,14 @@ fn main() {
         std::process::exit(1);
       }
     }
+  } else if let cli::SubCmd::Worker { fd, scm, configuration_state_fd, id, command_buffer_size, max_command_buffer_size } = matches.cmd {
+    let max_command_buffer_size = max_command_buffer_size.unwrap_or(command_buffer_size * 2);
+    worker::begin_worker_process(fd, scm, configuration_state_fd, id, command_buffer_size, max_command_buffer_size);
+  } else if let cli::SubCmd::Master { fd, upgrade_fd, command_buffer_size, max_command_buffer_size } = matches.cmd {
+    let max_command_buffer_size = max_command_buffer_size.unwrap_or(command_buffer_size * 2);
+    upgrade::begin_new_master_process(fd, upgrade_fd, command_buffer_size, max_command_buffer_size);
+  } else {
+    ctl::ctl(matches);
   }
 }
 
@@ -127,10 +139,9 @@ fn init_workers(config: &Config) -> Result<Vec<Worker>, StartupError> {
   }
 }
 
-fn get_config_file_path<'a>(matches: &'a ArgMatches<'a>) -> Result<&'a str, StartupError> {
-  let start_matches = matches.subcommand_matches("start").expect("unknown subcommand");
-  match start_matches.value_of("config") {
-    Some(config_file) => Ok(config_file),
+fn get_config_file_path(matches: &cli::Sozu) -> Result<&str, StartupError> {
+  match matches.config.as_ref() {
+    Some(config_file) => Ok(config_file.as_str()),
     None => option_env!("SOZU_CONFIG").ok_or(StartupError::ConfigurationFileNotSpecified)
   }
 }

@@ -88,7 +88,7 @@ pub fn start_new_master_process(executable_path: String, upgrade_data: UpgradeDa
     ForkResult::Child => {
       trace!("child({}):\twill spawn a child", unsafe { libc::getpid() });
       let res = Command::new(executable_path)
-        .arg("upgrade")
+        .arg("master")
         .arg("--fd")
         .arg(client.as_raw_fd().to_string())
         .arg("--upgrade-fd")
