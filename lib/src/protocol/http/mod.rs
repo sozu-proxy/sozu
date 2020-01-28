@@ -200,9 +200,10 @@ impl<Front:SocketHandler> Http<Front> {
 
   pub fn added_request_header(&self, public_address: Option<SocketAddr>, client_address: Option<SocketAddr>) -> String {
     let peer = client_address.or_else(|| self.front_socket().peer_addr().ok()).map(|addr| (addr.ip(), addr.port()));
-    let front = public_address.or_else(|| self.front_socket().local_addr().ok()).map(|addr| addr.ip());
-    let front_port = public_address.or_else(|| self.front_socket().local_addr().ok()).map(|addr| addr.port());
-    if let (Some((peer_ip, peer_port)), Some(front), Some(front_port)) = (peer, front, front_port) {
+    let front = public_address.or_else(|| self.front_socket().local_addr().ok())
+      .map(|addr| (addr.ip(), addr.port()));
+
+    if let (Some((peer_ip, peer_port)), Some((front, front_port))) = (peer, front) {
       let proto = match self.protocol() {
         Protocol::HTTP  => "http",
         Protocol::HTTPS => "https",

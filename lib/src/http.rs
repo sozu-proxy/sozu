@@ -75,8 +75,9 @@ impl Session {
       Some(State::Expect(ExpectProxyProtocol::new(sock, token, request_id)))
     } else {
       gauge_add!("protocol.http", 1);
+      let session_address = sock.peer_addr().ok();
       Http::new(sock, token, request_id, pool.clone(), public_address,
-        None, sticky_name.clone(), Protocol::HTTP).map(|http| State::Http(http))
+        session_address, sticky_name.clone(), Protocol::HTTP).map(|http| State::Http(http))
     };
 
     protocol.map(|pr| {
