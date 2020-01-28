@@ -60,6 +60,7 @@ impl<W: Write> MultiLineWriter<W> {
                 }
             }
         }
+        //println!("buf len {} last newline {}, written {}", self.buf.len(), self.last_newline, written);
         if written > 0 {
             //println!("FLUSHED: {}", ::std::str::from_utf8(&self.buf[..written]).unwrap());
             self.buf.drain(..written);
@@ -67,6 +68,8 @@ impl<W: Write> MultiLineWriter<W> {
 
         if flush_entire_buffer {
             self.last_newline = 0;
+        } else if written > self.last_newline {
+            self.last_newline = 0
         } else {
             self.last_newline -= written;
         }
