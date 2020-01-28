@@ -4,7 +4,7 @@ use std::str::FromStr;
 use std::cell::RefCell;
 use std::cmp::{self,Ord};
 use std::fmt::{Arguments,format};
-use std::io::{stdout,Stdout,Write,LineWriter};
+use std::io::{stdout,Stdout,Write,LineWriter,BufWriter};
 use std::net::{SocketAddr,UdpSocket};
 use std::net::TcpStream;
 use mio_uds::UnixDatagram;
@@ -194,7 +194,7 @@ pub enum LoggerBackend {
   Unix(UnixDatagram),
   Udp(UdpSocket, SocketAddr),
   Tcp(TcpStream),
-  File(LineWriter<File>),
+  File(::writer::MultiLineWriter<File>),
 }
 
 #[repr(usize)]

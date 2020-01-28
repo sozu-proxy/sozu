@@ -63,7 +63,7 @@ pub fn target_to_backend(target: &str) -> LoggerBackend {
   } else if target.starts_with("file://") {
     let path = Path::new(&target[7..]);
     match OpenOptions::new().create(true).append(true).open(path) {
-      Ok(file) => LoggerBackend::File(LineWriter::new(file)),
+      Ok(file) => LoggerBackend::File(sozu_command::writer::MultiLineWriter::new(file)),
       Err(e)   => {
         println!("invalid log target configuration: could not open file at {} (error: {:?})", &target[7..], e);
         LoggerBackend::Stdout(stdout())

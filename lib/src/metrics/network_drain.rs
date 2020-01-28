@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use mio::net::UdpSocket;
 use std::io::{self,LineWriter,Write,ErrorKind};
 use std::collections::HashMap;
+use sozu_command::writer::MultiLineWriter;
 
 use super::{Subscriber,MetricData,StoredMetricData};
 
@@ -39,7 +40,7 @@ impl Write for MetricSocket {
 pub struct NetworkDrain {
   queue:              VecDeque<MetricLine>,
   pub prefix:         String,
-  pub remote:         LineWriter<MetricSocket>,
+  pub remote:         MultiLineWriter<MetricSocket>,
   is_writable:        bool,
   data:               BTreeMap<String, StoredMetricData>,
   /// (app_id, key) -> metric
@@ -56,7 +57,7 @@ impl NetworkDrain {
     NetworkDrain {
       queue:  VecDeque::new(),
       prefix,
-      remote: LineWriter::with_capacity(2048, MetricSocket {
+      remote: MultiLineWriter::with_capacity(512, MetricSocket {
         addr, socket
       }),
       is_writable: true,
@@ -121,9 +122,9 @@ impl NetworkDrain {
 
           send_count += 1;
           if send_count >= 10 {
-            if let Err(e) = self.remote.flush() {
+            /*if let Err(e) = self.remote.flush() {
               error!("error flushing metrics socket: {:?}", e);
-            }
+            }*/
             send_count = 0;
           }
         },
@@ -147,9 +148,9 @@ impl NetworkDrain {
     }
     }
 
-    if let Err(e) = self.remote.flush() {
+    /*if let Err(e) = self.remote.flush() {
       error!("error flushing metrics socket: {:?}", e);
-    }
+    }*/
 
     if self.is_writable {
     for (ref key, ref mut stored_metric) in self.app_data.iter_mut().filter(|&(_, ref value)| value.updated && now.duration_since(value.last_sent) > secs) {
@@ -191,9 +192,9 @@ impl NetworkDrain {
 
           send_count += 1;
           if send_count >= 10 {
-            if let Err(e) = self.remote.flush() {
+            /*if let Err(e) = self.remote.flush() {
               error!("error flushing metrics socket: {:?}", e);
-            }
+            }*/
             send_count = 0;
           }
         },
@@ -217,9 +218,9 @@ impl NetworkDrain {
     }
     }
 
-    if let Err(e) = self.remote.flush() {
+    /*if let Err(e) = self.remote.flush() {
       error!("error flushing metrics socket: {:?}", e);
-    }
+    }*/
 
     if self.is_writable {
     for (ref key, ref mut stored_metric) in self.backend_data.iter_mut().filter(|&(_, ref value)| value.updated && now.duration_since(value.last_sent) > secs) {
@@ -261,9 +262,9 @@ impl NetworkDrain {
 
           send_count += 1;
           if send_count >= 10 {
-            if let Err(e) = self.remote.flush() {
+            /*if let Err(e) = self.remote.flush() {
               error!("error flushing metrics socket: {:?}", e);
-            }
+            }*/
             send_count = 0;
           }
         },
@@ -286,9 +287,9 @@ impl NetworkDrain {
       }
     }
     }
-    if let Err(e) = self.remote.flush() {
+    /*if let Err(e) = self.remote.flush() {
       error!("error flushing metrics socket: {:?}", e);
-    }
+    }*/
 
     if self.is_writable {
     for metric in self.queue.drain(..) {
@@ -327,9 +328,9 @@ impl NetworkDrain {
         Ok(()) => {
           send_count += 1;
           if send_count >= 10 {
-            if let Err(e) = self.remote.flush() {
+            /*if let Err(e) = self.remote.flush() {
               error!("error flushing metrics socket: {:?}", e);
-            }
+            }*/
             send_count = 0;
           }
         },
@@ -352,9 +353,9 @@ impl NetworkDrain {
       }
     }
 
-    if let Err(e) = self.remote.flush() {
+    /*if let Err(e) = self.remote.flush() {
       error!("error flushing metrics socket: {:?}", e);
-    }
+    }*/
     }
   }
 }

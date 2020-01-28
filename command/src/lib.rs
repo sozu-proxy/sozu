@@ -24,3 +24,4 @@ pub mod proxy;
 pub mod channel;
 pub mod buffer;
 pub mod scm_socket;
+pub mod writer;
