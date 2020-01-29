@@ -9,7 +9,7 @@ pub struct MultiLineWriter<W: Write> {
 
 impl<W: Write> MultiLineWriter<W> {
     pub fn new(inner: W) -> MultiLineWriter<W> {
-        MultiLineWriter::with_capacity(1024, inner)
+        MultiLineWriter::with_capacity(4096, inner)
     }
 
     pub fn with_capacity(capacity: usize, inner: W) -> MultiLineWriter<W> {
