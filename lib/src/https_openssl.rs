@@ -69,7 +69,7 @@ pub struct Session {
   backend:            Option<Rc<RefCell<Backend>>>,
   back_connected:     BackendConnectionStatus,
   protocol:           Option<State>,
-  public_address:     Option<SocketAddr>,
+  public_address:     SocketAddr,
   ssl:                Option<Ssl>,
   pool:               Weak<RefCell<Pool<Buffer>>>,
   sticky_name:        String,
@@ -85,7 +85,7 @@ pub struct Session {
 
 impl Session {
   pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
-    public_address: Option<SocketAddr>, expect_proxy: bool, sticky_name: String,
+    public_address: SocketAddr, expect_proxy: bool, sticky_name: String,
     timeout: Timeout, answers: Rc<RefCell<HttpAnswers>>, listen_token: Token) -> Session {
 
     let peer_address = if expect_proxy {
@@ -163,7 +163,7 @@ impl Session {
       debug!("switching to TLS handshake");
       if let Some(ref addresses) = expect.addresses {
         if let (Some(public_address), Some(session_address)) = (addresses.destination(), addresses.source()) {
-          self.public_address = Some(public_address);
+          self.public_address = public_address;
           self.peer_address = Some(session_address);
 
           let ExpectProxyProtocol { frontend, readiness, request_id, .. } = expect;
@@ -1424,7 +1424,8 @@ impl ProxyConfiguration<Session> for Proxy {
         }
 
         let c = Session::new(ssl, frontend_sock, session_token, Rc::downgrade(&self.pool),
-        listener.config.public_address, listener.config.expect_proxy, listener.config.sticky_name.clone(),
+          listener.config.public_address.unwrap_or(listener.config.front),
+          listener.config.expect_proxy, listener.config.sticky_name.clone(),
           timeout, listener.answers.clone(), Token(token.0));
 
         Ok((Rc::new(RefCell::new(c)), false))

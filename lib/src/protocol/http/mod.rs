@@ -74,7 +74,7 @@ pub struct Http<Front:SocketHandler> {
   pub front_readiness:Readiness,
   pub back_readiness: Readiness,
   pub log_ctx:        String,
-  pub public_address: Option<SocketAddr>,
+  pub public_address: SocketAddr,
   pub session_address: Option<SocketAddr>,
   pub sticky_name:    String,
   pub sticky_session: Option<StickySession>,
@@ -91,7 +91,7 @@ pub struct Http<Front:SocketHandler> {
 
 impl<Front:SocketHandler> Http<Front> {
   pub fn new(sock: Front, token: Token, request_id: Hyphenated, pool: Weak<RefCell<Pool<Buffer>>>,
-    public_address: Option<SocketAddr>, session_address: Option<SocketAddr>, sticky_name: String,
+    public_address: SocketAddr, session_address: Option<SocketAddr>, sticky_name: String,
     protocol: Protocol) -> Option<Http<Front>> {
 
     let log_ctx    = format!("{} - -\t", &request_id);
@@ -198,12 +198,11 @@ impl<Front:SocketHandler> Http<Front> {
 
   }
 
-  pub fn added_request_header(&self, public_address: Option<SocketAddr>, client_address: Option<SocketAddr>) -> String {
+  pub fn added_request_header(&self, public_address: SocketAddr, client_address: Option<SocketAddr>) -> String {
     let peer = client_address.or_else(|| self.front_socket().peer_addr().ok()).map(|addr| (addr.ip(), addr.port()));
-    let front = public_address.or_else(|| self.front_socket().local_addr().ok())
-      .map(|addr| (addr.ip(), addr.port()));
+    let front = (public_address.ip(), public_address.port());
 
-    if let (Some((peer_ip, peer_port)), Some((front, front_port))) = (peer, front) {
+    if let (Some((peer_ip, peer_port)), (front, front_port)) = (peer, front) {
       let proto = match self.protocol() {
         Protocol::HTTP  => "http",
         Protocol::HTTPS => "https",

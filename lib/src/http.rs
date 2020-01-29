@@ -66,7 +66,7 @@ pub struct Session {
 
 impl Session {
   pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
-    public_address: Option<SocketAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout,
+    public_address: SocketAddr, expect_proxy: bool, sticky_name: String, timeout: Timeout,
     answers: Rc<RefCell<HttpAnswers>>, listen_token: Token) -> Option<Session> {
     let request_id = Uuid::new_v4().to_hyphenated();
     let protocol = if expect_proxy {
@@ -159,7 +159,7 @@ impl Session {
         (add.destination(), add.source())
       }) {
         let http = Http::new(expect.frontend, expect.frontend_token, expect.request_id,
-          self.pool.clone(), Some(public_address), Some(client_address),
+          self.pool.clone(), public_address, Some(client_address),
           self.sticky_name.clone(), Protocol::HTTP).map(|mut http| {
             http.front_readiness.event = readiness.event;
 
@@ -1228,7 +1228,8 @@ impl ProxyConfiguration<Session> for Proxy {
         error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
       }
       if let Some(c) = Session::new(frontend_sock, session_token, Rc::downgrade(&self.pool),
-      listener.config.public_address, listener.config.expect_proxy, listener.config.sticky_name.clone(), timeout,
+      listener.config.public_address.unwrap_or(listener.config.front),
+      listener.config.expect_proxy, listener.config.sticky_name.clone(), timeout,
       listener.answers.clone(), listener.token) {
         if let Err(e) = poll.register(
           c.front_socket(),

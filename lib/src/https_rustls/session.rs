@@ -38,7 +38,7 @@ pub struct Session {
   pub backend:        Option<Rc<RefCell<Backend>>>,
   pub back_connected: BackendConnectionStatus,
   protocol:           Option<State>,
-  pub public_address: Option<SocketAddr>,
+  pub public_address: SocketAddr,
   pool:               Weak<RefCell<Pool<Buffer>>>,
   pub metrics:        SessionMetrics,
   pub app_id:         Option<String>,
@@ -53,7 +53,7 @@ pub struct Session {
 
 impl Session {
   pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
-    public_address: Option<SocketAddr>, expect_proxy: bool, sticky_name: String, timeout: Timeout,
+    public_address: SocketAddr, expect_proxy: bool, sticky_name: String, timeout: Timeout,
     answers: Rc<RefCell<HttpAnswers>>, listen_token: Token) -> Session {
     let peer_address = if expect_proxy {
       // Will be defined later once the expect proxy header has been received and parsed
@@ -128,7 +128,7 @@ impl Session {
       debug!("switching to TLS handshake");
       if let Some(ref addresses) = expect.addresses {
         if let (Some(public_address), Some(session_address)) = (addresses.destination(), addresses.source()) {
-          self.public_address = Some(public_address);
+          self.public_address = public_address;
           self.peer_address = Some(session_address);
 
           let ExpectProxyProtocol {

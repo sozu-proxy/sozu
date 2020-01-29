@@ -470,7 +470,8 @@ impl ProxyConfiguration<Session> for Proxy {
         }
 
         let session = ServerSession::new(&listener.ssl_config);
-        let c = Session::new(session, frontend_sock, session_token, Rc::downgrade(&self.pool), listener.config.public_address,
+        let c = Session::new(session, frontend_sock, session_token, Rc::downgrade(&self.pool),
+          listener.config.public_address.unwrap_or(listener.config.front),
           listener.config.expect_proxy, listener.config.sticky_name.clone(), timeout, listener.answers.clone(), Token(token.0));
 
         Ok((Rc::new(RefCell::new(c)), false))
