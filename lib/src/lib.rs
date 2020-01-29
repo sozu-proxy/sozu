@@ -179,6 +179,7 @@ extern crate quickcheck;
 #[cfg(feature = "use-openssl")]
 extern crate openssl_sys;
 extern crate chrono;
+extern crate iovec;
 
 #[macro_use] pub mod util;
 #[macro_use] pub mod metrics;

@@ -821,7 +821,14 @@ impl<Front:SocketHandler> Http<Front> {
         metrics.bout += sz;
         return SessionResult::Continue;
       }
-      let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.as_ref().unwrap().next_output_data());
+      //let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.as_ref().unwrap().next_output_data());
+      let (current_sz, current_res) = if self.frontend.has_vectored_writes() {
+        let bufs = self.back_buf.as_ref().unwrap().as_iovec();
+        self.frontend.socket_write_vectored(&bufs)
+      } else {
+        self.frontend.socket_write(self.back_buf.as_ref().unwrap().next_output_data())
+      };
+
       res = current_res;
       self.back_buf.as_mut().unwrap().consume_output_data(current_sz);
       sz += current_sz;
@@ -985,7 +992,12 @@ impl<Front:SocketHandler> Http<Front> {
           metrics.backend_bout += sz;
           return SessionResult::Continue;
         }
+        /*
         let (current_sz, current_res) = sock.socket_write(self.front_buf.as_ref().unwrap().next_output_data());
+        */
+        let bufs = self.front_buf.as_ref().unwrap().as_iovec();
+        let (current_sz, current_res) = sock.socket_write_vectored(&bufs);
+        //println!("vectored io returned {:?}", (current_sz, current_res));
         socket_res = current_res;
         self.front_buf.as_mut().unwrap().consume_output_data(current_sz);
         sz += current_sz;

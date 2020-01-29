@@ -29,6 +29,10 @@ pub enum TransportProtocol {
 pub trait SocketHandler {
   fn socket_read(&mut self,  buf: &mut[u8]) -> (usize, SocketResult);
   fn socket_write(&mut self, buf: &[u8])    -> (usize, SocketResult);
+  fn socket_write_vectored(&mut self,  buf: &[&iovec::IoVec]) -> (usize, SocketResult) {
+    unimplemented!()
+  }
+  fn has_vectored_writes(&self) -> bool { false }
   fn socket_ref(&self) -> &TcpStream;
   fn protocol(&self) -> TransportProtocol;
 }
@@ -84,6 +88,28 @@ impl SocketHandler for TcpStream {
       }
     }
   }
+
+  fn socket_write_vectored(&mut self,  bufs: &[&iovec::IoVec]) -> (usize, SocketResult) {
+    match self.write_bufs(bufs) {
+      Ok(0)  => return (0, SocketResult::Continue),
+      Ok(sz) => return (sz, SocketResult::Continue),
+      Err(e) => match e.kind() {
+        ErrorKind::WouldBlock => return (0, SocketResult::WouldBlock),
+        ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe => {
+          incr!("tcp.write.error");
+          return (0, SocketResult::Closed)
+        },
+        _ => {
+          //FIXME: timeout and other common errors should be sent up
+          error!("SOCKET\tsocket_write error={:?}", e);
+          incr!("tcp.write.error");
+          return (0, SocketResult::Error)
+        },
+      }
+    }
+  }
+
+  fn has_vectored_writes(&self) -> bool { true }
 
   fn socket_ref(&self) -> &TcpStream { self }
 
