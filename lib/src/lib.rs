@@ -607,11 +607,13 @@ impl SessionMetrics {
   }
 
   pub fn service_start(&mut self) {
+    let now = SteadyTime::now();
+
     if self.start.is_none() {
-      self.start = Some(SteadyTime::now());
+      self.start = Some(now);
     }
 
-    self.service_start = Some(SteadyTime::now());
+    self.service_start = Some(now);
   }
 
   pub fn service_stop(&mut self) {
