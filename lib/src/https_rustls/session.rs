@@ -54,7 +54,7 @@ pub struct Session {
 impl Session {
   pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: SocketAddr, expect_proxy: bool, sticky_name: String, timeout: Timeout,
-    answers: Rc<RefCell<HttpAnswers>>, listen_token: Token) -> Session {
+    answers: Rc<RefCell<HttpAnswers>>, listen_token: Token, delay: Duration) -> Session {
     let peer_address = if expect_proxy {
       // Will be defined later once the expect proxy header has been received and parsed
       None
@@ -72,6 +72,8 @@ impl Session {
       Some(State::Handshake(TlsHandshake::new(ssl, sock, request_id)))
     };
 
+    let metrics = SessionMetrics::new(Some(delay));
+
     let mut session = Session {
       frontend_token: token,
       backend:        None,
@@ -79,7 +81,7 @@ impl Session {
       protocol:       state,
       public_address,
       pool,
-      metrics:        SessionMetrics::new(),
+      metrics,
       app_id:         None,
       sticky_name,
       timeout,
@@ -584,6 +586,7 @@ impl ProxySession for Session {
   fn process_events(&mut self, token: Token, events: Ready) {
     trace!("token {:?} got event {}", token, super::super::unix_ready_to_string(UnixReady::from(events)));
     self.last_event = SteadyTime::now();
+    self.metrics.wait_start();
 
     if self.frontend_token == token {
       self.front_readiness().event = self.front_readiness().event | UnixReady::from(events);

@@ -202,7 +202,7 @@ mod expect_test {
       }
     }
 
-    let mut session_metrics = SessionMetrics::new();
+    let mut session_metrics = SessionMetrics::new(None);
     let mut expect_pp = ExpectProxyProtocol::new(session_stream, Token(0),
       Uuid::new_v4().to_hyphenated());
 

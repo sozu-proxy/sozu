@@ -71,8 +71,10 @@ pub struct Session {
 }
 
 impl Session {
-  fn new(sock: TcpStream, frontend_token: Token, accept_token: Token, front_buf: Checkout<Buffer>,
-    back_buf: Checkout<Buffer>, app_id: Option<String>, backend_id: Option<String>, proxy_protocol: Option<ProxyProtocolConfig>, timeout: Timeout) -> Session {
+  fn new(sock: TcpStream, frontend_token: Token, accept_token: Token,
+    front_buf: Checkout<Buffer>, back_buf: Checkout<Buffer>, app_id: Option<String>,
+    backend_id: Option<String>, proxy_protocol: Option<ProxyProtocolConfig>,
+    timeout: Timeout, delay: Duration) -> Session {
     let s = sock.try_clone().expect("could not clone the socket");
     let frontend_address = sock.peer_addr().ok();
     let mut frontend_buffer = None;
@@ -107,6 +109,7 @@ impl Session {
       }
     };
 
+    let metrics = SessionMetrics::new(Some(delay));
 
     Session {
       sock,
@@ -118,7 +121,7 @@ impl Session {
       request_id,
       app_id,
       backend_id,
-      metrics:            SessionMetrics::new(),
+      metrics,
       protocol,
       front_buf:          frontend_buffer,
       back_buf:           backend_buffer,
@@ -553,6 +556,7 @@ impl ProxySession for Session {
   fn process_events(&mut self, token: Token, events: Ready) {
     trace!("token {:?} got event {}", token, super::unix_ready_to_string(UnixReady::from(events)));
     self.last_event = SteadyTime::now();
+    self.metrics.wait_start();
 
     if self.frontend_token == token {
       self.front_readiness().event = self.front_readiness().event | UnixReady::from(events);
@@ -989,7 +993,7 @@ impl ProxyConfiguration<Session> for Proxy {
     }
   }
 
-  fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout)
+  fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout, delay: Duration)
     -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
     let internal_token = Token(token.0);
     if let Some(listener) = self.listeners.get_mut(&internal_token) {
@@ -1009,7 +1013,8 @@ impl ProxyConfiguration<Session> for Proxy {
           error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
         }
         let c = Session::new(frontend_sock, session_token, internal_token,
-          front_buf, back_buf, listener.app_id.clone(), None, proxy_protocol.clone(), timeout);
+          front_buf, back_buf, listener.app_id.clone(), None, proxy_protocol.clone(), timeout,
+          delay);
         incr!("tcp.requests");
 
         if let Err(e) = poll.register(

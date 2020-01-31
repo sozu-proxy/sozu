@@ -86,7 +86,8 @@ pub struct Session {
 impl Session {
   pub fn new(ssl:Ssl, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: SocketAddr, expect_proxy: bool, sticky_name: String,
-    timeout: Timeout, answers: Rc<RefCell<HttpAnswers>>, listen_token: Token) -> Session {
+    timeout: Timeout, answers: Rc<RefCell<HttpAnswers>>, listen_token: Token,
+    delay: Duration) -> Session {
 
     let peer_address = if expect_proxy {
       // Will be defined later once the expect proxy header has been received and parsed
@@ -105,6 +106,8 @@ impl Session {
       Some(State::Handshake(TlsHandshake::new(ssl, sock, request_id, peer_address.clone())))
     };
 
+    let metrics = SessionMetrics::new(Some(delay));
+
     let mut session = Session {
       frontend_token:     token,
       backend:            None,
@@ -114,7 +117,7 @@ impl Session {
       ssl:                None,
       pool,
       sticky_name,
-      metrics:            SessionMetrics::new(),
+      metrics,
       app_id:             None,
       timeout,
       last_event:         SteadyTime::now(),
@@ -590,6 +593,7 @@ impl ProxySession for Session {
   fn process_events(&mut self, token: Token, events: Ready) {
     trace!("token {:?} got event {}", token, super::unix_ready_to_string(UnixReady::from(events)));
     self.last_event = SteadyTime::now();
+    self.metrics.wait_start();
 
     if self.frontend_token == token {
       self.front_readiness().event = self.front_readiness().event | UnixReady::from(events);
@@ -1407,7 +1411,7 @@ impl ProxyConfiguration<Session> for Proxy {
     self.listeners.get_mut(&Token(token.0)).unwrap().accept(token)
   }
 
-  fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout)
+  fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout, delay: Duration)
     -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
     if let Some(ref listener) = self.listeners.get(&Token(token.0)) {
       if let Err(e) = frontend_sock.set_nodelay(true) {
@@ -1426,7 +1430,7 @@ impl ProxyConfiguration<Session> for Proxy {
         let c = Session::new(ssl, frontend_sock, session_token, Rc::downgrade(&self.pool),
           listener.config.public_address.unwrap_or(listener.config.front),
           listener.config.expect_proxy, listener.config.sticky_name.clone(),
-          timeout, listener.answers.clone(), Token(token.0));
+          timeout, listener.answers.clone(), Token(token.0), delay);
 
         Ok((Rc::new(RefCell::new(c)), false))
       } else {

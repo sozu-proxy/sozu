@@ -282,7 +282,7 @@ pub trait ProxyConfiguration<Session> {
     back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse;
   fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
-  fn create_session(&mut self, socket: TcpStream, token: ListenToken, event_loop: &mut Poll, session_token: Token, timeout: Timeout)
+  fn create_session(&mut self, socket: TcpStream, token: ListenToken, event_loop: &mut Poll, session_token: Token, timeout: Timeout, delay: Duration)
     -> Result<(Rc<RefCell<Session>>, bool), AcceptError>;
   fn listen_port_state(&self, port: &u16) -> ListenPortState;
 }
@@ -560,6 +560,8 @@ pub struct SessionMetrics {
   pub start:        Option<SteadyTime>,
   /// time actually spent handling the request
   pub service_time: Duration,
+  /// time spent waiting for its turn
+  pub wait_time:    Duration,
   /// bytes received by the frontend
   pub bin:          usize,
   /// bytes sent by the frontend
@@ -567,6 +569,7 @@ pub struct SessionMetrics {
 
   /// date at which we started working on the request
   pub service_start: Option<SteadyTime>,
+  pub wait_start:    SteadyTime,
 
   pub backend_id:    Option<String>,
   pub backend_start: Option<SteadyTime>,
@@ -577,13 +580,15 @@ pub struct SessionMetrics {
 }
 
 impl SessionMetrics {
-  pub fn new() -> SessionMetrics {
+  pub fn new(delay: Option<Duration>) -> SessionMetrics {
     SessionMetrics {
       start:         Some(SteadyTime::now()),
       service_time:  Duration::seconds(0),
+      wait_time:     delay.unwrap_or_else(|| Duration::seconds(0)),
       bin:           0,
       bout:          0,
       service_start: None,
+      wait_start:    SteadyTime::now(),
       backend_id:    None,
       backend_start: None,
       backend_connected: None,
@@ -596,6 +601,7 @@ impl SessionMetrics {
   pub fn reset(&mut self) {
     self.start         = None;
     self.service_time  = Duration::seconds(0);
+    self.wait_time     = Duration::seconds(0);
     self.bin           = 0;
     self.bout          = 0;
     self.service_start = None;
@@ -614,6 +620,8 @@ impl SessionMetrics {
     }
 
     self.service_start = Some(now);
+    let prev = self.wait_time;
+    self.wait_time = self.wait_time + (now - self.wait_start);
   }
 
   pub fn service_stop(&mut self) {
@@ -622,6 +630,10 @@ impl SessionMetrics {
       let duration = SteadyTime::now() - start;
       self.service_time = self.service_time + duration;
     }
+  }
+
+  pub fn wait_start(&mut self) {
+    self.wait_start = SteadyTime::now();
   }
 
   pub fn service_time(&self) -> Duration {

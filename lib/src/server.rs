@@ -903,7 +903,7 @@ impl Server {
     }
   }
 
-  pub fn create_session_tcp(&mut self, token: ListenToken, socket: TcpStream) -> bool {
+  pub fn create_session_tcp(&mut self, token: ListenToken, socket: TcpStream, delay: time::Duration) -> bool {
     if self.nb_connections == self.max_connections {
       error!("max number of session connection reached, flushing the accept queue");
       self.can_accept = false;
@@ -923,7 +923,7 @@ impl Server {
         let session_token = Token(entry.index().0);
         let index = entry.index();
         let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
-        match self.tcp.create_session(socket, token, &mut self.poll, session_token, timeout) {
+        match self.tcp.create_session(socket, token, &mut self.poll, session_token, timeout, delay) {
           Ok((session, should_connect)) => {
             entry.insert(session);
             self.nb_connections += 1;
@@ -957,7 +957,7 @@ impl Server {
     true
   }
 
-  pub fn create_session_http(&mut self, token: ListenToken, socket: TcpStream) -> bool {
+  pub fn create_session_http(&mut self, token: ListenToken, socket: TcpStream, delay: time::Duration) -> bool {
     if self.nb_connections == self.max_connections {
       error!("max number of session connection reached, flushing the accept queue");
       self.can_accept = false;
@@ -975,7 +975,7 @@ impl Server {
       Some(entry) => {
         let session_token = Token(entry.index().0);
         let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
-        match self.http.create_session(socket, token, &mut self.poll, session_token, timeout) {
+        match self.http.create_session(socket, token, &mut self.poll, session_token, timeout, delay) {
           Ok((session, _)) => {
             entry.insert(session);
             self.nb_connections += 1;
@@ -1001,7 +1001,7 @@ impl Server {
     }
   }
 
-  pub fn create_session_https(&mut self, token: ListenToken, socket: TcpStream) -> bool {
+  pub fn create_session_https(&mut self, token: ListenToken, socket: TcpStream, delay: time::Duration) -> bool {
     if self.nb_connections == self.max_connections {
       error!("max number of session connection reached, flushing the accept queue");
       self.can_accept = false;
@@ -1019,7 +1019,7 @@ impl Server {
       Some(entry) => {
         let session_token = Token(entry.index().0);
         let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
-        match self.https.create_session(socket, token, &mut self.poll, session_token, timeout) {
+        match self.https.create_session(socket, token, &mut self.poll, session_token, timeout, delay) {
           Ok((session, _)) => {
             entry.insert(session);
             self.nb_connections += 1;
@@ -1113,17 +1113,17 @@ impl Server {
         //FIXME: check the timestamp
         match protocol {
           Protocol::TCPListen   => {
-            if !self.create_session_tcp(token, sock) {
+            if !self.create_session_tcp(token, sock, delay) {
               break;
             }
           },
           Protocol::HTTPListen  => {
-            if !self.create_session_http(token, sock) {
+            if !self.create_session_http(token, sock, delay) {
               break;
             }
           },
           Protocol::HTTPSListen => {
-            if !self.create_session_https(token, sock) {
+            if !self.create_session_https(token, sock, delay) {
               break;
             }
           },
@@ -1464,12 +1464,14 @@ impl HttpsProvider {
     }
   }
 
-  pub fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<ProxySessionCast>>,bool), AcceptError> {
+  pub fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken,
+    poll: &mut Poll, session_token: Token, timeout: Timeout, delay: time::Duration)
+    -> Result<(Rc<RefCell<ProxySessionCast>>,bool), AcceptError> {
     match self {
-      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.create_session(frontend_sock, token, poll, session_token, timeout).map(|(r,b)| {
+      &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.create_session(frontend_sock, token, poll, session_token, timeout, delay).map(|(r,b)| {
         (r as Rc<RefCell<ProxySessionCast>>, b)
       }),
-      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.create_session(frontend_sock, token, poll, session_token, timeout).map(|(r,b)| {
+      &mut HttpsProvider::Openssl(ref mut openssl) => openssl.create_session(frontend_sock, token, poll, session_token, timeout, delay).map(|(r,b)| {
         (r as Rc<RefCell<ProxySessionCast>>, b)
       }),
     }
@@ -1535,9 +1537,11 @@ impl HttpsProvider {
     rustls.accept(token)
   }
 
-  pub fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout) -> Result<(Rc<RefCell<Session>>,bool), AcceptError> {
+  pub fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken,
+    poll: &mut Poll, session_token: Token, timeout: Timeout, delay: time::Duration)
+    -> Result<(Rc<RefCell<Session>>,bool), AcceptError> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
-    rustls.create_session(frontend_sock, token, poll, session_token, timeout)
+    rustls.create_session(frontend_sock, token, poll, session_token, timeout, delay)
   }
 
   pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_session: Rc<RefCell<ProxySessionCast>>, back_token: Token)

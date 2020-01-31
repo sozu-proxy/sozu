@@ -440,6 +440,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
+    let wait_time  = metrics.wait_time;
 
     let app_id = OptionalString::new(self.app_id.as_ref().map(|s| s.as_str()));
     time!("request_time", app_id.as_str(), response_time.num_milliseconds());

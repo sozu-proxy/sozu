@@ -222,7 +222,7 @@ mod send_test {
 
     let mut send_pp = SendProxyProtocol::new(client_stream, Token(0),
       Uuid::new_v4().to_hyphenated(), Some(backend_stream));
-    let mut session_metrics = SessionMetrics::new();
+    let mut session_metrics = SessionMetrics::new(None);
 
     send_pp.set_back_connected(BackendConnectionStatus::Connected);
 

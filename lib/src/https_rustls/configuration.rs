@@ -14,6 +14,7 @@ use std::str::from_utf8_unchecked;
 use rustls::{ServerConfig, ServerSession, NoClientAuth, ProtocolVersion,
   ALL_CIPHERSUITES};
 use mio_extras::timer::Timeout;
+use time::Duration;
 
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,
@@ -453,7 +454,8 @@ impl ProxyConfiguration<Session> for Proxy {
     self.listeners.get_mut(&Token(token.0)).unwrap().accept(token)
   }
 
-  fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken, poll: &mut Poll, session_token: Token, timeout: Timeout)
+  fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken,
+    poll: &mut Poll, session_token: Token, timeout: Timeout, delay: Duration)
     -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
       if let Some(ref listener) = self.listeners.get(&Token(token.0)) {
         if let Err(e) = frontend_sock.set_nodelay(true) {
@@ -472,7 +474,8 @@ impl ProxyConfiguration<Session> for Proxy {
         let session = ServerSession::new(&listener.ssl_config);
         let c = Session::new(session, frontend_sock, session_token, Rc::downgrade(&self.pool),
           listener.config.public_address.unwrap_or(listener.config.front),
-          listener.config.expect_proxy, listener.config.sticky_name.clone(), timeout, listener.answers.clone(), Token(token.0));
+          listener.config.expect_proxy, listener.config.sticky_name.clone(),
+          timeout, listener.answers.clone(), Token(token.0), delay);
 
         Ok((Rc::new(RefCell::new(c)), false))
       } else {
