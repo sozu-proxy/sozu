@@ -73,7 +73,6 @@ pub struct Http<Front:SocketHandler> {
   pub backend_id:     Option<String>,
   pub front_readiness:Readiness,
   pub back_readiness: Readiness,
-  pub log_ctx:        String,
   pub public_address: SocketAddr,
   pub session_address: Option<SocketAddr>,
   pub sticky_name:    String,
@@ -94,7 +93,6 @@ impl<Front:SocketHandler> Http<Front> {
     public_address: SocketAddr, session_address: Option<SocketAddr>, sticky_name: String,
     protocol: Protocol) -> Option<Http<Front>> {
 
-    let log_ctx    = format!("{} - -\t", &request_id);
     let mut session = Http {
       frontend:           sock,
       backend:            None,
@@ -108,7 +106,6 @@ impl<Front:SocketHandler> Http<Front> {
       backend_id:         None,
       front_readiness:    Readiness::new(),
       back_readiness:     Readiness::new(),
-      log_ctx,
       public_address,
       session_address,
       sticky_name,
@@ -150,16 +147,15 @@ impl<Front:SocketHandler> Http<Front> {
 
     self.back_buf = None;
     self.request_id = request_id;
-    self.reset_log_context();
     self.keepalive_count += 1;
   }
 
-  pub fn reset_log_context(&mut self) {
-    self.log_ctx = format!("{} {} {}\t",
-      self.request_id,
-      self.app_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),
-      self.backend_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-")
-      );
+  pub fn log_context(&self) -> LogContext {
+    LogContext {
+      request_id: self.request_id,
+      app_id: self.app_id.as_deref(),
+      backend_id: self.backend_id.as_deref(),
+    }
   }
 
   fn tokens(&self) -> Option<(Token,Token)> {
@@ -278,26 +274,16 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn close(&mut self) {
   }
 
-  pub fn log_context(&self) -> String {
-    if let Some(ref app_id) = self.app_id {
-      format!("{}\t{}\t", self.request_id, app_id)
-    } else {
-      format!("{}\tunknown\t", self.request_id)
-    }
-  }
-
   pub fn set_back_socket(&mut self, socket: TcpStream) {
     self.backend         = Some(socket);
   }
 
   pub fn set_app_id(&mut self, app_id: String) {
     self.app_id  = Some(app_id);
-    self.reset_log_context();
   }
 
   pub fn set_backend_id(&mut self, backend_id: String) {
     self.backend_id = Some(backend_id);
-    self.reset_log_context();
   }
 
   pub fn set_back_token(&mut self, token: Token) {
@@ -352,7 +338,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn remove_backend(&mut self) -> (Option<String>, Option<SocketAddr>) {
-    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.log_ctx, self.frontend_token.0,
+    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.log_context(), self.frontend_token.0,
       self.backend_token.map(|t| format!("{}", t.0)).unwrap_or_else(|| "-".to_string()));
     let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
     self.backend       = None;
@@ -469,7 +455,7 @@ impl<Front:SocketHandler> Http<Front> {
     let proto = self.protocol_string();
 
     info_access!("{}{} -> {}\t{} {} {} {}\t{} {} {}\t{}",
-      self.log_ctx, session, backend,
+      self.log_context(), session, backend,
       LogDuration(response_time), LogDuration(service_time),
       metrics.bin, metrics.bout,
       proto, host, request_line, status_line);
@@ -503,7 +489,7 @@ impl<Front:SocketHandler> Http<Front> {
     let proto = self.protocol_string();
 
     info_access!("{}{} -> X\t{} {} {} {}\t{} {} {}\t{}",
-      self.log_ctx, session,
+      self.log_context(), session,
       LogDuration(response_time), LogDuration(service_time),
       metrics.bin, metrics.bout,
       proto, host, request_line, status_line);
@@ -538,7 +524,7 @@ impl<Front:SocketHandler> Http<Front> {
     let proto = self.protocol_string();
 
     error_access!("{}{} -> {}\t{} {} {} {}\t{} {} {}\t{} | {}",
-      self.log_ctx, session, backend,
+      self.log_context(), session, backend,
       LogDuration(response_time), LogDuration(service_time), metrics.bin, metrics.bout,
       proto, host, request_line, status_line, message);
   }
@@ -579,7 +565,7 @@ impl<Front:SocketHandler> Http<Front> {
     }
 
     let (sz, res) = self.frontend.socket_read(self.front_buf.as_mut().unwrap().buffer.space());
-    debug!("{}\tFRONT: read {} bytes", self.log_ctx, sz);
+    debug!("{}\tFRONT: read {} bytes", self.log_context(), sz);
 
     if sz > 0 {
       count!("bytes_in", sz as i64);
@@ -693,7 +679,7 @@ impl<Front:SocketHandler> Http<Front> {
         SessionResult::Continue
       },
       Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
-        error!("{}\tfront read should have stopped on chunk ended", self.log_ctx);
+        error!("{}\tfront read should have stopped on chunk ended", self.log_context());
         self.front_readiness.interest.remove(Ready::readable());
         SessionResult::Continue
       },
@@ -836,7 +822,7 @@ impl<Front:SocketHandler> Http<Front> {
     metrics.bout += sz;
 
     if let Some((front,back)) = self.tokens() {
-      debug!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}, buffer position {} restart position {}", self.log_ctx, front.0, back.0, sz, output_size, self.back_buf.as_ref().unwrap().buffer_position, self.back_buf.as_ref().unwrap().start_parsing_position);
+      debug!("{}\tFRONT [{}<-{}]: wrote {} bytes of {}, buffer position {} restart position {}", self.log_context(), front.0, back.0, sz, output_size, self.back_buf.as_ref().unwrap().buffer_position, self.back_buf.as_ref().unwrap().start_parsing_position);
     }
 
     match res {
@@ -903,7 +889,7 @@ impl<Front:SocketHandler> Http<Front> {
         // with no keepalive on front but keepalive on backend, we could have
         // a pool of connections
         if front_keep_alive && back_keep_alive {
-          debug!("{} keep alive front/back", self.log_ctx);
+          debug!("{} keep alive front/back", self.log_context());
           self.reset();
           self.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
           self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
@@ -913,13 +899,13 @@ impl<Front:SocketHandler> Http<Front> {
           //self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
           //SessionResult::CloseBackend
         } else if front_keep_alive && !back_keep_alive {
-          debug!("{} keep alive front", self.log_ctx);
+          debug!("{} keep alive front", self.log_context());
           self.reset();
           self.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
           self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
           SessionResult::CloseBackend(self.backend_token.take())
         } else {
-          debug!("{} no keep alive", self.log_ctx);
+          debug!("{} no keep alive", self.log_context());
           self.front_readiness.reset();
           self.back_readiness.reset();
           SessionResult::CloseSession
@@ -959,7 +945,7 @@ impl<Front:SocketHandler> Http<Front> {
   // Forward content to application
   pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
-      error!("{}\tsending default answer, should not write to back", self.log_ctx);
+      error!("{}\tsending default answer, should not write to back", self.log_context());
       self.back_readiness.interest.remove(Ready::writable());
       self.front_readiness.interest.insert(Ready::writable());
       return SessionResult::Continue;
@@ -1006,7 +992,7 @@ impl<Front:SocketHandler> Http<Front> {
     metrics.backend_bout += sz;
 
     if let Some((front,back)) = tokens {
-      debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", self.log_ctx, front.0, back.0, sz, output_size);
+      debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", self.log_context(), front.0, back.0, sz, output_size);
     }
     match socket_res {
       SocketResult::Error | SocketResult::Closed => {
@@ -1078,7 +1064,7 @@ impl<Front:SocketHandler> Http<Front> {
   // Read content from application
   pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, SessionResult) {
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
-      error!("{}\tsending default answer, should not read from back socket", self.log_ctx);
+      error!("{}\tsending default answer, should not read from back socket", self.log_context());
       self.back_readiness.interest.remove(Ready::readable());
       return (ProtocolResult::Continue, SessionResult::Continue);
     }
@@ -1119,7 +1105,7 @@ impl<Front:SocketHandler> Http<Front> {
     metrics.backend_bin += sz;
 
     if let Some((front,back)) = tokens {
-      debug!("{}\tBACK  [{}<-{}]: read {} bytes", self.log_ctx, front.0, back.0, sz);
+      debug!("{}\tBACK  [{}<-{}]: read {} bytes", self.log_context(), front.0, back.0, sz);
     }
 
     if r != SocketResult::Continue || sz == 0 {
@@ -1162,7 +1148,7 @@ impl<Front:SocketHandler> Http<Front> {
           (ProtocolResult::Continue, SessionResult::Continue)
         } else {
           error!("{}\tback read should have stopped on chunk ended\nreq: {:?} res:{:?}\ndata:{}",
-            self.log_ctx, self.request, self.response,
+            self.log_context(), self.request, self.response,
             self.back_buf.as_ref().unwrap().unparsed_data().to_hex(16));
           self.log_request_error(metrics, "back read should have stopped on chunk ended");
           (ProtocolResult::Continue, SessionResult::CloseSession)
@@ -1237,7 +1223,7 @@ impl<Front:SocketHandler> Http<Front> {
 
         (ProtocolResult::Continue, SessionResult::Continue)
       },
-      Some(ResponseState::Error(_,_,_,_,_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_ctx),
+      Some(ResponseState::Error(_,_,_,_,_)) => panic!("{}\tback read should have stopped on responsestate error", self.log_context()),
       _ => {
         let (response_state, header_end, is_head) =
             (self.response.take().unwrap(), self.res_header_end.take(),
@@ -1312,6 +1298,22 @@ fn save_http_status_metric(rs_status_line : Option<&RStatusLine>) {
       500...599 => { incr!("http.status.5xx"); },
       _ => { incr!("http.status.other"); }, // http responses with other codes (protocol error)
     }
+  }
+}
+
+pub struct LogContext<'a> {
+  pub request_id: Hyphenated,
+  pub app_id:     Option<&'a str>,
+  pub backend_id: Option<&'a str>,
+}
+
+impl<'a> std::fmt::Display for LogContext<'a> {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    write!(f, "{} {} {}\t",
+      self.request_id,
+      self.app_id.unwrap_or(&"-"),
+      self.backend_id.unwrap_or(&"-")
+    )
   }
 }
 

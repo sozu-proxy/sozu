@@ -527,7 +527,6 @@ impl ProxyConfiguration<Session> for Proxy {
 
     session.http_mut().map(|http| {
       http.app_id = Some(app_id.clone());
-      http.reset_log_context();
     });
 
     // we still want to use the new socket

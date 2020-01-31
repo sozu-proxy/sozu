@@ -294,7 +294,7 @@ impl Session {
 
   fn log_context(&self)  -> String {
     if let &State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
-      http.log_context()
+      http.log_context().to_string()
     } else {
       "".to_string()
     }
@@ -1488,7 +1488,6 @@ impl ProxyConfiguration<Session> for Proxy {
 
     session.http_mut().map(|http| {
       http.app_id = Some(app_id.clone());
-      http.reset_log_context();
     });
 
     if let Err(e) = socket.set_nodelay(true) {

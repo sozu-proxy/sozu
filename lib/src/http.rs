@@ -361,9 +361,10 @@ impl Session {
   }
 
   fn remove_backend(&mut self) {
-    debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND",
+    /*debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND",
       self.http().map(|h| h.log_ctx.clone()).unwrap_or_else(|| "".to_string()), self.frontend_token.0,
       self.back_token().map(|t| format!("{}", t.0)).unwrap_or_else(|| "-".to_string()));
+    */
 
     if let Some(backend) = self.backend.take() {
       self.http_mut().map(|h| h.clear_back_token());
@@ -1093,7 +1094,6 @@ impl ProxyConfiguration<Session> for Proxy {
 
     session.http_mut().map(|http| {
       http.app_id = Some(app_id.clone());
-      http.reset_log_context();
     });
 
     if let Err(e) = socket.set_nodelay(true) {

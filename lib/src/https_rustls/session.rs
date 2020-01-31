@@ -288,7 +288,7 @@ impl Session {
 
   pub fn log_context(&self)  -> String {
     if let State::Http(ref http) = unwrap_msg!(self.protocol.as_ref()) {
-      http.log_context()
+      http.log_context().to_string()
     } else {
       "".to_string()
     }
