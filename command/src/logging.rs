@@ -9,7 +9,6 @@ use std::net::{SocketAddr,UdpSocket};
 use std::net::TcpStream;
 use mio_uds::UnixDatagram;
 
-
 thread_local! {
   pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());
   pub static TAG:    String          = LOGGER.with(|logger| (*logger.borrow()).tag.clone());
@@ -468,12 +467,12 @@ macro_rules! log {
           $crate::logging::LOGGER.with(|l| {
             let pid = l.borrow().pid;
 
-            let now = $crate::logging::chrono_now();
+            let (precise_time, now) = $crate::logging::now();
             l.borrow_mut().log(
               &_META,
               format_args!(
                 concat!("{} {} {} {} {}\t", $format, '\n'),
-                now, ::time::precise_time_ns(), pid, tag,
+                now, precise_time, pid, tag,
                 $level_tag $(, $final_args)*)
             );
           })
@@ -509,12 +508,12 @@ macro_rules! log_access {
           $crate::logging::LOGGER.with(|l| {
             let pid = l.borrow().pid;
 
-            let now = $crate::logging::chrono_now();
+            let (precise_time, now) = $crate::logging::now();
             l.borrow_mut().log_access(
               &_META,
               format_args!(
                 concat!("{} {} {} {} {}\t", $format, '\n'),
-                now, ::time::precise_time_ns(), pid, tag,
+                now, precise_time, pid, tag,
                 $level_tag $(, $final_args)*)
             );
           })
@@ -645,11 +644,12 @@ impl log::Log for CompatLogger {
     TAG.with(|tag| {
       LOGGER.with(|l| {
         let pid = l.borrow().pid;
+        let (precise_time, now) = now();
         l.borrow_mut().compat_log(
           record.metadata(),
           format_args!(
             concat!("{} {} {} {} {}\t{}\n"),
-            ::time::now_utc().rfc3339(), ::time::precise_time_ns(), pid, tag,
+            now, precise_time, pid, tag,
             record.level(), record.args())
         );
       })
@@ -666,23 +666,22 @@ macro_rules! setup_test_logger {
   );
 }
 
-use chrono::format::{*, Pad::Zero, Numeric::*};
-const PREFIX: &'static [Item<'static>] = &[
-              Item::Numeric(Year, Zero),
-              Item::Literal("-"),
-              Item::Numeric(Month, Zero),
-              Item::Literal("-"),
-              Item::Numeric(Day, Zero),
-              Item::Literal("T"),
-              Item::Numeric(Hour, Zero),
-              Item::Literal(":"),
-              Item::Numeric(Minute, Zero),
-              Item::Literal(":"),
-              Item::Numeric(Second, Zero),
-              Item::Fixed(Fixed::Nanosecond6),
-              Item::Fixed(Fixed::TimezoneOffsetColonZ),
-          ];
+pub struct Rfc3339Time {
+  inner: ::time::PrimitiveDateTime,
+}
 
-pub fn chrono_now() -> DelayedFormat<std::slice::Iter<'static, Item<'static>>> {
-  ::chrono::offset::Utc::now().format_with_items(PREFIX.iter())
+impl std::fmt::Display for Rfc3339Time {
+  fn fmt(&self, f: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+    let t = self.inner;
+    write!(f, "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}Z",
+      t.year(), t.month(), t.day(),
+      t.hour(), t.minute(), t.second(),
+      t.microsecond()
+    )
+  }
+}
+
+pub fn now() -> (Rfc3339Time, i128) {
+  let t = time::PrimitiveDateTime::now();
+  (Rfc3339Time { inner: t, }, (t - time::PrimitiveDateTime::unix_epoch()).whole_nanoseconds())
 }

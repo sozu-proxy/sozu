@@ -14,7 +14,6 @@ extern crate tempfile;
 extern crate futures;
 extern crate regex;
 extern crate jemallocator;
-extern crate chrono;
 #[macro_use] extern crate sozu_lib as sozu;
 #[macro_use] extern crate sozu_command_lib as sozu_command;
 
