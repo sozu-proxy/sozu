@@ -326,7 +326,7 @@ impl Session {
 
   fn set_back_socket(&mut self, socket: TcpStream) {
     match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Http(ref mut http) => http.set_back_socket(socket),
+      State::Http(ref mut http) => http.set_back_socket(socket, self.backend.as_ref().map(|b| b.borrow().address).unwrap()),
       // not passing it here since we should already have a connection available
       State::WebSocket(_)       => {},
       State::Expect(_)          => {},

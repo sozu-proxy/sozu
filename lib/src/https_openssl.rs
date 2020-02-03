@@ -393,7 +393,8 @@ impl Session {
   }
 
   fn set_back_socket(&mut self, sock:TcpStream) {
-    unwrap_msg!(self.http_mut()).set_back_socket(sock)
+    let backend_address = self.backend.as_ref().map(|b| b.borrow().address).unwrap();
+    unwrap_msg!(self.http_mut()).set_back_socket(sock, backend_address)
   }
 
   fn set_back_token(&mut self, token: Token) {

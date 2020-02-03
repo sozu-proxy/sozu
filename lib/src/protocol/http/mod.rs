@@ -75,6 +75,7 @@ pub struct Http<Front:SocketHandler> {
   pub back_readiness: Readiness,
   pub public_address: SocketAddr,
   pub session_address: Option<SocketAddr>,
+  pub backend_address: Option<SocketAddr>,
   pub sticky_name:    String,
   pub sticky_session: Option<StickySession>,
   pub protocol:       Protocol,
@@ -108,6 +109,7 @@ impl<Front:SocketHandler> Http<Front> {
       back_readiness:     Readiness::new(),
       public_address,
       session_address,
+      backend_address:    None,
       sticky_name,
       sticky_session:     None,
       protocol,
@@ -274,12 +276,13 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn close(&mut self) {
   }
 
-  pub fn set_back_socket(&mut self, socket: TcpStream) {
-    self.backend         = Some(socket);
+  pub fn set_back_socket(&mut self, socket: TcpStream, address: SocketAddr) {
+    self.backend = Some(socket);
+    self.backend_address = Some(address);
   }
 
   pub fn set_app_id(&mut self, app_id: String) {
-    self.app_id  = Some(app_id);
+    self.app_id = Some(app_id);
   }
 
   pub fn set_backend_id(&mut self, backend_id: String) {
@@ -400,7 +403,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn get_backend_address(&self) -> Option<SocketAddr> {
-    self.backend.as_ref().and_then(|backend| backend.peer_addr().ok())
+    self.backend_address.or_else( || self.backend.as_ref().and_then(|backend| backend.peer_addr().ok()))
   }
 
   pub fn websocket_context(&self) -> String {
