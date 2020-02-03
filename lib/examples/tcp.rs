@@ -2,7 +2,6 @@
 extern crate sozu_lib as sozu;
 #[macro_use] extern crate sozu_command_lib as sozu_command;
 extern crate time;
-extern crate chrono;
 
 use std::thread;
 use std::io::stdout;
