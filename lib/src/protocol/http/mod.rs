@@ -6,6 +6,7 @@ use mio::*;
 use mio::unix::UnixReady;
 use mio::tcp::TcpStream;
 use uuid::{Uuid, adapter::Hyphenated};
+use time::{SteadyTime, Duration};
 use sozu_command::buffer::Buffer;
 use super::super::{SessionResult,Protocol,Readiness,SessionMetrics, LogDuration};
 use buffer_queue::BufferQueue;
@@ -86,6 +87,7 @@ pub struct Http<Front:SocketHandler> {
   pub added_req_header: String,
   pub added_res_header: String,
   pub keepalive_count: usize,
+  pub backend_stop:    Option<SteadyTime>,
   pool:                Weak<RefCell<Pool<Buffer>>>,
 }
 
@@ -120,6 +122,7 @@ impl<Front:SocketHandler> Http<Front> {
       added_req_header: String::from(""),
       added_res_header: String::from(""),
       keepalive_count: 0,
+      backend_stop:    None,
       pool,
     };
     session.added_req_header = session.added_request_header(public_address, session_address);
@@ -271,6 +274,20 @@ impl<Front:SocketHandler> Http<Front> {
         false
       }
     }
+  }
+
+  pub fn is_valid_backend_socket(&mut self) -> bool {
+    // if socket was not used in the last second, test it
+    if self.backend_stop.as_ref().map(|t| {
+      let now = SteadyTime::now();
+      let dur = now - *t;
+
+      dur > Duration::seconds(1)
+    }).unwrap_or(true) {
+      return self.test_back_socket();
+    }
+
+    return true;
   }
 
   pub fn close(&mut self) {
@@ -1141,6 +1158,7 @@ impl<Front:SocketHandler> Http<Front> {
         self.front_readiness.interest.insert(Ready::writable());
         if ! self.back_buf.as_ref().unwrap().needs_input() {
           metrics.backend_stop();
+          self.backend_stop = Some(SteadyTime::now());
           self.back_readiness.interest.remove(Ready::readable());
         }
         (ProtocolResult::Continue, SessionResult::Continue)
@@ -1195,6 +1213,7 @@ impl<Front:SocketHandler> Http<Front> {
 
           if let Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) = self.response {
             metrics.backend_stop();
+            self.backend_stop = Some(SteadyTime::now());
             self.back_readiness.interest.remove(Ready::readable());
           }
         }
@@ -1258,6 +1277,7 @@ impl<Front:SocketHandler> Http<Front> {
 
         if let Some(ResponseState::Response(_,_)) = self.response {
           metrics.backend_stop();
+          self.backend_stop = Some(SteadyTime::now());
           self.back_readiness.interest.remove(Ready::readable());
         }
 

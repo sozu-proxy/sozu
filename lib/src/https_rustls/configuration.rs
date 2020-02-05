@@ -497,7 +497,9 @@ impl ProxyConfiguration<Session> for Proxy {
          let ref backend = *backend.borrow();
          self.backends.borrow().has_backend(&app_id, backend)
         }).unwrap_or(false);
-      let is_valid_backend_socket = has_backend && session.http_mut().map(|h| h.test_back_socket()).unwrap_or(false);
+
+      let is_valid_backend_socket = has_backend &&
+        session.http_mut().map(|h| h.is_valid_backend_socket()).unwrap_or(false);
 
       if is_valid_backend_socket {
         //matched on keepalive
