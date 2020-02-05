@@ -1,12 +1,11 @@
 use std::str;
 use std::time::{Duration,Instant};
-use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use mio::net::UdpSocket;
 use std::io::{self,LineWriter,Write,ErrorKind};
 use std::collections::HashMap;
-use sozu_command::writer::MultiLineWriter;
+use super::writer::{MetricSocket, MetricsWriter};
 
 use super::{Subscriber,MetricData,StoredMetricData};
 
@@ -21,28 +20,12 @@ pub struct MetricLine {
   duration:   usize,
 }
 
-pub struct MetricSocket {
-  pub addr:   SocketAddr,
-  pub socket: UdpSocket,
-}
-
-
-impl Write for MetricSocket {
-  fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-    self.socket.send_to(buf, &self.addr)
-  }
-
-  fn flush(&mut self) -> io::Result<()> {
-    Ok(())
-  }
-}
-
 pub struct NetworkDrain {
   queue:              VecDeque<MetricLine>,
   pub prefix:         String,
-  pub remote:         MultiLineWriter<MetricSocket>,
+  pub remote:         MetricsWriter,
   is_writable:        bool,
-  data:               BTreeMap<String, StoredMetricData>,
+  data:               HashMap<String, StoredMetricData>,
   /// (app_id, key) -> metric
   app_data:           HashMap<(String, String), StoredMetricData>,
   /// (app_id, backend_id, key) -> metric
@@ -54,14 +37,16 @@ pub struct NetworkDrain {
 
 impl NetworkDrain {
   pub fn new(prefix: String, socket: UdpSocket, addr: SocketAddr) -> Self {
+    socket.connect(addr).unwrap();
+
     NetworkDrain {
       queue:  VecDeque::new(),
       prefix,
-      remote: MultiLineWriter::with_capacity(512, MetricSocket {
+      remote: MetricsWriter::new(MetricSocket {
         addr, socket
       }),
       is_writable: true,
-      data: BTreeMap::new(),
+      data: HashMap::new(),
       app_data: HashMap::new(),
       backend_data: HashMap::new(),
       use_tagged_metrics: false,

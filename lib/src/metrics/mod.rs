@@ -9,6 +9,7 @@ use sozu_command::proxy::{FilteredData,MetricsData};
 
 mod network_drain;
 mod local_drain;
+mod writer;
 
 use self::network_drain::NetworkDrain;
 use self::local_drain::LocalDrain;
