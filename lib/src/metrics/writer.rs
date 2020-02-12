@@ -65,7 +65,7 @@ impl MetricsWriter {
         while written < len {
             self.panicked = true;
 
-            let mut last_index = 0;
+            let mut last_index = written;
             let mut iovs = self.packet_indexes.iter().map(|index| {
               let iov = iovec {
                 iov_base: (self.buf.as_ptr() as usize + last_index) as *mut c_void,
@@ -143,38 +143,16 @@ impl MetricsWriter {
 
                   if sent as usize == self.packet_indexes.len() {
                     self.packet_indexes.clear();
+                    break;
                   } else {
                     for i in 0..(sent as usize) {
                       let _ = self.packet_indexes.remove(0);
                     }
                   }
 
-                  /*
-                  Ok(portions_sent as usize)
-                  */
                 }
               }
             };
-
-
-            let r = self.inner.as_mut().unwrap().write(&self.buf[written..len]);
-            self.panicked = false;
-
-            match r {
-                Ok(0) => {
-                    ret = Err(Error::new(
-                        ErrorKind::WriteZero,
-                        "failed to write the buffered data",
-                    ));
-                    break;
-                }
-                Ok(n) => written += n,
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => {
-                    ret = Err(e);
-                    break;
-                }
-            }
         }
         //println!("buf len {} last newline {}, written {}", self.buf.len(), self.last_newline, written);
         if written > 0 {
