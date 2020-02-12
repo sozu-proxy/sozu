@@ -98,6 +98,10 @@ impl MetricsWriter {
             }).collect::<Vec<_>>();
             //println!("created {} packets", messages.len());
 
+            if messages.is_empty() {
+              break;
+            }
+
             unsafe {
               let r = libc::sendmmsg(
                 self.inner.as_ref().unwrap().socket.as_raw_fd(),
