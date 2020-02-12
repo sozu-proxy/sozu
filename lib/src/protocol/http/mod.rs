@@ -88,6 +88,7 @@ pub struct Http<Front:SocketHandler> {
   pub added_res_header: String,
   pub keepalive_count: usize,
   pub backend_stop:    Option<SteadyTime>,
+  pub closing:         bool,
   pool:                Weak<RefCell<Pool<Buffer>>>,
 }
 
@@ -123,6 +124,7 @@ impl<Front:SocketHandler> Http<Front> {
       added_res_header: String::from(""),
       keepalive_count: 0,
       backend_stop:    None,
+      closing:         false,
       pool,
     };
     session.added_req_header = session.added_request_header(public_address, session_address);
@@ -203,6 +205,13 @@ impl<Front:SocketHandler> Http<Front> {
     let peer = client_address.or_else(|| self.front_socket().peer_addr().ok()).map(|addr| (addr.ip(), addr.port()));
     let front = (public_address.ip(), public_address.port());
 
+    //FIXME: should update the Connection header directly if present
+    let closing_header = if self.closing {
+      "Connection: close\r\n"
+    } else {
+      ""
+    };
+
     if let (Some((peer_ip, peer_port)), (front, front_port)) = (peer, front) {
       let proto = match self.protocol() {
         Protocol::HTTP  => "http",
@@ -214,32 +223,36 @@ impl<Front:SocketHandler> Http<Front> {
       match (peer_ip, peer_port, front) {
         (IpAddr::V4(_), peer_port, IpAddr::V4(_)) => {
           format!("Forwarded: proto={};for={}:{};by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
-                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
-            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id)
+                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n{}",
+            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id, closing_header)
         },
         (IpAddr::V4(_), peer_port, IpAddr::V6(_)) => {
           format!("Forwarded: proto={};for={}:{};by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
-                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
-            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id)
+                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n{}",
+            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id, closing_header)
         },
         (IpAddr::V6(_), peer_port, IpAddr::V4(_)) => {
           format!("Forwarded: proto={};for=\"{}:{}\";by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
-                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
-            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id)
+                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n{}",
+            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id, closing_header)
         },
         (IpAddr::V6(_), peer_port, IpAddr::V6(_)) => {
           format!("Forwarded: proto={};for=\"{}:{}\";by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
-                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n",
-            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id)
+                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n{}",
+            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id, closing_header)
         },
       }
     } else {
-      format!("Sozu-Id: {}\r\n", self.request_id)
+      format!("Sozu-Id: {}\r\n{}", self.request_id, closing_header)
     }
   }
 
   pub fn added_response_header(&self) -> String {
-    format!("Sozu-Id: {}\r\n", self.request_id)
+    if self.closing {
+      format!("Sozu-Id: {}\r\nConnection: close", self.request_id)
+    } else {
+      format!("Sozu-Id: {}\r\n", self.request_id)
+    }
   }
 
   pub fn front_socket(&self) -> &TcpStream {
@@ -398,6 +411,7 @@ impl<Front:SocketHandler> Http<Front> {
       && self.back_buf.as_ref().map(|b| !b.empty()).unwrap_or(false) {
         SessionResult::CloseSession
     } else {
+      self.closing = true;
       SessionResult::Continue
     }
   }
@@ -905,6 +919,14 @@ impl<Front:SocketHandler> Http<Front> {
 
         self.log_request_success(&metrics);
         metrics.reset();
+
+        if self.closing {
+          debug!("{} closing proxy, no keep alive", self.log_context());
+          self.front_readiness.reset();
+          self.back_readiness.reset();
+          return SessionResult::CloseSession
+        }
+
         //FIXME: we could get smarter about this
         // with no keepalive on backend, we could open a new backend ConnectionError
         // with no keepalive on front but keepalive on backend, we could have
