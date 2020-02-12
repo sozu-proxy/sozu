@@ -388,16 +388,15 @@ pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, time
         Some(message) => {
           match message.status {
             CommandStatus::Processing => {
-              eprintln!("Proxy is processing: {}", message.message);
-              exit(1);
+              eprintln!("Worker {} is processing: {}", worker_id, message.message);
             },
             CommandStatus::Error => {
-              eprintln!("could not stop the proxy: {}", message.message);
+              eprintln!("could not stop the worker {}: {}", worker_id, message.message);
               exit(1);
             },
             CommandStatus::Ok => {
               if &id == &message.id {
-                println!("Proxy shut down: {}", message.message);
+                println!("Worker {} shut down: {}", worker_id, message.message);
                 break;
               }
             }
