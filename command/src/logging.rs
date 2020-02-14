@@ -467,7 +467,7 @@ macro_rules! log {
           $crate::logging::LOGGER.with(|l| {
             let pid = l.borrow().pid;
 
-            let (precise_time, now) = $crate::logging::now();
+            let (now, precise_time) = $crate::logging::now();
             l.borrow_mut().log(
               &_META,
               format_args!(
@@ -508,7 +508,7 @@ macro_rules! log_access {
           $crate::logging::LOGGER.with(|l| {
             let pid = l.borrow().pid;
 
-            let (precise_time, now) = $crate::logging::now();
+            let (now, precise_time) = $crate::logging::now();
             l.borrow_mut().log_access(
               &_META,
               format_args!(
@@ -644,7 +644,7 @@ impl log::Log for CompatLogger {
     TAG.with(|tag| {
       LOGGER.with(|l| {
         let pid = l.borrow().pid;
-        let (precise_time, now) = now();
+        let (now, precise_time) = now();
         l.borrow_mut().compat_log(
           record.metadata(),
           format_args!(
