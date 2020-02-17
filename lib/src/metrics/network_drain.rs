@@ -61,7 +61,7 @@ impl NetworkDrain {
 
   pub fn send_data(&mut self) {
     let now  = Instant::now();
-    let secs = Duration::new(2, 0);
+    let secs = Duration::new(1, 0);
     let mut send_count = 0;
 
     // remove metrics that were not touched in the last 10mn
