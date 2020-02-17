@@ -133,10 +133,6 @@ impl LocalDrain {
       (key.to_string(), aggregated_to_filtered(value))
     }).collect();
 
-    self.data.clear();
-
-    //data.insert(String::from("requests"), FilteredData::TimeSerie(self.request_counter.filtered()));
-
     data
   }
 
@@ -162,7 +158,6 @@ impl LocalDrain {
   }
 
   pub fn clear(&mut self) {
-    self.data.clear();
     self.app_data.clear();
   }
 }
