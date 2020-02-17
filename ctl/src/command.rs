@@ -5,7 +5,7 @@ use sozu_command::command::{CommandResponseData,CommandRequestData,CommandReques
 use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
   AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend,
-  QueryCertificateType, QueryAnswerCertificate};
+  QueryCertificateType, QueryAnswerCertificate, FilteredData};
 
 use serde_json;
 use std::collections::{HashMap,HashSet,BTreeMap};
@@ -608,10 +608,17 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
 
                 let mut master_table = Table::new();
                 master_table.add_row(row![String::from("Master process")]);
-                master_table.add_row(row![String::from("key"), String::from("value")]);
+                master_table.add_row(row![String::from("key"), String::from("Count"), String::from("Gauge")]);
 
                 for (ref key, ref value) in data.master.iter() {
-                  master_table.add_row(row![key.to_string(), format!("{:?}", value)]);
+                  match value {
+                    FilteredData::Count(c) => {master_table.add_row(row![key.to_string(), c, String::new()]);},
+                    FilteredData::Gauge(c) => { master_table.add_row(row![key.to_string(), String::new(), c]);},
+                    r => {
+                      println!("unexpected metric: {:?}", r);
+                      master_table.add_row(row![key.to_string(), String::new(), String::new()]);
+                    }
+                  }
                 }
 
                 master_table.printstd();
@@ -619,13 +626,33 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                 println!("\nworker metrics:\n");
 
                 let mut proxy_table = Table::new();
-                proxy_table.add_row(row![String::from("Workers")]);
+                let mut row = vec![cell!("Workers")];
+                for key in data.workers.keys() {
+                  row.push(cell!(key));
+                  row.push(cell!(""));
+                  row.push(cell!(""));
+                  row.push(cell!(""));
+                  row.push(cell!(""));
+                  row.push(cell!(""));
+                  row.push(cell!(""));
+                  row.push(cell!(""));
+                  row.push(cell!(""));
+                }
+                proxy_table.add_row(Row::new(row));
 
                 let mut worker_keys = HashSet::new();
                 let mut header = Vec::new();
                 header.push(cell!("key"));
                 for key in data.workers.keys() {
-                  header.push(cell!(&key));
+                  header.push(cell!("Count"));
+                  header.push(cell!("Gauge"));
+                  header.push(cell!("p50"));
+                  header.push(cell!("p90"));
+                  header.push(cell!("p99"));
+                  header.push(cell!("p99.9"));
+                  header.push(cell!("p99.99"));
+                  header.push(cell!("p99.999"));
+                  header.push(cell!("p100"));
                   worker_keys.insert(key);
                 }
                 proxy_table.add_row(Row::new(header.clone()));
@@ -643,8 +670,65 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                   row.push(cell!(k.to_string()));
                   for worker_key in worker_keys.iter() {
                     let wk: &str = worker_key;
-                    row.push(cell!(data.workers[wk].proxy.get(k)
-                                   .map(|value| format!("{:?}", value)).unwrap_or(String::new())));
+
+                    match data.workers[wk].proxy.get(k) {
+                      None => {
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                      },
+                      Some(FilteredData::Count(c)) => {
+                        row.push(cell!(c));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                      },
+                      Some(FilteredData::Gauge(c)) => {
+                        row.push(cell!(""));
+                        row.push(cell!(c));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                      },
+                      Some(FilteredData::Percentiles(p)) => {
+                        row.push(cell!(p.samples));
+                        row.push(cell!(""));
+                        row.push(cell!(p.p_50));
+                        row.push(cell!(p.p_90));
+                        row.push(cell!(p.p_99));
+                        row.push(cell!(p.p_99_9));
+                        row.push(cell!(p.p_99_99));
+                        row.push(cell!(p.p_99_999));
+                        row.push(cell!(p.p_100));
+                      },
+                      r => {
+                        println!("unexpected metric: {:?}", r);
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                        row.push(cell!(""));
+                      }
+                    }
                   }
 
                   proxy_table.add_row(Row::new(row));
@@ -666,7 +750,19 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
 
                   let mut application_table = Table::new();
 
-                  application_table.add_row(row![String::from(id)]);
+                  let mut row = vec![cell!(id)];
+                  for key in data.workers.keys() {
+                    row.push(cell!(key));
+                    row.push(cell!(""));
+                    row.push(cell!(""));
+                    row.push(cell!(""));
+                    row.push(cell!(""));
+                    row.push(cell!(""));
+                    row.push(cell!(""));
+                    row.push(cell!(""));
+                    row.push(cell!(""));
+                  }
+                  application_table.add_row(Row::new(row));
                   application_table.add_row(Row::new(header.clone()));
 
                   let mut app_metrics = HashSet::new();
@@ -690,8 +786,64 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                     row.push(cell!(metric.to_string()));
 
                     for worker in data.workers.values() {
-                      row.push(cell!(worker.applications.get(id).and_then(|app| app.data.get(metric))
-                                     .map(|value| format!("{:?}", value)).unwrap_or(String::new())));
+                      match worker.applications.get(id).and_then(|app| app.data.get(metric)) {
+                        None => {
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                        },
+                        Some(FilteredData::Count(c)) => {
+                          row.push(cell!(c));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                        },
+                        Some(FilteredData::Gauge(c)) => {
+                          row.push(cell!(""));
+                          row.push(cell!(c));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                        }
+                        Some(FilteredData::Percentiles(p)) => {
+                          row.push(cell!(p.samples));
+                          row.push(cell!(""));
+                          row.push(cell!(p.p_50));
+                          row.push(cell!(p.p_90));
+                          row.push(cell!(p.p_99));
+                          row.push(cell!(p.p_99_9));
+                          row.push(cell!(p.p_99_99));
+                          row.push(cell!(p.p_99_999));
+                          row.push(cell!(p.p_100));
+                        },
+                        r => {
+                          println!("unexpected metric: {:?}", r);
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                          row.push(cell!(""));
+                        },
+                      }
                     }
                     application_table.add_row(Row::new(row));
                   }
@@ -701,7 +853,19 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                     let backend: &str = backend_id;
                     let mut backend_table = Table::new();
 
-                    backend_table.add_row(row![format!("app: {} - backend: {}", id, backend)]);
+                    let mut row = vec![cell!(format!("{}: {}", id, backend))];
+                    for key in data.workers.keys() {
+                      row.push(cell!(key));
+                      row.push(cell!(""));
+                      row.push(cell!(""));
+                      row.push(cell!(""));
+                      row.push(cell!(""));
+                      row.push(cell!(""));
+                      row.push(cell!(""));
+                      row.push(cell!(""));
+                      row.push(cell!(""));
+                    }
+                    backend_table.add_row(Row::new(row));
                     backend_table.add_row(Row::new(header.clone()));
 
                     let mut backend_metrics = HashSet::new();
@@ -721,9 +885,65 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                       row.push(cell!(metric.to_string()));
 
                       for worker in data.workers.values() {
-                        row.push(cell!(worker.applications.get(id).and_then(|app| app.backends.get(backend))
-                                       .and_then(|back| back.get(metric))
-                                       .map(|value| format!("{:?}", value)).unwrap_or(String::new())));
+                        match worker.applications.get(id).and_then(|app| app.backends.get(backend))
+                          .and_then(|back| back.get(metric)) {
+                          None => {
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                          },
+                          Some(FilteredData::Count(c)) => {
+                            row.push(cell!(c));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                          },
+                          Some(FilteredData::Gauge(c)) => {
+                            row.push(cell!(""));
+                            row.push(cell!(c));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                          }
+                          Some(FilteredData::Percentiles(p)) => {
+                            row.push(cell!(p.samples));
+                            row.push(cell!(""));
+                            row.push(cell!(p.p_50));
+                            row.push(cell!(p.p_90));
+                            row.push(cell!(p.p_99));
+                            row.push(cell!(p.p_99_9));
+                            row.push(cell!(p.p_99_99));
+                            row.push(cell!(p.p_99_999));
+                            row.push(cell!(p.p_100));
+                          },
+                          r => {
+                            println!("unexpected metric: {:?}", r);
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                            row.push(cell!(""));
+                          },
+                        }
                       }
                       backend_table.add_row(Row::new(row));
                     }
