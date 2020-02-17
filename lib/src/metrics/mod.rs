@@ -77,7 +77,11 @@ impl StoredMetricData {
       last_sent,
       updated: true,
       data: if let MetricData::GaugeAdd(v) = data {
-        MetricData::Gauge(v as usize)
+        if v >= 0 {
+          MetricData::Gauge(v as usize)
+        } else {
+          MetricData::Gauge(0)
+        }
       } else { data }
     }
   }
