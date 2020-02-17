@@ -352,8 +352,8 @@ pub fn upgrade_master(mut channel: Channel<CommandRequest,CommandResponse>,
             for (i, ref worker) in running_workers.iter().enumerate() {
               println!("Upgrading worker {} (of {})", i+1, running_count);
 
-              channel = upgrade_worker(channel, 1000, worker.id);
-              thread::sleep(Duration::from_millis(1000));
+              channel = upgrade_worker(channel, 0, worker.id);
+              //thread::sleep(Duration::from_millis(1000));
             }
 
             println!("Proxy successfully upgraded!");
