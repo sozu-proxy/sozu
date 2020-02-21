@@ -335,6 +335,9 @@ impl BufferQueue {
         &OutputElement::Delete(sz) => start += sz,
         &OutputElement::Slice(sz)  => {
           //println!("Slice({})", sz);
+          if sz == 0 {
+            continue
+          }
           let end = min(start+sz, length);
           if let Some(i) = iovec::IoVec::from_bytes(&self.buffer.data()[start..end]) {
             //println!("iovec size: {}", i.len());
@@ -348,12 +351,17 @@ impl BufferQueue {
             break;
           }
         }
-        &OutputElement::Insert(ref v) => if let Some(i) = iovec::IoVec::from_bytes(&v[..]) {
-          //println!("got Insert with {} bytes", v.len());
-          res.push(i);
-          complete_size += i.len();
-        } else {
-          break;
+        &OutputElement::Insert(ref v) => {
+          if v.is_empty() {
+            continue
+          }
+          if let Some(i) = iovec::IoVec::from_bytes(&v[..]) {
+            //println!("got Insert with {} bytes", v.len());
+            res.push(i);
+            complete_size += i.len();
+          } else {
+            break;
+          }
         },
         &OutputElement::Splice(sz)  => { unimplemented!("splice not used in iovec") },
       }
