@@ -844,6 +844,9 @@ impl<Front:SocketHandler> Http<Front> {
       //let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.as_ref().unwrap().next_output_data());
       let (current_sz, current_res) = if self.frontend.has_vectored_writes() {
         let bufs = self.back_buf.as_ref().unwrap().as_iovec();
+        if bufs.is_empty() {
+          break;
+        }
         self.frontend.socket_write_vectored(&bufs)
       } else {
         self.frontend.socket_write(self.back_buf.as_ref().unwrap().next_output_data())
@@ -1024,6 +1027,9 @@ impl<Front:SocketHandler> Http<Front> {
         let (current_sz, current_res) = sock.socket_write(self.front_buf.as_ref().unwrap().next_output_data());
         */
         let bufs = self.front_buf.as_ref().unwrap().as_iovec();
+        if bufs.is_empty() {
+          break;
+        }
         let (current_sz, current_res) = sock.socket_write_vectored(&bufs);
         //println!("vectored io returned {:?}", (current_sz, current_res));
         socket_res = current_res;
