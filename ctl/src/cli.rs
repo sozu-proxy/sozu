@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 #[derive(StructOpt, PartialEq, Debug)]
 pub struct App {
   #[structopt(short="c", long = "config", help = "Sets a custom config file")]
-  pub config: String,
+  pub config: Option<String>,
   #[structopt(short="t", long = "timeout", help = "Sets a custom timeout for commands (in milliseconds). 0 disables the timeout")]
   pub timeout: Option<u64>,
   #[structopt(subcommand)]

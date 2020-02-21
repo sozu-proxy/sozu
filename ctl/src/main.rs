@@ -30,7 +30,7 @@ use cli::*;
 fn main() {
   let matches = App::from_args();
 
-  let config_file = matches.config;
+  let config_file = matches.config.or(option_env!("SOZU_CONFIG").map(|s| s.to_string())).expect("missing --config <configuration file> option");
 
   let config  = Config::load_from_path(config_file.as_str()).expect("could not parse configuration file");
 
