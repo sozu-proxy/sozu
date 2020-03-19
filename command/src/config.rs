@@ -13,7 +13,8 @@ use toml;
 
 use proxy::{CertificateAndKey,ProxyRequestData,HttpFront,TcpFront,Backend,
   HttpListener,HttpsListener,TcpListener,AddCertificate,TlsProvider,LoadBalancingParams,
-  Application, TlsVersion,ActivateListener,ListenerType,RulePosition,PathRule};
+  Application, TlsVersion,ActivateListener,ListenerType,RulePosition,PathRule,
+  Route};
 
 use command::{CommandRequestData,CommandRequest,PROTOCOL_VERSION};
 
@@ -505,7 +506,7 @@ impl HttpFrontendConfig {
       }));
 
       v.push(ProxyRequestData::AddHttpsFront(HttpFront {
-        app_id:      app_id.to_string(),
+        route:       Route::AppId(app_id.to_string()),
         address:     self.address,
         hostname:    self.hostname.clone(),
         path:        self.path.clone(),
@@ -514,7 +515,7 @@ impl HttpFrontendConfig {
     } else {
       //create the front both for HTTP and HTTPS if possible
       v.push(ProxyRequestData::AddHttpFront(HttpFront {
-        app_id:     app_id.to_string(),
+        route:      Route::AppId(app_id.to_string()),
         address:    self.address,
         hostname:   self.hostname.clone(),
         path:       self.path.clone(),

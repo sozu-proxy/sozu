@@ -7,6 +7,8 @@ use super::DefaultAnswerStatus;
 pub struct DefaultAnswers {
   /// 400
   pub BadRequest:         Rc<Vec<u8>>,
+  /// 401
+  pub Unauthorized:       Rc<Vec<u8>>,
   /// 404
   pub NotFound:           Rc<Vec<u8>>,
   /// 408
@@ -35,6 +37,9 @@ impl HttpAnswers {
       default: DefaultAnswers {
         BadRequest: Rc::new(Vec::from(
           &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
+        )),
+        Unauthorized: Rc::new(Vec::from(
+          &b"HTTP/1.1 401 Unauthorized\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..]
         )),
         NotFound: Rc::new(Vec::from(answer_404.as_bytes())),
         RequestTimeout: Rc::new(Vec::from(
@@ -68,6 +73,7 @@ impl HttpAnswers {
     match answer {
       DefaultAnswerStatus::Answer301 => panic!("the 301 answer is generated dynamically"),
       DefaultAnswerStatus::Answer400 => self.default.BadRequest.clone(),
+      DefaultAnswerStatus::Answer401 => self.default.Unauthorized.clone(),
       DefaultAnswerStatus::Answer404 => self.default.NotFound.clone(),
       DefaultAnswerStatus::Answer408 => self.default.RequestTimeout.clone(),
       DefaultAnswerStatus::Answer413 => self.default.PayloadTooLarge.clone(),

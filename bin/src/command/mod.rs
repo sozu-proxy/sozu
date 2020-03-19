@@ -18,7 +18,7 @@ use sozu_command::config::Config;
 use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::command::{self,CommandRequest,CommandResponse,CommandResponseData,CommandStatus,RunState};
-use sozu_command::proxy::{ProxyRequest,ProxyResponse,ProxyResponseData};
+use sozu_command::proxy::{ProxyRequest,ProxyResponse,ProxyResponseData,Route};
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 
 pub mod executor;

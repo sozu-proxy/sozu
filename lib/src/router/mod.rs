@@ -1,18 +1,16 @@
 use regex::bytes::Regex;
 use std::str::from_utf8;
-use sozu_command::proxy::{HttpFront,RulePosition};
+use sozu_command::proxy::{HttpFront,RulePosition, Route};
 
 pub mod trie;
 pub mod pattern_trie;
 
 use self::pattern_trie::TrieNode;
 
-pub type AppId = String;
-
 pub struct Router {
-  pre: Vec<(DomainRule, PathRule, AppId)>,
-  pub tree: TrieNode<Vec<(PathRule, AppId)>>,
-  post: Vec<(DomainRule, PathRule, AppId)>,
+  pre: Vec<(DomainRule, PathRule, Route)>,
+  pub tree: TrieNode<Vec<(PathRule, Route)>>,
+  post: Vec<(DomainRule, PathRule, Route)>,
 }
 
 impl Router {
@@ -24,7 +22,7 @@ impl Router {
     }
   }
 
-  pub fn lookup(&self, hostname: &[u8], path: &[u8]) -> Option<AppId> {
+  pub fn lookup(&self, hostname: &[u8], path: &[u8]) -> Option<Route> {
     for (domain_rule, path_rule, app_id) in self.pre.iter() {
       if domain_rule.matches(hostname) && path_rule.matches(path) != PathRuleResult::None {
         return Some(app_id.clone());
@@ -63,16 +61,16 @@ impl Router {
   pub fn add_http_front(&mut self, front: HttpFront) -> bool {
     match front.position {
       RulePosition::Pre => match (front.hostname.parse::<DomainRule>(), PathRule::from_config(front.path)) {
-        (Ok(domain), Some(path)) => self.add_pre_rule(domain, path, front.app_id),
+        (Ok(domain), Some(path)) => self.add_pre_rule(domain, path, front.route),
         _ => false,
       },
       RulePosition::Post => match (front.hostname.parse::<DomainRule>(), PathRule::from_config(front.path)) {
-        (Ok(domain), Some(path)) => self.add_post_rule(domain, path, front.app_id),
+        (Ok(domain), Some(path)) => self.add_post_rule(domain, path, front.route),
         _ => false,
       },
       RulePosition::Tree => {
         match PathRule::from_config(front.path) {
-          Some(path) => self.add_tree_rule(front.hostname.as_bytes(), path, front.app_id),
+          Some(path) => self.add_tree_rule(front.hostname.as_bytes(), path, front.route),
           _ => false,
         }
       }
@@ -91,14 +89,14 @@ impl Router {
       },
       RulePosition::Tree => {
         match PathRule::from_config(front.path) {
-          Some(path) => self.remove_tree_rule(front.hostname.as_bytes(), path, front.app_id),
+          Some(path) => self.remove_tree_rule(front.hostname.as_bytes(), path, front.route),
           _ => false,
         }
       }
     }
   }
 
-  pub fn add_tree_rule(&mut self, hostname: &[u8], path: PathRule, app_id: AppId) -> bool {
+  pub fn add_tree_rule(&mut self, hostname: &[u8], path: PathRule, app_id: Route) -> bool {
     let hostname = match from_utf8(hostname) {
       Err(_) => return false,
       Ok(h) => h,
@@ -127,7 +125,7 @@ impl Router {
     }
   }
 
-  pub fn remove_tree_rule(&mut self, hostname: &[u8], path: PathRule, _app_id: AppId) -> bool {
+  pub fn remove_tree_rule(&mut self, hostname: &[u8], path: PathRule, _app_id: Route) -> bool {
     let hostname = match from_utf8(hostname) {
       Err(_) => return false,
       Ok(h) => h,
@@ -155,7 +153,7 @@ impl Router {
     }
   }
 
-  pub fn add_pre_rule(&mut self, domain: DomainRule, path: PathRule, app_id: AppId) -> bool {
+  pub fn add_pre_rule(&mut self, domain: DomainRule, path: PathRule, app_id: Route) -> bool {
     if self.pre.iter().position(|(d, p, _)| *d == domain && *p == path).is_none() {
       self.pre.push((domain, path, app_id));
       true
@@ -164,7 +162,7 @@ impl Router {
     }
   }
 
-  pub fn add_post_rule(&mut self, domain: DomainRule, path: PathRule, app_id: AppId) -> bool {
+  pub fn add_post_rule(&mut self, domain: DomainRule, path: PathRule, app_id: Route) -> bool {
     if self.post.iter().position(|(d, p, _)| *d == domain && *p == path).is_none() {
       self.post.push((domain, path, app_id));
       true
@@ -385,6 +383,7 @@ impl std::str::FromStr for PathRule {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use sozu_command::proxy::Route;
 
   #[test]
   fn convert_regex() {
@@ -430,15 +429,15 @@ mod tests {
   fn match_router() {
     let mut router = Router::new();
 
-    assert!(router.add_pre_rule("*".parse::<DomainRule>().unwrap(), PathRule::Prefix("/.well-known/acme-challenge".to_string()), "acme".to_string()));
-    assert!(router.add_tree_rule("www.example.com".as_bytes(), PathRule::Prefix("/".to_string()), "example".to_string()));
-    assert!(router.add_tree_rule("*.test.example.com".as_bytes(), PathRule::Regex(Regex::new("/hello[A-Z]+/").unwrap()), "examplewildcard".to_string()));
-    assert!(router.add_tree_rule("/test[0-9]/.example.com".as_bytes(), PathRule::Prefix("/".to_string()), "exampleregex".to_string()));
+    assert!(router.add_pre_rule("*".parse::<DomainRule>().unwrap(), PathRule::Prefix("/.well-known/acme-challenge".to_string()), Route::AppId("acme".to_string())));
+    assert!(router.add_tree_rule("www.example.com".as_bytes(), PathRule::Prefix("/".to_string()), Route::AppId("example".to_string())));
+    assert!(router.add_tree_rule("*.test.example.com".as_bytes(), PathRule::Regex(Regex::new("/hello[A-Z]+/").unwrap()), Route::AppId("examplewildcard".to_string())));
+    assert!(router.add_tree_rule("/test[0-9]/.example.com".as_bytes(), PathRule::Prefix("/".to_string()), Route::AppId("exampleregex".to_string())));
 
-    assert_eq!(router.lookup("www.example.com".as_bytes(), "/helloA".as_bytes()), Some("example".to_string()));
-    assert_eq!(router.lookup("www.example.com".as_bytes(), "/.well-known/acme-challenge".as_bytes()), Some("acme".to_string()));
+    assert_eq!(router.lookup("www.example.com".as_bytes(), "/helloA".as_bytes()), Some(Route::AppId("example".to_string())));
+    assert_eq!(router.lookup("www.example.com".as_bytes(), "/.well-known/acme-challenge".as_bytes()), Some(Route::AppId("acme".to_string())));
     assert_eq!(router.lookup("www.test.example.com".as_bytes(), "/".as_bytes()), None);
-    assert_eq!(router.lookup("www.test.example.com".as_bytes(), "/helloAB/".as_bytes()), Some("examplewildcard".to_string()));
-    assert_eq!(router.lookup("test1.example.com".as_bytes(), "/helloAB/".as_bytes()), Some("exampleregex".to_string()));
+    assert_eq!(router.lookup("www.test.example.com".as_bytes(), "/helloAB/".as_bytes()), Some(Route::AppId("examplewildcard".to_string())));
+    assert_eq!(router.lookup("test1.example.com".as_bytes(), "/helloAB/".as_bytes()), Some(Route::AppId("exampleregex".to_string())));
   }
 }

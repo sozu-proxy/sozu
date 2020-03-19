@@ -207,13 +207,33 @@ pub enum FrontendCmd {
 }
 
 #[derive(StructOpt, PartialEq, Debug)]
+pub enum Route {
+    /// traffic will go to the backend servers with this application id
+    Id {
+        /// traffic will go to the backend servers with this application id
+        id: String
+    },
+    /// traffic to this frontend will be rejected with HTTP 401
+    Deny,
+}
+
+impl std::convert::Into<sozu_command::proxy::Route> for Route {
+    fn into(self) -> sozu_command::proxy::Route {
+        match self {
+          Route::Deny => sozu_command::proxy::Route::Deny,
+          Route::Id { id } => sozu_command::proxy::Route::AppId(id),
+        }
+    }
+}
+
+#[derive(StructOpt, PartialEq, Debug)]
 pub enum HttpFrontendCmd {
   #[structopt(name = "add")]
   Add {
     #[structopt(short = "a", long = "address", help = "frontend address, format: IP:port")]
     address: SocketAddr,
-    #[structopt(short = "i", long = "id", help = "app id of the frontend")]
-    id: String,
+    #[structopt(flatten, name = "route")]
+    route: Route,
     #[structopt(short = "host", long = "hostname")]
     hostname: String,
     #[structopt(short = "p", long = "path", help="URL prefix of the frontend")]
@@ -223,8 +243,8 @@ pub enum HttpFrontendCmd {
   Remove {
     #[structopt(short = "a", long = "address", help = "frontend address, format: IP:port")]
     address: SocketAddr,
-    #[structopt(short = "i", long = "id", help = "app id of the frontend")]
-    id: String,
+    #[structopt(flatten, name = "route")]
+    route: Route,
     #[structopt(short = "host", long = "hostname")]
     hostname: String,
     #[structopt(short = "p", long = "path", help="URL prefix of the frontend")]

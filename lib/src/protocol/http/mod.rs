@@ -47,6 +47,7 @@ pub enum SessionStatus {
 pub enum DefaultAnswerStatus {
   Answer301,
   Answer400,
+  Answer401,
   Answer404,
   Answer408,
   Answer413,
@@ -187,6 +188,7 @@ impl<Front:SocketHandler> Http<Front> {
       match answer {
         DefaultAnswerStatus::Answer301 => incr!("http.301.redirection"),
         DefaultAnswerStatus::Answer400 => incr!("http.400.errors"),
+        DefaultAnswerStatus::Answer401 => incr!("http.401.errors"),
         DefaultAnswerStatus::Answer404 => incr!("http.404.errors"),
         DefaultAnswerStatus::Answer408 => incr!("http.408.errors"),
         DefaultAnswerStatus::Answer413 => incr!("http.413.errors"),
@@ -503,6 +505,7 @@ impl<Front:SocketHandler> Http<Front> {
       SessionStatus::Normal => "-",
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer301, _, _) => "301 Moved Permanently",
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer400, _, _) => "400 Bad Request",
+      SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer401, _, _) => "400 Unauthorized",
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer404, _, _) => "404 Not Found",
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer408, _, _) => "408 Request Timeout",
       SessionStatus::DefaultAnswer(DefaultAnswerStatus::Answer413, _, _) => "413 Payload Too Large",

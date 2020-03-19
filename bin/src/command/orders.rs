@@ -17,9 +17,11 @@ use nom::{Err,HexDisplay,Offset};
 use sozu_command::buffer::fixed::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners, ScmSocket};
-use sozu_command::proxy::{ProxyRequestData, ProxyRequest, Query, QueryAnswer, QueryApplicationType,
-MetricsData, AggregatedMetricsData, ProxyResponseData, HttpFront, TcpFront, ProxyResponseStatus};
-use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
+use sozu_command::proxy::{ProxyRequestData, ProxyRequest, Query, QueryAnswer,
+  QueryApplicationType, MetricsData, AggregatedMetricsData, ProxyResponseData,
+  HttpFront, TcpFront, Route, ProxyResponseStatus};
+use sozu_command::command::{CommandResponseData,CommandRequestData,
+  CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
 use sozu_command::state::get_application_ids_by_domain;
 use sozu_command::logging;
 use sozu::metrics::METRICS;
@@ -636,8 +638,16 @@ impl CommandServer {
             self.answer_error(token, message_id, msg, None);
             return;
           },
-          ProxyRequestData::RemoveHttpFront(HttpFront{ ref app_id, ref address, .. })
-          | ProxyRequestData::RemoveHttpsFront(HttpFront{ ref app_id, ref address, .. })
+          ProxyRequestData::RemoveHttpFront(HttpFront{ ref route, ref address, .. })
+          | ProxyRequestData::RemoveHttpsFront(HttpFront{ ref route, ref address, .. }) => {
+            let msg = match route {
+                Route::AppId(app_id) => format!("No such frontend at {} for the application {}", address, app_id),
+                Route::Deny => format!("No such frontend at {}", address),
+            };
+            error!("{}", msg);
+            self.answer_error(token, message_id, msg, None);
+            return;
+          },
           | ProxyRequestData::RemoveTcpFront(TcpFront{ ref app_id, ref address }) => {
             let msg = format!("No such frontend at {} for the application {}", address, app_id);
             error!("{}", msg);

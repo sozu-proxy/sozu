@@ -9,7 +9,8 @@ use proxy::{Application,CertFingerprint,CertificateAndKey,ProxyRequestData,
   HttpFront,TcpFront,Backend,QueryAnswerApplication,
   AddCertificate, RemoveCertificate, RemoveBackend,
   HttpListener,HttpsListener,TcpListener,ListenerType,
-  ActivateListener,RemoveListener,PathRule,DeactivateListener};
+  ActivateListener,RemoveListener,PathRule,DeactivateListener,
+  Route};
 
 pub type AppId = String;
 
@@ -36,8 +37,10 @@ pub struct ConfigState {
   pub http_listeners:  HashMap<SocketAddr, (HttpListener, bool)>,
   pub https_listeners: HashMap<SocketAddr, (HttpsListener, bool)>,
   pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
-  pub http_fronts:     HashMap<AppId, Vec<HttpFront>>,
-  pub https_fronts:    HashMap<AppId, Vec<HttpFront>>,
+  // indexed by (address, hostname, path)
+  pub http_fronts:     HashMap<(SocketAddr, String, PathRule), HttpFront>,
+  // indexed by (address, hostname, path)
+  pub https_fronts:    HashMap<(SocketAddr, String, PathRule), HttpFront>,
   pub tcp_fronts:      HashMap<AppId, Vec<TcpFront>>,
   // certificate and names
   pub certificates:    HashMap<SocketAddr, HashMap<CertFingerprint, (CertificateAndKey, Vec<String>)>>,
@@ -129,23 +132,17 @@ impl ConfigState {
         }
       },
       &ProxyRequestData::AddHttpFront(ref front) => {
-        let front_vec = self.http_fronts.entry(front.app_id.clone()).or_insert_with(Vec::new);
-        if !front_vec.contains(front) {
-          front_vec.push(front.clone());
-          true
+        if self.http_fronts.contains_key(&(front.address, front.hostname.to_string(), front.path.clone())) {
+            false
         } else {
-          false
+          self.http_fronts.insert(
+            (front.address, front.hostname.to_string(), front.path.clone()),
+            front.clone());
+          true
         }
       },
       &ProxyRequestData::RemoveHttpFront(ref front) => {
-        if let Some(front_list) = self.http_fronts.get_mut(&front.app_id) {
-          let len = front_list.len();
-          front_list.retain(|el| el.hostname != front.hostname || el.path != front.path);
-
-          front_list.len() != len
-        } else {
-          false
-        }
+        self.http_fronts.remove(&(front.address, front.hostname.to_string(), front.path.clone())).is_some()
       },
       &ProxyRequestData::AddCertificate(ref add) => {
         let fingerprint = match calculate_fingerprint(&add.certificate.certificate.as_bytes()[..]) {
@@ -189,22 +186,17 @@ impl ConfigState {
         }
       },
       &ProxyRequestData::AddHttpsFront(ref front) => {
-        let front_vec = self.https_fronts.entry(front.app_id.clone()).or_insert_with(Vec::new);
-        if !front_vec.contains(front) {
-          front_vec.push(front.clone());
-          true
+        if self.https_fronts.contains_key(&(front.address, front.hostname.to_string(), front.path.clone())) {
+            false
         } else {
-          false
+          self.https_fronts.insert(
+            (front.address, front.hostname.to_string(), front.path.clone()),
+            front.clone());
+          true
         }
       },
       &ProxyRequestData::RemoveHttpsFront(ref front) => {
-        if let Some(front_list) = self.https_fronts.get_mut(&front.app_id) {
-          let len = front_list.len();
-          front_list.retain(|el| el.hostname != front.hostname || el.path != front.path);
-          front_list.len() != len
-        } else {
-          false
-        }
+        self.https_fronts.remove(&(front.address, front.hostname.to_string(), front.path.clone())).is_some()
       },
       &ProxyRequestData::AddTcpFront(ref front) => {
         let front_vec = self.tcp_fronts.entry(front.app_id.clone()).or_insert_with(Vec::new);
@@ -291,10 +283,8 @@ impl ConfigState {
       v.push(ProxyRequestData::AddApplication(app.clone()));
     }
 
-    for front_list in self.http_fronts.values() {
-      for front in front_list {
-        v.push(ProxyRequestData::AddHttpFront(front.clone()));
-      }
+    for front in self.http_fronts.values() {
+      v.push(ProxyRequestData::AddHttpFront(front.clone()));
     }
 
     for (ref front, ref certs) in self.certificates.iter() {
@@ -307,10 +297,8 @@ impl ConfigState {
       }
     }
 
-    for front_list in self.https_fronts.values() {
-      for front in front_list {
-        v.push(ProxyRequestData::AddHttpsFront(front.clone()));
-      }
+    for front in self.https_fronts.values() {
+      v.push(ProxyRequestData::AddHttpsFront(front.clone()));
     }
 
     for front_list in self.tcp_fronts.values() {
@@ -390,33 +378,25 @@ impl ConfigState {
     let added_https_listeners: Vec<&SocketAddr> = their_https_listeners.difference(&my_https_listeners)
       .cloned().collect();
 
-    let mut my_http_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
-    for (ref app_id, ref front_list) in self.http_fronts.iter() {
-      for ref front in front_list.iter() {
-        my_http_fronts.insert((&app_id, &front));
-      }
+    let mut my_http_fronts: HashSet<(&(SocketAddr, String, PathRule), &HttpFront)> = HashSet::new();
+    for (ref route, ref front) in self.http_fronts.iter() {
+      my_http_fronts.insert((&route, &front));
     }
-    let mut their_http_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
-    for (ref app_id, ref front_list) in other.http_fronts.iter() {
-      for ref front in front_list.iter() {
-        their_http_fronts.insert((&app_id, &front));
-      }
+    let mut their_http_fronts: HashSet<(&(SocketAddr, String, PathRule), &HttpFront)> = HashSet::new();
+    for (ref route, ref front) in other.http_fronts.iter() {
+      their_http_fronts.insert((&route, &front));
     }
 
     let removed_http_fronts = my_http_fronts.difference(&their_http_fronts);
     let added_http_fronts   = their_http_fronts.difference(&my_http_fronts);
 
-    let mut my_https_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
-    for (ref app_id, ref front_list) in self.https_fronts.iter() {
-      for ref front in front_list.iter() {
-        my_https_fronts.insert((&app_id, &front));
-      }
+    let mut my_https_fronts: HashSet<(&(SocketAddr, String, PathRule), &HttpFront)> = HashSet::new();
+    for (ref route, ref front) in self.https_fronts.iter() {
+      my_https_fronts.insert((&route, &front));
     }
-    let mut their_https_fronts: HashSet<(&AppId, &HttpFront)> = HashSet::new();
-    for (ref app_id, ref front_list) in other.https_fronts.iter() {
-      for ref front in front_list.iter() {
-        their_https_fronts.insert((&app_id, &front));
-      }
+    let mut their_https_fronts: HashSet<(&(SocketAddr, String, PathRule), &HttpFront)> = HashSet::new();
+    for (ref route, ref front) in other.https_fronts.iter() {
+      their_https_fronts.insert((&route, &front));
     }
 
     let removed_https_fronts = my_https_fronts.difference(&their_https_fronts);
@@ -714,13 +694,14 @@ impl ConfigState {
     v
   }
 
+  // FIXME: what about deny rules?
   pub fn hash_state(&self) -> BTreeMap<AppId, u64> {
     self.applications.keys().map(|app_id| {
       let mut s = DefaultHasher::new();
       self.applications.get(app_id).hash(&mut s);
       self.backends.get(app_id).map(|ref v| v.iter().collect::<BTreeSet<_>>().hash(&mut s));
-      self.http_fronts.get(app_id).map(|ref v| v.iter().collect::<BTreeSet<_>>().hash(&mut s));
-      self.https_fronts.get(app_id).map(|ref v| v.iter().collect::<BTreeSet<_>>().hash(&mut s));
+      self.http_fronts.values().filter(|f| f.route == Route::AppId(app_id.to_string())).map(|ref v| v.hash(&mut s));
+      self.https_fronts.values().filter(|f| f.route == Route::AppId(app_id.to_string())).map(|ref v| v.hash(&mut s));
       self.tcp_fronts.get(app_id).map(|ref v| v.iter().collect::<BTreeSet<_>>().hash(&mut s));
 
       (app_id.to_string(), s.finish())
@@ -731,8 +712,26 @@ impl ConfigState {
   pub fn application_state(&self, app_id: &str) -> QueryAnswerApplication {
     QueryAnswerApplication {
       configuration:   self.applications.get(app_id).cloned(),
-      http_frontends:  self.http_fronts.get(app_id).cloned().unwrap_or_else(Vec::new),
-      https_frontends: self.https_fronts.get(app_id).cloned().unwrap_or_else(Vec::new),
+      http_frontends:  self.http_fronts.iter().filter_map(|(k, v)| {
+          match &v.route {
+            Route::Deny => None,
+            Route::AppId(id) => if id == app_id {
+                Some(v)
+            } else {
+                None
+            }
+          }
+        }).cloned().collect(),
+      https_frontends: self.https_fronts.iter().filter_map(|(k, v)| {
+          match &v.route {
+            Route::Deny => None,
+            Route::AppId(id) => if id == app_id {
+                Some(v)
+            } else {
+                None
+            }
+          }
+        }).cloned().collect(),
       tcp_frontends:   self.tcp_fronts.get(app_id).cloned().unwrap_or_else(Vec::new),
       backends:        self.backends.get(app_id).cloned().unwrap_or_else(Vec::new),
     }
@@ -743,8 +742,8 @@ impl ConfigState {
   }
 
   pub fn count_frontends(&self) -> usize {
-    self.http_fronts.values().fold(0, |acc, v| acc + v.len()) +
-    self.https_fronts.values().fold(0, |acc, v| acc + v.len()) +
+    self.http_fronts.values().count() +
+    self.https_fronts.values().count() +
     self.tcp_fronts.values().fold(0, |acc, v| acc + v.len())
   }
 }
@@ -765,19 +764,21 @@ pub fn get_application_ids_by_domain(state: &ConfigState, hostname: String, path
   let mut app_ids: HashSet<AppId> = HashSet::new();
 
   state.http_fronts.values()
-    .for_each(|fronts| {
-      fronts
-        .iter()
-        .filter(|front| domain_check(&front.hostname, &front.path, &hostname, &path))
-        .for_each(|front| { app_ids.insert(front.app_id.clone()); });
+    .for_each(|front| {
+      if domain_check(&front.hostname, &front.path, &hostname, &path) {
+          if let Route::AppId(id) = &front.route {
+              app_ids.insert(id.to_string());
+          }
+      }
     });
 
   state.https_fronts.values()
-    .for_each(|fronts| {
-      fronts
-        .iter()
-        .filter(|front| domain_check(&front.hostname, &front.path, &hostname, &path))
-        .for_each(|front| { app_ids.insert(front.app_id.clone()); });
+    .for_each(|front| {
+      if domain_check(&front.hostname, &front.path, &hostname, &path) {
+          if let Route::AppId(id) = &front.route {
+              app_ids.insert(id.to_string());
+          }
+      }
     });
 
   app_ids
@@ -792,13 +793,13 @@ pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<(Strin
 mod tests {
   use super::*;
   use config::LoadBalancingAlgorithms;
-  use proxy::{ProxyRequestData,HttpFront,Backend,LoadBalancingParams,TlsProvider,RulePosition,PathRule};
+  use proxy::{ProxyRequestData,HttpFront,Backend,LoadBalancingParams,TlsProvider,RulePosition,PathRule, Route};
 
   #[test]
   fn serialize() {
     let mut state:ConfigState = Default::default();
-    state.handle_order(&ProxyRequestData::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path: PathRule::Prefix(String::from("/")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Tree }));
-    state.handle_order(&ProxyRequestData::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path: PathRule::Prefix(String::from("/abc")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Pre }));
+    state.handle_order(&ProxyRequestData::AddHttpFront(HttpFront { route: Route::AppId(String::from("app_1")), hostname: String::from("lolcatho.st:8080"), path: PathRule::Prefix(String::from("/")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Tree }));
+    state.handle_order(&ProxyRequestData::AddHttpFront(HttpFront { route: Route::AppId(String::from("app_2")), hostname: String::from("test.local"), path: PathRule::Prefix(String::from("/abc")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Pre }));
     state.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-1"), address: "127.0.0.2:1027".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_2"), backend_id: String::from("app_2-0"), address: "192.167.1.2:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
@@ -819,22 +820,22 @@ mod tests {
   #[test]
   fn diff() {
     let mut state:ConfigState = Default::default();
-    state.handle_order(&ProxyRequestData::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path: PathRule::Prefix(String::from("/")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Post }));
-    state.handle_order(&ProxyRequestData::AddHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path: PathRule::Prefix(String::from("/abc")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Tree }));
+    state.handle_order(&ProxyRequestData::AddHttpFront(HttpFront { route: Route::AppId(String::from("app_1")), hostname: String::from("lolcatho.st:8080"), path: PathRule::Prefix(String::from("/")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Post }));
+    state.handle_order(&ProxyRequestData::AddHttpFront(HttpFront { route: Route::AppId(String::from("app_2")), hostname: String::from("test.local"), path: PathRule::Prefix(String::from("/abc")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Tree }));
     state.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-1"), address: "127.0.0.2:1027".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_2"), backend_id: String::from("app_2-0"), address: "192.167.1.2:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state.handle_order(&ProxyRequestData::AddApplication(Application { app_id: String::from("app_2"), sticky_session: true, https_redirect: true, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::RoundRobin, answer_503: None }));
 
     let mut state2:ConfigState = Default::default();
-    state2.handle_order(&ProxyRequestData::AddHttpFront(HttpFront { app_id: String::from("app_1"), hostname: String::from("lolcatho.st:8080"), path: PathRule::Prefix(String::from("/")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Post }));
+    state2.handle_order(&ProxyRequestData::AddHttpFront(HttpFront { route: Route::AppId(String::from("app_1")), hostname: String::from("lolcatho.st:8080"), path: PathRule::Prefix(String::from("/")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Post }));
     state2.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state2.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-1"), address: "127.0.0.2:1027".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state2.handle_order(&ProxyRequestData::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-2"), address: "127.0.0.2:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state2.handle_order(&ProxyRequestData::AddApplication(Application { app_id: String::from("app_3"), sticky_session: false, https_redirect: false, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::RoundRobin, answer_503: None }));
 
    let e = vec!(
-     ProxyRequestData::RemoveHttpFront(HttpFront { app_id: String::from("app_2"), hostname: String::from("test.local"), path: PathRule::Prefix(String::from("/abc")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Tree }),
+     ProxyRequestData::RemoveHttpFront(HttpFront { route: Route::AppId(String::from("app_2")), hostname: String::from("test.local"), path: PathRule::Prefix(String::from("/abc")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Tree }),
      ProxyRequestData::RemoveBackend(RemoveBackend { app_id: String::from("app_2"), backend_id: String::from("app_2-0"), address: "192.167.1.2:1026".parse().unwrap() }),
      ProxyRequestData::AddBackend(Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-2"), address: "127.0.0.2:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None }),
      ProxyRequestData::RemoveApplication(String::from("app_2")),
@@ -863,7 +864,7 @@ mod tests {
   fn application_ids_by_domain() {
     let mut config = ConfigState::new();
     let http_front_app1 = HttpFront {
-      app_id: String::from("MyApp_1"),
+      route: Route::AppId(String::from("MyApp_1")),
       hostname: String::from("lolcatho.st"),
       path: PathRule::Prefix(String::from("")),
       address: "0.0.0.0:8080".parse().unwrap(),
@@ -871,7 +872,7 @@ mod tests {
     };
 
     let https_front_app1 = HttpFront {
-      app_id: String::from("MyApp_1"),
+      route: Route::AppId(String::from("MyApp_1")),
       hostname: String::from("lolcatho.st"),
       path: PathRule::Prefix(String::from("")),
       address: "0.0.0.0:8443".parse().unwrap(),
@@ -879,7 +880,7 @@ mod tests {
     };
 
     let http_front_app2 = HttpFront {
-      app_id: String::from("MyApp_2"),
+      route: Route::AppId(String::from("MyApp_2")),
       hostname: String::from("lolcatho.st"),
       path: PathRule::Prefix(String::from("/api")),
       address: "0.0.0.0:8080".parse().unwrap(),
@@ -887,7 +888,7 @@ mod tests {
     };
 
     let https_front_app2 = HttpFront {
-      app_id: String::from("MyApp_2"),
+      route: Route::AppId(String::from("MyApp_2")),
       hostname: String::from("lolcatho.st"),
       path: PathRule::Prefix(String::from("/api")),
       address: "0.0.0.0:8443".parse().unwrap(),

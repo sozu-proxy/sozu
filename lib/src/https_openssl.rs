@@ -30,7 +30,8 @@ use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,CertFingerprint,CertificateAndKey,
   ProxyRequestData,HttpFront,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,TlsVersion,ProxyEvent,Query,QueryCertificateType,
-  QueryAnswer,QueryAnswerCertificate,ProxyResponseData};
+  QueryAnswer,QueryAnswerCertificate,ProxyResponseData,RemoveListener,
+  Route};
 use sozu_command::logging;
 use sozu_command::buffer::fixed::Buffer;
 
@@ -1231,7 +1232,7 @@ impl Listener {
   }
 
   // ToDo factor out with http.rs
-  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<String> {
+  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<Route> {
     let host: &str = if let Ok((i, (hostname, _))) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
         error!("frontend_from_request: invalid remaining chars after hostname. Host: {}", host);
@@ -1437,7 +1438,12 @@ impl Proxy {
       .ok_or(ConnectionError::NoRequestLineGiven)?;
     match self.listeners.get(&session.listen_token).as_ref()
       .and_then(|l| l.frontend_from_request(&host, &rl.uri)) {
-      Some(app_id) => Ok(app_id),
+      Some(Route::AppId(app_id)) => Ok(app_id),
+      Some(Route::Deny) => {
+        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer401, None);
+        session.set_answer(DefaultAnswerStatus::Answer401, answer);
+        Err(ConnectionError::Unauthorized)
+      },
       None => {
         let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
         session.set_answer(DefaultAnswerStatus::Answer404, answer);
@@ -1853,6 +1859,7 @@ mod tests {
   use std::rc::Rc;
   use std::sync::{Arc,Mutex};
   use router::{trie::TrieNode,Router,PathRule};
+  use sozu_command::proxy::Route;
   use openssl::ssl::{SslContext, SslMethod};
 
   /*
@@ -1882,10 +1889,10 @@ mod tests {
     let uri3 = "/yolo/swag".to_owned();
 
     let mut fronts = Router::new();
-    assert!(fronts.add_tree_rule("lolcatho.st".as_bytes(), PathRule::Prefix(uri1), app_id1.clone()));
-    assert!(fronts.add_tree_rule("lolcatho.st".as_bytes(), PathRule::Prefix(uri2), app_id2));
-    assert!(fronts.add_tree_rule("lolcatho.st".as_bytes(), PathRule::Prefix(uri3), app_id3));
-    assert!(fronts.add_tree_rule("other.domain".as_bytes(), PathRule::Prefix("test".to_string()), app_id1));
+    assert!(fronts.add_tree_rule("lolcatho.st".as_bytes(), PathRule::Prefix(uri1), Route::AppId(app_id1.clone())));
+    assert!(fronts.add_tree_rule("lolcatho.st".as_bytes(), PathRule::Prefix(uri2), Route::AppId(app_id2)));
+    assert!(fronts.add_tree_rule("lolcatho.st".as_bytes(), PathRule::Prefix(uri3), Route::AppId(app_id3)));
+    assert!(fronts.add_tree_rule("other.domain".as_bytes(), PathRule::Prefix("test".to_string()), Route::AppId(app_id1)));
 
     let contexts   = HashMap::new();
     let rc_ctx     = Arc::new(Mutex::new(contexts));
@@ -1913,16 +1920,16 @@ mod tests {
 
     println!("TEST {}", line!());
     let frontend1 = listener.frontend_from_request("lolcatho.st", "/");
-    assert_eq!(frontend1.expect("should find a frontend"), "app_1");
+    assert_eq!(frontend1.expect("should find a frontend"), Route::AppId("app_1".to_string()));
     println!("TEST {}", line!());
     let frontend2 = listener.frontend_from_request("lolcatho.st", "/test");
-    assert_eq!(frontend2.expect("should find a frontend"), "app_1");
+    assert_eq!(frontend2.expect("should find a frontend"), Route::AppId("app_1".to_string()));
     println!("TEST {}", line!());
     let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test");
-    assert_eq!(frontend3.expect("should find a frontend"), "app_2");
+    assert_eq!(frontend3.expect("should find a frontend"), Route::AppId("app_2".to_string()));
     println!("TEST {}", line!());
     let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag");
-    assert_eq!(frontend4.expect("should find a frontend"), "app_3");
+    assert_eq!(frontend4.expect("should find a frontend"), Route::AppId("app_3".to_string()));
     println!("TEST {}", line!());
     let frontend5 = listener.frontend_from_request("domain", "/");
     assert_eq!(frontend5, None);

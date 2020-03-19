@@ -1315,7 +1315,8 @@ impl Server {
       Ok(BackendConnectAction::New) => {
       },
       Err(ConnectionError::HostNotFound) | Err(ConnectionError::NoBackendAvailable) |
-        Err(ConnectionError::HttpsRedirect) | Err(ConnectionError::InvalidHost) => {
+        Err(ConnectionError::HttpsRedirect) | Err(ConnectionError::InvalidHost) |
+        Err(ConnectionError::Unauthorized) => {
         if protocol == Protocol::TCP {
           self.close_session(token);
         }

@@ -16,7 +16,8 @@ use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::proxy::{Application,ProxyRequestData,HttpFront,HttpListener,
-  ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent};
+  ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent,RemoveListener,
+  Route};
 use sozu_command::logging;
 use sozu_command::buffer::fixed::Buffer;
 
@@ -880,7 +881,12 @@ impl Proxy {
 
     let app_id = match self.listeners.get(&session.listen_token).as_ref()
       .and_then(|l| l.frontend_from_request(&host, &rl.uri)) {
-      Some(app_id) => app_id,
+      Some(Route::AppId(app_id)) => app_id,
+      Some(Route::Deny) => {
+        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer401, None);
+        session.set_answer(DefaultAnswerStatus::Answer401, answer);
+        return Err(ConnectionError::Unauthorized);
+      },
       None => {
         let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
         session.set_answer(DefaultAnswerStatus::Answer404, answer);
@@ -968,7 +974,7 @@ impl Listener {
     }
   }
 
-  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<String> {
+  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<Route> {
     let host: &str = if let Ok((i, (hostname, _))) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
         error!("frontend_from_request: invalid remaining chars after hostname. Host: {}", host);
@@ -1304,7 +1310,8 @@ mod tests {
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
-  use sozu_command::proxy::{ProxyRequestData,HttpFront,Backend,HttpListener,ProxyRequest,LoadBalancingParams,PathRule,RulePosition};
+  use sozu_command::proxy::{ProxyRequestData,HttpFront,Backend,HttpListener,
+    ProxyRequest,LoadBalancingParams,PathRule,RulePosition, Route};
   use sozu_command::config::LoadBalancingAlgorithms;
   use sozu_command::channel::Channel;
 
@@ -1340,9 +1347,9 @@ mod tests {
       start(config, channel, 10, 16384);
     });
 
-    let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1024".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
+    let front = HttpFront { route: Route::AppId(String::from("app_1")), address: "127.0.0.1:1024".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
     command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFront(front) });
-    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), address: "127.0.0.1:1025".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
+    let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1025".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1396,7 +1403,7 @@ mod tests {
       start(config, channel, 10, 16384);
     });
 
-    let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1031".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
+    let front = HttpFront { route: Route::AppId(String::from("app_1")), address: "127.0.0.1:1031".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
     command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFront(front) });
     let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddBackend(backend) });
@@ -1475,9 +1482,9 @@ mod tests {
 
     let application = Application { app_id: String::from("app_1"), sticky_session: false, https_redirect: true, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::default(), answer_503: None };
     command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddApplication(application) });
-    let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1041".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
+    let front = HttpFront { route: Route::AppId(String::from("app_1")), address: "127.0.0.1:1041".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
     command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddHttpFront(front) });
-    let backend = Backend { app_id: String::from("app_1"),backend_id: String::from("app_1-0"), address: "127.0.0.1:1040".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
+    let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1040".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&ProxyRequest { id: String::from("ID_IJKL"), order: ProxyRequestData::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1552,13 +1559,13 @@ mod tests {
     let uri3 = "/yolo/swag".to_owned();
 
     let mut fronts = Router::new();
-    fronts.add_http_front(HttpFront { app_id: app_id1, address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
+    fronts.add_http_front(HttpFront { route: Route::AppId(app_id1), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
                               path: PathRule::Prefix(uri1), position: RulePosition::Tree });
-    fronts.add_http_front(HttpFront { app_id: app_id2, address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
+    fronts.add_http_front(HttpFront { route: Route::AppId(app_id2), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
                               path: PathRule::Prefix(uri2), position: RulePosition::Tree });
-    fronts.add_http_front(HttpFront { app_id: app_id3, address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
+    fronts.add_http_front(HttpFront { route: Route::AppId(app_id3), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
                               path: PathRule::Prefix(uri3), position: RulePosition::Tree });
-    fronts.add_http_front(HttpFront { app_id: "app_1".to_owned(), address: "0.0.0.0:80".parse().unwrap(), hostname: "other.domain".to_owned(), path: PathRule::Prefix("/test".to_owned()), position: RulePosition::Tree });
+    fronts.add_http_front(HttpFront { route: Route::AppId("app_1".to_owned()), address: "0.0.0.0:80".parse().unwrap(), hostname: "other.domain".to_owned(), path: PathRule::Prefix("/test".to_owned()), position: RulePosition::Tree });
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
     let listener = Listener {
@@ -1576,10 +1583,10 @@ mod tests {
     let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test");
     let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag");
     let frontend5 = listener.frontend_from_request("domain", "/");
-    assert_eq!(frontend1.expect("should find frontend"), "app_1");
-    assert_eq!(frontend2.expect("should find frontend"), "app_1");
-    assert_eq!(frontend3.expect("should find frontend"), "app_2");
-    assert_eq!(frontend4.expect("should find frontend"), "app_3");
+    assert_eq!(frontend1.expect("should find frontend"), Route::AppId("app_1".to_string()));
+    assert_eq!(frontend2.expect("should find frontend"), Route::AppId("app_1".to_string()));
+    assert_eq!(frontend3.expect("should find frontend"), Route::AppId("app_2".to_string()));
+    assert_eq!(frontend4.expect("should find frontend"), Route::AppId("app_3".to_string()));
     assert_eq!(frontend5, None);
   }
 }
