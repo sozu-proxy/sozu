@@ -39,13 +39,13 @@ impl CommandServer {
     //info!("handle_client_message: front token = {:?}, message = {:#?}", token, message);
     let config_command = message.data.clone();
     match config_command {
-      CommandRequestData::SaveState(path) => {
+      CommandRequestData::SaveState { path } => {
         self.save_state(token, &message.id, &path);
       },
       CommandRequestData::DumpState => {
         self.dump_state(token, &message.id);
       },
-      CommandRequestData::LoadState(path) => {
+      CommandRequestData::LoadState { path } => {
         self.load_state(Some(token), &message.id, &path);
         //self.answer_success(token, message.id.as_str(), "loaded the configuration", None);
       },
@@ -199,6 +199,17 @@ impl CommandServer {
                 }
               }
               offset = buffer.data().offset(i);
+
+              if orders.iter().find(|o| {
+                if o.version > sozu_command::command::PROTOCOL_VERSION {
+                  error!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", sozu_command::command::PROTOCOL_VERSION, o.version);
+                  true
+                } else {
+                  false
+                }
+              }).is_some() {
+                break;
+              }
 
               let mut new_state = self.state.clone();
               for message in orders {

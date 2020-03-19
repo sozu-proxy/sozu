@@ -66,7 +66,7 @@ pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
-    CommandRequestData::SaveState(path),
+    CommandRequestData::SaveState { path },
     None,
   ));
 
@@ -104,7 +104,7 @@ pub fn load_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
-    CommandRequestData::LoadState(path.clone()),
+    CommandRequestData::LoadState { path: path.clone() },
     None,
   ));
 
