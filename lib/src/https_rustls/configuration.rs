@@ -18,7 +18,7 @@ use sozu_command::proxy::{Application,
   ProxyRequestData,HttpFront,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
   TlsVersion,ProxyResponseData,Query, QueryCertificateType,QueryAnswer,
-  QueryAnswerCertificate};
+  QueryAnswerCertificate,RemoveListener,Route};
 use sozu_command::logging;
 use sozu_command::ready::Ready;
 
@@ -193,7 +193,7 @@ impl Listener {
   }
 
   // ToDo factor out with http.rs
-  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<String> {
+  pub fn frontend_from_request(&self, host: &str, uri: &str) -> Option<Route> {
     let host: &str = if let Ok((i, (hostname, _))) = hostname_and_port(host.as_bytes()) {
       if i != &b""[..] {
         error!("invalid remaining chars after hostname");
@@ -378,7 +378,11 @@ impl Proxy {
       .ok_or(ConnectionError::NoRequestLineGiven)?;
     match self.listeners.get(&listen_token).as_ref()
       .and_then(|l| l.frontend_from_request(&host, &rl.uri)) {
-      Some(app_id) => Ok(app_id),
+      Some(Route::AppId(app_id)) => Ok(app_id),
+      Some(Route::Deny) => {
+        session.set_answer(DefaultAnswerStatus::Answer401, None);
+        Err(ConnectionError::Unauthorized)
+      },
       None => {
         session.set_answer(DefaultAnswerStatus::Answer404, None);
         Err(ConnectionError::HostNotFound)

@@ -22,6 +22,7 @@ use sozu_command::config::Config;
 use sozu_command::proxy::{ProxyRequest, ProxyRequestData, ProxyResponseData, ProxyResponseStatus};
 use sozu_command::scm_socket::{Listeners, ScmSocket};
 use sozu_command::state::ConfigState;
+use sozu_command::proxy::Route;
 
 use crate::get_executable_path;
 use crate::upgrade::SerializedWorker;

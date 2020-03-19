@@ -415,7 +415,8 @@ pub enum ConnectionError {
   HostNotFound,
   NoBackendAvailable,
   ToBeDefined,
-  HttpsRedirect
+  HttpsRedirect,
+  Unauthorized,
 }
 
 #[derive(Debug,PartialEq,Eq)]
