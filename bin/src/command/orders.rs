@@ -17,6 +17,7 @@ use sozu_command::command::{
     CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
     RunState, WorkerInfo,
 };
+use sozu_command::proxy::Route;
 use sozu_command::logging;
 use sozu_command::proxy::{
     AggregatedMetricsData, MetricsData, ProxyRequestData, ProxyResponseData,
@@ -1061,10 +1062,10 @@ impl CommandServer {
                         return;
                     }
                     ProxyRequestData::RemoveHttpFront(h) | ProxyRequestData::RemoveHttpsFront(h) => {
-                        let msg = format!(
-                            "cannot remove HTTP frontend: application {} has no frontends on {} for {} {}",
-                            h.app_id, h.address, h.hostname, h.path,
-                        );
+                        let msg = match h.route {
+                            Route::AppId(app_id) => format!("No such frontend at {} for the application {}", h.address, app_id),
+                            Route::Deny => format!("No such frontend at {}", h.address),
+                        };
                         error!("{}", msg);
                         self.answer_error(client_id, request_id, msg, None).await;
                         return;

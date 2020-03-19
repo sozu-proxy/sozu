@@ -5,7 +5,9 @@
   "data": {
     "type": "REMOVE_HTTP_FRONT",
     "data": {
-      "app_id": "xxx",
+      "route": {
+        "APP_ID": "xxx"
+      },
       "address": "0.0.0.0:8080",
       "hostname": "yyy",
       "path": {

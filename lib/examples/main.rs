@@ -8,7 +8,7 @@ use std::env;
 use std::io::stdout;
 use sozu_command::logging::{Logger,LoggerBackend};
 use sozu_command::proxy;
-use sozu_command::proxy::{LoadBalancingParams,PathRule, RulePosition};
+use sozu_command::proxy::{LoadBalancingParams,PathRule, RulePosition, Route};
 use sozu_command::channel::Channel;
 
 fn main() {
@@ -36,7 +36,7 @@ fn main() {
   });
 
   let http_front = proxy::HttpFront {
-    app_id:   String::from("app_1"),
+    route:   Route::AppId(String::from("app_1")),
     address:  "127.0.0.1:8080".parse().unwrap(),
     hostname: String::from("lolcatho.st"),
     path:     PathRule::Prefix(String::from("/")),
@@ -111,7 +111,7 @@ fn main() {
   });
 
   let tls_front = proxy::HttpFront {
-    app_id:   String::from("app_1"),
+    route:   Route::AppId(String::from("app_1")),
     address:  "127.0.0.1:8443".parse().unwrap(),
     hostname: String::from("lolcatho.st"),
     path:     PathRule::Prefix(String::from("/")),
@@ -156,7 +156,7 @@ fn main() {
   });
 
   let tls_front2 = proxy::HttpFront {
-    app_id:   String::from("app_2"),
+    route:   Route::AppId(String::from("app_2")),
     address:  "127.0.0.1:8443".parse().unwrap(),
     hostname: String::from("test.local"),
     path:     PathRule::Prefix(String::from("/")),
