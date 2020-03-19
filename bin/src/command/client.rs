@@ -5,7 +5,10 @@ use std::collections::VecDeque;
 use nom::IResult;
 use serde_json::from_str;
 
-use sozu_command::channel::Channel;
+use sozu_command::{
+    channel::Channel,
+    command::PROTOCOL_VERSION
+};
 
 use super::{CommandRequest,CommandResponse};
 

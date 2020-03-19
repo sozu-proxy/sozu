@@ -10,11 +10,12 @@ use proxy::{AggregatedMetricsData,ProxyRequestData,QueryAnswer,ProxyEvent};
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum CommandRequestData {
   Proxy(ProxyRequestData),
-  SaveState(String),
-  LoadState(String),
+  SaveState { path: String },
+  LoadState { path: String },
   DumpState,
   ListWorkers,
   LaunchWorker(String),
@@ -23,12 +24,14 @@ pub enum CommandRequestData {
   SubscribeEvents,
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct CommandRequest {
   pub id:        String,
   pub version:   u8,
-  pub data:      CommandRequestData,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub worker_id: Option<u32>,
+  #[serde(flatten)]
+  pub data:      CommandRequestData,
 }
 
 impl CommandRequest {
@@ -118,213 +121,10 @@ impl From<ProxyEvent> for Event {
   }
 }
 
-enum CommandRequestField {
-  Id,
-  Version,
-  WorkerId,
-  Type,
-  Data,
-}
-
-impl<'de> serde::Deserialize<'de> for CommandRequestField {
-  fn deserialize<D>(deserializer: D) -> Result<CommandRequestField, D::Error>
-        where D: serde::de::Deserializer<'de> {
-    struct CommandRequestFieldVisitor;
-    impl<'de> serde::de::Visitor<'de> for CommandRequestFieldVisitor {
-      type Value = CommandRequestField;
-
-      fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("expected id, version, worker id, type or data")
-      }
-
-      fn visit_str<E>(self, value: &str) -> Result<CommandRequestField, E>
-        where E: serde::de::Error {
-        match value {
-          "id"        => Ok(CommandRequestField::Id),
-          "version"   => Ok(CommandRequestField::Version),
-          "type"      => Ok(CommandRequestField::Type),
-          "worker_id" => Ok(CommandRequestField::WorkerId),
-          "data"      => Ok(CommandRequestField::Data),
-          e => Err(serde::de::Error::custom(format!("expected id, version, worker id, type or data, got: {}", e))),
-        }
-      }
-    }
-
-    deserializer.deserialize_any(CommandRequestFieldVisitor)
-  }
-}
-
-struct CommandRequestVisitor;
-impl<'de> serde::de::Visitor<'de> for CommandRequestVisitor {
-  type Value = CommandRequest;
-
-  fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-    formatter.write_str("")
-  }
-
-  fn visit_map<V>(self, mut visitor: V) -> Result<CommandRequest, V::Error>
-        where V: serde::de::MapAccess<'de> {
-    let mut id:Option<String>              = None;
-    let mut version:Option<u8>             = None;
-    let mut worker_id: Option<u32>          = None;
-    let mut config_type:Option<String>     = None;
-    let mut data:Option<serde_json::Value> = None;
-
-    loop {
-      match visitor.next_key()? {
-        Some(CommandRequestField::Type)    => { config_type = Some(visitor.next_value()?); }
-        Some(CommandRequestField::Id)      => { id = Some(visitor.next_value()?); }
-        Some(CommandRequestField::Version) => { version = Some(visitor.next_value()?); }
-        Some(CommandRequestField::WorkerId) => { worker_id = Some(visitor.next_value()?); }
-        Some(CommandRequestField::Data)    => { data = Some(visitor.next_value()?); }
-        None => { break; }
-      }
-    }
-
-    //println!("decoded type = {:?}, value= {:?}", proxy_type, state);
-    let config_type = match config_type {
-      Some(config) => config,
-      None => return Err(serde::de::Error::missing_field("type")),
-    };
-    let id = match id {
-      Some(id) => id,
-      None => return Err(serde::de::Error::missing_field("id")),
-    };
-    let _version = match version {
-      Some(version) => {
-        if version > PROTOCOL_VERSION {
-          let msg = format!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", PROTOCOL_VERSION, version);
-          return Err(serde::de::Error::custom(msg));
-        } else {
-          version
-        }
-      },
-      None => return Err(serde::de::Error::missing_field("version")),
-    };
-
-    let data = if config_type == "PROXY" {
-      let data = match data {
-        Some(data) => data,
-        None => return Err(serde::de::Error::missing_field("data")),
-      };
-      let command = serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("proxy configuration command")))?;
-      CommandRequestData::Proxy(command)
-    } else if config_type == "SAVE_STATE" {
-      let data = match data {
-        Some(data) => data,
-        None => return Err(serde::de::Error::missing_field("data")),
-      };
-      let state: SaveStateData = serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("save state")))?;
-      CommandRequestData::SaveState(state.path)
-    } else if config_type == "DUMP_STATE" {
-      CommandRequestData::DumpState
-    } else if config_type == "LOAD_STATE" {
-      let data = match data {
-        Some(data) => data,
-        None => return Err(serde::de::Error::missing_field("data")),
-      };
-      let state: SaveStateData = serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("save state")))?;
-      CommandRequestData::LoadState(state.path)
-    } else if config_type == "LIST_WORKERS" {
-      CommandRequestData::ListWorkers
-    } else if config_type == "LAUNCH_WORKER" {
-      let data = match data {
-        Some(data) => data,
-        None => return Err(serde::de::Error::missing_field("data")),
-      };
-      CommandRequestData::LaunchWorker(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("launch worker")))?)
-    } else if config_type == "UPGRADE_MASTER" {
-      CommandRequestData::UpgradeMaster
-    } else if config_type == "UPGRADE_WORKER" {
-      let data = match data {
-        Some(data) => data,
-        None => return Err(serde::de::Error::missing_field("data")),
-      };
-      CommandRequestData::UpgradeWorker(serde_json::from_value(data).or_else(|_| Err(serde::de::Error::custom("upgrade worker")))?)
-    } else if config_type == "SUBSCRIBE_EVENTS" {
-      CommandRequestData::SubscribeEvents
-    } else {
-      return Err(serde::de::Error::custom("unrecognized command"));
-    };
-
-    Ok(CommandRequest {
-      id,
-      version: PROTOCOL_VERSION,
-      data,
-      worker_id,
-    })
-  }
-}
-
-impl<'de> serde::Deserialize<'de> for CommandRequest {
-  fn deserialize<D>(deserializer: D) -> Result<CommandRequest, D::Error>
-    where D: serde::de::Deserializer<'de> {
-    static FIELDS: &'static [&'static str] = &["id", "version", "worker_id", "type", "data"];
-    deserializer.deserialize_struct("CommandRequest", FIELDS, CommandRequestVisitor)
-  }
-}
-
 #[derive(Serialize)]
 struct StatePath {
   path: String
 }
-
-impl serde::Serialize for CommandRequest {
-  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-      where S: serde::Serializer,
-  {
-    let mut count = 4;
-    if self.worker_id.is_some() {
-      count += 1;
-    }
-    let mut map = serializer.serialize_map(Some(count))?;
-
-    map.serialize_entry("id", &self.id)?;
-    map.serialize_entry("version", &self.version)?;
-
-    if self.worker_id.is_some() {
-      map.serialize_entry("worker_id", self.worker_id.as_ref().unwrap())?;
-    }
-
-    match self.data {
-      CommandRequestData::Proxy(ref order) => {
-        map.serialize_entry("type", "PROXY")?;
-        map.serialize_entry("data", order)?;
-      },
-      CommandRequestData::SaveState(ref path) => {
-        map.serialize_entry("type", "SAVE_STATE")?;
-        map.serialize_entry("data", &StatePath { path: path.to_string() })?;
-      },
-      CommandRequestData::LoadState(ref path) => {
-        map.serialize_entry("type", "LOAD_STATE")?;
-        map.serialize_entry("data", &StatePath { path: path.to_string() })?;
-      },
-      CommandRequestData::DumpState => {
-        map.serialize_entry("type", "DUMP_STATE")?;
-      },
-      CommandRequestData::ListWorkers => {
-        map.serialize_entry("type", "LIST_WORKERS")?;
-      },
-      CommandRequestData::LaunchWorker(ref tag) => {
-        map.serialize_entry("type", "LAUNCH_WORKER")?;
-        map.serialize_entry("data", tag)?;
-      },
-      CommandRequestData::UpgradeMaster => {
-        map.serialize_entry("type", "UPGRADE_MASTER")?;
-      },
-      CommandRequestData::UpgradeWorker(ref id) => {
-        map.serialize_entry("type", "UPGRADE_WORKER")?;
-        map.serialize_entry("data", id)?;
-      },
-      CommandRequestData::SubscribeEvents => {
-        map.serialize_entry("type", "SUBSCRIBE_EVENTS")?;
-      },
-    };
-
-    map.end()
-  }
-}
-
 
 #[cfg(test)]
 mod tests {
@@ -350,16 +150,6 @@ mod tests {
       address: "0.0.0.0:8080".parse().unwrap(),
       position: RulePosition::Tree,
     })));
-  }
-
-  #[test]
-  fn protocol_version_mismatch_test() {
-    let data = include_str!("../assets/protocol_mismatch.json");
-    let msg = format!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {} at line 14 column 1", PROTOCOL_VERSION, 1);
-    let res: Result<CommandRequest, serde_json::Error> = serde_json::from_str(data);
-
-    let err = format!("{}", res.unwrap_err());
-    assert_eq!(err, msg);
   }
 
   macro_rules! test_message (
@@ -548,14 +338,14 @@ mod tests {
   test_message!(load_state, "../assets/load_state.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::LoadState(String::from("./config_dump.json")),
+      data:     CommandRequestData::LoadState { path: String::from("./config_dump.json") },
       worker_id: None
     });
 
   test_message!(save_state, "../assets/save_state.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::SaveState(String::from("./config_dump.json")),
+      data:     CommandRequestData::SaveState { path: String::from("./config_dump.json") },
       worker_id: None
     });
 
