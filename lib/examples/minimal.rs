@@ -33,7 +33,7 @@ fn main() {
     sozu::http::start(config, channel, max_buffers, buffer_size);
   });
 
-  let http_front = proxy::HttpFront {
+  let http_front = proxy::HttpFrontend {
     route:    Route::AppId(String::from("test")),
     address:  "127.0.0.1:8080".parse().unwrap(),
     hostname: String::from("example.com"),
@@ -51,7 +51,7 @@ fn main() {
 
   command.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_ABCD"),
-    order: proxy::ProxyRequestData::AddHttpFront(http_front)
+    order: proxy::ProxyRequestData::AddHttpFrontend(http_front)
   });
 
   command.write_message(&proxy::ProxyRequest {

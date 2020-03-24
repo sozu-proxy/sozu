@@ -35,7 +35,7 @@ fn main() {
     sozu::http::start(config, channel, max_buffers, buffer_size);
   });
 
-  let http_front = proxy::HttpFront {
+  let http_front = proxy::HttpFrontend {
     route:   Route::AppId(String::from("app_1")),
     address:  "127.0.0.1:8080".parse().unwrap(),
     hostname: String::from("lolcatho.st"),
@@ -54,7 +54,7 @@ fn main() {
 
   command.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_ABCD"),
-    order: proxy::ProxyRequestData::AddHttpFront(http_front)
+    order: proxy::ProxyRequestData::AddHttpFrontend(http_front)
   });
 
   command.write_message(&proxy::ProxyRequest {
@@ -109,7 +109,7 @@ fn main() {
     })
   });
 
-  let tls_front = proxy::HttpFront {
+  let tls_front = proxy::HttpFrontend {
     route:   Route::AppId(String::from("app_1")),
     address:  "127.0.0.1:8443".parse().unwrap(),
     hostname: String::from("lolcatho.st"),
@@ -119,7 +119,7 @@ fn main() {
 
   command2.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_IJKL2"),
-    order: proxy::ProxyRequestData::AddHttpsFront(tls_front)
+    order: proxy::ProxyRequestData::AddHttpsFrontend(tls_front)
   });
   let tls_backend = proxy::Backend {
     app_id:      String::from("app_1"),
@@ -153,7 +153,7 @@ fn main() {
     })
   });
 
-  let tls_front2 = proxy::HttpFront {
+  let tls_front2 = proxy::HttpFrontend {
     route:   Route::AppId(String::from("app_2")),
     address:  "127.0.0.1:8443".parse().unwrap(),
     hostname: String::from("test.local"),
@@ -163,7 +163,7 @@ fn main() {
 
   command2.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_QRST2"),
-    order: proxy::ProxyRequestData::AddHttpsFront(tls_front2)
+    order: proxy::ProxyRequestData::AddHttpsFrontend(tls_front2)
   });
 
   let tls_backend2 = proxy::Backend {

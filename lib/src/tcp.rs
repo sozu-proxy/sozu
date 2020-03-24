@@ -925,11 +925,11 @@ impl ProxyConfiguration<Session> for Proxy {
 
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
     match message.order {
-      ProxyRequestData::AddTcpFront(front) => {
+      ProxyRequestData::AddTcpFrontend(front) => {
         let _ = self.add_tcp_front(&front.app_id, &front.address);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
-      ProxyRequestData::RemoveTcpFront(front) => {
+      ProxyRequestData::RemoveTcpFrontend(front) => {
         let _ = self.remove_tcp_front(front.address);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
@@ -1121,7 +1121,7 @@ mod tests {
   use std::sync::{Arc, Barrier};
   use std::sync::atomic::{AtomicBool, Ordering};
   use sozu_command::scm_socket::Listeners;
-  use sozu_command::proxy::{self,TcpFront,LoadBalancingParams};
+  use sozu_command::proxy::{self,TcpFrontend,LoadBalancingParams};
   use sozu_command::channel::Channel;
   use std::os::unix::io::IntoRawFd;
   static TEST_FINISHED: AtomicBool = AtomicBool::new(false);
@@ -1288,7 +1288,7 @@ mod tests {
 
     command.set_blocking(true);
     {
-      let front = TcpFront {
+      let front = TcpFrontend {
         app_id: String::from("yolo"),
         address: "127.0.0.1:1234".parse().unwrap(),
       };
@@ -1301,11 +1301,11 @@ mod tests {
         backup: None,
       };
 
-      command.write_message(&ProxyRequest { id: String::from("ID_YOLO1"), order: ProxyRequestData::AddTcpFront(front) });
+      command.write_message(&ProxyRequest { id: String::from("ID_YOLO1"), order: ProxyRequestData::AddTcpFrontend(front) });
       command.write_message(&ProxyRequest { id: String::from("ID_YOLO2"), order: ProxyRequestData::AddBackend(backend) });
     }
     {
-      let front = TcpFront {
+      let front = TcpFrontend {
         app_id: String::from("yolo"),
         address: "127.0.0.1:1235".parse().unwrap(),
       };
@@ -1317,7 +1317,7 @@ mod tests {
         sticky_id: None,
         backup: None,
       };
-      command.write_message(&ProxyRequest { id: String::from("ID_YOLO3"), order: ProxyRequestData::AddTcpFront(front) });
+      command.write_message(&ProxyRequest { id: String::from("ID_YOLO3"), order: ProxyRequestData::AddTcpFrontend(front) });
       command.write_message(&ProxyRequest { id: String::from("ID_YOLO4"), order: ProxyRequestData::AddBackend(backend) });
     }
 

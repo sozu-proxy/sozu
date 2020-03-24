@@ -11,7 +11,7 @@ use std::io::{self,Error,ErrorKind,Read};
 use certificate::split_certificate_chain;
 use toml;
 
-use proxy::{CertificateAndKey,ProxyRequestData,HttpFront,TcpFront,Backend,
+use proxy::{CertificateAndKey,ProxyRequestData,HttpFrontend,TcpFrontend,Backend,
   HttpListener,HttpsListener,TcpListener,AddCertificate,TlsProvider,LoadBalancingParams,
   Application, TlsVersion,ActivateListener,ListenerType,RulePosition,PathRule,
   Route};
@@ -505,7 +505,7 @@ impl HttpFrontendConfig {
         names: vec!(self.hostname.clone()),
       }));
 
-      v.push(ProxyRequestData::AddHttpsFront(HttpFront {
+      v.push(ProxyRequestData::AddHttpsFrontend(HttpFrontend {
         route:       Route::AppId(app_id.to_string()),
         address:     self.address,
         hostname:    self.hostname.clone(),
@@ -514,7 +514,7 @@ impl HttpFrontendConfig {
       }));
     } else {
       //create the front both for HTTP and HTTPS if possible
-      v.push(ProxyRequestData::AddHttpFront(HttpFront {
+      v.push(ProxyRequestData::AddHttpFrontend(HttpFrontend {
         route:      Route::AppId(app_id.to_string()),
         address:    self.address,
         hostname:   self.hostname.clone(),
@@ -608,7 +608,7 @@ impl TcpAppConfig {
     }));
 
     for frontend in &self.frontends {
-      v.push(ProxyRequestData::AddTcpFront(TcpFront {
+      v.push(ProxyRequestData::AddTcpFrontend(TcpFrontend {
         app_id:  self.app_id.clone(),
         address: frontend.address,
       }));

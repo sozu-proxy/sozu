@@ -130,18 +130,18 @@ pub enum ProxyRequestData {
     AddApplication(Application),
     RemoveApplication(String),
 
-    AddHttpFront(HttpFront),
-    RemoveHttpFront(HttpFront),
+    AddHttpFrontend(HttpFrontend),
+    RemoveHttpFrontend(HttpFrontend),
 
-    AddHttpsFront(HttpFront),
-    RemoveHttpsFront(HttpFront),
+    AddHttpsFrontend(HttpFrontend),
+    RemoveHttpsFrontend(HttpFrontend),
 
     AddCertificate(AddCertificate),
     ReplaceCertificate(ReplaceCertificate),
     RemoveCertificate(RemoveCertificate),
 
-    AddTcpFront(TcpFront),
-    RemoveTcpFront(TcpFront),
+    AddTcpFrontend(TcpFrontend),
+    RemoveTcpFrontend(TcpFrontend),
 
     AddBackend(Backend),
     RemoveBackend(RemoveBackend),
@@ -272,7 +272,7 @@ pub enum Route {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct HttpFront {
+pub struct HttpFrontend {
     pub route:      Route,
     pub address:    SocketAddr,
     pub hostname:   String,
@@ -281,8 +281,8 @@ pub struct HttpFront {
     pub position:   RulePosition,
 }
 
-impl Ord for HttpFront {
-  fn cmp(&self, o: &HttpFront) -> Ordering {
+impl Ord for HttpFrontend {
+  fn cmp(&self, o: &HttpFrontend) -> Ordering {
     self.route.cmp(&o.route)
       .then(self.hostname.cmp(&o.hostname))
       .then(self.path.cmp(&o.path))
@@ -291,8 +291,8 @@ impl Ord for HttpFront {
   }
 }
 
-impl PartialOrd for HttpFront {
-  fn partial_cmp(&self, other: &HttpFront) -> Option<Ordering> {
+impl PartialOrd for HttpFrontend {
+  fn partial_cmp(&self, other: &HttpFrontend) -> Option<Ordering> {
     Some(self.cmp(other))
   }
 }
@@ -336,20 +336,20 @@ pub struct ReplaceCertificate {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct TcpFront {
+pub struct TcpFrontend {
     pub app_id:  String,
     pub address: SocketAddr,
 }
 
-impl Ord for TcpFront {
-  fn cmp(&self, o: &TcpFront) -> Ordering {
+impl Ord for TcpFrontend {
+  fn cmp(&self, o: &TcpFrontend) -> Ordering {
     self.app_id.cmp(&o.app_id)
       .then(socketaddr_cmp(&self.address, &o.address))
   }
 }
 
-impl PartialOrd for TcpFront {
-  fn partial_cmp(&self, other: &TcpFront) -> Option<Ordering> {
+impl PartialOrd for TcpFrontend {
+  fn partial_cmp(&self, other: &TcpFrontend) -> Option<Ordering> {
     Some(self.cmp(other))
   }
 }
@@ -619,9 +619,9 @@ pub enum QueryAnswer {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueryAnswerApplication {
   pub configuration:   Option<Application>,
-  pub http_frontends:  Vec<HttpFront>,
-  pub https_frontends: Vec<HttpFront>,
-  pub tcp_frontends:   Vec<TcpFront>,
+  pub http_frontends:  Vec<HttpFrontend>,
+  pub https_frontends: Vec<HttpFrontend>,
+  pub tcp_frontends:   Vec<TcpFrontend>,
   pub backends:        Vec<Backend>,
 }
 
@@ -652,15 +652,15 @@ impl ProxyRequestData {
     match *self {
       ProxyRequestData::AddApplication(_)      => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::RemoveApplication(_)   => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      ProxyRequestData::AddHttpFront(_)        => [Topic::HttpProxyConfig].iter().cloned().collect(),
-      ProxyRequestData::RemoveHttpFront(_)     => [Topic::HttpProxyConfig].iter().cloned().collect(),
-      ProxyRequestData::AddHttpsFront(_)       => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      ProxyRequestData::RemoveHttpsFront(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::AddHttpFrontend(_)     => [Topic::HttpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::RemoveHttpFrontend(_)  => [Topic::HttpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::AddHttpsFrontend(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::RemoveHttpsFrontend(_) => [Topic::HttpsProxyConfig].iter().cloned().collect(),
       ProxyRequestData::AddCertificate(_)      => [Topic::HttpsProxyConfig].iter().cloned().collect(),
       ProxyRequestData::ReplaceCertificate(_)  => [Topic::HttpsProxyConfig].iter().cloned().collect(),
       ProxyRequestData::RemoveCertificate(_)   => [Topic::HttpsProxyConfig].iter().cloned().collect(),
-      ProxyRequestData::AddTcpFront(_)         => [Topic::TcpProxyConfig].iter().cloned().collect(),
-      ProxyRequestData::RemoveTcpFront(_)      => [Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::AddTcpFrontend(_)      => [Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::RemoveTcpFrontend(_)   => [Topic::TcpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::AddBackend(_)          => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::RemoveBackend(_)       => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::AddHttpListener(_)     => [Topic::HttpProxyConfig].iter().cloned().collect(),
@@ -694,10 +694,10 @@ mod tests {
 
   #[test]
   fn add_front_test() {
-    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"route": { "APP_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
+    let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"route": { "APP_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
     let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
-    assert!(command == ProxyRequestData::AddHttpFront(HttpFront{
+    assert!(command == ProxyRequestData::AddHttpFrontend(HttpFrontend{
       route: Route::AppId(String::from("xxx")),
       hostname: String::from("yyy"),
       path: PathRule::Prefix(String::from("xxx")),
@@ -708,10 +708,10 @@ mod tests {
 
   #[test]
   fn remove_front_test() {
-    let raw_json = r#"{"type": "REMOVE_HTTP_FRONT", "data": {"route": {"APP_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242"}}"#;
+    let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "data": {"route": {"APP_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242"}}"#;
     let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
-    assert!(command == ProxyRequestData::RemoveHttpFront(HttpFront{
+    assert!(command == ProxyRequestData::RemoveHttpFrontend(HttpFrontend{
       route: Route::AppId(String::from("xxx")),
       hostname: String::from("yyy"),
       path: PathRule::Prefix(String::from("xxx")),
@@ -750,10 +750,10 @@ mod tests {
 
   #[test]
   fn http_front_crash_test() {
-    let raw_json = r#"{"type": "ADD_HTTP_FRONT", "data": {"route": {"APP_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242"}}"#;
+    let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"route": {"APP_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242"}}"#;
     let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
-    assert!(command == ProxyRequestData::AddHttpFront(HttpFront{
+    assert!(command == ProxyRequestData::AddHttpFrontend(HttpFrontend{
       route: Route::AppId(String::from("aa")),
       hostname: String::from("cltdl.fr"),
       path: PathRule::Prefix(String::from("")),
@@ -765,9 +765,9 @@ mod tests {
   #[test]
   fn http_front_crash_test2() {
     let raw_json = r#"{"route": {"APP_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242" }"#;
-    let front: HttpFront = serde_json::from_str(raw_json).expect("could not parse json");
+    let front: HttpFrontend = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}",front);
-    assert!(front == HttpFront{
+    assert!(front == HttpFrontend{
       route: Route::AppId(String::from("aa")),
       hostname: String::from("cltdl.fr"),
       path: PathRule::Prefix(String::from("")),

@@ -15,7 +15,7 @@ use slab::Slab;
 use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::scm_socket::{Listeners,ScmSocket};
-use sozu_command::proxy::{Application,ProxyRequestData,HttpFront,HttpListener,
+use sozu_command::proxy::{Application,ProxyRequestData,HttpFrontend,HttpListener,
   ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent,RemoveListener,
   Route};
 use sozu_command::logging;
@@ -955,7 +955,7 @@ impl Listener {
     Some(self.token)
   }
 
-  pub fn add_http_front(&mut self, http_front: HttpFront) -> Result<(), String> {
+  pub fn add_http_front(&mut self, http_front: HttpFrontend) -> Result<(), String> {
     //FIXME: proper error reporting
     if self.fronts.add_http_front(http_front) {
       Ok(())
@@ -964,7 +964,7 @@ impl Listener {
     }
   }
 
-  pub fn remove_http_front(&mut self, http_front: HttpFront) -> Result<(), String> {
+  pub fn remove_http_front(&mut self, http_front: HttpFrontend) -> Result<(), String> {
     debug!("removing http_front {:?}", http_front);
     //FIXME: proper error reporting
     if self.fronts.remove_http_front(http_front) {
@@ -1120,7 +1120,7 @@ impl ProxyConfiguration<Session> for Proxy {
         self.remove_application(&application);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      ProxyRequestData::AddHttpFront(front) => {
+      ProxyRequestData::AddHttpFrontend(front) => {
         debug!("{} add front {:?}", message.id, front);
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
           match listener.add_http_front(front) {
@@ -1134,7 +1134,7 @@ impl ProxyConfiguration<Session> for Proxy {
           //  self.pool.clone(), None, token: Token) -> (Listener,HashSet<Token>
         }
       },
-      ProxyRequestData::RemoveHttpFront(front) => {
+      ProxyRequestData::RemoveHttpFrontend(front) => {
         debug!("{} front {:?}", message.id, front);
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
           match (*listener).remove_http_front(front) {
@@ -1310,7 +1310,7 @@ mod tests {
   use std::net::SocketAddr;
   use std::str::FromStr;
   use std::time::Duration;
-  use sozu_command::proxy::{ProxyRequestData,HttpFront,Backend,HttpListener,
+  use sozu_command::proxy::{ProxyRequestData,HttpFrontend,Backend,HttpListener,
     ProxyRequest,LoadBalancingParams,PathRule,RulePosition, Route};
   use sozu_command::config::LoadBalancingAlgorithms;
   use sozu_command::channel::Channel;
@@ -1347,8 +1347,8 @@ mod tests {
       start(config, channel, 10, 16384);
     });
 
-    let front = HttpFront { route: Route::AppId(String::from("app_1")), address: "127.0.0.1:1024".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
-    command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFront(front) });
+    let front = HttpFrontend { route: Route::AppId(String::from("app_1")), address: "127.0.0.1:1024".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
+    command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFrontend(front) });
     let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1025".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddBackend(backend) });
 
@@ -1403,8 +1403,8 @@ mod tests {
       start(config, channel, 10, 16384);
     });
 
-    let front = HttpFront { route: Route::AppId(String::from("app_1")), address: "127.0.0.1:1031".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
-    command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFront(front) });
+    let front = HttpFrontend { route: Route::AppId(String::from("app_1")), address: "127.0.0.1:1031".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
+    command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFrontend(front) });
     let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddBackend(backend) });
 
@@ -1482,8 +1482,8 @@ mod tests {
 
     let application = Application { app_id: String::from("app_1"), sticky_session: false, https_redirect: true, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::default(), answer_503: None };
     command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddApplication(application) });
-    let front = HttpFront { route: Route::AppId(String::from("app_1")), address: "127.0.0.1:1041".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
-    command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddHttpFront(front) });
+    let front = HttpFrontend { route: Route::AppId(String::from("app_1")), address: "127.0.0.1:1041".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
+    command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddHttpFrontend(front) });
     let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1040".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&ProxyRequest { id: String::from("ID_IJKL"), order: ProxyRequestData::AddBackend(backend) });
 
@@ -1559,13 +1559,13 @@ mod tests {
     let uri3 = "/yolo/swag".to_owned();
 
     let mut fronts = Router::new();
-    fronts.add_http_front(HttpFront { route: Route::AppId(app_id1), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
+    fronts.add_http_front(HttpFrontend { route: Route::AppId(app_id1), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
                               path: PathRule::Prefix(uri1), position: RulePosition::Tree });
-    fronts.add_http_front(HttpFront { route: Route::AppId(app_id2), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
+    fronts.add_http_front(HttpFrontend { route: Route::AppId(app_id2), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
                               path: PathRule::Prefix(uri2), position: RulePosition::Tree });
-    fronts.add_http_front(HttpFront { route: Route::AppId(app_id3), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
+    fronts.add_http_front(HttpFrontend { route: Route::AppId(app_id3), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
                               path: PathRule::Prefix(uri3), position: RulePosition::Tree });
-    fronts.add_http_front(HttpFront { route: Route::AppId("app_1".to_owned()), address: "0.0.0.0:80".parse().unwrap(), hostname: "other.domain".to_owned(), path: PathRule::Prefix("/test".to_owned()), position: RulePosition::Tree });
+    fronts.add_http_front(HttpFrontend { route: Route::AppId("app_1".to_owned()), address: "0.0.0.0:80".parse().unwrap(), hostname: "other.domain".to_owned(), path: PathRule::Prefix("/test".to_owned()), position: RulePosition::Tree });
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
     let listener = Listener {

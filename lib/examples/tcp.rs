@@ -36,7 +36,7 @@ fn main() {
     sozu::tcp::start(listener, max_buffers, buffer_size, channel);
   });
 
-  let tcp_front = proxy::TcpFront {
+  let tcp_front = proxy::TcpFrontend {
     app_id:  String::from("test"),
     address: "127.0.0.1:8080".parse().unwrap(),
   };
@@ -51,7 +51,7 @@ fn main() {
 
   command.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_ABCD"),
-    order: proxy::ProxyRequestData::AddTcpFront(tcp_front)
+    order: proxy::ProxyRequestData::AddTcpFrontend(tcp_front)
   });
 
   command.write_message(&proxy::ProxyRequest {

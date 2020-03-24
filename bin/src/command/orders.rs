@@ -18,8 +18,8 @@ use sozu_command::buffer::fixed::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners, ScmSocket};
 use sozu_command::proxy::{ProxyRequestData, ProxyRequest, Query, QueryAnswer,
-  QueryApplicationType, MetricsData, AggregatedMetricsData, ProxyResponseData,
-  HttpFront, TcpFront, Route, ProxyResponseStatus};
+  ueryApplicationType, MetricsData, AggregatedMetricsData, ProxyResponseData,
+  HttpFrontend, TcpFrontend, Route, ProxyResponseStatus};
 use sozu_command::command::{CommandResponseData,CommandRequestData,
   CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
 use sozu_command::state::get_application_ids_by_domain;
@@ -649,8 +649,8 @@ impl CommandServer {
             self.answer_error(token, message_id, msg, None);
             return;
           },
-          ProxyRequestData::RemoveHttpFront(HttpFront{ ref route, ref address, .. })
-          | ProxyRequestData::RemoveHttpsFront(HttpFront{ ref route, ref address, .. }) => {
+          ProxyRequestData::RemoveHttpFrontend(HttpFrontend{ ref route, ref address, .. })
+          | ProxyRequestData::RemoveHttpsFrontend(HttpFrontend{ ref route, ref address, .. }) => {
             let msg = match route {
                 Route::AppId(app_id) => format!("No such frontend at {} for the application {}", address, app_id),
                 Route::Deny => format!("No such frontend at {}", address),
@@ -659,7 +659,7 @@ impl CommandServer {
             self.answer_error(token, message_id, msg, None);
             return;
           },
-          | ProxyRequestData::RemoveTcpFront(TcpFront{ ref app_id, ref address }) => {
+          | ProxyRequestData::RemoveTcpFrontend(TcpFrontend{ ref app_id, ref address }) => {
             let msg = format!("No such frontend at {} for the application {}", address, app_id);
             error!("{}", msg);
             self.answer_error(token, message_id, msg, None);
@@ -767,12 +767,12 @@ impl CommandServer {
     match order {
       ProxyRequestData::AddBackend(_)
       | ProxyRequestData::RemoveBackend(_) => self.backends_count = self.state.count_backends(),
-      ProxyRequestData::AddHttpFront(_)
-      | ProxyRequestData::AddHttpsFront(_)
-      | ProxyRequestData::AddTcpFront(_)
-      | ProxyRequestData::RemoveHttpFront(_)
-      | ProxyRequestData::RemoveHttpsFront(_)
-      | ProxyRequestData::RemoveTcpFront(_) => self.frontends_count = self.state.count_frontends(),
+      ProxyRequestData::AddHttpFrontend(_)
+      | ProxyRequestData::AddHttpsFrontend(_)
+      | ProxyRequestData::AddTcpFrontend(_)
+      | ProxyRequestData::RemoveHttpFrontend(_)
+      | ProxyRequestData::RemoveHttpsFrontend(_)
+      | ProxyRequestData::RemoveTcpFrontend(_) => self.frontends_count = self.state.count_frontends(),
       _ => {}
     };
 

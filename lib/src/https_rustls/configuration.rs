@@ -18,7 +18,7 @@ use time::Duration;
 
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,
-  ProxyRequestData,HttpFront,HttpsListener,ProxyRequest,ProxyResponse,
+  ProxyRequestData,HttpFrontend,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
   TlsVersion,ProxyResponseData,Query, QueryCertificateType,QueryAnswer,
   QueryAnswerCertificate,RemoveListener,Route};
@@ -137,11 +137,11 @@ impl Listener {
     Some(self.token)
   }
 
-  pub fn add_https_front(&mut self, tls_front: HttpFront) -> bool {
+  pub fn add_https_front(&mut self, tls_front: HttpFrontend) -> bool {
     self.fronts.add_http_front(tls_front)
   }
 
-  pub fn remove_https_front(&mut self, tls_front: HttpFront) -> bool {
+  pub fn remove_https_front(&mut self, tls_front: HttpFrontend) -> bool {
     debug!("removing tls_front {:?}", tls_front);
     self.fronts.remove_http_front(tls_front)
   }
@@ -548,7 +548,7 @@ impl ProxyConfiguration<Session> for Proxy {
         self.remove_application(&application);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      ProxyRequestData::AddHttpsFront(front) => {
+      ProxyRequestData::AddHttpsFrontend(front) => {
         //info!("HTTPS\t{} add front {:?}", id, front);
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
           listener.add_https_front(front);
@@ -557,7 +557,7 @@ impl ProxyConfiguration<Session> for Proxy {
           panic!("unknown listener: {:?}", front.address)
         }
       },
-      ProxyRequestData::RemoveHttpsFront(front) => {
+      ProxyRequestData::RemoveHttpsFrontend(front) => {
         //info!("HTTPS\t{} remove front {:?}", id, front);
         if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front.address) {
           listener.remove_https_front(front);
