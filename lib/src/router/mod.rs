@@ -429,15 +429,15 @@ mod tests {
   fn match_router() {
     let mut router = Router::new();
 
-    assert!(router.add_pre_rule("*".parse::<DomainRule>().unwrap(), PathRule::Prefix("/.well-known/acme-challenge".to_string()), Route::AppId("acme".to_string())));
-    assert!(router.add_tree_rule("www.example.com".as_bytes(), PathRule::Prefix("/".to_string()), Route::AppId("example".to_string())));
-    assert!(router.add_tree_rule("*.test.example.com".as_bytes(), PathRule::Regex(Regex::new("/hello[A-Z]+/").unwrap()), Route::AppId("examplewildcard".to_string())));
-    assert!(router.add_tree_rule("/test[0-9]/.example.com".as_bytes(), PathRule::Prefix("/".to_string()), Route::AppId("exampleregex".to_string())));
+    assert!(router.add_pre_rule("*".parse::<DomainRule>().unwrap(), PathRule::Prefix("/.well-known/acme-challenge".to_string()), Route::ClusterId("acme".to_string())));
+    assert!(router.add_tree_rule("www.example.com".as_bytes(), PathRule::Prefix("/".to_string()), Route::ClusterId("example".to_string())));
+    assert!(router.add_tree_rule("*.test.example.com".as_bytes(), PathRule::Regex(Regex::new("/hello[A-Z]+/").unwrap()), Route::ClusterId("examplewildcard".to_string())));
+    assert!(router.add_tree_rule("/test[0-9]/.example.com".as_bytes(), PathRule::Prefix("/".to_string()), Route::ClusterId("exampleregex".to_string())));
 
-    assert_eq!(router.lookup("www.example.com".as_bytes(), "/helloA".as_bytes()), Some(Route::AppId("example".to_string())));
-    assert_eq!(router.lookup("www.example.com".as_bytes(), "/.well-known/acme-challenge".as_bytes()), Some(Route::AppId("acme".to_string())));
+    assert_eq!(router.lookup("www.example.com".as_bytes(), "/helloA".as_bytes()), Some(Route::ClusterId("example".to_string())));
+    assert_eq!(router.lookup("www.example.com".as_bytes(), "/.well-known/acme-challenge".as_bytes()), Some(Route::ClusterId("acme".to_string())));
     assert_eq!(router.lookup("www.test.example.com".as_bytes(), "/".as_bytes()), None);
-    assert_eq!(router.lookup("www.test.example.com".as_bytes(), "/helloAB/".as_bytes()), Some(Route::AppId("examplewildcard".to_string())));
-    assert_eq!(router.lookup("test1.example.com".as_bytes(), "/helloAB/".as_bytes()), Some(Route::AppId("exampleregex".to_string())));
+    assert_eq!(router.lookup("www.test.example.com".as_bytes(), "/helloAB/".as_bytes()), Some(Route::ClusterId("examplewildcard".to_string())));
+    assert_eq!(router.lookup("test1.example.com".as_bytes(), "/helloAB/".as_bytes()), Some(Route::ClusterId("exampleregex".to_string())));
   }
 }

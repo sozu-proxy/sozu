@@ -40,7 +40,7 @@ pub struct Session {
   pub public_address: SocketAddr,
   pool:               Weak<RefCell<Pool>>,
   pub metrics:        SessionMetrics,
-  pub app_id:         Option<String>,
+  pub cluster_id:         Option<String>,
   sticky_name:        String,
   last_event:         Instant,
   pub listen_token:   Token,
@@ -87,7 +87,7 @@ impl Session {
       public_address,
       pool,
       metrics,
-      app_id:         None,
+      cluster_id:         None,
       sticky_name,
       last_event:     Instant::now(),
       listen_token,
@@ -242,7 +242,7 @@ impl Session {
         }
       };
 
-      let mut pipe = Pipe::new(http.frontend, front_token, http.request_id, http.app_id, http.backend_id,
+      let mut pipe = Pipe::new(http.frontend, front_token, http.request_id, http.cluster_id, http.backend_id,
         Some(ws_context), http.backend, front_buf, back_buf, http.session_address, Protocol::HTTPS);
 
       pipe.front_readiness.event = http.front_readiness.event;
@@ -252,7 +252,7 @@ impl Session {
       pipe.front_timeout = Some(http.front_timeout);
       pipe.back_timeout = Some(http.back_timeout);
       pipe.set_back_token(back_token);
-      pipe.set_app_id(self.app_id.clone());
+      pipe.set_cluster_id(self.cluster_id.clone());
 
       gauge_add!("protocol.https", -1);
       gauge_add!("protocol.wss", 1);
@@ -448,7 +448,7 @@ impl Session {
 
     if connected == BackendConnectionStatus::Connected {
       gauge_add!("backend.connections", 1);
-      gauge_add!("connections_per_backend", 1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      gauge_add!("connections_per_backend", 1, self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
 
       // the back timeout was of connect_timeout duration before,
       // now that we're connected, move to backend_timeout duration
@@ -462,7 +462,7 @@ impl Session {
         let backend = &mut (*backend.borrow_mut());
 
         if backend.retry_policy.is_down() {
-          incr!("up", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+          incr!("up", self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
           info!("backend server {} at {} is up", backend.backend_id, backend.address);
           push_event(ProxyEvent::BackendUp(backend.backend_id.clone(), backend.address));
         }
@@ -515,10 +515,10 @@ impl Session {
 
       let already_unavailable = backend.retry_policy.is_down();
       backend.retry_policy.fail();
-      incr!("connections.error", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      incr!("connections.error", self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
       if !already_unavailable && backend.retry_policy.is_down() {
         error!("backend server {} at {} is down", backend.backend_id, backend.address);
-        incr!("down", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+        incr!("down", self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
 
         push_event(ProxyEvent::BackendDown(backend.backend_id.clone(), backend.address));
       }
@@ -770,7 +770,7 @@ impl ProxySession for Session {
 
     if back_connected == BackendConnectionStatus::Connected {
       gauge_add!("backend.connections", -1);
-      gauge_add!("connections_per_backend", -1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      gauge_add!("connections_per_backend", -1, self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
     }
 
     self.set_back_connected(BackendConnectionStatus::NotConnected);
@@ -831,8 +831,8 @@ impl ProxySession for Session {
       State::WebSocket(ref pipe)      => &pipe.front_readiness,
     };
 
-    error!("zombie session[{:?} => {:?}], state => readiness: {:?}, protocol: {}, app_id: {:?}, back_connected: {:?}, metrics: {:?}",
-      self.frontend_token, self.back_token(), r, p, self.app_id, self.back_connected, self.metrics);
+    error!("zombie session[{:?} => {:?}], state => readiness: {:?}, protocol: {}, cluster_id: {:?}, back_connected: {:?}, metrics: {:?}",
+      self.frontend_token, self.back_token(), r, p, self.cluster_id, self.back_connected, self.metrics);
   }
 
   fn tokens(&self) -> Vec<Token> {

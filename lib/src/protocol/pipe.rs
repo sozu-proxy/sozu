@@ -30,7 +30,7 @@ pub struct Pipe<Front:SocketHandler> {
   backend_token:      Option<Token>,
   pub front_buf:      Checkout,
   back_buf:           Checkout,
-  pub app_id:         Option<String>,
+  pub cluster_id:     Option<String>,
   pub backend_id:     Option<String>,
   pub request_id:     Ulid,
   pub websocket_context: Option<String>,
@@ -47,12 +47,12 @@ pub struct Pipe<Front:SocketHandler> {
 
 impl<Front:SocketHandler> Pipe<Front> {
   pub fn new(frontend: Front, frontend_token: Token, request_id: Ulid,
-    app_id: Option<String>, backend_id: Option<String>, websocket_context: Option<String>,
+    cluster_id: Option<String>, backend_id: Option<String>, websocket_context: Option<String>,
     backend: Option<TcpStream>, front_buf: Checkout,
     back_buf: Checkout, session_address: Option<SocketAddr>, protocol: Protocol) -> Pipe<Front> {
     let log_ctx = format!("{} {} {}\t",
       &request_id,
-      app_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),
+      cluster_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),
       backend_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-")
     );
     let frontend_status = ConnectionStatus::Normal;
@@ -69,7 +69,7 @@ impl<Front:SocketHandler> Pipe<Front> {
       backend_token:      None,
       front_buf,
       back_buf,
-      app_id,
+      cluster_id,
       backend_id,
       request_id,
       websocket_context,
@@ -173,8 +173,8 @@ impl<Front:SocketHandler> Pipe<Front> {
   pub fn close(&mut self) {
   }
 
-  pub fn set_app_id(&mut self, app_id: Option<String>) {
-    self.app_id = app_id;
+  pub fn set_cluster_id(&mut self, cluster_id: Option<String>) {
+    self.cluster_id = cluster_id;
     self.reset_log_context();
   }
 
@@ -186,7 +186,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   pub fn reset_log_context(&mut self) {
     self.log_ctx = format!("{} {} {}\t",
       self.request_id,
-      self.app_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),
+      self.cluster_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),
       self.backend_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-")
       );
   }
@@ -246,12 +246,12 @@ impl<Front:SocketHandler> Pipe<Front> {
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
 
-    let app_id = self.app_id.clone().unwrap_or_else(|| String::from("-"));
-    time!("request_time", &app_id, response_time.whole_milliseconds());
+    let cluster_id = self.cluster_id.clone().unwrap_or_else(|| String::from("-"));
+    time!("request_time", &cluster_id, response_time.whole_milliseconds());
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
-        record_backend_metrics!(app_id, backend_id, backend_response_time.whole_milliseconds(),
+        record_backend_metrics!(cluster_id, backend_id, backend_response_time.whole_milliseconds(),
           metrics.backend_connection_time(), metrics.backend_bin, metrics.backend_bout);
       }
     }
@@ -281,12 +281,12 @@ impl<Front:SocketHandler> Pipe<Front> {
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
 
-    let app_id = self.app_id.clone().unwrap_or_else(|| String::from("-"));
-    time!("request_time", &app_id, response_time.whole_milliseconds());
+    let cluster_id = self.cluster_id.clone().unwrap_or_else(|| String::from("-"));
+    time!("request_time", &cluster_id, response_time.whole_milliseconds());
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
-        record_backend_metrics!(app_id, backend_id, backend_response_time.whole_milliseconds(),
+        record_backend_metrics!(cluster_id, backend_id, backend_response_time.whole_milliseconds(),
           metrics.backend_connection_time(), metrics.backend_bin, metrics.backend_bout);
       }
     }

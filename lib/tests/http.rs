@@ -67,7 +67,7 @@ fn test() {
 
 
     let http_frontend = proxy::HttpFrontend {
-        route:    Route::AppId(String::from("test")),
+        route:    Route::ClusterId(String::from("test")),
         address:  "127.0.0.1:8080".parse().unwrap(),
         hostname: String::from("example.com"),
         path:     PathRule::Prefix(String::from("/")),
@@ -91,7 +91,7 @@ fn test() {
         };
 
     let http_backend = proxy::Backend {
-        app_id:                    String::from("test"),
+        cluster_id:                    String::from("test"),
         backend_id:                String::from("test-0"),
         address:                   "127.0.0.1:2048".parse().unwrap(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
@@ -159,14 +159,14 @@ fn test() {
     command.write_message(&proxy::ProxyRequest {
         id:    String::from("ID_EFGH-2"),
         order: proxy::ProxyRequestData::RemoveBackend(proxy::RemoveBackend {
-            app_id: String::from("test"),
+            cluster_id: String::from("test"),
             backend_id: String::from("test-0"),
             address: "127.0.0.1:2048".parse().unwrap(),
         })
     });
 
     let http_backend = proxy::Backend {
-        app_id:                    String::from("test"),
+        cluster_id:                String::from("test"),
         backend_id:                String::from("test-0"),
         address:                   "127.0.0.1:2048".parse().unwrap(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
@@ -243,14 +243,14 @@ fn test() {
     command.write_message(&proxy::ProxyRequest {
         id:    String::from("ID_EFGH-2"),
         order: proxy::ProxyRequestData::RemoveBackend(proxy::RemoveBackend {
-            app_id: String::from("test"),
+            cluster_id: String::from("test"),
             backend_id: String::from("test-0"),
             address: "127.0.0.1:2048".parse().unwrap(),
         })
     });
 
     let http_backend = proxy::Backend {
-        app_id:                    String::from("test"),
+        cluster_id:                String::from("test"),
         backend_id:                String::from("test-0"),
         address:                   "127.0.0.1:2048".parse().unwrap(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),

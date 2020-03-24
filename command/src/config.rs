@@ -12,7 +12,7 @@ use toml;
 
 use crate::proxy::{CertificateAndKey,ProxyRequestData,HttpFrontend,TcpFrontend,Backend,
   HttpListener,HttpsListener,TcpListener,AddCertificate,TlsProvider,LoadBalancingParams,
-  LoadMetric, Application, TlsVersion,ActivateListener,ListenerType,RulePosition,PathRule,
+  LoadMetric, Cluster, TlsVersion,ActivateListener,ListenerType,RulePosition,PathRule,
   LoadBalancingAlgorithms, Route};
 
 use crate::command::{CommandRequestData,CommandRequest,PROTOCOL_VERSION};
@@ -321,7 +321,7 @@ impl FileAppFrontendConfig {
     })
   }
 
-  pub fn to_http_front(&self, _app_id: &str) -> Result<HttpFrontendConfig, String> {
+  pub fn to_http_front(&self, _cluster_id: &str) -> Result<HttpFrontendConfig, String> {
     if self.hostname.is_none() {
       return Err(String::from("HTTP frontend should have a 'hostname' field"));
     }
@@ -405,7 +405,7 @@ pub struct BackendConfig {
 }
 
 impl FileAppConfig {
-  pub fn to_app_config(self, app_id: &str, expect_proxy: &HashSet<SocketAddr>) -> Result<AppConfig, String> {
+  pub fn to_app_config(self, cluster_id: &str, expect_proxy: &HashSet<SocketAddr>) -> Result<AppConfig, String> {
     match self.protocol {
       FileAppProtocolConfig::Tcp => {
         let mut has_expect_proxy = None;
@@ -414,13 +414,13 @@ impl FileAppConfig {
           if expect_proxy.contains(&f.address) {
             match has_expect_proxy {
               Some(true) => {},
-              Some(false) => return Err(format!("all the listeners for application {} should have the same expect_proxy option", app_id)),
+              Some(false) => return Err(format!("all the listeners for application {} should have the same expect_proxy option", cluster_id)),
               None => has_expect_proxy = Some(true),
             }
           } else {
             match has_expect_proxy {
               Some(false) => {},
-              Some(true) => return Err(format!("all the listeners for application {} should have the same expect_proxy option", app_id)),
+              Some(true) => return Err(format!("all the listeners for application {} should have the same expect_proxy option", cluster_id)),
               None => has_expect_proxy = Some(false),
             }
           }
@@ -441,7 +441,7 @@ impl FileAppConfig {
         };
 
         Ok(AppConfig::Tcp(TcpAppConfig {
-          app_id: app_id.to_string(),
+          cluster_id: cluster_id.to_string(),
           frontends,
           backends: self.backends,
           proxy_protocol,
@@ -452,7 +452,7 @@ impl FileAppConfig {
       FileAppProtocolConfig::Http => {
         let mut frontends = Vec::new();
         for f in self.frontends {
-          match f.to_http_front(app_id) {
+          match f.to_http_front(cluster_id) {
             Ok(frontend) => frontends.push(frontend),
             Err(e) => return Err(e),
           }
@@ -464,7 +464,7 @@ impl FileAppConfig {
         }).ok());
 
         Ok(AppConfig::Http(HttpAppConfig {
-          app_id: app_id.to_string(),
+          cluster_id: cluster_id.to_string(),
           frontends,
           backends: self.backends,
           sticky_session: self.sticky_session.unwrap_or(false),
@@ -494,7 +494,7 @@ pub struct HttpFrontendConfig {
 }
 
 impl HttpFrontendConfig {
-  pub fn generate_orders(&self, app_id: &str) -> Vec<ProxyRequestData> {
+  pub fn generate_orders(&self, cluster_id: &str) -> Vec<ProxyRequestData> {
     let mut v = Vec::new();
 
     if self.key.is_some() && self.certificate.is_some() {
@@ -511,7 +511,7 @@ impl HttpFrontendConfig {
       }));
 
       v.push(ProxyRequestData::AddHttpsFrontend(HttpFrontend {
-        route:       Route::AppId(app_id.to_string()),
+        route:       Route::ClusterId(cluster_id.to_string()),
         address:     self.address,
         hostname:    self.hostname.clone(),
         path:        self.path.clone(),
@@ -520,7 +520,7 @@ impl HttpFrontendConfig {
     } else {
       //create the front both for HTTP and HTTPS if possible
       v.push(ProxyRequestData::AddHttpFrontend(HttpFrontend {
-        route:      Route::AppId(app_id.to_string()),
+        route:      Route::ClusterId(cluster_id.to_string()),
         address:    self.address,
         hostname:   self.hostname.clone(),
         path:       self.path.clone(),
@@ -535,7 +535,7 @@ impl HttpFrontendConfig {
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpAppConfig {
-  pub app_id: String,
+  pub cluster_id: String,
   pub frontends: Vec<HttpFrontendConfig>,
   pub backends: Vec<BackendConfig>,
   pub sticky_session: bool,
@@ -549,8 +549,8 @@ impl HttpAppConfig {
   pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
     let mut v = Vec::new();
 
-    v.push(ProxyRequestData::AddApplication(Application {
-      app_id: self.app_id.clone(),
+    v.push(ProxyRequestData::AddCluster(Cluster {
+      cluster_id: self.cluster_id.clone(),
       sticky_session: self.sticky_session,
       https_redirect: self.https_redirect,
       proxy_protocol: None,
@@ -560,7 +560,7 @@ impl HttpAppConfig {
     }));
 
     for frontend in &self.frontends {
-      let mut orders = frontend.generate_orders(&self.app_id);
+      let mut orders = frontend.generate_orders(&self.cluster_id);
       v.extend(orders.drain(..));
     }
 
@@ -571,8 +571,8 @@ impl HttpAppConfig {
         });
 
         v.push(ProxyRequestData::AddBackend(Backend {
-          app_id:     self.app_id.clone(),
-          backend_id: backend.backend_id.clone().unwrap_or_else(|| format!("{}-{}-{}", self.app_id, backend_count, backend.address)),
+          cluster_id: self.cluster_id.clone(),
+          backend_id: backend.backend_id.clone().unwrap_or_else(|| format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)),
           address:    backend.address,
           load_balancing_parameters,
           sticky_id:  backend.sticky_id.clone(),
@@ -593,7 +593,7 @@ pub struct TcpFrontendConfig {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 pub struct TcpAppConfig {
-  pub app_id: String,
+  pub cluster_id: String,
   pub frontends: Vec<TcpFrontendConfig>,
   pub backends: Vec<BackendConfig>,
   #[serde(default)]
@@ -606,8 +606,8 @@ impl TcpAppConfig {
   pub fn generate_orders(&self) -> Vec<ProxyRequestData> {
     let mut v = Vec::new();
 
-    v.push(ProxyRequestData::AddApplication(Application {
-      app_id: self.app_id.clone(),
+    v.push(ProxyRequestData::AddCluster(Cluster {
+      cluster_id: self.cluster_id.clone(),
       sticky_session: false,
       https_redirect: false,
       proxy_protocol: self.proxy_protocol.clone(),
@@ -618,7 +618,7 @@ impl TcpAppConfig {
 
     for frontend in &self.frontends {
       v.push(ProxyRequestData::AddTcpFrontend(TcpFrontend {
-        app_id:  self.app_id.clone(),
+        cluster_id:  self.cluster_id.clone(),
         address: frontend.address,
       }));
     }
@@ -630,8 +630,8 @@ impl TcpAppConfig {
       });
 
       v.push(ProxyRequestData::AddBackend(Backend {
-        app_id:     self.app_id.clone(),
-        backend_id: backend.backend_id.clone().unwrap_or_else(|| format!("{}-{}-{}", self.app_id, backend_count, backend.address)),
+        cluster_id: self.cluster_id.clone(),
+        backend_id: backend.backend_id.clone().unwrap_or_else(|| format!("{}-{}-{}", self.cluster_id, backend_count, backend.address)),
         address:    backend.address,
         load_balancing_parameters,
         sticky_id:  backend.sticky_id.clone(),

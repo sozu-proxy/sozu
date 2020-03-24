@@ -14,7 +14,7 @@ use rustls::{ServerConfig, ServerSession, NoClientAuth, ProtocolVersion,
 use time::{Duration, Instant};
 
 use sozu_command::scm_socket::ScmSocket;
-use sozu_command::proxy::{Application,
+use sozu_command::proxy::{Cluster,
   ProxyRequestData,HttpFrontend,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
   TlsVersion,ProxyResponseData,Query, QueryCertificateType,QueryAnswer,
@@ -24,7 +24,7 @@ use sozu_command::ready::Ready;
 
 use protocol::http::{parser::{RRequestLine,hostname_and_port}, answers::HttpAnswers};
 use pool::Pool;
-use {AppId,ConnectionError,Protocol,
+use {ClusterId,ConnectionError,Protocol,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus};
 use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,SessionToken,ListenSession,CONN_RETRIES};
@@ -39,7 +39,7 @@ use super::session::Session;
 
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct TlsApp {
-  pub app_id:           String,
+  pub cluster_id:           String,
   pub hostname:         String,
   pub path_begin:       String,
 }
@@ -216,7 +216,7 @@ impl Listener {
 
 pub struct Proxy {
   listeners:      HashMap<Token, Listener>,
-  applications:   HashMap<AppId, Application>,
+  clusters:       HashMap<ClusterId, Cluster>,
   backends:       Rc<RefCell<BackendMap>>,
   pool:           Rc<RefCell<Pool>>,
 }
@@ -225,7 +225,7 @@ impl Proxy {
   pub fn new(pool: Rc<RefCell<Pool>>, backends: Rc<RefCell<BackendMap>>) -> Proxy {
     Proxy {
       listeners : HashMap::new(),
-      applications: HashMap::new(),
+      clusters: HashMap::new(),
       backends,
       pool,
     }
@@ -269,27 +269,27 @@ impl Proxy {
     })
   }
 
-  pub fn add_application(&mut self, mut application: Application) {
-    if let Some(answer_503) = application.answer_503.take() {
+  pub fn add_cluster(&mut self, mut cluster: Cluster) {
+    if let Some(answer_503) = cluster.answer_503.take() {
       for l in self.listeners.values_mut() {
-        l.answers.borrow_mut().add_custom_answer(&application.app_id, &answer_503);
+        l.answers.borrow_mut().add_custom_answer(&cluster.cluster_id, &answer_503);
       }
     }
 
-    self.applications.insert(application.app_id.clone(), application);
+    self.clusters.insert(cluster.cluster_id.clone(), cluster);
   }
 
-  pub fn remove_application(&mut self, app_id: &str) {
-    self.applications.remove(app_id);
+  pub fn remove_cluster(&mut self, cluster_id: &str) {
+    self.clusters.remove(cluster_id);
 
     for l in self.listeners.values_mut() {
-      l.answers.borrow_mut().remove_custom_answer(app_id);
+      l.answers.borrow_mut().remove_custom_answer(cluster_id);
     }
   }
 
-  pub fn backend_from_request(&mut self, session: &mut Session, app_id: &str,
+  pub fn backend_from_request(&mut self, session: &mut Session, cluster_id: &str,
   front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
-    session.http_mut().map(|h| h.set_app_id(String::from(app_id)));
+    session.http_mut().map(|h| h.set_cluster_id(String::from(cluster_id)));
 
     let sticky_session = session.http()
       .and_then(|http| http.request.as_ref())
@@ -297,13 +297,13 @@ impl Proxy {
 
     let res = match (front_should_stick, sticky_session) {
       (true, Some(sticky_session)) => {
-        self.backends.borrow_mut().backend_from_sticky_session(app_id, &sticky_session)
+        self.backends.borrow_mut().backend_from_sticky_session(cluster_id, &sticky_session)
           .map_err(|e| {
-            debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
+            debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, cluster_id);
             e
           })
       },
-      _ => self.backends.borrow_mut().backend_from_app_id(app_id),
+      _ => self.backends.borrow_mut().backend_from_cluster_id(cluster_id),
     };
 
     match res {
@@ -334,7 +334,7 @@ impl Proxy {
     }
   }
 
-  fn app_id_from_request(&mut self, session: &mut Session) -> Result<String, ConnectionError> {
+  fn cluster_id_from_request(&mut self, session: &mut Session) -> Result<String, ConnectionError> {
     let listen_token = session.listen_token;
 
     let h = session.http().and_then(|h| h.request.as_ref()).and_then(|r| r.get_host()).ok_or(ConnectionError::NoHostGiven)?;
@@ -378,7 +378,7 @@ impl Proxy {
       .ok_or(ConnectionError::NoRequestLineGiven)?;
     match self.listeners.get(&listen_token).as_ref()
       .and_then(|l| l.frontend_from_request(&host, &rl.uri)) {
-      Some(Route::AppId(app_id)) => Ok(app_id),
+      Some(Route::ClusterId(cluster_id)) => Ok(cluster_id),
       Some(Route::Deny) => {
         session.set_answer(DefaultAnswerStatus::Answer401, None);
         Err(ConnectionError::Unauthorized)
@@ -399,7 +399,6 @@ impl Proxy {
       Ok(())
     }
   }
-
 }
 
 impl ProxyConfiguration<Session> for Proxy {
@@ -441,17 +440,17 @@ impl ProxyConfiguration<Session> for Proxy {
     }
 
   fn connect_to_backend(&mut self, poll: &mut Poll,  session: &mut Session, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
-    let old_app_id = session.http().and_then(|ref http| http.app_id.clone());
+    let old_cluster_id = session.http().and_then(|ref http| http.cluster_id.clone());
     let old_back_token = session.back_token();
 
     self.check_circuit_breaker(session)?;
 
-    let app_id = self.app_id_from_request(session)?;
+    let cluster_id = self.cluster_id_from_request(session)?;
 
-    if (session.http().and_then(|h| h.app_id.as_ref()) == Some(&app_id)) && session.back_connected == BackendConnectionStatus::Connected {
+    if (session.http().and_then(|h| h.cluster_id.as_ref()) == Some(&cluster_id)) && session.back_connected == BackendConnectionStatus::Connected {
       let has_backend = session.backend.as_ref().map(|backend| {
          let ref backend = *backend.borrow();
-         self.backends.borrow().has_backend(&app_id, backend)
+         self.backends.borrow().has_backend(&cluster_id, backend)
         }).unwrap_or(false);
 
       let is_valid_backend_socket = has_backend &&
@@ -472,7 +471,7 @@ impl ProxyConfiguration<Session> for Proxy {
       }
     }
 
-    if old_app_id.is_some() && old_app_id.as_ref() != Some(&app_id) {
+    if old_cluster_id.is_some() && old_cluster_id.as_ref() != Some(&cluster_id) {
       if let Some(token) = session.back_token() {
         session.close_backend(token, poll);
 
@@ -482,13 +481,13 @@ impl ProxyConfiguration<Session> for Proxy {
       }
     }
 
-    session.app_id = Some(app_id.clone());
+    session.cluster_id = Some(cluster_id.clone());
 
-    let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
-    let mut socket = self.backend_from_request(session, &app_id, front_should_stick)?;
+    let front_should_stick = self.clusters.get(&cluster_id).map(|ref app| app.sticky_session).unwrap_or(false);
+    let mut socket = self.backend_from_request(session, &cluster_id, front_should_stick)?;
 
     session.http_mut().map(|http| {
-      http.app_id = Some(app_id.clone());
+      http.cluster_id = Some(cluster_id.clone());
     });
 
     // we still want to use the new socket
@@ -534,14 +533,14 @@ impl ProxyConfiguration<Session> for Proxy {
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
     //info!("{} notified", message);
     match message.order {
-      ProxyRequestData::AddApplication(application) => {
-        debug!("{} add application {:?}", message.id, application);
-        self.add_application(application);
+      ProxyRequestData::AddCluster(cluster) => {
+        debug!("{} add cluster {:?}", message.id, cluster);
+        self.add_cluster(cluster);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      ProxyRequestData::RemoveApplication(application) => {
-        debug!("{} remove application {:?}", message.id, application);
-        self.remove_application(&application);
+      ProxyRequestData::RemoveCluster { cluster_id } => {
+        debug!("{} remove cluster {:?}", message.id, cluster_id);
+        self.remove_cluster(&cluster_id);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::AddHttpsFrontend(front) => {
