@@ -18,7 +18,7 @@ use sozu_command::proxy::TcpListener as TcpListenerConfig;
 use sozu_command::logging;
 use sozu_command::ready::Ready;
 
-use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
+use {ClusterId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use backends::BackendMap;
@@ -54,7 +54,7 @@ pub struct Session {
   back_connected:     BackendConnectionStatus,
   accept_token:       Token,
   request_id:         Ulid,
-  app_id:             Option<String>,
+  cluster_id:         Option<String>,
   backend_id:         Option<String>,
   metrics:            SessionMetrics,
   protocol:           Option<State>,
@@ -69,7 +69,7 @@ pub struct Session {
 
 impl Session {
   fn new(sock: TcpStream, frontend_token: Token, accept_token: Token,
-    front_buf: Checkout, back_buf: Checkout, app_id: Option<String>,
+    front_buf: Checkout, back_buf: Checkout, cluster_id: Option<String>,
     backend_id: Option<String>, proxy_protocol: Option<ProxyProtocolConfig>,
     wait_time: Duration, front_timeout_duration: Duration, backend_timeout_duration: Duration) -> Session {
     let frontend_address = sock.peer_addr().ok();
@@ -101,9 +101,9 @@ impl Session {
       },
       None => {
         gauge_add!("protocol.tcp", 1);
-        let mut pipe = Pipe::new(sock, frontend_token, request_id, app_id.clone(), backend_id.clone(),
+        let mut pipe = Pipe::new(sock, frontend_token, request_id, cluster_id.clone(), backend_id.clone(),
           None, None, front_buf, back_buf, frontend_address, Protocol::TCP);
-        pipe.set_app_id(app_id.clone());
+        pipe.set_cluster_id(cluster_id.clone());
         Some(State::Pipe(pipe))
       }
     };
@@ -118,7 +118,7 @@ impl Session {
       back_connected:     BackendConnectionStatus::NotConnected,
       accept_token,
       request_id,
-      app_id,
+      cluster_id,
       backend_id,
       metrics,
       protocol,
@@ -149,13 +149,13 @@ impl Session {
 
     let response_time = self.metrics.response_time().whole_milliseconds();
     let service_time  = self.metrics.service_time().whole_milliseconds();
-    let app_id = self.app_id.clone().unwrap_or_else(|| String::from("-"));
-    time!("response_time", &app_id, response_time);
+    let cluster_id = self.cluster_id.clone().unwrap_or_else(|| String::from("-"));
+    time!("response_time", &cluster_id, response_time);
     time!("response_time", response_time);
 
     if let Some(backend_id) = self.metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = self.metrics.backend_response_time() {
-        record_backend_metrics!(app_id, backend_id, backend_response_time.whole_milliseconds(),
+        record_backend_metrics!(cluster_id, backend_id, backend_response_time.whole_milliseconds(),
           self.metrics.backend_response_time(), self.metrics.backend_bin, self.metrics.backend_bout);
       }
     }
@@ -197,7 +197,7 @@ impl Session {
   fn log_context(&self) -> String {
     format!("{} {} {}\t",
       self.request_id,
-      self.app_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),
+      self.cluster_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),
       self.backend_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-")
     )
   }
@@ -319,7 +319,7 @@ impl Session {
     if let Some(State::SendProxyProtocol(pp)) = protocol {
       if self.back_buf.is_some() && self.front_buf.is_some() {
         let mut pipe = pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap());
-        pipe.set_app_id(self.app_id.clone());
+        pipe.set_cluster_id(self.cluster_id.clone());
         self.protocol = Some(State::Pipe(pipe));
         gauge_add!("protocol.proxy.send", -1);
         gauge_add!("protocol.tcp", 1);
@@ -331,7 +331,7 @@ impl Session {
     } else if let Some(State::RelayProxyProtocol(pp)) = protocol {
       if self.back_buf.is_some() {
         let mut pipe = pp.into_pipe(self.back_buf.take().unwrap());
-        pipe.set_app_id(self.app_id.clone());
+        pipe.set_cluster_id(self.cluster_id.clone());
         self.protocol = Some(State::Pipe(pipe));
         gauge_add!("protocol.proxy.relay", -1);
         gauge_add!("protocol.tcp", 1);
@@ -343,7 +343,7 @@ impl Session {
     } else if let Some(State::ExpectProxyProtocol(pp)) = protocol {
       if self.front_buf.is_some() && self.back_buf.is_some() {
         let mut pipe = pp.into_pipe(self.front_buf.take().unwrap(), self.back_buf.take().unwrap(), None, None);
-        pipe.set_app_id(self.app_id.clone());
+        pipe.set_cluster_id(self.cluster_id.clone());
         self.protocol = Some(State::Pipe(pipe));
         gauge_add!("protocol.proxy.expect", -1);
         gauge_add!("protocol.tcp", 1);
@@ -427,7 +427,7 @@ impl Session {
 
     if status == BackendConnectionStatus::Connected {
       gauge_add!("backend.connections", 1);
-      gauge_add!("connections_per_backend", 1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      gauge_add!("connections_per_backend", 1, self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
       if let Some(State::SendProxyProtocol(ref mut pp)) = self.protocol {
         pp.set_back_connected(BackendConnectionStatus::Connected);
       }
@@ -436,7 +436,7 @@ impl Session {
         let ref mut backend = *backend.borrow_mut();
 
         if backend.retry_policy.is_down() {
-          incr!("up", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+          incr!("up", self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
           info!("backend server {} at {} is up", backend.backend_id, backend.address);
           push_event(ProxyEvent::BackendUp(backend.backend_id.clone(), backend.address));
         }
@@ -471,10 +471,10 @@ impl Session {
 
       let already_unavailable = backend.retry_policy.is_down();
       backend.retry_policy.fail();
-      incr!("connections.error", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      incr!("connections.error", self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
       if !already_unavailable && backend.retry_policy.is_down() {
         error!("backend server {} at {} is down", backend.backend_id, backend.address);
-        incr!("down", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+        incr!("down", self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
 
         push_event(ProxyEvent::BackendDown(backend.backend_id.clone(), backend.address));
       }
@@ -586,7 +586,7 @@ impl ProxySession for Session {
 
     if back_connected == BackendConnectionStatus::Connected {
       gauge_add!("backend.connections", -1);
-      gauge_add!("connections_per_backend", -1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      gauge_add!("connections_per_backend", -1, self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
     }
 
     self.set_back_connected(BackendConnectionStatus::NotConnected);
@@ -778,8 +778,8 @@ impl ProxySession for Session {
       _ => None,
     };
 
-    error!("zombie session[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, app_id: {:?}, back_connected: {:?}, metrics: {:?}",
-      self.frontend_token, self.back_token(), rf, rb, p, self.app_id, self.back_connected, self.metrics);
+    error!("zombie session[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, cluster_id: {:?}, back_connected: {:?}, metrics: {:?}",
+      self.frontend_token, self.back_token(), rf, rb, p, self.cluster_id, self.back_connected, self.metrics);
   }
 
   fn tokens(&self) -> Vec<Token> {
@@ -794,7 +794,7 @@ impl ProxySession for Session {
 }
 
 pub struct Listener {
-  app_id:   Option<String>,
+  cluster_id:   Option<String>,
   listener: Option<TcpListener>,
   token:    Token,
   address:  SocketAddr,
@@ -806,7 +806,7 @@ pub struct Listener {
 impl Listener {
   fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool>>, token: Token) -> Listener {
     Listener {
-      app_id: None,
+      cluster_id: None,
       listener: None,
       token,
       address: config.front,
@@ -844,7 +844,7 @@ impl Listener {
 }
 
 #[derive(Debug)]
-pub struct ApplicationConfiguration {
+pub struct ClusterConfiguration {
   proxy_protocol: Option<ProxyProtocolConfig>,
   load_balancing: LoadBalancingAlgorithms,
 }
@@ -853,7 +853,7 @@ pub struct Proxy {
   fronts:    HashMap<String, Token>,
   backends:  Rc<RefCell<BackendMap>>,
   listeners: HashMap<Token, Listener>,
-  configs:   HashMap<AppId, ApplicationConfiguration>,
+  configs:   HashMap<ClusterId, ClusterConfiguration>,
 }
 
 impl Proxy {
@@ -906,11 +906,11 @@ impl Proxy {
     })
   }
 
-  pub fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr) -> bool {
+  pub fn add_tcp_front(&mut self, cluster_id: &str, front: &SocketAddr) -> bool {
     if let Some(listener) = self.listeners.values_mut().find(|l| l.address == *front) {
-      self.fronts.insert(app_id.to_string(), listener.token);
+      self.fronts.insert(cluster_id.to_string(), listener.token);
       //info!("add_tcp_front: fronts are now: {:?}", self.fronts);
-      listener.app_id = Some(app_id.to_string());
+      listener.cluster_id = Some(cluster_id.to_string());
       true
     } else {
       false
@@ -919,8 +919,8 @@ impl Proxy {
 
   pub fn remove_tcp_front(&mut self, front: SocketAddr) -> bool {
     if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front) {
-      if let Some(app_id) = listener.app_id.take() {
-        self.fronts.remove(&app_id);
+      if let Some(cluster_id) = listener.cluster_id.take() {
+        self.fronts.remove(&cluster_id);
       }
       true
     } else {
@@ -933,14 +933,14 @@ impl Proxy {
 impl ProxyConfiguration<Session> for Proxy {
 
   fn connect_to_backend(&mut self, poll: &mut Poll, session: &mut Session, back_token: Token) ->Result<BackendConnectAction,ConnectionError> {
-    if self.listeners[&session.accept_token].app_id.is_none() {
+    if self.listeners[&session.accept_token].cluster_id.is_none() {
       error!("no TCP application corresponds to that front address");
       return Err(ConnectionError::HostNotFound);
     }
 
-    let app_id = self.listeners[&session.accept_token].app_id.clone();
-    session.app_id = app_id.clone();
-    let app_id = app_id.unwrap();
+    let cluster_id = self.listeners[&session.accept_token].cluster_id.clone();
+    session.cluster_id = cluster_id.clone();
+    let cluster_id = cluster_id.unwrap();
 
 
     if session.connection_attempt == CONN_RETRIES {
@@ -948,7 +948,7 @@ impl ProxyConfiguration<Session> for Proxy {
       return Err(ConnectionError::NoBackendAvailable)
     }
 
-    let conn = self.backends.borrow_mut().backend_from_app_id(&app_id);
+    let conn = self.backends.borrow_mut().backend_from_cluster_id(&cluster_id);
     match conn {
       Ok((backend,  mut stream)) => {
         if let Err(e) = stream.set_nodelay(true) {
@@ -987,7 +987,7 @@ impl ProxyConfiguration<Session> for Proxy {
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse {
     match message.order {
       ProxyRequestData::AddTcpFrontend(front) => {
-        let _ = self.add_tcp_front(&front.app_id, &front.address);
+        let _ = self.add_tcp_front(&front.cluster_id, &front.address);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None}
       },
       ProxyRequestData::RemoveTcpFrontend(front) => {
@@ -1020,16 +1020,16 @@ impl ProxyConfiguration<Session> for Proxy {
         });
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      ProxyRequestData::AddApplication(application) => {
-        let config = ApplicationConfiguration {
-          proxy_protocol: application.proxy_protocol,
-          load_balancing: application.load_balancing,
+      ProxyRequestData::AddCluster(cluster) => {
+        let config = ClusterConfiguration {
+          proxy_protocol: cluster.proxy_protocol,
+          load_balancing: cluster.load_balancing,
         };
-        self.configs.insert(application.app_id.clone(), config);
+        self.configs.insert(cluster.cluster_id.clone(), config);
 
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      ProxyRequestData::RemoveApplication(_) => {
+      ProxyRequestData::RemoveCluster{ cluster_id } => {
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::RemoveListener(remove) => {
@@ -1079,20 +1079,20 @@ impl ProxyConfiguration<Session> for Proxy {
       let mut p = (*listener.pool).borrow_mut();
 
       if let (Some(front_buf), Some(back_buf)) = (p.checkout(), p.checkout()) {
-        if listener.app_id.is_none() {
+        if listener.cluster_id.is_none() {
           error!("listener at address {:?} has no linked application", listener.address);
           return Err(AcceptError::IoError);
         }
 
         let proxy_protocol = self.configs
-                                .get(listener.app_id.as_ref().unwrap())
+                                .get(listener.cluster_id.as_ref().unwrap())
                                 .and_then(|c| c.proxy_protocol.clone());
 
         if let Err(e) = frontend_sock.set_nodelay(true) {
           error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
         }
         let mut c = Session::new(frontend_sock, session_token, internal_token,
-          front_buf, back_buf, listener.app_id.clone(), None, proxy_protocol.clone(), wait_time,
+          front_buf, back_buf, listener.cluster_id.clone(), None, proxy_protocol.clone(), wait_time,
           Duration::seconds(listener.config.front_timeout as i64),
           Duration::seconds(listener.config.back_timeout as i64));
         incr!("tcp.requests");
@@ -1349,11 +1349,11 @@ mod tests {
     command.set_blocking(true);
     {
       let front = TcpFrontend {
-        app_id: String::from("yolo"),
+        cluster_id: String::from("yolo"),
         address: "127.0.0.1:1234".parse().unwrap(),
       };
       let backend = proxy::Backend {
-        app_id: String::from("yolo"),
+        cluster_id: String::from("yolo"),
         backend_id: String::from("yolo-0"),
         address: "127.0.0.1:5678".parse().unwrap(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
@@ -1366,11 +1366,11 @@ mod tests {
     }
     {
       let front = TcpFrontend {
-        app_id: String::from("yolo"),
+        cluster_id: String::from("yolo"),
         address: "127.0.0.1:1235".parse().unwrap(),
       };
       let backend = proxy::Backend {
-        app_id: String::from("yolo"),
+        cluster_id: String::from("yolo"),
         backend_id: String::from("yolo-0"),
         address: "127.0.0.1:5678".parse().unwrap(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),

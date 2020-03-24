@@ -1,9 +1,0 @@
-{
-  "id": "ID_TEST",
-  "version": 0,
-  "type": "PROXY",
-  "data": {
-    "type": "REMOVE_APPLICATION",
-    "data": "xxx"
-  }
-}

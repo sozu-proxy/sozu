@@ -73,7 +73,7 @@ pub struct Http<Front:SocketHandler> {
   pub status:         SessionStatus,
   pub front_buf:      Option<BufferQueue>,
   pub back_buf:       Option<BufferQueue>,
-  pub app_id:         Option<String>,
+  pub cluster_id:     Option<String>,
   pub request_id:     Ulid,
   pub backend_id:     Option<String>,
   pub front_readiness:Readiness,
@@ -115,7 +115,7 @@ impl<Front:SocketHandler> Http<Front> {
       status:             SessionStatus::Normal,
       front_buf:          None,
       back_buf:           None,
-      app_id:             None,
+      cluster_id:             None,
       request_id,
       backend_id:         None,
       front_readiness:    Readiness::new(),
@@ -184,7 +184,7 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn log_context(&self) -> LogContext {
     LogContext {
       request_id: self.request_id,
-      app_id: self.app_id.as_deref(),
+      cluster_id: self.cluster_id.as_deref(),
       backend_id: self.backend_id.as_deref(),
     }
   }
@@ -221,7 +221,7 @@ impl<Front:SocketHandler> Http<Front> {
       };
     }
 
-    let buf = buf.unwrap_or_else(|| self.answers.borrow().get(answer, self.app_id.as_deref()));
+    let buf = buf.unwrap_or_else(|| self.answers.borrow().get(answer, self.cluster_id.as_deref()));
     self.status = SessionStatus::DefaultAnswer(answer, buf, 0);
     self.front_readiness.interest = Ready::writable() | Ready::hup() | Ready::error();
     self.back_readiness.interest  = Ready::hup() | Ready::error();
@@ -310,8 +310,8 @@ impl<Front:SocketHandler> Http<Front> {
     self.backend_data = backend;
   }
 
-  pub fn set_app_id(&mut self, app_id: String) {
-    self.app_id = Some(app_id);
+  pub fn set_cluster_id(&mut self, cluster_id: String) {
+    self.cluster_id = Some(cluster_id);
   }
 
   pub fn set_backend_id(&mut self, backend_id: String) {
@@ -386,7 +386,7 @@ impl<Front:SocketHandler> Http<Front> {
     self.cancel_backend_timeout();
     self.backend       = None;
     self.backend_token = None;
-    (self.app_id.clone(), addr)
+    (self.cluster_id.clone(), addr)
   }
 
   pub fn front_hup(&mut self) -> SessionResult {
@@ -513,15 +513,15 @@ impl<Front:SocketHandler> Http<Front> {
     let service_time  = metrics.service_time();
     let _wait_time  = metrics.wait_time;
 
-    let app_id = OptionalString::new(self.app_id.as_ref().map(|s| s.as_str()));
-    time!("response_time", app_id.as_str(), response_time.whole_milliseconds());
-    time!("service_time", app_id.as_str(), service_time.whole_milliseconds());
+    let cluster_id = OptionalString::new(self.cluster_id.as_ref().map(|s| s.as_str()));
+    time!("response_time", cluster_id.as_str(), response_time.whole_milliseconds());
+    time!("service_time", cluster_id.as_str(), service_time.whole_milliseconds());
     time!("response_time", response_time.whole_milliseconds());
     time!("service_time", service_time.whole_milliseconds());
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
-        record_backend_metrics!(app_id, backend_id, backend_response_time.whole_milliseconds(),
+        record_backend_metrics!(cluster_id, backend_id, backend_response_time.whole_milliseconds(),
           metrics.backend_connection_time(), metrics.backend_bin, metrics.backend_bout);
       }
     }
@@ -558,9 +558,9 @@ impl<Front:SocketHandler> Http<Front> {
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
 
-    if let Some(ref app_id) = self.app_id {
-      time!("response_time", &app_id, response_time.whole_milliseconds());
-      time!("service_time", &app_id, service_time.whole_milliseconds());
+    if let Some(ref cluster_id) = self.cluster_id {
+      time!("response_time", &cluster_id, response_time.whole_milliseconds());
+      time!("service_time", &cluster_id, service_time.whole_milliseconds());
     }
     time!("response_time", response_time.whole_milliseconds());
     time!("service_time", service_time.whole_milliseconds());
@@ -590,20 +590,20 @@ impl<Front:SocketHandler> Http<Front> {
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
 
-    if let Some(ref app_id) = self.app_id {
-      time!("response_time", &app_id, response_time.whole_milliseconds());
-      time!("service_time", &app_id, service_time.whole_milliseconds());
+    if let Some(ref cluster_id) = self.cluster_id {
+      time!("response_time", &cluster_id, response_time.whole_milliseconds());
+      time!("service_time", &cluster_id, service_time.whole_milliseconds());
     }
     time!("response_time", response_time.whole_milliseconds());
     time!("service_time", service_time.whole_milliseconds());
     incr!("http.errors");
     /*
-    let app_id = self.app_id.clone().unwrap_or(String::from("-"));
-    time!("request_time", &app_id, response_time);
+    let cluster_id = self.cluster_id.clone().unwrap_or(String::from("-"));
+    time!("request_time", &cluster_id, response_time);
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
-        record_backend_metrics!(app_id, backend_id, backend_response_time.whole_milliseconds(), metrics.backend_connection_time(), metrics.backend_bin, metrics.backend_bout);
+        record_backend_metrics!(cluster_id, backend_id, backend_response_time.whole_milliseconds(), metrics.backend_connection_time(), metrics.backend_bin, metrics.backend_bout);
       }
     }*/
 
@@ -1330,7 +1330,7 @@ impl<Front:SocketHandler> Http<Front> {
             let (response_state, header_end) = parse_response_until_stop(
               response_state, header_end, &mut self.back_buf.as_mut().unwrap(),
               is_head, &self.added_res_header,
-              &self.sticky_name, sticky_session, self.app_id.as_deref());
+              &self.sticky_name, sticky_session, self.cluster_id.as_deref());
 
 
             self.response = Some(response_state);
@@ -1396,7 +1396,7 @@ impl<Front:SocketHandler> Http<Front> {
           let (response_state2, header_end2) = parse_response_until_stop(
             response_state, header_end, &mut self.back_buf.as_mut().unwrap(),
             is_head, &self.added_res_header,
-            &self.sticky_name, sticky_session, self.app_id.as_deref());
+            &self.sticky_name, sticky_session, self.cluster_id.as_deref());
 
           self.response = Some(response_state2);
           self.res_header_end = header_end2;
@@ -1477,7 +1477,7 @@ impl<Front:SocketHandler> Http<Front> {
             },
             TimeoutStatus::Response => {
                 error!("backend {:?} timeout while receiving response (application {:?})",
-                  self.backend_id, self.app_id);
+                  self.backend_id, self.cluster_id);
                 SessionResult::CloseSession
             },
             TimeoutStatus::WaitingForNewRequest => SessionResult::Continue,
@@ -1514,7 +1514,7 @@ fn save_http_status_metric(rs_status_line : Option<&RStatusLine>) {
 
 pub struct LogContext<'a> {
   pub request_id: Ulid,
-  pub app_id:     Option<&'a str>,
+  pub cluster_id: Option<&'a str>,
   pub backend_id: Option<&'a str>,
 }
 
@@ -1522,7 +1522,7 @@ impl<'a> std::fmt::Display for LogContext<'a> {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     write!(f, "{} {} {}\t",
       self.request_id,
-      self.app_id.unwrap_or(&"-"),
+      self.cluster_id.unwrap_or(&"-"),
       self.backend_id.unwrap_or(&"-")
     )
   }
