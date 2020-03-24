@@ -8,7 +8,7 @@ extern crate ureq;
 use std::thread;
 use sozu_command::proxy;
 use sozu_command::channel::Channel;
-use sozu_command::proxy::{LoadBalancingParams, PathRule, RulePosition};
+use sozu_command::proxy::{LoadBalancingParams, PathRule, Route, RulePosition};
 use sozu_command::logging::{Logger,LoggerBackend};
 use tiny_http::{Server, Response};
 use std::{
@@ -66,17 +66,17 @@ fn test() {
         };
 
 
-    let http_front = proxy::HttpFront {
-        app_id:     String::from("test"),
-        address:    "127.0.0.1:8080".parse().unwrap(),
-        hostname:   String::from("example.com"),
-        path:       PathRule::Prefix(String::from("/")),
-        position:   RulePosition::Tree,
+    let http_frontend = proxy::HttpFrontend {
+        route:    Route::AppId(String::from("test")),
+        address:  "127.0.0.1:8080".parse().unwrap(),
+        hostname: String::from("example.com"),
+        path:     PathRule::Prefix(String::from("/")),
+        position: RulePosition::Tree,
     };
 
     command.write_message(&proxy::ProxyRequest {
         id:    String::from("ID_ABCD"),
-        order: proxy::ProxyRequestData::AddHttpFront(http_front)
+        order: proxy::ProxyRequestData::AddHttpFrontend(http_frontend)
     });
     println!("HTTP -> {:?}", command.read_message());
 

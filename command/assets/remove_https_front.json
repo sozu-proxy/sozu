@@ -3,7 +3,7 @@
   "version": 0,
   "type": "PROXY",
   "data": {
-    "type": "REMOVE_HTTPS_FRONT",
+    "type": "REMOVE_HTTPS_FRONTEND",
     "data": {
       "route": {
         "APP_ID": "xxx"
