@@ -132,7 +132,7 @@ mod tests {
   use serde_json;
   use hex::FromHex;
   use certificate::split_certificate_chain;
-  use proxy::{Application,CertificateAndKey,CertFingerprint,ProxyRequestData,HttpFrontend,Backend,
+  use proxy::{Application,CertificateAndKey,CertificateFingerprint,ProxyRequestData,HttpFrontend,Backend,
     AppMetricsData,MetricsData,FilteredData,Percentiles,RemoveBackend,
     AddCertificate,RemoveCertificate,LoadBalancingParams,RulePosition,PathRule,
     Route};
@@ -283,7 +283,7 @@ mod tests {
       version:  0,
       data:     CommandRequestData::Proxy(ProxyRequestData::RemoveCertificate(RemoveCertificate {
           front: "0.0.0.0:443".parse().unwrap(),
-          fingerprint: CertFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
+          fingerprint: CertificateFingerprint(FromHex::from_hex("ab2618b674e15243fd02a5618c66509e4840ba60e7d64cebec84cdbfeceee0c5").unwrap()),
           names: Vec::new(),
       })),
       worker_id: None

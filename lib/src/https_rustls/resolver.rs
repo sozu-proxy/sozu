@@ -6,7 +6,7 @@ use rustls::{ResolvesServerCert, SignatureScheme};
 use rustls::sign::{CertifiedKey, RSASigningKey};
 use rustls::internal::pemfile;
 
-use sozu_command::proxy::{CertificateAndKey, CertFingerprint, AddCertificate, RemoveCertificate};
+use sozu_command::proxy::{CertificateAndKey, CertificateFingerprint, AddCertificate, RemoveCertificate};
 use sozu_command::certificate::calculate_fingerprint_from_der;
 
 use router::trie::TrieNode;
@@ -16,8 +16,8 @@ struct TlsData {
 }
 
 pub struct CertificateResolver {
-  pub domains:  TrieNode<CertFingerprint>,
-  certificates: HashMap<CertFingerprint, TlsData>,
+  pub domains:  TrieNode<CertificateFingerprint>,
+  certificates: HashMap<CertificateFingerprint, TlsData>,
 }
 
 impl CertificateResolver {
@@ -28,7 +28,7 @@ impl CertificateResolver {
     }
   }
 
-  pub fn add_certificate(&mut self, add_certificate: AddCertificate) -> Option<CertFingerprint> {
+  pub fn add_certificate(&mut self, add_certificate: AddCertificate) -> Option<CertificateFingerprint> {
     if let Some(certified_key) = generate_certified_key(add_certificate.certificate) {
       let fingerprint = calculate_fingerprint_from_der(&certified_key.cert[0].0);
       if add_certificate.names.is_empty() {
@@ -51,7 +51,7 @@ impl CertificateResolver {
         cert:     certified_key,
       };
 
-      let fingerprint = CertFingerprint(fingerprint);
+      let fingerprint = CertificateFingerprint(fingerprint);
       self.certificates.insert(fingerprint.clone(), data);
       for name in names.drain(..) {
         self.domains.domain_insert(name.into_bytes(), fingerprint.clone());
@@ -96,7 +96,7 @@ impl CertificateResolverWrapper {
     CertificateResolverWrapper(Mutex::new(CertificateResolver::new()))
   }
 
-  pub fn add_certificate(&self, add_certificate: AddCertificate) -> Option<CertFingerprint> {
+  pub fn add_certificate(&self, add_certificate: AddCertificate) -> Option<CertificateFingerprint> {
     if let Ok(ref mut resolver) = self.0.try_lock() {
       resolver.add_certificate(add_certificate)
     } else {

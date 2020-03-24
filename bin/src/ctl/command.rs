@@ -3,7 +3,7 @@ use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
 use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFrontend,
-  TcpFrontend, CertificateAndKey, CertFingerprint, Query, QueryAnswer,
+  TcpFrontend, CertificateAndKey, CertificateFingerprint, Query, QueryAnswer,
   QueryApplicationType, QueryApplicationDomain, FilteredData, AddCertificate,
   RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend,
   TcpListener, ListenerType, TlsVersion, QueryCertificateType,
@@ -1713,11 +1713,11 @@ fn load_full_certificate(certificate_path: &str, certificate_chain_path: &str, k
   }
 }
 
-fn get_certificate_fingerprint(certificate_path: &str) -> Option<CertFingerprint> {
+fn get_certificate_fingerprint(certificate_path: &str) -> Option<CertificateFingerprint> {
   match Config::load_file_bytes(certificate_path) {
     Ok(data) => {
       match calculate_fingerprint(&data) {
-        Some(fingerprint) => Some(CertFingerprint(fingerprint)),
+        Some(fingerprint) => Some(CertificateFingerprint(fingerprint)),
         None              => {
           eprintln!("could not calculate finrprint for certificate");
           exit(1);

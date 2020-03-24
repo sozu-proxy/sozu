@@ -27,7 +27,7 @@ use openssl::ssl::SslVersion;
 use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::scm_socket::ScmSocket;
-use sozu_command::proxy::{Application,CertFingerprint,CertificateAndKey,
+use sozu_command::proxy::{Application,CertificateFingerprint,CertificateAndKey,
   ProxyRequestData,HttpFrontend,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,TlsVersion,ProxyEvent,Query,QueryCertificateType,
   QueryAnswer,QueryAnswerCertificate,ProxyResponseData,RemoveListener,
@@ -893,8 +893,8 @@ pub struct Listener {
   listener:        Option<TcpListener>,
   address:         SocketAddr,
   fronts:          Router,
-  domains:         Arc<Mutex<TrieNode<CertFingerprint>>>,
-  contexts:        Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
+  domains:         Arc<Mutex<TrieNode<CertificateFingerprint>>>,
+  contexts:        Arc<Mutex<HashMap<CertificateFingerprint,TlsData>>>,
   default_context: SslContext,
   answers:         Rc<RefCell<HttpAnswers>>,
   config:          HttpsListener,
@@ -906,7 +906,7 @@ pub struct Listener {
 impl Listener {
   pub fn new(config: HttpsListener, token: Token) -> Listener {
 
-    let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
+    let contexts:HashMap<CertificateFingerprint,TlsData> = HashMap::new();
     let domains      = TrieNode::root();
     let fronts       = Router::new();
     let rc_ctx       = Arc::new(Mutex::new(contexts));
@@ -955,8 +955,8 @@ impl Listener {
     Some(self.token)
   }
 
-  pub fn create_default_context(config: &HttpsListener, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
-    ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>) -> Option<(SslContext, SslOptions)> {
+  pub fn create_default_context(config: &HttpsListener, ref_ctx: Arc<Mutex<HashMap<CertificateFingerprint,TlsData>>>,
+    ref_domains: Arc<Mutex<TrieNode<CertificateFingerprint>>>) -> Option<(SslContext, SslOptions)> {
     let ctx = SslContext::builder(SslMethod::tls());
     if let Err(e) = ctx {
       error!("error building SSL context: {:?}", e);
@@ -1129,7 +1129,7 @@ impl Listener {
       //FIXME: would need more logs here
 
       //FIXME
-      let fingerprint = CertFingerprint(unwrap_msg!(cert.digest(MessageDigest::sha256()).map(|d| d.to_vec())));
+      let fingerprint = CertificateFingerprint(unwrap_msg!(cert.digest(MessageDigest::sha256()).map(|d| d.to_vec())));
       let names = get_cert_names(&cert);
       debug!("got certificate names: {:?}", names);
 
@@ -1215,7 +1215,7 @@ impl Listener {
   }
 
   // FIXME: return an error if the cert is still in use
-  pub fn remove_certificate(&mut self, fingerprint: CertFingerprint) {
+  pub fn remove_certificate(&mut self, fingerprint: CertificateFingerprint) {
     debug!("removing certificate {:?}", fingerprint);
     let mut contexts = unwrap_msg!(self.contexts.lock());
     let mut domains  = unwrap_msg!(self.domains.lock());
