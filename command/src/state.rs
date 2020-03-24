@@ -5,8 +5,8 @@ use std::net::SocketAddr;
 use std::iter::{repeat,FromIterator};
 use crate::certificate::calculate_fingerprint;
 
-use crate::proxy::{Application,CertFingerprint,CertificateAndKey,ProxyRequestData,
-  HttpFrontend,TcpFrontend,Backend,QueryAnswerApplication,
+use crate::proxy::{Application,CertificateFingerprint,CertificateAndKey,ProxyRequestData,
+HttpFrontend,TcpFrontend,Backend,QueryAnswerApplication,
   AddCertificate, RemoveCertificate, RemoveBackend,
   HttpListener,HttpsListener,TcpListener,ListenerType,
   ActivateListener,RemoveListener,PathRule,DeactivateListener,
@@ -24,7 +24,7 @@ pub struct HttpProxy {
 #[derive(Debug,Clone,PartialEq,Eq,Serialize, Deserialize)]
 pub struct HttpsProxy {
   address:      SocketAddr,
-  certificates: HashMap<CertFingerprint, CertificateAndKey>,
+  certificates: HashMap<CertificateFingerprint, CertificateAndKey>,
   fronts:       HashMap<AppId, Vec<HttpFrontend>>,
   backends:     HashMap<AppId, Vec<Backend>>,
 }
@@ -43,7 +43,7 @@ pub struct ConfigState {
   pub https_fronts:    HashMap<(SocketAddr, String, PathRule), HttpFrontend>,
   pub tcp_fronts:      HashMap<AppId, Vec<TcpFrontend>>,
   // certificate and names
-  pub certificates:    HashMap<SocketAddr, HashMap<CertFingerprint, (CertificateAndKey, Vec<String>)>>,
+  pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
   //ip, port
   pub http_addresses:  Vec<SocketAddr>,
   pub https_addresses: Vec<SocketAddr>,
@@ -146,7 +146,7 @@ impl ConfigState {
       },
       &ProxyRequestData::AddCertificate(ref add) => {
         let fingerprint = match calculate_fingerprint(&add.certificate.certificate.as_bytes()[..]) {
-          Some(f)  => CertFingerprint(f),
+          Some(f)  => CertificateFingerprint(f),
           None => {
             error!("cannot obtain the certificate's fingerprint");
             return false;
@@ -170,7 +170,7 @@ impl ConfigState {
         let changed = self.certificates.get_mut(&replace.front).and_then(|certs| certs.remove(&replace.old_fingerprint)).is_some();
 
         let fingerprint = match calculate_fingerprint(&replace.new_certificate.certificate.as_bytes()[..]) {
-          Some(f)  => CertFingerprint(f),
+          Some(f)  => CertificateFingerprint(f),
           None => {
             error!("cannot obtain the certificate's fingerprint");
             return changed;
@@ -658,12 +658,12 @@ impl ConfigState {
     }
 
 
-    //pub certificates:    HashMap<SocketAddr, HashMap<CertFingerprint, (CertificateAndKey, Vec<String>)>>,
-    let my_certificates:    HashSet<(SocketAddr, &CertFingerprint)> =
+    //pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
+    let my_certificates:    HashSet<(SocketAddr, &CertificateFingerprint)> =
       HashSet::from_iter(self.certificates.iter().flat_map(|(addr, certs)| {
         repeat(*addr).zip(certs.keys())
       }));
-    let their_certificates: HashSet<(SocketAddr, &CertFingerprint)> =
+    let their_certificates: HashSet<(SocketAddr, &CertificateFingerprint)> =
       HashSet::from_iter(other.certificates.iter().flat_map(|(addr, certs)| {
         repeat(*addr).zip(certs.keys())
       }));
@@ -796,7 +796,7 @@ pub fn get_application_ids_by_domain(state: &ConfigState, hostname: String, path
 }
 
 pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<(String, Vec<String>)> {
-  state.certificates.values().filter_map(|h| h.get(&CertFingerprint(fingerprint.to_vec())))
+  state.certificates.values().filter_map(|h| h.get(&CertificateFingerprint(fingerprint.to_vec())))
     .map(|(c, names)| (c.certificate.clone(), names.clone())).next()
 }
 
