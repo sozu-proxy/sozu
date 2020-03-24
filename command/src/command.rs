@@ -116,7 +116,7 @@ impl From<ProxyEvent> for Event {
   fn from(e: ProxyEvent) -> Self {
     match e {
       ProxyEvent::BackendDown(id, addr) => Event::BackendDown(id, addr),
-      ProxyEvent::NoAvailableBackends(app_id) => Event::NoAvailableBackends(app_id),
+      ProxyEvent::NoAvailableBackends(cluster_id) => Event::NoAvailableBackends(cluster_id),
     }
   }
 }
@@ -132,7 +132,7 @@ mod tests {
   use serde_json;
   use hex::FromHex;
   use certificate::split_certificate_chain;
-  use proxy::{Application,CertificateAndKey,CertificateFingerprint,ProxyRequestData,HttpFrontend,Backend,
+  use proxy::{Cluster,CertificateAndKey,CertificateFingerprint,ProxyRequestData,HttpFrontend,Backend,
     AppMetricsData,MetricsData,FilteredData,Percentiles,RemoveBackend,
     AddCertificate,RemoveCertificate,LoadBalancingParams,RulePosition,PathRule,
     Route};
@@ -140,11 +140,11 @@ mod tests {
 
   #[test]
   fn config_message_test() {
-    let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "data":{"type": "ADD_HTTP_FRONTEND", "data": { "route": {"APP_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}} }"#;
+    let raw_json = r#"{ "id": "ID_TEST", "version": 0, "type": "PROXY", "data":{"type": "ADD_HTTP_FRONTEND", "data": { "route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "0.0.0.0:8080"}} }"#;
     let message: CommandRequest = serde_json::from_str(raw_json).unwrap();
     println!("{:?}", message);
     assert_eq!(message.data, CommandRequestData::Proxy(ProxyRequestData::AddHttpFrontend(HttpFrontend{
-      route: Route::AppId(String::from("xxx")),
+      route: Route::ClusterId(String::from("xxx")),
       hostname: String::from("yyy"),
       path: PathRule::Prefix(String::from("xxx")),
       address: "0.0.0.0:8080".parse().unwrap(),
@@ -186,11 +186,11 @@ mod tests {
     )
   );
 
-  test_message!(add_application, "../assets/add_application.json", CommandRequest {
+  test_message!(add_cluster, "../assets/add_cluster.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::Proxy(ProxyRequestData::AddApplication(Application {
-                  app_id: String::from("xxx"),
+      data:     CommandRequestData::Proxy(ProxyRequestData::AddCluster(Cluster {
+                  cluster_id: String::from("xxx"),
                   sticky_session: true,
                   https_redirect: true,
                   proxy_protocol: Some(ProxyProtocolConfig::ExpectHeader),
@@ -200,10 +200,10 @@ mod tests {
       worker_id: None
     });
 
-  test_message!(remove_application, "../assets/remove_application.json", CommandRequest {
+  test_message!(remove_cluster, "../assets/remove_cluster.json", CommandRequest {
       id:       "ID_TEST".to_string(),
       version:  0,
-      data:     CommandRequestData::Proxy(ProxyRequestData::RemoveApplication( String::from("xxx") )),
+      data:     CommandRequestData::Proxy(ProxyRequestData::RemoveCluster { cluster_id:  String::from("xxx") }),
       worker_id: None
     });
 
@@ -211,7 +211,7 @@ mod tests {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     CommandRequestData::Proxy(ProxyRequestData::AddHttpFrontend(HttpFrontend{
-                  route: Route::AppId(String::from("xxx")),
+                  route: Route::ClusterId(String::from("xxx")),
                   hostname: String::from("yyy"),
                   path: PathRule::Prefix(String::from("xxx")),
                   address: "0.0.0.0:8080".parse().unwrap(),
@@ -224,7 +224,7 @@ mod tests {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     CommandRequestData::Proxy(ProxyRequestData::RemoveHttpFrontend(HttpFrontend{
-                  route: Route::AppId(String::from("xxx")),
+                  route: Route::ClusterId(String::from("xxx")),
                   hostname: String::from("yyy"),
                   path: PathRule::Prefix(String::from("xxx")),
                   address: "0.0.0.0:8080".parse().unwrap(),
@@ -237,7 +237,7 @@ mod tests {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     CommandRequestData::Proxy(ProxyRequestData::AddHttpsFrontend(HttpFrontend{
-                  route: Route::AppId(String::from("xxx")),
+                  route: Route::ClusterId(String::from("xxx")),
                   hostname: String::from("yyy"),
                   path: PathRule::Prefix(String::from("xxx")),
                   address: "0.0.0.0:8443".parse().unwrap(),
@@ -250,7 +250,7 @@ mod tests {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     CommandRequestData::Proxy(ProxyRequestData::RemoveHttpsFrontend(HttpFrontend{
-                  route: Route::AppId(String::from("xxx")),
+                  route: Route::ClusterId(String::from("xxx")),
                   hostname: String::from("yyy"),
                   path: PathRule::Prefix(String::from("xxx")),
                   address: "0.0.0.0:8443".parse().unwrap(),
@@ -293,7 +293,7 @@ mod tests {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     CommandRequestData::Proxy(ProxyRequestData::AddBackend(Backend{
-                  app_id: String::from("xxx"),
+                  cluster_id: String::from("xxx"),
                   backend_id: String::from("xxx-0"),
                   address: "127.0.0.1:8080".parse().unwrap(),
                   load_balancing_parameters: Some(LoadBalancingParams{ weight: 0 }),
@@ -307,7 +307,7 @@ mod tests {
       id:       "ID_TEST".to_string(),
       version:  0,
       data:     CommandRequestData::Proxy(ProxyRequestData::RemoveBackend(RemoveBackend{
-                  app_id: String::from("xxx"),
+                  cluster_id: String::from("xxx"),
                   backend_id: String::from("xxx-0"),
                   address: "127.0.0.1:8080".parse().unwrap(),
       })),

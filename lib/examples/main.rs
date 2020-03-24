@@ -36,7 +36,7 @@ fn main() {
   });
 
   let http_front = proxy::HttpFrontend {
-    route:   Route::AppId(String::from("app_1")),
+    route:   Route::ClusterId(String::from("app_1")),
     address:  "127.0.0.1:8080".parse().unwrap(),
     hostname: String::from("lolcatho.st"),
     path:     PathRule::Prefix(String::from("/")),
@@ -44,7 +44,7 @@ fn main() {
   };
 
   let http_backend = proxy::Backend {
-    app_id:      String::from("app_1"),
+    cluster_id:      String::from("app_1"),
     backend_id:  String::from("app_1-0"),
     sticky_id:   None,
     address:     "127.0.0.1:1026".parse().unwrap(),
@@ -110,7 +110,7 @@ fn main() {
   });
 
   let tls_front = proxy::HttpFrontend {
-    route:   Route::AppId(String::from("app_1")),
+    route:   Route::ClusterId(String::from("app_1")),
     address:  "127.0.0.1:8443".parse().unwrap(),
     hostname: String::from("lolcatho.st"),
     path:     PathRule::Prefix(String::from("/")),
@@ -122,7 +122,7 @@ fn main() {
     order: proxy::ProxyRequestData::AddHttpsFrontend(tls_front)
   });
   let tls_backend = proxy::Backend {
-    app_id:      String::from("app_1"),
+    cluster_id:      String::from("app_1"),
     backend_id:  String::from("app_1-0"),
     sticky_id:   None,
     address:     "127.0.0.1:1026".parse().unwrap(),
@@ -154,7 +154,7 @@ fn main() {
   });
 
   let tls_front2 = proxy::HttpFrontend {
-    route:   Route::AppId(String::from("app_2")),
+    route:   Route::ClusterId(String::from("app_2")),
     address:  "127.0.0.1:8443".parse().unwrap(),
     hostname: String::from("test.local"),
     path:     PathRule::Prefix(String::from("/")),
@@ -167,7 +167,7 @@ fn main() {
   });
 
   let tls_backend2 = proxy::Backend {
-    app_id:      String::from("app_2"),
+    cluster_id:  String::from("app_2"),
     backend_id:  String::from("app_2-0"),
     sticky_id:   None,
     address:     "127.0.0.1:1026".parse().unwrap(),

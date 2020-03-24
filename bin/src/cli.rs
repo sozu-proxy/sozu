@@ -221,7 +221,7 @@ impl std::convert::Into<sozu_command::proxy::Route> for Route {
     fn into(self) -> sozu_command::proxy::Route {
         match self {
           Route::Deny => sozu_command::proxy::Route::Deny,
-          Route::Id { id } => sozu_command::proxy::Route::AppId(id),
+          Route::Id { id } => sozu_command::proxy::Route::ClusterId(id),
         }
     }
 }

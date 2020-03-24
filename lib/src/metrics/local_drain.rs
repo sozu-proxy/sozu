@@ -82,7 +82,7 @@ pub struct AppMetrics {
 
 #[derive(Clone,Debug)]
 pub struct BackendMetrics {
-  pub app_id: String,
+  pub cluster_id: String,
   pub data:   BTreeMap<String, AggregatedMetric>,
 }
 
@@ -91,8 +91,8 @@ pub struct LocalDrain {
   pub prefix:          String,
   pub created:         Instant,
   pub data:            BTreeMap<String, AggregatedMetric>,
-  /// app_id -> response time histogram (in ms)
-  pub app_data:        BTreeMap<String, AppMetrics>,
+  /// cluster_id -> response time histogram (in ms)
+  pub cluster_data:        BTreeMap<String, AppMetrics>,
   // backend_id -> response time histogram (in ms)
 //  pub backend_data:    BTreeMap<String, BackendMetrics>,
   //pub request_counter: TimeSerie,
@@ -106,7 +106,7 @@ impl LocalDrain {
       prefix,
       created:     Instant::now(),
       data:        BTreeMap::new(),
-      app_data:    BTreeMap::new(),
+      cluster_data:    BTreeMap::new(),
  //     backend_data: BTreeMap::new(),
       //request_counter: TimeSerie::new(),
       use_tagged_metrics: false,
@@ -117,7 +117,7 @@ impl LocalDrain {
   pub fn dump_metrics_data(&mut self) -> MetricsData {
     MetricsData {
       proxy:        self.dump_process_data(),
-      applications: self.dump_app_data(),
+      clusters: self.dump_cluster_data(),
     }
   }
 
@@ -129,12 +129,12 @@ impl LocalDrain {
     data
   }
 
-  pub fn dump_app_data(&mut self) -> BTreeMap<String,AppMetricsData> {
-    let data = self.app_data.iter().map(|(ref app_id, ref app)| {
-      let data = app.data.iter().map(|(ref key, ref value)| {
+  pub fn dump_cluster_data(&mut self) -> BTreeMap<String,AppMetricsData> {
+    let data = self.cluster_data.iter().map(|(ref cluster_id, ref cluster)| {
+      let data = cluster.data.iter().map(|(ref key, ref value)| {
          (key.to_string(), aggregated_to_filtered(value))
        }).collect();
-      let backends = app.backend_data.iter().map(|(ref backend_id, ref backend_data)| {
+      let backends = cluster.backend_data.iter().map(|(ref backend_id, ref backend_data)| {
         let b = backend_data.iter().map(|(ref key, ref value)| {
          (key.to_string(), aggregated_to_filtered(value))
         }).collect();
@@ -142,25 +142,25 @@ impl LocalDrain {
         (backend_id.to_string(), b)
       }).collect();
 
-      (app_id.to_string(), AppMetricsData { data, backends })
+      (cluster_id.to_string(), AppMetricsData { data, backends })
     }).collect();
 
-    self.app_data.clear();
+    self.cluster_data.clear();
 
     data
   }
 
   pub fn clear(&mut self) {
-    self.app_data.clear();
+    self.cluster_data.clear();
   }
 }
 
 
 impl Subscriber for LocalDrain {
-  fn receive_metric(&mut self, key: &'static str, app_id: Option<&str>, backend_id: Option<&str>, metric: MetricData) {
-    if let Some(id) = app_id {
-      if !self.app_data.contains_key(id) {
-        self.app_data.insert(
+  fn receive_metric(&mut self, key: &'static str, cluster_id: Option<&str>, backend_id: Option<&str>, metric: MetricData) {
+    if let Some(id) = cluster_id {
+      if !self.cluster_data.contains_key(id) {
+        self.cluster_data.insert(
           String::from(id),
           AppMetrics {
             data: BTreeMap::new(),
@@ -169,16 +169,16 @@ impl Subscriber for LocalDrain {
         );
       }
 
-      self.app_data.get_mut(id).map(|app| {
+      self.cluster_data.get_mut(id).map(|cluster| {
         if let Some(bid) = backend_id {
-          if !app.backend_data.contains_key(bid) {
-            app.backend_data.insert(
+          if !cluster.backend_data.contains_key(bid) {
+            cluster.backend_data.insert(
               String::from(bid),
               BTreeMap::new()
             );
           }
 
-          app.backend_data.get_mut(bid).map(|backend_data| {
+          cluster.backend_data.get_mut(bid).map(|backend_data| {
             if !backend_data.contains_key(key) {
               backend_data.insert(
                 String::from(key),
@@ -190,13 +190,13 @@ impl Subscriber for LocalDrain {
               });
             }
           });
-        } else if !app.data.contains_key(key) {
-          app.data.insert(
+        } else if !cluster.data.contains_key(key) {
+          cluster.data.insert(
             String::from(key),
             AggregatedMetric::new(metric)
           );
         } else {
-          app.data.get_mut(key).map(|stored_metric| {
+          cluster.data.get_mut(key).map(|stored_metric| {
             stored_metric.update(key, metric);
           });
         }
@@ -221,8 +221,8 @@ pub struct ProxyMetrics {
   pub prefix:          String,
   pub created:         Instant,
   pub data:            BTreeMap<String, StoredMetricData>,
-  /// app_id -> response time histogram (in ms)
-  pub app_data:        BTreeMap<String,AppMetrics>,
+  /// cluster_id -> response time histogram (in ms)
+  pub cluster_data:        BTreeMap<String,AppMetrics>,
   /// backend_id -> response time histogram (in ms)
   pub backend_data:    BTreeMap<String,BackendMetrics>,
   pub request_counter: TimeSerie,
@@ -239,7 +239,7 @@ impl ProxyMetrics {
       prefix:      prefix,
       created:     Instant::now(),
       data:        BTreeMap::new(),
-      app_data:    BTreeMap::new(),
+      cluster_data:    BTreeMap::new(),
       backend_data: BTreeMap::new(),
       request_counter: TimeSerie::new(),
       is_writable: false,
@@ -267,7 +267,7 @@ impl ProxyMetrics {
 
 
   pub fn dump_percentiles(&self) -> BTreeMap<String, Percentiles> {
-    self.app_data.iter().map(|(ref app_id, ref metrics)| {
+    self.cluster_data.iter().map(|(ref cluster_id, ref metrics)| {
       let percentiles = Percentiles {
         samples:  metrics.response_time.len(),
         p_50:     metrics.response_time.value_at_percentile(50.0),
@@ -279,7 +279,7 @@ impl ProxyMetrics {
         p_100:    metrics.response_time.value_at_percentile(100.0),
       };
 
-      (app_id.to_string(), percentiles)
+      (cluster_id.to_string(), percentiles)
     }).collect()
   }
 
@@ -309,7 +309,7 @@ impl ProxyMetrics {
   pub fn dump_metrics_data(&mut self) -> MetricsData {
     MetricsData {
       proxy:        self.dump_data(),
-      applications: self.dump_percentiles(),
+      clusters: self.dump_percentiles(),
       backends:     self.dump_backend_data(),
     }
   }

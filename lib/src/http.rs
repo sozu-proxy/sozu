@@ -15,13 +15,13 @@ use slab::Slab;
 use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::scm_socket::{Listeners,ScmSocket};
-use sozu_command::proxy::{Application,ProxyRequestData,HttpFrontend,HttpListener,
+use sozu_command::proxy::{Cluster,ProxyRequestData,HttpFrontend,HttpListener,
   ProxyRequest,ProxyResponse,ProxyResponseStatus,ProxyEvent,RemoveListener,
   Route};
 use sozu_command::logging;
 use sozu_command::buffer::fixed::Buffer;
 
-use super::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
+use super::{ClusterId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetrics,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus,
   CloseResult};
 use super::backends::BackendMap;
@@ -56,7 +56,7 @@ pub struct Session {
   protocol:           Option<State>,
   pool:               Weak<RefCell<Pool<Buffer>>>,
   metrics:            SessionMetrics,
-  pub app_id:         Option<String>,
+  pub cluster_id:         Option<String>,
   sticky_name:        String,
   front_timeout:      Timeout,
   last_event:         SteadyTime,
@@ -91,7 +91,7 @@ impl Session {
         frontend_token:     token,
         pool,
         metrics,
-        app_id:             None,
+        cluster_id:             None,
         sticky_name,
         front_timeout:      timeout,
         last_event:         SteadyTime::now(),
@@ -145,13 +145,13 @@ impl Session {
       gauge_add!("protocol.ws", 1);
       gauge_add!("http.active_requests", -1);
       let mut pipe = Pipe::new(http.frontend, front_token, http.request_id,
-        http.app_id, http.backend_id, Some(ws_context),
+        http.cluster_id, http.backend_id, Some(ws_context),
         Some(unwrap_msg!(http.backend)), front_buf, back_buf, http.session_address, Protocol::HTTP);
 
       pipe.front_readiness.event = http.front_readiness.event;
       pipe.back_readiness.event  = http.back_readiness.event;
       pipe.set_back_token(back_token);
-      //pipe.set_app_id(self.app_id.clone());
+      //pipe.set_cluster_id(self.cluster_id.clone());
 
       self.protocol = Some(State::WebSocket(pipe));
       true
@@ -230,8 +230,8 @@ impl Session {
   fn log_context(&self) -> String {
     match *unwrap_msg!(self.protocol.as_ref()) {
       State::Http(ref http) => {
-        if let Some(ref app_id) = http.app_id {
-          format!("{}\t{}\t", http.request_id, app_id)
+        if let Some(ref cluster_id) = http.cluster_id {
+          format!("{}\t{}\t", http.request_id, cluster_id)
         } else {
           format!("{}\t-\t", http.request_id)
         }
@@ -271,7 +271,7 @@ impl Session {
     }
   }
 
-  // Forward content to application
+  // Forward content to cluster
   fn back_writable(&mut self) -> SessionResult {
     match *unwrap_msg!(self.protocol.as_mut())  {
       State::Http(ref mut http)      => http.back_writable(&mut self.metrics),
@@ -280,7 +280,7 @@ impl Session {
     }
   }
 
-  // Read content from application
+  // Read content from cluster
   fn back_readable(&mut self) -> SessionResult {
     let (upgrade, result) = match  *unwrap_msg!(self.protocol.as_mut())  {
       State::Http(ref mut http)      => http.back_readable(&mut self.metrics),
@@ -349,7 +349,7 @@ impl Session {
   fn set_back_connected(&mut self, connected: BackendConnectionStatus) {
     self.back_connected = connected;
     if connected == BackendConnectionStatus::Connected {
-      gauge_add!("connections", 1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      gauge_add!("connections", 1, self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
       self.backend.as_ref().map(|backend| {
         let ref mut backend = *backend.borrow_mut();
         //successful connection, rest failure counter
@@ -399,10 +399,10 @@ impl Session {
 
       let already_unavailable = backend.retry_policy.is_down();
       backend.retry_policy.fail();
-      incr!("connections.error", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      incr!("connections.error", self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
       if !already_unavailable && backend.retry_policy.is_down() {
         error!("backend server {} at {} is down", backend.backend_id, backend.address);
-        incr!("down", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+        incr!("down", self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
 
         push_event(ProxyEvent::BackendDown(backend.backend_id.clone(), backend.address));
       }
@@ -507,7 +507,7 @@ impl ProxySession for Session {
     }
 
     if back_connected == BackendConnectionStatus::Connected {
-      gauge_add!("connections", -1, self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+      gauge_add!("connections", -1, self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
     }
 
     self.set_back_connected(BackendConnectionStatus::NotConnected);
@@ -700,8 +700,8 @@ impl ProxySession for Session {
       _ => None,
     };
 
-    error!("zombie session[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, app_id: {:?}, back_connected: {:?}, metrics: {:?}",
-      self.frontend_token, self.back_token(), rf, rb, p, self.app_id, self.back_connected, self.metrics);
+    error!("zombie session[{:?} => {:?}], state => readiness: {:?} -> {:?}, protocol: {}, cluster_id: {:?}, back_connected: {:?}, metrics: {:?}",
+      self.frontend_token, self.back_token(), rf, rb, p, self.cluster_id, self.back_connected, self.metrics);
   }
 
   fn tokens(&self) -> Vec<Token> {
@@ -729,7 +729,7 @@ pub struct Listener {
 pub struct Proxy {
   listeners:    HashMap<Token,Listener>,
   backends:     Rc<RefCell<BackendMap>>,
-  applications: HashMap<AppId, Application>,
+  clusters: HashMap<ClusterId, Cluster>,
   pool:         Rc<RefCell<Pool<Buffer>>>,
 }
 
@@ -737,7 +737,7 @@ impl Proxy {
   pub fn new(pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>) -> Proxy {
     Proxy {
       listeners:      HashMap::new(),
-      applications:   HashMap::new(),
+      clusters:   HashMap::new(),
       backends,
       pool,
     }
@@ -782,27 +782,27 @@ impl Proxy {
     })
   }
 
-  pub fn add_application(&mut self, application: Application) {
-    if let Some(answer_503) = application.answer_503.as_ref() {
+  pub fn add_cluster(&mut self, cluster: Cluster) {
+    if let Some(answer_503) = cluster.answer_503.as_ref() {
       for l in self.listeners.values_mut() {
-        l.answers.borrow_mut().add_custom_answer(&application.app_id, &answer_503);
+        l.answers.borrow_mut().add_custom_answer(&cluster.cluster_id, &answer_503);
       }
     }
 
-    self.applications.insert(application.app_id.clone(), application);
+    self.clusters.insert(cluster.cluster_id.clone(), cluster);
   }
 
-  pub fn remove_application(&mut self, app_id: &str) {
-    self.applications.remove(app_id);
+  pub fn remove_cluster(&mut self, cluster_id: &str) {
+    self.clusters.remove(cluster_id);
 
     for l in self.listeners.values_mut() {
-      l.answers.borrow_mut().remove_custom_answer(app_id);
+      l.answers.borrow_mut().remove_custom_answer(cluster_id);
     }
   }
 
-  pub fn backend_from_request(&mut self, session: &mut Session, app_id: &str,
+  pub fn backend_from_request(&mut self, session: &mut Session, cluster_id: &str,
   front_should_stick: bool) -> Result<TcpStream,ConnectionError> {
-    session.http_mut().map(|h| h.set_app_id(String::from(app_id)));
+    session.http_mut().map(|h| h.set_cluster_id(String::from(cluster_id)));
 
     let sticky_session = session.http()
       .and_then(|http| http.request.as_ref())
@@ -810,18 +810,18 @@ impl Proxy {
 
     let res = match (front_should_stick, sticky_session) {
       (true, Some(sticky_session)) => {
-        self.backends.borrow_mut().backend_from_sticky_session(app_id, &sticky_session)
+        self.backends.borrow_mut().backend_from_sticky_session(cluster_id, &sticky_session)
           .map_err(|e| {
-            debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, app_id);
+            debug!("Couldn't find a backend corresponding to sticky_session {} for app {}", sticky_session, cluster_id);
             e
           })
       },
-      _ => self.backends.borrow_mut().backend_from_app_id(app_id),
+      _ => self.backends.borrow_mut().backend_from_cluster_id(cluster_id),
     };
 
     match res {
       Err(e) => {
-        let answer = self.get_service_unavailable_answer(Some(app_id), session.listen_token);
+        let answer = self.get_service_unavailable_answer(Some(cluster_id), session.listen_token);
         session.set_answer(DefaultAnswerStatus::Answer503, answer);
         Err(e)
       },
@@ -847,7 +847,7 @@ impl Proxy {
     }
   }
 
-  fn app_id_from_request(&mut self, session: &mut Session) -> Result<String, ConnectionError> {
+  fn cluster_id_from_request(&mut self, session: &mut Session) -> Result<String, ConnectionError> {
     let h = session.http().and_then(|h| h.request.as_ref())
       .and_then(|s| s.get_host()).ok_or(ConnectionError::NoHostGiven)?;
 
@@ -879,9 +879,9 @@ impl Proxy {
     let rl = session.http().and_then(|h| h.request.as_ref())
       .and_then(|s| s.get_request_line()).ok_or(ConnectionError::NoRequestLineGiven)?;
 
-    let app_id = match self.listeners.get(&session.listen_token).as_ref()
+    let cluster_id = match self.listeners.get(&session.listen_token).as_ref()
       .and_then(|l| l.frontend_from_request(&host, &rl.uri)) {
-      Some(Route::AppId(app_id)) => app_id,
+      Some(Route::ClusterId(cluster_id)) => cluster_id,
       Some(Route::Deny) => {
         let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer401, None);
         session.set_answer(DefaultAnswerStatus::Answer401, answer);
@@ -894,20 +894,20 @@ impl Proxy {
       }
     };
 
-    let front_should_redirect_https = self.applications.get(&app_id).map(|ref app| app.https_redirect).unwrap_or(false);
+    let front_should_redirect_https = self.clusters.get(&cluster_id).map(|ref app| app.https_redirect).unwrap_or(false);
     if front_should_redirect_https {
       let answer = format!("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://{}{}\r\n\r\n", host, rl.uri);
       session.set_answer(DefaultAnswerStatus::Answer301, Rc::new(answer.into_bytes()));
       return Err(ConnectionError::HttpsRedirect);
     }
 
-    Ok(app_id)
+    Ok(cluster_id)
   }
 
   fn check_circuit_breaker(&mut self, session: &mut Session) -> Result<(), ConnectionError> {
     if session.connection_attempt == CONN_RETRIES {
       error!("{} max connection attempt reached", session.log_context());
-      let answer = self.get_service_unavailable_answer(session.app_id.as_ref().map(|app_id| app_id.as_str()), session.listen_token);
+      let answer = self.get_service_unavailable_answer(session.cluster_id.as_ref().map(|cluster_id| cluster_id.as_str()), session.listen_token);
       session.set_answer(DefaultAnswerStatus::Answer503, answer);
       Err(ConnectionError::NoBackendAvailable)
     } else {
@@ -915,8 +915,8 @@ impl Proxy {
     }
   }
 
-  fn get_service_unavailable_answer(&self, app_id: Option<&str>, listen_token: Token) -> Rc<Vec<u8>> {
-    self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer503, app_id)
+  fn get_service_unavailable_answer(&self, cluster_id: Option<&str>, listen_token: Token) -> Rc<Vec<u8>> {
+    self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer503, cluster_id)
   }
 }
 
@@ -1020,17 +1020,17 @@ impl Listener {
 
 impl ProxyConfiguration<Session> for Proxy {
   fn connect_to_backend(&mut self, poll: &mut Poll, session: &mut Session, back_token: Token) -> Result<BackendConnectAction,ConnectionError> {
-    let old_app_id = session.http().and_then(|ref http| http.app_id.clone());
+    let old_cluster_id = session.http().and_then(|ref http| http.cluster_id.clone());
     let old_back_token = session.back_token();
 
     self.check_circuit_breaker(session)?;
 
-    let app_id = self.app_id_from_request(session)?;
+    let cluster_id = self.cluster_id_from_request(session)?;
 
-    if (session.http().and_then(|h| h.app_id.as_ref()) == Some(&app_id)) && session.back_connected == BackendConnectionStatus::Connected {
+    if (session.http().and_then(|h| h.cluster_id.as_ref()) == Some(&cluster_id)) && session.back_connected == BackendConnectionStatus::Connected {
       let has_backend = session.backend.as_ref().map(|backend| {
           let ref backend = *backend.borrow();
-          self.backends.borrow().has_backend(&app_id, backend)
+          self.backends.borrow().has_backend(&cluster_id, backend)
         }).unwrap_or(false);
 
       let is_valid_backend_socket = has_backend &&
@@ -1050,8 +1050,8 @@ impl ProxyConfiguration<Session> for Proxy {
       }
     }
 
-    //replacing with a connection to another application
-    if old_app_id.is_some() && old_app_id.as_ref() != Some(&app_id) {
+    //replacing with a connection to another cluster
+    if old_cluster_id.is_some() && old_cluster_id.as_ref() != Some(&cluster_id) {
       if let Some(token) = session.back_token() {
         session.close_backend(token, poll);
 
@@ -1061,13 +1061,13 @@ impl ProxyConfiguration<Session> for Proxy {
       }
     }
 
-    session.app_id = Some(app_id.clone());
+    session.cluster_id = Some(cluster_id.clone());
 
-    let front_should_stick = self.applications.get(&app_id).map(|ref app| app.sticky_session).unwrap_or(false);
-    let socket = self.backend_from_request(session, &app_id, front_should_stick)?;
+    let front_should_stick = self.clusters.get(&cluster_id).map(|ref app| app.sticky_session).unwrap_or(false);
+    let socket = self.backend_from_request(session, &cluster_id, front_should_stick)?;
 
     session.http_mut().map(|http| {
-      http.app_id = Some(app_id.clone());
+      http.cluster_id = Some(cluster_id.clone());
     });
 
     if let Err(e) = socket.set_nodelay(true) {
@@ -1110,14 +1110,14 @@ impl ProxyConfiguration<Session> for Proxy {
     // ToDo temporary
     //trace!("{} notified", message);
     match message.order {
-      ProxyRequestData::AddApplication(application) => {
-        debug!("{} add application {:?}", message.id, application);
-        self.add_application(application);
+      ProxyRequestData::AddCluster(cluster) => {
+        debug!("{} add cluster {:?}", message.id, cluster);
+        self.add_cluster(cluster);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
-      ProxyRequestData::RemoveApplication(application) => {
-        debug!("{} remove application {:?}", message.id, application);
-        self.remove_application(&application);
+      ProxyRequestData::RemoveCluster{ cluster_id } => {
+        debug!("{} remove cluster {:?}", message.id, cluster_id);
+        self.remove_cluster(&cluster_id);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::AddHttpFrontend(front) => {
@@ -1347,9 +1347,9 @@ mod tests {
       start(config, channel, 10, 16384);
     });
 
-    let front = HttpFrontend { route: Route::AppId(String::from("app_1")), address: "127.0.0.1:1024".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
+    let front = HttpFrontend { route: Route::ClusterId(String::from("app_1")), address: "127.0.0.1:1024".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
     command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFrontend(front) });
-    let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1025".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
+    let backend = Backend { cluster_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1025".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1403,9 +1403,9 @@ mod tests {
       start(config, channel, 10, 16384);
     });
 
-    let front = HttpFrontend { route: Route::AppId(String::from("app_1")), address: "127.0.0.1:1031".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
+    let front = HttpFrontend { route: Route::ClusterId(String::from("app_1")), address: "127.0.0.1:1031".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
     command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFrontend(front) });
-    let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
+    let backend = Backend { cluster_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1480,11 +1480,11 @@ mod tests {
       start(config, channel, 10, 16384);
     });
 
-    let application = Application { app_id: String::from("app_1"), sticky_session: false, https_redirect: true, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::default(), answer_503: None };
-    command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddApplication(application) });
-    let front = HttpFrontend { route: Route::AppId(String::from("app_1")), address: "127.0.0.1:1041".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
+    let cluster = Cluster { cluster_id: String::from("app_1"), sticky_session: false, https_redirect: true, proxy_protocol: None, load_balancing_policy: LoadBalancingAlgorithms::default(), answer_503: None };
+    command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddCluster(cluster) });
+    let front = HttpFrontend { route: Route::ClusterId(String::from("app_1")), address: "127.0.0.1:1041".parse().unwrap(), hostname: String::from("localhost"), path: PathRule::Prefix(String::from("/")), position: RulePosition::Tree };
     command.write_message(&ProxyRequest { id: String::from("ID_EFGH"), order: ProxyRequestData::AddHttpFrontend(front) });
-    let backend = Backend { app_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1040".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
+    let backend = Backend { cluster_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1040".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None };
     command.write_message(&ProxyRequest { id: String::from("ID_IJKL"), order: ProxyRequestData::AddBackend(backend) });
 
     println!("test received: {:?}", command.read_message());
@@ -1551,28 +1551,28 @@ mod tests {
 
   #[test]
   fn frontend_from_request_test() {
-    let app_id1 = "app_1".to_owned();
-    let app_id2 = "app_2".to_owned();
-    let app_id3 = "app_3".to_owned();
+    let cluster_id1 = "app_1".to_owned();
+    let cluster_id2 = "app_2".to_owned();
+    let cluster_id3 = "app_3".to_owned();
     let uri1 = "/".to_owned();
     let uri2 = "/yolo".to_owned();
     let uri3 = "/yolo/swag".to_owned();
 
     let mut fronts = Router::new();
-    fronts.add_http_front(HttpFrontend { route: Route::AppId(app_id1), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
+    fronts.add_http_front(HttpFrontend { route: Route::ClusterId(cluster_id1), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
                               path: PathRule::Prefix(uri1), position: RulePosition::Tree });
-    fronts.add_http_front(HttpFrontend { route: Route::AppId(app_id2), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
+    fronts.add_http_front(HttpFrontend { route: Route::ClusterId(cluster_id2), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
                               path: PathRule::Prefix(uri2), position: RulePosition::Tree });
-    fronts.add_http_front(HttpFrontend { route: Route::AppId(app_id3), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
+    fronts.add_http_front(HttpFrontend { route: Route::ClusterId(cluster_id3), address: "0.0.0.0:80".parse().unwrap(), hostname: "lolcatho.st".to_owned(),
                               path: PathRule::Prefix(uri3), position: RulePosition::Tree });
-    fronts.add_http_front(HttpFrontend { route: Route::AppId("app_1".to_owned()), address: "0.0.0.0:80".parse().unwrap(), hostname: "other.domain".to_owned(), path: PathRule::Prefix("/test".to_owned()), position: RulePosition::Tree });
+    fronts.add_http_front(HttpFrontend { route: Route::ClusterId("app_1".to_owned()), address: "0.0.0.0:80".parse().unwrap(), hostname: "other.domain".to_owned(), path: PathRule::Prefix("/test".to_owned()), position: RulePosition::Tree });
 
     let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
     let listener = Listener {
       listener: None,
       address:  front,
       fronts,
-      answers: Rc::new(RefCell::new(HttpAnswers::new("HTTP/1.1 404 Not Found\r\n\r\n", "HTTP/1.1 503 your application is in deployment\r\n\r\n"))),
+      answers: Rc::new(RefCell::new(HttpAnswers::new("HTTP/1.1 404 Not Found\r\n\r\n", "HTTP/1.1 503 your cluster is in deployment\r\n\r\n"))),
       config: Default::default(),
       token: Token(0),
       active: true,
@@ -1583,10 +1583,10 @@ mod tests {
     let frontend3 = listener.frontend_from_request("lolcatho.st", "/yolo/test");
     let frontend4 = listener.frontend_from_request("lolcatho.st", "/yolo/swag");
     let frontend5 = listener.frontend_from_request("domain", "/");
-    assert_eq!(frontend1.expect("should find frontend"), Route::AppId("app_1".to_string()));
-    assert_eq!(frontend2.expect("should find frontend"), Route::AppId("app_1".to_string()));
-    assert_eq!(frontend3.expect("should find frontend"), Route::AppId("app_2".to_string()));
-    assert_eq!(frontend4.expect("should find frontend"), Route::AppId("app_3".to_string()));
+    assert_eq!(frontend1.expect("should find frontend"), Route::ClusterId("app_1".to_string()));
+    assert_eq!(frontend2.expect("should find frontend"), Route::ClusterId("app_1".to_string()));
+    assert_eq!(frontend3.expect("should find frontend"), Route::ClusterId("app_2".to_string()));
+    assert_eq!(frontend4.expect("should find frontend"), Route::ClusterId("app_3".to_string()));
     assert_eq!(frontend5, None);
   }
 }

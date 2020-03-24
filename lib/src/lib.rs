@@ -47,12 +47,12 @@
 //!
 //! ```ignore
 //! let http_front = proxy::HttpFront {
-//!   app_id:     String::from("test"),
+//!   cluster_id:     String::from("test"),
 //!   hostname:   String::from("example.com"),
 //!   path_begin: String::from("/")
 //! };
 //! let http_backend = proxy::Backend {
-//!   app_id:     String::from("test"),
+//!   cluster_id:     String::from("test"),
 //!   ip_address: String::from("192.0.2.1"),
 //!   port:       8080
 //! };
@@ -71,10 +71,10 @@
 //! println!("HTTP -> {:?}", command.read_message());
 //! ```
 //!
-//! An application is identified by its `app_id`, a string that will be shared
+//! An application is identified by its `cluster_id`, a string that will be shared
 //! between one or multiple "fronts", and one or multiple "backends".
 //!
-//! A "front" is a way to recognize a request and match it to an `app_id`,
+//! A "front" is a way to recognize a request and match it to an `cluster_id`,
 //! depending on the hostname and the beginning of the URL path.
 //!
 //! A backend corresponds to one backend server, indicated by its IP and port.
@@ -121,12 +121,12 @@
 //!   });
 //!
 //!   let http_front = proxy::HttpFront {
-//!     app_id:     String::from("test"),
+//!     cluster_id:     String::from("test"),
 //!     hostname:   String::from("example.com"),
 //!     path_begin: String::from("/")
 //!   };
 //!   let http_backend = proxy::Backend {
-//!     app_id:     String::from("test"),
+//!     cluster_id:     String::from("test"),
 //!     ip_address: String::from("192.0.2.1"),
 //!     port:       8080
 //!   };
@@ -225,7 +225,7 @@ use sozu_command::proxy::{ProxyRequest,ProxyResponse,LoadBalancingParams};
 
 use self::retry::RetryPolicy;
 
-pub type AppId = String;
+pub type ClusterId = String;
 
 #[derive(Debug,Clone,Copy,PartialEq)]
 pub enum Protocol {

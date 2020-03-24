@@ -37,11 +37,11 @@ fn main() {
   });
 
   let tcp_front = proxy::TcpFrontend {
-    app_id:  String::from("test"),
+    cluster_id:  String::from("test"),
     address: "127.0.0.1:8080".parse().unwrap(),
   };
   let tcp_backend = proxy::Backend {
-    app_id:     String::from("test"),
+    cluster_id:     String::from("test"),
     backend_id: String::from("test-0"),
     address:    "127.0.0.1:1026".parse().unwrap(),
     load_balancing_parameters: Some(LoadBalancingParams::default()),

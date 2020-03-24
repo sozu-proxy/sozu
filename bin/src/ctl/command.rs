@@ -2,7 +2,7 @@ use sozu_command::config::{Config, ProxyProtocolConfig, LoadBalancingAlgorithms,
 use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
-use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFrontend,
+use sozu_command::proxy::{Cluster, ProxyRequestData, Backend, HttpFrontend,
   TcpFrontend, CertificateAndKey, CertificateFingerprint, Query, QueryAnswer,
   QueryApplicationType, QueryApplicationDomain, FilteredData, AddCertificate,
   RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend,
@@ -741,15 +741,15 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
 
                 println!("\napplication metrics:\n");
 
-                let mut app_ids = HashSet::new();
+                let mut cluster_ids = HashSet::new();
                 for metrics in data.workers.values() {
-                  for key in metrics.applications.keys() {
-                    app_ids.insert(key);
+                  for key in metrics.clusters.keys() {
+                    cluster_ids.insert(key);
                   }
                 }
 
-                for app_id in app_ids.iter() {
-                  let id: &str = app_id;
+                for cluster_id in cluster_ids.iter() {
+                  let id: &str = cluster_id;
 
                   let mut application_table = Table::new();
 
@@ -772,7 +772,7 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                   let mut backend_ids = HashSet::new();
 
                   for worker in data.workers.values() {
-                    if let Some(app) = worker.applications.get(id) {
+                    if let Some(app) = worker.clusters.get(id) {
                       for k in app.data.keys() {
                         app_metrics.insert(k);
                       }
@@ -789,7 +789,7 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                     row.push(cell!(metric.to_string()));
 
                     for worker in data.workers.values() {
-                      match worker.applications.get(id).and_then(|app| app.data.get(metric)) {
+                      match worker.clusters.get(id).and_then(|app| app.data.get(metric)) {
                         None => {
                           row.push(cell!(""));
                           row.push(cell!(""));
@@ -873,7 +873,7 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
 
                     let mut backend_metrics = HashSet::new();
                     for worker in data.workers.values() {
-                      if let Some(app) = worker.applications.get(id) {
+                      if let Some(app) = worker.clusters.get(id) {
                         for b in app.backends.values() {
                           for k in b.keys() {
                             backend_metrics.insert(k);
@@ -888,7 +888,7 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                       row.push(cell!(metric.to_string()));
 
                       for worker in data.workers.values() {
-                        match worker.applications.get(id).and_then(|app| app.backends.get(backend))
+                        match worker.clusters.get(id).and_then(|app| app.backends.get(backend))
                           .and_then(|back| back.get(metric)) {
                           None => {
                             row.push(cell!(""));
@@ -965,7 +965,7 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
   }
 }
 
-pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool, load_balancing_policy: LoadBalancingAlgorithms) {
+pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, cluster_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool, load_balancing_policy: LoadBalancingAlgorithms) {
   let proxy_protocol = match (send_proxy, expect_proxy) {
     (true, true) => Some(ProxyProtocolConfig::RelayHeader),
     (true, false) => Some(ProxyProtocolConfig::SendHeader),
@@ -973,8 +973,8 @@ pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout
     _ => None,
   };
 
-  order_command(channel, timeout, ProxyRequestData::AddApplication(Application {
-    app_id: String::from(app_id),
+  order_command(channel, timeout, ProxyRequestData::AddCluster(Cluster {
+    cluster_id: String::from(cluster_id),
     sticky_session,
     https_redirect,
     proxy_protocol,
@@ -983,8 +983,8 @@ pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout
   }));
 }
 
-pub fn remove_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str) {
-  order_command(channel, timeout, ProxyRequestData::RemoveApplication(String::from(app_id)));
+pub fn remove_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, cluster_id: &str) {
+  order_command(channel, timeout, ProxyRequestData::RemoveCluster{ cluster_id: String::from(cluster_id) });
 }
 
 pub fn add_http_frontend(channel: Channel<CommandRequest,CommandResponse>,
@@ -1032,10 +1032,10 @@ pub fn remove_http_frontend(channel: Channel<CommandRequest,CommandResponse>,
 }
 
 
-pub fn add_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
+pub fn add_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, cluster_id: &str,
   backend_id: &str, address: SocketAddr, sticky_id: Option<String>, backup: Option<bool>) {
   order_command(channel, timeout, ProxyRequestData::AddBackend(Backend {
-      app_id: String::from(app_id),
+      cluster_id: String::from(cluster_id),
       address: address,
       backend_id: String::from(backend_id),
       load_balancing_parameters: Some(LoadBalancingParams::default()),
@@ -1044,10 +1044,10 @@ pub fn add_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u6
     }));
 }
 
-pub fn remove_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
+pub fn remove_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, cluster_id: &str,
   backend_id: &str, address: SocketAddr) {
   order_command(channel, timeout, ProxyRequestData::RemoveBackend(RemoveBackend {
-    app_id: String::from(app_id),
+    cluster_id: String::from(cluster_id),
     address: address,
     backend_id: String::from(backend_id),
   }));
@@ -1091,18 +1091,18 @@ pub fn replace_certificate(channel: Channel<CommandRequest,CommandResponse>, tim
   }
 }
 
-pub fn add_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
+pub fn add_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, cluster_id: &str,
   address: SocketAddr) {
   order_command(channel, timeout, ProxyRequestData::AddTcpFrontend(TcpFrontend {
-    app_id: String::from(app_id),
+    cluster_id: String::from(cluster_id),
     address,
   }));
 }
 
-pub fn remove_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
+pub fn remove_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, cluster_id: &str,
   address: SocketAddr) {
   order_command(channel, timeout, ProxyRequestData::RemoveTcpFrontend(TcpFrontend {
-    app_id: String::from(app_id),
+    cluster_id: String::from(cluster_id),
     address,
   }));
 }
@@ -1183,8 +1183,8 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
     exit(1);
   }
 
-  let command = if let Some(ref app_id) = application_id {
-    CommandRequestData::Proxy(ProxyRequestData::Query(Query::Applications(QueryApplicationType::AppId(app_id.to_string()))))
+  let command = if let Some(ref cluster_id) = application_id {
+    CommandRequestData::Proxy(ProxyRequestData::Query(Query::Applications(QueryApplicationType::ClusterId(cluster_id.to_string()))))
   } else if let Some(ref domain) = domain {
     let splitted: Vec<String> = domain.splitn(2, "/").map(|elem| elem.to_string()).collect();
 
@@ -1295,11 +1295,11 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
                 }
               }
 
-              println!("Application level configuration for {}:\n", needle);
+              println!("Cluster level configuration for {}:\n", needle);
 
               for (ref key, ref values) in application_data.iter() {
                 let mut row = Vec::new();
-                row.push(cell!(key.configuration.clone().map(|conf| conf.app_id).unwrap_or(String::from(""))));
+                row.push(cell!(key.configuration.clone().map(|conf| conf.cluster_id).unwrap_or(String::from(""))));
                 row.push(cell!(key.configuration.clone().map(|conf| conf.sticky_session).unwrap_or(false)));
                 row.push(cell!(key.configuration.clone().map(|conf| conf.https_redirect).unwrap_or(false)));
 
@@ -1321,7 +1321,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
               for (ref key, ref values) in frontend_data.iter() {
                 let mut row = Vec::new();
                 match &key.route {
-                  Route::AppId(app_id) => row.push(cell!(app_id)),
+                  Route::ClusterId(cluster_id) => row.push(cell!(cluster_id)),
                   Route::Deny => row.push(cell!("-")),
                 }
                 row.push(cell!(key.hostname));
@@ -1345,7 +1345,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
               for (ref key, ref values) in https_frontend_data.iter() {
                 let mut row = Vec::new();
                 match &key.route {
-                  Route::AppId(app_id) => row.push(cell!(app_id)),
+                  Route::ClusterId(cluster_id) => row.push(cell!(cluster_id)),
                   Route::Deny => row.push(cell!("-")),
                 }
                 row.push(cell!(key.hostname));
@@ -1368,7 +1368,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
 
               for (ref key, ref values) in tcp_frontend_data.iter() {
                 let mut row = Vec::new();
-                row.push(cell!(key.app_id));
+                row.push(cell!(key.cluster_id));
                 row.push(cell!(format!("{}", key.address)));
 
                 for val in values.iter() {
@@ -1651,8 +1651,8 @@ fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: 
             //deactivate success messages for now
             /*
             match order {
-              ProxyRequestData::AddApplication(_) => println!("application added : {}", message.message),
-              ProxyRequestData::RemoveApplication(_) => println!("application removed : {} ", message.message),
+              ProxyRequestData::AddCluster(_) => println!("application added : {}", message.message),
+              ProxyRequestData::RemoveCluster(_) => println!("application removed : {} ", message.message),
               ProxyRequestData::AddBackend(_) => println!("backend added : {}", message.message),
               ProxyRequestData::RemoveBackend(_) => println!("backend removed : {} ", message.message),
               ProxyRequestData::AddCertificate(_) => println!("certificate added: {}", message.message),

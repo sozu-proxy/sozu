@@ -50,8 +50,8 @@ pub struct AggregatedMetricsData {
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
 pub struct MetricsData {
-  pub proxy:        BTreeMap<String, FilteredData>,
-  pub applications: BTreeMap<String, AppMetricsData>,
+  pub proxy:    BTreeMap<String, FilteredData>,
+  pub clusters: BTreeMap<String, AppMetricsData>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
@@ -127,8 +127,8 @@ impl fmt::Display for ProxyRequest {
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProxyRequestData {
-    AddApplication(Application),
-    RemoveApplication(String),
+    AddCluster(Cluster),
+    RemoveCluster { cluster_id: String },
 
     AddHttpFrontend(HttpFrontend),
     RemoveHttpFrontend(HttpFrontend),
@@ -218,8 +218,8 @@ impl<'de> serde::Deserialize<'de> for CertificateFingerprint {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
-pub struct Application {
-    pub app_id:            String,
+pub struct Cluster {
+    pub cluster_id:        String,
     pub sticky_session:    bool,
     pub https_redirect:    bool,
     #[serde(default)]
@@ -268,7 +268,7 @@ impl std::fmt::Display for PathRule {
 pub enum Route {
   // send a 401 default answer
   Deny,
-  AppId(String),
+  ClusterId(String),
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
@@ -337,13 +337,13 @@ pub struct ReplaceCertificate {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct TcpFrontend {
-    pub app_id:  String,
+    pub cluster_id:  String,
     pub address: SocketAddr,
 }
 
 impl Ord for TcpFrontend {
   fn cmp(&self, o: &TcpFrontend) -> Ordering {
-    self.app_id.cmp(&o.app_id)
+    self.cluster_id.cmp(&o.cluster_id)
       .then(socketaddr_cmp(&self.address, &o.address))
   }
 }
@@ -357,7 +357,7 @@ impl PartialOrd for TcpFrontend {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct Backend {
-    pub app_id:     String,
+    pub cluster_id:     String,
     pub backend_id: String,
     pub address:    SocketAddr,
     #[serde(default)]
@@ -371,7 +371,7 @@ pub struct Backend {
 
 impl Ord for Backend {
   fn cmp(&self, o: &Backend) -> Ordering {
-    self.app_id.cmp(&o.app_id)
+    self.cluster_id.cmp(&o.cluster_id)
       .then(self.backend_id.cmp(&o.backend_id))
       .then(self.sticky_id.cmp(&o.sticky_id))
       .then(self.load_balancing_parameters.cmp(&o.load_balancing_parameters))
@@ -388,7 +388,7 @@ impl PartialOrd for Backend {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct RemoveBackend {
-    pub app_id:     String,
+    pub cluster_id:     String,
     pub backend_id: String,
     pub address:    SocketAddr,
 }
@@ -589,7 +589,7 @@ pub enum Query {
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryApplicationType {
-  AppId(String),
+  ClusterId(String),
   Domain(QueryApplicationDomain)
 }
 
@@ -618,7 +618,7 @@ pub enum QueryAnswer {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueryAnswerApplication {
-  pub configuration:   Option<Application>,
+  pub configuration:   Option<Cluster>,
   pub http_frontends:  Vec<HttpFrontend>,
   pub https_frontends: Vec<HttpFrontend>,
   pub tcp_frontends:   Vec<TcpFrontend>,
@@ -650,8 +650,8 @@ pub enum QueryAnswerCertificate {
 impl ProxyRequestData {
   pub fn get_topics(&self) -> HashSet<Topic> {
     match *self {
-      ProxyRequestData::AddApplication(_)      => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      ProxyRequestData::RemoveApplication(_)   => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::AddCluster(_)          => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::RemoveCluster{ref cluster_id} => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::AddHttpFrontend(_)     => [Topic::HttpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::RemoveHttpFrontend(_)  => [Topic::HttpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::AddHttpsFrontend(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
@@ -694,11 +694,11 @@ mod tests {
 
   #[test]
   fn add_front_test() {
-    let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"route": { "APP_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
+    let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"route": { "CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242", "sticky_session": false}}"#;
     let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == ProxyRequestData::AddHttpFrontend(HttpFrontend{
-      route: Route::AppId(String::from("xxx")),
+      route: Route::ClusterId(String::from("xxx")),
       hostname: String::from("yyy"),
       path: PathRule::Prefix(String::from("xxx")),
       address: "127.0.0.1:4242".parse().unwrap(),
@@ -708,11 +708,11 @@ mod tests {
 
   #[test]
   fn remove_front_test() {
-    let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "data": {"route": {"APP_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242"}}"#;
+    let raw_json = r#"{"type": "REMOVE_HTTP_FRONTEND", "data": {"route": {"CLUSTER_ID": "xxx"}, "hostname": "yyy", "path": {"PREFIX": "xxx"}, "address": "127.0.0.1:4242"}}"#;
     let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == ProxyRequestData::RemoveHttpFrontend(HttpFrontend{
-      route: Route::AppId(String::from("xxx")),
+      route: Route::ClusterId(String::from("xxx")),
       hostname: String::from("yyy"),
       path: PathRule::Prefix(String::from("xxx")),
       address: "127.0.0.1:4242".parse().unwrap(),
@@ -723,11 +723,11 @@ mod tests {
 
   #[test]
   fn add_backend_test() {
-    let raw_json = r#"{"type": "ADD_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080", "load_balancing_parameters": { "weight": 0 }}}"#;
+    let raw_json = r#"{"type": "ADD_BACKEND", "data": {"cluster_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080", "load_balancing_parameters": { "weight": 0 }}}"#;
     let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == ProxyRequestData::AddBackend(Backend{
-      app_id: String::from("xxx"),
+      cluster_id: String::from("xxx"),
       backend_id: String::from("xxx-0"),
       address: "0.0.0.0:8080".parse().unwrap(),
       sticky_id: None,
@@ -738,11 +738,11 @@ mod tests {
 
   #[test]
   fn remove_backend_test() {
-    let raw_json = r#"{"type": "REMOVE_BACKEND", "data": {"app_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080"}}"#;
+    let raw_json = r#"{"type": "REMOVE_BACKEND", "data": {"cluster_id": "xxx", "backend_id": "xxx-0", "address": "0.0.0.0:8080"}}"#;
     let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == ProxyRequestData::RemoveBackend(RemoveBackend {
-      app_id: String::from("xxx"),
+      cluster_id: String::from("xxx"),
       backend_id: String::from("xxx-0"),
       address: "0.0.0.0:8080".parse().unwrap(),
     }));
@@ -750,11 +750,11 @@ mod tests {
 
   #[test]
   fn http_front_crash_test() {
-    let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"route": {"APP_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242"}}"#;
+    let raw_json = r#"{"type": "ADD_HTTP_FRONTEND", "data": {"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242"}}"#;
     let command: ProxyRequestData = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}", command);
     assert!(command == ProxyRequestData::AddHttpFrontend(HttpFrontend{
-      route: Route::AppId(String::from("aa")),
+      route: Route::ClusterId(String::from("aa")),
       hostname: String::from("cltdl.fr"),
       path: PathRule::Prefix(String::from("")),
       address: "127.0.0.1:4242".parse().unwrap(),
@@ -764,11 +764,11 @@ mod tests {
 
   #[test]
   fn http_front_crash_test2() {
-    let raw_json = r#"{"route": {"APP_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242" }"#;
+    let raw_json = r#"{"route": {"CLUSTER_ID": "aa"}, "hostname": "cltdl.fr", "path": {"PREFIX": ""}, "address": "127.0.0.1:4242" }"#;
     let front: HttpFrontend = serde_json::from_str(raw_json).expect("could not parse json");
     println!("{:?}",front);
     assert!(front == HttpFrontend{
-      route: Route::AppId(String::from("aa")),
+      route: Route::ClusterId(String::from("aa")),
       hostname: String::from("cltdl.fr"),
       path: PathRule::Prefix(String::from("")),
       address: "127.0.0.1:4242".parse().unwrap(),

@@ -538,12 +538,12 @@ impl Server {
         },
         &Query::Applications(ref query_type) => {
           let answer = match query_type {
-            &QueryApplicationType::AppId(ref app_id) => {
-              QueryAnswer::Applications(vec!(self.config_state.application_state(app_id)))
+            &QueryApplicationType::ClusterId(ref cluster_id) => {
+              QueryAnswer::Applications(vec!(self.config_state.application_state(cluster_id)))
             },
             &QueryApplicationType::Domain(ref domain) => {
-              let app_ids = get_application_ids_by_domain(&self.config_state, domain.hostname.clone(), domain.path.clone());
-              let answer = app_ids.iter().map(|ref app_id| self.config_state.application_state(app_id)).collect();
+              let cluster_ids = get_application_ids_by_domain(&self.config_state, domain.hostname.clone(), domain.path.clone());
+              let answer = cluster_ids.iter().map(|ref cluster_id| self.config_state.application_state(cluster_id)).collect();
 
               QueryAnswer::Applications(answer)
             }
@@ -584,22 +584,22 @@ impl Server {
     self.config_state.handle_order(&message.order);
 
     match message {
-      ProxyRequest { order: ProxyRequestData::AddApplication(ref application), .. } => {
-        self.backends.borrow_mut().set_load_balancing_policy_for_app(&application.app_id,
-          application.load_balancing_policy);
+      ProxyRequest { order: ProxyRequestData::AddCluster(ref cluster), .. } => {
+        self.backends.borrow_mut().set_load_balancing_policy_for_app(&cluster.cluster_id,
+          cluster.load_balancing_policy);
         //not returning because the message must still be handled by each proxy
       },
       ProxyRequest { ref id, order: ProxyRequestData::AddBackend(ref backend) } => {
         let new_backend = Backend::new(&backend.backend_id, backend.address,
           backend.sticky_id.clone(), backend.load_balancing_parameters.clone(), backend.backup);
-        self.backends.borrow_mut().add_backend(&backend.app_id, new_backend);
+        self.backends.borrow_mut().add_backend(&backend.cluster_id, new_backend);
 
         let answer = ProxyResponse { id: id.to_string(), status: ProxyResponseStatus::Ok, data: None };
         push_queue(answer);
         return;
       },
       ProxyRequest { ref id, order: ProxyRequestData::RemoveBackend(ref backend) } => {
-        self.backends.borrow_mut().remove_backend(&backend.app_id, &backend.address);
+        self.backends.borrow_mut().remove_backend(&backend.cluster_id, &backend.address);
 
         let answer = ProxyResponse { id: id.to_string(), status: ProxyResponseStatus::Ok, data: None };
         push_queue(answer);

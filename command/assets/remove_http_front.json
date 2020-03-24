@@ -6,7 +6,7 @@
     "type": "REMOVE_HTTP_FRONTEND",
     "data": {
       "route": {
-        "APP_ID": "xxx"
+        "CLUSTER_ID": "xxx"
       },
       "address": "0.0.0.0:8080",
       "hostname": "yyy",

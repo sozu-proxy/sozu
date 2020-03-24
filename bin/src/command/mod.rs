@@ -659,7 +659,7 @@ pub fn start(config: Config, command_socket_path: String, workers: Vec<Worker>) 
         server.load_state(None, "INITIALIZATION", state_path);
       });
 
-      gauge!("configuration.applications", server.state.applications.len());
+      gauge!("configuration.clusters", server.state.clusters.len());
       gauge!("configuration.backends", server.backends_count);
       gauge!("configuration.frontends", server.frontends_count);
 

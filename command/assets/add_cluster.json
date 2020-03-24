@@ -3,9 +3,9 @@
   "version": 0,
   "type": "PROXY",
   "data": {
-    "type": "ADD_APPLICATION",
+    "type": "ADD_CLUSTER",
     "data": {
-      "app_id": "xxx",
+      "cluster_id": "xxx",
       "sticky_session": true,
       "https_redirect": true,
       "proxy_protocol": "EXPECT_HEADER",

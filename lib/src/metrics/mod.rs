@@ -110,7 +110,7 @@ pub fn setup<O: Into<String>>(metrics_host: &SocketAddr, origin: O, use_tagged_m
 }
 
 pub trait Subscriber {
-  fn receive_metric(&mut self, label: &'static str, app_id: Option<&str>, backend_id: Option<&str>, metric: MetricData);
+  fn receive_metric(&mut self, label: &'static str, cluster_id: Option<&str>, backend_id: Option<&str>, metric: MetricData);
 }
 
 pub struct Aggregator {
@@ -186,18 +186,18 @@ impl Aggregator {
 }
 
 impl Subscriber for Aggregator {
-  fn receive_metric(&mut self, label: &'static str, app_id: Option<&str>, backend_id: Option<&str>, metric: MetricData) {
+  fn receive_metric(&mut self, label: &'static str, cluster_id: Option<&str>, backend_id: Option<&str>, metric: MetricData) {
     if let Some(ref mut net) = self.network.as_mut() {
-      net.receive_metric(label, app_id, backend_id, metric.clone());
+      net.receive_metric(label, cluster_id, backend_id, metric.clone());
     }
-    self.local.receive_metric(label, app_id, backend_id, metric.clone());
+    self.local.receive_metric(label, cluster_id, backend_id, metric.clone());
   }
 }
 
 #[derive(Debug,Clone,PartialEq)]
 pub struct MetricLine {
   label:      &'static str,
-  app_id:     Option<String>,
+  cluster_id:     Option<String>,
   backend_id: Option<String>,
   /// in milliseconds
   duration:   usize,
@@ -236,11 +236,11 @@ macro_rules! count (
 #[macro_export]
 macro_rules! incr (
   ($key:expr) => (count!($key, 1););
-  ($key:expr, $app_id:expr, $backend_id:expr) => {
+  ($key:expr, $cluster_id:expr, $backend_id:expr) => {
     use $crate::metrics::Subscriber;
 
     $crate::metrics::METRICS.with(|metrics| {
-      (*metrics.borrow_mut()).receive_metric($key, $app_id, $backend_id, $crate::metrics::MetricData::Count(1));
+      (*metrics.borrow_mut()).receive_metric($key, $cluster_id, $backend_id, $crate::metrics::MetricData::Count(1));
     });
   }
 );
@@ -268,12 +268,12 @@ macro_rules! gauge_add (
       (*metrics.borrow_mut()).gauge_add($key, v);
     });
   });
-  ($key:expr, $value:expr, $app_id:expr, $backend_id:expr) => {
+  ($key:expr, $value:expr, $cluster_id:expr, $backend_id:expr) => {
     use $crate::metrics::Subscriber;
     let v = $value;
 
     $crate::metrics::METRICS.with(|metrics| {
-      (*metrics.borrow_mut()).receive_metric($key, $app_id, $backend_id, $crate::metrics::MetricData::GaugeAdd(v));
+      (*metrics.borrow_mut()).receive_metric($key, $cluster_id, $backend_id, $crate::metrics::MetricData::GaugeAdd(v));
     });
   }
 );
@@ -289,32 +289,32 @@ macro_rules! time (
       m.receive_metric($key, None, None, MetricData::Time(v as usize));
     });
   };
-  ($key:expr, $app_id:expr, $value: expr) => ({
+  ($key:expr, $cluster_id:expr, $value: expr) => ({
     use $crate::metrics::{MetricData,Subscriber};
     let v = $value;
     $crate::metrics::METRICS.with(|metrics| {
       let ref mut m = *metrics.borrow_mut();
-      let app: &str = $app_id;
+      let cluster: &str = $cluster_id;
 
-      m.receive_metric($key, Some(app), None, MetricData::Time(v as usize));
+      m.receive_metric($key, Some(cluster), None, MetricData::Time(v as usize));
     });
   })
 );
 
 #[macro_export]
 macro_rules! record_backend_metrics (
-  ($app_id:expr, $backend_id:expr, $response_time: expr, $backend_connection_time: expr, $bin: expr, $bout: expr) => {
+  ($cluster_id:expr, $backend_id:expr, $response_time: expr, $backend_connection_time: expr, $bin: expr, $bout: expr) => {
     use $crate::metrics::{MetricData,Subscriber};
     $crate::metrics::METRICS.with(|metrics| {
       let ref mut m = *metrics.borrow_mut();
-      let app_id: &str = $app_id.as_str();
+      let cluster_id: &str = $cluster_id.as_str();
       let backend_id: &str = $backend_id;
 
-      m.receive_metric("bytes_in", Some(app_id), Some(backend_id), MetricData::Count($bin as i64));
-      m.receive_metric("bytes_out", Some(app_id), Some(backend_id), MetricData::Count($bout as i64));
-      m.receive_metric("response_time", Some(app_id), Some(backend_id), MetricData::Time($response_time as usize));
+      m.receive_metric("bytes_in", Some(cluster_id), Some(backend_id), MetricData::Count($bin as i64));
+      m.receive_metric("bytes_out", Some(cluster_id), Some(backend_id), MetricData::Count($bout as i64));
+      m.receive_metric("response_time", Some(cluster_id), Some(backend_id), MetricData::Time($response_time as usize));
       if let Some(t) = $backend_connection_time {
-        m.receive_metric("connection_time", Some(app_id), Some(backend_id), MetricData::Time(t.num_milliseconds() as usize));
+        m.receive_metric("connection_time", Some(cluster_id), Some(backend_id), MetricData::Time(t.num_milliseconds() as usize));
       }
     });
   }
