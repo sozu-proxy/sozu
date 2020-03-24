@@ -2,8 +2,8 @@ use sozu_command::config::{Config, ProxyProtocolConfig, Listener, FileListenerPr
 use sozu_command::channel::Channel;
 use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
 use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
-use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFront,
-  TcpFront, CertificateAndKey, CertFingerprint, Query, QueryAnswer,
+use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFrontend,
+  TcpFrontend, CertificateAndKey, CertFingerprint, Query, QueryAnswer,
   QueryApplicationType, QueryApplicationDomain, FilteredData, AddCertificate,
   RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend,
   TcpListener, ListenerType, TlsVersion, QueryCertificateType,
@@ -1012,7 +1012,7 @@ pub fn add_http_frontend(channel: Channel<CommandRequest,CommandResponse>,
   https: bool)
   -> Result<(), anyhow::Error> {
   if https {
-    order_command(channel, timeout, ProxyRequestData::AddHttpsFront(HttpFront {
+    order_command(channel, timeout, ProxyRequestData::AddHttpsFrontend(HttpFrontend {
       route,
       address,
       hostname: String::from(hostname),
@@ -1020,7 +1020,7 @@ pub fn add_http_frontend(channel: Channel<CommandRequest,CommandResponse>,
       position: RulePosition::Tree,
     }))
   } else {
-    order_command(channel, timeout, ProxyRequestData::AddHttpFront(HttpFront {
+    order_command(channel, timeout, ProxyRequestData::AddHttpFrontend(HttpFrontend {
       route,
       address,
       hostname: String::from(hostname),
@@ -1035,7 +1035,7 @@ pub fn remove_http_frontend(channel: Channel<CommandRequest,CommandResponse>,
   https: bool)
   -> Result<(), anyhow::Error> {
   if https {
-    order_command(channel, timeout, ProxyRequestData::RemoveHttpsFront(HttpFront {
+    order_command(channel, timeout, ProxyRequestData::RemoveHttpsFrontend(HttpFrontend {
       route,
       address,
       hostname: String::from(hostname),
@@ -1043,7 +1043,7 @@ pub fn remove_http_frontend(channel: Channel<CommandRequest,CommandResponse>,
       position: RulePosition::Tree,
     }))
   } else {
-    order_command(channel, timeout, ProxyRequestData::RemoveHttpFront(HttpFront {
+    order_command(channel, timeout, ProxyRequestData::RemoveHttpFrontend(HttpFrontend {
       route,
       address,
       hostname: String::from(hostname),
@@ -1160,7 +1160,7 @@ pub fn replace_certificate(channel: Channel<CommandRequest,CommandResponse>, tim
 
 pub fn add_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
   address: SocketAddr) -> Result<(), anyhow::Error> {
-  order_command(channel, timeout, ProxyRequestData::AddTcpFront(TcpFront {
+  order_command(channel, timeout, ProxyRequestData::AddTcpFrontend(TcpFrontend {
     app_id: String::from(app_id),
     address,
   }))
@@ -1168,7 +1168,7 @@ pub fn add_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, timeou
 
 pub fn remove_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
   address: SocketAddr) -> Result<(), anyhow::Error> {
-  order_command(channel, timeout, ProxyRequestData::RemoveTcpFront(TcpFront {
+  order_command(channel, timeout, ProxyRequestData::RemoveTcpFrontend(TcpFrontend {
     app_id: String::from(app_id),
     address,
   }))
@@ -1722,8 +1722,8 @@ fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: 
               ProxyRequestData::RemoveBackend(_) => println!("backend removed : {} ", message.message),
               ProxyRequestData::AddCertificate(_) => println!("certificate added: {}", message.message),
               ProxyRequestData::RemoveCertificate(_) => println!("certificate removed: {}", message.message),
-              ProxyRequestData::AddHttpFront(_) => println!("front added: {}", message.message),
-              ProxyRequestData::RemoveHttpFront(_) => println!("front removed: {}", message.message),
+              ProxyRequestData::AddHttpFrontend(_) => println!("front added: {}", message.message),
+              ProxyRequestData::RemoveHttpFrontend(_) => println!("front removed: {}", message.message),
               _ => {
                 // do nothing for now
               }

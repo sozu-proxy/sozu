@@ -1,6 +1,6 @@
 use regex::bytes::Regex;
 use std::str::from_utf8;
-use sozu_command::proxy::{HttpFront,RulePosition, Route};
+use sozu_command::proxy::{HttpFrontend,RulePosition, Route};
 
 pub mod trie;
 pub mod pattern_trie;
@@ -58,7 +58,7 @@ impl Router {
     None
   }
 
-  pub fn add_http_front(&mut self, front: HttpFront) -> bool {
+  pub fn add_http_front(&mut self, front: HttpFrontend) -> bool {
     match front.position {
       RulePosition::Pre => match (front.hostname.parse::<DomainRule>(), PathRule::from_config(front.path)) {
         (Ok(domain), Some(path)) => self.add_pre_rule(domain, path, front.route),
@@ -77,7 +77,7 @@ impl Router {
     }
   }
 
-  pub fn remove_http_front(&mut self, front: HttpFront) -> bool {
+  pub fn remove_http_front(&mut self, front: HttpFrontend) -> bool {
     match front.position {
       RulePosition::Pre => match (front.hostname.parse::<DomainRule>(), PathRule::from_config(front.path)) {
         (Ok(domain), Some(path)) => self.remove_pre_rule(domain, path),
