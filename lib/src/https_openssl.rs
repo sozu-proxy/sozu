@@ -24,7 +24,7 @@ use openssl::error::ErrorStack;
 use openssl::ssl::SslVersion;
 
 use sozu_command::scm_socket::ScmSocket;
-use sozu_command::proxy::{Application,CertFingerprint,CertificateAndKey,
+use sozu_command::proxy::{Application,CertificateFingerprint,CertificateAndKey,
   ProxyRequestData,HttpFrontend,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,TlsVersion,ProxyEvent,Query,QueryCertificateType,
   QueryAnswer,QueryAnswerCertificate,ProxyResponseData,RemoveListener,
@@ -977,8 +977,8 @@ pub struct Listener {
   listener:        Option<TcpListener>,
   address:         SocketAddr,
   fronts:          Router,
-  domains:         Arc<Mutex<TrieNode<CertFingerprint>>>,
-  contexts:        Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
+  domains:         Arc<Mutex<TrieNode<CertificateFingerprint>>>,
+  contexts:        Arc<Mutex<HashMap<CertificateFingerprint,TlsData>>>,
   default_context: SslContext,
   answers:         Rc<RefCell<HttpAnswers>>,
   config:          HttpsListener,
@@ -990,7 +990,7 @@ pub struct Listener {
 impl Listener {
   pub fn new(config: HttpsListener, token: Token) -> Listener {
 
-    let contexts:HashMap<CertFingerprint,TlsData> = HashMap::new();
+    let contexts:HashMap<CertificateFingerprint,TlsData> = HashMap::new();
     let domains      = TrieNode::root();
     let fronts       = Router::new();
     let rc_ctx       = Arc::new(Mutex::new(contexts));
@@ -1039,8 +1039,8 @@ impl Listener {
     Some(self.token)
   }
 
-  pub fn create_default_context(config: &HttpsListener, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
-    ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>) -> Option<(SslContext, SslOptions)> {
+  pub fn create_default_context(config: &HttpsListener, ref_ctx: Arc<Mutex<HashMap<CertificateFingerprint,TlsData>>>,
+    ref_domains: Arc<Mutex<TrieNode<CertificateFingerprint>>>) -> Option<(SslContext, SslOptions)> {
 
     let mut cert_read  = config.certificate.as_ref().map(|c| c.as_bytes())
         .unwrap_or(include_bytes!("../assets/certificate.pem"));
@@ -1063,8 +1063,8 @@ impl Listener {
 
   pub fn create_context(tls_versions: &[TlsVersion], cipher_list: &str,
     cert: &X509, key: &PKey<Private>, cert_chain: &[X509],
-    ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
-    ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>) -> Option<(SslContext, SslOptions)> {
+    ref_ctx: Arc<Mutex<HashMap<CertificateFingerprint,TlsData>>>,
+    ref_domains: Arc<Mutex<TrieNode<CertificateFingerprint>>>) -> Option<(SslContext, SslOptions)> {
     let ctx = SslContext::builder(SslMethod::tls());
     if let Err(e) = ctx {
       error!("error building SSL context: {:?}", e);
@@ -1153,8 +1153,8 @@ impl Listener {
   }
 
   #[allow(dead_code)]
-  fn create_servername_callback(ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
-    ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>)
+  fn create_servername_callback(ref_ctx: Arc<Mutex<HashMap<CertificateFingerprint,TlsData>>>,
+    ref_domains: Arc<Mutex<TrieNode<CertificateFingerprint>>>)
     -> impl Fn(&mut SslRef, &mut SslAlert) -> Result<(), SniError> + 'static + Sync + Send {
     move |ssl: &mut SslRef, alert: &mut SslAlert| {
       let contexts = unwrap_msg!(ref_ctx.lock());
@@ -1192,8 +1192,8 @@ impl Listener {
     }
   }
 
-  fn create_client_hello_callback(ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
-    ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>)
+  fn create_client_hello_callback(ref_ctx: Arc<Mutex<HashMap<CertificateFingerprint,TlsData>>>,
+    ref_domains: Arc<Mutex<TrieNode<CertificateFingerprint>>>)
 -> impl Fn(&mut SslRef, &mut SslAlert)
         -> Result<ssl::ClientHelloResponse, ErrorStack> + 'static + Sync + Send {
     move |ssl: &mut SslRef, alert: &mut SslAlert| {
@@ -1270,7 +1270,7 @@ impl Listener {
       //FIXME: would need more logs here
 
       //FIXME
-      let fingerprint = CertFingerprint(unwrap_msg!(cert.digest(MessageDigest::sha256()).map(|d| d.to_vec())));
+      let fingerprint = CertificateFingerprint(unwrap_msg!(cert.digest(MessageDigest::sha256()).map(|d| d.to_vec())));
       let names = get_cert_names(&cert);
       debug!("got certificate names: {:?}", names);
 
@@ -1325,7 +1325,7 @@ impl Listener {
   }
 
   // FIXME: return an error if the cert is still in use
-  pub fn remove_certificate(&mut self, fingerprint: CertFingerprint) {
+  pub fn remove_certificate(&mut self, fingerprint: CertificateFingerprint) {
     debug!("removing certificate {:?}", fingerprint);
     let mut contexts = unwrap_msg!(self.contexts.lock());
     let mut domains  = unwrap_msg!(self.domains.lock());
