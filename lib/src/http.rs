@@ -752,6 +752,14 @@ impl Proxy {
     }
   }
 
+  pub fn remove_listener(&mut self, address: SocketAddr) -> bool {
+    let len = self.listeners.len();
+    self.listeners.retain(|_, l| l.address != address);
+
+    self.listeners.len() < len
+  }
+
+
   pub fn activate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr, tcp_listener: Option<TcpListener>) -> Option<Token> {
     for listener in self.listeners.values_mut() {
       if &listener.address == addr {
@@ -765,6 +773,12 @@ impl Proxy {
     self.listeners.values_mut().filter(|l| l.listener.is_some()).map(|l| {
       (l.address, l.listener.take().unwrap())
     }).collect()
+  }
+
+  pub fn give_back_listener(&mut self, address: SocketAddr) -> Option<(Token, TcpListener)> {
+    self.listeners.values_mut().find(|l| l.address == address).and_then(|l| {
+      l.listener.take().map(|sock| (l.token, sock))
+    })
   }
 
   pub fn add_application(&mut self, mut application: Application) {
@@ -1176,9 +1190,16 @@ impl ProxyConfiguration<Session> for Proxy {
         }
       },
       ProxyRequestData::RemoveListener(remove) => {
-        info!("removing http listener at address {:?}", remove.front);
-        fixme!();
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unimplemented")), data: None }
+        debug!("removing HTTP listener at address {:?}", remove.front);
+        if !self.remove_listener(remove.front) {
+          ProxyResponse {
+              id: message.id,
+              status: ProxyResponseStatus::Error(format!("no HTTP listener to remove at address {:?}", remove.front)), 
+              data: None
+          }
+        } else {
+          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+        }
       },
       ProxyRequestData::SoftStop => {
         info!("{} processing soft shutdown", message.id);

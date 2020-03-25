@@ -823,6 +823,13 @@ impl Proxy {
     }
   }
 
+  pub fn remove_listener(&mut self, address: SocketAddr) -> bool {
+    let len = self.listeners.len();
+    self.listeners.retain(|_, l| l.address != address);
+
+    self.listeners.len() < len
+  }
+
   pub fn activate_listener(&mut self, event_loop: &mut Poll, addr: &SocketAddr, tcp_listener: Option<TcpListener>) -> Option<Token> {
     for listener in self.listeners.values_mut() {
       if &listener.address == addr {
@@ -837,6 +844,12 @@ impl Proxy {
       .filter(|app_listener| app_listener.listener.is_some())
       .map(|app_listener| (app_listener.address, app_listener.listener.take().unwrap()))
       .collect()
+  }
+
+  pub fn give_back_listener(&mut self, address: SocketAddr) -> Option<(Token, TcpListener)> {
+    self.listeners.values_mut().find(|l| l.address == address).and_then(|l| {
+      l.listener.take().map(|sock| (l.token, sock))
+    })
   }
 
   pub fn add_tcp_front(&mut self, app_id: &str, front: &SocketAddr) -> bool {
@@ -962,8 +975,15 @@ impl ProxyConfiguration<Session> for Proxy {
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::RemoveListener(remove) => {
-        fixme!();
-        ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unimplemented")), data: None }
+        if !self.remove_listener(remove.front) {
+          ProxyResponse {
+              id: message.id,
+              status: ProxyResponseStatus::Error(format!("no TCP listener to remove at address {:?}", remove.front)), 
+              data: None
+          }
+        } else {
+          ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
+        }
       },
       command => {
         error!("{} unsupported message for TCP proxy, ignoring {:?}", message.id, command);
