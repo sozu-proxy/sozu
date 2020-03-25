@@ -1393,11 +1393,14 @@ impl ProxySession for ListenSession {
   }
 
   fn timeout(&mut self, _token: Token, _timer: &mut Timer<Token>, _front_timeout: &time::Duration) -> SessionResult {
-    unimplemented!();
+    error!("called ProxySession::timeout(token={:?}, time, front_timeout = {:?}) on ListenSession {{ protocol: {:?} }}",
+      _token, _front_timeout, self.protocol);
+    SessionResult::CloseSession
   }
 
   fn cancel_timeouts(&self, _timer: &mut Timer<Token>) {
-    unimplemented!();
+    error!("called ProxySession::cancel_timeouts(timer) on ListenSession {{ protocol: {:?} }}",
+      self.protocol);
   }
 
 }
