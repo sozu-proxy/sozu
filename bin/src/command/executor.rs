@@ -204,7 +204,7 @@ impl Future for FutureAnswer {
       Some(message) => {
         match message.status {
           ProxyResponseStatus::Ok => Ok(Async::Ready(message)),
-          ProxyResponseStatus::Error(s) => Err(s),
+          ProxyResponseStatus::Error(_) => Ok(Async::Ready(message)),
           _ => panic!(),
         }
       },

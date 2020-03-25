@@ -18,7 +18,7 @@ use sozu_command::buffer::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners, ScmSocket};
 use sozu_command::proxy::{ProxyRequestData, ProxyRequest, Query, QueryAnswer, QueryApplicationType,
-MetricsData, AggregatedMetricsData, ProxyResponseData, HttpFront, TcpFront};
+MetricsData, AggregatedMetricsData, ProxyResponseData, HttpFront, TcpFront, ProxyResponseStatus};
 use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
 use sozu_command::state::get_application_ids_by_domain;
 use sozu_command::logging;
@@ -678,14 +678,16 @@ impl CommandServer {
         worker.run_state = RunState::Stopping;
       }
 
+      let id = worker.id.clone();
       futures.push(
         Box::new(executor::send(
           worker_token,
           ProxyRequest { id: message_id.to_string(), order: order.clone() })
-        .map(move |_| {
+        .map(move |r| {
           if should_stop_worker {
             executor::Executor::stop_worker(worker_token)
           }
+          (id, r)
         })
       ));
 
@@ -699,20 +701,43 @@ impl CommandServer {
 
     let id = message_id.to_string();
     let should_stop_master = (order == ProxyRequestData::SoftStop || order == ProxyRequestData::HardStop) && worker_id.is_none();
-    let f = join_all(futures).map(move |_| {
+    let f = join_all(futures).map(move |r| {
       if should_stop_master {
         executor::Executor::stop_master();
       }
+
+      r
     });
 
     executor::Executor::execute(
-      f.map(move |_v| {
-        executor::Executor::send_client(token, CommandResponse::new(
-          id,
-          CommandStatus::Ok,
-          String::new(),
-          None
-        ));
+      f.map(move |v| {
+          let mut messages = vec![];
+          let mut has_error = false;
+          for response in v.iter() {
+              if let ProxyResponseStatus::Error(ref e) = response.1.status {
+                messages.push(format!("{}: {}", response.0, e));
+                has_error = true;
+              } else {
+                messages.push(format!("{}: OK", response.0));
+              }
+
+          }
+          if has_error {
+              executor::Executor::send_client(token, CommandResponse::new(
+                      id,
+                      CommandStatus::Error,
+                      messages.join(", "),
+                      None
+                      ));
+
+          } else {
+              executor::Executor::send_client(token, CommandResponse::new(
+                      id,
+                      CommandStatus::Ok,
+                      String::new(),
+                      None
+                      ));
+          }
       }).map_err(|e| {
         error!("worker_state error: {}", e);
       })
