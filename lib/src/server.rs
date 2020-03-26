@@ -5,7 +5,7 @@ use mio::net::*;
 use mio::*;
 use mio::unix::UnixReady;
 use std::collections::{HashSet,VecDeque};
-use std::os::unix::io::{FromRawFd,IntoRawFd};
+use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd};
 use slab::Slab;
 use time::{self, SteadyTime};
 use std::time::Duration;
@@ -697,7 +697,7 @@ impl Server {
                   if deactivate.to_scm {
                       self.scm.set_blocking(false);
                       let listeners = Listeners {
-                          http: vec![(deactivate.front, listener.into_raw_fd())],
+                          http: vec![(deactivate.front, listener.as_raw_fd())],
                           tls:  vec![],
                           tcp:  vec![],
                       };
@@ -812,7 +812,7 @@ impl Server {
                       self.scm.set_blocking(false);
                       let listeners = Listeners {
                           http: vec![],
-                          tls:  vec![(deactivate.front, listener.into_raw_fd())],
+                          tls:  vec![(deactivate.front, listener.as_raw_fd())],
                           tcp:  vec![],
                       };
                       info!("sending HTTPS listener: {:?}", listeners);
@@ -926,7 +926,7 @@ impl Server {
                       let listeners = Listeners {
                           http: vec![],
                           tls:  vec![],
-                          tcp:  vec![(deactivate.front, listener.into_raw_fd())],
+                          tcp:  vec![(deactivate.front, listener.as_raw_fd())],
                       };
                       info!("sending TCP listener: {:?}", listeners);
                       let res = self.scm.send_listeners(&listeners);
@@ -977,10 +977,11 @@ impl Server {
       }
     }
 
+    // use as_raw_fd because the listeners should be dropped after sending them
     let listeners = Listeners {
-      http: http_listeners.into_iter().map(|(addr, listener)|  (addr, listener.into_raw_fd())).collect(),
-      tls:  https_listeners.into_iter().map(|(addr, listener)| (addr, listener.into_raw_fd())).collect(),
-      tcp:  tcp_listeners.into_iter().map(|(addr, listener)|   (addr, listener.into_raw_fd())).collect(),
+      http: http_listeners.iter().map(|(addr, listener)|  (*addr, listener.as_raw_fd())).collect(),
+      tls:  https_listeners.iter().map(|(addr, listener)| (*addr, listener.as_raw_fd())).collect(),
+      tcp:  tcp_listeners.iter().map(|(addr, listener)|   (*addr, listener.as_raw_fd())).collect(),
     };
     info!("sending default listeners: {:?}", listeners);
     let res = self.scm.send_listeners(&listeners);
