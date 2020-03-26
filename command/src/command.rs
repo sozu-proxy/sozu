@@ -414,7 +414,7 @@ mod tests {
               (String::from("sozu.count"), FilteredData::Count(-2)),
               (String::from("sozu.time"),  FilteredData::Time(1234)),
             ].iter().cloned().collect(),
-            applications: [
+            clusters: [
               (String::from("app_1"), AppMetricsData {
                 data: [
                   (String::from("request_time"), FilteredData::Percentiles(Percentiles {

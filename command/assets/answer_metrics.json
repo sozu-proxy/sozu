@@ -36,7 +36,7 @@
               "data": 1234
             }
           },
-          "applications": {
+          "clusters": {
             "app_1": {
               "data": {
                 "request_time": {

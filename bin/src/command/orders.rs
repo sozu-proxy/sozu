@@ -18,7 +18,7 @@ use sozu_command::buffer::fixed::Buffer;
 use sozu_command::channel::Channel;
 use sozu_command::scm_socket::{Listeners, ScmSocket};
 use sozu_command::proxy::{ProxyRequestData, ProxyRequest, Query, QueryAnswer,
-  ueryApplicationType, MetricsData, AggregatedMetricsData, ProxyResponseData,
+  QueryApplicationType, MetricsData, AggregatedMetricsData, ProxyResponseData,
   HttpFrontend, TcpFrontend, Route, ProxyResponseStatus};
 use sozu_command::command::{CommandResponseData,CommandRequestData,
   CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
