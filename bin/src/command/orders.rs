@@ -481,7 +481,7 @@ impl CommandServer {
     let id = message_id.to_string();
 
     for ref mut worker in self.workers.values_mut()
-      .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
+      .filter(|worker| worker.run_state != RunState::Stopped) {
 
       let tag = worker.id.to_string();
       futures.push(
@@ -527,7 +527,7 @@ impl CommandServer {
     let id = message_id.to_string();
     let mut futures = Vec::new();
     for ref mut worker in self.workers.values_mut()
-      .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
+      .filter(|worker| worker.run_state != RunState::Stopped) {
 
       let tag = worker.id.to_string();
       futures.push(
