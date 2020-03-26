@@ -29,7 +29,7 @@ nix = "^0.22"
 mio = { version = "^0.7", features = [ "os-poll", "tcp", "uds" ] }
 libc = "^0.2"
 pool = "^0.1"
-time = "^0.2"
+time = "^0.2.9"
 toml = "^0.5"
 sha2 = "^0.9"
 memchr = "2.3"
