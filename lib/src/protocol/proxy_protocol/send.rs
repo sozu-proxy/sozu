@@ -140,7 +140,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
     &mut self.back_readiness
   }
 
-  pub fn into_pipe(mut self, front_buf: Checkout<Buffer>, back_buf: Checkout<Buffer>) -> Pipe<Front> {
+  pub fn into_pipe(mut self, front_buf: Checkout, back_buf: Checkout) -> Pipe<Front> {
     let backend_socket = self.backend.take().unwrap();
     let addr = self.front_socket().peer_addr().ok();
 

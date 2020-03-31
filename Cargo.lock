@@ -868,6 +868,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c7ac1531a0016945992b4e816e81538dfad0b9f00d280bcb707d711839f1536d"
 
 [[package]]
+name = "poule"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5830f93d0d012c17fecbc00e7dbe3aa02e36fb97357fdec37bff6d6b5d729273"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "ppv-lite86"
 version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1326,6 +1335,7 @@ dependencies = [
  "nix",
  "pem",
  "pool",
+ "poule",
  "serde",
  "serde_derive",
  "serde_json",
@@ -1354,6 +1364,7 @@ dependencies = [
  "openssl",
  "openssl-sys",
  "pool",
+ "poule",
  "quickcheck",
  "rand 0.8.3",
  "rustls",

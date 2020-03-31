@@ -272,11 +272,11 @@ pub struct Proxy {
   listeners:      HashMap<Token, Listener>,
   applications:   HashMap<AppId, Application>,
   backends:       Rc<RefCell<BackendMap>>,
-  pool:           Rc<RefCell<Pool<Buffer>>>,
+  pool:           Rc<RefCell<Pool>>,
 }
 
 impl Proxy {
-  pub fn new(pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>) -> Proxy {
+  pub fn new(pool: Rc<RefCell<Pool>>, backends: Rc<RefCell<BackendMap>>) -> Proxy {
     Proxy {
       listeners : HashMap::new(),
       applications: HashMap::new(),
@@ -733,7 +733,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
   let mut event_loop  = Poll::new().expect("could not create event loop");
 
   let pool = Rc::new(RefCell::new(
-    Pool::with_capacity(2*max_buffers, 0, || Buffer::with_capacity(buffer_size))
+    Pool::with_capacity(2*max_buffers, buffer_size)
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
 
