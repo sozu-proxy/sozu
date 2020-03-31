@@ -130,7 +130,7 @@ impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
     &mut self.readiness
   }
 
-  pub fn into_pipe(self, front_buf: Checkout<Buffer>, back_buf: Checkout<Buffer>,
+  pub fn into_pipe(self, front_buf: Checkout, back_buf: Checkout,
     backend_socket: Option<TcpStream>, backend_token: Option<Token>) -> Pipe<Front> {
 
     let addr = self.front_socket().peer_addr().ok();

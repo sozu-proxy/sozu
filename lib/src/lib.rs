@@ -177,6 +177,7 @@ extern crate hashbrown;
 extern crate regex;
 extern crate hpack;
 extern crate cookie_factory;
+extern crate poule;
 
 #[cfg(test)]
 #[macro_use]

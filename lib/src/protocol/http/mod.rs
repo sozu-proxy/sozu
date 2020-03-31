@@ -90,11 +90,11 @@ pub struct Http<Front:SocketHandler> {
   pub keepalive_count: usize,
   pub backend_stop:    Option<SteadyTime>,
   pub closing:         bool,
-  pool:                Weak<RefCell<Pool<Buffer>>>,
+  pool:                Weak<RefCell<Pool>>,
 }
 
 impl<Front:SocketHandler> Http<Front> {
-  pub fn new(sock: Front, token: Token, request_id: Hyphenated, pool: Weak<RefCell<Pool<Buffer>>>,
+  pub fn new(sock: Front, token: Token, request_id: Hyphenated, pool: Weak<RefCell<Pool>>,
     public_address: SocketAddr, session_address: Option<SocketAddr>, sticky_name: String,
     protocol: Protocol) -> Option<Http<Front>> {
 

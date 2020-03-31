@@ -134,7 +134,7 @@ pub struct Server {
   nb_connections:  usize,
   front_timeout:   time::Duration,
   timer:           Timer<Token>,
-  pool:            Rc<RefCell<Pool<Buffer>>>,
+  pool:            Rc<RefCell<Pool>>,
   backends:        Rc<RefCell<BackendMap>>,
   scm_listeners:   Option<Listeners>,
   zombie_check_interval: time::Duration,
@@ -146,9 +146,7 @@ pub struct Server {
 impl Server {
   pub fn new_from_config(channel: ProxyChannel, scm: ScmSocket, config: Config, config_state: ConfigState) -> Self {
     let event_loop  = Poll::new().expect("could not create event loop");
-    let pool = Rc::new(RefCell::new(
-      Pool::with_capacity(2*config.max_buffers, 0, || Buffer::with_capacity(config.buffer_size))
-    ));
+    let pool = Rc::new(RefCell::new(Pool::with_capacity(2*config.max_buffers, config.buffer_size)));
     let backends = Rc::new(RefCell::new(BackendMap::new()));
 
     //FIXME: we will use a few entries for the channel, metrics socket and the listeners
@@ -179,7 +177,7 @@ impl Server {
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
     sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken>,
-    pool: Rc<RefCell<Pool<Buffer>>>,
+    pool: Rc<RefCell<Pool>>,
     backends: Rc<RefCell<BackendMap>>,
     http: Option<http::Proxy>,
     https: Option<HttpsProvider>,
@@ -1542,7 +1540,7 @@ pub enum HttpsProvider {
 
 #[cfg(feature = "use-openssl")]
 impl HttpsProvider {
-  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
+  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
     if use_openssl {
       HttpsProvider::Openssl(https_openssl::Proxy::new(pool, backends))
     } else {
@@ -1631,7 +1629,7 @@ use https_rustls::session::Session;
 
 #[cfg(not(feature = "use-openssl"))]
 impl HttpsProvider {
-  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
+  pub fn new(use_openssl: bool, pool: Rc<RefCell<Pool>>, backends: Rc<RefCell<BackendMap>>) -> HttpsProvider {
     if use_openssl {
       error!("the openssl provider is not compiled, continuing with the rustls provider");
     }

@@ -7,29 +7,42 @@
 /// buffer pool in the future, so this module will still be useful to
 /// test the differences
 
-
-use pool_crate;
+use poule;
 use std::ops;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use sozu_command::buffer::fixed::Buffer;
 
 static BUFFER_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-pub type Reset = dyn pool_crate::Reset;
+pub type Reset = dyn poule::Reset;
 
-pub struct Pool<T:pool_crate::Reset> {
-  pub inner: pool_crate::Pool<T>,
+pub struct Pool {
+  pub inner: poule::Pool<Buffer>,
+  pub buffer_size: usize,
 }
 
-impl<T: pool_crate::Reset> Pool<T> {
-  pub fn with_capacity<F>(count: usize, extra: usize, init: F) -> Pool<T>
-    where F: Fn() -> T {
+impl Pool {
+  pub fn with_capacity(count: usize, buffer_size: usize) -> Pool {
+    let mut inner = poule::Pool::with_capacity(count);
+    inner.grow_to(1);
     Pool {
-      inner: pool_crate::Pool::with_capacity(count, extra, init),
+      inner,
+      buffer_size,
     }
   }
 
-  pub fn checkout(&mut self) -> Option<Checkout<T>> {
-    self.inner.checkout().map(|c| {
+  pub fn checkout(&mut self) -> Option<Checkout> {
+    if self.inner.used() == self.inner.capacity() &&
+        self.inner.capacity() < self.inner.maximum_capacity() {
+        self.inner.grow_to(std::cmp::min(self.inner.capacity()*2, self.inner.maximum_capacity()));
+        debug!("growing pool capacity from {} to {}", self.inner.capacity(),
+          std::cmp::min(self.inner.capacity()*2, self.inner.maximum_capacity()));
+    }
+    let capacity = self.buffer_size;
+    self.inner.checkout(|| {
+        trace!("initializing a buffer with capacity {}", capacity);
+        Buffer::with_capacity(capacity)
+    }).map(|c| {
       let old_buffer_count = BUFFER_COUNT.fetch_add(1, Ordering::SeqCst);
       gauge!("buffer.count", old_buffer_count + 1);
       Checkout {
@@ -39,44 +52,46 @@ impl<T: pool_crate::Reset> Pool<T> {
   }
 }
 
-impl<T: pool_crate::Reset> ops::Deref for Pool<T> {
-  type Target = pool_crate::Pool<T>;
+impl ops::Deref for Pool {
+  type Target = poule::Pool<Buffer>;
 
   fn deref(&self) -> &Self::Target {
     &self.inner
   }
 }
 
-impl<T: pool_crate::Reset> ops::DerefMut for Pool<T> {
-  fn deref_mut(&mut self) -> &mut pool_crate::Pool<T> {
+impl ops::DerefMut for Pool {
+  fn deref_mut(&mut self) -> &mut poule::Pool<Buffer> {
     &mut self.inner
   }
 }
 
-pub struct Checkout<T> {
-  pub inner: pool_crate::Checkout<T>,
+pub struct Checkout {
+  pub inner: poule::Checkout<Buffer>,
 }
 
-impl<T> ops::Deref for Checkout<T> {
-    type Target = pool_crate::Checkout<T>;
+impl ops::Deref for Checkout {
+    type Target = poule::Checkout<Buffer>;
 
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl<T> ops::DerefMut for Checkout<T> {
-    fn deref_mut(&mut self) -> &mut pool_crate::Checkout<T> {
+impl ops::DerefMut for Checkout {
+    fn deref_mut(&mut self) -> &mut poule::Checkout<Buffer> {
         &mut self.inner
     }
 }
 
-impl<T> Drop for Checkout<T> {
+impl Drop for Checkout {
     fn drop(&mut self) {
       let old_buffer_count = BUFFER_COUNT.fetch_sub(1, Ordering::SeqCst);
       gauge!("buffer.count", old_buffer_count - 1);
     }
 }
 
+/*
 unsafe impl<T: Send> Send for Checkout<T> { }
 unsafe impl<T: Sync> Sync for Checkout<T> { }
+*/

@@ -48,14 +48,14 @@ pub struct BufferQueue {
   pub buffer_position:        usize,
   pub parsed_position:        usize,
   pub start_parsing_position: usize,
-  pub buffer:                 Checkout<Buffer>,
+  pub buffer:                 Checkout,
   /// Vec<(start, length)>
   pub input_queue:            Vec<InputElement>,
   pub output_queue:           Vec<OutputElement>,
 }
 
 impl BufferQueue {
-  pub fn with_buffer(buffer: Checkout<Buffer>) -> BufferQueue {
+  pub fn with_buffer(buffer: Checkout) -> BufferQueue {
     BufferQueue {
       buffer_position:        0,
       parsed_position:        0,
@@ -484,8 +484,8 @@ impl fmt::Debug for BufferQueue {
 }
 
 
-pub fn buf_with_capacity(capacity: usize) -> (Pool<Buffer>, BufferQueue) {
-  let mut pool = Pool::with_capacity(1, 0, || Buffer::with_capacity(capacity));
+pub fn buf_with_capacity(capacity: usize) -> (Pool, BufferQueue) {
+  let mut pool = Pool::with_capacity(1, capacity);
   let b = BufferQueue::with_buffer(pool.checkout().unwrap());
   (pool, b)
 }

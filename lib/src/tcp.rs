@@ -61,8 +61,8 @@ pub struct Session {
   backend_id:         Option<String>,
   metrics:            SessionMetrics,
   protocol:           Option<State>,
-  front_buf:          Option<Checkout<Buffer>>,
-  back_buf:           Option<Checkout<Buffer>>,
+  front_buf:          Option<Checkout>,
+  back_buf:           Option<Checkout>,
   timeout:            Timeout,
   last_event:         SteadyTime,
   connection_attempt: u8,
@@ -71,7 +71,7 @@ pub struct Session {
 
 impl Session {
   fn new(sock: TcpStream, frontend_token: Token, accept_token: Token,
-    front_buf: Checkout<Buffer>, back_buf: Checkout<Buffer>, cluster_id: Option<String>,
+    front_buf: Checkout, back_buf: Checkout, cluster_id: Option<String>,
     backend_id: Option<String>, proxy_protocol: Option<ProxyProtocolConfig>,
     timeout: Timeout, delay: Duration) -> Session {
     let frontend_address = sock.peer_addr().ok();
@@ -744,13 +744,13 @@ pub struct Listener {
   listener: Option<TcpListener>,
   token:    Token,
   address:  SocketAddr,
-  pool:     Rc<RefCell<Pool<Buffer>>>,
+  pool:     Rc<RefCell<Pool>>,
   config:   TcpListenerConfig,
   active:   bool,
 }
 
 impl Listener {
-  fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool<Buffer>>>, token: Token) -> Listener {
+  fn new(config: TcpListenerConfig, pool: Rc<RefCell<Pool>>, token: Token) -> Listener {
     Listener {
       cluster_id: None,
       listener: None,
@@ -810,7 +810,7 @@ impl Proxy {
     }
   }
 
-  pub fn add_listener(&mut self, config: TcpListenerConfig, pool: Rc<RefCell<Pool<Buffer>>>, token: Token) -> Option<Token> {
+  pub fn add_listener(&mut self, config: TcpListenerConfig, pool: Rc<RefCell<Pool>>, token: Token) -> Option<Token> {
     if self.listeners.contains_key(&token) {
       None
     } else {
@@ -1068,7 +1068,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
 
   let mut poll          = Poll::new().expect("could not create event loop");
   let pool = Rc::new(RefCell::new(
-    Pool::with_capacity(2*max_buffers, 0, || Buffer::with_capacity(buffer_size))
+    Pool::with_capacity(2*max_buffers, buffer_size)
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
 
@@ -1233,7 +1233,7 @@ mod tests {
       let max_buffers = 100;
       let buffer_size = 16384;
       let pool = Rc::new(RefCell::new(
-        Pool::with_capacity(2*max_buffers, 0, || Buffer::with_capacity(buffer_size))
+        Pool::with_capacity(2*max_buffers, buffer_size)
       ));
       let backends = Rc::new(RefCell::new(BackendMap::new()));
 

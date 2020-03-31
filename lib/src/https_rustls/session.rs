@@ -39,7 +39,7 @@ pub struct Session {
   pub back_connected: BackendConnectionStatus,
   protocol:           Option<State>,
   pub public_address: SocketAddr,
-  pool:               Weak<RefCell<Pool<Buffer>>>,
+  pool:               Weak<RefCell<Pool>>,
   pub metrics:        SessionMetrics,
   pub cluster_id:         Option<String>,
   sticky_name:        String,
@@ -52,7 +52,7 @@ pub struct Session {
 }
 
 impl Session {
-  pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
+  pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool>>,
     public_address: SocketAddr, expect_proxy: bool, sticky_name: String, timeout: Timeout,
     answers: Rc<RefCell<HttpAnswers>>, listen_token: Token, delay: Duration) -> Session {
     let peer_address = if expect_proxy {

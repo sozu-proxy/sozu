@@ -24,7 +24,7 @@ pub struct RelayProxyProtocol<Front:SocketHandler> {
   pub backend:        Option<TcpStream>,
   pub frontend_token: Token,
   pub backend_token:  Option<Token>,
-  pub front_buf:      Checkout<Buffer>,
+  pub front_buf:      Checkout,
   pub front_readiness:Readiness,
   pub back_readiness: Readiness,
   cursor_header:      usize,
@@ -32,7 +32,7 @@ pub struct RelayProxyProtocol<Front:SocketHandler> {
 
 impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
   pub fn new(frontend: Front, frontend_token: Token, request_id: Hyphenated,
-    backend: Option<TcpStream>, front_buf: Checkout<Buffer>) -> Self {
+    backend: Option<TcpStream>, front_buf: Checkout) -> Self {
 
     RelayProxyProtocol {
       header_size: None,
@@ -169,7 +169,7 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
     &mut self.back_readiness
   }
 
-  pub fn into_pipe(mut self, back_buf: Checkout<Buffer>) -> Pipe<Front> {
+  pub fn into_pipe(mut self, back_buf: Checkout) -> Pipe<Front> {
     let backend_socket = self.backend.take().unwrap();
     let addr = self.front_socket().peer_addr().ok();
 

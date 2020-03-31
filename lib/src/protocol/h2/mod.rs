@@ -30,18 +30,18 @@ pub struct Http2<Front:SocketHandler> {
   backend:             Option<TcpStream>,
   frontend_token:      Token,
   backend_token:       Option<Token>,
-  back_buf:            Option<Checkout<Buffer>>,
+  back_buf:            Option<Checkout>,
   pub app_id:          Option<String>,
   pub request_id:      Hyphenated,
   pub back_readiness:  Readiness,
   pub log_ctx:         String,
   public_address:      Option<SocketAddr>,
   pub state:           Option<state::State>,
-  pool:                Weak<RefCell<Pool<Buffer>>>,
+  pool:                Weak<RefCell<Pool>>,
 }
 
 impl<Front:SocketHandler> Http2<Front> {
-  pub fn new(frontend: Front, frontend_token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
+  pub fn new(frontend: Front, frontend_token: Token, pool: Weak<RefCell<Pool>>,
   public_address: Option<SocketAddr>, client_address: Option<SocketAddr>, sticky_name: String,
   protocol: Protocol) -> Http2<Front> {
     let request_id = Uuid::new_v4().to_hyphenated();
@@ -399,12 +399,12 @@ impl<Front:SocketHandler> Http2<Front> {
 pub struct Connection<Socket:SocketHandler> {
   pub socket: Socket,
   pub readiness: Readiness,
-  pub read_buffer: Checkout<Buffer>,
-  pub write_buffer: Checkout<Buffer>,
+  pub read_buffer: Checkout,
+  pub write_buffer: Checkout,
 }
 
 impl<Socket:SocketHandler> Connection<Socket> {
-  pub fn new(socket: Socket, read_buffer: Checkout<Buffer>, write_buffer: Checkout<Buffer>) -> Self {
+  pub fn new(socket: Socket, read_buffer: Checkout, write_buffer: Checkout) -> Self {
     Connection {
       socket,
       readiness: Readiness {

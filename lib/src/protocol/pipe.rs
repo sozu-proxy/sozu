@@ -28,8 +28,8 @@ pub struct Pipe<Front:SocketHandler> {
   backend:            Option<TcpStream>,
   frontend_token:     Token,
   backend_token:      Option<Token>,
-  pub front_buf:      Checkout<Buffer>,
-  back_buf:           Checkout<Buffer>,
+  pub front_buf:      Checkout,
+  back_buf:           Checkout,
   pub cluster_id:         Option<String>,
   pub backend_id:     Option<String>,
   pub request_id:     Hyphenated,
@@ -46,8 +46,8 @@ pub struct Pipe<Front:SocketHandler> {
 impl<Front:SocketHandler> Pipe<Front> {
   pub fn new(frontend: Front, frontend_token: Token, request_id: Hyphenated,
     cluster_id: Option<String>, backend_id: Option<String>, websocket_context: Option<String>,
-    backend: Option<TcpStream>, front_buf: Checkout<Buffer>,
-    back_buf: Checkout<Buffer>, session_address: Option<SocketAddr>, protocol: Protocol) -> Pipe<Front> {
+    backend: Option<TcpStream>, front_buf: Checkout,
+    back_buf: Checkout, session_address: Option<SocketAddr>, protocol: Protocol) -> Pipe<Front> {
     let log_ctx = format!("{} {} {}\t",
       &request_id,
       cluster_id.as_ref().map(|s| s.as_str()).unwrap_or(&"-"),

@@ -54,7 +54,7 @@ pub struct Session {
   backend:            Option<Rc<RefCell<Backend>>>,
   back_connected:     BackendConnectionStatus,
   protocol:           Option<State>,
-  pool:               Weak<RefCell<Pool<Buffer>>>,
+  pool:               Weak<RefCell<Pool>>,
   metrics:            SessionMetrics,
   pub cluster_id:         Option<String>,
   sticky_name:        String,
@@ -66,7 +66,7 @@ pub struct Session {
 }
 
 impl Session {
-  pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
+  pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool>>,
     public_address: SocketAddr, expect_proxy: bool, sticky_name: String, timeout: Timeout,
     answers: Rc<RefCell<HttpAnswers>>, listen_token: Token, delay: Duration) -> Option<Session> {
     let request_id = Uuid::new_v4().to_hyphenated();
@@ -730,11 +730,11 @@ pub struct Proxy {
   listeners:    HashMap<Token,Listener>,
   backends:     Rc<RefCell<BackendMap>>,
   clusters: HashMap<ClusterId, Cluster>,
-  pool:         Rc<RefCell<Pool<Buffer>>>,
+  pool:         Rc<RefCell<Pool>>,
 }
 
 impl Proxy {
-  pub fn new(pool: Rc<RefCell<Pool<Buffer>>>, backends: Rc<RefCell<BackendMap>>) -> Proxy {
+  pub fn new(pool: Rc<RefCell<Pool>>, backends: Rc<RefCell<BackendMap>>) -> Proxy {
     Proxy {
       listeners:      HashMap::new(),
       clusters:   HashMap::new(),
@@ -1247,7 +1247,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
   let mut event_loop  = Poll::new().expect("could not create event loop");
 
   let pool = Rc::new(RefCell::new(
-    Pool::with_capacity(2*max_buffers, 0, || Buffer::with_capacity(buffer_size))
+    Pool::with_capacity(2*max_buffers, buffer_size)
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
   let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
