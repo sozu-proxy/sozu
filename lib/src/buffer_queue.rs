@@ -476,10 +476,10 @@ impl Reset for BufferQueue {
 
 impl fmt::Debug for BufferQueue {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    let b: &Buffer = &self.buffer;
+    //let b: &Buffer = &self.buffer;
     write!(f, "BufferQueue {{\nbuffer_position: {},\nparsed_position: {},\nstart_parsing_position: {},\ninput_queue: {:?},\noutput_queue:{:?},\nbuffer: {:?}\n}}",
     self.buffer_position, self.parsed_position, self.start_parsing_position,
-    self.input_queue, self.output_queue, b)
+    self.input_queue, self.output_queue, /*b*/ ())
   }
 }
 
@@ -519,13 +519,14 @@ mod tests {
       output_queue:           vec!()
     };*/
 
-    assert_eq!(b.unparsed_data(), &b"ABCDEFGHIJ"[..]);
+    // the pool will align the buffer to 16 bytes so there are trailing zeroes
+    assert_eq!(b.unparsed_data(), &b"ABCDEFGHIJ\0\0\0\0\0\0"[..]);
     b.consume_parsed_data(4);
     assert_eq!(b.parsed_position, 4);
     assert_eq!(b.start_parsing_position, 4);
     assert_eq!(b.input_queue, vec!(InputElement::Slice(6)));
     println!("TEST[{}]", line!());
-    assert_eq!(b.unparsed_data(), &b"EFGHIJ"[..]);
+    assert_eq!(b.unparsed_data(), &b"EFGHIJ\0\0\0\0\0\0"[..]);
     println!("TEST[{}]", line!());
 
     b.slice_output(4);
