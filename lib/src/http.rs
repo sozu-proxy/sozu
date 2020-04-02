@@ -628,7 +628,9 @@ impl ProxySession for Session {
           SessionResult::CloseSession => {
             return order;
           },
-          SessionResult::Continue => {},
+          SessionResult::Continue => {
+            continue;
+          },
           _ => {
             self.back_readiness().map(|r| r.event.remove(UnixReady::hup()));
             return order;

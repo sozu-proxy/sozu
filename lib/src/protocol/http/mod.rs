@@ -395,7 +395,11 @@ impl<Front:SocketHandler> Http<Front> {
           self.back_readiness.interest.insert(Ready::readable());
           SessionResult::Continue
         } else {
-          SessionResult::CloseSession
+          let answer_502 = "HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+          self.set_answer(DefaultAnswerStatus::Answer502, Rc::new(Vec::from(answer_502.as_bytes())));
+          // we're not expecting any more data from the backend
+          self.back_readiness.interest  = UnixReady::from(Ready::empty());
+          SessionResult::Continue
         }
       } else {
         self.front_readiness.interest.insert(Ready::writable());
