@@ -692,12 +692,11 @@ impl<Front:SocketHandler> Http<Front> {
         self.log_request_error(metrics, "front parsing error, closing the connection");
         incr!("http.front_parse_errors");
 
-        // increment active requests here because it will be decremented right away
-        // when closing the connection. It's slightly easier than decrementing it
-        // at every place we return SessionResult::CloseSession
+        let answer_400 = &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..];
+        self.set_answer(DefaultAnswerStatus::Answer400, Rc::new(Vec::from(answer_400)));
         gauge_add!("http.active_requests", 1);
 
-        return SessionResult::CloseSession;
+        return SessionResult::Continue;
       }
 
       let is_now_initial = self.request == Some(RequestState::Initial);
@@ -767,8 +766,10 @@ impl<Front:SocketHandler> Http<Front> {
         self.req_header_end = header_end;
 
         if unwrap_msg!(self.request.as_ref()).is_front_error() {
-          self.log_request_error(metrics, "front parsing error, closing the connection");
-          return SessionResult::CloseSession;
+          self.log_request_error(metrics, "front parsing error, closing the connection2");
+          let answer_400 = &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..];
+          self.set_answer(DefaultAnswerStatus::Answer400, Rc::new(Vec::from(answer_400)));
+          return SessionResult::Continue;
         }
 
         if let Some(RequestState::Request(_,_,_)) = self.request {
