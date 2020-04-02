@@ -152,7 +152,7 @@ impl Session {
     })
   }
 
-  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Rc<Vec<u8>>)  {
+  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Option<Rc<Vec<u8>>>)  {
     self.protocol.as_mut().map(|protocol| {
       if let &mut State::Http(ref mut http) = protocol {
         http.set_answer(answer, buf);
@@ -199,7 +199,7 @@ impl Session {
 
       let mut http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(),
         handshake.request_id, pool, self.public_address.clone(), self.peer_address,
-        self.sticky_name.clone(), Protocol::HTTPS);
+        self.sticky_name.clone(), Protocol::HTTPS, self.answers.clone());
 
       http.front_readiness = readiness;
       http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
@@ -533,13 +533,11 @@ impl ProxySession for Session {
       } else {
         match self.http().map(|h| h.timeout_status()) {
           Some(TimeoutStatus::Request) => {
-            let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer408, None);
-            self.set_answer(DefaultAnswerStatus::Answer408, answer);
+            self.set_answer(DefaultAnswerStatus::Answer408, None);
             self.writable()
           },
           Some(TimeoutStatus::Response) => {
-            let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer504, None);
-            self.set_answer(DefaultAnswerStatus::Answer504, answer);
+            self.set_answer(DefaultAnswerStatus::Answer504, None);
             self.writable()
           },
           _ => {
@@ -1368,8 +1366,7 @@ impl Proxy {
 
     match res {
       Err(e) => {
-        let answer = self.get_service_unavailable_answer(Some(app_id), &session.listen_token);
-        session.set_answer(DefaultAnswerStatus::Answer503, answer);
+        session.set_answer(DefaultAnswerStatus::Answer503, None);
         Err(e)
       },
       Ok((backend, conn))  => {
@@ -1400,8 +1397,7 @@ impl Proxy {
     let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
-        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
-        session.set_answer(DefaultAnswerStatus::Answer400, answer);
+        session.set_answer(DefaultAnswerStatus::Answer400, None);
         return Err(ConnectionError::InvalidHost);
       }
 
@@ -1417,8 +1413,7 @@ impl Proxy {
       if servername.as_ref().map(|s| s.as_str()) != Some(hostname_str) {
         error!("TLS SNI hostname '{:?}' and Host header '{}' don't match", servername, hostname_str);
         /*FIXME: deactivate this check for a temporary test
-        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
-        unwrap_msg!(session.http()).set_answer(DefaultAnswerStatus::Answer404, answer);
+        unwrap_msg!(session.http()).set_answer(DefaultAnswerStatus::Answer404, None);
         return Err(ConnectionError::HostNotFound);
         */
       }
@@ -1432,8 +1427,7 @@ impl Proxy {
       }
     } else {
       error!("hostname parsing failed");
-      let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
-      session.set_answer(DefaultAnswerStatus::Answer400, answer);
+      session.set_answer(DefaultAnswerStatus::Answer400, None);
       return Err(ConnectionError::InvalidHost);
     };
 
@@ -1444,8 +1438,7 @@ impl Proxy {
       .map(|ref front| front.app_id.clone()) {
       Some(app_id) => Ok(app_id),
       None => {
-        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
-        session.set_answer(DefaultAnswerStatus::Answer404, answer);
+        session.set_answer(DefaultAnswerStatus::Answer404, None);
         Err(ConnectionError::HostNotFound)
       }
     }
@@ -1454,16 +1447,11 @@ impl Proxy {
   fn check_circuit_breaker(&mut self, session: &mut Session) -> Result<(), ConnectionError> {
     if session.connection_attempt == CONN_RETRIES {
       error!("{} max connection attempt reached", session.log_context());
-      let answer = self.get_service_unavailable_answer(session.app_id.as_ref().map(|app_id| app_id.as_str()), &session.listen_token);
-      session.set_answer(DefaultAnswerStatus::Answer503, answer);
+      session.set_answer(DefaultAnswerStatus::Answer503, None);
       Err(ConnectionError::NoBackendAvailable)
     } else {
       Ok(())
     }
-  }
-
-  fn get_service_unavailable_answer(&self, app_id: Option<&str>, listen_token: &Token) -> Rc<Vec<u8>> {
-    self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer503, app_id)
   }
 }
 
