@@ -71,7 +71,7 @@ pub struct Http<Front:SocketHandler> {
   pub status:         SessionStatus,
   pub front_buf:      Option<BufferQueue>,
   pub back_buf:       Option<BufferQueue>,
-  pub cluster_id:         Option<String>,
+  pub cluster_id:     Option<String>,
   pub request_id:     Hyphenated,
   pub backend_id:     Option<String>,
   pub front_readiness:Readiness,
@@ -90,6 +90,7 @@ pub struct Http<Front:SocketHandler> {
   pub added_res_header: String,
   pub keepalive_count: usize,
   pub backend_stop:    Option<SteadyTime>,
+  answers:             Rc<RefCell<answers::HttpAnswers>>,
   pub closing:         bool,
   pool:                Weak<RefCell<Pool>>,
 }
@@ -97,7 +98,7 @@ pub struct Http<Front:SocketHandler> {
 impl<Front:SocketHandler> Http<Front> {
   pub fn new(sock: Front, token: Token, request_id: Hyphenated, pool: Weak<RefCell<Pool>>,
     public_address: SocketAddr, session_address: Option<SocketAddr>, sticky_name: String,
-    protocol: Protocol) -> Option<Http<Front>> {
+    protocol: Protocol, answers: Rc<RefCell<answers::HttpAnswers>>) -> Option<Http<Front>> {
 
     let mut session = Http {
       frontend:           sock,
@@ -127,6 +128,7 @@ impl<Front:SocketHandler> Http<Front> {
       keepalive_count: 0,
       backend_stop:    None,
       closing:         false,
+      answers,
       pool,
     };
     session.added_req_header = session.added_request_header(public_address, session_address);
@@ -179,7 +181,7 @@ impl<Front:SocketHandler> Http<Front> {
       prefix, self.request, self.req_header_end, self.response, self.res_header_end)
   }
 
-  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Rc<Vec<u8>>)  {
+  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Option<Rc<Vec<u8>>>)  {
     self.front_buf = None;
     self.back_buf = None;
 
@@ -199,6 +201,8 @@ impl<Front:SocketHandler> Http<Front> {
       };
     }
 
+    let buf = buf.unwrap_or_else(|| self.answers.borrow().get(DefaultAnswerStatus::Answer502,
+      self.cluster_id.as_deref()));
     self.status = SessionStatus::DefaultAnswer(answer, buf, 0);
     self.front_readiness.interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
     self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
@@ -395,8 +399,7 @@ impl<Front:SocketHandler> Http<Front> {
           self.back_readiness.interest.insert(Ready::readable());
           SessionResult::Continue
         } else {
-          let answer_502 = "HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
-          self.set_answer(DefaultAnswerStatus::Answer502, Rc::new(Vec::from(answer_502.as_bytes())));
+          self.set_answer(DefaultAnswerStatus::Answer502, None);
           // we're not expecting any more data from the backend
           self.back_readiness.interest  = UnixReady::from(Ready::empty());
           SessionResult::Continue
@@ -599,8 +602,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     if self.front_buf.as_ref().unwrap().buffer.available_space() == 0 {
       if self.backend_token == None {
-        let answer_413 = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n\r\n";
-        self.set_answer(DefaultAnswerStatus::Answer413, Rc::new(Vec::from(answer_413.as_bytes())));
+        self.set_answer(DefaultAnswerStatus::Answer413, None);
         self.front_readiness.interest.remove(Ready::readable());
         self.front_readiness.interest.insert(Ready::writable());
       } else {
@@ -692,8 +694,7 @@ impl<Front:SocketHandler> Http<Front> {
         self.log_request_error(metrics, "front parsing error, closing the connection");
         incr!("http.front_parse_errors");
 
-        let answer_400 = &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..];
-        self.set_answer(DefaultAnswerStatus::Answer400, Rc::new(Vec::from(answer_400)));
+        self.set_answer(DefaultAnswerStatus::Answer400, None);
         gauge_add!("http.active_requests", 1);
 
         return SessionResult::Continue;
@@ -766,9 +767,8 @@ impl<Front:SocketHandler> Http<Front> {
         self.req_header_end = header_end;
 
         if unwrap_msg!(self.request.as_ref()).is_front_error() {
-          self.log_request_error(metrics, "front parsing error, closing the connection2");
-          let answer_400 = &b"HTTP/1.1 400 Bad Request\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"[..];
-          self.set_answer(DefaultAnswerStatus::Answer400, Rc::new(Vec::from(answer_400)));
+          self.log_request_error(metrics, "front parsing error, closing the connection");
+          self.set_answer(DefaultAnswerStatus::Answer400, None);
           return SessionResult::Continue;
         }
 
@@ -1312,8 +1312,7 @@ impl<Front:SocketHandler> Http<Front> {
 
         if unwrap_msg!(self.response.as_ref()).is_back_error() {
           self.log_request_error(metrics, "back socket parse error, closing connection");
-          let answer_502 = "HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
-          self.set_answer(DefaultAnswerStatus::Answer502, Rc::new(Vec::from(answer_502.as_bytes())));
+          self.set_answer(DefaultAnswerStatus::Answer502, None);
           return (ProtocolResult::Continue, self.writable(metrics));
         }
 

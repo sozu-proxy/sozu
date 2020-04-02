@@ -78,7 +78,8 @@ impl Session {
       gauge_add!("protocol.http", 1);
       let session_address = sock.peer_addr().ok();
       Http::new(sock, token, request_id, pool.clone(), public_address,
-        session_address, sticky_name.clone(), Protocol::HTTP).map(|http| State::Http(http))
+        session_address, sticky_name.clone(), Protocol::HTTP, answers.clone())
+          .map(|http| State::Http(http))
     };
 
     let metrics = SessionMetrics::new(Some(delay));
@@ -163,7 +164,7 @@ impl Session {
       }) {
         let http = Http::new(expect.frontend, expect.frontend_token, expect.request_id,
           self.pool.clone(), public_address, Some(client_address),
-          self.sticky_name.clone(), Protocol::HTTP).map(|mut http| {
+          self.sticky_name.clone(), Protocol::HTTP, self.answers.clone()).map(|mut http| {
             http.front_readiness.event = readiness.event;
 
             State::Http(http)
@@ -190,7 +191,7 @@ impl Session {
     }
   }
 
-  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Rc<Vec<u8>>)  {
+  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Option<Rc<Vec<u8>>>)  {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http) => http.set_answer(answer, buf),
       _ => {}
@@ -464,13 +465,11 @@ impl ProxySession for Session {
       } else {
         match self.http().map(|h| h.timeout_status()) {
           Some(TimeoutStatus::Request) => {
-            let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer408, None);
-            self.set_answer(DefaultAnswerStatus::Answer408, answer);
+            self.set_answer(DefaultAnswerStatus::Answer408, None);
             self.writable()
           },
           Some(TimeoutStatus::Response) => {
-            let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer504, None);
-            self.set_answer(DefaultAnswerStatus::Answer504, answer);
+            self.set_answer(DefaultAnswerStatus::Answer504, None);
             self.writable()
           },
           _ => {
@@ -823,8 +822,7 @@ impl Proxy {
 
     match res {
       Err(e) => {
-        let answer = self.get_service_unavailable_answer(Some(cluster_id), session.listen_token);
-        session.set_answer(DefaultAnswerStatus::Answer503, answer);
+        session.set_answer(DefaultAnswerStatus::Answer503, None);
         Err(e)
       },
       Ok((backend, conn))  => {
@@ -856,8 +854,7 @@ impl Proxy {
     let host: &str = if let Ok((i, (hostname, port))) = hostname_and_port(h.as_bytes()) {
       if i != &b""[..] {
         error!("connect_to_backend: invalid remaining chars after hostname. Host: {}", h);
-        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
-        session.set_answer(DefaultAnswerStatus::Answer400, answer);
+        session.set_answer(DefaultAnswerStatus::Answer400, None);
         return Err(ConnectionError::InvalidHost);
       }
 
@@ -873,8 +870,7 @@ impl Proxy {
       }
     } else {
       error!("hostname parsing failed for: '{}'", h);
-      let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer400, None);
-      session.set_answer(DefaultAnswerStatus::Answer400, answer);
+      session.set_answer(DefaultAnswerStatus::Answer400, None);
       return Err(ConnectionError::InvalidHost);
     };
 
@@ -885,13 +881,11 @@ impl Proxy {
       .and_then(|l| l.frontend_from_request(&host, &rl.uri)) {
       Some(Route::ClusterId(cluster_id)) => cluster_id,
       Some(Route::Deny) => {
-        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer401, None);
-        session.set_answer(DefaultAnswerStatus::Answer401, answer);
+        session.set_answer(DefaultAnswerStatus::Answer401, None);
         return Err(ConnectionError::Unauthorized);
       },
       None => {
-        let answer = self.listeners[&session.listen_token].answers.borrow().get(DefaultAnswerStatus::Answer404, None);
-        session.set_answer(DefaultAnswerStatus::Answer404, answer);
+        session.set_answer(DefaultAnswerStatus::Answer404, None);
         return Err(ConnectionError::HostNotFound);
       }
     };
@@ -899,7 +893,7 @@ impl Proxy {
     let front_should_redirect_https = self.clusters.get(&cluster_id).map(|ref app| app.https_redirect).unwrap_or(false);
     if front_should_redirect_https {
       let answer = format!("HTTP/1.1 301 Moved Permanently\r\nContent-Length: 0\r\nLocation: https://{}{}\r\n\r\n", host, rl.uri);
-      session.set_answer(DefaultAnswerStatus::Answer301, Rc::new(answer.into_bytes()));
+      session.set_answer(DefaultAnswerStatus::Answer301, Some(Rc::new(answer.into_bytes())));
       return Err(ConnectionError::HttpsRedirect);
     }
 
@@ -909,16 +903,11 @@ impl Proxy {
   fn check_circuit_breaker(&mut self, session: &mut Session) -> Result<(), ConnectionError> {
     if session.connection_attempt == CONN_RETRIES {
       error!("{} max connection attempt reached", session.log_context());
-      let answer = self.get_service_unavailable_answer(session.cluster_id.as_ref().map(|cluster_id| cluster_id.as_str()), session.listen_token);
-      session.set_answer(DefaultAnswerStatus::Answer503, answer);
+      session.set_answer(DefaultAnswerStatus::Answer503, None);
       Err(ConnectionError::NoBackendAvailable)
     } else {
       Ok(())
     }
-  }
-
-  fn get_service_unavailable_answer(&self, cluster_id: Option<&str>, listen_token: Token) -> Rc<Vec<u8>> {
-    self.listeners[&listen_token].answers.borrow().get(DefaultAnswerStatus::Answer503, cluster_id)
   }
 }
 

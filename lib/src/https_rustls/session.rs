@@ -115,7 +115,7 @@ impl Session {
     })
   }
 
-  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Rc<Vec<u8>>)  {
+  pub fn set_answer(&mut self, answer: DefaultAnswerStatus, buf: Option<Rc<Vec<u8>>>)  {
     self.protocol.as_mut().map(|protocol| {
       if let State::Http(ref mut http) = *protocol {
         http.set_answer(answer, buf);
@@ -174,7 +174,7 @@ impl Session {
       let readiness = handshake.readiness.clone();
       let http = Http::new(front_stream, self.frontend_token, handshake.request_id,
         self.pool.clone(), self.public_address, self.peer_address,
-        self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
+        self.sticky_name.clone(), Protocol::HTTPS, self.answers.clone()).map(|mut http| {
 
         let res = http.frontend.session.read(front_buf.space());
         match res {
@@ -525,13 +525,11 @@ impl ProxySession for Session {
       } else {
         match self.http().map(|h| h.timeout_status()) {
           Some(TimeoutStatus::Request) => {
-            let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer408, None);
-            self.set_answer(DefaultAnswerStatus::Answer408, answer);
+            self.set_answer(DefaultAnswerStatus::Answer408, None);
             self.writable()
           },
           Some(TimeoutStatus::Response) => {
-            let answer = self.answers.borrow().get(DefaultAnswerStatus::Answer504, None);
-            self.set_answer(DefaultAnswerStatus::Answer504, answer);
+            self.set_answer(DefaultAnswerStatus::Answer504, None);
             self.writable()
           },
           _ => {
