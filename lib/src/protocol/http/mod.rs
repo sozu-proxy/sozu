@@ -502,6 +502,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   pub fn log_default_answer_success(&self, metrics: &SessionMetrics) {
     let session = SessionAddress(self.get_session_address());
+    let backend = SessionAddress(self.get_backend_address());
 
     let status_line = match self.status {
       SessionStatus::Normal => "-",
@@ -529,8 +530,8 @@ impl<Front:SocketHandler> Http<Front> {
 
     let proto = self.protocol_string();
 
-    info_access!("{}{} -> X\t{} {} {} {}\t{} {} {}\t{}",
-      self.log_context(), session,
+    info_access!("{}{} -> {}\t{} {} {} {}\t{} {} {}\t{}",
+      self.log_context(), session, backend,
       LogDuration(response_time), LogDuration(service_time),
       metrics.bin, metrics.bout,
       proto, host, request_line, status_line);
@@ -1382,7 +1383,7 @@ struct SessionAddress(Option<SocketAddr>);
 impl std::fmt::Display for SessionAddress {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match self.0 {
-      None => write!(f, "-"),
+      None => write!(f, "X"),
       Some(SocketAddr::V4(addr)) => write!(f, "{}", addr),
       Some(SocketAddr::V6(addr)) => write!(f, "{}", addr),
     }
