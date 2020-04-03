@@ -38,9 +38,9 @@ pub struct ConfigState {
   pub https_listeners: HashMap<SocketAddr, (HttpsListener, bool)>,
   pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
   // indexed by (address, hostname, path)
-  pub http_fronts:     HashMap<(SocketAddr, String, PathRule), HttpFrontend>,
+  pub http_fronts:     HashMap<RouteKey, HttpFrontend>,
   // indexed by (address, hostname, path)
-  pub https_fronts:    HashMap<(SocketAddr, String, PathRule), HttpFrontend>,
+  pub https_fronts:    HashMap<RouteKey, HttpFrontend>,
   pub tcp_fronts:      HashMap<ClusterId, Vec<TcpFrontend>>,
   // certificate and names
   pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
@@ -132,17 +132,17 @@ impl ConfigState {
         }
       },
       &ProxyRequestData::AddHttpFrontend(ref front) => {
-        if self.http_fronts.contains_key(&(front.address, front.hostname.to_string(), front.path.clone())) {
+        if self.http_fronts.contains_key(&RouteKey(front.address, front.hostname.to_string(), front.path.clone())) {
             false
         } else {
           self.http_fronts.insert(
-            (front.address, front.hostname.to_string(), front.path.clone()),
+            RouteKey(front.address, front.hostname.to_string(), front.path.clone()),
             front.clone());
           true
         }
       },
       &ProxyRequestData::RemoveHttpFrontend(ref front) => {
-        self.http_fronts.remove(&(front.address, front.hostname.to_string(), front.path.clone())).is_some()
+        self.http_fronts.remove(&RouteKey(front.address, front.hostname.to_string(), front.path.clone())).is_some()
       },
       &ProxyRequestData::AddCertificate(ref add) => {
         let fingerprint = match calculate_fingerprint(&add.certificate.certificate.as_bytes()[..]) {
@@ -186,17 +186,17 @@ impl ConfigState {
         }
       },
       &ProxyRequestData::AddHttpsFrontend(ref front) => {
-        if self.https_fronts.contains_key(&(front.address, front.hostname.to_string(), front.path.clone())) {
+        if self.https_fronts.contains_key(&RouteKey(front.address, front.hostname.to_string(), front.path.clone())) {
             false
         } else {
           self.https_fronts.insert(
-            (front.address, front.hostname.to_string(), front.path.clone()),
+            RouteKey(front.address, front.hostname.to_string(), front.path.clone()),
             front.clone());
           true
         }
       },
       &ProxyRequestData::RemoveHttpsFrontend(ref front) => {
-        self.https_fronts.remove(&(front.address, front.hostname.to_string(), front.path.clone())).is_some()
+        self.https_fronts.remove(&RouteKey(front.address, front.hostname.to_string(), front.path.clone())).is_some()
       },
       &ProxyRequestData::AddTcpFrontend(ref front) => {
         let front_vec = self.tcp_fronts.entry(front.cluster_id.clone()).or_insert_with(Vec::new);
@@ -379,11 +379,11 @@ impl ConfigState {
     let added_https_listeners: Vec<&SocketAddr> = their_https_listeners.difference(&my_https_listeners)
       .cloned().collect();
 
-    let mut my_http_fronts: HashSet<(&(SocketAddr, String, PathRule), &HttpFrontend)> = HashSet::new();
+    let mut my_http_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
     for (ref route, ref front) in self.http_fronts.iter() {
       my_http_fronts.insert((&route, &front));
     }
-    let mut their_http_fronts: HashSet<(&(SocketAddr, String, PathRule), &HttpFrontend)> = HashSet::new();
+    let mut their_http_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
     for (ref route, ref front) in other.http_fronts.iter() {
       their_http_fronts.insert((&route, &front));
     }
@@ -391,11 +391,11 @@ impl ConfigState {
     let removed_http_fronts = my_http_fronts.difference(&their_http_fronts);
     let added_http_fronts   = their_http_fronts.difference(&my_http_fronts);
 
-    let mut my_https_fronts: HashSet<(&(SocketAddr, String, PathRule), &HttpFrontend)> = HashSet::new();
+    let mut my_https_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
     for (ref route, ref front) in self.https_fronts.iter() {
       my_https_fronts.insert((&route, &front));
     }
-    let mut their_https_fronts: HashSet<(&(SocketAddr, String, PathRule), &HttpFrontend)> = HashSet::new();
+    let mut their_https_fronts: HashSet<(&RouteKey, &HttpFrontend)> = HashSet::new();
     for (ref route, ref front) in other.https_fronts.iter() {
       their_https_fronts.insert((&route, &front));
     }
@@ -1082,4 +1082,64 @@ mod tests {
     assert_eq!(diff, e);
   }
 
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash)]
+pub struct RouteKey(pub SocketAddr, pub String, pub PathRule);
+
+impl serde::Serialize for RouteKey {
+  fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+      where S: serde::Serializer,
+  {
+    let s = match &self.2 {
+      PathRule::Prefix(prefix) => format!("{};{};P{}", self.0, self.1, prefix),
+      PathRule::Regex(regex) => format!("{};{};R{}", self.0, self.1, regex),
+    };
+    serializer.serialize_str(&s)
+  }
+}
+
+use std::fmt;
+use serde::de::{self, Visitor};
+struct RouteKeyVisitor {}
+
+impl<'de> Visitor<'de> for RouteKeyVisitor {
+  type Value = RouteKey;
+
+  fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+    formatter.write_str("parsing a route key")
+  }
+
+  fn visit_str<E>(self, value: &str) -> Result<RouteKey, E>
+    where E: de::Error
+  {
+    let mut it = value.split(";");
+    let address = it.next()
+      .ok_or_else(|| E::custom(format!("invalid format")))
+      .and_then(|s| s.parse::<SocketAddr>()
+        .map_err(|e| E::custom(format!("could not deserialize SocketAddr: {:?}", e)))
+      )?;
+
+    let hostname = it.next()
+      .ok_or_else(|| E::custom(format!("invalid format")))?;
+
+    let path_rule_str = it.next()
+      .ok_or_else(|| E::custom(format!("invalid format")))?;
+
+    let path_rule = match path_rule_str.chars().next() {
+      Some('R') => PathRule::Regex(String::from(&path_rule_str[1..])),
+      Some('P') => PathRule::Prefix(String::from(&path_rule_str[1..])),
+      _ => return Err(E::custom(format!("invalid path rule"))),
+    };
+
+    let res = Ok(RouteKey(address, hostname.to_string(), path_rule));
+    res
+  }
+}
+
+impl<'de> serde::Deserialize<'de> for RouteKey {
+  fn deserialize<D>(deserializer: D) -> Result<RouteKey, D::Error>
+        where D: serde::de::Deserializer<'de> {
+    deserializer.deserialize_str(RouteKeyVisitor{})
+  }
 }
