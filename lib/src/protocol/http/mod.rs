@@ -487,8 +487,10 @@ impl<Front:SocketHandler> Http<Front> {
     let wait_time  = metrics.wait_time;
 
     let cluster_id = OptionalString::new(self.cluster_id.as_ref().map(|s| s.as_str()));
-    time!("request_time", cluster_id.as_str(), response_time.num_milliseconds());
+    time!("response_time", cluster_id.as_str(), response_time.num_milliseconds());
     time!("service_time", cluster_id.as_str(), service_time.num_milliseconds());
+    time!("response_time", response_time.num_milliseconds());
+    time!("service_time", service_time.num_milliseconds());
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
@@ -530,8 +532,11 @@ impl<Front:SocketHandler> Http<Front> {
     let service_time  = metrics.service_time();
 
     if let Some(ref cluster_id) = self.cluster_id {
-      time!("http.request.time", &cluster_id, response_time.num_milliseconds());
+      time!("response_time", &cluster_id, response_time.num_milliseconds());
+      time!("service_time", &cluster_id, service_time.num_milliseconds());
     }
+    time!("response_time", response_time.num_milliseconds());
+    time!("service_time", service_time.num_milliseconds());
     incr!("http.errors");
 
     let proto = self.protocol_string();
@@ -558,6 +563,12 @@ impl<Front:SocketHandler> Http<Front> {
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
 
+    if let Some(ref cluster_id) = self.cluster_id {
+      time!("response_time", &cluster_id, response_time.num_milliseconds());
+      time!("service_time", &cluster_id, service_time.num_milliseconds());
+    }
+    time!("response_time", response_time.num_milliseconds());
+    time!("service_time", service_time.num_milliseconds());
     incr!("http.errors");
     /*
     let cluster_id = self.cluster_id.clone().unwrap_or(String::from("-"));
