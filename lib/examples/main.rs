@@ -24,7 +24,7 @@ fn main() {
   gauge!("sozu.TEST", 42);
 
   let config = proxy::HttpListener {
-    front: "127.0.0.1:8080".parse().expect("could not parse address"),
+    address: "127.0.0.1:8080".parse().expect("could not parse address"),
     ..Default::default()
   };
 
@@ -67,7 +67,7 @@ fn main() {
 
 
   let config = proxy::HttpsListener {
-    front: "127.0.0.1:8443".parse().expect("could not parse address"),
+    address: "127.0.0.1:8443".parse().expect("could not parse address"),
     cipher_list: String::from("ECDHE-ECDSA-CHACHA20-POLY1305:\
     ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:\
     ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:\
@@ -103,7 +103,7 @@ fn main() {
   command2.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_IJKL1"),
     order: proxy::ProxyRequestData::AddCertificate(proxy::AddCertificate{
-      front: "127.0.0.1:8443".parse().unwrap(),
+      address: "127.0.0.1:8443".parse().unwrap(),
       certificate: certificate_and_key,
       names: Vec::new(),
     })
@@ -147,7 +147,7 @@ fn main() {
   command2.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_QRST1"),
     order: proxy::ProxyRequestData::AddCertificate(proxy::AddCertificate {
-      front: "127.0.0.1:8443".parse().unwrap(),
+      address: "127.0.0.1:8443".parse().unwrap(),
       certificate: certificate_and_key2,
       names: Vec::new(),
     })

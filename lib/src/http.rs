@@ -915,7 +915,7 @@ impl Listener {
   pub fn new(config: HttpListener, token: Token) -> Listener {
     Listener {
       listener: None,
-      address: config.front,
+      address: config.address,
       fronts:  Router::new(),
       answers: Rc::new(RefCell::new(HttpAnswers::new(&config.answer_404, &config.answer_503))),
       config,
@@ -929,8 +929,8 @@ impl Listener {
       return Some(self.token);
     }
 
-    let listener = tcp_listener.or_else(|| server_bind(&self.config.front).map_err(|e| {
-      error!("could not create listener {:?}: {:?}", self.config.front, e);
+    let listener = tcp_listener.or_else(|| server_bind(&self.config.address).map_err(|e| {
+      error!("could not create listener {:?}: {:?}", self.config.address, e);
     }).ok());
 
     if let Some(ref sock) = listener {
@@ -1137,11 +1137,11 @@ impl ProxyConfiguration<Session> for Proxy {
         }
       },
       ProxyRequestData::RemoveListener(remove) => {
-        debug!("removing HTTP listener at address {:?}", remove.front);
-        if !self.remove_listener(remove.front) {
+        debug!("removing HTTP listener at address {:?}", remove.address);
+        if !self.remove_listener(remove.address) {
           ProxyResponse {
               id: message.id,
-              status: ProxyResponseStatus::Error(format!("no HTTP listener to remove at address {:?}", remove.front)), 
+              status: ProxyResponseStatus::Error(format!("no HTTP listener to remove at address {:?}", remove.address)),
               data: None
           }
         } else {
@@ -1201,7 +1201,7 @@ impl ProxyConfiguration<Session> for Proxy {
         error!("error setting nodelay on front socket({:?}): {:?}", frontend_sock, e);
       }
       if let Some(c) = Session::new(frontend_sock, session_token, Rc::downgrade(&self.pool),
-      listener.config.public_address.unwrap_or(listener.config.front),
+      listener.config.public_address.unwrap_or(listener.config.address),
       listener.config.expect_proxy, listener.config.sticky_name.clone(), timeout,
       listener.answers.clone(), listener.token, delay) {
         if let Err(e) = poll.register(
@@ -1264,10 +1264,10 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
     Token(e.index().0)
   };
 
-  let front = config.front;
+  let address = config.address;
   let mut proxy = Proxy::new(pool.clone(), backends.clone());
   let _ = proxy.add_listener(config, token);
-  let _ = proxy.activate_listener(&mut event_loop, &front, None);
+  let _ = proxy.activate_listener(&mut event_loop, &address, None);
   let (scm_server, scm_client) = UnixStream::pair().unwrap();
   let scm = ScmSocket::new(scm_client.into_raw_fd());
   if let Err(e) = scm.send_listeners(&Listeners {
@@ -1326,9 +1326,9 @@ mod tests {
     start_server(1025, barrier.clone());
     barrier.wait();
 
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
+    let address: SocketAddr = FromStr::from_str("127.0.0.1:1024").expect("could not parse address");
     let config = HttpListener {
-      front,
+      address,
       ..Default::default()
     };
 
@@ -1382,9 +1382,9 @@ mod tests {
     start_server(1028, barrier.clone());
     barrier.wait();
 
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1031").expect("could not parse address");
+    let address: SocketAddr = FromStr::from_str("127.0.0.1:1031").expect("could not parse address");
     let config = HttpListener {
-      front,
+      address,
       ..Default::default()
     };
 
@@ -1459,9 +1459,9 @@ mod tests {
   #[test]
   fn https_redirect() {
     setup_test_logger!();
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1041").expect("could not parse address");
+    let address: SocketAddr = FromStr::from_str("127.0.0.1:1041").expect("could not parse address");
     let config = HttpListener {
-      front,
+      address,
       ..Default::default()
     };
 
@@ -1558,10 +1558,10 @@ mod tests {
                               path: PathRule::Prefix(uri3), position: RulePosition::Tree });
     fronts.add_http_front(HttpFrontend { route: Route::ClusterId("app_1".to_owned()), address: "0.0.0.0:80".parse().unwrap(), hostname: "other.domain".to_owned(), path: PathRule::Prefix("/test".to_owned()), position: RulePosition::Tree });
 
-    let front: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
+    let address: SocketAddr = FromStr::from_str("127.0.0.1:1030").expect("could not parse address");
     let listener = Listener {
       listener: None,
-      address:  front,
+      address:  address,
       fronts,
       answers: Rc::new(RefCell::new(HttpAnswers::new("HTTP/1.1 404 Not Found\r\n\r\n", "HTTP/1.1 503 your cluster is in deployment\r\n\r\n"))),
       config: Default::default(),

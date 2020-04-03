@@ -78,7 +78,7 @@ impl Listener {
 
     http_proxy_configuration.map(|addr| {
       let mut configuration = HttpListener {
-        front:          addr,
+        address:          addr,
         public_address: self.public_address,
         expect_proxy:   self.expect_proxy.unwrap_or(false),
         sticky_name:    self.sticky_name.clone(),
@@ -157,7 +157,7 @@ impl Listener {
 
     tls_proxy_configuration.map(|addr| {
       let mut configuration = HttpsListener {
-        front:           addr,
+        address:           addr,
         sticky_name:     self.sticky_name.clone(),
         public_address:  self.public_address,
         cipher_list,
@@ -207,7 +207,7 @@ impl Listener {
 
     addr_parsed.map(|addr| {
       TcpListener {
-        front:          addr,
+        address:          addr,
         public_address: self.public_address,
         expect_proxy:   self.expect_proxy.unwrap_or(false),
       }
@@ -496,7 +496,7 @@ impl HttpFrontendConfig {
     if self.key.is_some() && self.certificate.is_some() {
 
       v.push(ProxyRequestData::AddCertificate(AddCertificate{
-        front: self.address,
+        address: self.address,
         certificate: CertificateAndKey {
           key:               self.key.clone().unwrap(),
           certificate:       self.certificate.clone().unwrap(),
@@ -1017,7 +1017,7 @@ impl Config {
           version:  PROTOCOL_VERSION,
           worker_id: None,
           data:     CommandRequestData::Proxy(ProxyRequestData::ActivateListener(ActivateListener{
-            front:    listener.front,
+            address:    listener.address,
             proxy:    ListenerType::HTTP,
             from_scm: false,
           })),
@@ -1031,7 +1031,7 @@ impl Config {
           version:  PROTOCOL_VERSION,
           worker_id: None,
           data:     CommandRequestData::Proxy(ProxyRequestData::ActivateListener(ActivateListener{
-            front:    listener.front,
+            address:    listener.address,
             proxy:    ListenerType::HTTPS,
             from_scm: false,
           })),
@@ -1045,7 +1045,7 @@ impl Config {
           version:  PROTOCOL_VERSION,
           worker_id: None,
           data:     CommandRequestData::Proxy(ProxyRequestData::ActivateListener(ActivateListener{
-            front:    listener.front,
+            address:    listener.address,
             proxy:    ListenerType::TCP,
             from_scm: false,
           })),

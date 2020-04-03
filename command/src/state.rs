@@ -87,48 +87,48 @@ impl ConfigState {
         self.clusters.remove(cluster_id).is_some()
       },
       &ProxyRequestData::AddHttpListener(ref listener) => {
-        if self.http_listeners.contains_key(&listener.front) {
+        if self.http_listeners.contains_key(&listener.address) {
           false
         } else {
-          self.http_listeners.insert(listener.front, (listener.clone(), false));
+          self.http_listeners.insert(listener.address, (listener.clone(), false));
           true
         }
       },
       &ProxyRequestData::AddHttpsListener(ref listener) => {
-        if self.https_listeners.contains_key(&listener.front) {
+        if self.https_listeners.contains_key(&listener.address) {
           false
         } else {
-          self.https_listeners.insert(listener.front, (listener.clone(), false));
+          self.https_listeners.insert(listener.address, (listener.clone(), false));
           true
         }
       },
       &ProxyRequestData::AddTcpListener(ref listener) => {
-        if self.tcp_listeners.contains_key(&listener.front) {
+        if self.tcp_listeners.contains_key(&listener.address) {
           false
         } else {
-          self.tcp_listeners.insert(listener.front, (listener.clone(), false));
+          self.tcp_listeners.insert(listener.address, (listener.clone(), false));
           true
         }
       },
       &ProxyRequestData::RemoveListener(ref remove) => {
         match remove.proxy {
-          ListenerType::HTTP =>  self.http_listeners.remove(&remove.front).is_some(),
-          ListenerType::HTTPS => self.https_listeners.remove(&remove.front).is_some(),
-          ListenerType::TCP =>   self.tcp_listeners.remove(&remove.front).is_some(),
+          ListenerType::HTTP =>  self.http_listeners.remove(&remove.address).is_some(),
+          ListenerType::HTTPS => self.https_listeners.remove(&remove.address).is_some(),
+          ListenerType::TCP =>   self.tcp_listeners.remove(&remove.address).is_some(),
         }
       },
       &ProxyRequestData::ActivateListener(ref activate) => {
         match activate.proxy {
-          ListenerType::HTTP =>  self.http_listeners.get_mut(&activate.front).map(|t| t.1 = true).is_some(),
-          ListenerType::HTTPS => self.https_listeners.get_mut(&activate.front).map(|t| t.1 = true).is_some(),
-          ListenerType::TCP =>   self.tcp_listeners.get_mut(&activate.front).map(|t| t.1 = true).is_some(),
+          ListenerType::HTTP =>  self.http_listeners.get_mut(&activate.address).map(|t| t.1 = true).is_some(),
+          ListenerType::HTTPS => self.https_listeners.get_mut(&activate.address).map(|t| t.1 = true).is_some(),
+          ListenerType::TCP =>   self.tcp_listeners.get_mut(&activate.address).map(|t| t.1 = true).is_some(),
         }
       },
       &ProxyRequestData::DeactivateListener(ref deactivate) => {
         match deactivate.proxy {
-          ListenerType::HTTP =>  self.http_listeners.get_mut(&deactivate.front).map(|t| t.1 = false).is_some(),
-          ListenerType::HTTPS => self.https_listeners.get_mut(&deactivate.front).map(|t| t.1 = false).is_some(),
-          ListenerType::TCP =>   self.tcp_listeners.get_mut(&deactivate.front).map(|t| t.1 = false).is_some(),
+          ListenerType::HTTP =>  self.http_listeners.get_mut(&deactivate.address).map(|t| t.1 = false).is_some(),
+          ListenerType::HTTPS => self.https_listeners.get_mut(&deactivate.address).map(|t| t.1 = false).is_some(),
+          ListenerType::TCP =>   self.tcp_listeners.get_mut(&deactivate.address).map(|t| t.1 = false).is_some(),
         }
       },
       &ProxyRequestData::AddHttpFrontend(ref front) => {
@@ -153,21 +153,21 @@ impl ConfigState {
           }
         };
 
-        if !self.certificates.contains_key(&add.front) {
-          self.certificates.insert(add.front.clone(), HashMap::new());
+        if !self.certificates.contains_key(&add.address) {
+          self.certificates.insert(add.address.clone(), HashMap::new());
         }
-        if !self.certificates.get(&add.front).unwrap().contains_key(&fingerprint) {
-          self.certificates.get_mut(&add.front).unwrap().insert(fingerprint.clone(), (add.certificate.clone(), add.names.clone()));
+        if !self.certificates.get(&add.address).unwrap().contains_key(&fingerprint) {
+          self.certificates.get_mut(&add.address).unwrap().insert(fingerprint.clone(), (add.certificate.clone(), add.names.clone()));
           true
         } else {
           false
         }
       },
       &ProxyRequestData::RemoveCertificate(ref remove) => {
-        self.certificates.get_mut(&remove.front).and_then(|certs| certs.remove(&remove.fingerprint)).is_some()
+        self.certificates.get_mut(&remove.address).and_then(|certs| certs.remove(&remove.fingerprint)).is_some()
       },
       &ProxyRequestData::ReplaceCertificate(ref replace) => {
-        let changed = self.certificates.get_mut(&replace.front).and_then(|certs| certs.remove(&replace.old_fingerprint)).is_some();
+        let changed = self.certificates.get_mut(&replace.address).and_then(|certs| certs.remove(&replace.old_fingerprint)).is_some();
 
         let fingerprint = match calculate_fingerprint(&replace.new_certificate.certificate.as_bytes()[..]) {
           Some(f)  => CertificateFingerprint(f),
@@ -177,8 +177,8 @@ impl ConfigState {
           }
         };
 
-        if !self.certificates.get(&replace.front).unwrap().contains_key(&fingerprint) {
-          self.certificates.get_mut(&replace.front).map(|certs| certs.insert(fingerprint.clone(),
+        if !self.certificates.get(&replace.address).unwrap().contains_key(&fingerprint) {
+          self.certificates.get_mut(&replace.address).map(|certs| certs.insert(fingerprint.clone(),
             (replace.new_certificate.clone(), replace.new_names.clone())));
           true
         } else {
@@ -250,7 +250,7 @@ impl ConfigState {
       v.push(ProxyRequestData::AddHttpListener(listener.clone()));
       if active {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
-          front: listener.front.clone(),
+          address: listener.address.clone(),
           proxy: ListenerType::HTTP,
           from_scm: false
         }));
@@ -261,7 +261,7 @@ impl ConfigState {
       v.push(ProxyRequestData::AddHttpsListener(listener.clone()));
       if active {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
-          front: listener.front.clone(),
+          address: listener.address.clone(),
           proxy: ListenerType::HTTPS,
           from_scm: false
         }));
@@ -272,7 +272,7 @@ impl ConfigState {
       v.push(ProxyRequestData::AddTcpListener(listener.clone()));
       if active {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
-          front: listener.front.clone(),
+          address: listener.address.clone(),
           proxy: ListenerType::TCP,
           from_scm: false
         }));
@@ -290,7 +290,7 @@ impl ConfigState {
     for (ref front, ref certs) in self.certificates.iter() {
       for &(ref certificate_and_key, ref names) in certs.values() {
         v.push(ProxyRequestData::AddCertificate(AddCertificate{
-          front: **front,
+          address: **front,
           certificate: certificate_and_key.clone(),
           names: names.clone(),
         }));
@@ -320,7 +320,7 @@ impl ConfigState {
     let mut v = Vec::new();
     for front in self.http_listeners.iter().filter(|(_,t)| t.1).map(|(k,_)| k) {
       v.push(ProxyRequestData::ActivateListener(ActivateListener {
-        front: *front,
+        address: *front,
         proxy: ListenerType::HTTP,
         from_scm: false,
       }));
@@ -328,14 +328,14 @@ impl ConfigState {
 
     for front in self.https_listeners.iter().filter(|(_,t)| t.1).map(|(k,_)| k) {
       v.push(ProxyRequestData::ActivateListener(ActivateListener {
-        front: *front,
+        address: *front,
         proxy: ListenerType::HTTPS,
         from_scm: false,
       }));
     }
     for front in self.tcp_listeners.iter().filter(|(_,t)| t.1).map(|(k,_)| k) {
       v.push(ProxyRequestData::ActivateListener(ActivateListener {
-        front: *front,
+        address: *front,
         proxy: ListenerType::TCP,
         from_scm: false,
       }));
@@ -452,14 +452,14 @@ impl ConfigState {
     for address in removed_tcp_listeners {
       if self.tcp_listeners[address].1 {
         v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
-          front: **address,
+          address: **address,
           proxy: ListenerType::TCP,
           to_scm: false,
         }));
       }
 
       v.push(ProxyRequestData::RemoveListener(RemoveListener {
-        front: **address,
+        address: **address,
         proxy: ListenerType::TCP
       }));
     }
@@ -469,7 +469,7 @@ impl ConfigState {
 
       if other.tcp_listeners[address].1 {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
-          front: *address,
+          address: *address,
           proxy: ListenerType::TCP,
           from_scm: false,
         }));
@@ -479,14 +479,14 @@ impl ConfigState {
     for address in removed_http_listeners {
       if self.http_listeners[address].1 {
         v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
-          front: **address,
+          address: **address,
           proxy: ListenerType::HTTP,
           to_scm: false,
         }));
       }
 
       v.push(ProxyRequestData::RemoveListener(RemoveListener {
-        front: **address,
+        address: **address,
         proxy: ListenerType::HTTP
       }));
     }
@@ -496,7 +496,7 @@ impl ConfigState {
 
       if other.http_listeners[address].1 {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
-          front: *address,
+          address: *address,
           proxy: ListenerType::HTTP,
           from_scm: false,
         }));
@@ -506,14 +506,14 @@ impl ConfigState {
     for address in removed_https_listeners {
       if self.https_listeners[address].1 {
         v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
-          front: **address,
+          address: **address,
           proxy: ListenerType::HTTPS,
           to_scm: false,
         }));
       }
 
       v.push(ProxyRequestData::RemoveListener(RemoveListener {
-        front: **address,
+        address: **address,
         proxy: ListenerType::HTTPS
       }));
     }
@@ -523,7 +523,7 @@ impl ConfigState {
 
       if other.https_listeners[address].1 {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
-          front: *address,
+          address: *address,
           proxy: ListenerType::HTTPS,
           from_scm: false,
         }));
@@ -536,7 +536,7 @@ impl ConfigState {
 
       if my_listener != their_listener {
         v.push(ProxyRequestData::RemoveListener(RemoveListener {
-          front: **addr,
+          address: **addr,
           proxy: ListenerType::TCP
         }));
 
@@ -545,7 +545,7 @@ impl ConfigState {
 
       if *my_active && !*their_active {
         v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
-          front: **addr,
+          address: **addr,
           proxy: ListenerType::TCP,
           to_scm: false,
         }));
@@ -553,7 +553,7 @@ impl ConfigState {
 
       if !*my_active && *their_active {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
-          front: **addr,
+          address: **addr,
           proxy: ListenerType::TCP,
           from_scm: false,
         }));
@@ -566,7 +566,7 @@ impl ConfigState {
 
       if my_listener != their_listener {
         v.push(ProxyRequestData::RemoveListener(RemoveListener {
-          front: **addr,
+          address: **addr,
           proxy: ListenerType::HTTP
         }));
 
@@ -575,7 +575,7 @@ impl ConfigState {
 
       if *my_active && !*their_active {
         v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
-          front: **addr,
+          address: **addr,
           proxy: ListenerType::HTTP,
           to_scm: false,
         }));
@@ -583,7 +583,7 @@ impl ConfigState {
 
       if !*my_active && *their_active {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
-          front: **addr,
+          address: **addr,
           proxy: ListenerType::HTTP,
           from_scm: false,
         }));
@@ -596,7 +596,7 @@ impl ConfigState {
 
       if my_listener != their_listener {
         v.push(ProxyRequestData::RemoveListener(RemoveListener {
-          front: **addr,
+          address: **addr,
           proxy: ListenerType::HTTPS
         }));
 
@@ -605,7 +605,7 @@ impl ConfigState {
 
       if *my_active && !*their_active {
         v.push(ProxyRequestData::DeactivateListener(DeactivateListener {
-          front: **addr,
+          address: **addr,
           proxy: ListenerType::HTTPS,
           to_scm: false,
         }));
@@ -613,7 +613,7 @@ impl ConfigState {
 
       if !*my_active && *their_active {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
-          front: **addr,
+          address: **addr,
           proxy: ListenerType::HTTPS,
           from_scm: false,
         }));
@@ -629,9 +629,9 @@ impl ConfigState {
       v.push(ProxyRequestData::AddCluster(cluster.clone()));
     }
 
-    for &(front, _, &(ref certificate_and_key, ref names)) in added_certificates {
+    for &(address, _, &(ref certificate_and_key, ref names)) in added_certificates {
       v.push(ProxyRequestData::AddCertificate(AddCertificate{
-        front,
+        address,
         certificate: certificate_and_key.clone(),
         names: names.clone(),
       }));
@@ -673,9 +673,9 @@ impl ConfigState {
       v.push(ProxyRequestData::AddTcpFrontend(front.clone()));
     }
 
-    for  &(front, fingerprint, _) in removed_certificates {
+    for  &(address, fingerprint, _) in removed_certificates {
       v.push(ProxyRequestData::RemoveCertificate(RemoveCertificate {
-        front,
+        address,
         fingerprint: fingerprint.clone(),
         names: Vec::new(),
       }));
@@ -685,7 +685,7 @@ impl ConfigState {
       let listener = &other.tcp_listeners[address];
       if listener.1 {
         v.push(ProxyRequestData::ActivateListener(ActivateListener {
-          front: listener.0.front.clone(),
+          address: listener.0.address.clone(),
           proxy: ListenerType::TCP,
           from_scm: false
         }));
@@ -949,17 +949,17 @@ mod tests {
   fn listener_diff() {
     let mut state:ConfigState = Default::default();
     state.handle_order(&ProxyRequestData::AddTcpListener(TcpListener {
-      front: "0.0.0.0:1234".parse().unwrap(),
+      address: "0.0.0.0:1234".parse().unwrap(),
       public_address: None,
       expect_proxy: false,
     }));
     state.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
-      front: "0.0.0.0:1234".parse().unwrap(),
+      address: "0.0.0.0:1234".parse().unwrap(),
       proxy: ListenerType::TCP,
       from_scm: false,
     }));
     state.handle_order(&ProxyRequestData::AddHttpListener(HttpListener {
-      front: "0.0.0.0:8080".parse().unwrap(),
+      address: "0.0.0.0:8080".parse().unwrap(),
       public_address: None,
       expect_proxy: false,
       answer_404: String::new(),
@@ -967,7 +967,7 @@ mod tests {
       sticky_name: String::new(),
     }));
     state.handle_order(&ProxyRequestData::AddHttpsListener(HttpsListener {
-      front: "0.0.0.0:8443".parse().unwrap(),
+      address: "0.0.0.0:8443".parse().unwrap(),
       public_address: None,
       expect_proxy: false,
       answer_404: String::new(),
@@ -979,19 +979,19 @@ mod tests {
       tls_provider: TlsProvider::Openssl,
     }));
     state.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
-      front: "0.0.0.0:8443".parse().unwrap(),
+      address: "0.0.0.0:8443".parse().unwrap(),
       proxy: ListenerType::HTTPS,
       from_scm: false,
     }));
 
     let mut state2:ConfigState = Default::default();
     state2.handle_order(&ProxyRequestData::AddTcpListener(TcpListener {
-      front: "0.0.0.0:1234".parse().unwrap(),
+      address: "0.0.0.0:1234".parse().unwrap(),
       public_address: None,
       expect_proxy: true,
     }));
     state2.handle_order(&ProxyRequestData::AddHttpListener(HttpListener {
-      front: "0.0.0.0:8080".parse().unwrap(),
+      address: "0.0.0.0:8080".parse().unwrap(),
       public_address: None,
       expect_proxy: false,
       answer_404: "test".to_string(),
@@ -999,12 +999,12 @@ mod tests {
       sticky_name: String::new(),
     }));
     state2.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
-      front: "0.0.0.0:8080".parse().unwrap(),
+      address: "0.0.0.0:8080".parse().unwrap(),
       proxy: ListenerType::HTTP,
       from_scm: false,
     }));
     state2.handle_order(&ProxyRequestData::AddHttpsListener(HttpsListener {
-      front: "0.0.0.0:8443".parse().unwrap(),
+      address: "0.0.0.0:8443".parse().unwrap(),
       public_address: None,
       expect_proxy: false,
       answer_404: String::from("test"),
@@ -1016,32 +1016,32 @@ mod tests {
       tls_provider: TlsProvider::Openssl,
     }));
     state2.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
-      front: "0.0.0.0:8443".parse().unwrap(),
+      address: "0.0.0.0:8443".parse().unwrap(),
       proxy: ListenerType::HTTPS,
       from_scm: false,
     }));
 
     let e = vec!(
       ProxyRequestData::RemoveListener(RemoveListener {
-        front: "0.0.0.0:1234".parse().unwrap(),
+        address: "0.0.0.0:1234".parse().unwrap(),
         proxy: ListenerType::TCP,
       }),
       ProxyRequestData::AddTcpListener(TcpListener {
-        front: "0.0.0.0:1234".parse().unwrap(),
+        address: "0.0.0.0:1234".parse().unwrap(),
         public_address: None,
         expect_proxy: true,
       }),
       ProxyRequestData::DeactivateListener(DeactivateListener {
-        front: "0.0.0.0:1234".parse().unwrap(),
+        address: "0.0.0.0:1234".parse().unwrap(),
         proxy: ListenerType::TCP,
         to_scm: false,
       }),
       ProxyRequestData::RemoveListener(RemoveListener {
-        front: "0.0.0.0:8080".parse().unwrap(),
+        address: "0.0.0.0:8080".parse().unwrap(),
         proxy: ListenerType::HTTP,
       }),
       ProxyRequestData::AddHttpListener(HttpListener {
-        front: "0.0.0.0:8080".parse().unwrap(),
+        address: "0.0.0.0:8080".parse().unwrap(),
         public_address: None,
         expect_proxy: false,
         answer_404: String::from("test"),
@@ -1049,16 +1049,16 @@ mod tests {
         sticky_name: String::new(),
       }),
       ProxyRequestData::ActivateListener(ActivateListener {
-        front: "0.0.0.0:8080".parse().unwrap(),
+        address: "0.0.0.0:8080".parse().unwrap(),
         proxy: ListenerType::HTTP,
         from_scm: false,
       }),
       ProxyRequestData::RemoveListener(RemoveListener {
-        front: "0.0.0.0:8443".parse().unwrap(),
+        address: "0.0.0.0:8443".parse().unwrap(),
         proxy: ListenerType::HTTPS,
       }),
       ProxyRequestData::AddHttpsListener(HttpsListener {
-        front: "0.0.0.0:8443".parse().unwrap(),
+        address: "0.0.0.0:8443".parse().unwrap(),
         public_address: None,
         expect_proxy: false,
         answer_404: String::from("test"),

@@ -28,7 +28,7 @@ fn main() {
     let max_buffers   = 500;
     let buffer_size   = 16384;
     let listener = TcpListener {
-      front: "127.0.0.1:8080".parse().unwrap(),
+      address: "127.0.0.1:8080".parse().unwrap(),
       public_address: None,
       expect_proxy: false,
     };

@@ -102,7 +102,7 @@ impl Listener {
     }
 
     Listener {
-      address:    config.front.clone(),
+      address:    config.address.clone(),
       fronts:     Router::new(),
       answers:    Rc::new(RefCell::new(HttpAnswers::new(&config.answer_404, &config.answer_503))),
       ssl_config: Arc::new(server_config),
@@ -119,8 +119,8 @@ impl Listener {
       return Some(self.token);
     }
 
-    let listener = tcp_listener.or_else(|| server_bind(&self.config.front).map_err(|e| {
-      error!("could not create listener {:?}: {:?}", self.config.front, e);
+    let listener = tcp_listener.or_else(|| server_bind(&self.config.address).map_err(|e| {
+      error!("could not create listener {:?}: {:?}", self.config.address, e);
     }).ok());
 
 
@@ -158,14 +158,14 @@ impl Listener {
 
   pub fn replace_certificate(&mut self, replace_certificate: ReplaceCertificate) {
     debug!("replacing certificate {:?}", replace_certificate);
-    let ReplaceCertificate { front, new_certificate, old_fingerprint, old_names, new_names } = replace_certificate;
+    let ReplaceCertificate { address, new_certificate, old_fingerprint, old_names, new_names } = replace_certificate;
     let remove = RemoveCertificate {
-      front,
+      address,
       fingerprint: old_fingerprint,
       names: old_names,
     };
     let add = AddCertificate {
-      front,
+      address,
       certificate: new_certificate,
       names: new_names,
     };
@@ -426,7 +426,7 @@ impl ProxyConfiguration<Session> for Proxy {
 
         let session = ServerSession::new(&listener.ssl_config);
         let c = Session::new(session, frontend_sock, session_token, Rc::downgrade(&self.pool),
-          listener.config.public_address.unwrap_or(listener.config.front),
+          listener.config.public_address.unwrap_or(listener.config.address),
           listener.config.expect_proxy, listener.config.sticky_name.clone(),
           timeout, listener.answers.clone(), Token(token.0), delay);
 
@@ -557,7 +557,7 @@ impl ProxyConfiguration<Session> for Proxy {
         }
       },
       ProxyRequestData::AddCertificate(add_certificate) => {
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == add_certificate.front) {
+        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == add_certificate.address) {
           listener.add_certificate(add_certificate);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
@@ -566,7 +566,7 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::RemoveCertificate(remove_certificate) => {
         //FIXME: should return an error if certificate still has fronts referencing it
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == remove_certificate.front) {
+        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == remove_certificate.address) {
           listener.remove_certificate(remove_certificate);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
@@ -575,7 +575,7 @@ impl ProxyConfiguration<Session> for Proxy {
       },
       ProxyRequestData::ReplaceCertificate(replace_certificate) => {
         //FIXME: should return an error if certificate still has fronts referencing it
-        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == replace_certificate.front) {
+        if let Some(listener) = self.listeners.values_mut().find(|l| l.address == replace_certificate.address) {
           listener.replace_certificate(replace_certificate);
           ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
         } else {
@@ -583,11 +583,11 @@ impl ProxyConfiguration<Session> for Proxy {
         }
       },
       ProxyRequestData::RemoveListener(remove) => {
-        debug!("removing HTTPS listener at address: {:?}", remove.front);
-        if !self.remove_listener(remove.front) {
+        debug!("removing HTTPS listener at address: {:?}", remove.address);
+        if !self.remove_listener(remove.address) {
           ProxyResponse {
               id: message.id,
-              status: ProxyResponseStatus::Error(format!("no HTTPS listener to remove at address {:?}", remove.front)),
+              status: ProxyResponseStatus::Error(format!("no HTTPS listener to remove at address {:?}", remove.address)),
               data: None
           }
         } else {
@@ -700,10 +700,10 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
     Token(e.index().0)
   };
 
-  let front = config.front.clone();
+  let address = config.address.clone();
   let mut configuration = Proxy::new(pool.clone(), backends.clone());
   if configuration.add_listener(config, token).is_some() &&
-    configuration.activate_listener(&mut event_loop, &front, None).is_some() {
+    configuration.activate_listener(&mut event_loop, &address, None).is_some() {
       let (scm_server, _scm_client) = UnixStream::pair().unwrap();
       let mut server_config: server::ServerConfig = Default::default();
       server_config.max_connections = max_buffers;
