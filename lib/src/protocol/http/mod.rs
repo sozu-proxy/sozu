@@ -448,8 +448,10 @@ impl<Front:SocketHandler> Http<Front> {
     let wait_time  = metrics.wait_time;
 
     let app_id = OptionalString::new(self.app_id.as_ref().map(|s| s.as_str()));
-    time!("request_time", app_id.as_str(), response_time.whole_milliseconds());
+    time!("response_time", app_id.as_str(), response_time.whole_milliseconds());
     time!("service_time", app_id.as_str(), service_time.whole_milliseconds());
+    time!("response_time", response_time.whole_milliseconds());
+    time!("service_time", service_time.whole_milliseconds());
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
@@ -490,8 +492,11 @@ impl<Front:SocketHandler> Http<Front> {
     let service_time  = metrics.service_time();
 
     if let Some(ref app_id) = self.app_id {
-      time!("http.request.time", &app_id, response_time.whole_milliseconds());
+      time!("response_time", &app_id, response_time.whole_milliseconds());
+      time!("service_time", &app_id, service_time.whole_milliseconds());
     }
+    time!("response_time", response_time.whole_milliseconds());
+    time!("service_time", service_time.whole_milliseconds());
     incr!("http.errors");
 
     let proto = self.protocol_string();
@@ -518,6 +523,12 @@ impl<Front:SocketHandler> Http<Front> {
     let response_time = metrics.response_time();
     let service_time  = metrics.service_time();
 
+    if let Some(ref app_id) = self.app_id {
+      time!("response_time", &app_id, response_time.whole_milliseconds());
+      time!("service_time", &app_id, service_time.whole_milliseconds());
+    }
+    time!("response_time", response_time.whole_milliseconds());
+    time!("service_time", service_time.whole_milliseconds());
     incr!("http.errors");
     /*
     let app_id = self.app_id.clone().unwrap_or(String::from("-"));

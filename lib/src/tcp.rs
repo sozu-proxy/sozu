@@ -147,7 +147,8 @@ impl Session {
     let response_time = self.metrics.response_time().whole_milliseconds();
     let service_time  = self.metrics.service_time().whole_milliseconds();
     let app_id = self.app_id.clone().unwrap_or_else(|| String::from("-"));
-    time!("request_time", &app_id, response_time);
+    time!("response_time", &app_id, response_time);
+    time!("response_time", response_time);
 
     if let Some(backend_id) = self.metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = self.metrics.backend_response_time() {
