@@ -280,7 +280,7 @@ macro_rules! gauge_add (
 
 #[macro_export]
 macro_rules! time (
-  ($key:expr, $value: expr) => {
+  ($key:expr, $value: expr) => ({
     use $crate::metrics::{MetricData,Subscriber};
     let v = $value;
     $crate::metrics::METRICS.with(|metrics| {
@@ -288,7 +288,7 @@ macro_rules! time (
 
       m.receive_metric($key, None, None, MetricData::Time(v as usize));
     });
-  };
+  });
   ($key:expr, $cluster_id:expr, $value: expr) => ({
     use $crate::metrics::{MetricData,Subscriber};
     let v = $value;
