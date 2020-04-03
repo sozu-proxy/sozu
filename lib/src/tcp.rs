@@ -809,7 +809,7 @@ impl Listener {
       cluster_id: None,
       listener: None,
       token,
-      address: config.front,
+      address: config.address,
       pool,
       config,
       active: false,
@@ -821,8 +821,8 @@ impl Listener {
       return Some(self.token);
     }
 
-    let mut listener = tcp_listener.or_else(|| server_bind(&self.config.front).map_err(|e| {
-      error!("could not create listener {:?}: {:?}", self.config.front, e);
+    let mut listener = tcp_listener.or_else(|| server_bind(&self.config.address).map_err(|e| {
+      error!("could not create listener {:?}: {:?}", self.config.address, e);
     }).ok());
 
 
@@ -906,8 +906,8 @@ impl Proxy {
     })
   }
 
-  pub fn add_tcp_front(&mut self, cluster_id: &str, front: &SocketAddr) -> bool {
-    if let Some(listener) = self.listeners.values_mut().find(|l| l.address == *front) {
+  pub fn add_tcp_front(&mut self, cluster_id: &str, address: &SocketAddr) -> bool {
+    if let Some(listener) = self.listeners.values_mut().find(|l| l.address == *address) {
       self.fronts.insert(cluster_id.to_string(), listener.token);
       //info!("add_tcp_front: fronts are now: {:?}", self.fronts);
       listener.cluster_id = Some(cluster_id.to_string());
@@ -917,8 +917,8 @@ impl Proxy {
     }
   }
 
-  pub fn remove_tcp_front(&mut self, front: SocketAddr) -> bool {
-    if let Some(listener) = self.listeners.values_mut().find(|l| l.address == front) {
+  pub fn remove_tcp_front(&mut self, address: SocketAddr) -> bool {
+    if let Some(listener) = self.listeners.values_mut().find(|l| l.address == address) {
       if let Some(cluster_id) = listener.cluster_id.take() {
         self.fronts.remove(&cluster_id);
       }
@@ -1033,10 +1033,10 @@ impl ProxyConfiguration<Session> for Proxy {
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::RemoveListener(remove) => {
-        if !self.remove_listener(remove.front) {
+        if !self.remove_listener(remove.address) {
           ProxyResponse {
               id: message.id,
-              status: ProxyResponseStatus::Error(format!("no TCP listener to remove at address {:?}", remove.front)), 
+              status: ProxyResponseStatus::Error(format!("no TCP listener to remove at address {:?}", remove.address)),
               data: None
           }
         } else {
@@ -1151,10 +1151,10 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
     Token(key)
   };
 
-  let front = config.front;
+  let address = config.address;
   let mut configuration = Proxy::new(backends.clone());
   let _ = configuration.add_listener(config, pool.clone(), token);
-  let _ = configuration.activate_listener(&mut poll, &front, None);
+  let _ = configuration.activate_listener(&mut poll, &address, None);
   let (scm_server, _scm_client) = UnixStream::pair().unwrap();
 
   let mut server_config: server::ServerConfig = Default::default();
@@ -1312,7 +1312,7 @@ mod tests {
 
       let mut configuration = Proxy::new(backends.clone());
       let listener_config = TcpListenerConfig {
-        front: "127.0.0.1:1234".parse().unwrap(),
+        address: "127.0.0.1:1234".parse().unwrap(),
         public_address: None,
         expect_proxy: false,
         front_timeout: 60,
@@ -1321,10 +1321,10 @@ mod tests {
       };
 
       {
-        let front = listener_config.front.clone();
+        let address = listener_config.address.clone();
         let entry = sessions.vacant_entry();
         let _ = configuration.add_listener(listener_config, pool.clone(), Token(entry.key()));
-        let _ = configuration.activate_listener(&mut poll, &front, None);
+        let _ = configuration.activate_listener(&mut poll, &address, None);
         entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::TCPListen })));
       }
 
