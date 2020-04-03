@@ -201,8 +201,7 @@ impl<Front:SocketHandler> Http<Front> {
       };
     }
 
-    let buf = buf.unwrap_or_else(|| self.answers.borrow().get(DefaultAnswerStatus::Answer502,
-      self.cluster_id.as_deref()));
+    let buf = buf.unwrap_or_else(|| self.answers.borrow().get(answer, self.cluster_id.as_deref()));
     self.status = SessionStatus::DefaultAnswer(answer, buf, 0);
     self.front_readiness.interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
     self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
