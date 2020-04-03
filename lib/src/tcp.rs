@@ -405,15 +405,16 @@ impl Session {
 
       self.backend.as_ref().map(|backend| {
         let ref mut backend = *backend.borrow_mut();
-        let was_unavailable = backend.retry_policy.is_down();
 
-        //successful connection, reset failure counter
+        if backend.retry_policy.is_down() {
+          incr!("up", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+          info!("backend server {} at {} is up", backend.backend_id, backend.address);
+          push_event(ProxyEvent::BackendUp(backend.backend_id.clone(), backend.address));
+        }
+
+        //successful connection, rest failure counter
         backend.failures = 0;
         backend.retry_policy.succeed();
-
-        if was_unavailable {
-            incr!("up", self.app_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
-        }
       });
     }
   }
