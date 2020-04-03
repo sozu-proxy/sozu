@@ -353,7 +353,14 @@ impl Session {
       gauge_add!("connections", 1, self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
       self.backend.as_ref().map(|backend| {
         let ref mut backend = *backend.borrow_mut();
-        //successful connection, rest failure counter
+
+        if backend.retry_policy.is_down() {
+          incr!("up", self.cluster_id.as_ref().map(|s| s.as_str()), self.metrics.backend_id.as_ref().map(|s| s.as_str()));
+          info!("backend server {} at {} is up", backend.backend_id, backend.address);
+          push_event(ProxyEvent::BackendUp(backend.backend_id.clone(), backend.address));
+        }
+
+        //successful connection, reset failure counter
         backend.failures = 0;
         backend.retry_policy.succeed();
       });

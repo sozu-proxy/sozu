@@ -109,6 +109,7 @@ struct SaveStateData {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Event {
   BackendDown(String, SocketAddr),
+  BackendUp(String, SocketAddr),
   NoAvailableBackends(String),
 }
 
@@ -116,6 +117,7 @@ impl From<ProxyEvent> for Event {
   fn from(e: ProxyEvent) -> Self {
     match e {
       ProxyEvent::BackendDown(id, addr) => Event::BackendDown(id, addr),
+      ProxyEvent::BackendUp(id, addr) => Event::BackendUp(id, addr),
       ProxyEvent::NoAvailableBackends(cluster_id) => Event::NoAvailableBackends(cluster_id),
     }
   }

@@ -109,6 +109,7 @@ pub struct BackendMetricsData {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum ProxyEvent {
   BackendDown(String, SocketAddr),
+  BackendUp(String, SocketAddr),
   NoAvailableBackends(String),
 }
 
