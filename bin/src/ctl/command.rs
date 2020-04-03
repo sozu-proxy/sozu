@@ -1082,7 +1082,7 @@ pub fn add_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout
                                                        certificate_chain_path,
                                                        key_path, versions)? {
     order_command(channel, timeout, ProxyRequestData::AddCertificate(AddCertificate {
-      front: address,
+      address,
       certificate: new_certificate,
       names,
     }))?;
@@ -1111,8 +1111,8 @@ pub fn remove_certificate(channel: Channel<CommandRequest,CommandResponse>, time
     }
   }).or(certificate_path.and_then(get_certificate_fingerprint)) {
     order_command(channel, timeout, ProxyRequestData::RemoveCertificate(RemoveCertificate {
-      front: address,
-      fingerprint: fingerprint,
+      address,
+      fingerprint,
       names: Vec::new(),
     }))?
   }
@@ -1145,7 +1145,7 @@ pub fn replace_certificate(channel: Channel<CommandRequest,CommandResponse>, tim
         }
     }).or(old_certificate_path.and_then(get_certificate_fingerprint)) {
       order_command(channel, timeout, ProxyRequestData::ReplaceCertificate(ReplaceCertificate {
-        front: address,
+        address,
         new_certificate,
         old_fingerprint,
         new_names: Vec::new(),
@@ -1216,7 +1216,7 @@ pub fn add_tcp_listener(channel: Channel<CommandRequest,CommandResponse>, timeou
   public_address: Option<SocketAddr>, expect_proxy: bool)
   -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::AddTcpListener(TcpListener {
-    front: address,
+    address,
     public_address,
     expect_proxy,
     front_timeout: 60,
@@ -1228,7 +1228,7 @@ pub fn add_tcp_listener(channel: Channel<CommandRequest,CommandResponse>, timeou
 pub fn remove_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType)
   -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::RemoveListener(RemoveListener {
-    front: address,
+    address,
     proxy
   }))
 }
@@ -1236,7 +1236,7 @@ pub fn remove_listener(channel: Channel<CommandRequest,CommandResponse>, timeout
 pub fn activate_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType)
 -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::ActivateListener(ActivateListener {
-    front: address,
+    address,
     proxy,
     from_scm: false
   }))
@@ -1245,7 +1245,7 @@ pub fn activate_listener(channel: Channel<CommandRequest,CommandResponse>, timeo
 pub fn deactivate_listener(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr, proxy: ListenerType)
   -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::DeactivateListener(DeactivateListener {
-    front: address,
+    address,
     proxy,
     to_scm: false
   }))

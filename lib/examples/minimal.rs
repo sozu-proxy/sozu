@@ -21,7 +21,7 @@ fn main() {
   info!("starting up");
 
   let config = proxy::HttpListener {
-    front: "127.0.0.1:8080".parse().expect("could not parse address"),
+    address: "127.0.0.1:8080".parse().expect("could not parse address"),
     ..Default::default()
   };
 

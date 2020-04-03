@@ -341,7 +341,7 @@ pub struct CertificateAndKey {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct AddCertificate {
-    pub front:       SocketAddr,
+    pub address:     SocketAddr,
     pub certificate: CertificateAndKey,
     #[serde(default)]
     #[serde(skip_serializing_if="Vec::is_empty")]
@@ -350,7 +350,7 @@ pub struct AddCertificate {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct RemoveCertificate {
-    pub front:       SocketAddr,
+    pub address:     SocketAddr,
     pub fingerprint: CertificateFingerprint,
     #[serde(default)]
     #[serde(skip_serializing_if="Vec::is_empty")]
@@ -359,7 +359,7 @@ pub struct RemoveCertificate {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct ReplaceCertificate {
-    pub front:           SocketAddr,
+    pub address:         SocketAddr,
     pub new_certificate: CertificateAndKey,
     pub old_fingerprint: CertificateFingerprint,
     #[serde(default)]
@@ -514,27 +514,27 @@ pub enum ListenerType {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct RemoveListener {
-  pub front: SocketAddr,
-  pub proxy: ListenerType,
+  pub address: SocketAddr,
+  pub proxy:   ListenerType,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct ActivateListener {
-  pub front:    SocketAddr,
+  pub address:  SocketAddr,
   pub proxy:    ListenerType,
   pub from_scm: bool,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct DeactivateListener {
-  pub front:  SocketAddr,
-  pub proxy:  ListenerType,
-  pub to_scm: bool,
+  pub address: SocketAddr,
+  pub proxy:   ListenerType,
+  pub to_scm:  bool,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpListener {
-    pub front:          SocketAddr,
+    pub address:        SocketAddr,
     pub public_address: Option<SocketAddr>,
     pub answer_404:     String,
     pub answer_503:     String,
@@ -556,7 +556,7 @@ pub struct HttpListener {
 impl Default for HttpListener {
   fn default() -> HttpListener {
     HttpListener {
-      front:           "127.0.0.1:8080".parse().expect("could not parse address"),
+      address:           "127.0.0.1:8080".parse().expect("could not parse address"),
       public_address:  None,
       answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
       answer_503:      String::from("HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
@@ -632,7 +632,7 @@ impl error::Error for ParseErrorTlsVersion {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct HttpsListener {
-    pub front:              SocketAddr,
+    pub address:            SocketAddr,
     pub public_address:     Option<SocketAddr>,
     pub answer_404:         String,
     pub answer_503:         String,
@@ -661,7 +661,7 @@ pub struct HttpsListener {
 impl Default for HttpsListener {
   fn default() -> HttpsListener {
     HttpsListener {
-      front:           "127.0.0.1:8443".parse().expect("could not parse address"),
+      address:         "127.0.0.1:8443".parse().expect("could not parse address"),
       public_address:  None,
       answer_404:      String::from("HTTP/1.1 404 Not Found\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
       answer_503:      String::from("HTTP/1.1 503 Service Unavailable\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
@@ -697,7 +697,7 @@ impl Default for HttpsListener {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct TcpListener {
-  pub front:          SocketAddr,
+  pub address:        SocketAddr,
   #[serde(default)]
   #[serde(skip_serializing_if = "Option::is_none")]
   pub public_address: Option<SocketAddr>,
