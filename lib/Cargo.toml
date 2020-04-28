@@ -45,6 +45,7 @@ iovec = "0.1.4"
 memchr = "2.3"
 foreign-types-shared = "0.1"
 poule = "0.3.2"
+lazycell = "1.2"
 
 [dev-dependencies]
 tiny_http = "^0.8"

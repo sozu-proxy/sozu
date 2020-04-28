@@ -1347,6 +1347,7 @@ dependencies = [
  "hdrhistogram",
  "idna",
  "iovec",
+ "lazycell",
  "libc",
  "log",
  "memchr",

@@ -9,7 +9,6 @@ use std::io::{ErrorKind,Read};
 use time::{Instant, Duration};
 use rusty_ulid::Ulid;
 use rustls::{ServerSession,Session as ClientSession,ProtocolVersion,SupportedCipherSuite,CipherSuite};
-use mio_extras::timer::{Timer, Timeout};
 use sozu_command::buffer::fixed::Buffer;
 use sozu_command::proxy::ProxyEvent;
 
@@ -26,6 +25,7 @@ use retry::RetryPolicy;
 use util::UnwrapLog;
 use buffer_queue::BufferQueue;
 use server::{push_event, TIMER};
+use timer::{Timer, Timeout};
 
 pub enum State {
   Expect(ExpectProxyProtocol<TcpStream>, ServerSession),

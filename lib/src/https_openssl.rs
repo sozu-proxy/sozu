@@ -24,7 +24,6 @@ use openssl::hash::MessageDigest;
 use openssl::nid;
 use openssl::error::ErrorStack;
 use openssl::ssl::SslVersion;
-use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Application,CertFingerprint,CertificateAndKey,
@@ -50,6 +49,7 @@ use protocol::http::{DefaultAnswerStatus, TimeoutStatus};
 use protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use retry::RetryPolicy;
 use util::UnwrapLog;
+use timer::{Timer,Timeout};
 
 #[derive(Debug,Clone,PartialEq,Eq)]
 pub struct TlsApp {
