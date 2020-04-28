@@ -110,6 +110,10 @@ impl ServerConfig {
       accept_queue_timeout: config.accept_queue_timeout,
     }
   }
+
+  pub fn slab_capacity(&self) -> usize {
+    10+2*self.max_connections
+  }
 }
 
 impl Default for ServerConfig {
@@ -134,7 +138,7 @@ pub struct Server {
   tcp:             tcp::Proxy,
   config_state:    ConfigState,
   scm:             ScmSocket,
-  sessions:        Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken>,
+  sessions:        Slab<Rc<RefCell<dyn ProxySessionCast>>>,
   max_connections: usize,
   nb_connections:  usize,
   front_timeout:   time::Duration,
@@ -152,36 +156,36 @@ impl Server {
     let event_loop  = Poll::new().expect("could not create event loop");
     let pool = Rc::new(RefCell::new(Pool::with_capacity(config.min_buffers, config.max_buffers, config.buffer_size)));
     let backends = Rc::new(RefCell::new(BackendMap::new()));
+    let server_config = ServerConfig::from_config(&config);
 
     //FIXME: we will use a few entries for the channel, metrics socket and the listeners
     //FIXME: for HTTP/2, we will have more than 2 entries per session
-    let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken> = Slab::with_capacity(10+2*config.max_connections);
+    let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>> = Slab::with_capacity(server_config.slab_capacity());
     {
-      let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
-      trace!("taking token {:?} for channel", entry.index());
+      let entry = sessions.vacant_entry();
+      trace!("taking token {:?} for channel", SessionToken(entry.key()));
       entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::Channel })));
     }
     {
-      let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
-      trace!("taking token {:?} for metrics", entry.index());
+      let entry = sessions.vacant_entry();
+      trace!("taking token {:?} for metrics", SessionToken(entry.key()));
       entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::Timer })));
     }
     {
-      let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
-      trace!("taking token {:?} for metrics", entry.index());
+      let entry = sessions.vacant_entry();
+      trace!("taking token {:?} for metrics", SessionToken(entry.key()));
       entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::Metrics })));
     }
 
     let use_openssl = config.tls_provider == TlsProvider::Openssl;
     let https = HttpsProvider::new(use_openssl, pool.clone(), backends.clone());
 
-    let server_config = ServerConfig::from_config(&config);
     Server::new(event_loop, channel, scm, sessions, pool, backends, None,
                 Some(https), None, server_config, Some(config_state), expects_initial_status)
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
-    sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken>,
+    sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>>,
     pool: Rc<RefCell<Pool>>,
     backends: Rc<RefCell<BackendMap>>,
     http: Option<http::Proxy>,
@@ -280,6 +284,10 @@ impl Server {
     server.scm_listeners = listeners;
 
     server
+  }
+
+  pub fn slab_capacity(&self) -> usize {
+    10+2*self.max_connections
   }
 }
 
@@ -414,7 +422,7 @@ impl Server {
 
         let mut count = 0;
         let duration = self.zombie_check_interval;
-        for session in self.sessions.iter_mut().filter(|c| {
+        for (index, session) in self.sessions.iter_mut().filter(|(_, c)| {
           now - c.borrow().last_event() > duration
         }) {
           let t = session.borrow().tokens();
@@ -441,7 +449,8 @@ impl Server {
           let mut remaining = 0;
           for tk in tokens.into_iter() {
             let cl = self.to_session(tk);
-            if self.sessions.remove(cl).is_some() {
+            if self.sessions.contains(cl.0) {
+              self.sessions.remove(cl.0);
               remaining += 1;
             }
           }
@@ -463,9 +472,9 @@ impl Server {
       if self.shutting_down.is_some() {
         let mut closing_tokens = HashSet::new();
         for session in self.sessions.iter_mut() {
-          let res = session.borrow_mut().shutting_down();
+          let res = session.1.borrow_mut().shutting_down();
           if let SessionResult::CloseSession = res {
-            let t = session.borrow().tokens();
+            let t = session.1.borrow().tokens();
             closing_tokens.insert(t[0]);
           }
         }
@@ -642,9 +651,7 @@ impl Server {
             return;
           }*/
 
-          let entry = self.sessions.vacant_entry();
-
-          if entry.is_none() {
+          if self.sessions.len() >= self.slab_capacity() {
             push_queue(ProxyResponse {
               id: id.to_string(),
               status: ProxyResponseStatus::Error(String::from("session list is full, cannot add a listener")),
@@ -653,8 +660,8 @@ impl Server {
             return;
           }
 
-          let entry = entry.unwrap();
-          let token = Token(entry.index().0);
+          let entry = self.sessions.vacant_entry();
+          let token = Token(entry.key());
 
           let status = if self.http.add_listener(listener.clone(), token).is_some() {
             entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
@@ -706,8 +713,9 @@ impl Server {
                   if let Err(e) = self.poll.deregister(&listener) {
                       error!("error deregistering HTTP listen socket({:?}): {:?}", deactivate, e);
                   }
-                  if self.sessions.remove(token.0.into()).is_some() {
-                      info!("removed listen token {:?}", token);
+                  if self.sessions.contains(token.0) {
+                    self.sessions.remove(token.0);
+                    info!("removed listen token {:?}", token);
                   }
 
                   if deactivate.to_scm {
@@ -756,9 +764,7 @@ impl Server {
             return;
           }*/
 
-          let entry = self.sessions.vacant_entry();
-
-          if entry.is_none() {
+          if self.sessions.len() >= self.slab_capacity() {
             push_queue(ProxyResponse {
               id: id.to_string(),
               status: ProxyResponseStatus::Error(String::from("session list is full, cannot add a listener")),
@@ -767,8 +773,8 @@ impl Server {
             return;
           }
 
-          let entry = entry.unwrap();
-          let token = Token(entry.index().0);
+          let entry = self.sessions.vacant_entry();
+          let token = Token(entry.key());
 
           let status = if self.https.add_listener(listener.clone(), token).is_some() {
             entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPSListen })));
@@ -820,8 +826,9 @@ impl Server {
                   if let Err(e) = self.poll.deregister(&listener) {
                       error!("error deregistering HTTPS listen socket({:?}): {:?}", deactivate, e);
                   }
-                  if self.sessions.remove(token.0.into()).is_some() {
-                      info!("removed listen token {:?}", token);
+                  if self.sessions.contains(token.0) {
+                    self.sessions.remove(token.0);
+                    info!("removed listen token {:?}", token);
                   }
 
                   if deactivate.to_scm {
@@ -870,9 +877,7 @@ impl Server {
           }
           */
 
-          let entry = self.sessions.vacant_entry();
-
-          if entry.is_none() {
+          if self.sessions.len() >= self.slab_capacity() {
             push_queue(ProxyResponse {
               id,
               status: ProxyResponseStatus::Error(String::from("session list is full, cannot add a listener")),
@@ -881,8 +886,8 @@ impl Server {
             return;
           }
 
-          let entry = entry.unwrap();
-          let token = Token(entry.index().0);
+          let entry = self.sessions.vacant_entry();
+          let token = Token(entry.key());
 
           let status = if self.tcp.add_listener(listener.clone(), self.pool.clone(), token).is_some() {
             entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::TCPListen })));
@@ -933,8 +938,9 @@ impl Server {
                   if let Err(e) = self.poll.deregister(&listener) {
                       error!("error deregistering TCP listen socket({:?}): {:?}", deactivate, e);
                   }
-                  if self.sessions.remove(token.0.into()).is_some() {
-                      info!("removed listen token {:?}", token);
+                  if self.sessions.contains(token.0) {
+                    self.sessions.remove(token.0);
+                    info!("removed listen token {:?}", token);
                   }
 
                   if deactivate.to_scm {
@@ -1016,14 +1022,16 @@ impl Server {
   }
 
   pub fn close_session(&mut self, token: SessionToken) {
-    if self.sessions.contains(token) {
-      let session = self.sessions.remove(token).expect("session shoud be there");
+    if self.sessions.contains(token.0) {
+      let session = self.sessions.remove(token.0);
       session.borrow().cancel_timeouts();
       let CloseResult { tokens } = session.borrow_mut().close(&mut self.poll);
 
       for tk in tokens.into_iter() {
         let cl = self.to_session(tk);
-        self.sessions.remove(cl);
+        if self.sessions.contains(cl.0) {
+          self.sessions.remove(cl.0);
+        }
       }
 
       assert!(self.nb_connections != 0);
@@ -1047,55 +1055,56 @@ impl Server {
       return false;
     }
 
-    //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
-    let index = match self.sessions.vacant_entry() {
-      None => {
+
+    if self.sessions.len() >= self.slab_capacity() {
         error!("not enough memory to accept another session, flushing the accept queue");
         error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
         gauge!("accept_queue.backpressure", 1);
         self.can_accept = false;
 
         return false;
-      },
-      Some(entry) => {
-        let session_token = Token(entry.index().0);
-        let index = entry.index();
+    }
+
+    //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
+    let index = {
+        let entry = self.sessions.vacant_entry();
+        let session_token = Token(entry.key());
+        let index = entry.key();
         let front_timeout = std::time::Duration::try_from(self.front_timeout).unwrap();
         let timeout = TIMER.with(|timer| {
             timer.borrow_mut().set_timeout(front_timeout, session_token)
         });
         match self.tcp.create_session(socket, token, &mut self.poll, session_token, timeout, delay) {
-          Ok((session, should_connect)) => {
-            entry.insert(session);
-            self.nb_connections += 1;
-            assert!(self.nb_connections <= self.max_connections);
-            gauge!("client.connections", self.nb_connections);
+            Ok((session, should_connect)) => {
+                entry.insert(session);
+                self.nb_connections += 1;
+                assert!(self.nb_connections <= self.max_connections);
+                gauge!("client.connections", self.nb_connections);
 
-            if should_connect {
-              index
-            } else {
-              return true;
+                if should_connect {
+                    index
+                } else {
+                    return true;
+                }
+            },
+            Err(AcceptError::IoError) => {
+                //FIXME: do we stop accepting?
+                return false;
+            },
+            Err(AcceptError::WouldBlock) => {
+                self.accept_ready.remove(&token);
+                return false;
+            },
+            Err(AcceptError::TooManySessions) => {
+                error!("max number of session connection reached, flushing the accept queue");
+                gauge!("accept_queue.backpressure", 1);
+                self.can_accept = false;
+                return false;
             }
-          },
-          Err(AcceptError::IoError) => {
-            //FIXME: do we stop accepting?
-            return false;
-          },
-          Err(AcceptError::WouldBlock) => {
-            self.accept_ready.remove(&token);
-            return false;
-          },
-          Err(AcceptError::TooManySessions) => {
-            error!("max number of session connection reached, flushing the accept queue");
-            gauge!("accept_queue.backpressure", 1);
-            self.can_accept = false;
-            return false;
-          }
         }
-      }
     };
 
-    self.connect_to_backend(index);
+    self.connect_to_backend(SessionToken(index));
     true
   }
 
@@ -1108,44 +1117,42 @@ impl Server {
     }
 
     //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
-    match self.sessions.vacant_entry() {
-      None => {
-        error!("not enough memory to accept another session, flushing the accept queue");
-        error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
-        gauge!("accept_queue.backpressure", 1);
-        self.can_accept = false;
-        false
-      },
-      Some(entry) => {
-        let session_token = Token(entry.index().0);
-        let front_timeout = std::time::Duration::try_from(self.front_timeout).unwrap();
-        let timeout = TIMER.with(|timer| {
-            timer.borrow_mut().set_timeout(front_timeout, session_token)
-        });
-        match self.http.create_session(socket, token, &mut self.poll, session_token, timeout, delay) {
-          Ok((session, _)) => {
+    if self.sessions.len() >= self.slab_capacity() {
+      error!("not enough memory to accept another session, flushing the accept queue");
+      error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
+      gauge!("accept_queue.backpressure", 1);
+      self.can_accept = false;
+      return false;
+    }
+
+    let entry = self.sessions.vacant_entry();
+    let session_token = Token(entry.key());
+    let front_timeout = std::time::Duration::try_from(self.front_timeout).unwrap();
+    let timeout = TIMER.with(|timer| {
+        timer.borrow_mut().set_timeout(front_timeout, session_token)
+    });
+    match self.http.create_session(socket, token, &mut self.poll, session_token, timeout, delay) {
+        Ok((session, _)) => {
             entry.insert(session);
             self.nb_connections += 1;
             assert!(self.nb_connections <= self.max_connections);
             gauge!("client.connections", self.nb_connections);
             true
-          },
-          Err(AcceptError::IoError) => {
+        },
+        Err(AcceptError::IoError) => {
             //FIXME: do we stop accepting?
             false
-          },
-          Err(AcceptError::WouldBlock) => {
+        },
+        Err(AcceptError::WouldBlock) => {
             self.accept_ready.remove(&token);
             false
-          },
-          Err(AcceptError::TooManySessions) => {
+        },
+        Err(AcceptError::TooManySessions) => {
             error!("max number of session connection reached, flushing the accept queue");
             gauge!("accept_queue.backpressure", 1);
             self.can_accept = false;
             false
-          }
         }
-      }
     }
   }
 
@@ -1158,44 +1165,42 @@ impl Server {
     }
 
     //FIXME: we must handle separately the session limit since the sessions slab also has entries for listeners and backends
-    match self.sessions.vacant_entry() {
-      None => {
-        error!("not enough memory to accept another session, flushing the accept queue");
-        error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
-        gauge!("accept_queue.backpressure", 1);
-        self.can_accept = false;
-        false
-      },
-      Some(entry) => {
-        let session_token = Token(entry.index().0);
-        let front_timeout = std::time::Duration::try_from(self.front_timeout).unwrap();
-        let timeout = TIMER.with(|timer| {
-            timer.borrow_mut().set_timeout(front_timeout, session_token)
-        });
-        match self.https.create_session(socket, token, &mut self.poll, session_token, timeout, delay) {
-          Ok((session, _)) => {
+    if self.sessions.len() >= self.slab_capacity() {
+      error!("not enough memory to accept another session, flushing the accept queue");
+      error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
+      gauge!("accept_queue.backpressure", 1);
+      self.can_accept = false;
+      return false;
+    }
+
+    let entry = self.sessions.vacant_entry();
+    let session_token = Token(entry.key());
+    let front_timeout = std::time::Duration::try_from(self.front_timeout).unwrap();
+    let timeout = TIMER.with(|timer| {
+        timer.borrow_mut().set_timeout(front_timeout, session_token)
+    });
+    match self.https.create_session(socket, token, &mut self.poll, session_token, timeout, delay) {
+        Ok((session, _)) => {
             entry.insert(session);
             self.nb_connections += 1;
             assert!(self.nb_connections <= self.max_connections);
             gauge!("client.connections", self.nb_connections);
             true
-          },
-          Err(AcceptError::IoError) => {
+        },
+        Err(AcceptError::IoError) => {
             //FIXME: do we stop accepting?
             false
-          },
-          Err(AcceptError::WouldBlock) => {
+        },
+        Err(AcceptError::WouldBlock) => {
             self.accept_ready.remove(&token);
             false
-          },
-          Err(AcceptError::TooManySessions) => {
+        },
+        Err(AcceptError::TooManySessions) => {
             error!("max number of session connection reached, flushing the accept queue");
             gauge!("accept_queue.backpressure", 1);
             self.can_accept = false;
             false
-          }
         }
-      }
     }
   }
 
@@ -1292,23 +1297,23 @@ impl Server {
   }
 
   pub fn connect_to_backend(&mut self, token: SessionToken) {
-    if ! self.sessions.contains(token) {
+    if ! self.sessions.contains(token.0) {
       error!("invalid token in connect_to_backend");
       return;
     }
 
     let (protocol, res) = {
-      let cl = self.sessions[token].clone();
-      let cl2: Rc<RefCell<dyn ProxySessionCast>> = self.sessions[token].clone();
+      let cl = self.sessions[token.0].clone();
+      let cl2: Rc<RefCell<dyn ProxySessionCast>> = self.sessions[token.0].clone();
       let protocol = { cl.borrow().protocol() };
-      let entry = self.sessions.vacant_entry();
-      if entry.is_none() {
+
+      if self.sessions.len() >= self.slab_capacity() {
         error!("not enough memory, cannot connect to backend");
         return;
       }
-      let entry = entry.unwrap();
+      let entry = self.sessions.vacant_entry();
+      let back_token = Token(entry.key());
       let entry = entry.insert(cl);
-      let back_token = Token(entry.index().0);
 
       let (protocol, res) = match protocol {
         Protocol::TCP   => {
@@ -1336,7 +1341,7 @@ impl Server {
       };
 
       if res != Ok(BackendConnectAction::New) {
-        entry.remove();
+        self.sessions.remove(back_token.0);
       }
       (protocol, res)
     };
@@ -1366,7 +1371,8 @@ impl Server {
       SessionResult::CloseBackend(opt) => {
         if let Some(token) = opt {
           let cl = self.to_session(token);
-          if let Some(session) = self.sessions.remove(cl) {
+          if self.sessions.contains(cl.0) {
+            let session = self.sessions.remove(cl.0);
             session.borrow_mut().close_backend(token, &mut self.poll);
           }
         }
@@ -1374,7 +1380,8 @@ impl Server {
       SessionResult::ReconnectBackend(main_token, backend_token)  => {
         if let Some(t) = backend_token {
           let cl = self.to_session(t);
-          if let Some(session) = self.sessions.remove(cl) {
+          if self.sessions.contains(cl.0) {
+            let session = self.sessions.remove(cl.0);
             session.borrow_mut().close_backend(t, &mut self.poll);
           }
         }
@@ -1392,7 +1399,7 @@ impl Server {
   pub fn ready(&mut self, token: Token, events: Ready) {
     trace!("PROXY\t{:?} got events: {:?}", token, events);
 
-    let mut session_token = SessionToken(token.0);
+    let mut session_token = token.0;
     if self.sessions.contains(session_token) {
       //info!("sessions contains {:?}", session_token);
       let protocol = self.sessions[session_token].borrow().protocol();
@@ -1433,7 +1440,7 @@ impl Server {
         }
 
         let order = self.sessions[session_token].borrow_mut().ready();
-        trace!("session[{:?} -> {:?}] got events {:?} and returned order {:?}", session_token, self.from_session(session_token), events, order);
+        trace!("session[{:?} -> {:?}] got events {:?} and returned order {:?}", session_token, self.from_session(SessionToken(session_token)), events, order);
         //FIXME: the CloseBackend message might not mean we have nothing else to do
         //with that session
         let is_connect = match order {
@@ -1445,10 +1452,10 @@ impl Server {
         // corresponds to an entry that will be removed in interpret_session_order
         // so we ask for the "main" token, ie the one for the front socket
         if let SessionResult::ReconnectBackend(Some(t), _) = order {
-          session_token = self.to_session(t);
+          session_token = self.to_session(t).0;
         }
 
-        self.interpret_session_order(session_token, order);
+        self.interpret_session_order(SessionToken(session_token), order);
 
         // if we had to connect to a backend server, go back to the loop
         // I'm not sure we would have anything to do right away, though,
@@ -1464,10 +1471,10 @@ impl Server {
   pub fn timeout(&mut self, token: Token) {
     trace!("PROXY\t{:?} got timeout", token);
 
-    let session_token = SessionToken(token.0);
+    let session_token = token.0;
     if self.sessions.contains(session_token) {
       let order = self.sessions[session_token].borrow_mut().timeout(token, &self.front_timeout);
-      self.interpret_session_order(session_token, order);
+      self.interpret_session_order(SessionToken(session_token), order);
     }
   }
 
@@ -1477,7 +1484,7 @@ impl Server {
     if self.can_accept && !self.accept_ready.is_empty() {
       loop {
         if let Some(token) = self.accept_ready.iter().next().map(|token| ListenToken(token.0)) {
-          let protocol = self.sessions[SessionToken(token.0)].borrow().protocol();
+          let protocol = self.sessions[token.0].borrow().protocol();
           self.accept(token, protocol);
           if !self.can_accept || self.accept_ready.is_empty() {
             break;
