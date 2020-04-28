@@ -158,9 +158,9 @@ impl Executor {
 
   pub fn execute(s: impl Future<Item = (), Error = ()> + Send + 'static) {
     let mut inner = EXECUTOR.inner.lock().unwrap();
-    if let Ok(id) = inner.tasks.insert(spawn(Box::new(s))) {
-      inner.ready.insert(id);
-    }
+    //FIXME: not checking for max number of tasks
+    let id = inner.tasks.insert(spawn(Box::new(s)));
+    inner.ready.insert(id);
   }
 
   pub fn run() {

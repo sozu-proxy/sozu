@@ -677,27 +677,28 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
 
-  let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
+  let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>> = Slab::with_capacity(max_buffers);
   {
-    let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
-    info!("taking token {:?} for channel", entry.index());
+    let entry = sessions.vacant_entry();
+    info!("taking token {:?} for channel", SessionToken(entry.key()));
     entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
   }
   {
-    let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
-    info!("taking token {:?} for timer", entry.index());
+    let entry = sessions.vacant_entry();
+    info!("taking token {:?} for timer", SessionToken(entry.key()));
     entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
   }
   {
-    let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
-    info!("taking token {:?} for metrics", entry.index());
+    let entry = sessions.vacant_entry();
+    info!("taking token {:?} for metrics", SessionToken(entry.key()));
     entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
   }
 
   let token = {
-    let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
+    let entry = sessions.vacant_entry();
+    let key = entry.key();
     let e = entry.insert(Rc::new(RefCell::new(ListenSession { protocol: Protocol::HTTPListen })));
-    Token(e.index().0)
+    Token(key)
   };
 
   let address = config.address.clone();

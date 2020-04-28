@@ -82,7 +82,7 @@ impl CommandServer {
     where T: Clone+Into<String>,
           U: Clone+Into<String> {
     trace!("answer_success for front token {:?} id {}, message {:#?} data {:#?}", token, id.clone().into(), message.clone().into(), data);
-    self.clients[token].push_message(CommandResponse::new(
+    self.clients[token.0].push_message(CommandResponse::new(
       id.into(),
       CommandStatus::Ok,
       message.into(),
@@ -94,7 +94,7 @@ impl CommandServer {
     where T: Clone+Into<String>,
           U: Clone+Into<String> {
     trace!("answer_error for front token {:?} id {}, message {:#?} data {:#?}", token, id.clone().into(), message.clone().into(), data);
-    self.clients[token].push_message(CommandResponse::new(
+    self.clients[token.0].push_message(CommandResponse::new(
       id.into(),
       CommandStatus::Error,
       message.into(),
@@ -289,7 +289,7 @@ impl CommandServer {
               format!("ok: 0 messages, error: 0"),
               None
             );
-            self.clients[token].push_message(answer);
+            self.clients[token.0].push_message(answer);
           }
         }
 
@@ -316,7 +316,7 @@ impl CommandServer {
   pub fn launch_worker(&mut self, token: FrontToken, message: &CommandRequest, tag: &str) {
     let id = self.next_id;
     if let Ok(mut worker) = start_worker(id, &self.config, self.executable_path.clone(), &self.state, None) {
-      self.clients[token].push_message(CommandResponse::new(
+      self.clients[token.0].push_message(CommandResponse::new(
           message.id.clone(),
           CommandStatus::Processing,
           "sending configuration orders".to_string(),
@@ -368,7 +368,7 @@ impl CommandServer {
     let next_id = self.next_id;
     let worker_token = self.token_count + 1;
     let mut worker = if let Ok(mut worker) = start_worker(next_id, &self.config, self.executable_path.clone(), &self.state, None) {
-      self.clients[token].push_message(CommandResponse::new(
+      self.clients[token.0].push_message(CommandResponse::new(
           String::from(message_id),
           CommandStatus::Processing,
           "sending configuration orders".to_string(),
@@ -462,8 +462,8 @@ impl CommandServer {
   pub fn upgrade_master(&mut self, token: FrontToken, message_id: &str) {
     self.disable_cloexec_before_upgrade();
     //FIXME: do we need to be blocking here?
-    self.clients[token].channel.set_blocking(true);
-    self.clients[token].channel.write_message(&CommandResponse::new(
+    self.clients[token.0].channel.set_blocking(true);
+    self.clients[token.0].channel.write_message(&CommandResponse::new(
         String::from(message_id),
         CommandStatus::Processing,
         "".to_string(),
@@ -474,7 +474,7 @@ impl CommandServer {
     let res = channel.read_message();
     debug!("upgrade channel sent: {:?}", res);
     if let Some(true) = res {
-      self.clients[token].channel.write_message(&CommandResponse::new(
+      self.clients[token.0].channel.write_message(&CommandResponse::new(
         message_id.into(),
         CommandStatus::Ok,
         format!("new master process launched with pid {}, closing the old one", pid),

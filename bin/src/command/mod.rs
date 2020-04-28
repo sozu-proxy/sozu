@@ -31,6 +31,7 @@ use self::executor::{Executor, StateChange};
 
 const SERVER: Token = Token(0);
 const HALF_USIZE: usize = 0x8000000000000000usize;
+const SLAB_CAPACITY: usize = 1024;
 
 #[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
 pub struct FrontToken(pub usize);
@@ -97,7 +98,7 @@ pub struct CommandServer {
   sock:              UnixListener,
   buffer_size:       usize,
   max_buffer_size:   usize,
-  clients:           Slab<CommandClient,FrontToken>,
+  clients:           Slab<CommandClient>,
   workers:           HashMap<Token, Worker>,
   event_subscribers: Vec<FrontToken>,
   next_id:           u32,
@@ -120,11 +121,13 @@ impl CommandServer {
     let acc = self.sock.accept();
     if let Ok(Some((sock, _))) = acc {
       let conn = CommandClient::new(sock, self.buffer_size, self.max_buffer_size);
-      let tok = self.clients.insert(conn)
-        .map_err(|_| io::Error::new(ErrorKind::ConnectionRefused, "could not add client to slab"))?;
+      if self.clients.len() >= SLAB_CAPACITY {
+        return Err(io::Error::new(ErrorKind::ConnectionRefused, "could not add client to slab"));
+      }
 
+      let tok = self.clients.insert(conn);
       // Register the connection
-      let token = self.from_front(tok);
+      let token = self.from_front(FrontToken(tok));
       self.clients[tok].token = Some(token);
       self.poll.register(&self.clients[tok].channel.sock, token,
         Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
@@ -231,7 +234,7 @@ impl CommandServer {
       loop {
         let mut did_something = false;
         {
-          let tokens: Vec<Token> = self.clients.iter().filter(|client| client.can_handle_events()).map(|client| client.token.unwrap()).collect();
+          let tokens: Vec<Token> = self.clients.iter().filter(|(_, client)| client.can_handle_events()).map(|(_, client)| client.token.unwrap()).collect();
 
           if ! tokens.is_empty() {
             did_something = true;
@@ -281,7 +284,7 @@ impl CommandServer {
       });
 
       let clients_not_served = self.clients.iter()
-                                            .filter(|c| !c.queue.is_empty())
+                                            .filter(|(_, c)| !c.queue.is_empty())
                                             .count();
 
       if self.must_stop && clients_not_served == 0 {
@@ -327,8 +330,8 @@ impl CommandServer {
       },
       _ => {
         let conn_token = self.to_front(token);
-        if self.clients.contains(conn_token) {
-          self.clients[conn_token].channel.handle_events(events);
+        if self.clients.contains(conn_token.0) {
+          self.clients[conn_token.0].channel.handle_events(events);
         }
 
         self.handle_client_events(conn_token);
@@ -341,7 +344,7 @@ impl CommandServer {
     Executor::run();
 
     while let Some((client_token, answer)) = Executor::get_client_message() {
-      self.clients.get_mut(client_token).map(|cl| cl.push_message(answer));
+      self.clients.get_mut(client_token.0).map(|cl| cl.push_message(answer));
     }
 
     while let Some((worker_token, message)) = Executor::get_worker_message() {
@@ -450,14 +453,14 @@ impl CommandServer {
   }
 
   pub fn handle_client_events(&mut self, conn_token: FrontToken) {
-    if self.clients.contains(conn_token) {
+    if self.clients.contains(conn_token.0) {
 
-      if UnixReady::from(self.clients[conn_token].channel.readiness).is_hup() {
-        let _ = self.poll.deregister(&self.clients[conn_token].channel.sock).map_err(|e| {
+      if UnixReady::from(self.clients[conn_token.0].channel.readiness).is_hup() {
+        let _ = self.poll.deregister(&self.clients[conn_token.0].channel.sock).map_err(|e| {
           error!("could not unregister client socket: {:?}", e);
         });
 
-        self.clients.remove(conn_token);
+        self.clients.remove(conn_token.0);
 
         if let Some(pos) = self.event_subscribers.iter().position(|t| t == &conn_token) {
           let _ = self.event_subscribers.remove(pos);
@@ -474,7 +477,7 @@ impl CommandServer {
           );*/
 
           {
-            let client = &mut self.clients[conn_token];
+            let client = &mut self.clients[conn_token.0];
 
             if client.channel.readiness() == Ready::empty() {
               break;
@@ -511,13 +514,13 @@ impl CommandServer {
             }
           }
 
-          if self.clients[conn_token].channel.readiness().is_readable() {
-            let _ = self.clients[conn_token].channel.readable().map_err(|e| {
+          if self.clients[conn_token.0].channel.readiness().is_readable() {
+            let _ = self.clients[conn_token.0].channel.readable().map_err(|e| {
               error!("could not read from client socket: {:?}", e);
             });
 
             loop {
-              if let Some(message) = self.clients[conn_token].channel.read_message() {
+              if let Some(message) = self.clients[conn_token.0].channel.read_message() {
                 incr!("client_cmd");
                 self.handle_client_message(conn_token, &message);
               } else {
@@ -543,7 +546,7 @@ impl CommandServer {
           Some(CommandResponseData::Event(event.clone()))
         );
 
-        self.clients.get_mut(*client_token).map(|cl| cl.push_message(event));
+        self.clients.get_mut(client_token.0).map(|cl| cl.push_message(event));
       }
     } else {
       Executor::handle_message(token, msg);
