@@ -41,7 +41,7 @@ use {AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,SessionMetri
   CloseResult};
 use backends::BackendMap;
 use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,
-  ListenSession, CONN_RETRIES, push_event};
+  ListenSession, CONN_RETRIES, push_event, TIMER};
 use socket::server_bind;
 use trie::*;
 use protocol::{ProtocolResult,Http,Pipe,StickySession};
@@ -524,11 +524,13 @@ impl ProxySession for Session {
     result
   }
 
-  fn timeout(&mut self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult {
+  fn timeout(&mut self, token: Token, front_timeout: &Duration) -> SessionResult {
     if self.frontend_token == token {
       let dur = Instant::now() - self.last_event;
       if dur < *front_timeout {
-        timer.set_timeout(std::time::Duration::try_from(*front_timeout - dur).unwrap(), token);
+        TIMER.with(|timer| {
+            timer.borrow_mut().set_timeout(std::time::Duration::try_from(*front_timeout - dur).unwrap(), token);
+        });
         SessionResult::Continue
       } else {
         match self.http().map(|h| h.timeout_status()) {
@@ -551,8 +553,10 @@ impl ProxySession for Session {
     }
   }
 
-  fn cancel_timeouts(&self, timer: &mut Timer<Token>) {
-    timer.cancel_timeout(&self.timeout);
+  fn cancel_timeouts(&self) {
+      TIMER.with(|timer| {
+          timer.borrow_mut().cancel_timeout(&self.timeout);
+      });
   }
 
   //FIXME: check the token passed as argument

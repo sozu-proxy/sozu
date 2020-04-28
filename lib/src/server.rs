@@ -39,6 +39,10 @@ thread_local! {
   pub static QUEUE: RefCell<VecDeque<ProxyResponse>> = RefCell::new(VecDeque::new());
 }
 
+thread_local! {
+  pub static TIMER: RefCell<Timer<Token>> = RefCell::new(Timer::default());
+}
+
 pub fn push_queue(message: ProxyResponse) {
   QUEUE.with(|queue| {
     (*queue.borrow_mut()).push_back(message);
@@ -134,7 +138,6 @@ pub struct Server {
   max_connections: usize,
   nb_connections:  usize,
   front_timeout:   time::Duration,
-  timer:           Timer<Token>,
   pool:            Rc<RefCell<Pool>>,
   backends:        Rc<RefCell<BackendMap>>,
   scm_listeners:   Option<Listeners>,
@@ -199,13 +202,14 @@ impl Server {
       PollOpt::edge()
     ).expect("should register the channel");
 
-    let timer = Timer::default();
-    poll.register(
-      &timer,
-      Token(1),
-      Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-      PollOpt::edge()
-    ).expect("should register the timer");
+    TIMER.with(|timer| {
+        poll.register(
+            &*timer.borrow(),
+            Token(1),
+            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
+            PollOpt::edge()
+            ).expect("should register the timer");
+    });
 
     METRICS.with(|metrics| {
       if let Some(sock) = (*metrics.borrow()).socket() {
@@ -230,7 +234,6 @@ impl Server {
       max_connections: server_config.max_connections,
       nb_connections:  0,
       scm_listeners:   None,
-      timer,
       pool,
       backends,
       front_timeout: time::Duration::seconds(i64::from(server_config.front_timeout)),
@@ -384,7 +387,7 @@ impl Server {
           }
 
         } else if event.token() == Token(1) {
-          while let Some(t) = self.timer.poll() {
+          while let Some(t) = TIMER.with(|timer| timer.borrow_mut().poll()) {
             self.timeout(t);
           }
         } else if event.token() == Token(2) {
@@ -1015,7 +1018,7 @@ impl Server {
   pub fn close_session(&mut self, token: SessionToken) {
     if self.sessions.contains(token) {
       let session = self.sessions.remove(token).expect("session shoud be there");
-      session.borrow().cancel_timeouts(&mut self.timer);
+      session.borrow().cancel_timeouts();
       let CloseResult { tokens } = session.borrow_mut().close(&mut self.poll);
 
       for tk in tokens.into_iter() {
@@ -1057,7 +1060,10 @@ impl Server {
       Some(entry) => {
         let session_token = Token(entry.index().0);
         let index = entry.index();
-        let timeout = self.timer.set_timeout(std::time::Duration::try_from(self.front_timeout).unwrap(), session_token);
+        let front_timeout = std::time::Duration::try_from(self.front_timeout).unwrap();
+        let timeout = TIMER.with(|timer| {
+            timer.borrow_mut().set_timeout(front_timeout, session_token)
+        });
         match self.tcp.create_session(socket, token, &mut self.poll, session_token, timeout, delay) {
           Ok((session, should_connect)) => {
             entry.insert(session);
@@ -1112,7 +1118,10 @@ impl Server {
       },
       Some(entry) => {
         let session_token = Token(entry.index().0);
-        let timeout = self.timer.set_timeout(std::time::Duration::try_from(self.front_timeout).unwrap(), session_token);
+        let front_timeout = std::time::Duration::try_from(self.front_timeout).unwrap();
+        let timeout = TIMER.with(|timer| {
+            timer.borrow_mut().set_timeout(front_timeout, session_token)
+        });
         match self.http.create_session(socket, token, &mut self.poll, session_token, timeout, delay) {
           Ok((session, _)) => {
             entry.insert(session);
@@ -1159,7 +1168,10 @@ impl Server {
       },
       Some(entry) => {
         let session_token = Token(entry.index().0);
-        let timeout = self.timer.set_timeout(std::time::Duration::try_from(self.front_timeout).unwrap(), session_token);
+        let front_timeout = std::time::Duration::try_from(self.front_timeout).unwrap();
+        let timeout = TIMER.with(|timer| {
+            timer.borrow_mut().set_timeout(front_timeout, session_token)
+        });
         match self.https.create_session(socket, token, &mut self.poll, session_token, timeout, delay) {
           Ok((session, _)) => {
             entry.insert(session);
@@ -1454,7 +1466,7 @@ impl Server {
 
     let session_token = SessionToken(token.0);
     if self.sessions.contains(session_token) {
-      let order = self.sessions[session_token].borrow_mut().timeout(token, &mut self.timer, &self.front_timeout);
+      let order = self.sessions[session_token].borrow_mut().timeout(token, &self.front_timeout);
       self.interpret_session_order(session_token, order);
     }
   }
@@ -1533,14 +1545,14 @@ impl ProxySession for ListenSession {
   fn close_backend(&mut self, _token: Token, _poll: &mut Poll) {
   }
 
-  fn timeout(&mut self, _token: Token, _timer: &mut Timer<Token>, _front_timeout: &time::Duration) -> SessionResult {
+  fn timeout(&mut self, _token: Token, _front_timeout: &time::Duration) -> SessionResult {
     error!("called ProxySession::timeout(token={:?}, time, front_timeout = {:?}) on ListenSession {{ protocol: {:?} }}",
       _token, _front_timeout, self.protocol);
     SessionResult::CloseSession
   }
 
-  fn cancel_timeouts(&self, _timer: &mut Timer<Token>) {
-    error!("called ProxySession::cancel_timeouts(timer) on ListenSession {{ protocol: {:?} }}",
+  fn cancel_timeouts(&self) {
+    error!("called ProxySession::cancel_timeouts() on ListenSession {{ protocol: {:?} }}",
       self.protocol);
   }
 
