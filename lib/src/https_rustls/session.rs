@@ -24,7 +24,7 @@ use protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use retry::RetryPolicy;
 use util::UnwrapLog;
 use buffer_queue::BufferQueue;
-use server::push_event;
+use server::{push_event, TIMER};
 
 pub enum State {
   Expect(ExpectProxyProtocol<TcpStream>, ServerSession),
@@ -523,11 +523,13 @@ impl ProxySession for Session {
     result
   }
 
-  fn timeout(&mut self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult {
+  fn timeout(&mut self, token: Token, front_timeout: &Duration) -> SessionResult {
     if self.frontend_token == token {
       let dur = SteadyTime::now() - self.last_event;
       if dur < *front_timeout {
-        timer.set_timeout((*front_timeout - dur).to_std().unwrap(), token);
+        TIMER.with(|timer| {
+          timer.borrow_mut().set_timeout((*front_timeout - dur).to_std().unwrap(), token);
+        });
         SessionResult::Continue
       } else {
         match self.http().map(|h| h.timeout_status()) {
@@ -550,8 +552,10 @@ impl ProxySession for Session {
     }
   }
 
-  fn cancel_timeouts(&self, timer: &mut Timer<Token>) {
-    timer.cancel_timeout(&self.timeout);
+  fn cancel_timeouts(&self) {
+    TIMER.with(|timer| {
+        timer.borrow_mut().cancel_timeout(&self.timeout);
+    });
   }
 
   fn close_backend(&mut self, _: Token, poll: &mut Poll) {

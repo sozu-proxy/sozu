@@ -30,7 +30,7 @@ use super::protocol::{ProtocolResult,StickySession,Http,Pipe};
 use super::protocol::http::{DefaultAnswerStatus, TimeoutStatus, answers::HttpAnswers};
 use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use super::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,
-  ListenSession, CONN_RETRIES, push_event};
+  ListenSession, CONN_RETRIES, push_event, TIMER};
 use super::socket::server_bind;
 use super::retry::RetryPolicy;
 use super::protocol::http::parser::{hostname_and_port, RequestState};
@@ -463,11 +463,15 @@ impl ProxySession for Session {
     result
   }
 
-  fn timeout(&mut self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult {
+  fn timeout(&mut self, token: Token, front_timeout: &Duration) -> SessionResult {
+    info!("got timeout for token {:?} and duration {:?}", token, front_timeout);
     if self.frontend_token == token {
       let dur = SteadyTime::now() - self.last_event;
       if dur < *front_timeout {
-        timer.set_timeout((*front_timeout - dur).to_std().unwrap(), token);
+        TIMER.with(|timer| {
+          println!("resetting timeout");
+          timer.borrow_mut().set_timeout((*front_timeout - dur).to_std().unwrap(), token);
+        });
         SessionResult::Continue
       } else {
         match self.http().map(|h| h.timeout_status()) {
@@ -489,8 +493,10 @@ impl ProxySession for Session {
     }
   }
 
-  fn cancel_timeouts(&self, timer: &mut Timer<Token>) {
-    timer.cancel_timeout(&self.front_timeout);
+  fn cancel_timeouts(&self) {
+    TIMER.with(|ref mut timer| {
+      timer.borrow_mut().cancel_timeout(&self.front_timeout);
+    });
   }
 
   //FIXME: check the token passed as argument
