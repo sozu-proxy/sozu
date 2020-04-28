@@ -13,7 +13,6 @@ use std::net::SocketAddr;
 use std::str::from_utf8_unchecked;
 use rustls::{ServerConfig, ServerSession, NoClientAuth, ProtocolVersion,
   ALL_CIPHERSUITES};
-use mio_extras::timer::Timeout;
 use time::Duration;
 
 use sozu_command::scm_socket::ScmSocket;
@@ -36,6 +35,7 @@ use router::Router;
 use protocol::StickySession;
 use protocol::http::DefaultAnswerStatus;
 use util::UnwrapLog;
+use timer::Timeout;
 
 use super::resolver::CertificateResolverWrapper;
 use super::session::Session;

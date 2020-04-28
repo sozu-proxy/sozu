@@ -9,7 +9,6 @@ use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd};
 use slab::Slab;
 use time::{self, SteadyTime};
 use std::time::Duration;
-use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
@@ -28,6 +27,7 @@ use pool::Pool;
 use metrics::METRICS;
 use backends::BackendMap;
 use features::FEATURES;
+use timer::{Timer, Timeout};
 
 // Number of retries to perform on a server after a connection failure
 pub const CONN_RETRIES: u8 = 3;

@@ -24,7 +24,6 @@ use openssl::hash::MessageDigest;
 use openssl::nid;
 use openssl::error::ErrorStack;
 use openssl::ssl::SslVersion;
-use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::proxy::{Cluster,CertificateFingerprint,CertificateAndKey,
@@ -52,6 +51,7 @@ use protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use protocol::h2::Http2;
 use retry::RetryPolicy;
 use util::UnwrapLog;
+use timer::{Timer,Timeout};
 
 //const SERVER_PROTOS: &'static [u8] = b"\x02h2\x08http/1.1";
 //const SERVER_PROTOS: &'static [u8] = b"\x08http/1.1\x02h2";

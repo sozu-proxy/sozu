@@ -12,7 +12,6 @@ use std::net::{SocketAddr,Shutdown};
 use uuid::Uuid;
 use time::{Duration,SteadyTime};
 use uuid::adapter::Hyphenated;
-use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::scm_socket::ScmSocket;
 use sozu_command::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
@@ -34,8 +33,8 @@ use protocol::proxy_protocol::send::SendProxyProtocol;
 use protocol::proxy_protocol::relay::RelayProxyProtocol;
 use protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use retry::RetryPolicy;
-
 use util::UnwrapLog;
+use timer::{Timer,Timeout};
 
 pub enum UpgradeResult {
   Continue,

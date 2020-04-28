@@ -172,12 +172,12 @@ extern crate hdrhistogram;
 #[macro_use] extern crate sozu_command_lib as sozu_command;
 extern crate idna;
 extern crate webpki;
-extern crate mio_extras;
 extern crate hashbrown;
 extern crate regex;
 extern crate hpack;
 extern crate cookie_factory;
 extern crate poule;
+extern crate lazycell;
 
 #[cfg(test)]
 #[macro_use]
@@ -199,6 +199,7 @@ pub mod backends;
 pub mod retry;
 pub mod load_balancing;
 pub mod features;
+pub mod timer;
 
 #[cfg(feature = "splice")]
 mod splice;
@@ -220,7 +221,6 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::cell::RefCell;
 use time::{SteadyTime,Duration};
-use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::proxy::{ProxyRequest,ProxyResponse,LoadBalancingParams};
 
@@ -287,7 +287,9 @@ pub trait ProxyConfiguration<Session> {
     back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse;
   fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
-  fn create_session(&mut self, socket: TcpStream, token: ListenToken, event_loop: &mut Poll, session_token: Token, timeout: Timeout, delay: Duration)
+  fn create_session(&mut self, socket: TcpStream, token: ListenToken,
+                    event_loop: &mut Poll, session_token: Token, timeout: timer::Timeout,
+                    delay: Duration)
     -> Result<(Rc<RefCell<Session>>, bool), AcceptError>;
   fn listen_port_state(&self, port: &u16) -> ListenPortState;
 }

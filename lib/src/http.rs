@@ -12,7 +12,6 @@ use mio::unix::UnixReady;
 use uuid::Uuid;
 use time::{SteadyTime,Duration};
 use slab::Slab;
-use mio_extras::timer::{Timer, Timeout};
 
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::proxy::{Cluster,ProxyRequestData,HttpFrontend,HttpListener,
@@ -36,6 +35,7 @@ use super::retry::RetryPolicy;
 use super::protocol::http::parser::{hostname_and_port, RequestState};
 use router::Router;
 use util::UnwrapLog;
+use timer::{Timer, Timeout};
 
 #[derive(PartialEq)]
 pub enum SessionStatus {
