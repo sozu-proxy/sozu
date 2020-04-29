@@ -13,6 +13,7 @@ use socket::{SocketHandler, SocketResult, TransportProtocol};
 use protocol::ProtocolResult;
 use pool::Pool;
 use util::UnwrapLog;
+use server::TIMER;
 
 pub mod parser;
 pub mod cookies;
@@ -91,6 +92,7 @@ pub struct Http<Front:SocketHandler> {
   answers:             Rc<RefCell<answers::HttpAnswers>>,
   pub closing:         bool,
   pool:                Weak<RefCell<Pool>>,
+  pub frontend_last_event: SteadyTime,
 }
 
 impl<Front:SocketHandler> Http<Front> {
@@ -126,6 +128,7 @@ impl<Front:SocketHandler> Http<Front> {
       keepalive_count: 0,
       backend_stop:    None,
       closing:         false,
+      frontend_last_event: SteadyTime::now(),
       answers,
       pool,
     };
@@ -550,6 +553,8 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Read content from the session
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    self.frontend_last_event = SteadyTime::now();
+
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
       self.front_readiness.interest.insert(Ready::writable());
       self.back_readiness.interest.remove(Ready::readable());
@@ -768,6 +773,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   fn writable_default_answer(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    self.frontend_last_event = SteadyTime::now();
     let res = if let SessionStatus::DefaultAnswer(_, ref buf, mut index) = self.status {
       let len = buf.len();
 
@@ -811,6 +817,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Forward content to session
   pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    self.frontend_last_event = SteadyTime::now();
 
     //handle default answers
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
@@ -990,6 +997,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Forward content to application
   pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    self.frontend_last_event = SteadyTime::now();
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
       error!("{}\tsending default answer, should not write to back", self.log_context());
       self.back_readiness.interest.remove(Ready::writable());
@@ -1123,6 +1131,8 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Read content from application
   pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, SessionResult) {
+    self.frontend_last_event = SteadyTime::now();
+
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
       error!("{}\tsending default answer, should not read from back socket", self.log_context());
       self.back_readiness.interest.remove(Ready::readable());
@@ -1348,6 +1358,45 @@ impl<Front:SocketHandler> Http<Front> {
       .map(|sticky_client| sticky_client != &session.sticky_id)
       .unwrap_or(true)
   }
+
+  pub fn timeout(&mut self, token: Token, front_timeout: &Duration, metrics: &mut SessionMetrics) -> SessionResult {
+    if self.frontend_token == token {
+      let dur = SteadyTime::now() - self.frontend_last_event;
+      if dur < *front_timeout {
+        TIMER.with(|timer| {
+            timer.borrow_mut().set_timeout((*front_timeout - dur).to_std().unwrap(), token);
+        });
+        SessionResult::Continue
+      } else {
+        info!("frontend timeout triggered for token {:?}", token);
+        match self.timeout_status() {
+          TimeoutStatus::Request => {
+            self.set_answer(DefaultAnswerStatus::Answer408, None);
+            self.writable(metrics)
+          },
+          TimeoutStatus::Response => {
+            self.set_answer(DefaultAnswerStatus::Answer504, None);
+            self.writable(metrics)
+          },
+          _ => {
+            SessionResult::CloseSession
+          }
+        }
+      }
+    } else {
+      // invalid token, obsolete timeout triggered
+      SessionResult::Continue
+    }
+  }
+
+  /*fn cancel_timeouts(&self) {
+      TIMER.with(|timer| {
+          timer.borrow_mut().cancel_timeout_with_token(self.frontend_token);
+          if let Some(t) = self.backend_token.as_ref() {
+            timer.borrow_mut().cancel_timeout_with_token(*t);
+          }
+      });
+  }*/
 }
 
 /// Save the backend http response status code metric
