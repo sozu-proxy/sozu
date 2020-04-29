@@ -452,12 +452,12 @@ impl ProxySession for Session {
   }
 
   fn timeout(&mut self, token: Token, front_timeout: &Duration) -> SessionResult {
-    info!("got timeout for token {:?} and duration {:?}", token, front_timeout);
+    //info!("got timeout for token {:?} and duration {:?}", token, front_timeout);
     if self.frontend_token == token {
       let dur = Instant::now() - self.last_event;
       if dur < *front_timeout {
         TIMER.with(|timer| {
-          println!("resetting timeout");
+          //println!("resetting timeout");
           timer.borrow_mut().set_timeout(std::time::Duration::try_from(*front_timeout - dur).unwrap(), token);
         });
         SessionResult::Continue

@@ -206,15 +206,6 @@ impl Server {
       PollOpt::edge()
     ).expect("should register the channel");
 
-    TIMER.with(|timer| {
-        poll.register(
-            &*timer.borrow(),
-            Token(1),
-            Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-            PollOpt::edge()
-            ).expect("should register the timer");
-    });
-
     METRICS.with(|metrics| {
       if let Some(sock) = (*metrics.borrow()).socket() {
         poll.register(sock, Token(2), Ready::writable(), PollOpt::edge()).expect("should register the metrics socket");
@@ -300,6 +291,7 @@ impl Server {
     let mut current_poll_errors = 0;
     let mut last_zombie_check = Instant::now();
     let mut last_sessions_len = self.sessions.len();
+    let mut should_poll_at: Option<Instant> = None;
 
     loop {
       if current_poll_errors == max_poll_errors {
@@ -307,7 +299,10 @@ impl Server {
         panic!("poll() calls failed {} times in a row", current_poll_errors);
       }
 
-      if let Err(error) = self.poll.poll(&mut events, poll_timeout) {
+      let timeout = should_poll_at.as_ref()
+          .map(|i| std::time::Duration::try_from(*i - Instant::now()).unwrap())
+          .or(poll_timeout);
+      if let Err(error) = self.poll.poll(&mut events, timeout) {
         error!("Error while polling events: {:?}", error);
         current_poll_errors += 1;
         continue;
@@ -407,8 +402,18 @@ impl Server {
         }
       }
 
+      if let Some(t) = should_poll_at.as_ref() {
+          if *t <= Instant::now() {
+              while let Some(t) = TIMER.with(|timer| timer.borrow_mut().poll()) {
+                  //info!("polled for timeout: {:?}", t);
+                  self.timeout(t);
+              }
+          }
+      }
       self.handle_remaining_readiness();
       self.create_sessions();
+
+      should_poll_at = TIMER.with(|timer| timer.borrow().next_poll_date().map(|i| i.into()));
 
       let now = Instant::now();
       if now - last_zombie_check > self.zombie_check_interval {
