@@ -463,33 +463,11 @@ impl ProxySession for Session {
     result
   }
 
-  fn timeout(&mut self, token: Token, front_timeout: &Duration) -> SessionResult {
-    //info!("got timeout for token {:?} and duration {:?}", token, front_timeout);
-    if self.frontend_token == token {
-      let dur = SteadyTime::now() - self.last_event;
-      if dur < *front_timeout {
-        TIMER.with(|timer| {
-          //println!("resetting timeout");
-          timer.borrow_mut().set_timeout((*front_timeout - dur).to_std().unwrap(), token);
-        });
-        SessionResult::Continue
-      } else {
-        match self.http().map(|h| h.timeout_status()) {
-          Some(TimeoutStatus::Request) => {
-            self.set_answer(DefaultAnswerStatus::Answer408, None);
-            self.writable()
-          },
-          Some(TimeoutStatus::Response) => {
-            self.set_answer(DefaultAnswerStatus::Answer504, None);
-            self.writable()
-          },
-          _ => {
-            SessionResult::CloseSession
-          }
-        }
-      }
-    } else {
-      SessionResult::Continue
+  fn timeout(&mut self, token: Token, timeout: &Duration) -> SessionResult {
+    match *unwrap_msg!(self.protocol.as_mut()) {
+      State::Http(ref mut http) => http.timeout(token, timeout, &mut self.metrics),
+      State::Expect(_)  => SessionResult::CloseSession,
+      State::WebSocket(_) => SessionResult::CloseSession,
     }
   }
 
