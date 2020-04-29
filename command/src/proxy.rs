@@ -430,6 +430,9 @@ pub struct HttpListener {
     pub expect_proxy:   bool,
     #[serde(default = "default_sticky_name")]
     pub sticky_name:    String,
+    pub front_timeout:  u32,
+    pub back_timeout:   u32,
+    pub connect_timeout: u32,
 }
 
 impl Default for HttpListener {
@@ -441,6 +444,9 @@ impl Default for HttpListener {
       answer_503:      String::from("HTTP/1.1 503 your application is in deployment\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"),
       expect_proxy:    false,
       sticky_name:     String::from("SOZUBALANCEID"),
+      front_timeout:   60,
+      back_timeout:    30,
+      connect_timeout: 3,
     }
   }
 }
@@ -526,6 +532,9 @@ pub struct HttpsListener {
     pub certificate_chain:  Vec<String>,
     #[serde(default)]
     pub key:                Option<String>,
+    pub front_timeout:  u32,
+    pub back_timeout:   u32,
+    pub connect_timeout: u32,
 }
 
 impl Default for HttpsListener {
@@ -557,6 +566,9 @@ impl Default for HttpsListener {
       certificate:         None,
       certificate_chain:   vec![],
       key:                 None,
+      front_timeout:   60,
+      back_timeout:    30,
+      connect_timeout: 3,
     }
   }
 }
@@ -570,6 +582,9 @@ pub struct TcpListener {
   #[serde(default)]
   #[serde(skip_serializing_if = "is_false")]
   pub expect_proxy:   bool,
+  pub front_timeout:  u32,
+  pub back_timeout:   u32,
+  pub connect_timeout: u32,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
