@@ -1118,7 +1118,7 @@ pub fn add_http_listener(channel: Channel<CommandRequest,CommandResponse>, timeo
     listener.sticky_name = sticky_name;
   }
 
-  match listener.to_http() {
+  match listener.to_http(None, None, None) {
     Some(conf) => order_command(channel, timeout, ProxyRequestData::AddHttpListener(conf)),
     None => eprintln!("Error creating HTTP listener")
   };
@@ -1139,7 +1139,7 @@ pub fn add_https_listener(channel: Channel<CommandRequest,CommandResponse>, time
   listener.tls_versions = if tls_versions.len() == 0 { None } else { Some(tls_versions) };
   listener.rustls_cipher_list = if rustls_cipher_list.len() == 0 { None } else { Some(rustls_cipher_list) };
 
-  match listener.to_tls() {
+  match listener.to_tls(None, None, None) {
     Some(conf) => order_command(channel, timeout, ProxyRequestData::AddHttpsListener(conf)),
     None => eprintln!("Error creating HTTPS listener")
   };
@@ -1150,7 +1150,10 @@ pub fn add_tcp_listener(channel: Channel<CommandRequest,CommandResponse>, timeou
   order_command(channel, timeout, ProxyRequestData::AddTcpListener(TcpListener {
     address,
     public_address,
-    expect_proxy
+    expect_proxy,
+    front_timeout: 60,
+    back_timeout: 30,
+    connect_timeout: 3,
   }));
 }
 

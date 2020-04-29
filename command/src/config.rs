@@ -33,6 +33,9 @@ pub struct Listener {
   pub expect_proxy:       Option<bool>,
   #[serde(default = "default_sticky_name")]
   pub sticky_name:        String,
+  pub front_timeout:      Option<u32>,
+  pub back_timeout:       Option<u32>,
+  pub connect_timeout:    Option<u32>,
 }
 
 fn default_sticky_name() -> String {
@@ -52,10 +55,13 @@ impl Listener {
       tls_versions:       None,
       expect_proxy:       None,
       sticky_name:        String::from("SOZUBALANCEID"),
+      front_timeout:      None,
+      back_timeout:       None,
+      connect_timeout:    None,
     }
   }
 
-  pub fn to_http(&self) -> Option<HttpListener> {
+  pub fn to_http(&self, front_timeout: Option<u32>, back_timeout: Option<u32>, connect_timeout: Option<u32>) -> Option<HttpListener> {
     if self.protocol != FileListenerProtocolConfig::Http {
       error!("cannot convert listener to HTTP");
       return None;
@@ -82,6 +88,9 @@ impl Listener {
         public_address: self.public_address,
         expect_proxy:   self.expect_proxy.unwrap_or(false),
         sticky_name:    self.sticky_name.clone(),
+        front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
+        back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
+        connect_timeout: self.connect_timeout.or(connect_timeout).unwrap_or(3),
         ..Default::default()
       };
 
@@ -104,7 +113,7 @@ impl Listener {
     })
   }
 
-  pub fn to_tls(&self) -> Option<HttpsListener> {
+  pub fn to_tls(&self, front_timeout: Option<u32>, back_timeout: Option<u32>, connect_timeout: Option<u32>) -> Option<HttpsListener> {
     if self.protocol != FileListenerProtocolConfig::Https {
       error!("cannot convert listener to HTTPS");
       return None;
@@ -164,6 +173,9 @@ impl Listener {
         versions,
         expect_proxy,
         rustls_cipher_list,
+        front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
+        back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
+        connect_timeout: self.connect_timeout.or(connect_timeout).unwrap_or(3),
         ..Default::default()
       };
 
@@ -189,7 +201,7 @@ impl Listener {
     })
   }
 
-  pub fn to_tcp(&self) -> Option<TcpListener> {
+  pub fn to_tcp(&self, front_timeout: Option<u32>, back_timeout: Option<u32>, connect_timeout: Option<u32>) -> Option<TcpListener> {
     /*let mut address = self.address.clone();
     address.push(':');
     address.push_str(&self.port.to_string());
@@ -210,6 +222,9 @@ impl Listener {
         address:          addr,
         public_address: self.public_address,
         expect_proxy:   self.expect_proxy.unwrap_or(false),
+        front_timeout: self.front_timeout.or(front_timeout).unwrap_or(60),
+        back_timeout: self.back_timeout.or(back_timeout).unwrap_or(30),
+        connect_timeout: self.connect_timeout.or(connect_timeout).unwrap_or(3),
       }
     })
 
@@ -679,6 +694,10 @@ pub struct FileConfig {
   #[serde(default)]
   pub front_timeout:            Option<u32>,
   #[serde(default)]
+  pub back_timeout:             Option<u32>,
+  #[serde(default)]
+  pub connect_timeout:          Option<u32>,
+  #[serde(default)]
   pub zombie_check_interval:    Option<u32>,
   #[serde(default)]
   pub accept_queue_timeout:     Option<u32>,
@@ -766,21 +785,21 @@ impl FileConfig {
 
         match listener.protocol {
           FileListenerProtocolConfig::Https => {
-            if let Some(l) = listener.to_tls() {
+            if let Some(l) = listener.to_tls(self.front_timeout.clone(), self.back_timeout.clone(), self.connect_timeout.clone()) {
               https_listeners.push(l);
             } else {
               panic!("invalid listener");
             }
           },
           FileListenerProtocolConfig::Http => {
-            if let Some(l) = listener.to_http() {
+            if let Some(l) = listener.to_http(self.front_timeout.clone(), self.back_timeout.clone(), self.connect_timeout.clone()) {
               http_listeners.push(l);
             } else {
               panic!("invalid listener");
             }
           },
           FileListenerProtocolConfig::Tcp => {
-            if let Some(l) = listener.to_tcp() {
+            if let Some(l) = listener.to_tcp(self.front_timeout.clone(), self.back_timeout.clone(), self.connect_timeout.clone()) {
               tcp_listeners.push(l);
             } else {
               panic!("invalid listener");
@@ -817,12 +836,12 @@ impl FileConfig {
                       // create a default listener for that front
                       let p = if frontend.certificate.is_some() {
                         let listener = Listener::new(frontend.address, FileListenerProtocolConfig::Https);
-                        https_listeners.push(listener.to_tls().unwrap());
+                        https_listeners.push(listener.to_tls(self.front_timeout.clone(), self.back_timeout.clone(), self.connect_timeout.clone()).unwrap());
 
                         FileListenerProtocolConfig::Https
                       } else {
                         let listener = Listener::new(frontend.address, FileListenerProtocolConfig::Http);
-                        http_listeners.push(listener.to_http().unwrap());
+                        http_listeners.push(listener.to_http(self.front_timeout.clone(), self.back_timeout.clone(), self.connect_timeout.clone()).unwrap());
 
                         FileListenerProtocolConfig::Http
                       };
@@ -842,7 +861,7 @@ impl FileConfig {
                     None => {
                       // create a default listener for that front
                       let listener = Listener::new(frontend.address, FileListenerProtocolConfig::Tcp);
-                      tcp_listeners.push(listener.to_tcp().unwrap());
+                      tcp_listeners.push(listener.to_tcp(self.front_timeout.clone(), self.back_timeout.clone(), self.connect_timeout.clone()).unwrap());
                       known_addresses.insert(frontend.address, FileListenerProtocolConfig::Tcp);
                     },
                   }
@@ -902,6 +921,8 @@ impl FileConfig {
       tls_provider,
       activate_listeners: self.activate_listeners.unwrap_or(true),
       front_timeout: self.front_timeout.unwrap_or(60),
+      back_timeout: self.front_timeout.unwrap_or(30),
+      connect_timeout: self.front_timeout.unwrap_or(3),
       //defaults to 30mn
       zombie_check_interval: self.zombie_check_interval.unwrap_or(30 * 60),
       accept_queue_timeout: self.accept_queue_timeout.unwrap_or(60),
@@ -939,6 +960,10 @@ pub struct Config {
   pub activate_listeners:       bool,
   #[serde(default = "default_front_timeout")]
   pub front_timeout:            u32,
+  #[serde(default = "default_back_timeout")]
+  pub back_timeout:            u32,
+  #[serde(default = "default_connect_timeout")]
+  pub connect_timeout:            u32,
   #[serde(default = "default_zombie_check_interval")]
   pub zombie_check_interval:    u32,
   #[serde(default = "default_accept_queue_timeout")]
@@ -947,6 +972,14 @@ pub struct Config {
 
 fn default_front_timeout() -> u32 {
   60
+}
+
+fn default_back_timeout() -> u32 {
+  30
+}
+
+fn default_connect_timeout() -> u32 {
+  3
 }
 
 //defaults to 30mn
@@ -1138,6 +1171,9 @@ mod tests {
       rustls_cipher_list: None,
       expect_proxy: None,
       sticky_name: "SOZUBALANCEID".to_string(),
+      front_timeout: None,
+      back_timeout: None,
+      connect_timeout: None,
     };
     println!("http: {:?}", to_string(&http));
     let https = Listener {
@@ -1151,6 +1187,9 @@ mod tests {
       rustls_cipher_list: None,
       expect_proxy: None,
       sticky_name: "SOZUBALANCEID".to_string(),
+      front_timeout: None,
+      back_timeout: None,
+      connect_timeout: None,
     };
     println!("https: {:?}", to_string(&https));
 
@@ -1185,6 +1224,8 @@ mod tests {
       tls_provider: None,
       activate_listeners: None,
       front_timeout: None,
+      back_timeout: None,
+      connect_timeout: None,
       zombie_check_interval: None,
       accept_queue_timeout: None,
     };

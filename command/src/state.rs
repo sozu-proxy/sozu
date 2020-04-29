@@ -952,6 +952,9 @@ mod tests {
       address: "0.0.0.0:1234".parse().unwrap(),
       public_address: None,
       expect_proxy: false,
+      front_timeout: 60,
+      back_timeout: 30,
+      connect_timeout: 3,
     }));
     state.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
       address: "0.0.0.0:1234".parse().unwrap(),
@@ -965,6 +968,9 @@ mod tests {
       answer_404: String::new(),
       answer_503: String::new(),
       sticky_name: String::new(),
+      front_timeout: 60,
+      back_timeout: 30,
+      connect_timeout: 3,
     }));
     state.handle_order(&ProxyRequestData::AddHttpsListener(HttpsListener {
       address: "0.0.0.0:8443".parse().unwrap(),
@@ -977,6 +983,9 @@ mod tests {
       cipher_list: String::new(),
       rustls_cipher_list: Vec::new(),
       tls_provider: TlsProvider::Openssl,
+      front_timeout: 60,
+      back_timeout: 30,
+      connect_timeout: 3,
     }));
     state.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
       address: "0.0.0.0:8443".parse().unwrap(),
@@ -989,6 +998,9 @@ mod tests {
       address: "0.0.0.0:1234".parse().unwrap(),
       public_address: None,
       expect_proxy: true,
+      front_timeout: 60,
+      back_timeout: 30,
+      connect_timeout: 3,
     }));
     state2.handle_order(&ProxyRequestData::AddHttpListener(HttpListener {
       address: "0.0.0.0:8080".parse().unwrap(),
@@ -997,6 +1009,9 @@ mod tests {
       answer_404: "test".to_string(),
       answer_503: String::new(),
       sticky_name: String::new(),
+      front_timeout: 60,
+      back_timeout: 30,
+      connect_timeout: 3,
     }));
     state2.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
       address: "0.0.0.0:8080".parse().unwrap(),
@@ -1014,6 +1029,9 @@ mod tests {
       cipher_list: String::new(),
       rustls_cipher_list: Vec::new(),
       tls_provider: TlsProvider::Openssl,
+      front_timeout: 60,
+      back_timeout: 30,
+      connect_timeout: 3,
     }));
     state2.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
       address: "0.0.0.0:8443".parse().unwrap(),
@@ -1030,6 +1048,9 @@ mod tests {
         address: "0.0.0.0:1234".parse().unwrap(),
         public_address: None,
         expect_proxy: true,
+        front_timeout: 60,
+        back_timeout: 30,
+        connect_timeout: 3,
       }),
       ProxyRequestData::DeactivateListener(DeactivateListener {
         address: "0.0.0.0:1234".parse().unwrap(),
@@ -1047,6 +1068,9 @@ mod tests {
         answer_404: String::from("test"),
         answer_503: String::new(),
         sticky_name: String::new(),
+        front_timeout: 60,
+        back_timeout: 30,
+        connect_timeout: 3,
       }),
       ProxyRequestData::ActivateListener(ActivateListener {
         address: "0.0.0.0:8080".parse().unwrap(),
@@ -1068,6 +1092,9 @@ mod tests {
         cipher_list: String::new(),
         rustls_cipher_list: Vec::new(),
         tls_provider: TlsProvider::Openssl,
+        front_timeout: 60,
+        back_timeout: 30,
+        connect_timeout: 3,
       }),
     );
 
