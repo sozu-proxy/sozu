@@ -903,7 +903,7 @@ impl FileConfig {
       activate_listeners: self.activate_listeners.unwrap_or(true),
       front_timeout: self.front_timeout.unwrap_or(60),
       //defaults to 30mn
-      zombie_check_interval: self.front_timeout.unwrap_or(30 * 60),
+      zombie_check_interval: self.zombie_check_interval.unwrap_or(30 * 60),
       accept_queue_timeout: self.accept_queue_timeout.unwrap_or(60),
     }
   }
