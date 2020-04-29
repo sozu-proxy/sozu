@@ -1059,6 +1059,8 @@ impl ProxyConfiguration<Session> for Proxy {
       r.interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
     });
 
+    let connect_timeout = time::Duration::seconds(i64::from(self.listeners.get(&session.listen_token).as_ref().map(|l| l.config.connect_timeout).unwrap()));
+
     session.back_connected = BackendConnectionStatus::Connecting;
     if let Some(back_token) = old_back_token {
       session.set_back_token(back_token);
@@ -1071,6 +1073,10 @@ impl ProxyConfiguration<Session> for Proxy {
         error!("error registering back socket({:?}): {:?}", socket, e);
       }
       session.set_back_socket(socket);
+      TIMER.with(|timer| {
+        timer.borrow_mut().cancel_timeout_with_token(back_token);
+        timer.borrow_mut().set_timeout(connect_timeout.to_std().unwrap(), back_token);
+      });
       Ok(BackendConnectAction::Replace)
     } else {
       if let Err(e) = poll.register(
@@ -1084,6 +1090,9 @@ impl ProxyConfiguration<Session> for Proxy {
 
       session.set_back_socket(socket);
       session.set_back_token(back_token);
+      TIMER.with(|timer| {
+        timer.borrow_mut().set_timeout(connect_timeout.to_std().unwrap(), back_token);
+      });
       Ok(BackendConnectAction::New)
     }
   }

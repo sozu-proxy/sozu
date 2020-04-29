@@ -1380,7 +1380,7 @@ impl<Front:SocketHandler> Http<Front> {
         });
         SessionResult::Continue
       } else {
-        info!("frontend timeout triggered for token {:?}", token);
+        //info!("frontend timeout triggered for token {:?}", token);
         match self.timeout_status() {
           TimeoutStatus::Request => {
             self.set_answer(DefaultAnswerStatus::Answer408, None);
@@ -1395,9 +1395,24 @@ impl<Front:SocketHandler> Http<Front> {
           }
         }
       }
+    } else if self.backend_token == Some(token) {
+        //info!("backend timeout triggered for token {:?}", token);
+        match self.timeout_status() {
+            TimeoutStatus::Request => {
+                error!("got backend timeout while waiting for a request, this should not happen");
+                SessionResult::CloseSession
+            },
+            TimeoutStatus::Response => {
+                self.set_answer(DefaultAnswerStatus::Answer504, None);
+                self.writable(metrics)
+            },
+            _ => {
+                SessionResult::CloseSession
+            }
+        }
     } else {
-      // invalid token, obsolete timeout triggered
-      SessionResult::Continue
+        error!("got timeout for an invalid token");
+        SessionResult::CloseSession
     }
   }
 

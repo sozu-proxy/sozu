@@ -246,6 +246,21 @@ impl<T> Timer<T> {
         Some(self.entries.remove(timeout.token.into()).state)
     }
 
+    pub fn cancel_timeout_with_token(&mut self, token: Token) -> Option<T> {
+        let links = match self.entries.get(token.0) {
+            Some(e) => e.links,
+            None => return None,
+        };
+
+        // Sanity check
+        /*if links.tick != timeout.tick {
+            return None;
+        }*/
+
+        self.unlink(&links, token);
+        Some(self.entries.remove(token.0).state)
+    }
+
     /// Poll for an expired timer.
     ///
     /// The return value holds the state associated with the first expired
