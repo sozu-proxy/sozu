@@ -2,12 +2,11 @@
 //!
 //! code imported from mio-extras
 //! License: MIT or Apache 2.0
-use mio::{Evented, Poll, PollOpt, Ready, Registration, SetReadiness, Token};
+use mio::Token;
 use slab::Slab;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{cmp, fmt, io, iter, thread, u64, usize};
+use std::{cmp, iter, u64, usize};
 
 // Conversion utilities
 mod convert {
@@ -82,6 +81,13 @@ pub struct Timeout {
     tick: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct TimeoutContainer {
+    pub timeout: Timeout,
+    pub duration: Duration,
+}
+
+
 #[derive(Copy, Clone, Debug)]
 struct WheelEntry {
     next_tick: Tick,
@@ -103,13 +109,7 @@ struct EntryLinks {
 }
 
 type Tick = u64;
-
 const TICK_MAX: Tick = u64::MAX;
-
-// Manages communication with wakeup thread
-type WakeupState = Arc<AtomicUsize>;
-
-const TERMINATE_THREAD: usize = 0;
 const EMPTY: Token = Token(usize::MAX);
 
 impl Builder {
@@ -227,6 +227,15 @@ impl<T> Timer<T> {
         Timeout { token, tick }
     }
 
+    /// Resets a timeout.
+    ///
+    pub fn reset_timeout(&mut self, timeout: &Timeout, delay_from_now: Duration) -> Option<Timeout> {
+        match self.cancel_timeout(timeout) {
+            None => None,
+            Some(state) => Some(self.set_timeout(delay_from_now, state))
+        }
+    }
+
     /// Cancel a timeout.
     ///
     /// If the timeout has not yet occurred, the return value holds the
@@ -244,21 +253,6 @@ impl<T> Timer<T> {
 
         self.unlink(&links, timeout.token);
         Some(self.entries.remove(timeout.token.into()).state)
-    }
-
-    pub fn cancel_timeout_with_token(&mut self, token: Token) -> Option<T> {
-        let links = match self.entries.get(token.0) {
-            Some(e) => e.links,
-            None => return None,
-        };
-
-        // Sanity check
-        /*if links.tick != timeout.tick {
-            return None;
-        }*/
-
-        self.unlink(&links, token);
-        Some(self.entries.remove(token.0).state)
     }
 
     /// Poll for an expired timer.

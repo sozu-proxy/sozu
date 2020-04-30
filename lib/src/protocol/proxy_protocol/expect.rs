@@ -12,7 +12,6 @@ use socket::{SocketHandler, SocketResult};
 use SessionMetrics;
 use protocol::pipe::Pipe;
 use pool::Checkout;
-use sozu_command::buffer::fixed::Buffer;
 use super::parser::parse_v2_header;
 use super::header::ProxyAddr;
 use Protocol;

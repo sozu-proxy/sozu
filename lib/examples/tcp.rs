@@ -31,6 +31,9 @@ fn main() {
       front: "127.0.0.1:8080".parse().unwrap(),
       public_address: None,
       expect_proxy: false,
+      front_timeout: 60,
+      back_timeout: 30,
+      connect_timeout: 3,
     };
     Logger::init("TCP".to_string(), "debug", LoggerBackend::Stdout(stdout()), None);
     sozu::tcp::start(listener, max_buffers, buffer_size, channel);

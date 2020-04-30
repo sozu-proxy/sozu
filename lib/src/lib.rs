@@ -249,7 +249,6 @@ pub trait ProxySession {
   fn close(&mut self, poll: &mut Poll) -> CloseResult;
   fn close_backend(&mut self, token: Token, poll: &mut Poll);
   fn timeout(&mut self, t: Token, front_timeout: &Duration) -> SessionResult;
-  fn cancel_timeouts(&self);
   fn last_event(&self) -> Instant;
   fn print_state(&self);
   fn tokens(&self) -> Vec<Token>;
@@ -284,8 +283,7 @@ pub trait ProxyConfiguration<Session> {
   fn notify(&mut self, event_loop: &mut Poll, message: ProxyRequest) -> ProxyResponse;
   fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError>;
   fn create_session(&mut self, socket: TcpStream, token: ListenToken,
-                    event_loop: &mut Poll, session_token: Token, timeout: timer::Timeout,
-                    delay: Duration)
+                    event_loop: &mut Poll, session_token: Token, wait_time: Duration)
     -> Result<(Rc<RefCell<Session>>, bool), AcceptError>;
   fn listen_port_state(&self, port: &u16) -> ListenPortState;
 }
@@ -592,11 +590,11 @@ pub struct SessionMetrics {
 }
 
 impl SessionMetrics {
-  pub fn new(delay: Option<Duration>) -> SessionMetrics {
+  pub fn new(wait_time: Option<Duration>) -> SessionMetrics {
     SessionMetrics {
       start:         Some(Instant::now()),
       service_time:  Duration::seconds(0),
-      wait_time:     delay.unwrap_or_else(|| Duration::seconds(0)),
+      wait_time:     wait_time.unwrap_or_else(|| Duration::seconds(0)),
       bin:           0,
       bout:          0,
       service_start: None,

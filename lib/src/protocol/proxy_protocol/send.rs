@@ -5,7 +5,6 @@ use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use rusty_ulid::Ulid;
-use sozu_command::buffer::fixed::Buffer;
 use {
   SessionMetrics,
   SessionResult,

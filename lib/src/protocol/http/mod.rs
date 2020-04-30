@@ -14,6 +14,7 @@ use protocol::ProtocolResult;
 use pool::Pool;
 use util::UnwrapLog;
 use server::TIMER;
+use timer::TimeoutContainer;
 
 pub mod parser;
 pub mod cookies;
@@ -60,6 +61,7 @@ pub enum TimeoutStatus {
   Request,
   Response,
   WaitingForNewRequest,
+  WaitingForResponse,
 }
 
 pub struct Http<Front:SocketHandler> {
@@ -92,13 +94,17 @@ pub struct Http<Front:SocketHandler> {
   answers:             Rc<RefCell<answers::HttpAnswers>>,
   pub closing:         bool,
   pool:                Weak<RefCell<Pool>>,
-  pub frontend_last_event: SteadyTime,
+  pub frontend_last_event: Instant,
+  pub front_timeout:   Option<TimeoutContainer>,
+  pub back_timeout:    Option<TimeoutContainer>,
+  backend_timeout_duration: Duration,
 }
 
 impl<Front:SocketHandler> Http<Front> {
   pub fn new(sock: Front, token: Token, request_id: Ulid, pool: Weak<RefCell<Pool>>,
     public_address: SocketAddr, session_address: Option<SocketAddr>, sticky_name: String,
-    protocol: Protocol, answers: Rc<RefCell<answers::HttpAnswers>>) -> Http<Front> {
+    protocol: Protocol, answers: Rc<RefCell<answers::HttpAnswers>>,
+    front_timeout: TimeoutContainer, backend_timeout_duration: Duration) -> Http<Front> {
 
     let mut session = Http {
       frontend:           sock,
@@ -128,7 +134,10 @@ impl<Front:SocketHandler> Http<Front> {
       keepalive_count: 0,
       backend_stop:    None,
       closing:         false,
-      frontend_last_event: SteadyTime::now(),
+      frontend_last_event: Instant::now(),
+      front_timeout: Some(front_timeout),
+      back_timeout: None,
+      backend_timeout_duration,
       answers,
       pool,
     };
@@ -160,6 +169,21 @@ impl<Front:SocketHandler> Http<Front> {
     self.back_buf = None;
     self.request_id = request_id;
     self.keepalive_count += 1;
+
+    // reset the front timeout and cancel the back timeout while we are
+    // waiting for a new request
+    if let Some(timeout) = self.front_timeout.take() {
+        let duration = timeout.duration;
+        let timeout = TIMER.with(|timer| {
+            timer.borrow_mut().set_timeout(duration, self.frontend_token)
+        });
+        self.front_timeout = Some(TimeoutContainer { timeout, duration });
+    }
+    if let Some(timeout) = self.back_timeout.as_ref() {
+        TIMER.with(|timer| {
+            timer.borrow_mut().cancel_timeout(&timeout.timeout);
+        });
+    }
   }
 
   pub fn log_context(&self) -> LogContext {
@@ -306,6 +330,23 @@ impl<Front:SocketHandler> Http<Front> {
     &mut self.back_readiness
   }
 
+  pub fn set_back_timeout(&mut self, dur: Duration) {
+      if let Some(timeout) = self.back_timeout.take() {
+        TIMER.with(|timer| {
+          timer.borrow_mut().cancel_timeout(&timeout.timeout);
+        })
+      }
+
+      if let Some(token) = self.backend_token.as_ref() {
+          let duration = dur.to_std().unwrap();
+          let timeout = TIMER.with(|timer| {
+              timer.borrow_mut().set_timeout(duration, *token)
+          });
+          self.back_timeout = Some(TimeoutContainer { timeout, duration });
+    }
+
+  }
+
   fn protocol(&self) -> Protocol {
     self.protocol
   }
@@ -331,7 +372,10 @@ impl<Front:SocketHandler> Http<Front> {
     match self.request.as_ref() {
       Some(RequestState::Request(_,_,_)) | Some(RequestState::RequestWithBody(_,_,_,_)) |
         Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
-          TimeoutStatus::Response
+          match self.response.as_ref() {
+            Some(ResponseState::Initial) => TimeoutStatus::WaitingForResponse,
+            _ => TimeoutStatus::Response,
+          }
       },
       _ => if self.keepalive_count > 0 {
         TimeoutStatus::WaitingForNewRequest
@@ -345,6 +389,7 @@ impl<Front:SocketHandler> Http<Front> {
     debug!("{}\tPROXY [{} -> {}] CLOSED BACKEND", self.log_context(), self.frontend_token.0,
       self.backend_token.map(|t| format!("{}", t.0)).unwrap_or_else(|| "-".to_string()));
     let addr:Option<SocketAddr> = self.backend.as_ref().and_then(|sock| sock.peer_addr().ok());
+    self.cancel_backend_timeout();
     self.backend       = None;
     self.backend_token = None;
     (self.app_id.clone(), addr)
@@ -553,7 +598,16 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Read content from the session
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-    self.frontend_last_event = SteadyTime::now();
+    if let Some(TimeoutContainer { timeout, duration }) = self.front_timeout.take() {
+        if let Some(timeout) = TIMER.with(|timer| {
+            timer.borrow_mut().reset_timeout(&timeout, duration)
+        }) {
+          self.front_timeout = Some(TimeoutContainer { timeout, duration });
+        } else {
+          error!("could not reset front timeout");
+        }
+    }
+    self.frontend_last_event = Instant::now();
 
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
       self.front_readiness.interest.insert(Ready::writable());
@@ -773,7 +827,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   fn writable_default_answer(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-    self.frontend_last_event = SteadyTime::now();
+    self.frontend_last_event = Instant::now();
     let res = if let SessionStatus::DefaultAnswer(_, ref buf, mut index) = self.status {
       let len = buf.len();
 
@@ -817,7 +871,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Forward content to session
   pub fn writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-    self.frontend_last_event = SteadyTime::now();
+    self.frontend_last_event = Instant::now();
 
     //handle default answers
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
@@ -997,7 +1051,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Forward content to application
   pub fn back_writable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-    self.frontend_last_event = SteadyTime::now();
+    self.frontend_last_event = Instant::now();
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
       error!("{}\tsending default answer, should not write to back", self.log_context());
       self.back_readiness.interest.remove(Ready::writable());
@@ -1090,6 +1144,14 @@ impl<Front:SocketHandler> Http<Front> {
           self.front_readiness.interest.remove(Ready::readable());
           self.back_readiness.interest.insert(Ready::readable());
           self.back_readiness.interest.remove(Ready::writable());
+
+          // cancel the front timeout while we are waiting for the server to answer
+          if let Some(timeout) = self.front_timeout.as_ref() {
+            TIMER.with(|timer| {
+              timer.borrow_mut().cancel_timeout(&timeout.timeout);
+            })
+          }
+          self.set_back_timeout(self.backend_timeout_duration);
           SessionResult::Continue
         },
         Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Initial)) => {
@@ -1131,7 +1193,17 @@ impl<Front:SocketHandler> Http<Front> {
 
   // Read content from application
   pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> (ProtocolResult, SessionResult) {
-    self.frontend_last_event = SteadyTime::now();
+    if let Some(TimeoutContainer { timeout, duration }) = self.back_timeout.take() {
+        if let Some(timeout) = TIMER.with(|timer| {
+            timer.borrow_mut().reset_timeout(&timeout, duration)
+        }) {
+          self.back_timeout = Some(TimeoutContainer { timeout, duration });
+        } else {
+          error!("could not reset back timeout");
+        }
+    }
+
+    self.frontend_last_event = Instant::now();
 
     if let SessionStatus::DefaultAnswer(_,_,_) = self.status {
       error!("{}\tsending default answer, should not read from back socket", self.log_context());
@@ -1361,7 +1433,7 @@ impl<Front:SocketHandler> Http<Front> {
 
   pub fn timeout(&mut self, token: Token, front_timeout: &Duration, metrics: &mut SessionMetrics) -> SessionResult {
     if self.frontend_token == token {
-      let dur = SteadyTime::now() - self.frontend_last_event;
+      let dur = Instant::now() - self.frontend_last_event;
       if dur < *front_timeout {
         TIMER.with(|timer| {
             timer.borrow_mut().set_timeout((*front_timeout - dur).to_std().unwrap(), token);
@@ -1374,13 +1446,13 @@ impl<Front:SocketHandler> Http<Front> {
             self.set_answer(DefaultAnswerStatus::Answer408, None);
             self.writable(metrics)
           },
-          TimeoutStatus::Response => {
-            self.set_answer(DefaultAnswerStatus::Answer504, None);
-            self.writable(metrics)
-          },
-          _ => {
+          TimeoutStatus::WaitingForResponse => {
             SessionResult::CloseSession
-          }
+          },
+          TimeoutStatus::Response => {
+            SessionResult::CloseSession
+          },
+          TimeoutStatus::WaitingForNewRequest => SessionResult::CloseSession,
         }
       }
     } else if self.backend_token == Some(token) {
@@ -1388,15 +1460,18 @@ impl<Front:SocketHandler> Http<Front> {
         match self.timeout_status() {
             TimeoutStatus::Request => {
                 error!("got backend timeout while waiting for a request, this should not happen");
-                SessionResult::CloseSession
-            },
-            TimeoutStatus::Response => {
                 self.set_answer(DefaultAnswerStatus::Answer504, None);
                 self.writable(metrics)
             },
-            _ => {
+            TimeoutStatus::WaitingForResponse => {
+                self.set_answer(DefaultAnswerStatus::Answer504, None);
+                self.writable(metrics)
+            },
+            TimeoutStatus::Response => {
+                error!("backend timeout while sending response");
                 SessionResult::CloseSession
-            }
+            },
+            TimeoutStatus::WaitingForNewRequest => SessionResult::Continue,
         }
     } else {
         error!("got timeout for an invalid token");
@@ -1404,14 +1479,27 @@ impl<Front:SocketHandler> Http<Front> {
     }
   }
 
-  /*fn cancel_timeouts(&self) {
+  pub fn cancel_timeouts(&self) {
+      let front_timeout = self.front_timeout.as_ref();
+      let back_timeout = self.front_timeout.as_ref();
       TIMER.with(|timer| {
-          timer.borrow_mut().cancel_timeout_with_token(self.frontend_token);
-          if let Some(t) = self.backend_token.as_ref() {
-            timer.borrow_mut().cancel_timeout_with_token(*t);
+          if let Some(timeout) = front_timeout {
+            timer.borrow_mut().cancel_timeout(&timeout.timeout);
+          }
+          if let Some(timeout) = back_timeout {
+            timer.borrow_mut().cancel_timeout(&timeout.timeout);
           }
       });
-  }*/
+  }
+
+  pub fn cancel_backend_timeout(&self) {
+      let back_timeout = self.front_timeout.as_ref();
+      TIMER.with(|timer| {
+          if let Some(timeout) = back_timeout {
+            timer.borrow_mut().cancel_timeout(&timeout.timeout);
+          }
+      });
+  }
 }
 
 /// Save the backend http response status code metric
