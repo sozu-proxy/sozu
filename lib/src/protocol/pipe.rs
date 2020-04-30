@@ -3,11 +3,15 @@ use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use uuid::adapter::Hyphenated;
+use time::Duration;
+
 use sozu_command::buffer::fixed::Buffer;
 use {SessionResult,Readiness,SessionMetrics};
 use socket::{SocketHandler,SocketResult,TransportProtocol};
 use pool::Checkout;
 use {Protocol, LogDuration};
+use timer::TimeoutContainer;
+use server::TIMER;
 
 #[derive(PartialEq)]
 pub enum SessionStatus {
@@ -41,6 +45,8 @@ pub struct Pipe<Front:SocketHandler> {
   protocol:           Protocol,
   frontend_status:    ConnectionStatus,
   backend_status:     ConnectionStatus,
+  pub front_timeout:  Option<TimeoutContainer>,
+  pub back_timeout:   Option<TimeoutContainer>,
 }
 
 impl<Front:SocketHandler> Pipe<Front> {
@@ -84,6 +90,8 @@ impl<Front:SocketHandler> Pipe<Front> {
       protocol,
       frontend_status,
       backend_status,
+      front_timeout: None,
+      back_timeout: None,
     };
 
     trace!("created pipe");
@@ -116,6 +124,24 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   pub fn back_token(&self)   -> Option<Token> {
     self.backend_token
+  }
+
+  pub fn timeout(&mut self, _token: Token, _front_timeout: &Duration, _metrics: &mut SessionMetrics) -> SessionResult {
+      //FIXME
+      SessionResult::CloseSession
+  }
+
+  pub fn cancel_timeouts(&self) {
+      let front_timeout = self.front_timeout.as_ref();
+      let back_timeout = self.front_timeout.as_ref();
+      TIMER.with(|timer| {
+          if let Some(timeout) = front_timeout {
+            timer.borrow_mut().cancel_timeout(&timeout.timeout);
+          }
+          if let Some(timeout) = back_timeout {
+            timer.borrow_mut().cancel_timeout(&timeout.timeout);
+          }
+      });
   }
 
   pub fn close(&mut self) {
@@ -317,6 +343,16 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   // Read content from the session
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    if let Some(TimeoutContainer { timeout, duration }) = self.front_timeout.take() {
+        if let Some(timeout) = TIMER.with(|timer| {
+            timer.borrow_mut().reset_timeout(&timeout, duration)
+        }) {
+          self.front_timeout = Some(TimeoutContainer { timeout, duration });
+        } else {
+          error!("could not reset front container");
+        }
+    }
+
     trace!("pipe readable");
     if self.front_buf.available_space() == 0 {
       self.front_readiness.interest.remove(Ready::readable());
@@ -546,6 +582,16 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   // Read content from application
   pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
+    if let Some(TimeoutContainer { timeout, duration }) = self.back_timeout.take() {
+        if let Some(timeout) = TIMER.with(|timer| {
+            timer.borrow_mut().reset_timeout(&timeout, duration)
+        }) {
+          self.back_timeout = Some(TimeoutContainer { timeout, duration });
+        } else {
+          error!("could not reset back timeout");
+        }
+    }
+
     trace!("pipe back_readable");
     if self.back_buf.available_space() == 0 {
       self.back_readiness.interest.remove(Ready::readable());

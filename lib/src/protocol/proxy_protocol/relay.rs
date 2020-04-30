@@ -6,7 +6,6 @@ use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use uuid::adapter::Hyphenated;
 use nom::{Err,Offset};
-use sozu_command::buffer::fixed::Buffer;
 use SessionResult;
 use Readiness;
 use protocol::ProtocolResult;

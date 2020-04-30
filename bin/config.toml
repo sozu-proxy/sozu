@@ -100,6 +100,14 @@ tls_provider = "rustls"
 # defaults to 60 seconds
 # front_timeout = 60
 
+# maximum time of inactivity for a backend socket, in seconds
+# defaults to 30 seconds
+# back_timeout = 30
+
+# maximum time to connect to a backend server, in seconds
+# defaults to 3 seconds
+# connect_timeout = 3
+
 # duration between zombie checks, in seconds
 # defaults to 30 minutes
 # in case of bugs in sozu's event loop and protocol implementations, some client

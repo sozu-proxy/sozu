@@ -20,9 +20,8 @@ use sozu_command::proxy::{Cluster,
   ProxyRequestData,HttpFrontend,HttpsListener,ProxyRequest,ProxyResponse,
   ProxyResponseStatus,AddCertificate,RemoveCertificate,ReplaceCertificate,
   TlsVersion,ProxyResponseData,Query, QueryCertificateType,QueryAnswer,
-  QueryAnswerCertificate,RemoveListener,Route};
+  QueryAnswerCertificate,Route};
 use sozu_command::logging;
-use sozu_command::buffer::fixed::Buffer;
 
 use protocol::http::{parser::{RRequestLine,hostname_and_port}, answers::HttpAnswers};
 use pool::Pool;
@@ -35,7 +34,6 @@ use router::Router;
 use protocol::StickySession;
 use protocol::http::DefaultAnswerStatus;
 use util::UnwrapLog;
-use timer::Timeout;
 
 use super::resolver::CertificateResolverWrapper;
 use super::session::Session;
@@ -408,7 +406,7 @@ impl ProxyConfiguration<Session> for Proxy {
   }
 
   fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken,
-    poll: &mut Poll, session_token: Token, timeout: Timeout, delay: Duration)
+    poll: &mut Poll, session_token: Token, wait_time: Duration)
     -> Result<(Rc<RefCell<Session>>, bool), AcceptError> {
       if let Some(ref listener) = self.listeners.get(&Token(token.0)) {
         if let Err(e) = frontend_sock.set_nodelay(true) {
@@ -428,7 +426,10 @@ impl ProxyConfiguration<Session> for Proxy {
         let c = Session::new(session, frontend_sock, session_token, Rc::downgrade(&self.pool),
           listener.config.public_address.unwrap_or(listener.config.address),
           listener.config.expect_proxy, listener.config.sticky_name.clone(),
-          timeout, listener.answers.clone(), Token(token.0), delay);
+          listener.answers.clone(), Token(token.0), wait_time,
+          Duration::seconds(listener.config.front_timeout as i64),
+          Duration::seconds(listener.config.back_timeout as i64),
+          );
 
         Ok((Rc::new(RefCell::new(c)), false))
       } else {
@@ -495,6 +496,8 @@ impl ProxyConfiguration<Session> for Proxy {
       r.interest  = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
     });
 
+    let connect_timeout = time::Duration::seconds(i64::from(self.listeners.get(&session.listen_token).as_ref().map(|l| l.config.connect_timeout).unwrap()));
+
     session.back_connected = BackendConnectionStatus::Connecting;
     if let Some(back_token) = old_back_token {
       session.set_back_token(back_token);
@@ -508,6 +511,7 @@ impl ProxyConfiguration<Session> for Proxy {
       }
 
       session.set_back_socket(socket);
+      session.http_mut().map(|h| h.set_back_timeout(connect_timeout));
       Ok(BackendConnectAction::Replace)
     } else {
       if let Err(e) = poll.register(
@@ -521,6 +525,7 @@ impl ProxyConfiguration<Session> for Proxy {
 
       session.set_back_socket(socket);
       session.set_back_token(back_token);
+      session.http_mut().map(|h| h.set_back_timeout(connect_timeout));
       Ok(BackendConnectAction::New)
     }
   }

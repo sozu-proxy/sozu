@@ -4,11 +4,10 @@ use std::net::{Shutdown,SocketAddr};
 use mio::*;
 use mio::net::*;
 use mio::unix::UnixReady;
-use std::io::{ErrorKind,Read};
+use std::io::{ErrorKind, Read};
 use time::{SteadyTime, Duration};
 use uuid::Uuid;
 use rustls::{ServerSession,Session as ClientSession,ProtocolVersion,SupportedCipherSuite,CipherSuite};
-use sozu_command::buffer::fixed::Buffer;
 use sozu_command::proxy::ProxyEvent;
 
 use protocol::http::parser::RequestState;
@@ -18,13 +17,13 @@ use {Backend,SessionResult,Protocol,Readiness,SessionMetrics, ProxySession,
 use socket::FrontRustls;
 use protocol::{ProtocolResult,Http,Pipe};
 use protocol::rustls::TlsHandshake;
-use protocol::http::{DefaultAnswerStatus, TimeoutStatus, answers::HttpAnswers};
+use protocol::http::{DefaultAnswerStatus, answers::HttpAnswers};
 use protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use retry::RetryPolicy;
 use util::UnwrapLog;
 use buffer_queue::BufferQueue;
 use server::{push_event, TIMER};
-use timer::{Timer, Timeout};
+use timer::TimeoutContainer;
 
 pub enum State {
   Expect(ExpectProxyProtocol<TcpStream>, ServerSession),
@@ -41,20 +40,22 @@ pub struct Session {
   pub public_address: SocketAddr,
   pool:               Weak<RefCell<Pool>>,
   pub metrics:        SessionMetrics,
-  pub cluster_id:         Option<String>,
+  pub cluster_id:     Option<String>,
   sticky_name:        String,
-  timeout:            Timeout,
   last_event:         SteadyTime,
   pub listen_token:   Token,
   pub connection_attempt: u8,
   peer_address:       Option<SocketAddr>,
   answers:            Rc<RefCell<HttpAnswers>>,
+  front_timeout:      Option<TimeoutContainer>,
+  backend_timeout_duration: Duration,
 }
 
 impl Session {
   pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool>>,
-    public_address: SocketAddr, expect_proxy: bool, sticky_name: String, timeout: Timeout,
-    answers: Rc<RefCell<HttpAnswers>>, listen_token: Token, delay: Duration) -> Session {
+    public_address: SocketAddr, expect_proxy: bool, sticky_name: String,
+    answers: Rc<RefCell<HttpAnswers>>, listen_token: Token, wait_time: Duration,
+    front_timeout_duration: Duration, backend_timeout_duration: Duration) -> Session {
     let peer_address = if expect_proxy {
       // Will be defined later once the expect proxy header has been received and parsed
       None
@@ -63,6 +64,12 @@ impl Session {
     };
 
     let request_id = Uuid::new_v4().to_hyphenated();
+    let duration = front_timeout_duration.to_std().unwrap();
+    let timeout = TIMER.with(|timer| {
+        timer.borrow_mut().set_timeout(duration, token)
+    });
+    let front_timeout = Some(TimeoutContainer { timeout, duration });
+
     let state = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);
@@ -72,7 +79,7 @@ impl Session {
       Some(State::Handshake(TlsHandshake::new(ssl, sock, request_id)))
     };
 
-    let metrics = SessionMetrics::new(Some(delay));
+    let metrics = SessionMetrics::new(Some(wait_time));
 
     let mut session = Session {
       frontend_token: token,
@@ -84,12 +91,13 @@ impl Session {
       metrics,
       cluster_id:         None,
       sticky_name,
-      timeout,
       last_event:     SteadyTime::now(),
       listen_token,
       connection_attempt: 0,
       peer_address,
       answers,
+      front_timeout,
+      backend_timeout_duration,
     };
     session.front_readiness().interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
     session
@@ -172,9 +180,11 @@ impl Session {
       };
 
       let readiness = handshake.readiness.clone();
+      let backend_timeout_duration = self.backend_timeout_duration;
       let http = Http::new(front_stream, self.frontend_token, handshake.request_id,
         self.pool.clone(), self.public_address, self.peer_address,
-        self.sticky_name.clone(), Protocol::HTTPS, self.answers.clone()).map(|mut http| {
+        self.sticky_name.clone(), Protocol::HTTPS, self.answers.clone(),
+        self.front_timeout.take().unwrap(), backend_timeout_duration).map(|mut http| {
 
         let res = http.frontend.session.read(front_buf.space());
         match res {
@@ -246,6 +256,8 @@ impl Session {
 
       pipe.front_readiness.event = http.front_readiness.event;
       pipe.back_readiness.event  = http.back_readiness.event;
+      pipe.front_timeout = http.front_timeout;
+      pipe.back_timeout = http.back_timeout;
       pipe.set_back_token(back_token);
       pipe.set_cluster_id(self.cluster_id.clone());
 
@@ -298,8 +310,30 @@ impl Session {
 
   fn readable(&mut self)      -> SessionResult {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
-      State::Expect(ref mut expect, _)    => expect.readable(&mut self.metrics),
-      State::Handshake(ref mut handshake) => handshake.readable(),
+      State::Expect(ref mut expect, _)    => {
+          if let Some(TimeoutContainer { timeout, duration }) = self.front_timeout.take() {
+              if let Some(timeout) = TIMER.with(|timer| {
+                  timer.borrow_mut().reset_timeout(&timeout, duration)
+              }) {
+                  self.front_timeout = Some(TimeoutContainer { timeout, duration });
+              } else {
+                  error!("could not reset front timeout");
+              }
+          }
+          expect.readable(&mut self.metrics)
+      },
+      State::Handshake(ref mut handshake) => {
+          if let Some(TimeoutContainer { timeout, duration }) = self.front_timeout.take() {
+              if let Some(timeout) = TIMER.with(|timer| {
+                  timer.borrow_mut().reset_timeout(&timeout, duration)
+              }) {
+                  self.front_timeout = Some(TimeoutContainer { timeout, duration });
+              } else {
+                  error!("could not reset front timeout");
+              }
+          }
+          handshake.readable()
+      },
       State::Http(ref mut http)           => (ProtocolResult::Continue, http.readable(&mut self.metrics)),
       State::WebSocket(ref mut pipe)      => (ProtocolResult::Continue, pipe.readable(&mut self.metrics)),
     };
@@ -477,6 +511,20 @@ impl Session {
   fn reset_connection_attempt(&mut self) {
     self.connection_attempt = 0;
   }
+
+  fn cancel_timeouts(&self) {
+      if let Some(timeout) = self.front_timeout.as_ref() {
+        TIMER.with(|timer| {
+            timer.borrow_mut().cancel_timeout(&timeout.timeout);
+        });
+      }
+
+      match *unwrap_msg!(self.protocol.as_ref()) {
+          State::Http(ref http) => http.cancel_timeouts(),
+          State::WebSocket(ref pipe) => pipe.cancel_timeouts(),
+          _ => {},
+      }
+  }
 }
 
 impl ProxySession for Session {
@@ -484,6 +532,7 @@ impl ProxySession for Session {
     //println!("TLS closing[{:?}] temp->front: {:?}, temp->back: {:?}", self.token, *self.temp.front_buf, *self.temp.back_buf);
     self.http_mut().map(|http| http.close());
     self.metrics.service_stop();
+    self.cancel_timeouts();
     if let Err(e) = self.front_socket().shutdown(Shutdown::Both) {
       if e.kind() != ErrorKind::NotConnected {
         error!("error closing front socket: {:?}", e);
@@ -528,12 +577,6 @@ impl ProxySession for Session {
       State::Http(ref mut http) => http.timeout(token, timeout, &mut self.metrics),
       _ => SessionResult::CloseSession,
     }
-  }
-
-  fn cancel_timeouts(&self) {
-    TIMER.with(|timer| {
-        timer.borrow_mut().cancel_timeout(&self.timeout);
-    });
   }
 
   fn close_backend(&mut self, _: Token, poll: &mut Poll) {
@@ -590,6 +633,8 @@ impl ProxySession for Session {
 
     if self.back_connected() == BackendConnectionStatus::Connecting &&
       self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
+
+      self.http_mut().map(|h| h.cancel_backend_timeout());
 
       if self.back_readiness().map(|r| r.event.is_hup()).unwrap_or(false) ||
         !self.http_mut().map(|h| h.test_back_socket()).unwrap_or(false) {
