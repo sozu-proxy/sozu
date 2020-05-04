@@ -4,9 +4,9 @@
 //! License: MIT or Apache 2.0
 use mio::Token;
 use slab::Slab;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{cmp, iter, u64, usize};
+use server::TIMER;
 
 // Conversion utilities
 mod convert {
@@ -83,10 +83,70 @@ pub struct Timeout {
 
 #[derive(Clone, Debug)]
 pub struct TimeoutContainer {
-    pub timeout: Timeout,
+    // mark it as an option, so we do not try to cancel a timeout multiple times
+    pub timeout: Option<Timeout>,
     pub duration: Duration,
 }
 
+impl TimeoutContainer {
+  pub fn new(duration: Duration, token: Token) -> TimeoutContainer {
+    let timeout = TIMER.with(|timer| {
+        timer.borrow_mut().set_timeout(duration, token)
+    });
+    TimeoutContainer { timeout: Some(timeout), duration }
+  }
+
+  pub fn take(&mut self) -> TimeoutContainer {
+    TimeoutContainer {
+        timeout: self.timeout.take(),
+        duration: self.duration,
+    }
+  }
+
+  pub fn set(&mut self, token: Token) {
+      if let Some(timeout) = self.timeout.take() {
+          TIMER.with(|timer| {
+              timer.borrow_mut().cancel_timeout(&timeout)
+          });
+      }
+
+      let timeout = TIMER.with(|timer| {
+          timer.borrow_mut().set_timeout(self.duration, token)
+      });
+
+    self.timeout = Some(timeout);
+  }
+
+  pub fn cancel(&mut self) -> bool {
+      match self.timeout.take() {
+        None => {
+            error!("cannot cancel non existing timeout");
+            false
+        },
+        Some(timeout) => {
+            TIMER.with(|timer| {
+                timer.borrow_mut().cancel_timeout(&timeout)
+            });
+            true
+        },
+      }
+  }
+
+  pub fn reset(&mut self) -> bool {
+      self.timeout = match self.timeout.take() {
+        None => {
+            error!("cannot reset non existing timeout");
+            return false;
+        },
+        Some(timeout) => {
+            TIMER.with(|timer| {
+                timer.borrow_mut().reset_timeout(&timeout, self.duration)
+            })
+        },
+      };
+      self.timeout.is_some()
+  }
+}
 
 #[derive(Copy, Clone, Debug)]
 struct WheelEntry {
@@ -243,7 +303,10 @@ impl<T> Timer<T> {
     pub fn cancel_timeout(&mut self, timeout: &Timeout) -> Option<T> {
         let links = match self.entries.get(timeout.token.into()) {
             Some(e) => e.links,
-            None => return None,
+            None => {
+                error!("timeout token {:?} not found", timeout.token);
+                return None
+            },
         };
 
         // Sanity check
