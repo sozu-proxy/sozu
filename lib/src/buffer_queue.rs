@@ -485,7 +485,7 @@ impl fmt::Debug for BufferQueue {
 
 
 pub fn buf_with_capacity(capacity: usize) -> (Pool, BufferQueue) {
-  let mut pool = Pool::with_capacity(1, capacity);
+  let mut pool = Pool::with_capacity(1, capacity, 16384);
   let b = BufferQueue::with_buffer(pool.checkout().unwrap());
   (pool, b)
 }

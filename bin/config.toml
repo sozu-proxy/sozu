@@ -67,11 +67,16 @@ handle_process_affinity = false
 # defaults to 10000 maximum connections
 max_connections = 500
 
-# maximum number of buffers used by the protocol implementations for active
-# connections (ie currently serving a request). For now, you should estimate
-# that max_buffers = number of concurrent requests * 2
+# maximum number of buffers in the pool used by the protocol implementations
+# for active connections (ie currently serving a request). For now, you should
+# estimate that max_buffers = number of concurrent requests * 2
 # defaults to 1000
-max_buffers = 500
+# max_buffers = 1000
+
+# minimum number of buffers preallocated in the pool
+# cannot be larger than max_buffers
+# defaults to 1
+# min_buffers = 1
 
 # size of the buffers used by the protocol implementations. Each worker will
 # preallocate max_buffers * 2 * buffer_size bytes, so you should plan for this

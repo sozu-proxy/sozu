@@ -1265,7 +1265,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
   let mut event_loop  = Poll::new().expect("could not create event loop");
 
   let pool = Rc::new(RefCell::new(
-    Pool::with_capacity(2*max_buffers, buffer_size)
+    Pool::with_capacity(1, max_buffers, buffer_size)
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
   let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>> = Slab::with_capacity(max_buffers);
