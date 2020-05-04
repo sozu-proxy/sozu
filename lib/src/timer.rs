@@ -120,7 +120,8 @@ impl TimeoutContainer {
   pub fn cancel(&mut self) -> bool {
       match self.timeout.take() {
         None => {
-            error!("cannot cancel non existing timeout");
+            //error!("cannot cancel non existing timeout");
+            //error!("self.duration was {:?}", self.duration);
             false
         },
         Some(timeout) => {
@@ -135,7 +136,7 @@ impl TimeoutContainer {
   pub fn reset(&mut self) -> bool {
       self.timeout = match self.timeout.take() {
         None => {
-            error!("cannot reset non existing timeout");
+            //error!("cannot reset non existing timeout");
             return false;
         },
         Some(timeout) => {

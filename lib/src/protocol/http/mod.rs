@@ -616,7 +616,7 @@ impl<Front:SocketHandler> Http<Front> {
   // Read content from the session
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     if !self.front_timeout.reset() {
-        error!("could not reset front timeout");
+        //error!("could not reset front timeout");
     }
     self.frontend_last_event = SteadyTime::now();
 

@@ -263,7 +263,7 @@ impl Session {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Expect(ref mut expect)  => {
           if !self.front_timeout.reset() {
-              error!("could not reset front timeout");
+              //error!("could not reset front timeout");
           }
           expect.readable(&mut self.metrics)
       },
