@@ -1080,7 +1080,7 @@ pub fn start(config: TcpListenerConfig, max_buffers: usize, buffer_size:usize, c
 
   let mut poll          = Poll::new().expect("could not create event loop");
   let pool = Rc::new(RefCell::new(
-    Pool::with_capacity(2*max_buffers, buffer_size)
+    Pool::with_capacity(1, max_buffers, buffer_size)
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
 
@@ -1245,7 +1245,7 @@ mod tests {
       let max_buffers = 100;
       let buffer_size = 16384;
       let pool = Rc::new(RefCell::new(
-        Pool::with_capacity(2*max_buffers, buffer_size)
+        Pool::with_capacity(1, 2*max_buffers, buffer_size)
       ));
       let backends = Rc::new(RefCell::new(BackendMap::new()));
 

@@ -20,9 +20,9 @@ pub struct Pool {
 }
 
 impl Pool {
-  pub fn with_capacity(count: usize, buffer_size: usize) -> Pool {
-    let mut inner = poule::Pool::with_extra(count, buffer_size);
-    inner.grow_to(1);
+  pub fn with_capacity(minimum: usize, maximum: usize, buffer_size: usize) -> Pool {
+    let mut inner = poule::Pool::with_extra(maximum, buffer_size);
+    inner.grow_to(minimum);
     Pool {
       inner,
       buffer_size,

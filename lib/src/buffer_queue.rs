@@ -480,7 +480,7 @@ impl fmt::Debug for BufferQueue {
 
 
 pub fn buf_with_capacity(capacity: usize) -> (Pool, BufferQueue) {
-  let mut pool = Pool::with_capacity(1, capacity);
+  let mut pool = Pool::with_capacity(1, capacity, 16384);
   let b = BufferQueue::with_buffer(pool.checkout().unwrap());
   (pool, b)
 }
@@ -515,13 +515,13 @@ mod tests {
     };*/
 
     // the pool will align the buffer to 16 bytes so there are trailing zeroes
-    assert_eq!(b.unparsed_data(), &b"ABCDEFGHIJ\0\0\0\0\0\0"[..]);
+    assert_eq!(b.unparsed_data(), &b"ABCDEFGHIJ\0\0\0\0\0\0\0\0\0\0"[..]);
     b.consume_parsed_data(4);
     assert_eq!(b.parsed_position, 4);
     assert_eq!(b.start_parsing_position, 4);
     assert_eq!(b.input_queue, vec!(InputElement::Slice(6)));
     println!("TEST[{}]", line!());
-    assert_eq!(b.unparsed_data(), &b"EFGHIJ\0\0\0\0\0\0"[..]);
+    assert_eq!(b.unparsed_data(), &b"EFGHIJ\0\0\0\0\0\0\0\0\0\0"[..]);
     println!("TEST[{}]", line!());
 
     b.slice_output(4);
