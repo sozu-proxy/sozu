@@ -304,9 +304,16 @@ impl Server {
         panic!("poll() calls failed {} times in a row", current_poll_errors);
       }
 
-      let timeout = should_poll_at.as_ref()
-          .map(|i| std::time::Duration::try_from(*i - Instant::now()).unwrap())
-          .or(poll_timeout);
+      let now = Instant::now();
+      let timeout = match should_poll_at.as_ref() {
+          None => poll_timeout,
+          Some(i) => if *i <= now {
+              poll_timeout
+          } else {
+              Some(std::time::Duration::try_from(*i - now).unwrap())
+          },
+      };
+
       if let Err(error) = self.poll.poll(&mut events, timeout) {
         error!("Error while polling events: {:?}", error);
         current_poll_errors += 1;
