@@ -47,7 +47,7 @@ pub struct Session {
   pub connection_attempt: u8,
   peer_address:       Option<SocketAddr>,
   answers:            Rc<RefCell<HttpAnswers>>,
-  front_timeout:      Option<TimeoutContainer>,
+  front_timeout:      TimeoutContainer,
   backend_timeout_duration: Duration,
 }
 
@@ -68,7 +68,7 @@ impl Session {
     let timeout = TIMER.with(|timer| {
         timer.borrow_mut().set_timeout(duration, token)
     });
-    let front_timeout = Some(TimeoutContainer { timeout, duration });
+    let front_timeout = TimeoutContainer { timeout: Some(timeout), duration };
 
     let state = if expect_proxy {
       trace!("starting in expect proxy state");
@@ -184,7 +184,7 @@ impl Session {
       let http = Http::new(front_stream, self.frontend_token, handshake.request_id,
         self.pool.clone(), self.public_address, self.peer_address,
         self.sticky_name.clone(), Protocol::HTTPS, self.answers.clone(),
-        self.front_timeout.take().unwrap(), backend_timeout_duration).map(|mut http| {
+        self.front_timeout.take(), backend_timeout_duration).map(|mut http| {
 
         let res = http.frontend.session.read(front_buf.space());
         match res {
@@ -256,8 +256,8 @@ impl Session {
 
       pipe.front_readiness.event = http.front_readiness.event;
       pipe.back_readiness.event  = http.back_readiness.event;
-      pipe.front_timeout = http.front_timeout;
-      pipe.back_timeout = http.back_timeout;
+      pipe.front_timeout = Some(http.front_timeout);
+      pipe.back_timeout = Some(http.back_timeout);
       pipe.set_back_token(back_token);
       pipe.set_cluster_id(self.cluster_id.clone());
 
@@ -311,26 +311,14 @@ impl Session {
   fn readable(&mut self)      -> SessionResult {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Expect(ref mut expect, _)    => {
-          if let Some(TimeoutContainer { timeout, duration }) = self.front_timeout.take() {
-              if let Some(timeout) = TIMER.with(|timer| {
-                  timer.borrow_mut().reset_timeout(&timeout, duration)
-              }) {
-                  self.front_timeout = Some(TimeoutContainer { timeout, duration });
-              } else {
-                  error!("could not reset front timeout");
-              }
+          if !self.front_timeout.reset() {
+              error!("could not reset front timeout");
           }
           expect.readable(&mut self.metrics)
       },
       State::Handshake(ref mut handshake) => {
-          if let Some(TimeoutContainer { timeout, duration }) = self.front_timeout.take() {
-              if let Some(timeout) = TIMER.with(|timer| {
-                  timer.borrow_mut().reset_timeout(&timeout, duration)
-              }) {
-                  self.front_timeout = Some(TimeoutContainer { timeout, duration });
-              } else {
-                  error!("could not reset front timeout");
-              }
+          if !self.front_timeout.reset() {
+              error!("could not reset front timeout");
           }
           handshake.readable()
       },
@@ -512,16 +500,12 @@ impl Session {
     self.connection_attempt = 0;
   }
 
-  fn cancel_timeouts(&self) {
-      if let Some(timeout) = self.front_timeout.as_ref() {
-        TIMER.with(|timer| {
-            timer.borrow_mut().cancel_timeout(&timeout.timeout);
-        });
-      }
+  fn cancel_timeouts(&mut self) {
+      self.front_timeout.cancel();
 
-      match *unwrap_msg!(self.protocol.as_ref()) {
-          State::Http(ref http) => http.cancel_timeouts(),
-          State::WebSocket(ref pipe) => pipe.cancel_timeouts(),
+      match *unwrap_msg!(self.protocol.as_mut()) {
+          State::Http(ref mut http) => http.cancel_timeouts(),
+          State::WebSocket(ref mut pipe) => pipe.cancel_timeouts(),
           _ => {},
       }
   }

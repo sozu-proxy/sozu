@@ -64,9 +64,8 @@ pub struct Session {
   last_event:         SteadyTime,
   connection_attempt: u8,
   frontend_address:   Option<SocketAddr>,
-  front_timeout:      Option<TimeoutContainer>,
-  back_timeout:       Option<TimeoutContainer>,
-  backend_timeout_duration: Duration,
+  front_timeout:      TimeoutContainer,
+  back_timeout:       TimeoutContainer,
 }
 
 impl Session {
@@ -80,10 +79,11 @@ impl Session {
 
     let request_id = Uuid::new_v4().to_hyphenated();
     let duration = front_timeout_duration.to_std().unwrap();
-    let timeout = TIMER.with(|timer| {
-        timer.borrow_mut().set_timeout(duration, frontend_token)
-    });
-    let front_timeout = Some(TimeoutContainer { timeout, duration });
+    let front_timeout = TimeoutContainer::new(duration, frontend_token);
+    let back_timeout = TimeoutContainer {
+        timeout: None,
+        duration: backend_timeout_duration.to_std().unwrap(),
+    };
 
     let protocol = match proxy_protocol {
       Some(ProxyProtocolConfig::RelayHeader) => {
@@ -133,8 +133,7 @@ impl Session {
       connection_attempt: 0,
       frontend_address,
       front_timeout,
-      back_timeout: None,
-      backend_timeout_duration,
+      back_timeout,
     }
   }
 
@@ -207,14 +206,8 @@ impl Session {
   }
 
   fn readable(&mut self) -> SessionResult {
-    if let Some(TimeoutContainer { timeout, duration }) = self.front_timeout.take() {
-      if let Some(timeout) = TIMER.with(|timer| {
-        timer.borrow_mut().reset_timeout(&timeout, duration)
-      }) {
-        self.front_timeout = Some(TimeoutContainer { timeout, duration });
-      } else {
+    if!self.front_timeout.reset() {
         error!("could not reset front timeout");
-      }
     }
 
     let mut should_upgrade_protocol = ProtocolResult::Continue;
@@ -249,14 +242,8 @@ impl Session {
   }
 
   fn back_readable(&mut self) -> SessionResult {
-    if let Some(TimeoutContainer { timeout, duration }) = self.back_timeout.take() {
-      if let Some(timeout) = TIMER.with(|timer| {
-        timer.borrow_mut().reset_timeout(&timeout, duration)
-      }) {
-        self.back_timeout = Some(TimeoutContainer { timeout, duration });
-      } else {
-        error!("could not reset front timeout");
-      }
+    if!self.back_timeout.reset() {
+        error!("could not reset back timeout");
     }
 
     match self.protocol {
@@ -504,17 +491,9 @@ impl Session {
     }
   }
 
-  pub fn cancel_timeouts(&self) {
-      let front_timeout = self.front_timeout.as_ref();
-      let back_timeout = self.front_timeout.as_ref();
-      TIMER.with(|timer| {
-          if let Some(timeout) = front_timeout {
-            timer.borrow_mut().cancel_timeout(&timeout.timeout);
-          }
-          if let Some(timeout) = back_timeout {
-            timer.borrow_mut().cancel_timeout(&timeout.timeout);
-          }
-      });
+  pub fn cancel_timeouts(&mut self) {
+      self.front_timeout.cancel();
+      self.back_timeout.cancel();
   }
 }
 
@@ -629,12 +608,8 @@ impl ProxySession for Session {
         return SessionResult::ReconnectBackend(Some(self.frontend_token), backend_token);
       } else if self.back_readiness().unwrap().event != UnixReady::from(Ready::empty()) {
         self.reset_connection_attempt();
-        let duration = self.backend_timeout_duration.to_std().unwrap();
         let back_token = self.backend_token.unwrap();
-        let timeout = TIMER.with(|timer| {
-            timer.borrow_mut().set_timeout(duration, back_token)
-        });
-        self.back_timeout = Some(TimeoutContainer { timeout, duration });
+        self.back_timeout.set(back_token);
 
         self.set_back_connected(BackendConnectionStatus::Connected);
       }
@@ -969,7 +944,7 @@ impl ProxyConfiguration<Session> for Proxy {
         let timeout = TIMER.with(|timer| {
             timer.borrow_mut().set_timeout(duration, back_token)
         });
-        session.back_timeout = Some(TimeoutContainer { timeout, duration });
+        session.back_timeout.timeout = Some(timeout);
 
         session.set_back_token(back_token);
         session.set_back_socket(stream);

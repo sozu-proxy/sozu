@@ -5,13 +5,11 @@ use mio::unix::UnixReady;
 use uuid::adapter::Hyphenated;
 use time::Duration;
 
-use sozu_command::buffer::fixed::Buffer;
 use {SessionResult,Readiness,SessionMetrics};
 use socket::{SocketHandler,SocketResult,TransportProtocol};
 use pool::Checkout;
 use {Protocol, LogDuration};
 use timer::TimeoutContainer;
-use server::TIMER;
 
 #[derive(PartialEq)]
 pub enum SessionStatus {
@@ -131,17 +129,9 @@ impl<Front:SocketHandler> Pipe<Front> {
       SessionResult::CloseSession
   }
 
-  pub fn cancel_timeouts(&self) {
-      let front_timeout = self.front_timeout.as_ref();
-      let back_timeout = self.front_timeout.as_ref();
-      TIMER.with(|timer| {
-          if let Some(timeout) = front_timeout {
-            timer.borrow_mut().cancel_timeout(&timeout.timeout);
-          }
-          if let Some(timeout) = back_timeout {
-            timer.borrow_mut().cancel_timeout(&timeout.timeout);
-          }
-      });
+  pub fn cancel_timeouts(&mut self) {
+      self.front_timeout.as_mut().map(|t| t.cancel());
+      self.back_timeout.as_mut().map(|t| t.cancel());
   }
 
   pub fn close(&mut self) {
@@ -343,14 +333,10 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   // Read content from the session
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-    if let Some(TimeoutContainer { timeout, duration }) = self.front_timeout.take() {
-        if let Some(timeout) = TIMER.with(|timer| {
-            timer.borrow_mut().reset_timeout(&timeout, duration)
-        }) {
-          self.front_timeout = Some(TimeoutContainer { timeout, duration });
-        } else {
-          error!("could not reset front container");
-        }
+    if let Some(t) = self.front_timeout.as_mut() {
+      if !t.reset() {
+        error!("could not reset front timeout");
+      }
     }
 
     trace!("pipe readable");
@@ -582,14 +568,10 @@ impl<Front:SocketHandler> Pipe<Front> {
 
   // Read content from application
   pub fn back_readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
-    if let Some(TimeoutContainer { timeout, duration }) = self.back_timeout.take() {
-        if let Some(timeout) = TIMER.with(|timer| {
-            timer.borrow_mut().reset_timeout(&timeout, duration)
-        }) {
-          self.back_timeout = Some(TimeoutContainer { timeout, duration });
-        } else {
-          error!("could not reset back timeout");
-        }
+    if let Some(t) = self.back_timeout.as_mut() {
+      if !t.reset() {
+        error!("could not reset back timeout");
+      }
     }
 
     trace!("pipe back_readable");
