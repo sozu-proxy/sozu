@@ -925,9 +925,10 @@ impl RequestState {
 
   pub fn get_host(&self) -> Option<&str> {
     match *self {
-      RequestState::HasHost(_, _, ref host)            |
-      RequestState::Request(_, _, ref host)            |
-      RequestState::RequestWithBody(_, _, ref host, _) |
+      RequestState::HasHost(_, _, ref host)             |
+      RequestState::HasHostAndLength(_, _, ref host, _) |
+      RequestState::Request(_, _, ref host)             |
+      RequestState::RequestWithBody(_, _, ref host, _)  |
       RequestState::RequestWithBodyChunks(_, _, ref host, _) => Some(host.as_str()),
       RequestState::Error(_, _, ref host, _, _)              => host.as_ref().map(|s| s.as_str()),
       _                                                      => None
@@ -936,10 +937,11 @@ impl RequestState {
 
   pub fn get_uri(&self) -> Option<String> {
     match *self {
-      RequestState::HasRequestLine(ref rl, _)        |
-      RequestState::HasHost(ref rl, _, _)            |
-      RequestState::Request(ref rl , _, _)           |
-      RequestState::RequestWithBody(ref rl, _, _, _) |
+      RequestState::HasRequestLine(ref rl, _)         |
+      RequestState::HasHost(ref rl, _, _)             |
+      RequestState::HasHostAndLength(ref rl, _, _, _) |
+      RequestState::Request(ref rl , _, _)            |
+      RequestState::RequestWithBody(ref rl, _, _, _)  |
       RequestState::RequestWithBodyChunks(ref rl, _, _, _) => Some(rl.uri.clone()),
       RequestState::Error(ref rl, _, _, _, _)              => rl.as_ref().map(|r| r.uri.clone()),
       _                                                    => None
@@ -948,10 +950,11 @@ impl RequestState {
 
   pub fn get_request_line(&self) -> Option<&RRequestLine> {
     match *self {
-      RequestState::HasRequestLine(ref rl, _)        |
-      RequestState::HasHost(ref rl, _, _)            |
-      RequestState::Request(ref rl, _, _)            |
-      RequestState::RequestWithBody(ref rl, _, _, _) |
+      RequestState::HasRequestLine(ref rl, _)         |
+      RequestState::HasHost(ref rl, _, _)             |
+      RequestState::HasHostAndLength(ref rl, _, _, _) |
+      RequestState::Request(ref rl, _, _)             |
+      RequestState::RequestWithBody(ref rl, _, _, _)  |
       RequestState::RequestWithBodyChunks(ref rl, _, _, _) => Some(rl),
       RequestState::Error(ref rl, _, _, _, _) => rl.as_ref(),
       _ => None
