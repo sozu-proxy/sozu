@@ -4,6 +4,10 @@ sudo: required
 dist: xenial
 cache: cargo
 
+os:
+  - linux
+  - mac
+
 rust:
   - nightly
   - beta
@@ -45,6 +49,11 @@ addons:
       - zlib1g-dev
     sources:
       - kalakris-cmake
+  homebrew:
+    packages:
+      - openssl
+      - cmake
+      - pkg-config
 
 
 script:
