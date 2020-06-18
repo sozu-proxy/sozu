@@ -2,7 +2,7 @@ use std::io::{self, Error, ErrorKind, Write};
 use std::os::unix::io::AsRawFd;
 use std::net::SocketAddr;
 use mio::net::UdpSocket;
-use libc::{sendmmsg, mmsghdr, msghdr, iovec, c_void, c_uint};
+use libc::{msghdr, iovec, c_void, c_uint};
 
 pub struct MetricSocket {
   pub addr:   SocketAddr,
@@ -20,6 +20,10 @@ impl Write for MetricSocket {
   }
 }
 
+#[cfg(not(target_os = "linux"))]
+pub type MetricsWriter = sozu_command::writer::MultiLineWriter<MetricSocket>;
+
+#[cfg(target_os = "linux")]
 pub struct MetricsWriter {
     inner: Option<MetricSocket>,
     buf: Vec<u8>,
@@ -29,6 +33,7 @@ pub struct MetricsWriter {
     packet_indexes: Vec<usize>,
 }
 
+#[cfg(target_os = "linux")]
 impl MetricsWriter {
     pub fn new(inner: MetricSocket) -> MetricsWriter {
         MetricsWriter::with_capacity(16384, inner)
@@ -83,7 +88,7 @@ impl MetricsWriter {
 
             let mut messages = iovs.iter().map(|iov| {
 
-              mmsghdr {
+              libc::mmsghdr {
                 msg_hdr: msghdr {
                   msg_name: std::ptr::null_mut(),
                   msg_namelen: 0,
@@ -105,7 +110,7 @@ impl MetricsWriter {
             unsafe {
               let r = libc::sendmmsg(
                 self.inner.as_ref().unwrap().socket.as_raw_fd(),
-                &mut messages[0] as *mut mmsghdr,
+                &mut messages[0] as *mut libc::mmsghdr,
                 messages.len() as c_uint,
                 0,
               );
@@ -181,6 +186,7 @@ impl MetricsWriter {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Write for MetricsWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         if self.buf.len() + buf.len() > self.buf.capacity() {
@@ -213,6 +219,7 @@ impl Write for MetricsWriter {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for MetricsWriter {
     fn drop(&mut self) {
         if self.inner.is_some() && !self.panicked {
