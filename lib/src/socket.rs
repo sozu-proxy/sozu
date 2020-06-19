@@ -45,7 +45,7 @@ impl SocketHandler for TcpStream {
         return (size, SocketResult::Continue);
       }
       match self.read(&mut buf[size..]) {
-        Ok(0)  => return (size, SocketResult::Continue),
+        Ok(0)  => return (size, SocketResult::Closed),
         Ok(sz) => size +=sz,
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
