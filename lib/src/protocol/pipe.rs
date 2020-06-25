@@ -570,7 +570,7 @@ impl<Front:SocketHandler> Pipe<Front> {
         metrics.backend_bin += sz;
       }
 
-      if sz == 0 && r == SocketResult::Continue {
+      if sz == 0 && r == SocketResult::Closed {
         self.backend_status = match self.backend_status {
           ConnectionStatus::Normal => ConnectionStatus::WriteOpen,
           ConnectionStatus::ReadOpen => ConnectionStatus::Closed,
@@ -597,11 +597,13 @@ impl<Front:SocketHandler> Pipe<Front> {
           return SessionResult::CloseSession;
         },
         SocketResult::Closed => {
-          metrics.service_stop();
-          self.front_readiness.reset();
-          self.back_readiness.reset();
-          self.log_request_success(metrics);
-          return SessionResult::CloseSession;
+          if !self.check_connections() {
+            metrics.service_stop();
+            self.front_readiness.reset();
+            self.back_readiness.reset();
+            self.log_request_success(metrics);
+            return SessionResult::CloseSession;
+          }
         },
         SocketResult::WouldBlock => {
           self.back_readiness.event.remove(Ready::readable());
