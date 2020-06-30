@@ -30,7 +30,7 @@ use self::client::CommandClient;
 use self::executor::{Executor, StateChange};
 
 const SERVER: Token = Token(0);
-const HALF_USIZE: usize = 0x8000000000000000usize;
+const HALF_USIZE: usize = usize::MAX / 2 + 1;
 
 #[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
 pub struct FrontToken(pub usize);
