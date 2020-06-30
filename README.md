@@ -1,23 +1,13 @@
-# sōzu HTTP reverse proxy
+# [Sōzu](https://www.sozu.io/) &middot; [![Join the chat at https://gitter.im/sozu-proxy/sozu](https://badges.gitter.im/sozu-proxy/sozu.svg)](https://gitter.im/sozu-proxy/sozu?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge) [![Build Status](https://travis-ci.org/sozu-proxy/sozu.svg?branch=master)](https://travis-ci.org/sozu-proxy/sozu)
 
-[![Join the chat at https://gitter.im/sozu-proxy/sozu](https://badges.gitter.im/sozu-proxy/sozu.svg)](https://gitter.im/sozu-proxy/sozu?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
-[![Build Status](https://travis-ci.org/sozu-proxy/sozu.svg?branch=master)](https://travis-ci.org/sozu-proxy/sozu)
+**Sōzu** is a lightweight, fast, always-up reverse proxy server.
 
-it will be awesome when it will be ready
+## Why use Sōzu?
 
-## Goals
-
-Build the most reliable reverse proxy ever:
-
-- it should never crash (currently fixing the remaining panics)
-- you should not need to restart it
-  - it can receive configuration changes from a unix socket at runtime
-  - it should be able to upgrade without any downtime
-- it should not have exploitable memory errors
-  - even if it has one, workers will be sandboxed
-- you set up a limit on the number of concurrent connections to a worker
-  - the reverse proxy will refuse new connections over that limit, instead of requesting unavailable resources like memory
-
+- **Hot configurable:** Sozu can receive configuration changes at runtime through secure unix sockets.
+- **Upgrades without restarting:** Sozu is always-up, meaning it upgrades itself *while still processing requests*.
+- **Handles SSL:** Sozu handles SSL, so your backend servers can focus on what they do best.
+- **Protects your network:** Sozu protect backends by shielding them behind the reverse proxy, limiting direct network access. Sozu uses Rust, a language primed for memory safety. And even if there a worker is exploited, sozu workers are sandboxed.
 
 ## Building and starting
 
