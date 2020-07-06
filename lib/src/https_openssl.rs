@@ -368,13 +368,13 @@ impl Session {
     let (upgrade, result) = match *unwrap_msg!(self.protocol.as_mut()) {
       State::Expect(ref mut expect,_)     => {
           if !self.front_timeout.reset() {
-              error!("could not reset front timeout");
+              error!("could not reset front timeout (HTTPS OpenSSL upgrading from Expect)");
           }
           expect.readable(&mut self.metrics)
       },
       State::Handshake(ref mut handshake) => {
           if !self.front_timeout.reset() {
-              error!("could not reset front timeout");
+              error!("could not reset front timeout (HTTPS OpenSSL upgrading from Handshake)");
           }
           handshake.readable(&mut self.metrics)
       },

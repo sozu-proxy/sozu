@@ -335,7 +335,7 @@ impl<Front:SocketHandler> Pipe<Front> {
   pub fn readable(&mut self, metrics: &mut SessionMetrics) -> SessionResult {
     if let Some(t) = self.front_timeout.as_mut() {
       if !t.reset() {
-        error!("could not reset front timeout");
+        error!("could not reset front timeout (pipe readable)");
       }
     }
 
