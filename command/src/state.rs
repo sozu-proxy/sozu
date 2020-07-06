@@ -701,8 +701,12 @@ impl ConfigState {
       let mut s = DefaultHasher::new();
       self.clusters.get(cluster_id).hash(&mut s);
       self.backends.get(cluster_id).map(|ref v| v.iter().collect::<BTreeSet<_>>().hash(&mut s));
-      self.http_fronts.values().filter(|f| f.route == Route::ClusterId(cluster_id.to_string())).map(|ref v| v.hash(&mut s));
-      self.https_fronts.values().filter(|f| f.route == Route::ClusterId(cluster_id.to_string())).map(|ref v| v.hash(&mut s));
+      for v in self.http_fronts.values().filter(|f| f.route == Route::ClusterId(cluster_id.to_string())) {
+        v.hash(&mut s);
+      }
+      for v in self.https_fronts.values().filter(|f| f.route == Route::ClusterId(cluster_id.to_string())) {
+        v.hash(&mut s);
+      }
       self.tcp_fronts.get(cluster_id).map(|ref v| v.iter().collect::<BTreeSet<_>>().hash(&mut s));
 
       (cluster_id.to_string(), s.finish())
