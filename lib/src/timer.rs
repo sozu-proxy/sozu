@@ -103,6 +103,11 @@ impl TimeoutContainer {
     }
   }
 
+  /// must be called when a timeout was triggered, to prevent errors when canceling
+  pub fn triggered(&mut self) {
+      let _ = self.timeout.take();
+  }
+
   pub fn set(&mut self, token: Token) {
       if let Some(timeout) = self.timeout.take() {
           TIMER.with(|timer| {
