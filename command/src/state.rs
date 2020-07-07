@@ -1127,7 +1127,7 @@ mod tests {
 
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,PartialOrd,Ord,Hash)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash)]
 pub struct RouteKey(pub SocketAddr, pub String, pub PathRule);
 
 impl serde::Serialize for RouteKey {
@@ -1140,6 +1140,33 @@ impl serde::Serialize for RouteKey {
     };
     serializer.serialize_str(&s)
   }
+}
+
+//FIXME: custom ordering implementation for now, as libstd will implement PartialOrd and Ord for SocketAddr from rust 1.45.0
+use std::cmp::{PartialOrd, Ord, Ordering};
+impl PartialOrd for RouteKey {
+    fn partial_cmp(&self, other: &RouteKey) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RouteKey {
+    fn cmp(&self, other: &RouteKey) -> Ordering {
+        let order = match (self.0, other.0) {
+            (SocketAddr::V4(_), SocketAddr::V6(_)) => Ordering::Less,
+            (SocketAddr::V6(_), SocketAddr::V4(_)) => Ordering::Greater,
+            (SocketAddr::V4(s), SocketAddr::V4(o)) => {
+                s.ip().cmp(o.ip()).then(s.port().cmp(&o.port()))
+            },
+            (SocketAddr::V6(s), SocketAddr::V6(o)) => {
+                s.ip().cmp(o.ip()).then(s.port().cmp(&o.port()))
+            }
+
+
+        };
+
+        order.then(self.1.cmp(&other.1)).then(self.2.cmp(&other.2))
+    }
 }
 
 use std::fmt;
