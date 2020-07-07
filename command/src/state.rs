@@ -38,9 +38,9 @@ pub struct ConfigState {
   pub https_listeners: HashMap<SocketAddr, (HttpsListener, bool)>,
   pub tcp_listeners:   HashMap<SocketAddr, (TcpListener, bool)>,
   // indexed by (address, hostname, path)
-  pub http_fronts:     HashMap<RouteKey, HttpFrontend>,
+  pub http_fronts:     BTreeMap<RouteKey, HttpFrontend>,
   // indexed by (address, hostname, path)
-  pub https_fronts:    HashMap<RouteKey, HttpFrontend>,
+  pub https_fronts:    BTreeMap<RouteKey, HttpFrontend>,
   pub tcp_fronts:      HashMap<ClusterId, Vec<TcpFrontend>>,
   // certificate and names
   pub certificates:    HashMap<SocketAddr, HashMap<CertificateFingerprint, (CertificateAndKey, Vec<String>)>>,
@@ -58,8 +58,8 @@ impl ConfigState {
       http_listeners:  HashMap::new(),
       https_listeners: HashMap::new(),
       tcp_listeners:   HashMap::new(),
-      http_fronts:     HashMap::new(),
-      https_fronts:    HashMap::new(),
+      http_fronts:     BTreeMap::new(),
+      https_fronts:    BTreeMap::new(),
       tcp_fronts:      HashMap::new(),
       certificates:    HashMap::new(),
       http_addresses:  Vec::new(),
@@ -697,21 +697,33 @@ impl ConfigState {
 
   // FIXME: what about deny rules?
   pub fn hash_state(&self) -> BTreeMap<ClusterId, u64> {
-    self.clusters.keys().map(|cluster_id| {
+    let mut h: HashMap<_,_> = self.clusters.keys().map(|cluster_id| {
       let mut s = DefaultHasher::new();
       self.clusters.get(cluster_id).hash(&mut s);
       self.backends.get(cluster_id).map(|ref v| v.iter().collect::<BTreeSet<_>>().hash(&mut s));
-      for v in self.http_fronts.values().filter(|f| f.route == Route::ClusterId(cluster_id.to_string())) {
-        v.hash(&mut s);
-      }
-      for v in self.https_fronts.values().filter(|f| f.route == Route::ClusterId(cluster_id.to_string())) {
-        v.hash(&mut s);
-      }
       self.tcp_fronts.get(cluster_id).map(|ref v| v.iter().collect::<BTreeSet<_>>().hash(&mut s));
+      (cluster_id.to_string(), s)
+    }).collect();
 
-      (cluster_id.to_string(), s.finish())
+    for front in self.http_fronts.values() {
+        if let Route::ClusterId(cluster_id) = &front.route {
+            if let Some(s) = h.get_mut(cluster_id) {
+                front.hash(s);
+            }
 
-    }).collect()
+        }
+    }
+
+    for front in self.https_fronts.values() {
+        if let Route::ClusterId(cluster_id) = &front.route {
+            if let Some(s) = h.get_mut(cluster_id) {
+                front.hash(s);
+            }
+
+        }
+    }
+
+    h.drain().map(|(cluster_id, hasher)| (cluster_id, hasher.finish())).collect()
   }
 
   pub fn application_state(&self, cluster_id: &str) -> QueryAnswerApplication {
@@ -1115,7 +1127,7 @@ mod tests {
 
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash)]
+#[derive(Debug,Clone,PartialEq,Eq,PartialOrd,Ord,Hash)]
 pub struct RouteKey(pub SocketAddr, pub String, pub PathRule);
 
 impl serde::Serialize for RouteKey {

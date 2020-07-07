@@ -358,7 +358,7 @@ impl PartialOrd for TcpFrontend {
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub struct Backend {
-    pub cluster_id:     String,
+    pub cluster_id: String,
     pub backend_id: String,
     pub address:    SocketAddr,
     #[serde(default)]
