@@ -36,7 +36,7 @@ tempfile = "^3.0"
 futures = "^0.1"
 lazy_static = "^1.1"
 regex = "1.0"
-jemallocator = "^0.3"
+jemallocator = {version = "^0.3", optional = true }
 sozu-lib = { version = "^0.11", path = "../lib" }
 sozu-command-lib = { version = "^0.11", path = "../command" }
 
@@ -44,6 +44,7 @@ sozu-command-lib = { version = "^0.11", path = "../command" }
 num_cpus = "^1.3.0"
 
 [features]
+default = [ "jemallocator" ]
 unstable = []
 logs-debug = ["sozu-lib/logs-debug", "sozu-command-lib/logs-debug"]
 logs-trace = ["sozu-lib/logs-trace", "sozu-command-lib/logs-trace"]

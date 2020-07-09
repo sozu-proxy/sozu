@@ -13,6 +13,7 @@ extern crate nix;
 extern crate tempfile;
 extern crate futures;
 extern crate regex;
+#[cfg(feature = "jemallocator")]
 extern crate jemallocator;
 #[macro_use] extern crate sozu_lib as sozu;
 #[macro_use] extern crate sozu_command_lib as sozu_command;
@@ -22,6 +23,7 @@ extern crate num_cpus;
 #[cfg(target_os="linux")]
 use regex::Regex;
 
+#[cfg(feature = "jemallocator")]
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
