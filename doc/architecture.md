@@ -25,13 +25,13 @@ The master exposes a unix socket for configuration instead of a HTTP server on l
 
 ### Event loop with mio
 
-Every worker runs an event looped based on epoll (on Linux) or kqueue (on OSX and BSD), using the [mio library](https://github.com/carllerche/mio).
+Every worker runs an event looped based on epoll (on Linux) or kqueue (on OSX and BSD), using the [mio library](https://github.com/tokio-rs/mio).
 
 Mio provides a cross platform abstraction allowing callers to receive events, like a socket becoming readable (meaning it received some data).
 
 Sōzu asks mio to send all the events of a socket in [edge triggered mode](http://man7.org/linux/man-pages/man7/epoll.7.html). That way, it only receives an event once, and stores it in a [`Readiness` structure](https://github.com/sozu-proxy/sozu/blob/3111e2db420d2773b1f0404d6556f40b2f2ea85b/lib/src/network/mod.rs#L313-L319). It will then use that information and the "interest" (indicating if the current protocol state machine wants to read or write on the socket).
 
-Each socket event is returned with a `Token` indicating its inedx in a `Slab` data structure. A client session can have multiple sockets (typically, a front socket and a back socket).
+Each socket event is returned with a `Token` indicating its index in a `Slab` data structure. A client session can have multiple sockets (typically, a front socket and a back socket).
 
 ### Protocols
 
