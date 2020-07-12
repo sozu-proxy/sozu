@@ -1,4 +1,4 @@
-# sozu, a HTTP proxy
+# Sōzu, a HTTP proxy
 
 This project wraps the `sozu_lib` library to make it scalable and dynamically
 configured. Each single threaded event loop is started in a worker process that
