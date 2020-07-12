@@ -4,12 +4,12 @@ sozuctl provides various commands like shutdown, upgrade, status etc.
 
 There are three options:
 
-1. config - Sets a custom config file
+1. config  - Sets a custom config file
 2. timeout - "Sets a custom timeout for commands (in milliseconds). 0 disables the timeout"
 3. cmd     - Various subcommands
 
 
-The cmd has various subcommands such as:
+The cmd provides subcommands such as:
 
 - shutdown
 - upgrade

@@ -1,3 +1,5 @@
+//! Rust Vector data structure with a goal to provide additional functionalities.
+
 use std::{cmp, ptr};
 use std::io::{self,Write,Read};
 use std::iter::repeat;

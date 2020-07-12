@@ -5,14 +5,13 @@ use std::iter::Iterator;
 use std::str::from_utf8;
 use std::marker::PhantomData;
 use std::io::{self,Read,Write,ErrorKind};
-use std::os::unix::net;
 use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd,RawFd};
 use std::cmp::min;
 use serde_json;
 use serde::ser::Serialize;
 use serde::de::DeserializeOwned;
 
-use buffer::Buffer;
+use crate::buffer::Buffer;
 
 #[derive(Debug,PartialEq)]
 pub enum ConnError {
@@ -69,7 +68,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
   pub fn set_nonblocking(&mut self, nonblocking: bool) {
     unsafe {
       let fd = self.sock.as_raw_fd();
-      let stream = net::UnixStream::from_raw_fd(fd);
+      let stream = std::os::unix::net::UnixStream::from_raw_fd(fd);
       let _ = stream.set_nonblocking(nonblocking).map_err(|e| {
         error!("could not change blocking status for stream: {:?}", e);
       });
@@ -135,7 +134,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
               break;
             },
             _ => {
-              //log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error (kind: {:?}): {:?}", tok.0, code, e);
+              // log!(log::LogLevel::Error, "UNIX CLIENT[{}] read error (kind: {:?}): {:?}", tok.0, code, e);
               self.interest  = Ready::empty();
               self.readiness = Ready::empty();
               return Err(ConnError::SocketError);
@@ -362,8 +361,8 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
 impl<Tx: Debug+DeserializeOwned+Serialize, Rx: Debug+DeserializeOwned+Serialize> Channel<Tx,Rx> {
   pub fn generate(buffer_size: usize, max_buffer_size: usize) -> io::Result<(Channel<Tx,Rx>, Channel<Rx,Tx>)> {
     let     (command,proxy) = UnixStream::pair()?;
-    let     proxy_channel   = Channel::new(proxy, buffer_size, max_buffer_size);
-    let mut command_channel = Channel::new(command, buffer_size, max_buffer_size);
+    let     proxy_channel           = Channel::new(proxy, buffer_size, max_buffer_size);
+    let mut command_channel         = Channel::new(command, buffer_size, max_buffer_size);
     command_channel.set_nonblocking(false);
     Ok((command_channel, proxy_channel))
   }

@@ -230,7 +230,7 @@ The fingerprint is the hexadecimal representation of the SHA256 hash of the cert
 {
   "id":       "ID_ABCD",
   "version":  0,
-  "data":{
+  "data": {
     "type": "ADD_BACKEND",
     "data": {
       "app_id": "xxx",

@@ -1,8 +1,8 @@
-use sozu_command::config::{Config, ProxyProtocolConfig, LoadBalancingAlgorithms};
-use sozu_command::channel::Channel;
-use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
-use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
-use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFront, TcpFront,
+use sozu_command_lib::config::{Config, ProxyProtocolConfig, LoadBalancingAlgorithms};
+use sozu_command_lib::channel::Channel;
+use sozu_command_lib::certificate::{calculate_fingerprint,split_certificate_chain};
+use sozu_command_lib::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
+use sozu_command_lib::proxy::{Application, ProxyRequestData, Backend, HttpFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
   AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend,
   QueryCertificateType, QueryAnswerCertificate, FilteredData};

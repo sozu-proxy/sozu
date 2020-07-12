@@ -1,4 +1,4 @@
-use sozu_command::config::LoadBalancingAlgorithms;
+use sozu_command_lib::config::LoadBalancingAlgorithms;
 use std::net::SocketAddr;
 
 #[derive(StructOpt, PartialEq, Debug)]

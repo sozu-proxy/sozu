@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::collections::{HashMap,BTreeMap,HashSet};
 
 
-use config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
+use crate::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
 
 pub type MessageId = String;
 

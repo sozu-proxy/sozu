@@ -9,6 +9,7 @@ version = "0.11.48"
 license = "AGPL-3.0"
 authors = ["Geoffroy Couprie <geo.couprie@gmail.com>"]
 categories = ["network-programming"]
+edition= "2018"
 
 include = [
   "./README.md",
@@ -33,9 +34,8 @@ time = "^0.2"
 toml = "^0.5"
 sha2 = "^0.8"
 memchr = "2.3"
-serde = "^1.0.2"
+serde = { version = "^1.0.2", features=["derive"]}
 serde_json = "^1.0.1"
-serde_derive = "^1.0.2"
 
 [features]
 unstable = []
