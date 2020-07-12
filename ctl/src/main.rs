@@ -1,12 +1,7 @@
 #[macro_use] extern crate prettytable;
-extern crate rand;
-extern crate sozu_command_lib as sozu_command;
-extern crate structopt;
-#[macro_use] extern crate structopt_derive;
-extern crate serde;
-extern crate serde_json;
-#[macro_use] extern crate serde_derive;
-extern crate hex;
+#[macro_use] extern crate structopt;
+#[macro_use] extern crate serde;
+
 
 mod command;
 mod cli;
@@ -14,9 +9,11 @@ mod cli;
 use std::io;
 use structopt::StructOpt;
 
-use sozu_command::config::Config;
-use sozu_command::channel::Channel;
-use sozu_command::command::{CommandRequest,CommandResponse};
+use sozu_command_lib::config::Config;
+use sozu_command_lib::channel::Channel;
+use sozu_command_lib::command::{CommandRequest,CommandResponse};
+use cli::App;
+
 
 use command::{add_application,remove_application,dump_state,load_state,
   save_state, soft_stop, hard_stop, upgrade_master, status,metrics,
@@ -25,14 +22,15 @@ use command::{add_application,remove_application,dump_state,load_state,
   replace_certificate, query_application, logging_filter, upgrade_worker,
   events,query_certificate};
 
-use cli::*;
 
 fn main() {
   let matches = App::from_args();
 
-  let config_file = matches.config.or(option_env!("SOZU_CONFIG").map(|s| s.to_string())).expect("missing --config <configuration file> option");
+  let config_file = matches.config.or(option_env!("SOZU_CONFIG").map(|s| s.to_string()))
+                                  .expect("missing --config <configuration file> option");
 
-  let config  = Config::load_from_path(config_file.as_str()).expect("could not parse configuration file");
+  let config  = Config::load_from_path(config_file.as_str())
+                                .expect("could not parse configuration file");
 
   // If the command is `config check` then exit because if we are here, the configuration is valid
   if let SubCmd::Config{ cmd: ConfigCmd::Check{} } = matches.cmd {
@@ -51,28 +49,46 @@ fn main() {
         soft_stop(channel, worker);
       }
     },
-    SubCmd::Upgrade { worker: None } => upgrade_master(channel, &config),
-    SubCmd::Upgrade { worker: Some(id) } => { upgrade_worker(channel, timeout, id); },
-    SubCmd::Status{ json } => status(channel, json),
-    SubCmd::Metrics{ json } => metrics(channel, json),
-    SubCmd::Logging{ level } => logging_filter(channel, timeout, &level),
-    SubCmd::State{ cmd } => {
+    SubCmd::Upgrade { worker: None }          => upgrade_master(channel, &config),
+    SubCmd::Upgrade { worker: Some(id) } => upgrade_worker(channel, timeout, id),
+    SubCmd::Status { json }             => status(channel, json),
+    SubCmd::Metrics { json }            => metrics(channel, json),
+    SubCmd::Logging { level }            => logging_filter(channel, timeout, &level),
+    SubCmd::State { cmd }                     => {
       match cmd {
         StateCmd::Save{ file } => save_state(channel, timeout, file),
         StateCmd::Load{ file } => load_state(channel, timeout, file),
-        StateCmd::Dump{ json } => dump_state(channel, timeout, json),
+        StateCmd::Dump{ json }   => dump_state(channel, timeout, json),
       }
     },
     SubCmd::Application{ cmd } => {
       match cmd {
-        ApplicationCmd::Add{ id, sticky_session, https_redirect, send_proxy, expect_proxy, load_balancing_policy } => add_application(channel, timeout, &id, sticky_session, https_redirect, send_proxy, expect_proxy, load_balancing_policy),
+        ApplicationCmd::Add { 
+          id, 
+          sticky_session, 
+          https_redirect, 
+          send_proxy, 
+          expect_proxy, 
+          load_balancing_policy 
+        } => add_application(channel, timeout, &id, sticky_session, https_redirect, send_proxy, expect_proxy, load_balancing_policy),
         ApplicationCmd::Remove{ id } => remove_application(channel, timeout, &id),
       }
     },
     SubCmd::Backend{ cmd } => {
       match cmd {
-        BackendCmd::Add{ id, backend_id, address, sticky_id, backup } => add_backend(channel, timeout, &id, &backend_id, address, sticky_id, backup),
-        BackendCmd::Remove{ id, backend_id, address } => remove_backend(channel, timeout, &id, &backend_id, address),
+        BackendCmd::Add { 
+          id, 
+          backend_id, 
+          address, 
+          sticky_id, 
+          backup 
+        } => add_backend(channel, timeout, &id, &backend_id, address, sticky_id, backup),
+        
+        BackendCmd::Remove { 
+          id, 
+          backend_id, 
+          address 
+        } => remove_backend(channel, timeout, &id, &backend_id, address),
       }
     },
     SubCmd::Frontend{ cmd } => {
@@ -125,7 +141,7 @@ fn main() {
   }
 }
 
-pub fn create_channel(config: &Config) -> Result<Channel<CommandRequest,CommandResponse>,io::Error> {
+pub fn create_channel(config: &Config) -> Result<Channel<CommandRequest,CommandResponse>, io::Error> {
   Channel::from_path(&config.command_socket_path(), config.command_buffer_size, config.max_command_buffer_size)
     .and_then(|mut channel| {
       channel.set_nonblocking(false);

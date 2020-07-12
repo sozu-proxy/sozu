@@ -924,9 +924,9 @@ fn default_front_timeout() -> u32 {
   60
 }
 
-//defaults to 30mn
+// defaults to 30mn
 fn default_zombie_check_interval() -> u32 {
-  30*60
+  30 * 60
 }
 
 fn default_accept_queue_timeout() -> u32 {

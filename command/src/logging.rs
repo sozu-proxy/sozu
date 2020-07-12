@@ -682,6 +682,6 @@ impl std::fmt::Display for Rfc3339Time {
 }
 
 pub fn now() -> (Rfc3339Time, i128) {
-  let t = time::PrimitiveDateTime::now();
+  let t = std::time::SystemTime::now().into();
   (Rfc3339Time { inner: t, }, (t - time::PrimitiveDateTime::unix_epoch()).whole_nanoseconds())
 }

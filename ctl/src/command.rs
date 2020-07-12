@@ -20,6 +20,8 @@ use prettytable::{Table, Row};
 use super::create_channel;
 use rand::distributions::Alphanumeric;
 
+type millis = u64;
+type Chan = Channel<CommandRequest,CommandResponse>;
 
 // Used to display the JSON response of the status command
 #[derive(Serialize, Debug)]
@@ -61,10 +63,9 @@ macro_rules! command_timeout {
   )
 }
 
-pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, path: String) {
-  let id = generate_id();
+pub fn save_state(mut channel: Chan, timeout: millis, path: String) {
   channel.write_message(&CommandRequest::new(
-    id.clone(),
+    generate_id(),
     CommandRequestData::SaveState(path),
     None,
   ));
@@ -99,10 +100,9 @@ pub fn save_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
   });
 }
 
-pub fn load_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, path: String) {
-  let id = generate_id();
+pub fn load_state(mut channel: Chan, timeout: u64, path: String) {
   channel.write_message(&CommandRequest::new(
-    id.clone(),
+    generate_id(),
     CommandRequestData::LoadState(path.clone()),
     None,
   ));
@@ -137,7 +137,7 @@ pub fn load_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
   });
 }
 
-pub fn dump_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, json: bool) {
+pub fn dump_state(mut channel: Chan, timeout: u64, json: bool) {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
@@ -188,7 +188,7 @@ pub fn dump_state(mut channel: Channel<CommandRequest,CommandResponse>, timeout:
   });
 }
 
-pub fn soft_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id: Option<u32>) {
+pub fn soft_stop(mut channel: Chan, proxy_id: Option<u32>) {
   println!("shutting down proxy");
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
@@ -226,7 +226,7 @@ pub fn soft_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id:
   }
 }
 
-pub fn hard_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id: Option<u32>, timeout: u64) {
+pub fn hard_stop(mut channel: Chan, proxy_id: Option<u32>, timeout: u64) {
   println!("shutting down proxy");
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
@@ -264,7 +264,7 @@ pub fn hard_stop(mut channel: Channel<CommandRequest,CommandResponse>, proxy_id:
   );
 }
 
-pub fn upgrade_master(mut channel: Channel<CommandRequest,CommandResponse>,
+pub fn upgrade_master(mut channel: Chan,
                   config: &Config) {
   println!("Preparing to upgrade proxy...");
 
@@ -364,7 +364,7 @@ pub fn upgrade_master(mut channel: Channel<CommandRequest,CommandResponse>,
   }
 }
 
-pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, worker_id: u32) -> Channel<CommandRequest,CommandResponse> {
+pub fn upgrade_worker(mut channel: Chan, timeout: u64, worker_id: u32) -> Chan {
   println!("upgrading worker {}", worker_id);
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
@@ -416,7 +416,7 @@ pub fn upgrade_worker(mut channel: Channel<CommandRequest,CommandResponse>, time
   timeout_thread.join().expect("upgrade_worker: Timeout thread should correctly terminate")
 }
 
-pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) {
+pub fn status(mut channel: Chan, json: bool) {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
@@ -567,7 +567,7 @@ pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
   }
 }
 
-pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) {
+pub fn metrics(mut channel: Chan, json: bool) {
   let id = generate_id();
   //println!("will send message for metrics with id {}", id);
   channel.write_message(&CommandRequest::new(
@@ -575,7 +575,7 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
     CommandRequestData::Proxy(ProxyRequestData::Metrics),
     None,
   ));
-  //println!("message sent");
+  // println!("message sent");
 
   loop {
     match channel.read_message() {
@@ -629,14 +629,9 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                 let mut row = vec![cell!("Workers")];
                 for key in data.workers.keys() {
                   row.push(cell!(key));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
+                  for _ in 1..=8 {
+                    row.push(cell!(""));
+                  }
                 }
                 proxy_table.add_row(Row::new(row));
 
@@ -673,37 +668,22 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
 
                     match data.workers[wk].proxy.get(k) {
                       None => {
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
+                        for _ in 1..=9 {
+                          row.push(cell!(""));
+                        }
                       },
                       Some(FilteredData::Count(c)) => {
                         row.push(cell!(c));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
+                        for _ in 1..=8 {
+                          row.push(cell!(""));
+                        }
                       },
                       Some(FilteredData::Gauge(c)) => {
                         row.push(cell!(""));
                         row.push(cell!(c));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
+                        for _ in 1..=7 {
+                          row.push(cell!(""));
+                        }
                       },
                       Some(FilteredData::Percentiles(p)) => {
                         row.push(cell!(p.samples));
@@ -718,15 +698,9 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                       },
                       r => {
                         println!("unexpected metric: {:?}", r);
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
+                        for _ in 1..=9{
+                          row.push(cell!(""));
+                        }
                       }
                     }
                   }
@@ -753,14 +727,9 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                   let mut row = vec![cell!(id)];
                   for key in data.workers.keys() {
                     row.push(cell!(key));
-                    row.push(cell!(""));
-                    row.push(cell!(""));
-                    row.push(cell!(""));
-                    row.push(cell!(""));
-                    row.push(cell!(""));
-                    row.push(cell!(""));
-                    row.push(cell!(""));
-                    row.push(cell!(""));
+                    for _ in 1..=8 {
+                      row.push(cell!(""));
+                    }
                   }
                   application_table.add_row(Row::new(row));
                   application_table.add_row(Row::new(header.clone()));
@@ -788,37 +757,22 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                     for worker in data.workers.values() {
                       match worker.applications.get(id).and_then(|app| app.data.get(metric)) {
                         None => {
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
+                          for _ in 1..=9 {
+                            row.push(cell!(""));
+                          }
                         },
                         Some(FilteredData::Count(c)) => {
                           row.push(cell!(c));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
+                          for _ in 1..=8 {
+                            row.push(cell!(""));
+                          }
                         },
                         Some(FilteredData::Gauge(c)) => {
                           row.push(cell!(""));
                           row.push(cell!(c));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
+                          for _ in 1..=6{
+                            row.push(cell!(""));
+                          }
                         }
                         Some(FilteredData::Percentiles(p)) => {
                           row.push(cell!(p.samples));
@@ -833,15 +787,9 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                         },
                         r => {
                           println!("unexpected metric: {:?}", r);
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
+                          for _ in 1..=9 {
+                            row.push(cell!(""));
+                          }
                         },
                       }
                     }
@@ -856,14 +804,9 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                     let mut row = vec![cell!(format!("{}: {}", id, backend))];
                     for key in data.workers.keys() {
                       row.push(cell!(key));
-                      row.push(cell!(""));
-                      row.push(cell!(""));
-                      row.push(cell!(""));
-                      row.push(cell!(""));
-                      row.push(cell!(""));
-                      row.push(cell!(""));
-                      row.push(cell!(""));
-                      row.push(cell!(""));
+                      for _ in 1..=8 {
+                        row.push(cell!(""));
+                      }
                     }
                     backend_table.add_row(Row::new(row));
                     backend_table.add_row(Row::new(header.clone()));
@@ -888,37 +831,22 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                         match worker.applications.get(id).and_then(|app| app.backends.get(backend))
                           .and_then(|back| back.get(metric)) {
                           None => {
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
+                            for _ in 1..=9 {
+                              row.push(cell!(""));
+                            }
                           },
                           Some(FilteredData::Count(c)) => {
                             row.push(cell!(c));
+                            for _ in 1..=8 {
                             row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
+                          }
                           },
                           Some(FilteredData::Gauge(c)) => {
                             row.push(cell!(""));
                             row.push(cell!(c));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
+                            for _ in 1..=6 {
+                              row.push(cell!(""));
+                            }
                           }
                           Some(FilteredData::Percentiles(p)) => {
                             row.push(cell!(p.samples));
@@ -933,15 +861,9 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                           },
                           r => {
                             println!("unexpected metric: {:?}", r);
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
+                            for _ in 1..=9 {
+                              row.push(cell!(""));
+                            }
                           },
                         }
                       }
@@ -962,12 +884,12 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
   }
 }
 
-pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool, load_balancing_policy: LoadBalancingAlgorithms) {
+pub fn add_application(channel: Chan, timeout: u64, app_id: &str, sticky_session: bool, https_redirect: bool, send_proxy: bool, expect_proxy: bool, load_balancing_policy: LoadBalancingAlgorithms) {
   let proxy_protocol = match (send_proxy, expect_proxy) {
-    (true, true) => Some(ProxyProtocolConfig::RelayHeader),
+    (true, true)  => Some(ProxyProtocolConfig::RelayHeader),
     (true, false) => Some(ProxyProtocolConfig::SendHeader),
     (false, true) => Some(ProxyProtocolConfig::ExpectHeader),
-    _ => None,
+    _             => None,
   };
 
   order_command(channel, timeout, ProxyRequestData::AddApplication(Application {
@@ -980,11 +902,11 @@ pub fn add_application(channel: Channel<CommandRequest,CommandResponse>, timeout
   }));
 }
 
-pub fn remove_application(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str) {
+pub fn remove_application(channel: Chan, timeout: u64, app_id: &str) {
   order_command(channel, timeout, ProxyRequestData::RemoveApplication(String::from(app_id)));
 }
 
-pub fn add_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
+pub fn add_http_frontend(channel: Chan, timeout: u64, app_id: &str,
   address: SocketAddr, hostname: &str, path_begin: &str, https: bool) {
   if https {
     order_command(channel, timeout, ProxyRequestData::AddHttpsFront(HttpFront {
@@ -1003,7 +925,7 @@ pub fn add_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeo
   }
 }
 
-pub fn remove_http_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
+pub fn remove_http_frontend(channel: Chan, timeout: u64, app_id: &str,
   address: SocketAddr, hostname: &str, path_begin: &str, https: bool) {
   if https {
     order_command(channel, timeout, ProxyRequestData::RemoveHttpsFront(HttpFront {
@@ -1023,7 +945,7 @@ pub fn remove_http_frontend(channel: Channel<CommandRequest,CommandResponse>, ti
 }
 
 
-pub fn add_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
+pub fn add_backend(channel: Chan, timeout: u64, app_id: &str,
   backend_id: &str, address: SocketAddr, sticky_id: Option<String>, backup: Option<bool>) {
   order_command(channel, timeout, ProxyRequestData::AddBackend(Backend {
       app_id: String::from(app_id),
@@ -1035,7 +957,7 @@ pub fn add_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u6
     }));
 }
 
-pub fn remove_backend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
+pub fn remove_backend(channel: Chan, timeout: u64, app_id: &str,
   backend_id: &str, address: SocketAddr) {
   order_command(channel, timeout, ProxyRequestData::RemoveBackend(RemoveBackend {
     app_id: String::from(app_id),
@@ -1044,7 +966,7 @@ pub fn remove_backend(channel: Channel<CommandRequest,CommandResponse>, timeout:
   }));
 }
 
-pub fn add_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
+pub fn add_certificate(channel: Chan, timeout: u64, address: SocketAddr,
   certificate_path: &str, certificate_chain_path: &str, key_path: &str) {
   if let Some(new_certificate) = load_full_certificate(certificate_path, certificate_chain_path, key_path) {
     order_command(channel, timeout, ProxyRequestData::AddCertificate(AddCertificate {
@@ -1055,7 +977,7 @@ pub fn add_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout
   }
 }
 
-pub fn remove_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
+pub fn remove_certificate(channel: Chan, timeout: u64, address: SocketAddr,
   certificate_path: &str) {
   if let Some(fingerprint) = get_certificate_fingerprint(certificate_path) {
     order_command(channel, timeout, ProxyRequestData::RemoveCertificate(RemoveCertificate {
@@ -1066,7 +988,7 @@ pub fn remove_certificate(channel: Channel<CommandRequest,CommandResponse>, time
   }
 }
 
-pub fn replace_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
+pub fn replace_certificate(channel: Chan, timeout: u64, address: SocketAddr,
   new_certificate_path: &str, new_certificate_chain_path: &str, new_key_path: &str, old_certificate_path: &str)
 {
   if let Some(new_certificate) = load_full_certificate(new_certificate_path, new_certificate_chain_path, new_key_path) {
@@ -1082,7 +1004,7 @@ pub fn replace_certificate(channel: Channel<CommandRequest,CommandResponse>, tim
   }
 }
 
-pub fn add_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
+pub fn add_tcp_frontend(channel: Chan, timeout: u64, app_id: &str,
   address: SocketAddr) {
   order_command(channel, timeout, ProxyRequestData::AddTcpFront(TcpFront {
     app_id: String::from(app_id),
@@ -1090,7 +1012,7 @@ pub fn add_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, timeou
   }));
 }
 
-pub fn remove_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, app_id: &str,
+pub fn remove_tcp_frontend(channel: Chan, timeout: u64, app_id: &str,
   address: SocketAddr) {
   order_command(channel, timeout, ProxyRequestData::RemoveTcpFront(TcpFront {
     app_id: String::from(app_id),
@@ -1098,7 +1020,7 @@ pub fn remove_tcp_frontend(channel: Channel<CommandRequest,CommandResponse>, tim
   }));
 }
 
-pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, json: bool, application_id: Option<String>, domain: Option<String>) {
+pub fn query_application(mut channel: Chan, json: bool, application_id: Option<String>, domain: Option<String>) {
   if application_id.is_some() && domain.is_some() {
     eprintln!("Error: Either request an application ID or a domain name");
     exit(1);
@@ -1374,8 +1296,7 @@ pub fn query_application(mut channel: Channel<CommandRequest,CommandResponse>, j
   }
 }
 
-pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, json: bool, fingerprint: Option<String>, domain: Option<String>) {
-
+pub fn query_certificate(mut channel: Chan, json: bool, fingerprint: Option<String>, domain: Option<String>) {
   let query = match (fingerprint, domain) {
     (None, None) => QueryCertificateType::All,
     (Some(f), None) => {
@@ -1494,11 +1415,11 @@ pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, j
   }
 }
 
-pub fn logging_filter(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, filter: &str) {
+pub fn logging_filter(channel: Chan, timeout: u64, filter: &str) {
   order_command(channel, timeout, ProxyRequestData::Logging(String::from(filter)));
 }
 
-pub fn events(mut channel: Channel<CommandRequest,CommandResponse>) {
+pub fn events(mut channel: Chan) {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),
@@ -1533,7 +1454,7 @@ pub fn events(mut channel: Channel<CommandRequest,CommandResponse>) {
   }
 }
 
-fn order_command(mut channel: Channel<CommandRequest,CommandResponse>, timeout: u64, order: ProxyRequestData) {
+fn order_command(mut channel: Chan, timeout: u64, order: ProxyRequestData) {
   let id = generate_id();
   channel.write_message(&CommandRequest::new(
     id.clone(),

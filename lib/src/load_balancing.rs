@@ -28,6 +28,7 @@ impl LoadBalancingAlgorithm for RoundRobinAlgorithm {
 
 impl RoundRobinAlgorithm {
 
+  #[allow(dead_code)]
   fn new() -> Self {
     Self {
       next_backend: 0,

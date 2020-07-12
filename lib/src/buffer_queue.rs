@@ -323,26 +323,26 @@ impl BufferQueue {
     let mut res = Vec::new();
 
     let it = self.output_queue.iter();
-    //first, calculate how many bytes we need to jump
+    //f irst, calculate how many bytes we need to jump
     let mut start         = 0usize;
-    let mut largest_size  = 0usize;
-    let mut delete_ended  = false;
+    let mut _largest_size  = 0usize;
+    let mut _delete_ended  = false;
     let length = self.buffer.available_data();
-    //println!("NEXT OUTPUT DATA:\nqueue:\n{:?}\nbuffer:\n{}", self.output_queue, self.buffer.data().to_hex(16));
-    let mut complete_size = 0;
+    // println!("NEXT OUTPUT DATA:\nqueue:\n{:?}\nbuffer:\n{}", self.output_queue, self.buffer.data().to_hex(16));
+    // let mut complete_size = 0;
     for el in it {
       match el {
         &OutputElement::Delete(sz) => start += sz,
         &OutputElement::Slice(sz)  => {
-          //println!("Slice({})", sz);
+          // println!("Slice({})", sz);
           if sz == 0 {
             continue
           }
           let end = min(start+sz, length);
           if let Some(i) = iovec::IoVec::from_bytes(&self.buffer.data()[start..end]) {
-            //println!("iovec size: {}", i.len());
+            // println!("iovec size: {}", i.len());
             res.push(i);
-            complete_size += i.len();
+            // complete_size += i.len();
             start = end;
             if end == length {
               break;
@@ -358,17 +358,17 @@ impl BufferQueue {
           if let Some(i) = iovec::IoVec::from_bytes(&v[..]) {
             //println!("got Insert with {} bytes", v.len());
             res.push(i);
-            complete_size += i.len();
+            // complete_size += i.len();
           } else {
             break;
           }
         },
-        &OutputElement::Splice(sz)  => { unimplemented!("splice not used in iovec") },
+        &OutputElement::Splice(_sz)  => { unimplemented!("splice not used in iovec") },
       }
     }
 
-    //println!("returning iovec: {:?}", res);
-    //println!("returning iovec with {} bytes", complete_size);
+    // println!("returning iovec: {:?}", res);
+    // println!("returning iovec with {} bytes", complete_size);
     res
   }
 
@@ -506,8 +506,8 @@ mod tests {
 
   #[test]
   fn consume() {
-    let (pool, mut b) = buf_with_capacity(10);
-    b.buffer.write(&b"ABCDEFGHIJ"[..]);
+    let (_pool, mut b) = buf_with_capacity(10);
+    b.buffer.write(&b"ABCDEFGHIJ"[..]).unwrap();
     b.buffer.fill(10);
     b.input_queue.push(InputElement::Slice(10));
     /*let mut b = BufferQueue {

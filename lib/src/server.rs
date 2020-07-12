@@ -5,7 +5,7 @@ use mio::net::*;
 use mio::*;
 use mio::unix::UnixReady;
 use std::collections::{HashSet,VecDeque};
-use std::os::unix::io::{AsRawFd,FromRawFd,IntoRawFd};
+use std::os::unix::io::{AsRawFd,FromRawFd};
 use slab::Slab;
 use time::{self, SteadyTime};
 use std::time::Duration;
@@ -129,7 +129,7 @@ pub struct Server {
   tcp:             tcp::Proxy,
   config_state:    ConfigState,
   scm:             ScmSocket,
-  sessions:        Slab<Rc<RefCell<ProxySessionCast>>,SessionToken>,
+  sessions:        Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken>,
   max_connections: usize,
   nb_connections:  usize,
   front_timeout:   time::Duration,
@@ -153,7 +153,7 @@ impl Server {
 
     //FIXME: we will use a few entries for the channel, metrics socket and the listeners
     //FIXME: for HTTP/2, we will have more than 2 entries per session
-    let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(10+2*config.max_connections);
+    let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken> = Slab::with_capacity(10+2*config.max_connections);
     {
       let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
       trace!("taking token {:?} for channel", entry.index());
@@ -187,7 +187,7 @@ impl Server {
     server_config: ServerConfig,
     config_state: Option<ConfigState>) -> Self {
 
-    FEATURES.with(|features| {
+    FEATURES.with(|_features| {
       // initializing feature flags
     });
 
@@ -1264,7 +1264,7 @@ impl Server {
 
     let (protocol, res) = {
       let cl = self.sessions[token].clone();
-      let cl2: Rc<RefCell<ProxySessionCast>> = self.sessions[token].clone();
+      let cl2: Rc<RefCell<dyn ProxySessionCast>> = self.sessions[token].clone();
       let protocol = { cl.borrow().protocol() };
       let entry = self.sessions.vacant_entry();
       if entry.is_none() {
@@ -1455,6 +1455,7 @@ impl Server {
     }
   }
 
+  #[allow(dead_code)]
   fn listen_port_state(&self, port: &u16) -> ListenPortState {
     let http_bound = self.http.listen_port_state(&port);
 
@@ -1678,7 +1679,7 @@ impl HttpsProvider {
     rustls.create_session(frontend_sock, token, poll, session_token, timeout, delay)
   }
 
-  pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_session: Rc<RefCell<ProxySessionCast>>, back_token: Token)
+  pub fn connect_to_backend(&mut self, poll: &mut Poll,  proxy_session: Rc<RefCell<dyn ProxySessionCast>>, back_token: Token)
     -> Result<BackendConnectAction, ConnectionError> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
 
