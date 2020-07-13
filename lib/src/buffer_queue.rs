@@ -325,8 +325,8 @@ impl BufferQueue {
     let it = self.output_queue.iter();
     //f irst, calculate how many bytes we need to jump
     let mut start         = 0usize;
-    let mut _largest_size  = 0usize;
-    let mut _delete_ended  = false;
+    let mut _largest_size = 0usize;
+    let mut _delete_ended = false;
     let length = self.buffer.available_data();
     // println!("NEXT OUTPUT DATA:\nqueue:\n{:?}\nbuffer:\n{}", self.output_queue, self.buffer.data().to_hex(16));
     // let mut complete_size = 0;

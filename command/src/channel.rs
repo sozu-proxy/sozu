@@ -361,8 +361,8 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
 impl<Tx: Debug+DeserializeOwned+Serialize, Rx: Debug+DeserializeOwned+Serialize> Channel<Tx,Rx> {
   pub fn generate(buffer_size: usize, max_buffer_size: usize) -> io::Result<(Channel<Tx,Rx>, Channel<Rx,Tx>)> {
     let     (command,proxy) = UnixStream::pair()?;
-    let     proxy_channel           = Channel::new(proxy, buffer_size, max_buffer_size);
-    let mut command_channel         = Channel::new(command, buffer_size, max_buffer_size);
+    let     proxy_channel   = Channel::new(proxy, buffer_size, max_buffer_size);
+    let mut command_channel = Channel::new(command, buffer_size, max_buffer_size);
     command_channel.set_nonblocking(false);
     Ok((command_channel, proxy_channel))
   }
