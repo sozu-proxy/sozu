@@ -268,7 +268,7 @@ impl FileAppFrontendConfig {
     })
   }
 
-  pub fn to_http_front(&self, app_id: &str) -> Result<HttpFrontendConfig, String> {
+  pub fn to_http_front(&self) -> Result<HttpFrontendConfig, String> {
     if self.hostname.is_none() {
       return Err(String::from("HTTP frontend should have a 'hostname' field"));
     }
@@ -356,7 +356,7 @@ impl error::Error for ParseErrorLoadBalancing {
         "Cannot find the load balancing policy asked"
     }
 
-    fn cause(&self) -> Option<&error::Error> {
+    fn cause(&self) -> Option<&dyn error::Error> {
         None
     }
 }
@@ -430,7 +430,7 @@ impl FileAppConfig {
       FileAppProtocolConfig::Http => {
         let mut frontends = Vec::new();
         for f in self.frontends {
-          match f.to_http_front(app_id) {
+          match f.to_http_front() {
             Ok(frontend) => frontends.push(frontend),
             Err(e) => return Err(e),
           }

@@ -29,7 +29,7 @@ pub enum TransportProtocol {
 pub trait SocketHandler {
   fn socket_read(&mut self,  buf: &mut[u8]) -> (usize, SocketResult);
   fn socket_write(&mut self, buf: &[u8])    -> (usize, SocketResult);
-  fn socket_write_vectored(&mut self,  buf: &[&iovec::IoVec]) -> (usize, SocketResult) {
+  fn socket_write_vectored(&mut self,  _buf: &[&iovec::IoVec]) -> (usize, SocketResult) {
     unimplemented!()
   }
   fn has_vectored_writes(&self) -> bool { false }
@@ -234,7 +234,7 @@ impl SocketHandler for FrontRustls {
           can_read  = false;
           is_closed = true;
         },
-        Ok(sz) => {},
+        Ok(_sz) => {},
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => {
             can_read = false;
@@ -294,7 +294,7 @@ impl SocketHandler for FrontRustls {
 
   fn socket_write(&mut self,  buf: &[u8]) -> (usize, SocketResult) {
     let mut buffered_size = 0usize;
-    let mut sent_size     = 0usize;
+    // let mut sent_size     = 0usize;
     let mut can_write     = true;
     let mut is_error      = false;
     let mut is_closed     = false;
@@ -341,8 +341,8 @@ impl SocketHandler for FrontRustls {
             //can_write = false;
             break;
           },
-          Ok(sz) => {
-            sent_size += sz;
+          Ok(_sz) => {
+            // sent_size += sz;
           },
           Err(e) => match e.kind() {
             ErrorKind::WouldBlock => can_write = false,

@@ -14,7 +14,7 @@ use nix::unistd::*;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 #[cfg(target_os = "macos")]
-use libc::{PATH_MAX, c_char,uint32_t,int32_t};
+use libc::{PATH_MAX, c_char};
 #[cfg(target_os = "macos")]
 use std::iter::repeat;
 #[cfg(target_os = "macos")]
@@ -196,7 +196,7 @@ pub unsafe fn get_executable_path() -> String {
 
 #[cfg(target_os = "macos")]
 extern {
-  pub fn _NSGetExecutablePath(buf: *mut c_char, size: *mut uint32_t) -> int32_t;
+  pub fn _NSGetExecutablePath(buf: *mut c_char, size: *mut u32) -> i32;
 }
 
 #[cfg(target_os = "macos")]
@@ -207,7 +207,7 @@ pub unsafe fn get_executable_path() -> String {
   let pathbuf = CString::from_vec_unchecked(temp);
   let ptr = pathbuf.into_raw();
 
-  let mut size:uint32_t = capacity as u32;
+  let mut size = capacity as u32;
   if _NSGetExecutablePath(ptr, &mut size) == 0 {
 
     let mut temp2:Vec<u8> = Vec::with_capacity(capacity);

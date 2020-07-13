@@ -5,7 +5,7 @@ use mio::*;
 use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
-use std::os::unix::io::{AsRawFd};
+use std::os::unix::io::AsRawFd;
 use std::io::ErrorKind;
 use std::collections::HashMap;
 use slab::Slab;
@@ -25,7 +25,7 @@ use sozu_command::proxy::{Application,
 use sozu_command::logging;
 use sozu_command::buffer::Buffer;
 
-use protocol::http::{parser::{RRequestLine,hostname_and_port}, answers::{DefaultAnswers, CustomAnswers, HttpAnswers}};
+use protocol::http::{parser::{RRequestLine,hostname_and_port}, answers::HttpAnswers};
 use pool::Pool;
 use {AppId,ConnectionError,Protocol,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus};
@@ -170,7 +170,7 @@ impl Listener {
             f.path_begin == front.path_begin
           }) {
 
-          let front = fronts.remove(pos);
+          let _ = fronts.remove(pos);
         }
       }
 
@@ -211,7 +211,7 @@ impl Listener {
     (*self.resolver).add_certificate(add);
   }
 
-  fn accept(&mut self, token: ListenToken) -> Result<TcpStream, AcceptError> {
+  fn accept(&mut self, _token: ListenToken) -> Result<TcpStream, AcceptError> {
 
     if let Some(ref listener) = self.listener.as_ref() {
       listener.accept().map_err(|e| {
@@ -689,7 +689,7 @@ impl ProxyConfiguration<Session> for Proxy {
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::Query(Query::Certificates(QueryCertificateType::All)) => {
-        let res = self.listeners.iter().map(|(addr, listener)| {
+        let res = self.listeners.iter().map(|(_addr, listener)| {
           let mut domains = (&unwrap_msg!(listener.resolver.0.lock()).domains).to_hashmap();
           let res = domains.drain().map(|(k, v)| {
             (String::from_utf8(k).unwrap(), v.0)
@@ -702,7 +702,7 @@ impl ProxyConfiguration<Session> for Proxy {
           data: Some(ProxyResponseData::Query(QueryAnswer::Certificates(QueryAnswerCertificate::All(res)))) }
       },
       ProxyRequestData::Query(Query::Certificates(QueryCertificateType::Domain(d))) => {
-        let res = self.listeners.iter().map(|(addr, listener)| {
+        let res = self.listeners.iter().map(|(_addr, listener)| {
           let domains  = &unwrap_msg!(listener.resolver.0.lock()).domains;
           (listener.address, domains.domain_lookup(d.as_bytes(), true).map(|(k, v)| {
             (String::from_utf8(k.to_vec()).unwrap(), v.0.clone())
@@ -719,7 +719,7 @@ impl ProxyConfiguration<Session> for Proxy {
     }
   }
 
-  fn listen_port_state(&self, port: &u16) -> ListenPortState {
+  fn listen_port_state(&self, _port: &u16) -> ListenPortState {
     fixme!();
     ListenPortState::Available
     //if port == &self.address.port() { ListenPortState::InUse } else { ListenPortState::Available }
@@ -737,7 +737,7 @@ pub fn start(config: HttpsListener, channel: ProxyChannel, max_buffers: usize, b
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
 
-  let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
+  let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
   {
     let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
     info!("taking token {:?} for channel", entry.index());

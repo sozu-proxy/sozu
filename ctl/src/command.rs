@@ -20,7 +20,7 @@ use prettytable::{Table, Row};
 use super::create_channel;
 use rand::distributions::Alphanumeric;
 
-type millis = u64;
+type Millis = u64;
 type Chan = Channel<CommandRequest,CommandResponse>;
 
 // Used to display the JSON response of the status command
@@ -63,9 +63,10 @@ macro_rules! command_timeout {
   )
 }
 
-pub fn save_state(mut channel: Chan, timeout: millis, path: String) {
+pub fn save_state(mut channel: Chan, timeout: Millis, path: String) {
+  let id = generate_id();
   channel.write_message(&CommandRequest::new(
-    generate_id(),
+    id.clone(),
     CommandRequestData::SaveState(path),
     None,
   ));
@@ -101,8 +102,9 @@ pub fn save_state(mut channel: Chan, timeout: millis, path: String) {
 }
 
 pub fn load_state(mut channel: Chan, timeout: u64, path: String) {
+  let id = generate_id();
   channel.write_message(&CommandRequest::new(
-    generate_id(),
+    id.clone(),
     CommandRequestData::LoadState(path.clone()),
     None,
   ));

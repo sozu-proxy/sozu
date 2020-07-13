@@ -51,8 +51,6 @@ pub enum State {
 }
 
 pub struct Session {
-  #[allow(dead_code)]
-  sock:               TcpStream,
   backend:            Option<Rc<RefCell<Backend>>>,
   frontend_token:     Token,
   backend_token:      Option<Token>,
@@ -113,7 +111,6 @@ impl Session {
     let metrics = SessionMetrics::new(Some(delay));
 
     Session {
-      sock,
       backend:            None,
       frontend_token,
       backend_token:      None,
@@ -185,12 +182,12 @@ impl Session {
     }
   }
 
-  fn request_id(&self) -> Option<&Hyphenated> {
-    match self.protocol {
-      Some(State::Pipe(ref pipe)) => Some(&pipe.request_id),
-      _ => None,
-    }
-  }
+  // fn request_id(&self) -> Option<&Hyphenated> {
+  //   match self.protocol {
+  //     Some(State::Pipe(ref pipe)) => Some(&pipe.request_id),
+  //     _ => None,
+  //   }
+  // }
 
   fn log_context(&self) -> String {
     format!("{} {} {}\t",
@@ -1219,7 +1216,7 @@ mod tests {
               handle_client(&mut stream, count)
             });
           }
-          Err(e) => { println!("connection failed"); }
+          Err(_e) => { println!("connection failed"); }
         }
         count += 1;
       }
@@ -1275,7 +1272,8 @@ mod tests {
 
       let (scm_server, scm_client) = UnixStream::pair().unwrap();
       let scm = ScmSocket::new(scm_client.into_raw_fd());
-      scm.send_listeners(&Listeners {
+      // Todo: Fix if there is error?
+      let _ = scm.send_listeners(&Listeners {
         http: Vec::new(),
         tls:  Vec::new(),
         tcp:  Vec::new(),

@@ -26,16 +26,13 @@ impl LoadBalancingAlgorithm for RoundRobinAlgorithm {
 
 }
 
-impl RoundRobinAlgorithm {
-
-  #[allow(dead_code)]
-  fn new() -> Self {
-    Self {
-      next_backend: 0,
-    }
-  }
-
-}
+// impl RoundRobinAlgorithm {
+//   fn new() -> Self {
+//     Self {
+//       next_backend: 0,
+//     }
+//   }
+// }
 
 #[derive(Debug)]
 pub struct RandomAlgorithm;

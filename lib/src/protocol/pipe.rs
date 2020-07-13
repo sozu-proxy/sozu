@@ -528,7 +528,7 @@ impl<Front:SocketHandler> Pipe<Front> {
         self.log_request_error(metrics, "back socket write error");
         return SessionResult::CloseSession;
       },
-      SocketResult::Error | SocketResult::Closed => {
+      SocketResult::Closed => {
         metrics.service_stop();
         self.front_readiness.reset();
         self.back_readiness.reset();

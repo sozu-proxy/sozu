@@ -3,7 +3,7 @@ use std::time::{Duration,Instant};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use mio::net::UdpSocket;
-use std::io::{self,LineWriter,Write,ErrorKind};
+use std::io::{Write,ErrorKind};
 use std::collections::HashMap;
 use super::writer::{MetricSocket, MetricsWriter};
 
@@ -65,8 +65,8 @@ impl NetworkDrain {
     let mut send_count = 0;
 
     // remove metrics that were not touched in the last 10mn
-    self.app_data.retain(|ref key, ref value| value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00));
-    self.backend_data.retain(|ref key, ref value| value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00));
+    self.app_data.retain(|ref _key, ref value| value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00));
+    self.backend_data.retain(|ref _key, ref value| value.updated || now.duration_since(value.last_sent) < Duration::new(600, 00));
 
     if self.is_writable {
 

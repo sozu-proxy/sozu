@@ -12,7 +12,8 @@ use structopt::StructOpt;
 use sozu_command_lib::config::Config;
 use sozu_command_lib::channel::Channel;
 use sozu_command_lib::command::{CommandRequest,CommandResponse};
-use cli::App;
+use cli::{App,SubCmd,StateCmd,ApplicationCmd,BackendCmd,FrontendCmd,TcpFrontendCmd,
+  QueryCmd,CertificateCmd,ConfigCmd,HttpFrontendCmd};
 
 
 use command::{add_application,remove_application,dump_state,load_state,
@@ -50,11 +51,11 @@ fn main() {
       }
     },
     SubCmd::Upgrade { worker: None }          => upgrade_master(channel, &config),
-    SubCmd::Upgrade { worker: Some(id) } => upgrade_worker(channel, timeout, id),
+    SubCmd::Upgrade { worker: Some(id) } => {upgrade_worker(channel, timeout, id);},
     SubCmd::Status { json }             => status(channel, json),
     SubCmd::Metrics { json }            => metrics(channel, json),
-    SubCmd::Logging { level }            => logging_filter(channel, timeout, &level),
-    SubCmd::State { cmd }                     => {
+    SubCmd::Logging { level }         => logging_filter(channel, timeout, &level),
+    SubCmd::State { cmd }           => {
       match cmd {
         StateCmd::Save{ file } => save_state(channel, timeout, file),
         StateCmd::Load{ file } => load_state(channel, timeout, file),

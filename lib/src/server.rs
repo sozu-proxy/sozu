@@ -178,7 +178,7 @@ impl Server {
   }
 
   pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
-    sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken>,
+    sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken>,
     pool: Rc<RefCell<Pool<Buffer>>>,
     backends: Rc<RefCell<BackendMap>>,
     http: Option<http::Proxy>,

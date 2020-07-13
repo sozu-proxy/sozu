@@ -34,7 +34,7 @@ pub struct Executor {
 
 pub struct Runner {
   pub ready: HashSet<usize>,
-  pub tasks: Slab<Spawn<Box<Future<Item = (), Error = ()> + Send>>>,
+  pub tasks: Slab<Spawn<Box<dyn Future<Item = (), Error = ()> + Send>>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -247,19 +247,19 @@ impl Stream for FutureProcessing {
   }
 }
 
-pub fn send_processing(worker_id: Token, message: ProxyRequest) -> (FutureProcessing, FutureAnswer) {
-  let message_id = message.id.to_string();
-  Executor::send_worker(worker_id, message);
-  (FutureProcessing {
-    worker_id,
-    message_id: message_id.clone()
-  },
+// pub fn send_processing(worker_id: Token, message: ProxyRequest) -> (FutureProcessing, FutureAnswer) {
+//   let message_id = message.id.to_string();
+//   Executor::send_worker(worker_id, message);
+//   (FutureProcessing {
+//     worker_id,
+//     message_id: message_id.clone()
+//   },
 
-  FutureAnswer {
-    worker_id,
-    message_id
-  })
-}
+//   FutureAnswer {
+//     worker_id,
+//     message_id
+//   })
+// }
 
 pub fn send(worker_id: Token, message: ProxyRequest) -> FutureAnswer {
   let message_id = message.id.to_string();
@@ -274,9 +274,7 @@ pub fn send(worker_id: Token, message: ProxyRequest) -> FutureAnswer {
 mod tests {
   use mio::Token;
   use super::*;
-  use futures::executor::spawn;
-  use futures::task;
-  use futures::future::{lazy, result};
+  use futures::future::{lazy};
   use sozu_command::proxy::{ProxyRequestData,ProxyResponseStatus};
   use sozu_command::command::CommandStatus;
 

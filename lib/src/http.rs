@@ -1277,7 +1277,7 @@ impl ProxyConfiguration<Session> for Proxy {
 
   }
 
-  fn listen_port_state(&self, port: &u16) -> ListenPortState {
+  fn listen_port_state(&self, _port: &u16) -> ListenPortState {
     //FIXME TOKEN
     fixme!();
     ListenPortState::Available
@@ -1385,10 +1385,10 @@ mod tests {
     };
 
     let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
-    let jg = thread::spawn(move || {
-      setup_test_logger!();
-      start(config, channel, 10, 16384);
-    });
+    // let jg = thread::spawn(move || {
+    //   setup_test_logger!();
+    //   start(config, channel, 10, 16384);
+    // });
 
     let front = HttpFront { app_id: String::from("app_1"), address: "127.0.0.1:1024".parse().unwrap(), hostname: String::from("localhost"), path_begin: String::from("/") };
     command.write_message(&ProxyRequest { id: String::from("ID_ABCD"), order: ProxyRequestData::AddHttpFront(front) });

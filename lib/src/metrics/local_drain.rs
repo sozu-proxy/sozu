@@ -1,10 +1,9 @@
 use std::str;
-use std::time::{Duration,Instant};
-use std::iter::repeat;
+use std::time::Instant;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use hdrhistogram::Histogram;
-use sozu_command::proxy::{FilteredData,MetricsData,Percentiles,FilteredTimeSerie,AppMetricsData};
+use sozu_command::proxy::{FilteredData,MetricsData,Percentiles,AppMetricsData};
 
 use super::{MetricData,Subscriber};
 
@@ -24,7 +23,7 @@ impl AggregatedMetric {
       MetricData::Time(value)  => {
         //FIXME: do not unwrap here
         let mut h = ::hdrhistogram::Histogram::new(3).unwrap();
-        h.record(value as u64);
+        let _ = h.record(value as u64);
         AggregatedMetric::Time(h)
       }
     }
@@ -42,7 +41,7 @@ impl AggregatedMetric {
         *v1 += v2;
       },
       (&mut AggregatedMetric::Time(ref mut v1), MetricData::Time(v2)) => {
-        (*v1).record(v2 as u64);
+        let _ = (*v1).record(v2 as u64);
       },
       (s,m) => panic!("tried to update metric {} of value {:?} with an incompatible metric: {:?}", key, s, m)
     }
@@ -84,14 +83,14 @@ pub struct BackendMetrics {
   pub data:   BTreeMap<String, AggregatedMetric>,
 }
 
-impl BackendMetrics {
-  pub fn new(app_id: String, h: Histogram<u32>) -> BackendMetrics {
-    BackendMetrics {
-      app_id,
-      data: BTreeMap::new(),
-    }
-  }
-}
+// impl BackendMetrics {
+//   pub fn new(app_id: String, _h: Histogram<u32>) -> BackendMetrics {
+//     BackendMetrics {
+//       app_id,
+//       data: BTreeMap::new(),
+//     }
+//   }
+// }
 
 #[derive(Debug)]
 pub struct LocalDrain {
@@ -334,75 +333,75 @@ pub struct TimeSerie {
   last_hour:         VecDeque<u32>,
 }
 
-impl TimeSerie {
-  pub fn new() -> TimeSerie {
-    TimeSerie {
-      sent_at:           Instant::now(),
-      updated_second_at: Instant::now(),
-      updated_minute_at: Instant::now(),
-      last_sent:         0,
-      last_second:       0,
-      last_minute:       repeat(0).take(60).collect(),
-      last_hour:         repeat(0).take(60).collect(),
-    }
-  }
+// impl TimeSerie {
+//   pub fn new() -> TimeSerie {
+//     TimeSerie {
+//       sent_at:           Instant::now(),
+//       updated_second_at: Instant::now(),
+//       updated_minute_at: Instant::now(),
+//       last_sent:         0,
+//       last_second:       0,
+//       last_minute:       repeat(0).take(60).collect(),
+//       last_hour:         repeat(0).take(60).collect(),
+//     }
+//   }
 
-  pub fn add(&mut self, value: u32) {
-    let now = Instant::now();
+//   pub fn add(&mut self, value: u32) {
+//     let now = Instant::now();
 
-    if now - self.updated_minute_at > Duration::from_secs(60) {
-      self.updated_minute_at = now;
-      let _ = self.last_hour.pop_front();
+//     if now - self.updated_minute_at > Duration::from_secs(60) {
+//       self.updated_minute_at = now;
+//       let _ = self.last_hour.pop_front();
 
-      self.last_hour.push_back( self.last_minute.iter().sum() );
-    }
+//       self.last_hour.push_back( self.last_minute.iter().sum() );
+//     }
 
-    if now - self.updated_second_at > Duration::from_secs(1) {
-      self.updated_second_at = now;
-      let _ = self.last_minute.pop_front();
+//     if now - self.updated_second_at > Duration::from_secs(1) {
+//       self.updated_second_at = now;
+//       let _ = self.last_minute.pop_front();
 
-      self.last_minute.push_back( self.last_second );
+//       self.last_minute.push_back( self.last_second );
 
-      self.last_second = value;
-    } else {
-      self.last_second += value;
-    }
+//       self.last_second = value;
+//     } else {
+//       self.last_second += value;
+//     }
 
-    self.last_sent += value;
-  }
+//     self.last_sent += value;
+//   }
 
-  pub fn increment(&mut self) {
-    self.add(1);
-  }
+//   pub fn increment(&mut self) {
+//     self.add(1);
+//   }
 
-  pub fn filtered(&mut self) -> FilteredTimeSerie {
-    let now = Instant::now();
+//   pub fn filtered(&mut self) -> FilteredTimeSerie {
+//     let now = Instant::now();
 
-    if now - self.updated_minute_at > Duration::from_secs(60) {
-      self.updated_minute_at = now;
-      let _ = self.last_hour.pop_front();
+//     if now - self.updated_minute_at > Duration::from_secs(60) {
+//       self.updated_minute_at = now;
+//       let _ = self.last_hour.pop_front();
 
-      self.last_hour.push_back( self.last_minute.iter().sum() );
-    }
+//       self.last_hour.push_back( self.last_minute.iter().sum() );
+//     }
 
-    if now - self.updated_second_at > Duration::from_secs(1) {
-      self.updated_second_at = now;
-      let _ = self.last_minute.pop_front();
+//     if now - self.updated_second_at > Duration::from_secs(1) {
+//       self.updated_second_at = now;
+//       let _ = self.last_minute.pop_front();
 
-      self.last_minute.push_back( self.last_second );
+//       self.last_minute.push_back( self.last_second );
 
-      self.last_second = 0;
-    }
+//       self.last_second = 0;
+//     }
 
-    FilteredTimeSerie {
-      last_second: self.last_second,
-      last_minute: self.last_minute.iter().cloned().collect(),
-      last_hour:   self.last_hour.iter().cloned().collect(),
-    }
-  }
+//     FilteredTimeSerie {
+//       last_second: self.last_second,
+//       last_minute: self.last_minute.iter().cloned().collect(),
+//       last_hour:   self.last_hour.iter().cloned().collect(),
+//     }
+//   }
 
-  pub fn update_sent_at(&mut self, now: Instant) {
-    self.sent_at   = now;
-    self.last_sent = 0;
-  }
-}
+//   pub fn update_sent_at(&mut self, now: Instant) {
+//     self.sent_at   = now;
+//     self.last_sent = 0;
+//   }
+// }

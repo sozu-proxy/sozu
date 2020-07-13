@@ -1,8 +1,6 @@
-use std::io::{self, Error, ErrorKind, Write};
-use std::os::unix::io::AsRawFd;
+use std::io::{self, Write};
 use std::net::SocketAddr;
 use mio::net::UdpSocket;
-use libc::{msghdr, iovec, c_void, c_uint};
 
 pub struct MetricSocket {
   pub addr:   SocketAddr,
