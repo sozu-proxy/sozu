@@ -50,16 +50,16 @@ fn main() {
         soft_stop(channel, worker);
       }
     },
-    SubCmd::Upgrade { worker: None }          => upgrade_master(channel, &config),
+    SubCmd::Upgrade { worker: None }     => upgrade_master(channel, &config),
     SubCmd::Upgrade { worker: Some(id) } => {upgrade_worker(channel, timeout, id);},
-    SubCmd::Status { json }             => status(channel, json),
-    SubCmd::Metrics { json }            => metrics(channel, json),
-    SubCmd::Logging { level }         => logging_filter(channel, timeout, &level),
-    SubCmd::State { cmd }           => {
+    SubCmd::Status { json }              => status(channel, json),
+    SubCmd::Metrics { json }             => metrics(channel, json),
+    SubCmd::Logging { level }            => logging_filter(channel, timeout, &level),
+    SubCmd::State { cmd }                => {
       match cmd {
         StateCmd::Save{ file } => save_state(channel, timeout, file),
         StateCmd::Load{ file } => load_state(channel, timeout, file),
-        StateCmd::Dump{ json }   => dump_state(channel, timeout, json),
+        StateCmd::Dump{ json } => dump_state(channel, timeout, json),
       }
     },
     SubCmd::Application{ cmd } => {
