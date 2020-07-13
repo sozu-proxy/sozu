@@ -7,7 +7,6 @@ use serde_json::from_str;
 
 use sozu_command::{
     channel::Channel,
-    command::PROTOCOL_VERSION,
     ready::Ready,
 };
 

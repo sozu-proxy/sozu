@@ -1,5 +1,5 @@
 use env;
-use std::io::{LineWriter,stdout};
+use std::io::{stdout};
 use std::path::Path;
 use std::fs::OpenOptions;
 use rand::{Rng,thread_rng};
