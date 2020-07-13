@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::collections::{HashMap,BTreeMap,HashSet};
 use std::str::FromStr;
 
-use config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
+use crate::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
 
 pub type MessageId = String;
 
@@ -512,7 +512,7 @@ impl error::Error for ParseErrorTlsVersion {
     "Cannot find the TLS version"
   }
 
-  fn cause(&self) -> Option<&error::Error> {
+  fn cause(&self) -> Option<&dyn error::Error> {
     None
   }
 }

@@ -27,9 +27,9 @@ use sozu_command::ready::Ready;
 
 use super::{CommandServer,FrontToken,Worker};
 use super::client::parse;
-use worker::{start_worker,get_executable_path};
-use upgrade::{start_new_main_process,SerializedWorker,UpgradeData};
-use util;
+use crate::worker::{start_worker,get_executable_path};
+use crate::upgrade::{start_new_main_process,SerializedWorker,UpgradeData};
+use crate::util;
 
 use super::executor;
 use futures::future::join_all;

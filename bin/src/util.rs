@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::Write;
 use libc;
 
-use logging;
+use crate::logging;
 use sozu_command::config::Config;
 use sozu::metrics;
 

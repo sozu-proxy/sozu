@@ -16,8 +16,8 @@ use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::proxy::ProxyRequest;
 
-use util;
-use command::{CommandServer,Worker};
+use crate::util;
+use crate::command::{CommandServer,Worker};
 
 #[derive(Deserialize,Serialize,Debug)]
 pub struct SerializedWorker {

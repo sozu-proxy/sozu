@@ -3,9 +3,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::iter::{repeat,FromIterator};
-use certificate::calculate_fingerprint;
+use crate::certificate::calculate_fingerprint;
 
-use proxy::{Application,CertFingerprint,CertificateAndKey,ProxyRequestData,
+use crate::proxy::{Application,CertFingerprint,CertificateAndKey,ProxyRequestData,
   HttpFront,TcpFront,Backend,QueryAnswerApplication,
   AddCertificate, RemoveCertificate, RemoveBackend,
   HttpListener,HttpsListener,TcpListener,ListenerType,
@@ -867,8 +867,8 @@ impl<'a, K:Ord, V:PartialEq, I1: Iterator<Item=(K, &'a V)>, I2: Iterator<Item=(K
 #[cfg(test)]
 mod tests {
   use super::*;
-  use config::LoadBalancingAlgorithms;
-  use proxy::{ProxyRequestData,HttpFront,Backend,LoadBalancingParams,TlsProvider};
+  use crate::config::LoadBalancingAlgorithms;
+  use crate::proxy::{ProxyRequestData,HttpFront,Backend,LoadBalancingParams,TlsProvider};
 
   #[test]
   fn serialize() {
@@ -1039,6 +1039,7 @@ mod tests {
       answer_503: String::new(),
       sticky_name: String::new(),
       front_timeout: 60,
+      request_timeout: 10,
       back_timeout: 30,
       connect_timeout: 3,
     }));
@@ -1057,6 +1058,7 @@ mod tests {
       certificate_chain:   vec![],
       key:                 None,
       front_timeout: 60,
+      request_timeout: 10,
       back_timeout: 30,
       connect_timeout: 3,
     }));
@@ -1083,6 +1085,7 @@ mod tests {
       answer_503: String::new(),
       sticky_name: String::new(),
       front_timeout: 60,
+      request_timeout: 10,
       back_timeout: 30,
       connect_timeout: 3,
     }));
@@ -1106,6 +1109,7 @@ mod tests {
       certificate_chain:   vec![],
       key:                 None,
       front_timeout: 60,
+      request_timeout: 10,
       back_timeout: 30,
       connect_timeout: 3,
     }));
@@ -1145,6 +1149,7 @@ mod tests {
         answer_503: String::new(),
         sticky_name: String::new(),
         front_timeout: 60,
+        request_timeout: 10,
         back_timeout: 30,
         connect_timeout: 3,
       }),
@@ -1172,6 +1177,7 @@ mod tests {
         certificate_chain:   vec![],
         key:                 None,
         front_timeout: 60,
+        request_timeout: 10,
         back_timeout: 30,
         connect_timeout: 3,
       }),

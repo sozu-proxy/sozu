@@ -1,6 +1,6 @@
 use clap::{App,Arg,SubCommand,ArgMatches};
-use worker::begin_worker_process;
-use upgrade::begin_new_main_process;
+use crate::worker::begin_worker_process;
+use crate::upgrade::begin_new_main_process;
 
 pub fn init<'a>() -> ArgMatches<'a> {
   App::new("sozu")

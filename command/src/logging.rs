@@ -193,7 +193,7 @@ pub enum LoggerBackend {
   Unix(UnixDatagram),
   Udp(UdpSocket, SocketAddr),
   Tcp(TcpStream),
-  File(::writer::MultiLineWriter<File>),
+  File(crate::writer::MultiLineWriter<File>),
 }
 
 #[repr(usize)]
@@ -619,7 +619,7 @@ macro_rules! fixme {
     };
 }
 
-use log;
+use crate::log;
 struct CompatLogger;
 
 impl From<log::Level> for LogLevel {

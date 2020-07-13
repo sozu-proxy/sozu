@@ -25,7 +25,7 @@ pub mod executor;
 pub mod orders;
 pub mod client;
 
-use worker::{start_worker, get_executable_path};
+use crate::worker::{start_worker, get_executable_path};
 use self::client::CommandClient;
 use self::executor::{Executor, StateChange};
 
