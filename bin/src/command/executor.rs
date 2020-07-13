@@ -274,9 +274,9 @@ pub fn send(worker_id: Token, message: ProxyRequest) -> FutureAnswer {
 mod tests {
   use mio::Token;
   use super::*;
-  use futures::executor::spawn;
-  use futures::task;
-  use futures::future::{lazy, result};
+  
+  
+  use futures::future::{lazy};
   use sozu_command::proxy::{ProxyRequestData,ProxyResponseStatus};
   use sozu_command::command::CommandStatus;
 
