@@ -3,22 +3,6 @@
 #[macro_use] extern crate lazy_static;
 #[macro_use] extern crate structopt_derive;
 #[macro_use] extern crate prettytable;
-extern crate mio;
-extern crate mio_uds;
-extern crate serde;
-extern crate serde_json;
-extern crate time;
-extern crate libc;
-extern crate slab;
-extern crate rand;
-extern crate nix;
-extern crate tempfile;
-extern crate futures;
-extern crate regex;
-extern crate jemallocator;
-extern crate chrono;
-extern crate structopt;
-extern crate hex;
 #[macro_use] extern crate sozu_lib as sozu;
 #[macro_use] extern crate sozu_command_lib as sozu_command;
 
@@ -38,17 +22,17 @@ mod util;
 mod cli;
 mod ctl;
 
-use std::env;
+
 use std::panic;
-use sozu_command::config::Config;
+use crate::sozu_command::config::Config;
 use structopt::StructOpt;
 
 #[cfg(target_os = "linux")]
 use libc::{cpu_set_t,pid_t};
 
-use command::Worker;
-use worker::{start_workers,get_executable_path};
-use sozu::metrics::METRICS;
+use crate::command::Worker;
+use crate::worker::{start_workers,get_executable_path};
+use crate::sozu::metrics::METRICS;
 
 enum StartupError {
   ConfigurationFileNotSpecified,

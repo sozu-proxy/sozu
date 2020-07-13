@@ -1,12 +1,12 @@
-use serde;
-use serde::ser::SerializeMap;
-use serde_json;
-use std::fmt;
+
+
+
+
 use std::net::SocketAddr;
 use std::collections::BTreeMap;
 
-use state::ConfigState;
-use proxy::{AggregatedMetricsData,ProxyRequestData,QueryAnswer,ProxyEvent};
+use crate::state::ConfigState;
+use crate::proxy::{AggregatedMetricsData,ProxyRequestData,QueryAnswer,ProxyEvent};
 
 pub const PROTOCOL_VERSION: u8 = 0;
 
@@ -133,12 +133,12 @@ mod tests {
   use super::*;
   use serde_json;
   use hex::FromHex;
-  use certificate::split_certificate_chain;
-  use proxy::{Cluster,CertificateAndKey,CertificateFingerprint,ProxyRequestData,HttpFrontend,Backend,
+  use crate::certificate::split_certificate_chain;
+  use crate::proxy::{Cluster,CertificateAndKey,CertificateFingerprint,ProxyRequestData,HttpFrontend,Backend,
     AppMetricsData,MetricsData,FilteredData,Percentiles,RemoveBackend,
     AddCertificate,RemoveCertificate,LoadBalancingParams,RulePosition,PathRule,
     Route};
-  use config::{LoadBalancingAlgorithms,ProxyProtocolConfig};
+  use crate::config::{LoadBalancingAlgorithms,ProxyProtocolConfig};
 
   #[test]
   fn config_message_test() {

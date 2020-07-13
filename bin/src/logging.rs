@@ -1,11 +1,11 @@
-use env;
+use std::env;
 use std::io::{stdout};
 use std::path::Path;
 use std::fs::OpenOptions;
 use rand::{Rng,thread_rng};
 use mio_uds::UnixDatagram;
 use std::net::{TcpStream,UdpSocket,ToSocketAddrs};
-use sozu_command::logging::{Logger,LoggerBackend};
+use crate::sozu_command::logging::{Logger,LoggerBackend};
 use rand::distributions::Alphanumeric;
 
 pub fn setup(tag: String, level: &str, target: &str, access_target: Option<&str>) {

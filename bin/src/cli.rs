@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
-use sozu_command::config::LoadBalancingAlgorithms;
-use sozu_command::proxy::TlsVersion;
+use crate::sozu_command::config::LoadBalancingAlgorithms;
+use crate::sozu_command::proxy::TlsVersion;
 
 #[derive(StructOpt, PartialEq, Debug)]
 #[structopt(name = "example", about = "An example of StructOpt usage.")]

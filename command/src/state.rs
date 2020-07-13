@@ -3,9 +3,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::iter::{repeat,FromIterator};
-use certificate::calculate_fingerprint;
+use crate::certificate::calculate_fingerprint;
 
-use proxy::{Cluster,CertificateFingerprint,CertificateAndKey,ProxyRequestData,
+use crate::proxy::{Cluster,CertificateFingerprint,CertificateAndKey,ProxyRequestData,
   HttpFrontend,TcpFrontend,Backend,QueryAnswerApplication,
   AddCertificate, RemoveCertificate, RemoveBackend,
   HttpListener,HttpsListener,TcpListener,ListenerType,
@@ -729,7 +729,7 @@ impl ConfigState {
   pub fn application_state(&self, cluster_id: &str) -> QueryAnswerApplication {
     QueryAnswerApplication {
       configuration:   self.clusters.get(cluster_id).cloned(),
-      http_frontends:  self.http_fronts.iter().filter_map(|(k, v)| {
+      http_frontends:  self.http_fronts.iter().filter_map(|(_k, v)| {
           match &v.route {
             Route::Deny => None,
             Route::ClusterId(id) => if id == cluster_id {
@@ -739,7 +739,7 @@ impl ConfigState {
             }
           }
         }).cloned().collect(),
-      https_frontends: self.https_fronts.iter().filter_map(|(k, v)| {
+      https_frontends: self.https_fronts.iter().filter_map(|(_k, v)| {
           match &v.route {
             Route::Deny => None,
             Route::ClusterId(id) => if id == cluster_id {
@@ -809,8 +809,8 @@ pub fn get_certificate(state: &ConfigState, fingerprint: &[u8]) -> Option<(Strin
 #[cfg(test)]
 mod tests {
   use super::*;
-  use config::LoadBalancingAlgorithms;
-  use proxy::{ProxyRequestData,HttpFrontend,Backend,LoadBalancingParams,TlsProvider,RulePosition,PathRule, Route};
+  use crate::config::LoadBalancingAlgorithms;
+  use crate::proxy::{ProxyRequestData,HttpFrontend,Backend,LoadBalancingParams,TlsProvider,RulePosition,PathRule, Route};
 
   #[test]
   fn serialize() {

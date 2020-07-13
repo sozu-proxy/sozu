@@ -10,14 +10,14 @@ use nix::unistd::*;
 use serde_json;
 use tempfile::tempfile;
 
-use sozu_command::config::Config;
-use sozu_command::command::RunState;
-use sozu_command::channel::Channel;
-use sozu_command::state::ConfigState;
-use sozu_command::proxy::ProxyRequest;
+use crate::sozu_command::config::Config;
+use crate::sozu_command::command::RunState;
+use crate::sozu_command::channel::Channel;
+use crate::sozu_command::state::ConfigState;
+use crate::sozu_command::proxy::ProxyRequest;
 
-use util;
-use command::{CommandServer,Worker};
+use crate::util;
+use crate::command::{CommandServer,Worker};
 
 #[derive(Deserialize,Serialize,Debug)]
 pub struct SerializedWorker {

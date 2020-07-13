@@ -13,19 +13,19 @@ use libc::pid_t;
 use nix::unistd::Pid;
 use nix::sys::signal::{kill,Signal};
 
-use sozu::metrics::METRICS;
-use sozu_command::config::Config;
-use sozu_command::channel::Channel;
-use sozu_command::state::ConfigState;
-use sozu_command::command::{self,CommandRequest,CommandResponse,CommandResponseData,CommandStatus,RunState};
-use sozu_command::proxy::{ProxyRequest,ProxyResponse,ProxyResponseData};
-use sozu_command::scm_socket::{Listeners,ScmSocket};
+use crate::sozu::metrics::METRICS;
+use crate::sozu_command::config::Config;
+use crate::sozu_command::channel::Channel;
+use crate::sozu_command::state::ConfigState;
+use crate::sozu_command::command::{self,CommandRequest,CommandResponse,CommandResponseData,CommandStatus,RunState};
+use crate::sozu_command::proxy::{ProxyRequest,ProxyResponse,ProxyResponseData};
+use crate::sozu_command::scm_socket::{Listeners,ScmSocket};
 
 pub mod executor;
 pub mod orders;
 pub mod client;
 
-use worker::{start_worker, get_executable_path};
+use crate::worker::{start_worker, get_executable_path};
 use self::client::CommandClient;
 use self::executor::{Executor, StateChange};
 

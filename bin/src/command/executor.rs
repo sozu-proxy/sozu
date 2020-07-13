@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use slab::Slab;
 use std::collections::{HashSet, VecDeque};
-use sozu_command::proxy::{ProxyRequest, ProxyResponse, ProxyResponseStatus};
-use sozu_command::command::CommandResponse;
+use crate::sozu_command::proxy::{ProxyRequest, ProxyResponse, ProxyResponseStatus};
+use crate::sozu_command::command::CommandResponse;
 use super::FrontToken;
 
 lazy_static! {
@@ -277,8 +277,8 @@ mod tests {
   
   
   use futures::future::{lazy};
-  use sozu_command::proxy::{ProxyRequestData,ProxyResponseStatus};
-  use sozu_command::command::CommandStatus;
+  use crate::sozu_command::proxy::{ProxyRequestData,ProxyResponseStatus};
+  use crate::sozu_command::command::CommandStatus;
 
   #[test]
   fn executor() {

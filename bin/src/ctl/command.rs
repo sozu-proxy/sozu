@@ -1,8 +1,8 @@
-use sozu_command::config::{Config, ProxyProtocolConfig, LoadBalancingAlgorithms, Listener, FileListenerProtocolConfig};
-use sozu_command::channel::Channel;
-use sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
-use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
-use sozu_command::proxy::{Cluster, ProxyRequestData, Backend, HttpFrontend,
+use crate::sozu_command::config::{Config, ProxyProtocolConfig, LoadBalancingAlgorithms, Listener, FileListenerProtocolConfig};
+use crate::sozu_command::channel::Channel;
+use crate::sozu_command::certificate::{calculate_fingerprint,split_certificate_chain};
+use crate::sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
+use crate::sozu_command::proxy::{Cluster, ProxyRequestData, Backend, HttpFrontend,
   TcpFrontend, CertificateAndKey, CertificateFingerprint, Query, QueryAnswer,
   QueryApplicationType, QueryApplicationDomain, FilteredData, AddCertificate,
   RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend,

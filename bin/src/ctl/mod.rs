@@ -2,10 +2,10 @@ mod command;
 
 use std::io;
 
-use sozu_command::config::Config;
-use sozu_command::channel::Channel;
-use sozu_command::command::{CommandRequest,CommandResponse};
-use sozu_command::proxy::ListenerType;
+use crate::sozu_command::config::Config;
+use crate::sozu_command::channel::Channel;
+use crate::sozu_command::command::{CommandRequest,CommandResponse};
+use crate::sozu_command::proxy::ListenerType;
 
 use crate::cli::*;
 use self::command::{add_application,remove_application,dump_state,load_state,

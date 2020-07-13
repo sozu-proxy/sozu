@@ -14,23 +14,23 @@ use mio_uds::{UnixListener,UnixStream};
 use mio::{Poll,PollOpt,Ready,Token};
 use nom::{Err,HexDisplay,Offset};
 
-use sozu_command::buffer::fixed::Buffer;
-use sozu_command::channel::Channel;
-use sozu_command::scm_socket::{Listeners, ScmSocket};
-use sozu_command::proxy::{ProxyRequestData, ProxyRequest, Query, QueryAnswer,
+use crate::sozu_command::buffer::fixed::Buffer;
+use crate::sozu_command::channel::Channel;
+use crate::sozu_command::scm_socket::{Listeners, ScmSocket};
+use crate::sozu_command::proxy::{ProxyRequestData, ProxyRequest, Query, QueryAnswer,
   QueryApplicationType, MetricsData, AggregatedMetricsData, ProxyResponseData,
   HttpFrontend, TcpFrontend, Route, ProxyResponseStatus};
-use sozu_command::command::{CommandResponseData,CommandRequestData,
+use crate::sozu_command::command::{CommandResponseData,CommandRequestData,
   CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
-use sozu_command::state::get_application_ids_by_domain;
-use sozu_command::logging;
-use sozu::metrics::METRICS;
+use crate::sozu_command::state::get_application_ids_by_domain;
+use crate::sozu_command::logging;
+use crate::sozu::metrics::METRICS;
 
 use super::{CommandServer,FrontToken,Worker};
 use super::client::parse;
-use worker::{start_worker,get_executable_path};
-use upgrade::{start_new_master_process,SerializedWorker,UpgradeData};
-use util;
+use crate::worker::{start_worker,get_executable_path};
+use crate::upgrade::{start_new_master_process,SerializedWorker,UpgradeData};
+use crate::util;
 
 use super::executor;
 use futures::future::join_all;

@@ -12,7 +12,7 @@ use serde_json;
 use serde::ser::Serialize;
 use serde::de::DeserializeOwned;
 
-use buffer::growable::Buffer;
+use crate::buffer::growable::Buffer;
 
 #[derive(Debug,PartialEq)]
 pub enum ConnError {

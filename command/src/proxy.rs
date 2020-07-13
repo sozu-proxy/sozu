@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::collections::{HashMap,BTreeMap,HashSet};
 use std::str::FromStr;
 
-use config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
+use crate::config::{ProxyProtocolConfig, LoadBalancingAlgorithms};
 
 pub type MessageId = String;
 
@@ -525,7 +525,7 @@ impl error::Error for ParseErrorTlsVersion {
     "Cannot find the TLS version"
   }
 
-  fn cause(&self) -> Option<&error::Error> {
+  fn cause(&self) -> Option<&dyn error::Error> {
     None
   }
 }
@@ -667,7 +667,7 @@ impl ProxyRequestData {
   pub fn get_topics(&self) -> HashSet<Topic> {
     match *self {
       ProxyRequestData::AddCluster(_)          => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      ProxyRequestData::RemoveCluster{ref cluster_id} => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
+      ProxyRequestData::RemoveCluster{cluster_id: _} => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::AddHttpFrontend(_)     => [Topic::HttpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::RemoveHttpFrontend(_)  => [Topic::HttpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::AddHttpsFrontend(_)    => [Topic::HttpsProxyConfig].iter().cloned().collect(),
