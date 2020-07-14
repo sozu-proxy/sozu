@@ -260,6 +260,7 @@ impl SocketHandler for FrontRustls {
 
       while !self.session.wants_read() {
         match self.session.read(&mut buf[size..]) {
+          Ok(0) => break,
           Ok(sz) => size += sz,
           Err(e) => match e.kind() {
             ErrorKind::WouldBlock => {
