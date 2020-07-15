@@ -671,6 +671,6 @@ mod tests {
 
   #[test]
   fn size() {
-    assert_size!(TrieNode<u32>, 128);
+    assert_size!(TrieNode<u32>, 136);
   }
 }
