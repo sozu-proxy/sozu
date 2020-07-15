@@ -3,8 +3,7 @@ use std::rc::{Rc,Weak};
 use std::cell::RefCell;
 use std::net::{SocketAddr,IpAddr};
 use mio::*;
-use mio::unix::UnixReady;
-use mio::tcp::TcpStream;
+use mio::net::TcpStream;
 use rusty_ulid::Ulid;
 use time::{Instant, Duration};
 use super::super::{SessionResult,Protocol,Readiness,SessionMetrics, LogDuration};
@@ -15,6 +14,7 @@ use pool::Pool;
 use util::UnwrapLog;
 use server::TIMER;
 use timer::TimeoutContainer;
+use sozu_command::ready::Ready;
 
 pub mod parser;
 pub mod cookies;
@@ -218,8 +218,8 @@ impl<Front:SocketHandler> Http<Front> {
 
     let buf = buf.unwrap_or_else(|| self.answers.borrow().get(answer, self.app_id.as_deref()));
     self.status = SessionStatus::DefaultAnswer(answer, buf, 0);
-    self.front_readiness.interest = UnixReady::from(Ready::writable()) | UnixReady::hup() | UnixReady::error();
-    self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
+    self.front_readiness.interest = Ready::writable() | Ready::hup() | Ready::error();
+    self.back_readiness.interest  = Ready::hup() | Ready::error();
 
   }
 
@@ -245,8 +245,16 @@ impl<Front:SocketHandler> Http<Front> {
     self.frontend.socket_ref()
   }
 
+  pub fn front_socket_mut(&mut self) -> &mut TcpStream {
+    self.frontend.socket_mut()
+  }
+
   pub fn back_socket(&self)  -> Option<&TcpStream> {
     self.backend.as_ref()
+  }
+
+  pub fn back_socket_mut(&mut self)  -> Option<&mut TcpStream> {
+    self.backend.as_mut()
   }
 
   pub fn back_token(&self)   -> Option<Token> {
@@ -390,7 +398,7 @@ impl<Front:SocketHandler> Http<Front> {
         } else {
           self.set_answer(DefaultAnswerStatus::Answer502, None);
           // we're not expecting any more data from the backend
-          self.back_readiness.interest  = UnixReady::from(Ready::empty());
+          self.back_readiness.interest  = Ready::empty();
           SessionResult::Continue
         }
       } else {
@@ -889,7 +897,7 @@ impl<Front:SocketHandler> Http<Front> {
       }
       //let (current_sz, current_res) = self.frontend.socket_write(self.back_buf.as_ref().unwrap().next_output_data());
       let (current_sz, current_res) = if self.frontend.has_vectored_writes() {
-        let bufs = self.back_buf.as_ref().unwrap().as_iovec();
+        let bufs = self.back_buf.as_ref().unwrap().as_ioslice();
         if bufs.is_empty() {
           break;
         }
@@ -984,8 +992,8 @@ impl<Front:SocketHandler> Http<Front> {
         if front_keep_alive && back_keep_alive {
           debug!("{} keep alive front/back", self.log_context());
           self.reset();
-          self.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-          self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
+          self.front_readiness.interest = Ready::readable() | Ready::hup() | Ready::error();
+          self.back_readiness.interest  = Ready::hup() | Ready::error();
 
           SessionResult::Continue
           //FIXME: issues reusing the backend socket
@@ -994,8 +1002,8 @@ impl<Front:SocketHandler> Http<Front> {
         } else if front_keep_alive && !back_keep_alive {
           debug!("{} keep alive front", self.log_context());
           self.reset();
-          self.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-          self.back_readiness.interest  = UnixReady::hup() | UnixReady::error();
+          self.front_readiness.interest = Ready::readable() | Ready::hup() | Ready::error();
+          self.back_readiness.interest  = Ready::hup() | Ready::error();
           SessionResult::CloseBackend(self.backend_token.take())
         } else {
           debug!("{} no keep alive", self.log_context());
@@ -1074,7 +1082,7 @@ impl<Front:SocketHandler> Http<Front> {
         /*
         let (current_sz, current_res) = sock.socket_write(self.front_buf.as_ref().unwrap().next_output_data());
         */
-        let bufs = self.front_buf.as_ref().unwrap().as_iovec();
+        let bufs = self.front_buf.as_ref().unwrap().as_ioslice();
         if bufs.is_empty() {
           break;
         }

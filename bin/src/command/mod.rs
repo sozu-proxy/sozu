@@ -1,6 +1,5 @@
 use mio::*;
-use mio::unix::UnixReady;
-use mio_uds::UnixListener;
+use mio::net::*;
 use slab::Slab;
 use std::fs;
 use std::fmt;
@@ -20,6 +19,7 @@ use sozu_command::state::ConfigState;
 use sozu_command::command::{self,CommandRequest,CommandResponse,CommandResponseData,CommandStatus,RunState};
 use sozu_command::proxy::{ProxyRequest,ProxyResponse,ProxyRequestData,ProxyResponseData};
 use sozu_command::scm_socket::{Listeners,ScmSocket};
+use sozu_command::ready::Ready;
 
 pub mod executor;
 pub mod orders;
@@ -119,38 +119,30 @@ impl CommandServer {
   fn accept(&mut self) -> io::Result<()> {
     debug!("server accepting socket");
 
-    let acc = self.sock.accept();
-    if let Ok(Some((sock, _))) = acc {
-      let conn = CommandClient::new(sock, self.buffer_size, self.max_buffer_size);
-      if self.clients.len() >= SLAB_CAPACITY {
+    let (sock, _) = self.sock.accept()?;
+    let conn = CommandClient::new(sock, self.buffer_size, self.max_buffer_size);
+    if self.clients.len() >= SLAB_CAPACITY {
         return Err(io::Error::new(ErrorKind::ConnectionRefused, "could not add client to slab"));
-      }
+    }
 
-      let tok = self.clients.insert(conn);
-      // Register the connection
-      let token = self.from_front(FrontToken(tok));
-      self.clients[tok].token = Some(token);
-      self.poll.register(&self.clients[tok].channel.sock, token,
-        Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
-        PollOpt::edge())
+    let tok = self.clients.insert(conn);
+    // Register the connection
+    let token = self.from_front(FrontToken(tok));
+    self.clients[tok].token = Some(token);
+    self.poll.registry().register(&mut self.clients[tok].channel.sock, token,
+                                  Interest::READABLE | Interest::WRITABLE)
         .ok().expect("could not register socket with event loop");
 
-      let accept_interest = Ready::readable();
-      self.poll.reregister(&self.sock, SERVER, accept_interest, PollOpt::edge())
-    } else {
-      //FIXME: what do other cases mean, like Ok(None)?
-      acc.map(|_| ())
-    }
+    self.poll.registry().reregister(&mut self.sock, SERVER, Interest::READABLE)
   }
 
-  fn new(srv: UnixListener, config: Config, mut worker_vec: Vec<Worker>, poll: Poll) -> CommandServer {
+  fn new(mut srv: UnixListener, config: Config, mut worker_vec: Vec<Worker>, poll: Poll) -> CommandServer {
     //FIXME: verify this
-    poll.register(&srv, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).unwrap();
-
+    poll.registry().register(&mut srv, Token(0), Interest::READABLE).unwrap();
     if config.metrics.is_some() {
       METRICS.with(|metrics| {
-        if let Some(sock) = (*metrics.borrow()).socket() {
-          poll.register(sock, Token(1), Ready::writable(), PollOpt::edge()).expect("should register the metrics socket");
+        if let Some(sock) = (*metrics.borrow_mut()).socket_mut() {
+          poll.registry().register(sock, Token(1), Interest::WRITABLE).expect("should register the metrics socket");
         } else {
           error!("could not register metrics socket");
         }
@@ -170,9 +162,8 @@ impl CommandServer {
 
     for mut worker in worker_vec.drain(..) {
       token_count += 1;
-      poll.register(&worker.channel.sock, Token(token_count),
-        Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
-        PollOpt::edge()).unwrap();
+      poll.registry().register(&mut worker.channel.sock, Token(token_count),
+        Interest::READABLE | Interest::WRITABLE).unwrap();
       worker.token = Some(Token(token_count));
       workers.insert(Token(token_count), worker);
     }
@@ -233,7 +224,7 @@ impl CommandServer {
       }
 
       for event in events.iter() {
-        self.ready(event.token(), event.readiness());
+        self.ready(event.token(), Ready::from(event));
       }
 
       loop {
@@ -318,8 +309,7 @@ impl CommandServer {
       Token(i) if i < HALF_USIZE + 1 => {
         if let Some(ref mut worker) =self.workers.get_mut(&Token(i)) {
           worker.channel.handle_events(events);
-          let uevent = UnixReady::from(events);
-          if uevent.is_hup() {
+          if events.is_hup() {
             if worker.run_state != RunState::Stopped && worker.run_state != RunState::Stopping {
               worker.run_state = RunState::NotAnswering;
             }
@@ -460,8 +450,8 @@ impl CommandServer {
   pub fn handle_client_events(&mut self, conn_token: FrontToken) {
     if self.clients.contains(conn_token.0) {
 
-      if UnixReady::from(self.clients[conn_token.0].channel.readiness).is_hup() {
-        let _ = self.poll.deregister(&self.clients[conn_token.0].channel.sock).map_err(|e| {
+      if self.clients[conn_token.0].channel.readiness.is_hup() {
+        let _ = self.poll.registry().deregister(&mut self.clients[conn_token.0].channel.sock).map_err(|e| {
           error!("could not unregister client socket: {:?}", e);
         });
 
@@ -591,7 +581,7 @@ impl CommandServer {
         } else if worker.run_state == RunState::Stopping {
           info!("worker process {} (PID = {}) not detected, assuming it stopped", worker.id, worker.pid);
           worker.run_state = RunState::Stopped;
-          let _ = self.poll.deregister(&worker.channel.sock);
+          let _ = self.poll.registry().deregister(&mut worker.channel.sock);
           return;
         } else {
           error!("failed to check process status: {:?}", res);
@@ -599,7 +589,7 @@ impl CommandServer {
         }
       }
 
-      let _ = self.poll.deregister(&worker.channel.sock);
+      let _ = self.poll.registry().deregister(&mut worker.channel.sock);
     }
 
     self.workers.remove(&token);
@@ -634,9 +624,8 @@ impl CommandServer {
           count += 1;
         }
 
-        self.poll.register(&worker.channel.sock, Token(worker_token),
-          Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
-          PollOpt::edge()).unwrap();
+        self.poll.registry().register(&mut worker.channel.sock, Token(worker_token),
+          Interest::READABLE | Interest::WRITABLE).unwrap();
         worker.token = Some(Token(worker_token));
 
         // the new worker expects a status message at startup

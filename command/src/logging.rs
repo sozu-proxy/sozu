@@ -7,7 +7,7 @@ use std::fmt::{Arguments,format};
 use std::io::{stdout,Stdout,Write};
 use std::net::{SocketAddr,UdpSocket};
 use std::net::TcpStream;
-use mio_uds::UnixDatagram;
+use mio::net::UnixDatagram;
 
 thread_local! {
   pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());

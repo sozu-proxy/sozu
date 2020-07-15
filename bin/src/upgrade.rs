@@ -1,5 +1,5 @@
-use mio_uds::UnixStream;
 use mio::Token;
+use mio::net::UnixStream;
 use libc::{self,pid_t};
 use std::process::Command;
 use std::os::unix::process::CommandExt;

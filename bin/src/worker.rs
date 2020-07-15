@@ -1,5 +1,4 @@
-use mio_uds::UnixStream;
-use mio::Ready;
+use mio::net::UnixStream;
 use libc::{self,pid_t};
 use std::io::{Seek,SeekFrom};
 use std::fs::File;
@@ -34,6 +33,7 @@ use sozu_command::channel::Channel;
 use sozu_command::state::ConfigState;
 use sozu_command::scm_socket::{Listeners,ScmSocket};
 use sozu_command::proxy::{ProxyRequest,ProxyResponse,ProxyRequestData};
+use sozu_command::ready::Ready;
 use sozu::server::Server;
 use sozu::metrics;
 

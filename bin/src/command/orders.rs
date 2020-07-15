@@ -9,9 +9,8 @@ use std::collections::{HashMap,BTreeMap};
 use std::os::unix::io::{AsRawFd,FromRawFd};
 use slab::Slab;
 use serde_json;
-use mio::unix::UnixReady;
-use mio_uds::{UnixListener,UnixStream};
-use mio::{Poll,PollOpt,Ready,Token};
+use mio::{Poll, Token, Interest};
+use mio::net::*;
 use nom::{Err,HexDisplay,Offset};
 
 use sozu_command::buffer::fixed::Buffer;
@@ -24,6 +23,7 @@ use sozu_command::state::{ConfigState, get_application_ids_by_domain};
 use sozu_command::config::Config;
 use sozu_command::logging;
 use sozu::metrics::METRICS;
+use sozu_command::ready::Ready;
 
 use super::{CommandServer,FrontToken,Worker};
 use super::client::parse;
@@ -331,9 +331,8 @@ impl CommandServer {
 
       debug!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
       worker_token, tag, worker.id, worker.channel.sock.take_error());
-      self.poll.register(&worker.channel.sock, Token(worker_token),
-        Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
-        PollOpt::edge()).unwrap();
+      self.poll.registry().register(&mut worker.channel.sock, Token(worker_token),
+        Interest::READABLE | Interest::WRITABLE).unwrap();
       worker.token = Some(Token(worker_token));
 
       info!("sending listeners: to the new worker: {:?}", worker.scm.send_listeners(&Listeners {
@@ -382,9 +381,8 @@ impl CommandServer {
 
       debug!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
       worker_token, "upgrade", worker.id, worker.channel.sock.take_error());
-      self.poll.register(&worker.channel.sock, Token(worker_token),
-        Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
-        PollOpt::edge()).unwrap();
+      self.poll.registry().register(&mut worker.channel.sock, Token(worker_token),
+        Interest::READABLE | Interest::WRITABLE).unwrap();
       worker.token = Some(Token(worker_token));
 
       worker
@@ -949,8 +947,8 @@ impl CommandServer {
     } = upgrade_data;
 
     debug!("listener is: {}", command);
-    let listener = unsafe { UnixListener::from_raw_fd(command) };
-    poll.register(&listener, Token(0), Ready::readable(), PollOpt::edge() | PollOpt::oneshot()).expect("should register listener correctly");
+    let mut listener = unsafe { UnixListener::from_raw_fd(command) };
+    poll.registry().register(&mut listener, Token(0), Interest::READABLE | Interest::WRITABLE).expect("should register listener correctly");
 
 
     let buffer_size     = config.command_buffer_size;
@@ -961,11 +959,10 @@ impl CommandServer {
         return None;
       }
 
-      let stream = unsafe { UnixStream::from_raw_fd(serialized.fd) };
+      let mut stream = unsafe { UnixStream::from_raw_fd(serialized.fd) };
       if let Some(token) = serialized.token {
-        let _register = poll.register(&stream, Token(token),
-          Ready::readable() | Ready::writable() | UnixReady::error() | UnixReady::hup(),
-          PollOpt::edge());
+        let _register = poll.registry().register(&mut stream, Token(token),
+          Interest::READABLE | Interest::WRITABLE);
         debug!("registering: {:?}", _register);
 
         let mut channel = Channel::new(stream, buffer_size, buffer_size * 2);

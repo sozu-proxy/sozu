@@ -20,8 +20,7 @@ include = [
 name = "sozu"
 
 [dependencies]
-mio = "^0.6"
-mio-uds = "^0.6"
+mio = { version = "^0.7", features = [ "os-poll", "uds" ] }
 serde = "~1.0.2"
 serde_json = "~1.0.1"
 serde_derive = "~1.0.2"

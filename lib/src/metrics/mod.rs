@@ -148,6 +148,10 @@ impl Aggregator {
     self.network.as_ref().map(|n| &n.remote.get_ref().socket)
   }
 
+  pub fn socket_mut(&mut self) -> Option<&mut UdpSocket> {
+    self.network.as_mut().map(|n| &mut n.remote.get_mut().socket)
+  }
+
   pub fn count_add(&mut self, key: &'static str, count_value: i64) {
     self.receive_metric(key, None, None, MetricData::Count(count_value));
   }
@@ -211,7 +215,7 @@ pub struct MetricSocket {
 
 impl Write for MetricSocket {
   fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-    self.socket.send_to(buf, &self.addr)
+    self.socket.send_to(buf, self.addr)
   }
 
   fn flush(&mut self) -> io::Result<()> {
@@ -220,7 +224,7 @@ impl Write for MetricSocket {
 }
 
 pub fn udp_bind() -> UdpSocket {
-  UdpSocket::bind(&("0.0.0.0:0".parse().unwrap())).expect("could not parse address")
+  UdpSocket::bind(("0.0.0.0:0".parse().unwrap())).expect("could not parse address")
 }
 
 #[macro_export]

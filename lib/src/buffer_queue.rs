@@ -319,7 +319,7 @@ impl BufferQueue {
     }
   }
 
-  pub fn as_iovec(&self) -> Vec<&iovec::IoVec> {
+  pub fn as_ioslice(&self) -> Vec<std::io::IoSlice> {
     let mut res = Vec::new();
 
     let it = self.output_queue.iter();
@@ -336,14 +336,11 @@ impl BufferQueue {
             continue
           }
           let end = min(start+sz, length);
-          if let Some(i) = iovec::IoVec::from_bytes(&self.buffer.data()[start..end]) {
-            //println!("iovec size: {}", i.len());
-            res.push(i);
-            start = end;
-            if end == length {
-              break;
-            }
-          } else {
+          let i = std::io::IoSlice::new(&self.buffer.data()[start..end]);
+          //println!("iovec size: {}", i.len());
+          res.push(i);
+          start = end;
+          if end == length {
             break;
           }
         }
@@ -351,14 +348,11 @@ impl BufferQueue {
           if v.is_empty() {
             continue
           }
-          if let Some(i) = iovec::IoVec::from_bytes(&v[..]) {
-            //println!("got Insert with {} bytes", v.len());
-            res.push(i);
-          } else {
-            break;
-          }
+          let i = std::io::IoSlice::new(&v[..]);
+          //println!("got Insert with {} bytes", v.len());
+          res.push(i);
         },
-        &OutputElement::Splice(_sz)  => { unimplemented!("splice not used in iovec") },
+        &OutputElement::Splice(_sz)  => { unimplemented!("splice not used in ioslice") },
       }
     }
 

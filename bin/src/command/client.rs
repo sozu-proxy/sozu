@@ -1,5 +1,5 @@
 use mio::*;
-use mio_uds::UnixStream;
+use mio::net::UnixStream;
 use std::str::from_utf8;
 use std::collections::VecDeque;
 use nom::IResult;
@@ -7,7 +7,8 @@ use serde_json::from_str;
 
 use sozu_command::{
     channel::Channel,
-    command::PROTOCOL_VERSION
+    command::PROTOCOL_VERSION,
+    ready::Ready,
 };
 
 use super::{CommandRequest,CommandResponse};

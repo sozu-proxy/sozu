@@ -1,5 +1,6 @@
-use mio::{Evented,Poll,PollOpt,Ready,Token};
-use mio_uds::UnixStream;
+use mio::*;
+use mio::net::UnixStream;
+use mio::event::Source;
 use std::fmt::Debug;
 use std::iter::Iterator;
 use std::str::from_utf8;
@@ -13,6 +14,7 @@ use serde::ser::Serialize;
 use serde::de::DeserializeOwned;
 
 use buffer::growable::Buffer;
+use ready::Ready;
 
 #[derive(Debug,PartialEq)]
 pub enum ConnError {
@@ -383,26 +385,25 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Iterator for Channel<Tx,Rx
   }
 }
 
-impl<Tx,Rx> Evented for Channel<Tx,Rx> {
-  fn register(&self,
-              poll: &Poll,
+use mio::{Interest, Registry, Token};
+impl<Tx,Rx> Source for Channel<Tx,Rx> {
+  fn register(&mut self,
+              registry: &Registry,
               token: Token,
-              interest: Ready,
-              opts: PollOpt)
+              interests: Interest)
               -> io::Result<()> {
-    self.sock.register(poll, token, interest, opts)
+    self.sock.register(registry, token, interests)
   }
 
-  fn reregister(&self,
-                poll: &Poll,
+  fn reregister(&mut self,
+                registry: &Registry,
                 token: Token,
-                interest: Ready,
-                opts: PollOpt)
+                interests: Interest)
                 -> io::Result<()> {
-    self.sock.reregister(poll, token, interest, opts)
+    self.sock.reregister(registry, token, interests)
   }
 
-  fn deregister(&self, poll: &Poll) -> io::Result<()> {
-    self.sock.deregister(poll)
+  fn deregister(&mut self, registry: &Registry) -> io::Result<()> {
+    self.sock.deregister(registry)
   }
 }

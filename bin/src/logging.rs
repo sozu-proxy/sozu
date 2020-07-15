@@ -3,7 +3,7 @@ use std::io::{LineWriter,stdout};
 use std::path::Path;
 use std::fs::OpenOptions;
 use rand::{Rng,thread_rng};
-use mio_uds::UnixDatagram;
+use mio::net::UnixDatagram;
 use std::net::{TcpStream,UdpSocket,ToSocketAddrs};
 use sozu_command::logging::{Logger,LoggerBackend};
 use rand::distributions::Alphanumeric;

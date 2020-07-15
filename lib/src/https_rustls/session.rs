@@ -3,7 +3,6 @@ use std::cell::RefCell;
 use std::net::{Shutdown,SocketAddr};
 use mio::*;
 use mio::net::*;
-use mio::unix::UnixReady;
 use std::io::{ErrorKind, Read};
 use time::{Instant, Duration};
 use rusty_ulid::Ulid;
@@ -24,6 +23,7 @@ use util::UnwrapLog;
 use buffer_queue::BufferQueue;
 use server::push_event;
 use timer::TimeoutContainer;
+use sozu_command::ready::Ready;
 
 pub enum State {
   Expect(ExpectProxyProtocol<TcpStream>, ServerSession),
@@ -98,7 +98,7 @@ impl Session {
       frontend_timeout_duration,
       backend_timeout_duration,
     };
-    session.front_readiness().interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+    session.front_readiness().interest = Ready::readable() | Ready::hup() | Ready::error();
     session
   }
 
@@ -206,7 +206,7 @@ impl Session {
       gauge_add!("protocol.https", 1);
       http.front_buf = Some(buf);
       http.front_readiness = readiness;
-      http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+      http.front_readiness.interest = Ready::readable() | Ready::hup() | Ready::error();
 
       self.protocol = Some(State::Http(http));
       return true;
@@ -384,12 +384,30 @@ impl Session {
     }
   }
 
+  pub fn front_socket_mut(&mut self) -> &mut TcpStream {
+    match unwrap_msg!(self.protocol.as_mut()) {
+      State::Expect(ref mut expect,_)     => expect.front_socket_mut(),
+      State::Handshake(ref mut handshake) => &mut handshake.stream,
+      State::Http(ref mut http)           => http.front_socket_mut(),
+      State::WebSocket(ref mut pipe)      => pipe.front_socket_mut(),
+    }
+  }
+
   pub fn back_socket(&self)  -> Option<&TcpStream> {
     match unwrap_msg!(self.protocol.as_ref()) {
       State::Expect(_,_)         => None,
       State::Handshake(_)        => None,
       State::Http(ref http)      => http.back_socket(),
       State::WebSocket(ref pipe) => pipe.back_socket(),
+    }
+  }
+
+  pub fn back_socket_mut(&mut self)  -> Option<&mut TcpStream> {
+    match unwrap_msg!(self.protocol.as_mut()) {
+      State::Expect(_,_)             => None,
+      State::Handshake(_)            => None,
+      State::Http(ref mut http)      => http.back_socket_mut(),
+      State::WebSocket(ref mut pipe) => pipe.back_socket_mut(),
     }
   }
 
@@ -513,7 +531,7 @@ impl ProxySession for Session {
       }
     }
 
-    if let Err(e) = poll.deregister(self.front_socket()) {
+    if let Err(e) = poll.registry().deregister(self.front_socket_mut()) {
       error!("error deregistering front socket: {:?}", e);
     }
 
@@ -558,15 +576,15 @@ impl ProxySession for Session {
 
     let back_connected = self.back_connected();
     if back_connected != BackendConnectionStatus::NotConnected {
-      self.back_readiness().map(|r| r.event = UnixReady::from(Ready::empty()));
-      if let Some(sock) = self.back_socket() {
+      self.back_readiness().map(|r| r.event = Ready::empty());
+      if let Some(sock) = self.back_socket_mut() {
         if let Err(e) = sock.shutdown(Shutdown::Both) {
           if e.kind() != ErrorKind::NotConnected {
             error!("error shutting down backend socket: {:?}", e);
           }
         }
 
-        if let Err(e) = poll.deregister(sock) {
+        if let Err(e) = poll.registry().deregister(sock) {
           error!("error deregistering backend socket: {:?}", e);
         }
       }
@@ -588,14 +606,14 @@ impl ProxySession for Session {
   }
 
   fn process_events(&mut self, token: Token, events: Ready) {
-    trace!("token {:?} got event {}", token, super::super::unix_ready_to_string(UnixReady::from(events)));
+    trace!("token {:?} got event {}", token, super::super::ready_to_string(Ready::from(events)));
     self.last_event = Instant::now();
     self.metrics.wait_start();
 
     if self.frontend_token == token {
-      self.front_readiness().event = self.front_readiness().event | UnixReady::from(events);
+      self.front_readiness().event = self.front_readiness().event | Ready::from(events);
     } else if self.back_token() == Some(token) {
-      self.back_readiness().map(|r| r.event = r.event | UnixReady::from(events));
+      self.back_readiness().map(|r| r.event = r.event | Ready::from(events));
     }
   }
 
@@ -606,7 +624,7 @@ impl ProxySession for Session {
     self.metrics().service_start();
 
     if self.back_connected() == BackendConnectionStatus::Connecting &&
-      self.back_readiness().map(|r| r.event != UnixReady::from(Ready::empty())).unwrap_or(false) {
+      self.back_readiness().map(|r| r.event != Ready::empty()).unwrap_or(false) {
 
       self.http_mut().map(|h| h.cancel_backend_timeout());
 
@@ -635,7 +653,7 @@ impl ProxySession for Session {
           return order;
         },
         _ => {
-          self.front_readiness().event.remove(UnixReady::hup());
+          self.front_readiness().event.remove(Ready::hup());
           return order;
         }
       }
@@ -644,11 +662,11 @@ impl ProxySession for Session {
     let token = self.frontend_token;
     while counter < max_loop_iterations {
       let front_interest = self.front_readiness().interest & self.front_readiness().event;
-      let back_interest  = self.back_readiness().map(|r| r.interest & r.event).unwrap_or(UnixReady::from(Ready::empty()));
+      let back_interest  = self.back_readiness().map(|r| r.interest & r.event).unwrap_or(Ready::empty());
 
       trace!("PROXY\t{} {:?} F:{:?} B:{:?}", self.log_context(), token, self.front_readiness().clone(), self.back_readiness());
 
-      if front_interest == UnixReady::from(Ready::empty()) && back_interest == UnixReady::from(Ready::empty()) {
+      if front_interest == Ready::empty() && back_interest == Ready::empty() {
         break;
       }
 
@@ -696,7 +714,7 @@ impl ProxySession for Session {
           },
           SessionResult::Continue => {},
           _ => {
-            self.back_readiness().map(|r| r.event.remove(UnixReady::hup()));
+            self.back_readiness().map(|r| r.event.remove(Ready::hup()));
             return order;
           }
         };
@@ -704,16 +722,15 @@ impl ProxySession for Session {
 
       if front_interest.is_error() {
           error!("PROXY session {:?} front error, disconnecting", self.frontend_token);
-
-          self.front_readiness().interest = UnixReady::from(Ready::empty());
-          self.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::empty()));
-              return SessionResult::CloseSession;
+          self.front_readiness().interest = Ready::empty();
+          self.back_readiness().map(|r| r.interest  = Ready::empty());
+          return SessionResult::CloseSession;
       }
 
       if back_interest.is_error() {
           if self.back_hup() == SessionResult::CloseSession {
-              self.front_readiness().interest = UnixReady::from(Ready::empty());
-              self.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::empty()));
+              self.front_readiness().interest = Ready::empty();
+              self.back_readiness().map(|r| r.interest  = Ready::empty());
               error!("PROXY session {:?} back error, disconnecting", self.frontend_token);
               return SessionResult::CloseSession;
           }

@@ -4,7 +4,6 @@ use std::cell::RefCell;
 use std::convert::TryFrom;
 use mio::net::*;
 use mio::*;
-use mio::unix::UnixReady;
 use std::collections::{HashSet,VecDeque};
 use std::os::unix::io::{AsRawFd,FromRawFd};
 use slab::Slab;
@@ -18,6 +17,7 @@ use sozu_command::proxy::{ProxyRequestData,MessageId,ProxyResponse, ProxyEvent,
   ProxyResponseData,ProxyResponseStatus,ProxyRequest,Topic,Query,QueryAnswer,
   QueryApplicationType,TlsProvider,ListenerType,HttpsListener,QueryAnswerCertificate,
   QueryCertificateType};
+use sozu_command::ready::Ready;
 
 use {SessionResult,ConnectionError,Protocol,ProxySession,
   CloseResult,AcceptError,BackendConnectAction,ProxyConfiguration,Backend};
@@ -188,7 +188,7 @@ impl Server {
                 Some(https), None, server_config, Some(config_state), expects_initial_status)
   }
 
-  pub fn new(poll: Poll, channel: ProxyChannel, scm: ScmSocket,
+  pub fn new(poll: Poll, mut channel: ProxyChannel, scm: ScmSocket,
     sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>>,
     pool: Rc<RefCell<Pool>>,
     backends: Rc<RefCell<BackendMap>>,
@@ -203,16 +203,15 @@ impl Server {
       // initializing feature flags
     });
 
-    poll.register(
-      &channel,
+    poll.registry().register(
+      &mut channel,
       Token(0),
-      Ready::readable() | Ready::writable() | Ready::from(UnixReady::hup() | UnixReady::error()),
-      PollOpt::edge()
+      Interest::READABLE | Interest::WRITABLE
     ).expect("should register the channel");
 
     METRICS.with(|metrics| {
-      if let Some(sock) = (*metrics.borrow()).socket() {
-        poll.register(sock, Token(2), Ready::writable(), PollOpt::edge()).expect("should register the metrics socket");
+      if let Some(sock) = (*metrics.borrow_mut()).socket_mut() {
+        poll.registry().register(sock, Token(2), Interest::WRITABLE).expect("should register the metrics socket");
       }
     });
 
@@ -325,16 +324,16 @@ impl Server {
 
       for event in events.iter() {
         if event.token() == Token(0) {
-          let kind = event.readiness();
-          if UnixReady::from(kind).is_error() {
+          if event.is_error() {
             error!("error reading from command channel");
             continue;
           }
-          if UnixReady::from(kind).is_hup() {
+          if event.is_read_closed() || event.is_write_closed() {
             error!("command channel was closed");
             continue;
           }
-          self.channel.handle_events(kind);
+          let ready = Ready::from(event);
+          self.channel.handle_events(ready);
 
           // loop here because iterations has borrow issues
           loop {
@@ -409,7 +408,7 @@ impl Server {
             (*metrics.borrow_mut()).writable();
           });
         } else {
-          self.ready(event.token(), event.readiness());
+          self.ready(event.token(), Ready::from(event));
         }
       }
 
@@ -725,8 +724,8 @@ impl Server {
           if deactivate.proxy == ListenerType::HTTP {
             debug!("{} deactivate http listener {:?}", id, deactivate);
             let status = match self.http.give_back_listener(deactivate.front) {
-              Some((token, listener)) => {
-                  if let Err(e) = self.poll.deregister(&listener) {
+              Some((token, mut listener)) => {
+                  if let Err(e) = self.poll.registry().deregister(&mut listener) {
                       error!("error deregistering HTTP listen socket({:?}): {:?}", deactivate, e);
                   }
                   if self.sessions.contains(token.0) {
@@ -838,8 +837,8 @@ impl Server {
           if deactivate.proxy == ListenerType::HTTPS {
             debug!("{} deactivate https listener {:?}", id, deactivate);
             let status = match self.https.give_back_listener(deactivate.front) {
-              Some((token, listener)) => {
-                  if let Err(e) = self.poll.deregister(&listener) {
+              Some((token, mut listener)) => {
+                  if let Err(e) = self.poll.registry().deregister(&mut listener) {
                       error!("error deregistering HTTPS listen socket({:?}): {:?}", deactivate, e);
                   }
                   if self.sessions.contains(token.0) {
@@ -950,8 +949,8 @@ impl Server {
           if deactivate.proxy == ListenerType::TCP {
             debug!("{} deactivate tcp listener {:?}", id, deactivate);
             let status = match self.tcp.give_back_listener(deactivate.front) {
-              Some((token, listener)) => {
-                  if let Err(e) = self.poll.deregister(&listener) {
+              Some((token, mut listener)) => {
+                  if let Err(e) = self.poll.registry().deregister(&mut listener) {
                       error!("error deregistering TCP listen socket({:?}): {:?}", deactivate, e);
                   }
                   if self.sessions.contains(token.0) {
@@ -994,23 +993,23 @@ impl Server {
   pub fn return_listen_sockets(&mut self) {
     self.scm.set_blocking(false);
 
-    let http_listeners = self.http.give_back_listeners();
-    for &(_, ref sock) in http_listeners.iter() {
-      if let Err(e) = self.poll.deregister(sock) {
+    let mut http_listeners = self.http.give_back_listeners();
+    for &mut (_, ref mut sock) in http_listeners.iter_mut() {
+      if let Err(e) = self.poll.registry().deregister(sock) {
         error!("error deregistering HTTP listen socket({:?}): {:?}", sock, e);
       }
     }
 
-    let https_listeners = self.https.give_back_listeners();
-    for &(_, ref sock) in https_listeners.iter() {
-      if let Err(e) = self.poll.deregister(sock) {
+    let mut https_listeners = self.https.give_back_listeners();
+    for &mut (_, ref mut sock) in https_listeners.iter_mut() {
+      if let Err(e) = self.poll.registry().deregister(sock) {
         error!("error deregistering HTTPS listen socket({:?}): {:?}", sock, e);
       }
     }
 
-    let tcp_listeners = self.tcp.give_back_listeners();
-    for &(_, ref sock) in tcp_listeners.iter() {
-      if let Err(e) = self.poll.deregister(sock) {
+    let mut tcp_listeners = self.tcp.give_back_listeners();
+    for &mut (_, ref mut sock) in tcp_listeners.iter_mut() {
+      if let Err(e) = self.poll.registry().deregister(sock) {
         error!("error deregistering TCP listen socket({:?}): {:?}", sock, e);
       }
     }
@@ -1423,7 +1422,7 @@ impl Server {
             return;
           }
 
-          if UnixReady::from(events).is_hup() {
+          if events.is_hup() {
             error!("should not happen: server {:?} closed", token);
             return;
           }

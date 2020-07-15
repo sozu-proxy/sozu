@@ -2,8 +2,7 @@ use std::io::{Write, ErrorKind};
 use std::io::Read;
 
 use mio::*;
-use mio::tcp::TcpStream;
-use mio::unix::UnixReady;
+use mio::net::TcpStream;
 use rusty_ulid::Ulid;
 use {
   SessionMetrics,
@@ -15,6 +14,7 @@ use {
   pool::Checkout,
 };
 use Protocol;
+use sozu_command::ready::Ready;
 
 use super::header::*;
 
@@ -41,12 +41,12 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
       frontend_token,
       backend_token:  None,
       front_readiness: Readiness {
-        interest: UnixReady::hup() | UnixReady::error(),
-        event:    UnixReady::from(Ready::empty()),
+        interest: Ready::hup() | Ready::error(),
+        event: Ready::empty(),
       },
       back_readiness: Readiness {
-        interest: UnixReady::hup() | UnixReady::error(),
-        event:    UnixReady::from(Ready::empty()),
+        interest: Ready::hup() | Ready::error(),
+        event: Ready::empty(),
       },
       cursor_header: 0,
     }
@@ -105,6 +105,10 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
     self.frontend.socket_ref()
   }
 
+  pub fn front_socket_mut(&mut self) -> &mut TcpStream {
+    self.frontend.socket_mut()
+  }
+
   pub fn back_socket(&self) -> Option<&TcpStream> {
     self.backend.as_ref()
   }
@@ -127,7 +131,7 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
 
   pub fn set_back_connected(&mut self, status: BackendConnectionStatus) {
     if status == BackendConnectionStatus::Connected {
-      self.back_readiness.interest.insert(UnixReady::from(Ready::writable()));
+      self.back_readiness.interest.insert(Ready::writable());
     }
   }
 
@@ -160,8 +164,8 @@ impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
     pipe.front_readiness = self.front_readiness;
     pipe.back_readiness  = self.back_readiness;
 
-    pipe.front_readiness.interest.insert(UnixReady::from(Ready::readable()));
-    pipe.back_readiness.interest.insert(UnixReady::from(Ready::readable()));
+    pipe.front_readiness.interest.insert(Ready::readable());
+    pipe.back_readiness.interest.insert(Ready::readable());
 
     if let Some(back_token) = self.backend_token {
       pipe.set_back_token(back_token);
@@ -202,7 +206,7 @@ mod send_test {
   // Get connection from the session and connect to the backend
   // When connections are etablish we send the proxy protocol header
   fn start_middleware(addr_client: SocketAddr, addr_backend: SocketAddr, barrier: Arc<Barrier>) {
-    let listener = TcpListener::bind(&addr_client).expect("could not accept session connection");
+    let listener = TcpListener::bind(addr_client).expect("could not accept session connection");
 
     let client_stream;
     barrier.wait();

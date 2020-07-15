@@ -1,6 +1,5 @@
 use mio::*;
 use mio::net::*;
-use mio::unix::UnixReady;
 use rusty_ulid::Ulid;
 use {SessionResult,Readiness};
 use protocol::ProtocolResult;
@@ -8,6 +7,7 @@ use openssl::ssl::{HandshakeError,MidHandshakeSslStream,Ssl,SslStream,NameType,S
 use std::net::SocketAddr;
 use LogDuration;
 use SessionMetrics;
+use sozu_command::ready::Ready;
 
 pub enum TlsState {
   Initial,
@@ -36,8 +36,8 @@ impl TlsHandshake {
       stream:         None,
       state:          TlsState::Initial,
       readiness:      Readiness {
-                        interest: UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
-                        event:    UnixReady::from(Ready::empty()),
+                        interest: Ready::readable() | Ready::hup() | Ready::error(),
+                        event:    Ready::empty(),
       },
       request_id,
       address,
@@ -146,6 +146,21 @@ impl TlsHandshake {
           },
           &HandshakeError::Failure(ref mid) | &HandshakeError::WouldBlock(ref mid) => Some(mid.get_ref())
         }
+      }
+    }
+  }
+
+  pub fn socket_mut(&mut self) -> Option<&mut TcpStream> {
+    match self.state {
+      TlsState::Initial => self.front.as_mut(),
+      TlsState::Handshake => self.mid.as_mut().map(|mid| mid.get_mut()),
+      TlsState::Established => self.stream.as_mut().map(|stream| stream.get_mut()),
+      TlsState::Error(HandshakeError::Failure(ref mut mid)) |
+      TlsState::Error(HandshakeError::WouldBlock(ref mut mid)) => {
+          Some(mid.get_mut())
+      },
+      TlsState::Error(HandshakeError::SetupFailure(_)) => {
+          self.front.as_mut().or(self.mid.as_mut().map(|mid| mid.get_mut()))
       }
     }
   }

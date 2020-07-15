@@ -2,8 +2,7 @@ use std::io::Write;
 use std::io::Read;
 
 use mio::*;
-use mio::tcp::TcpStream;
-use mio::unix::UnixReady;
+use mio::net::TcpStream;
 use rusty_ulid::Ulid;
 use nom::{Err,Offset};
 use SessionResult;
@@ -15,6 +14,7 @@ use protocol::pipe::Pipe;
 use super::parser::parse_v2_header;
 use pool::Checkout;
 use Protocol;
+use sozu_command::ready::Ready;
 
 pub struct RelayProxyProtocol<Front:SocketHandler> {
   pub header_size:    Option<usize>,
@@ -42,12 +42,12 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
       backend_token:  None,
       front_buf,
       front_readiness: Readiness {
-        interest: UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error(),
-        event:    UnixReady::from(Ready::empty()),
+        interest: Ready::readable() | Ready::hup() | Ready::error(),
+        event: Ready::empty(),
       },
       back_readiness: Readiness {
-        interest: UnixReady::hup() | UnixReady::error(),
-        event:    UnixReady::from(Ready::empty()),
+        interest: Ready::hup() | Ready::error(),
+        event: Ready::empty(),
       },
       cursor_header: 0,
     }
@@ -138,6 +138,10 @@ impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
 
   pub fn front_socket(&self) -> &TcpStream {
     self.frontend.socket_ref()
+  }
+
+  pub fn front_socket_mut(&mut self) -> &mut TcpStream {
+    self.frontend.socket_mut()
   }
 
   pub fn back_socket(&self) -> Option<&TcpStream> {

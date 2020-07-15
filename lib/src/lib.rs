@@ -167,7 +167,6 @@ extern crate rusty_ulid;
 extern crate net2;
 extern crate libc;
 extern crate slab;
-extern crate mio_uds;
 extern crate hdrhistogram;
 #[macro_use] extern crate sozu_command_lib as sozu_command;
 extern crate idna;
@@ -179,7 +178,6 @@ extern crate lazycell;
 extern crate quickcheck;
 #[cfg(feature = "use-openssl")]
 extern crate openssl_sys;
-extern crate iovec;
 extern crate foreign_types_shared;
 
 #[macro_use] pub mod util;
@@ -208,8 +206,7 @@ pub mod https_openssl;
 
 pub mod https_rustls;
 
-use mio::{Poll,Ready,Token};
-use mio::unix::UnixReady;
+use mio::{Poll, Token};
 use mio::net::TcpStream;
 use std::fmt;
 use std::str;
@@ -219,6 +216,7 @@ use std::cell::RefCell;
 use time::{Instant,Duration};
 
 use sozu_command::proxy::{ProxyRequest,ProxyResponse,LoadBalancingParams,ProxyEvent};
+use sozu_command::ready::Ready;
 
 use self::retry::RetryPolicy;
 
@@ -477,13 +475,13 @@ impl Backend {
     }
   }
 
-  pub fn try_connect(&mut self) -> Result<mio::tcp::TcpStream, ConnectionError> {
+  pub fn try_connect(&mut self) -> Result<mio::net::TcpStream, ConnectionError> {
     if self.status != BackendStatus::Normal {
       return Err(ConnectionError::NoBackendAvailable);
     }
 
     //FIXME: what happens if the connect() call fails with EINPROGRESS?
-    let conn = mio::tcp::TcpStream::connect(&self.address).map_err(|_| ConnectionError::NoBackendAvailable);
+    let conn = mio::net::TcpStream::connect(self.address).map_err(|_| ConnectionError::NoBackendAvailable);
     if conn.is_ok() {
       //self.retry_policy.succeed();
       self.inc_connections();
@@ -507,25 +505,25 @@ impl std::ops::Drop for Backend {
 
 #[derive(Clone)]
 pub struct Readiness {
-  pub event:    UnixReady,
-  pub interest: UnixReady,
+  pub event:    Ready,
+  pub interest: Ready,
 }
 
 impl Readiness {
   pub fn new() -> Readiness {
     Readiness {
-      event:    UnixReady::from(Ready::empty()),
-      interest: UnixReady::from(Ready::empty()),
+      event:    Ready::empty(),
+      interest: Ready::empty(),
     }
   }
 
   pub fn reset(&mut self) {
-    self.event =  UnixReady::from(Ready::empty());
-    self.interest  = UnixReady::from(Ready::empty());
+    self.event = Ready::empty();
+    self.interest = Ready::empty();
   }
 }
 
-pub fn display_unix_ready(s: &mut [u8], readiness: UnixReady) {
+pub fn display_ready(s: &mut [u8], readiness: Ready) {
   if readiness.is_readable() {
     s[0] = b'R';
   }
@@ -540,9 +538,9 @@ pub fn display_unix_ready(s: &mut [u8], readiness: UnixReady) {
   }
 }
 
-pub fn unix_ready_to_string(readiness: UnixReady) -> String {
+pub fn ready_to_string(readiness: Ready) -> String {
   let s = &mut [b'-'; 4];
-  display_unix_ready(s, readiness);
+  display_ready(s, readiness);
   String::from_utf8(s.to_vec()).unwrap()
 }
 
@@ -553,9 +551,9 @@ impl fmt::Debug for Readiness {
     let r = &mut [b'-'; 4];
     let mixed = &mut [b'-'; 4];
 
-    display_unix_ready(i, self.interest);
-    display_unix_ready(r, self.event);
-    display_unix_ready(mixed, self.interest & self.event);
+    display_ready(i, self.interest);
+    display_ready(r, self.event);
+    display_ready(mixed, self.interest & self.event);
 
     write!(f, "Readiness {{ interest: {}, readiness: {}, mixed: {} }}",
       str::from_utf8(i).unwrap(),

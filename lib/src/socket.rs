@@ -1,6 +1,6 @@
 use std::io::{self,ErrorKind,Read,Write};
 use std::net::SocketAddr;
-use mio::tcp::{TcpListener,TcpStream};
+use mio::net::{TcpListener,TcpStream};
 use rustls::{ServerSession, Session, ProtocolVersion};
 use net2::TcpBuilder;
 use net2::unix::UnixTcpBuilderExt;
@@ -29,11 +29,12 @@ pub enum TransportProtocol {
 pub trait SocketHandler {
   fn socket_read(&mut self,  buf: &mut[u8]) -> (usize, SocketResult);
   fn socket_write(&mut self, buf: &[u8])    -> (usize, SocketResult);
-  fn socket_write_vectored(&mut self,  buf: &[&iovec::IoVec]) -> (usize, SocketResult) {
+  fn socket_write_vectored(&mut self,  buf: &[std::io::IoSlice]) -> (usize, SocketResult) {
     unimplemented!()
   }
   fn has_vectored_writes(&self) -> bool { false }
   fn socket_ref(&self) -> &TcpStream;
+  fn socket_mut(&mut self) -> &mut TcpStream;
   fn protocol(&self) -> TransportProtocol;
   fn read_error(&self);
   fn write_error(&self);
@@ -89,8 +90,8 @@ impl SocketHandler for TcpStream {
     }
   }
 
-  fn socket_write_vectored(&mut self,  bufs: &[&iovec::IoVec]) -> (usize, SocketResult) {
-    match self.write_bufs(bufs) {
+  fn socket_write_vectored(&mut self,  bufs: &[std::io::IoSlice]) -> (usize, SocketResult) {
+    match self.write_vectored(bufs) {
       Ok(0)  => return (0, SocketResult::Continue),
       Ok(sz) => return (sz, SocketResult::Continue),
       Err(e) => match e.kind() {
@@ -112,6 +113,8 @@ impl SocketHandler for TcpStream {
   fn has_vectored_writes(&self) -> bool { true }
 
   fn socket_ref(&self) -> &TcpStream { self }
+
+  fn socket_mut(&mut self) -> &mut TcpStream { self }
 
   fn protocol(&self) -> TransportProtocol {
     TransportProtocol::Tcp
@@ -195,6 +198,8 @@ impl SocketHandler for SslStream<TcpStream> {
   }
 
   fn socket_ref(&self) -> &TcpStream { self.get_ref() }
+
+  fn socket_mut(&mut self) -> &mut TcpStream { self.get_mut() }
 
   fn protocol(&self) -> TransportProtocol {
     self.ssl().version2().map(|version| match version {
@@ -379,6 +384,8 @@ impl SocketHandler for FrontRustls {
 
   fn socket_ref(&self) -> &TcpStream { &self.stream }
 
+  fn socket_mut(&mut self) -> &mut TcpStream { &mut self.stream }
+
   fn protocol(&self) -> TransportProtocol {
     self.session.get_protocol_version().map(|version| match version {
       ProtocolVersion::SSLv2 => TransportProtocol::Ssl2,
@@ -418,7 +425,10 @@ pub fn server_bind(addr: &SocketAddr) -> io::Result<TcpListener> {
 
   // listen
   // FIXME: make the backlog configurable?
-  let listener = sock.listen(1024)?;
-  TcpListener::from_std(listener)
+  let mut listener = sock.listen(1024)?;
+
+  listener.set_nonblocking(true)?;
+
+  Ok(TcpListener::from_std(listener))
 }
 
