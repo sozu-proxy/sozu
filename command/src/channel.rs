@@ -127,8 +127,11 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
 
       match self.sock.read(self.front_buf.space()) {
         Ok(0) => {
+          self.interest  = Ready::empty();
           self.readiness.remove(Ready::readable());
-          break;
+          //error!("read() returned 0 (count={})", count);
+          self.readiness.insert(Ready::hup());
+          return Err(ConnError::SocketError);
         },
         Err(e) => {
           match e.kind() {
@@ -170,7 +173,10 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
 
       match self.sock.write(self.back_buf.data()) {
         Ok(0) => {
-          break;
+          //error!("write() returned 0");
+          self.interest  = Ready::empty();
+          self.readiness.insert(Ready::hup());
+          return Err(ConnError::SocketError);
         },
         Ok(r) => {
           count += r;
@@ -263,6 +269,7 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
 
         match self.sock.read(self.front_buf.space()) {
           Ok(0) => {
+              return None;
           },
           Err(_) => { return None; },
           Ok(r) => {
@@ -349,6 +356,9 @@ impl<Tx: Debug+Serialize, Rx: Debug+DeserializeOwned> Channel<Tx,Rx> {
       }
 
       match self.sock.write(self.back_buf.data()) {
+        Ok(0) => {
+            return false;
+        },
         Ok(r) => {
           self.back_buf.consume(r);
         },

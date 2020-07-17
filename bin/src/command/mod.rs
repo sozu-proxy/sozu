@@ -510,8 +510,8 @@ impl CommandServer {
           }
 
           if self.clients[conn_token.0].channel.readiness().is_readable() {
-            let _ = self.clients[conn_token.0].channel.readable().map_err(|e| {
-              error!("could not read from client socket: {:?}", e);
+            let _ = self.clients[conn_token.0].channel.readable().map_err(|_e| {
+              //error!("could not read from client socket: {:?}", e);
             });
 
             loop {
@@ -526,6 +526,21 @@ impl CommandServer {
             self.run_executor();
           }
         }
+      }
+
+      // test again if the client was closed
+      if self.clients[conn_token.0].channel.readiness.is_hup() {
+        let _ = self.poll.registry().deregister(&mut self.clients[conn_token.0].channel.sock).map_err(|e| {
+          error!("could not unregister client socket: {:?}", e);
+        });
+
+        self.clients.remove(conn_token.0);
+
+        if let Some(pos) = self.event_subscribers.iter().position(|t| t == &conn_token) {
+          let _ = self.event_subscribers.remove(pos);
+        }
+
+        trace!("closed client [{}]", conn_token.0);
       }
     }
   }
