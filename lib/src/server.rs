@@ -1018,6 +1018,7 @@ impl Server {
     // do not be ready to accept right away, wait until we get back to 10% capacity
     if !self.can_accept && self.nb_connections < self.max_connections * 90 / 100 {
       debug!("nb_connections = {}, max_connections = {}, starting to accept again", self.nb_connections, self.max_connections);
+      gauge!("accept_queue.backpressure", 0);
       self.can_accept = true;
     }
   }
@@ -1025,6 +1026,7 @@ impl Server {
   pub fn create_session_tcp(&mut self, token: ListenToken, socket: TcpStream, delay: time::Duration) -> bool {
     if self.nb_connections == self.max_connections {
       error!("max number of session connection reached, flushing the accept queue");
+      gauge!("accept_queue.backpressure", 1);
       self.can_accept = false;
       return false;
     }
@@ -1034,6 +1036,7 @@ impl Server {
       None => {
         error!("not enough memory to accept another session, flushing the accept queue");
         error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
+        gauge!("accept_queue.backpressure", 1);
         self.can_accept = false;
 
         return false;
@@ -1065,6 +1068,7 @@ impl Server {
           },
           Err(AcceptError::TooManySessions) => {
             error!("max number of session connection reached, flushing the accept queue");
+            gauge!("accept_queue.backpressure", 1);
             self.can_accept = false;
             return false;
           }
@@ -1079,6 +1083,7 @@ impl Server {
   pub fn create_session_http(&mut self, token: ListenToken, socket: TcpStream, delay: time::Duration) -> bool {
     if self.nb_connections == self.max_connections {
       error!("max number of session connection reached, flushing the accept queue");
+      gauge!("accept_queue.backpressure", 1);
       self.can_accept = false;
       return false;
     }
@@ -1088,6 +1093,7 @@ impl Server {
       None => {
         error!("not enough memory to accept another session, flushing the accept queue");
         error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
+        gauge!("accept_queue.backpressure", 1);
         self.can_accept = false;
         false
       },
@@ -1112,6 +1118,7 @@ impl Server {
           },
           Err(AcceptError::TooManySessions) => {
             error!("max number of session connection reached, flushing the accept queue");
+            gauge!("accept_queue.backpressure", 1);
             self.can_accept = false;
             false
           }
@@ -1123,6 +1130,7 @@ impl Server {
   pub fn create_session_https(&mut self, token: ListenToken, socket: TcpStream, delay: time::Duration) -> bool {
     if self.nb_connections == self.max_connections {
       error!("max number of session connection reached, flushing the accept queue");
+      gauge!("accept_queue.backpressure", 1);
       self.can_accept = false;
       return false;
     }
@@ -1132,6 +1140,7 @@ impl Server {
       None => {
         error!("not enough memory to accept another session, flushing the accept queue");
         error!("nb_connections: {}, max_connections: {}", self.nb_connections, self.max_connections);
+        gauge!("accept_queue.backpressure", 1);
         self.can_accept = false;
         false
       },
@@ -1156,6 +1165,7 @@ impl Server {
           },
           Err(AcceptError::TooManySessions) => {
             error!("max number of session connection reached, flushing the accept queue");
+            gauge!("accept_queue.backpressure", 1);
             self.can_accept = false;
             false
           }
