@@ -9,6 +9,7 @@ use std::io::{Seek,SeekFrom};
 use nix::unistd::*;
 use serde_json;
 use tempfile::tempfile;
+use blocking::block_on;
 
 use sozu_command::config::Config;
 use sozu_command::command::RunState;
@@ -25,7 +26,6 @@ pub struct SerializedWorker {
   pub pid:        i32,
   pub id:         u32,
   pub run_state:  RunState,
-  pub token:      Option<usize>,
   pub queue:      Vec<ProxyRequest>,
   pub scm:        i32,
 }
@@ -33,11 +33,11 @@ pub struct SerializedWorker {
 impl SerializedWorker {
   pub fn from_worker(worker: &Worker) -> SerializedWorker {
     SerializedWorker {
-      fd:         worker.channel.sock.as_raw_fd(),
+      fd:         worker.fd,
       pid:        worker.pid,
       id:         worker.id,
       run_state:  worker.run_state.clone(),
-      token:      worker.token.clone().map(|Token(t)| t),
+      //token:      worker.token.clone().map(|Token(t)| t),
       queue:      worker.queue.clone().into(),
       scm:        worker.scm.raw_fd(),
     }
@@ -52,7 +52,7 @@ pub struct UpgradeData {
   pub workers:     Vec<SerializedWorker>,
   pub state:       ConfigState,
   pub next_id:     u32,
-  pub token_count: usize,
+  //pub token_count: usize,
 }
 
 pub fn start_new_main_process(executable_path: String, upgrade_data: UpgradeData) -> (pid_t, Channel<(),bool>) {
@@ -128,7 +128,9 @@ pub fn begin_new_main_process(fd: i32, upgrade_fd: i32, command_buffer_size: usi
   match util::write_pid_file(&config) {
     Ok(()) => {
       command.write_message(&true);
-      server.run();
+      block_on(async {
+        server.run().await;
+      });
       info!("main process stopped");
     },
     Err(e) => {

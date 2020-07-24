@@ -14,13 +14,14 @@ use regex::Regex;
 #[global_allocator]
 static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+#[macro_use]
+mod logging;
+
 mod command;
 mod worker;
-mod logging;
 mod upgrade;
-mod util;
 mod cli;
-
+mod util;
 
 use std::panic;
 use sozu_command::config::Config;

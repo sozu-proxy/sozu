@@ -1,295 +1,332 @@
-use std::fs;
-use std::str;
-use std::process;
-use std::io::{self,Read,Write};
-use std::convert::Into;
-use std::thread::sleep;
-use std::time::Duration;
-use std::collections::{HashMap,BTreeMap};
-use std::os::unix::io::{AsRawFd,FromRawFd};
-use slab::Slab;
+use futures::channel::mpsc::*;
+use futures::{SinkExt, StreamExt};
+use nom::{Err, HexDisplay, IResult, Offset};
 use serde_json;
-use mio::{Poll, Token, Interest};
-use mio::net::*;
-use nom::{Err,HexDisplay,Offset};
+use std::collections::{BTreeMap, HashSet};
+use std::fs;
+use std::io::{self, Read, Write};
+use std::os::unix::io::{FromRawFd, IntoRawFd};
+use std::os::unix::net::UnixStream;
+use std::time::Duration;
 
-use sozu_command::buffer::fixed::Buffer;
-use sozu_command::channel::Channel;
-use sozu_command::scm_socket::{Listeners, ScmSocket};
-use sozu_command::proxy::{ProxyRequestData, ProxyRequest, Query, QueryAnswer, QueryApplicationType,
-MetricsData, AggregatedMetricsData, ProxyResponseData, HttpFront, TcpFront, ProxyResponseStatus};
-use sozu_command::command::{CommandResponseData,CommandRequestData,CommandRequest,CommandResponse,CommandStatus,RunState,WorkerInfo};
-use sozu_command::state::{ConfigState, get_application_ids_by_domain};
-use sozu_command::config::Config;
-use sozu_command::logging;
+use async_io::Async;
+use smol::Task;
+
 use sozu::metrics::METRICS;
-use sozu_command::ready::Ready;
+use sozu_command::buffer::fixed::Buffer;
+use sozu_command::command::{
+    CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
+    RunState, WorkerInfo,
+};
+use sozu_command::logging;
+use sozu_command::proxy::{
+    AggregatedMetricsData, HttpFront, MetricsData, ProxyRequestData, ProxyResponseData,
+    ProxyResponseStatus, Query, QueryAnswer, QueryApplicationType, TcpFront,
+    ProxyRequest,
+};
+use sozu_command::scm_socket::Listeners;
+use sozu_command::state::get_application_ids_by_domain;
+use sozu_command_lib::config::Config;
 
-use super::{CommandServer,FrontToken,Worker};
-use super::client::parse;
-use crate::worker::{start_worker,get_executable_path};
-use crate::upgrade::{start_new_main_process,SerializedWorker,UpgradeData};
-use crate::util;
-
-use super::executor;
-use futures::future::join_all;
-use futures::Future;
+use super::{CommandMessage, CommandServer};
+use crate::upgrade::start_new_main_process;
+use crate::worker::start_worker;
 
 impl CommandServer {
-  pub fn handle_client_message(&mut self, token: FrontToken, message: &CommandRequest) {
-    //info!("handle_client_message: front token = {:?}, message = {:#?}", token, message);
-    let config_command = message.data.clone();
-    match config_command {
-      CommandRequestData::SaveState { path } => {
-        self.save_state(token, &message.id, &path);
-      },
-      CommandRequestData::DumpState => {
-        self.dump_state(token, &message.id);
-      },
-      CommandRequestData::LoadState { path } => {
-        self.load_state(Some(token), &message.id, &path);
-        //self.answer_success(token, message.id.as_str(), "loaded the configuration", None);
-      },
-      CommandRequestData::ListWorkers => {
-        self.list_workers(token, &message.id);
-      },
-      CommandRequestData::LaunchWorker(tag) => {
-        self.launch_worker(token, message, &tag);
-      },
-      CommandRequestData::UpgradeMain => {
-        self.upgrade_main(token, &message.id);
-      },
-      CommandRequestData::Proxy(order) => {
-        match order {
-          ProxyRequestData::Metrics => self.metrics(token, &message.id),
-          ProxyRequestData::Query(query) => self.query(token, &message.id, query),
-          order => {
-            self.worker_order(token, &message.id, order, message.worker_id);
-          }
+    pub async fn handle_client_message(
+        &mut self,
+        client_id: String,
+        request: sozu_command::command::CommandRequest,
+    ) {
+        match request.data {
+            CommandRequestData::SaveState { path } => {
+                self.save_state(client_id, &request.id, &path).await;
+            }
+            CommandRequestData::DumpState => {
+                self.dump_state(client_id, &request.id).await;
+            }
+            CommandRequestData::ListWorkers => {
+                self.list_workers(client_id, request.id).await;
+            }
+            CommandRequestData::LoadState { path } => {
+                self.load_state(Some(client_id), request.id, &path).await;
+            }
+            CommandRequestData::LaunchWorker(tag) => {
+                self.launch_worker(client_id, request.id, &tag).await;
+            }
+            CommandRequestData::UpgradeMain => {
+                self.upgrade_main(client_id, request.id).await;
+            }
+            CommandRequestData::UpgradeWorker(worker_id) => {
+                self.upgrade_worker(client_id, request.id, worker_id).await;
+            }
+
+            CommandRequestData::Proxy(proxy_request) => match proxy_request {
+                ProxyRequestData::Metrics => self.metrics(client_id, request.id).await,
+                ProxyRequestData::Query(query) => self.query(client_id, request.id, query).await,
+                order => {
+                    self.worker_order(client_id, request.id, order, request.worker_id)
+                        .await;
+                }
+            },
+            CommandRequestData::SubscribeEvents => {
+                self.event_subscribers.insert(client_id);
+            }
+            CommandRequestData::ReloadConfiguration { path }=> {
+                self.reload_configuration(Some(client_id), request.id, path).await;
+            },
+            r => error!("unknown request: {:?}", r),
+        }
+    }
+
+    pub async fn save_state(&mut self, client_id: String, message_id: &str, path: &str) {
+        if let Ok(mut f) = fs::File::create(&path) {
+            let res = self.save_state_to_file(&mut f);
+
+            match res {
+                Ok(counter) => {
+                    info!("wrote {} commands to {}", counter, path);
+                    self.answer_success(
+                        client_id,
+                        message_id,
+                        format!("saved {} config messages to {}", counter, path),
+                        None,
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    error!("failed writing state to file: {:?}", e);
+                    self.answer_error(client_id, message_id, "could not save state to file", None)
+                        .await;
+                }
+            }
+        } else {
+            error!("could not open file: {}", &path);
+            self.answer_error(client_id, message_id, "could not open file", None)
+                .await;
+        }
+    }
+
+    pub fn save_state_to_file(&mut self, f: &mut fs::File) -> io::Result<usize> {
+        let mut counter = 0usize;
+        let orders = self.state.generate_orders();
+
+        let res: io::Result<usize> = (move || {
+            for command in orders {
+                let message = CommandRequest::new(
+                    format!("SAVE-{}", counter),
+                    CommandRequestData::Proxy(command),
+                    None,
+                );
+
+                f.write_all(
+                    &serde_json::to_string(&message)
+                        .map(|s| s.into_bytes())
+                        .unwrap_or(vec![]),
+                )?;
+                f.write_all(&b"\n\0"[..])?;
+
+                if counter % 1000 == 0 {
+                    info!("writing command {}", counter);
+                    f.sync_all()?;
+                }
+                counter += 1;
+            }
+            f.sync_all()?;
+
+            Ok(counter)
+        })();
+
+        res
+    }
+
+    pub async fn dump_state(&mut self, client_id: String, message_id: &str) {
+        let state = self.state.clone();
+        self.answer_success(
+            client_id,
+            message_id,
+            String::new(),
+            Some(CommandResponseData::State(state)),
+        )
+        .await;
+    }
+
+    pub async fn load_state(&mut self, client_id: Option<String>, message_id: String, path: &str) {
+        let mut file = match fs::File::open(&path) {
+            Err(e) => {
+                error!("cannot open file at path '{}': {:?}", path, e);
+                if let Some(id) = client_id {
+                    self.answer_error(
+                        id,
+                        message_id,
+                        format!("cannot open file at path '{}': {:?}", path, e),
+                        None,
+                    )
+                    .await;
+                }
+                return;
+            }
+            Ok(file) => file,
         };
-      },
-      CommandRequestData::UpgradeWorker(id) => {
-        self.upgrade_worker(token, &message.id, id);
-      },
-      CommandRequestData::SubscribeEvents => {
-        self.event_subscribers.push(token);
-      },
-      CommandRequestData::ReloadConfiguration { path }=> {
-        self.reload_configuration(Some(token), &message.id, path);
-      },
-    }
-  }
 
-  pub fn answer_success<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<CommandResponseData>)
-    where T: Clone+Into<String>,
-          U: Clone+Into<String> {
-    trace!("answer_success for front token {:?} id {}, message {:#?} data {:#?}", token, id.clone().into(), message.clone().into(), data);
-    self.clients[token.0].push_message(CommandResponse::new(
-      id.into(),
-      CommandStatus::Ok,
-      message.into(),
-      data
-    ));
-  }
-
-  pub fn answer_error<T,U>(&mut self, token: FrontToken, id: T, message: U, data: Option<CommandResponseData>)
-    where T: Clone+Into<String>,
-          U: Clone+Into<String> {
-    trace!("answer_error for front token {:?} id {}, message {:#?} data {:#?}", token, id.clone().into(), message.clone().into(), data);
-    self.clients[token.0].push_message(CommandResponse::new(
-      id.into(),
-      CommandStatus::Error,
-      message.into(),
-      data
-    ));
-
-  }
-
-  pub fn save_state(&mut self, token: FrontToken, message_id: &str, path: &str) {
-    if let Ok(mut f) = fs::File::create(&path) {
-
-      let res = self.save_state_to_file(&mut f);
-
-      match res {
-        Ok(counter) => {
-          info!("wrote {} commands to {}", counter, path);
-          self.answer_success(token, message_id, format!("saved {} config messages to {}", counter, path), None);
-        },
-        Err(e) => {
-          error!("failed writing state to file: {:?}", e);
-          self.answer_error(token, message_id, "could not save state to file", None);
-        }
-      }
-    } else {
-      error!("could not open file: {}", &path);
-      self.answer_error(token, message_id, "could not open file", None);
-    }
-  }
-
-  pub fn save_state_to_file(&mut self, f: &mut fs::File) -> io::Result<usize> {
-    let mut counter = 0usize;
-    let orders = self.state.generate_orders();
-
-    let res: io::Result<usize> = (move || {
-      for command in orders {
-        let message = CommandRequest::new(
-          format!("SAVE-{}", counter),
-          CommandRequestData::Proxy(command),
-          None
-        );
-
-        f.write_all(&serde_json::to_string(&message).map(|s| s.into_bytes()).unwrap_or(vec!()))?;
-        f.write_all(&b"\n\0"[..])?;
-
-        if counter % 1000 == 0 {
-          info!("writing command {}", counter);
-          f.sync_all()?;
-        }
-        counter += 1;
-      }
-      f.sync_all()?;
-
-      Ok(counter)
-    })();
-
-    res
-  }
-
-  pub fn dump_state(&mut self, token: FrontToken, message_id: &str) {
-    let state = self.state.clone();
-    self.answer_success(token, message_id, String::new(), Some(CommandResponseData::State(state)));
-  }
-
-  pub fn load_state(&mut self, token_opt: Option<FrontToken>, message_id: &str, path: &str) {
-    match fs::File::open(&path) {
-      Err(e)   => {
-        error!("cannot open file at path '{}': {:?}", path, e);
-        if let Some(token) = token_opt {
-          self.answer_error(token, message_id, format!("cannot open file at path '{}': {:?}", path, e), None);
-        }
-      },
-      Ok(mut file) => {
         let mut buffer = Buffer::with_capacity(200000);
 
         info!("starting to load state from {}", path);
 
-        let mut message_counter = 0;
-        let mut diff_counter = 0;
+        let mut message_counter = 0usize;
+        let mut diff_counter = 0usize;
 
-        let mut futures = Vec::new();
+        let (load_state_tx, mut load_state_rx) = futures::channel::mpsc::channel(10000);
         loop {
-          let previous = buffer.available_data();
-          //FIXME: we should read in streaming here
-          if let Ok(sz) = file.read(buffer.space()) {
-            buffer.fill(sz);
-          } else {
-            error!("error reading state file");
-            break;
-          }
-
-          if buffer.available_data() == 0 {
-            break;
-          }
-
-
-          let mut offset = 0;
-          match parse(buffer.data()) {
-            Ok((i, orders)) => {
-              if i.len() > 0 {
-                //info!("could not parse {} bytes", i.len());
-                if previous == buffer.available_data() {
-                  error!("error consuming load state message");
-                  break;
-                }
-              }
-              offset = buffer.data().offset(i);
-
-              if orders.iter().find(|o| {
-                if o.version > sozu_command::command::PROTOCOL_VERSION {
-                  error!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", sozu_command::command::PROTOCOL_VERSION, o.version);
-                  true
-                } else {
-                  false
-                }
-              }).is_some() {
+            let previous = buffer.available_data();
+            //FIXME: we should read in streaming here
+            if let Ok(sz) = file.read(buffer.space()) {
+                buffer.fill(sz);
+            } else {
+                error!("error reading state file");
                 break;
-              }
-
-              for message in orders {
-                if let CommandRequestData::Proxy(order) = message.data {
-                  message_counter += 1;
-
-                  if self.state.handle_order(&order) {
-                      diff_counter += 1;
-
-                      let mut found = false;
-                      let id = format!("LOAD-STATE-{}-{}", message_id, diff_counter);
-
-                      for ref mut worker in self.workers.values_mut()
-                          .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
-                              let o = order.clone();
-                              futures.push(
-                                  executor::send(worker.token.expect("worker should have a token"), ProxyRequest { id: id.clone(), order: o })
-                                  );
-                              found = true;
-
-                          }
-
-                      if !found {
-                          // FIXME: should send back error here
-                          error!("no worker found");
-                      }
-                  }
-                }
-              }
-
-            },
-            Err(Err::Incomplete(_)) => {
-              if buffer.available_data() == buffer.capacity() {
-                error!("message too big, stopping parsing:\n{}", buffer.data().to_hex(16));
-                break;
-              }
             }
-            Err(e) => {
-              error!("saved state parse error: {:?}", e);
-              break;
-            },
-          }
-          buffer.consume(offset);
+
+            if buffer.available_data() == 0 {
+                break;
+            }
+
+            let mut offset = 0usize;
+            match parse(buffer.data()) {
+                Ok((i, orders)) => {
+                    if i.len() > 0 {
+                        //info!("could not parse {} bytes", i.len());
+                        if previous == buffer.available_data() {
+                            error!("error consuming load state message");
+                            break;
+                        }
+                    }
+                    offset = buffer.data().offset(i);
+
+                    if orders.iter().find(|o| {
+                        if o.version > sozu_command::command::PROTOCOL_VERSION {
+                            error!("configuration protocol version mismatch: Sōzu handles up to version {}, the message uses version {}", sozu_command::command::PROTOCOL_VERSION, o.version);
+                            true
+                        } else {
+                            false
+                        }
+                    }).is_some() {
+                        break;
+                    }
+
+                    for message in orders {
+                        if let CommandRequestData::Proxy(order) = message.data {
+                            message_counter += 1;
+
+                            if self.state.handle_order(&order) {
+                                diff_counter += 1;
+
+                                let mut found = false;
+                                let id = format!("LOAD-STATE-{}-{}", message_id, diff_counter);
+
+                                for ref mut worker in self.workers.iter_mut().filter(|worker| {
+                                    worker.run_state != RunState::Stopping
+                                        && worker.run_state != RunState::Stopped
+                                }) {
+                                    let worker_message_id = format!("{}-{}", id, worker.id);
+                                    worker.send(worker_message_id.clone(), order.clone()).await;
+                                    self.in_flight
+                                        .insert(worker_message_id, (load_state_tx.clone(), 1));
+
+                                    found = true;
+                                }
+
+                                if !found {
+                                    // FIXME: should send back error here
+                                    error!("no worker found");
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(Err::Incomplete(_)) => {
+                    if buffer.available_data() == buffer.capacity() {
+                        error!(
+                            "message too big, stopping parsing:\n{}",
+                            buffer.data().to_hex(16)
+                        );
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("saved state parse error: {:?}", e);
+                    break;
+                }
+            }
+            buffer.consume(offset);
         }
 
-        error!("stopped loading data from file, remaining: {} bytes, saw {} messages, generated {} diff messages",
-          buffer.available_data(), message_counter, diff_counter);
-        if diff_counter > 0 {
-          info!("state loaded from {}, will start sending {} messages to workers", path, diff_counter);
-          let id = message_id.to_string();
-          executor::Executor::execute(
-            //FIXME: join_all will stop at the first error, and we will end up accumulating messages
-            join_all(futures).map(move |v| {
-              info!("load_state: {} messages loaded", v.len());
-              if let Some(token) = token_opt {
-                executor::Executor::send_client(token, CommandResponse::new(
-                  id,
-                  CommandStatus::Ok,
-                  format!("ok: {} messages, error: 0", v.len()),
-                  None
-                ));
-              }
-            }).map_err(|e| {
-              error!("load_state error: {}", e);
-            })
-          );
+        let client_tx = if let Some(id) = client_id.as_ref() {
+            self.clients.get(id).cloned()
         } else {
-          info!("no messages sent to workers: local state already had those messages");
-          if let Some(token) = token_opt {
-            let answer = CommandResponse::new(
-              message_id.to_string(),
-              CommandStatus::Ok,
-              format!("ok: 0 messages, error: 0"),
-              None
+            None
+        };
+
+        error!("stopped loading data from file, remaining: {} bytes, saw {} messages, generated {} diff messages",
+        buffer.available_data(), message_counter, diff_counter);
+        if diff_counter > 0 {
+            info!(
+                "state loaded from {}, will start sending {} messages to workers",
+                path, diff_counter
             );
-            self.clients[token.0].push_message(answer);
-          }
+            let id = message_id.to_string();
+            Task::spawn(async move {
+                let mut ok = 0usize;
+                let mut error = 0usize;
+                while let Some(proxy_response) = load_state_rx.next().await {
+                    match proxy_response.status {
+                        ProxyResponseStatus::Ok => {
+                            ok += 1;
+                        }
+                        ProxyResponseStatus::Processing => {}
+                        ProxyResponseStatus::Error(message) => {
+                            error!("{}", message);
+                            error += 1;
+                        }
+                    };
+                    debug!("ok:{}, error: {}", ok, error);
+                }
+
+                if let Some(mut sender) = client_tx {
+                    if error == 0 {
+                        sender
+                            .send(CommandResponse::new(
+                                message_id.to_string(),
+                                CommandStatus::Ok,
+                                format!("ok: {} messages, error: 0", ok),
+                                None,
+                            ))
+                            .await;
+                    } else {
+                        sender
+                            .send(CommandResponse::new(
+                                message_id.to_string(),
+                                CommandStatus::Error,
+                                format!("ok: {} messages, error: {}", ok, error),
+                                None,
+                            ))
+                            .await;
+                    }
+                } else {
+                    if error == 0 {
+                        info!("loading state: {} ok messages, 0 errors", ok);
+                    } else {
+                        error!("loading state: {} ok messages, {} errors", ok, error);
+                    }
+                }
+            })
+            .detach();
+        } else {
+            info!("no messages sent to workers: local state already had those messages");
+            if let Some(id) = client_id {
+                self.answer_success(id, message_id, format!("ok: 0 messages, error: 0"), None)
+                    .await;
+            }
         }
 
         self.backends_count = self.state.count_backends();
@@ -297,719 +334,885 @@ impl CommandServer {
         gauge!("configuration.applications", self.state.applications.len());
         gauge!("configuration.backends", self.backends_count);
         gauge!("configuration.frontends", self.frontends_count);
-      }
-    }
-  }
-
-  pub fn list_workers(&mut self, token: FrontToken, message_id: &str) {
-    let workers: Vec<WorkerInfo> = self.workers.values().map(|ref worker| {
-      WorkerInfo {
-        id:         worker.id,
-        pid:        worker.pid,
-        run_state:  worker.run_state.clone(),
-      }
-    }).collect();
-    self.answer_success(token, message_id, "", Some(CommandResponseData::Workers(workers)));
-  }
-
-  pub fn launch_worker(&mut self, token: FrontToken, message: &CommandRequest, tag: &str) {
-    let id = self.next_id;
-    if let Ok(mut worker) = start_worker(id, &self.config, self.executable_path.clone(), &self.state, None) {
-      self.clients[token.0].push_message(CommandResponse::new(
-          message.id.clone(),
-          CommandStatus::Processing,
-          "sending configuration orders".to_string(),
-          None
-          ));
-      info!("created new worker: {}", id);
-
-      self.next_id += 1;
-
-      let worker_token = self.token_count + 1;
-      self.token_count = worker_token;
-      worker.token     = Some(Token(worker_token));
-
-      debug!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
-      worker_token, tag, worker.id, worker.channel.sock.take_error());
-      self.poll.registry().register(&mut worker.channel.sock, Token(worker_token),
-        Interest::READABLE | Interest::WRITABLE).unwrap();
-      worker.token = Some(Token(worker_token));
-
-      info!("sending listeners: to the new worker: {:?}", worker.scm.send_listeners(&Listeners {
-        http: Vec::new(),
-        tls:  Vec::new(),
-        tcp:  Vec::new(),
-      }));
-
-      let activate_orders = self.state.generate_activate_orders();
-      let mut count = 0;
-      for order in activate_orders.into_iter() {
-        worker.push_message(ProxyRequest {
-          id: format!("{}-ACTIVATE-{}", id, count),
-          order
-        });
-        count += 1;
-      }
-
-      self.workers.insert(Token(worker_token), worker);
-
-      self.answer_success(token, message.id.as_str(), "", None);
-    } else {
-      self.answer_error(token, message.id.as_str(), "failed creating worker", None);
-    }
-  }
-
-  pub fn upgrade_worker(&mut self, token: FrontToken, message_id: &str, id: u32) {
-    info!("client[{}] msg {} wants to upgrade worker {}", token.0, message_id, id);
-
-    // same as launch_worker
-    let next_id = self.next_id;
-    let worker_token = self.token_count + 1;
-    let mut worker = if let Ok(mut worker) = start_worker(next_id, &self.config, self.executable_path.clone(), &self.state, None) {
-      self.clients[token.0].push_message(CommandResponse::new(
-          String::from(message_id),
-          CommandStatus::Processing,
-          "sending configuration orders".to_string(),
-          None
-          ));
-      info!("created new worker: {}", next_id);
-
-      self.next_id += 1;
-
-      self.token_count = worker_token;
-      worker.token     = Some(Token(worker_token));
-
-      debug!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
-      worker_token, "upgrade", worker.id, worker.channel.sock.take_error());
-      self.poll.registry().register(&mut worker.channel.sock, Token(worker_token),
-        Interest::READABLE | Interest::WRITABLE).unwrap();
-      worker.token = Some(Token(worker_token));
-
-      worker
-    } else {
-      return self.answer_error(token, message_id, "failed creating worker", None);
-    };
-
-    if self.workers.values().find(|worker| {
-      worker.id == id && worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
-    }).is_none() {
-      self.answer_error(token, message_id, "worker not found", None);
-      return;
     }
 
-    // the worker might be loading a large state, so we must wait for it to finish
-    // before we tell the old worker to stop listening, otherwise the sockets
-    // present in the accept queue might timeout
-    worker.channel.set_blocking(true);
-    worker.channel.write_message(&ProxyRequest { id: String::from(message_id), order: ProxyRequestData::Status });
-    debug!("requested status from new worker");
-    let message = worker.channel.read_message();
-    debug!("new worker returned: {:?}", message);
-    worker.channel.set_blocking(false);
+    pub async fn list_workers(&mut self, client_id: String, request_id: String) {
+        let workers: Vec<WorkerInfo> = self
+            .workers
+            .iter()
+            .map(|ref worker| WorkerInfo {
+                id: worker.id,
+                pid: worker.pid,
+                run_state: worker.run_state.clone(),
+            })
+            .collect();
+        self.answer_success(
+            client_id,
+            request_id,
+            "",
+            Some(CommandResponseData::Workers(workers)),
+        )
+        .await;
+    }
 
-    let mut listeners = None;
-    {
-      let old_worker = self.workers.values_mut().filter(|worker| worker.id == id).next().unwrap();
+    pub async fn launch_worker(&mut self, client_id: String, request_id: String, tag: &str) {
+        if let Ok(mut worker) = start_worker(
+            self.next_id,
+            &self.config,
+            self.executable_path.clone(),
+            &self.state,
+            None,
+        ) {
+            if let Some(sender) = self.clients.get_mut(&client_id) {
+                sender
+                    .send(CommandResponse::new(
+                        request_id.clone(),
+                        CommandStatus::Processing,
+                        "sending configuration orders".to_string(),
+                        None,
+                    ))
+                    .await;
+            }
 
-      old_worker.channel.set_blocking(true);
-      old_worker.channel.write_message(&ProxyRequest { id: String::from(message_id), order: ProxyRequestData::ReturnListenSockets });
-      info!("sent returnlistensockets message to worker");
-      old_worker.channel.set_blocking(false);
+            info!("created new worker: {}", worker.id);
 
-      let mut counter   = 0;
+            self.next_id += 1;
+            /*
+            let worker_token = self.token_count + 1;
+            self.token_count = worker_token;
+            worker.token     = Some(Token(worker_token));*/
 
-      loop {
-        old_worker.scm.set_blocking(true);
-        if let Some(l) = old_worker.scm.receive_listeners() {
-          listeners = Some(l);
-          break;
+            /*debug!("registering new sock {:?} at token {:?} for tag {} and id {} (sock error: {:?})", worker.channel.sock,
+            worker_token, tag, worker.id, worker.channel.sock.take_error());
+            self.poll.registry().register(&mut worker.channel.sock, Token(worker_token),
+              Interest::READABLE | Interest::WRITABLE).unwrap();
+            worker.token = Some(Token(worker_token));
+            */
+            let sock = worker.channel.take().unwrap().sock;
+            let (worker_tx, worker_rx) = channel(10000);
+            worker.sender = Some(worker_tx);
+
+            let stream = Async::new(unsafe {
+                let fd = sock.into_raw_fd();
+                UnixStream::from_raw_fd(fd)
+            })
+            .unwrap();
+
+            let id = worker.id;
+            let command_tx = self.command_tx.clone();
+            //async fn worker(id: u32, sock: Async<UnixStream>, tx: Sender<CommandMessage>, rx: Receiver<()>) -> std::io::Result<()> {
+            Task::spawn(async move {
+                super::worker_loop(id, stream, command_tx, worker_rx)
+                    .await
+                    .unwrap();
+            })
+            .detach();
+
+            info!(
+                "sending listeners: to the new worker: {:?}",
+                worker.scm.send_listeners(&Listeners {
+                    http: Vec::new(),
+                    tls: Vec::new(),
+                    tcp: Vec::new(),
+                })
+            );
+
+            let activate_orders = self.state.generate_activate_orders();
+            let mut count = 0usize;
+            for order in activate_orders.into_iter() {
+                worker
+                    .send(format!("{}-ACTIVATE-{}", id, count), order)
+                    .await;
+                count += 1;
+            }
+
+            self.workers.push(worker);
+
+            self.answer_success(client_id, request_id, "", None).await;
         } else {
-          counter += 1;
-          if counter == 50 {
-            break;
-          }
-          sleep(Duration::from_millis(100));
+            self.answer_error(client_id, request_id, "failed creating worker", None)
+                .await;
         }
-      }
-      old_worker.run_state = RunState::Stopping;
-      let old_worker_token = old_worker.token.expect("worker should have a valid token");
-      executor::Executor::execute(
-        executor::send(
-          old_worker_token,
-          ProxyRequest { id: message_id.to_string(), order: ProxyRequestData::SoftStop })
-        .map(move |_| {
-          executor::Executor::stop_worker(old_worker_token)
-        }).map_err(|s| {
-          error!("error stopping worker: {:?}", s);
+    }
+
+    pub async fn upgrade_main(&mut self, client_id: String, request_id: String) {
+        self.disable_cloexec_before_upgrade();
+
+        if let Some(sender) = self.clients.get_mut(&client_id) {
+            sender
+                .send(CommandResponse::new(
+                    request_id.clone(),
+                    CommandStatus::Processing,
+                    "".to_string(),
+                    None,
+                ))
+                .await;
+        }
+
+        let (pid, mut channel) =
+            start_new_main_process(self.executable_path.clone(), self.generate_upgrade_data());
+        channel.set_blocking(true);
+        let res = channel.read_message();
+        debug!("upgrade channel sent: {:?}", res);
+
+        // signaling the accept loop that it should stop
+        self.accept_cancel.take().unwrap().send(());
+        if let Some(true) = res {
+            if let Some(sender) = self.clients.get_mut(&client_id) {
+                sender
+                    .send(CommandResponse::new(
+                        request_id.clone(),
+                        CommandStatus::Ok,
+                        format!(
+                            "new main process launched with pid {}, closing the old one",
+                            pid
+                        ),
+                        None,
+                    ))
+                    .await;
+            }
+
+            info!("wrote final message, closing");
+
+            //FIXME: should do some cleanup before exiting
+            std::thread::sleep(Duration::from_secs(2));
+            std::process::exit(0);
+        } else {
+            self.answer_error(
+                client_id,
+                request_id,
+                "could not upgrade main process",
+                None,
+            )
+            .await;
+        }
+    }
+
+    pub async fn upgrade_worker(&mut self, client_id: String, request_id: String, id: u32) {
+        info!(
+            "client[{}] msg {} wants to upgrade worker {}",
+            client_id, request_id, id
+        );
+
+        // same as launch_worker
+        let next_id = self.next_id;
+        let mut worker = if let Ok(mut worker) = start_worker(
+            next_id,
+            &self.config,
+            self.executable_path.clone(),
+            &self.state,
+            None,
+        ) {
+            if let Some(sender) = self.clients.get_mut(&client_id) {
+                sender
+                    .send(CommandResponse::new(
+                        request_id.clone(),
+                        CommandStatus::Processing,
+                        "sending configuration orders".to_string(),
+                        None,
+                    ))
+                    .await;
+            }
+            info!("created new worker: {}", next_id);
+
+            self.next_id += 1;
+
+            worker
+        } else {
+            return self
+                .answer_error(client_id, &request_id, "failed creating worker", None)
+                .await;
+        };
+
+        if self
+            .workers
+            .iter()
+            .find(|worker| {
+                worker.id == id
+                    && worker.run_state != RunState::Stopping
+                    && worker.run_state != RunState::Stopped
+            })
+            .is_none()
+        {
+            self.answer_error(client_id, &request_id, "worker not found", None)
+                .await;
+            return;
+        }
+
+
+        let sock = worker.channel.take().unwrap().sock;
+        let (worker_tx, worker_rx) = channel(10000);
+        worker.sender = Some(worker_tx);
+
+        worker
+            .sender
+            .as_mut()
+            .unwrap()
+            .send(ProxyRequest {
+                id: format!("UPGRADE-{}-STATUS", id),
+                order: ProxyRequestData::Status,
+            })
+        .await;
+
+
+        let mut listeners = None;
+        {
+            let old_worker = self
+                .workers
+                .iter_mut()
+                .filter(|worker| worker.id == id)
+                .next()
+                .unwrap();
+
+            /*
+            old_worker.channel.set_blocking(true);
+            old_worker.channel.write_message(&ProxyRequest { id: String::from(message_id), order: ProxyRequestData::ReturnListenSockets });
+            info!("sent returnlistensockets message to worker");
+            old_worker.channel.set_blocking(false);
+            */
+            let (tx, mut rx) = futures::channel::mpsc::channel(3);
+            let id = format!("{}-return-sockets", request_id);
+            self.in_flight.insert(id.clone(), (tx, 1));
+            old_worker
+                .send(id.clone(), ProxyRequestData::ReturnListenSockets)
+                .await;
+
+            info!("sent ReturnListenSockets to old worker");
+            Task::spawn(async move {
+                while let Some(proxy_response) = rx.next().await {
+                    match proxy_response.status {
+                        ProxyResponseStatus::Ok => {
+                            info!("returnsockets OK");
+                            break;
+                        }
+                        ProxyResponseStatus::Processing => {
+                            info!("returnsockets processing");
+                        }
+                        ProxyResponseStatus::Error(message) => {
+                            info!("return sockets error: {:?}", message);
+                            break;
+                        }
+                    };
+                }
+            })
+            .detach();
+
+            let mut counter = 0usize;
+
+            //FIXME: use blocking
+            loop {
+                info!("waiting for scm sockets");
+                old_worker.scm.set_blocking(true);
+                if let Some(l) = old_worker.scm.receive_listeners() {
+                    listeners = Some(l);
+                    break;
+                } else {
+                    counter += 1;
+                    if counter == 50 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            info!("got scm sockets");
+            old_worker.run_state = RunState::Stopping;
+
+            let (tx, mut rx) = futures::channel::mpsc::channel(10);
+            let id = format!("{}-softstop", request_id);
+            self.in_flight.insert(id.clone(), (tx, 1));
+            old_worker
+                .send(id.clone(), ProxyRequestData::SoftStop)
+                .await;
+
+            let mut command_tx = self.command_tx.clone();
+            let worker_id = old_worker.id;
+            Task::spawn(async move {
+                while let Some(proxy_response) = rx.next().await {
+                    match proxy_response.status {
+                        ProxyResponseStatus::Ok => {
+                            info!("softstop OK");
+                            command_tx
+                                .send(CommandMessage::WorkerClose { id: worker_id })
+                                .await;
+                            break;
+                        }
+                        ProxyResponseStatus::Processing => {
+                            info!("softstop processing");
+                        }
+                        ProxyResponseStatus::Error(message) => {
+                            info!("softstop error: {:?}", message);
+                            break;
+                        }
+                    };
+                }
+            })
+            .detach();
+        }
+
+        match listeners {
+            Some(l) => {
+                info!(
+                    "sending listeners: to the new worker: {:?}",
+                    worker.scm.send_listeners(&l)
+                );
+                l.close();
+            }
+            None => error!("could not get the list of listeners from the previous worker"),
+        };
+
+
+        let stream = Async::new(unsafe {
+            let fd = sock.into_raw_fd();
+            UnixStream::from_raw_fd(fd)
         })
-      );
+        .unwrap();
+
+        let id = worker.id;
+        let command_tx = self.command_tx.clone();
+        //async fn worker(id: u32, sock: Async<UnixStream>, tx: Sender<CommandMessage>, rx: Receiver<()>) -> std::io::Result<()> {
+        Task::spawn(async move {
+            super::worker_loop(id, stream, command_tx, worker_rx)
+                .await
+                .unwrap();
+        })
+        .detach();
+
+        let activate_orders = self.state.generate_activate_orders();
+        let mut count = 0usize;
+        for order in activate_orders.into_iter() {
+            worker
+                .send(format!("{}-ACTIVATE-{}", request_id, count), order)
+                .await;
+            count += 1;
+        }
+        info!("sent config messages to the new worker");
+        self.workers.push(worker);
+
+        self.answer_success(client_id, request_id, "", None).await;
+        info!("finished upgrade");
     }
 
-    match listeners {
-      Some(l) => {
-        info!("sending listeners: to the new worker: {:?}", worker.scm.send_listeners(&l));
-        l.close();
-      },
-      None => error!("could not get the list of listeners from the previous worker"),
-    };
-    let activate_orders = self.state.generate_activate_orders();
-    let mut count = 0;
-    for order in activate_orders.into_iter() {
-      worker.push_message(ProxyRequest {
-        id: format!("{}-ACTIVATE-{}", message_id, count),
-        order
-      });
-      count += 1;
-    }
-    self.workers.insert(Token(worker_token), worker);
+    pub async fn reload_configuration(&mut self, client_id: Option<String>, message_id: String, config_path: Option<String>) {
+        let new_config = match Config::load_from_path(config_path.as_deref().unwrap_or(&self.config.config_path)) {
+            Err(e) => {
+                    if let Some(id) = client_id {
+                        self.answer_error(id, message_id,
+                            format!("cannot load configuration from '{}': {:?}", self.config.config_path, e),
+                            None).await;
+                    }
+                return
+            },
+            Ok(c) => c,
+        };
 
-    self.answer_success(token, message_id, "", None);
-  }
+        let mut message_counter = 0usize;
+        let mut diff_counter = 0usize;
 
-  pub fn upgrade_main(&mut self, token: FrontToken, message_id: &str) {
-    self.disable_cloexec_before_upgrade();
-    //FIXME: do we need to be blocking here?
-    self.clients[token.0].channel.set_blocking(true);
-    self.clients[token.0].channel.write_message(&CommandResponse::new(
-        String::from(message_id),
-        CommandStatus::Processing,
-        "".to_string(),
-        None
-        ));
-    let (pid, mut channel) = start_new_main_process(self.executable_path.clone(), self.generate_upgrade_data());
-    channel.set_blocking(true);
-    let res = channel.read_message();
-    debug!("upgrade channel sent: {:?}", res);
-    if let Some(true) = res {
-      self.clients[token.0].channel.write_message(&CommandResponse::new(
-        message_id.into(),
-        CommandStatus::Ok,
-        format!("new main process launched with pid {}, closing the old one", pid),
-        None
-      ));
-      info!("wrote final message, closing");
-      //FIXME: should do some cleanup before exiting
-      sleep(Duration::from_secs(2));
-      process::exit(0);
-    } else {
-      self.answer_error(token, message_id, "could not upgrade main process", None);
-    }
-  }
+        let (load_state_tx, mut load_state_rx) = futures::channel::mpsc::channel(10000);
 
-  pub fn metrics(&mut self, token: FrontToken, message_id: &str) {
-    let mut futures = Vec::new();
-    let id = message_id.to_string();
+        for message in new_config.generate_config_messages() {
+            if let CommandRequestData::Proxy(order) = message.data {
+                if self.state.handle_order(&order) {
+                    diff_counter += 1;
 
-    for ref mut worker in self.workers.values_mut()
-      .filter(|worker| worker.run_state != RunState::Stopped) {
+                    let mut found = false;
+                    let id = format!("LOAD-STATE-{}-{}", message_id, diff_counter);
 
-      let tag = worker.id.to_string();
-      futures.push(
-        executor::send(
-          worker.token.expect("worker should have a token"),
-          ProxyRequest { id: id.clone(), order: ProxyRequestData::Metrics }).map(|data| (tag, data))
-      );
-    }
+                    for ref mut worker in self.workers.iter_mut().filter(|worker| {
+                        worker.run_state != RunState::Stopping
+                            && worker.run_state != RunState::Stopped
+                    }) {
+                        let worker_message_id = format!("{}-{}", id, worker.id);
+                        worker.send(worker_message_id.clone(), order.clone()).await;
+                        self.in_flight
+                            .insert(worker_message_id, (load_state_tx.clone(), 1));
 
-    let main_metrics = METRICS.with(|metrics| {
-      (*metrics.borrow_mut()).dump_process_data()
-    });
+                        found = true;
+                    }
 
-    executor::Executor::execute(
-      //FIXME: join_all will stop at the first error, and we will end up accumulating messages
-      join_all(futures).map(move |v| {
-        let data: BTreeMap<String, MetricsData> = v.into_iter().filter_map(|(tag, metrics)| {
-          if let Some(ProxyResponseData::Metrics(d)) = metrics.data {
-            Some((tag, d))
-          } else {
+                    if !found {
+                        // FIXME: should send back error here
+                        error!("no worker found");
+                    }
+                }
+            }
+        }
+
+
+        let client_tx = if let Some(id) = client_id.as_ref() {
+            self.clients.get(id).cloned()
+        } else {
             None
-          }
-        }).collect();
-
-        let aggregated_data = AggregatedMetricsData {
-          main: main_metrics,
-          workers: data,
         };
 
-        executor::Executor::send_client(token, CommandResponse::new(
-          id,
-          CommandStatus::Ok,
-          String::new(),
-          Some(CommandResponseData::Metrics(aggregated_data))
-        ));
-      }).map_err(|e| {
-        error!("metrics error: {}", e);
-      })
-    );
-  }
+        if diff_counter > 0 {
+            info!("state loaded from {}, will start sending {} messages to workers", new_config.config_path, diff_counter);
+            let id = message_id.to_string();
+            Task::spawn(async move {
+                let mut ok = 0usize;
+                let mut error = 0usize;
+                while let Some(proxy_response) = load_state_rx.next().await {
+                    match proxy_response.status {
+                        ProxyResponseStatus::Ok => {
+                            ok += 1;
+                        }
+                        ProxyResponseStatus::Processing => {}
+                        ProxyResponseStatus::Error(message) => {
+                            error!("{}", message);
+                            error += 1;
+                        }
+                    };
+                    debug!("ok:{}, error: {}", ok, error);
+                }
 
-  pub fn query(&mut self, token: FrontToken, message_id: &str, query: Query) {
-    let id = message_id.to_string();
-    let mut futures = Vec::new();
-    for ref mut worker in self.workers.values_mut()
-      .filter(|worker| worker.run_state != RunState::Stopped) {
-
-      let tag = worker.id.to_string();
-      futures.push(
-        executor::send(
-          worker.token.expect("worker should have a token"),
-          ProxyRequest { id: id.clone(), order: ProxyRequestData::Query(query.clone()) }).map(|data| (tag, data))
-      );
-
-    }
-
-    let f = join_all(futures).map(move |v| {
-      let data: BTreeMap<String, QueryAnswer> = v.into_iter().filter_map(|(tag, query)| {
-        if let Some(ProxyResponseData::Query(d)) = query.data {
-          Some((tag, d))
+                if let Some(mut sender) = client_tx {
+                    if error == 0 {
+                        sender
+                            .send(CommandResponse::new(
+                                message_id.to_string(),
+                                CommandStatus::Ok,
+                                format!("ok: {} messages, error: 0", ok),
+                                None,
+                            ))
+                            .await;
+                    } else {
+                        sender
+                            .send(CommandResponse::new(
+                                message_id.to_string(),
+                                CommandStatus::Error,
+                                format!("ok: {} messages, error: {}", ok, error),
+                                None,
+                            ))
+                            .await;
+                    }
+                } else {
+                    if error == 0 {
+                        info!("loading state: {} ok messages, 0 errors", ok);
+                    } else {
+                        error!("loading state: {} ok messages, {} errors", ok, error);
+                    }
+                }
+            })
+            .detach();
         } else {
-          None
+            info!("no messages sent to workers: local state already had those messages");
+            if let Some(id) = client_id {
+                self.answer_success(id, message_id, format!("ok: 0 messages, error: 0"), None)
+                    .await;
+            }
         }
-      }).collect();
-      data
-    });
 
-    match &query {
-      &Query::ApplicationsHashes => {
-        let main = QueryAnswer::ApplicationsHashes(self.state.hash_state());
+        self.backends_count = self.state.count_backends();
+        self.frontends_count = self.state.count_frontends();
+        gauge!("configuration.applications", self.state.applications.len());
+        gauge!("configuration.backends", self.backends_count);
+        gauge!("configuration.frontends", self.frontends_count);
 
-        executor::Executor::execute(f.map(move |mut data| {
-          data.insert(String::from("main"), main);
-
-          executor::Executor::send_client(token, CommandResponse::new(
-            id,
-            CommandStatus::Ok,
-            String::new(),
-            Some(CommandResponseData::Query(data))
-          ));
-        }).map_err(|e| {
-          //FIXME: send back errors
-          error!("metrics error: {}", e);
-        }));
-      },
-      &Query::Applications(ref query_type) => {
-        let main = match query_type {
-          QueryApplicationType::AppId(ref app_id) => vec!(self.state.application_state(app_id)),
-          QueryApplicationType::Domain(ref domain) => {
-            let app_ids = get_application_ids_by_domain(&self.state, domain.hostname.clone(), domain.path_begin.clone());
-            app_ids.iter().map(|ref app_id| self.state.application_state(app_id)).collect()
-          }
-        };
-
-        executor::Executor::execute(f.map(move |mut data| {
-          data.insert(String::from("main"), QueryAnswer::Applications(main));
-
-          executor::Executor::send_client(token, CommandResponse::new(
-            id,
-            CommandStatus::Ok,
-            String::new(),
-            Some(CommandResponseData::Query(data))
-          ));
-        }).map_err(|e| {
-          //FIXME: send back errors
-          error!("metrics error: {}", e);
-        }));
-      },
-      &Query::Certificates(ref query_type) => {
-        executor::Executor::execute(f.map(move |data| {
-          info!("certificates query received: {:?}", data);
-
-          executor::Executor::send_client(token, CommandResponse::new(
-            id,
-            CommandStatus::Ok,
-            String::new(),
-            Some(CommandResponseData::Query(data))
-          ));
-        }).map_err(|e| {
-          //FIXME: send back errors
-          error!("certificates query error: {}", e);
-        }));
-      },
-    };
-  }
-
-  pub fn reload_configuration(&mut self, token_opt: Option<FrontToken>, message_id: &str, config_path: Option<String>) {
-      let new_config = match Config::load_from_path(config_path.as_deref().unwrap_or(&self.config.config_path)) {
-          Err(e) => {
-                  if let Some(token) = token_opt {
-                      self.answer_error(token, message_id,
-                                        format!("cannot load configuration from '{}': {:?}", self.config.config_path, e),
-                                        None);
-                  }
-              return
-          },
-          Ok(c) => c,
-      };
-
-      let mut new_state = ConfigState::default();
-      for message in new_config.generate_config_messages() {
-          if let CommandRequestData::Proxy(order) = message.data {
-              new_state.handle_order(&order);
-          }
-      }
-
-      let mut futures = Vec::new();
-      let mut diff_counter = 0usize;
-      let diff = self.state.diff(&new_state);
-      for order in diff {
-          diff_counter += 1;
-          self.state.handle_order(&order);
-
-          let mut found = false;
-          let id = format!("RELOAD-{}-{}", message_id, diff_counter);
-
-          for ref mut worker in self.workers.values_mut()
-              .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
-                  let o = order.clone();
-                  futures.push(
-                      executor::send(worker.token.expect("worker should have a token"), ProxyRequest { id: id.clone(), order: o })
-                      );
-                  found = true;
-
-              }
-
-          if !found {
-              // FIXME: should send back error here
-              error!("no worker found");
-          }
-      }
-
-      if diff_counter > 0 {
-          info!("state loaded from {}, will start sending {} messages to workers", new_config.config_path, diff_counter);
-          let id = message_id.to_string();
-          executor::Executor::execute(
-              //FIXME: join_all will stop at the first error, and we will end up accumulating messages
-              join_all(futures).map(move |v| {
-                  info!("load_state: {} messages loaded", v.len());
-                  if let Some(token) = token_opt {
-                      executor::Executor::send_client(token, CommandResponse::new(
-                              id,
-                              CommandStatus::Ok,
-                              format!("ok: {} messages, error: 0", v.len()),
-                              None
-                              ));
-                  }
-              }).map_err(|e| {
-                  error!("load_state error: {}", e);
-              })
-              );
-      } else {
-          info!("no messages sent to workers: local state already had those messages");
-          if let Some(token) = token_opt {
-              let answer = CommandResponse::new(
-                  message_id.to_string(),
-                  CommandStatus::Ok,
-                  format!("ok: 0 messages, error: 0"),
-                  None
-                  );
-              self.clients[token.0].push_message(answer);
-          }
-      }
-
-    self.backends_count = self.state.count_backends();
-    self.frontends_count = self.state.count_frontends();
-    gauge!("configuration.applications", self.state.applications.len());
-    gauge!("configuration.backends", self.backends_count);
-    gauge!("configuration.frontends", self.frontends_count);
-
-    self.config = new_config;
-  }
-
-  pub fn worker_order(&mut self, token: FrontToken, message_id: &str, order: ProxyRequestData, worker_id: Option<u32>) {
-    if let &ProxyRequestData::AddCertificate(_) = &order {
-      debug!("workerconfig client order AddCertificate()");
-    } else {
-      debug!("workerconfig client order {:?}", order);
+        self.config = new_config;
     }
 
-    if let &ProxyRequestData::Logging(ref logging_filter) = &order {
-      debug!("Changing main log level to {}", logging_filter);
-      logging::LOGGER.with(|l| {
-        let directives = logging::parse_logging_spec(&logging_filter);
-        l.borrow_mut().set_directives(directives);
-      });
-      // also change / set the content of RUST_LOG so future workers / main thread
-      // will have the new logging filter value
-      ::std::env::set_var("RUST_LOG", logging_filter);
-    }
-
-    if !self.state.handle_order(&order) {
-      // Check if the backend or frontend exist before deleting it
-      if worker_id.is_none() {
-        match order {
-          ProxyRequestData::RemoveBackend(ref backend) => {
-            let msg = format!("No such backend {} at {} for the application {}", backend.backend_id, backend.address, backend.app_id);
-            error!("{}", msg);
-            self.answer_error(token, message_id, msg, None);
-            return;
-          },
-          ProxyRequestData::RemoveHttpFront(HttpFront{ ref app_id, ref address, .. })
-          | ProxyRequestData::RemoveHttpsFront(HttpFront{ ref app_id, ref address, .. })
-          | ProxyRequestData::RemoveTcpFront(TcpFront{ ref app_id, ref address }) => {
-            let msg = format!("No such frontend at {} for the application {}", address, app_id);
-            error!("{}", msg);
-            self.answer_error(token, message_id, msg, None);
-            return;
-          },
-          _ => {},
-        };
-      }
-    }
-
-    if self.config.automatic_state_save {
-      if order != ProxyRequestData::SoftStop || order != ProxyRequestData::HardStop {
-        if let Some(path) = self.config.saved_state.clone() {
-          if let Ok(mut f) = fs::File::create(&path) {
-            let _ = self.save_state_to_file(&mut f).map_err(|e| {
-              error!("could not save state automatically to {}: {:?}", path, e);
-            });
-          }
+    pub async fn metrics(&mut self, client_id: String, request_id: String) {
+        let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
+        let mut count = 0usize;
+        for ref mut worker in self
+            .workers
+            .iter_mut()
+            .filter(|worker| worker.run_state != RunState::Stopped)
+        {
+            let req_id = format!("{}-metrics-{}", request_id, worker.id);
+            worker.send(req_id.clone(), ProxyRequestData::Metrics).await;
+            count += 1;
+            self.in_flight.insert(req_id, (tx.clone(), 1));
         }
-      }
-    }
 
-    let mut found = false;
-    let mut futures = Vec::new();
-    for ref mut worker in self.workers.values_mut()
-      .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
+        let main_metrics = METRICS.with(|metrics| (*metrics.borrow_mut()).dump_process_data());
 
-      if let Some(id) = worker_id {
-        if id != worker.id {
-          continue;
-        }
-      }
+        let mut client_tx = self.clients.get_mut(&client_id).unwrap().clone();
+        let prefix = format!("{}-metrics-", request_id);
+        Task::spawn(async move {
+            let mut v = Vec::new();
+            let mut i = 0;
+            while let Some(proxy_response) = rx.next().await {
+                match proxy_response.status {
+                    ProxyResponseStatus::Ok => {
+                        let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
+                        v.push((tag, proxy_response));
+                    }
+                    ProxyResponseStatus::Processing => {
+                        info!("metrics processing");
+                        continue;
+                    }
+                    ProxyResponseStatus::Error(_) => {
+                        let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
+                        v.push((tag, proxy_response));
+                    }
+                };
 
-      let worker_token = worker.token.expect("worker should have a token");
-      let should_stop_worker = order == ProxyRequestData::SoftStop || order == ProxyRequestData::HardStop;
-      if should_stop_worker {
-        worker.run_state = RunState::Stopping;
-      }
+                i += 1;
+                if i == count {
+                    break;
+                }
+            }
 
-      let id = worker.id.clone();
-      futures.push(
-        Box::new(executor::send(
-          worker_token,
-          ProxyRequest { id: message_id.to_string(), order: order.clone() })
-        .map(move |r| {
-          if should_stop_worker {
-            executor::Executor::stop_worker(worker_token)
-          }
-          (id, r)
+            let data: BTreeMap<String, MetricsData> = v
+                .into_iter()
+                .filter_map(|(tag, metrics)| {
+                    if let Some(ProxyResponseData::Metrics(d)) = metrics.data {
+                        Some((tag, d))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let aggregated_data = AggregatedMetricsData {
+                main: main_metrics,
+                workers: data,
+            };
+
+            client_tx
+                .send(CommandResponse::new(
+                    request_id.clone(),
+                    CommandStatus::Ok,
+                    "".to_string(),
+                    Some(CommandResponseData::Metrics(aggregated_data)),
+                ))
+                .await;
         })
-      ));
-
-      found = true;
+        .detach();
     }
 
-    if !found {
-      // FIXME: should send back error here
-      error!("no worker found");
+    pub async fn query(&mut self, client_id: String, request_id: String, query: Query) {
+        let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
+        let mut count = 0usize;
+        for ref mut worker in self
+            .workers
+            .iter_mut()
+            .filter(|worker| worker.run_state != RunState::Stopped)
+        {
+            let req_id = format!("{}-query-{}", request_id, worker.id);
+            worker
+                .send(req_id.clone(), ProxyRequestData::Query(query.clone()))
+                .await;
+            count += 1;
+            self.in_flight.insert(req_id, (tx.clone(), 1));
+        }
+
+        let mut main_query_answer = None;
+        match &query {
+            &Query::ApplicationsHashes => {
+                main_query_answer =
+                    Some(QueryAnswer::ApplicationsHashes(self.state.hash_state()));
+            }
+            &Query::Applications(ref query_type) => {
+                main_query_answer = Some(QueryAnswer::Applications(match query_type {
+                    QueryApplicationType::AppId(ref app_id) => {
+                        vec![self.state.application_state(app_id)]
+                    }
+                    QueryApplicationType::Domain(ref domain) => {
+                        let app_ids = get_application_ids_by_domain(&self.state, domain.hostname.clone(), domain.path_begin.clone());
+                        app_ids.iter().map(|ref app_id| self.state.application_state(app_id)).collect()
+                    }
+                }));
+            }
+            &Query::Certificates(_) => {}
+        };
+
+        let mut client_tx = self.clients.get_mut(&client_id).unwrap().clone();
+        let prefix = format!("{}-query-", request_id);
+        Task::spawn(async move {
+            let mut v = Vec::new();
+            let mut i = 0;
+            while let Some(proxy_response) = rx.next().await {
+                match proxy_response.status {
+                    ProxyResponseStatus::Ok => {
+                        let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
+                        v.push((tag, proxy_response));
+                    }
+                    ProxyResponseStatus::Processing => {
+                        info!("metrics processing");
+                        continue;
+                    }
+                    ProxyResponseStatus::Error(_) => {
+                        let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
+                        v.push((tag, proxy_response));
+                    }
+                };
+
+                i += 1;
+                if i == count {
+                    break;
+                }
+            }
+
+            let mut data: BTreeMap<String, QueryAnswer> = v
+                .into_iter()
+                .filter_map(|(tag, query)| {
+                    if let Some(ProxyResponseData::Query(d)) = query.data {
+                        Some((tag, d))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            match &query {
+                &Query::ApplicationsHashes => {
+                    let main = main_query_answer.unwrap();
+                    data.insert(String::from("main"), main);
+
+                    client_tx
+                        .send(CommandResponse::new(
+                            request_id.clone(),
+                            CommandStatus::Ok,
+                            "".to_string(),
+                            Some(CommandResponseData::Query(data)),
+                        ))
+                        .await;
+                }
+                &Query::Applications(ref query_type) => {
+                    let main = main_query_answer.unwrap();
+                    data.insert(String::from("main"), main);
+
+                    client_tx
+                        .send(CommandResponse::new(
+                            request_id.clone(),
+                            CommandStatus::Ok,
+                            "".to_string(),
+                            Some(CommandResponseData::Query(data)),
+                        ))
+                        .await;
+                }
+                &Query::Certificates(_) => {
+                    info!("certificates query received: {:?}", data);
+                    client_tx
+                        .send(CommandResponse::new(
+                            request_id.clone(),
+                            CommandStatus::Ok,
+                            "".to_string(),
+                            Some(CommandResponseData::Query(data)),
+                        ))
+                        .await;
+                }
+            };
+        })
+        .detach();
     }
 
-    let id = message_id.to_string();
-    let should_stop_main = (order == ProxyRequestData::SoftStop || order == ProxyRequestData::HardStop) && worker_id.is_none();
-    let f = join_all(futures).map(move |r| {
-      if should_stop_main {
-        executor::Executor::stop_main();
-      }
-
-      r
-    });
-
-    executor::Executor::execute(
-      f.map(move |v| {
-          let mut messages = vec![];
-          let mut has_error = false;
-          for response in v.iter() {
-              if let ProxyResponseStatus::Error(ref e) = response.1.status {
-                messages.push(format!("{}: {}", response.0, e));
-                has_error = true;
-              } else {
-                messages.push(format!("{}: OK", response.0));
-              }
-
-          }
-          if has_error {
-              executor::Executor::send_client(token, CommandResponse::new(
-                      id,
-                      CommandStatus::Error,
-                      messages.join(", "),
-                      None
-                      ));
-
-          } else {
-              executor::Executor::send_client(token, CommandResponse::new(
-                      id,
-                      CommandStatus::Ok,
-                      String::new(),
-                      None
-                      ));
-          }
-      }).map_err(|e| {
-        error!("worker_state error: {}", e);
-      })
-    );
-
-    match order {
-      ProxyRequestData::AddBackend(_)
-      | ProxyRequestData::RemoveBackend(_) => self.backends_count = self.state.count_backends(),
-      ProxyRequestData::AddHttpFront(_)
-      | ProxyRequestData::AddHttpsFront(_)
-      | ProxyRequestData::AddTcpFront(_)
-      | ProxyRequestData::RemoveHttpFront(_)
-      | ProxyRequestData::RemoveHttpsFront(_)
-      | ProxyRequestData::RemoveTcpFront(_) => self.frontends_count = self.state.count_frontends(),
-      _ => {}
-    };
-
-    gauge!("configuration.applications", self.state.applications.len());
-    gauge!("configuration.backends", self.backends_count);
-    gauge!("configuration.frontends", self.frontends_count);
-  }
-
-  pub fn load_static_application_configuration(&mut self) {
-    //FIXME: too many loops, this could be cleaner
-    for message in self.config.generate_config_messages() {
-      if let CommandRequestData::Proxy(order) = message.data {
-        self.state.handle_order(&order);
-
+    pub async fn worker_order(
+        &mut self,
+        client_id: String,
+        request_id: String,
+        order: ProxyRequestData,
+        worker_id: Option<u32>,
+    ) {
         if let &ProxyRequestData::AddCertificate(_) = &order {
-          debug!("config generated AddCertificate( ... )");
+            debug!("workerconfig client order AddCertificate()");
         } else {
-          debug!("config generated {:?}", order);
+            debug!("workerconfig client order {:?}", order);
         }
-        let mut found = false;
-        for ref mut worker in self.workers.values_mut()
-          .filter(|worker| worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped) {
 
-          let o = order.clone();
-          worker.push_message(ProxyRequest { id: message.id.clone(), order: o });
-          found = true;
+        if let &ProxyRequestData::Logging(ref logging_filter) = &order {
+            debug!("Changing main process log level to {}", logging_filter);
+            logging::LOGGER.with(|l| {
+                let directives = logging::parse_logging_spec(&logging_filter);
+                l.borrow_mut().set_directives(directives);
+            });
+            // also change / set the content of RUST_LOG so future workers / main thread
+            // will have the new logging filter value
+            ::std::env::set_var("RUST_LOG", logging_filter);
         }
+
+        if !self.state.handle_order(&order) {
+            // Check if the backend or frontend exist before deleting it
+            if worker_id.is_none() {
+                match order {
+                    ProxyRequestData::RemoveBackend(ref backend) => {
+                        let msg = format!(
+                            "No such backend {} at {} for the application {}",
+                            backend.backend_id, backend.address, backend.app_id
+                        );
+                        error!("{}", msg);
+                        self.answer_error(client_id, request_id, msg, None);
+                        return;
+                    }
+                    ProxyRequestData::RemoveHttpFront(HttpFront {
+                        ref app_id,
+                        ref address,
+                        ..
+                    })
+                    | ProxyRequestData::RemoveHttpsFront(HttpFront {
+                        ref app_id,
+                        ref address,
+                        ..
+                    })
+                    | ProxyRequestData::RemoveTcpFront(TcpFront {
+                        ref app_id,
+                        ref address,
+                    }) => {
+                        let msg = format!(
+                            "No such frontend at {} for the application {}",
+                            address, app_id
+                        );
+                        error!("{}", msg);
+                        self.answer_error(client_id, request_id, msg, None).await;
+                        return;
+                    }
+                    _ => {}
+                };
+            }
+        }
+
+        if self.config.automatic_state_save {
+            if order != ProxyRequestData::SoftStop || order != ProxyRequestData::HardStop {
+                if let Some(path) = self.config.saved_state.clone() {
+                    if let Ok(mut f) = fs::File::create(&path) {
+                        let _ = self.save_state_to_file(&mut f).map_err(|e| {
+                            error!("could not save state automatically to {}: {:?}", path, e);
+                        });
+                    }
+                }
+            }
+        }
+
+        let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
+        let mut found = false;
+        let mut stopping_workers = HashSet::new();
+
+        let mut count = 0usize;
+        for ref mut worker in self.workers.iter_mut().filter(|worker| {
+            worker.run_state != RunState::Stopping && worker.run_state != RunState::Stopped
+        }) {
+            if let Some(id) = worker_id {
+                if id != worker.id {
+                    continue;
+                }
+            }
+
+            let should_stop_worker =
+                order == ProxyRequestData::SoftStop || order == ProxyRequestData::HardStop;
+            if should_stop_worker {
+                worker.run_state = RunState::Stopping;
+                stopping_workers.insert(worker.id);
+            }
+
+            let id = worker.id.clone();
+            let req_id = format!("{}-worker-{}", request_id, worker.id);
+            worker.send(req_id.clone(), order.clone()).await;
+            self.in_flight.insert(req_id, (tx.clone(), 1));
+
+            found = true;
+            count += 1;
+        }
+
+        let should_stop_main = (order == ProxyRequestData::SoftStop
+            || order == ProxyRequestData::HardStop)
+            && worker_id.is_none();
+
+        let mut client_tx = self.clients.get_mut(&client_id).unwrap().clone();
+        let mut command_tx = self.command_tx.clone();
+        let prefix = format!("{}-worker-", request_id);
+        Task::spawn(async move {
+            let mut v = Vec::new();
+            let mut i = 0usize;
+            while let Some(proxy_response) = rx.next().await {
+                match proxy_response.status {
+                    ProxyResponseStatus::Ok => {
+                        let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
+                        v.push((tag.clone(), proxy_response));
+
+                        let id: u32 = tag.parse().unwrap();
+                        if stopping_workers.contains(&id) {
+                            command_tx.send(CommandMessage::WorkerClose { id }).await;
+                        }
+                    }
+                    ProxyResponseStatus::Processing => {
+                        info!("metrics processing");
+                        continue;
+                    }
+                    ProxyResponseStatus::Error(_) => {
+                        let tag = proxy_response.id.trim_start_matches(&prefix).to_string();
+                        v.push((tag, proxy_response));
+                    }
+                };
+
+                i += 1;
+                if i == count {
+                    break;
+                }
+            }
+
+            if should_stop_main {
+                command_tx.send(CommandMessage::MasterStop).await;
+            }
+
+            let mut messages = vec![];
+            let mut has_error = false;
+            for response in v.iter() {
+                if let ProxyResponseStatus::Error(ref e) = response.1.status {
+                    messages.push(format!("{}: {}", response.0, e));
+                    has_error = true;
+                } else {
+                    messages.push(format!("{}: OK", response.0));
+                }
+            }
+
+            if has_error {
+                client_tx
+                    .send(CommandResponse::new(
+                        request_id,
+                        CommandStatus::Error,
+                        messages.join(", "),
+                        None,
+                    ))
+                    .await;
+            } else {
+                client_tx
+                    .send(CommandResponse::new(
+                        request_id,
+                        CommandStatus::Ok,
+                        "".to_string(),
+                        None,
+                    ))
+                    .await;
+            }
+        })
+        .detach();
 
         if !found {
-          // FIXME: should send back error here
-          error!("no worker found");
+            // FIXME: should send back error here
+            error!("no worker found");
         }
-      }
-    }
 
-    self.backends_count = self.state.count_backends();
-    self.frontends_count = self.state.count_frontends();
-    gauge!("configuration.applications", self.state.applications.len());
-    gauge!("configuration.backends", self.backends_count);
-    gauge!("configuration.frontends", self.frontends_count);
-  }
-
-  pub fn disable_cloexec_before_upgrade(&mut self) {
-    for ref mut worker in self.workers.values() {
-      if worker.run_state == RunState::Running {
-        util::disable_close_on_exec(worker.channel.sock.as_raw_fd());
-      }
-    }
-    trace!("disabling cloexec on listener: {}", self.sock.as_raw_fd());
-    util::disable_close_on_exec(self.sock.as_raw_fd());
-  }
-
-  pub fn enable_cloexec_after_upgrade(&mut self) {
-    for ref mut worker in self.workers.values() {
-      if worker.run_state == RunState::Running {
-        util::enable_close_on_exec(worker.channel.sock.as_raw_fd());
-      }
-    }
-        util::enable_close_on_exec(self.sock.as_raw_fd());
-  }
-
-  pub fn generate_upgrade_data(&self) -> UpgradeData {
-    let workers: Vec<SerializedWorker> = self.workers.values().map(|ref worker| SerializedWorker::from_worker(worker)).collect();
-    //FIXME: ensure there's at least one worker
-    let state = self.state.clone();
-
-    UpgradeData {
-      command:     self.sock.as_raw_fd(),
-      config:      self.config.clone(),
-      workers:     workers,
-      state:       state,
-      next_id:     self.next_id,
-      token_count: self.token_count,
-    }
-  }
-
-  pub fn from_upgrade_data(upgrade_data: UpgradeData) -> CommandServer {
-    let poll = Poll::new().expect("should create poll object");
-    let UpgradeData {
-      command,
-      config,
-      workers,
-      state,
-      next_id,
-      token_count,
-    } = upgrade_data;
-
-    debug!("listener is: {}", command);
-    let mut listener = unsafe { UnixListener::from_raw_fd(command) };
-    poll.registry().register(&mut listener, Token(0), Interest::READABLE | Interest::WRITABLE).expect("should register listener correctly");
-
-
-    let buffer_size     = config.command_buffer_size;
-    let max_buffer_size = config.max_command_buffer_size;
-
-    let workers: HashMap<Token, Worker> = workers.iter().filter_map(|serialized| {
-      if serialized.run_state == RunState::Stopped {
-        return None;
-      }
-
-      let mut stream = unsafe { UnixStream::from_raw_fd(serialized.fd) };
-      if let Some(token) = serialized.token {
-        let _register = poll.registry().register(&mut stream, Token(token),
-          Interest::READABLE | Interest::WRITABLE);
-        debug!("registering: {:?}", _register);
-
-        let mut channel = Channel::new(stream, buffer_size, buffer_size * 2);
-        channel.readiness.insert(Ready::writable());
-        Some(
-          (
-            Token(token),
-            Worker {
-              id:         serialized.id,
-              channel:    channel,
-              token:      Some(Token(token)),
-              pid:        serialized.pid,
-              run_state:  serialized.run_state.clone(),
-              queue:      serialized.queue.clone().into(),
-              scm:        ScmSocket::new(serialized.scm),
+        match order {
+            ProxyRequestData::AddBackend(_) | ProxyRequestData::RemoveBackend(_) => {
+                self.backends_count = self.state.count_backends()
             }
-          )
-        )
-      } else { None }
-    }).collect();
+            ProxyRequestData::AddHttpFront(_)
+            | ProxyRequestData::AddHttpsFront(_)
+            | ProxyRequestData::AddTcpFront(_)
+            | ProxyRequestData::RemoveHttpFront(_)
+            | ProxyRequestData::RemoveHttpsFront(_)
+            | ProxyRequestData::RemoveTcpFront(_) => {
+                self.frontends_count = self.state.count_frontends()
+            }
+            _ => {}
+        };
 
-    let config_state = state.clone();
-
-    let backends_count  = config_state.count_backends();
-    let frontends_count = config_state.count_frontends();
-
-    let path = unsafe { get_executable_path() };
-    CommandServer {
-      sock:              listener,
-      poll:              poll,
-      config:            config,
-      buffer_size:       buffer_size,
-      max_buffer_size:   max_buffer_size,
-      //FIXME: deserialize client connections as well, otherwise they might leak?
-      clients:           Slab::with_capacity(1024),
-      event_subscribers: Vec::new(),
-      workers:           workers,
-      next_id:           next_id,
-      state:             config_state,
-      token_count:       token_count,
-
-      //FIXME: deserialize this as well
-      must_stop:         false,
-      executable_path:   path,
-      backends_count:    backends_count,
-      frontends_count:   frontends_count,
-      current_events:    HashMap::new(),
+        gauge!("configuration.applications", self.state.applications.len());
+        gauge!("configuration.backends", self.backends_count);
+        gauge!("configuration.frontends", self.frontends_count);
     }
-  }
+}
+
+pub fn parse(input: &[u8]) -> IResult<&[u8], Vec<CommandRequest>> {
+    use serde_json::from_slice;
+    many0!(
+        input,
+        //complete!(terminated!(map_res!(map_res!(is_not!("\0"), from_utf8), from_str), char!('\0')))
+        complete!(terminated!(
+            map_res!(is_not!("\0"), from_slice),
+            char!('\0')
+        ))
+    )
 }

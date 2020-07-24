@@ -14,7 +14,7 @@ thread_local! {
   pub static TAG:    String          = LOGGER.with(|logger| (*logger.borrow()).tag.clone());
 }
 
-static COMPAT_LOGGER: CompatLogger = CompatLogger;
+pub static COMPAT_LOGGER: CompatLogger = CompatLogger;
 
 pub struct Logger {
   pub directives:     Vec<LogDirective>,
@@ -620,7 +620,7 @@ macro_rules! fixme {
 }
 
 use crate::log;
-struct CompatLogger;
+pub struct CompatLogger;
 
 impl From<log::Level> for LogLevel {
   fn from(lvl: log::Level) -> Self {

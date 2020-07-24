@@ -54,9 +54,11 @@ pub fn start_workers(executable_path: String, config: &Config) -> nix::Result<Ve
       Ok((pid, command, scm)) => {
         let mut w =  Worker::new(index as u32, pid, command, scm, config);
         // the new worker expects a status message at startup
-        w.channel.set_blocking(true);
-        w.channel.write_message(&ProxyRequest { id: format!("start-status-{}", index), order: ProxyRequestData::Status });
-        w.channel.set_nonblocking(true);
+        if let Some(channel) = w.channel.as_mut() {
+            channel.set_blocking(true);
+            channel.write_message(&ProxyRequest { id: format!("start-status-{}", index), order: ProxyRequestData::Status });
+            channel.set_nonblocking(true);
+        }
         workers.push(w);
       },
       Err(e) => return Err(e)
