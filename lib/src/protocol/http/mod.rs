@@ -626,10 +626,19 @@ impl<Front:SocketHandler> Http<Front> {
       SocketResult::Error => {
         //we were in keep alive but the peer closed the connection
         if self.request == Some(RequestState::Initial) {
+          // count an error if we were waiting for the first request
+          // otherwise, if we already had one completed request and response,
+          // and are waiting for the next one, we do not count a socket
+          // closing abruptly as an error
+          if self.keepalive_count == 0 {
+              self.frontend.read_error();
+          }
+
           metrics.service_stop();
           self.front_readiness.reset();
           self.back_readiness.reset();
         } else {
+          self.frontend.read_error();
           let front_readiness = self.front_readiness.clone();
           let back_readiness  = self.back_readiness.clone();
           self.log_request_error(metrics,
@@ -641,10 +650,19 @@ impl<Front:SocketHandler> Http<Front> {
       SocketResult::Closed => {
         //we were in keep alive but the peer closed the connection
         if self.request == Some(RequestState::Initial) {
+          // count an error if we were waiting for the first request
+          // otherwise, if we already had one completed request and response,
+          // and are waiting for the next one, we do not count a socket
+          // closing abruptly as an error
+          if self.keepalive_count == 0 {
+              self.frontend.read_error();
+          }
+
           metrics.service_stop();
           self.front_readiness.reset();
           self.back_readiness.reset();
         } else {
+          self.frontend.read_error();
           let front_readiness = self.front_readiness.clone();
           let back_readiness  = self.back_readiness.clone();
           self.log_request_error(metrics,
@@ -803,6 +821,7 @@ impl<Front:SocketHandler> Http<Front> {
     };
 
     if res == SocketResult::Error {
+      self.frontend.write_error();
       self.log_request_error(metrics, "error writing default answer to front socket, closing");
       SessionResult::CloseSession
     } else {
@@ -865,6 +884,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     match res {
       SocketResult::Error | SocketResult::Closed => {
+        self.frontend.write_error();
         self.log_request_error(metrics, "error writing to front socket, closing");
         return SessionResult::CloseSession;
       },

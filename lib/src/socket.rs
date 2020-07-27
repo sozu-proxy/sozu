@@ -35,6 +35,8 @@ pub trait SocketHandler {
   fn has_vectored_writes(&self) -> bool { false }
   fn socket_ref(&self) -> &TcpStream;
   fn protocol(&self) -> TransportProtocol;
+  fn read_error(&self);
+  fn write_error(&self);
 }
 
 impl SocketHandler for TcpStream {
@@ -50,12 +52,10 @@ impl SocketHandler for TcpStream {
         Err(e) => match e.kind() {
           ErrorKind::WouldBlock => return (size, SocketResult::WouldBlock),
           ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe => {
-            incr!("tcp.read.error");
             return (size, SocketResult::Closed)
           },
           _ => {
             error!("SOCKET\tsocket_read error={:?}", e);
-            incr!("tcp.read.error");
             return (size, SocketResult::Error)
           },
         }
@@ -116,6 +116,14 @@ impl SocketHandler for TcpStream {
   fn protocol(&self) -> TransportProtocol {
     TransportProtocol::Tcp
   }
+
+  fn read_error(&self) {
+    incr!("tcp.read.error");
+  }
+
+  fn write_error(&self) {
+    incr!("tcp.write.error");
+  }
 }
 
 #[cfg(feature = "use-openssl")]
@@ -135,20 +143,16 @@ impl SocketHandler for SslStream<TcpStream> {
             ErrorCode::WANT_WRITE => return (size, SocketResult::WouldBlock),
             ErrorCode::SSL        => {
               debug!("SOCKET-TLS\treadable TLS socket SSL error: {:?} -> {:?}", e, e.ssl_error());
-              incr!("openssl.read.error");
               return (size, SocketResult::Error)
             },
             ErrorCode::SYSCALL    => {
-              incr!("openssl.read.error");
               return (size, SocketResult::Error)
             },
             ErrorCode::ZERO_RETURN => {
-              incr!("openssl.read.error");
               return (size, SocketResult::Closed)
             },
             _ => {
               debug!("SOCKET-TLS\treadable TLS socket error={:?} -> {:?}", e, e.ssl_error());
-              incr!("openssl.read.error");
               return (size, SocketResult::Error)
             }
           }
@@ -172,21 +176,16 @@ impl SocketHandler for SslStream<TcpStream> {
             ErrorCode::WANT_WRITE => return (size, SocketResult::WouldBlock),
             ErrorCode::SSL        => {
               debug!("SOCKET-TLS\twritable TLS socket SSL error: {:?} -> {:?}", e, e.ssl_error());
-              incr!("openssl.write.error");
               return (size, SocketResult::Error)
             },
             ErrorCode::SYSCALL        => {
-              debug!("SOCKET-TLS\twritable TLS socket syscall error: {:?} -> {:?}", e, e.ssl_error());
-              incr!("openssl.write.error");
               return (size, SocketResult::Error)
             },
             ErrorCode::ZERO_RETURN => {
-              incr!("openssl.write.error");
               return (size, SocketResult::Closed)
             },
             _ => {
               debug!("SOCKET-TLS\twritable TLS socket error={:?} -> {:?}", e, e.ssl_error());
-              incr!("openssl.write.error");
               return (size, SocketResult::Error)
             }
           }
@@ -205,6 +204,14 @@ impl SocketHandler for SslStream<TcpStream> {
       SslVersion::TLS1_2 => TransportProtocol::Tls1_2,
       _ => TransportProtocol::Tls1_3,
     }).unwrap_or(TransportProtocol::Tcp)
+  }
+
+  fn read_error(&self) {
+      incr!("openssl.read.error");
+  }
+
+  fn write_error(&self) {
+      incr!("openssl.write.error");
   }
 }
 
@@ -240,12 +247,10 @@ impl SocketHandler for FrontRustls {
             can_read = false;
           },
           ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe => {
-            incr!("rustls.read.error");
             is_closed = true;
           },
           _ => {
             error!("could not read TLS stream from socket: {:?}", e);
-            incr!("rustls.read.error");
             is_error = true;
             break;
            }
@@ -267,13 +272,11 @@ impl SocketHandler for FrontRustls {
               break;
             },
             ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted | ErrorKind::BrokenPipe => {
-              incr!("rustls.read.error");
               is_closed = true;
               break;
             },
             _ => {
               error!("could not read data from TLS stream: {:?}", e);
-              incr!("rustls.read.error");
               is_error = true;
               break;
             }
@@ -386,6 +389,14 @@ impl SocketHandler for FrontRustls {
       ProtocolVersion::TLSv1_3 => TransportProtocol::Tls1_3,
       _ => TransportProtocol::Tls1_3,
     }).unwrap_or(TransportProtocol::Tcp)
+  }
+
+  fn read_error(&self) {
+      incr!("rustls.read.error");
+  }
+
+  fn write_error(&self) {
+      incr!("rustls.write.error");
   }
 }
 
