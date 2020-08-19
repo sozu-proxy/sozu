@@ -156,10 +156,10 @@ impl Session {
       true
     } else if let State::Expect(expect) = protocol {
       debug!("switching to HTTP");
-      let readiness = expect.readiness;
       if let Some((Some(public_address), Some(client_address))) = expect.addresses.as_ref().map(|add| {
         (add.destination(), add.source())
       }) {
+        let readiness = expect.readiness;
         let http = Http::new(expect.frontend, expect.frontend_token, expect.request_id,
           self.pool.clone(), public_address, Some(client_address),
           self.sticky_name.clone(), Protocol::HTTP).map(|mut http| {
@@ -178,11 +178,10 @@ impl Session {
         gauge_add!("protocol.http", 1);
         self.protocol = http;
         return true;
+      } else {
+        self.protocol = Some(State::Expect(expect));
+        false
       }
-
-      //we cannot put back the protocol since we moved the stream
-      //self.protocol = Some(State::Expect(expect));
-      false
     } else {
       self.protocol = Some(protocol);
       true
