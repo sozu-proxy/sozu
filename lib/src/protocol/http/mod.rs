@@ -95,7 +95,7 @@ pub struct Http<Front:SocketHandler> {
 impl<Front:SocketHandler> Http<Front> {
   pub fn new(sock: Front, token: Token, request_id: Hyphenated, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: SocketAddr, session_address: Option<SocketAddr>, sticky_name: String,
-    protocol: Protocol) -> Option<Http<Front>> {
+    protocol: Protocol) -> Http<Front> {
 
     let mut session = Http {
       frontend:           sock,
@@ -130,7 +130,7 @@ impl<Front:SocketHandler> Http<Front> {
     session.added_req_header = session.added_request_header(public_address, session_address);
     session.added_res_header = session.added_response_header();
 
-    Some(session)
+    session
   }
 
   pub fn reset(&mut self) {

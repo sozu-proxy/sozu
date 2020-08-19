@@ -172,43 +172,34 @@ impl Session {
       };
 
       let readiness = handshake.readiness.clone();
-      let http = Http::new(front_stream, self.frontend_token, handshake.request_id,
-        self.pool.clone(), self.public_address, self.peer_address,
-        self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
+      let mut http = Http::new(front_stream, self.frontend_token, handshake.request_id,
+                               self.pool.clone(), self.public_address, self.peer_address,
+                               self.sticky_name.clone(), Protocol::HTTPS);
 
-        let res = http.frontend.session.read(front_buf.space());
-        match res {
+      let res = http.frontend.session.read(front_buf.space());
+      match res {
           Ok(sz) =>{
-            //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
-            front_buf.fill(sz);
-            count!("bytes_in", sz as i64);
-            self.metrics.bin += sz;
+              //info!("rustls upgrade: there were {} bytes of plaintext available", sz);
+              front_buf.fill(sz);
+              count!("bytes_in", sz as i64);
+              self.metrics.bin += sz;
           },
           Err(e) => {
-            error!("read error: {:?}", e);
+              error!("read error: {:?}", e);
           }
-        }
-
-        let sz = front_buf.available_data();
-        let mut buf = BufferQueue::with_buffer(front_buf);
-        buf.sliced_input(sz);
-
-        gauge_add!("protocol.tls.handshake", -1);
-        gauge_add!("protocol.https", 1);
-        http.front_buf = Some(buf);
-        http.front_readiness = readiness;
-        http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-        State::Http(http)
-      });
-
-      if http.is_none() {
-        error!("could not upgrade to HTTP");
-        //we cannot put back the protocol since we moved the stream
-        //self.protocol = Some(State::Handshake(handshake));
-        return false;
       }
 
-      self.protocol = http;
+      let sz = front_buf.available_data();
+      let mut buf = BufferQueue::with_buffer(front_buf);
+      buf.sliced_input(sz);
+
+      gauge_add!("protocol.tls.handshake", -1);
+      gauge_add!("protocol.https", 1);
+      http.front_buf = Some(buf);
+      http.front_readiness = readiness;
+      http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
+
+      self.protocol = Some(State::Http(http));
       return true;
     } else if let State::Http(http) = protocol {
       debug!("https switching to wss");

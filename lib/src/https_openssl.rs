@@ -196,26 +196,18 @@ impl Session {
         ssl.current_cipher().map(|c| incr!(c.name()));
       });
 
-      let http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(),
+      let mut http = Http::new(unwrap_msg!(handshake.stream), self.frontend_token.clone(),
         handshake.request_id, pool, self.public_address.clone(), self.peer_address,
-        self.sticky_name.clone(), Protocol::HTTPS).map(|mut http| {
+        self.sticky_name.clone(), Protocol::HTTPS);
 
-        http.front_readiness = readiness;
-        http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
-        State::Http(http)
-      });
+      http.front_readiness = readiness;
+      http.front_readiness.interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
 
-      if http.is_none() {
-        error!("could not upgrade to HTTP");
-        //we cannot put back the protocol since we moved the stream
-        //self.protocol = Some(State::Handshake(handshake));
-        return false;
-      }
       gauge_add!("protocol.tls.handshake", -1);
       gauge_add!("protocol.https", 1);
 
       self.ssl = handshake.ssl;
-      self.protocol = http;
+      self.protocol = Some(State::Http(http));
       return true;
     } else if let State::Http(http) = protocol {
       debug!("https switching to wss");

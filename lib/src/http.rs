@@ -76,8 +76,8 @@ impl Session {
     } else {
       gauge_add!("protocol.http", 1);
       let session_address = sock.peer_addr().ok();
-      Http::new(sock, token, request_id, pool.clone(), public_address,
-        session_address, sticky_name.clone(), Protocol::HTTP).map(|http| State::Http(http))
+      Some(State::Http(Http::new(sock, token, request_id, pool.clone(), public_address,
+        session_address, sticky_name.clone(), Protocol::HTTP)))
     };
 
     let metrics = SessionMetrics::new(Some(delay));
@@ -160,23 +160,14 @@ impl Session {
         (add.destination(), add.source())
       }) {
         let readiness = expect.readiness;
-        let http = Http::new(expect.frontend, expect.frontend_token, expect.request_id,
+        let mut http = Http::new(expect.frontend, expect.frontend_token, expect.request_id,
           self.pool.clone(), public_address, Some(client_address),
-          self.sticky_name.clone(), Protocol::HTTP).map(|mut http| {
-            http.front_readiness.event = readiness.event;
-
-            State::Http(http)
-        });
-
-        if http.is_none() {
-          //we cannot put back the protocol since we moved the stream
-          //self.protocol = Some(State::Expect(expect));
-          return false;
-        }
+          self.sticky_name.clone(), Protocol::HTTP);
+        http.front_readiness.event = readiness.event;
 
         gauge_add!("protocol.proxy.expect", -1);
         gauge_add!("protocol.http", 1);
-        self.protocol = http;
+        self.protocol = Some(State::Http(http));
         return true;
       } else {
         self.protocol = Some(State::Expect(expect));
