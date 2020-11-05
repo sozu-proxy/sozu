@@ -106,11 +106,13 @@ fn main() {
         CertificateCmd::Add{ certificate, chain, key, address } => {
           add_certificate(channel, timeout, address, &certificate, &chain, &key)
         },
-        CertificateCmd::Remove{ certificate, address } => {
-          remove_certificate(channel, timeout, address, &certificate)
+        CertificateCmd::Remove{ certificate, address, fingerprint } => {
+          remove_certificate(channel, timeout, address, certificate.as_deref(),
+            fingerprint.as_deref())
         },
-        CertificateCmd::Replace{ certificate, chain, key, old_certificate, address } => {
-          replace_certificate(channel, timeout, address, &certificate, &chain, &key, &old_certificate)
+        CertificateCmd::Replace{ certificate, chain, key, old_certificate, address, old_fingerprint } => {
+          replace_certificate(channel, timeout, address, &certificate, &chain,
+            &key, old_certificate.as_deref(), old_fingerprint.as_deref())
         },
       }
     },

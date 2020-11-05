@@ -231,7 +231,9 @@ pub enum CertificateCmd {
     #[structopt(short = "a", long = "address", help = "listener address, format: IP:port")]
     address: SocketAddr,
     #[structopt(short = "cert", long = "certificate", help = "path to the certificate")]
-    certificate: String,
+    certificate: Option<String>,
+    #[structopt(short = "f", long = "fingerprint", help = "certificate fingerprint")]
+    fingerprint: Option<String>,
   },
   #[structopt(name = "replace", about = "Replace an existing certificate")]
   Replace {
@@ -244,7 +246,9 @@ pub enum CertificateCmd {
     #[structopt(long = "new-key", help = "path to the new key")]
     key: String,
     #[structopt(short = "old-cert", long = "old-certificate", help = "path to the old certificate")]
-    old_certificate: String,
+    old_certificate: Option<String>,
+    #[structopt(short = "f", long = "fingerprint", help = "old certificate fingerprint")]
+    old_fingerprint: Option<String>,
   }
 }
 

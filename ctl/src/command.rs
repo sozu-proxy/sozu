@@ -1056,8 +1056,26 @@ pub fn add_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout
 }
 
 pub fn remove_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
-  certificate_path: &str) {
-  if let Some(fingerprint) = get_certificate_fingerprint(certificate_path) {
+  certificate_path: Option<&str>, fingerprint: Option<&str>) {
+  if certificate_path.is_some() && fingerprint.is_some() {
+    eprintln!("Error: Either provide the certificate's path or its fingerprint");
+    exit(1);
+  }
+
+  if certificate_path.is_none() && fingerprint.is_none() {
+    eprintln!("Error: Either provide the certificate's path or its fingerprint");
+    exit(1);
+  }
+
+    if let Some(fingerprint) = fingerprint.and_then(|s| {
+        match hex::decode(s) {
+            Ok(v) => Some(CertFingerprint(v)),
+            Err(e) => {
+                eprintln!("Error decoding the certificate fingerprint (expected hexadecimal data): {:?}", e);
+                None
+            }
+        }
+    }).or(certificate_path.and_then(get_certificate_fingerprint)) {
     order_command(channel, timeout, ProxyRequestData::RemoveCertificate(RemoveCertificate {
       front: address,
       fingerprint: fingerprint,
@@ -1067,10 +1085,29 @@ pub fn remove_certificate(channel: Channel<CommandRequest,CommandResponse>, time
 }
 
 pub fn replace_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
-  new_certificate_path: &str, new_certificate_chain_path: &str, new_key_path: &str, old_certificate_path: &str)
+  new_certificate_path: &str, new_certificate_chain_path: &str, new_key_path: &str,
+  old_certificate_path: Option<&str>, old_fingerprint: Option<&str>)
 {
+  if old_certificate_path.is_some() && old_fingerprint.is_some() {
+    eprintln!("Error: Either provide the old certificate's path or its fingerprint");
+    exit(1);
+  }
+
+  if old_certificate_path.is_none() && old_fingerprint.is_none() {
+    eprintln!("Error: Either provide the old certificate's path or its fingerprint");
+    exit(1);
+  }
+
   if let Some(new_certificate) = load_full_certificate(new_certificate_path, new_certificate_chain_path, new_key_path) {
-    if let Some(old_fingerprint) = get_certificate_fingerprint(old_certificate_path) {
+    if let Some(old_fingerprint) = old_fingerprint.and_then(|s| {
+        match hex::decode(s) {
+            Ok(v) => Some(CertFingerprint(v)),
+            Err(e) => {
+                eprintln!("Error decoding the certificate fingerprint (expected hexadecimal data): {:?}", e);
+                None
+            }
+        }
+    }).or(old_certificate_path.and_then(get_certificate_fingerprint)) {
       order_command(channel, timeout, ProxyRequestData::ReplaceCertificate(ReplaceCertificate {
         front: address,
         new_certificate,
