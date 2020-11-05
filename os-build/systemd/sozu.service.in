@@ -8,6 +8,7 @@ Wants=network-online.target
 PIDFile=__RUNDIR__/sozu/sozu.pid
 ExecStart=__BINDIR__/sozu start --config __SYSCONFDIR__/sozu/config.toml
 Restart=on-failure
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
