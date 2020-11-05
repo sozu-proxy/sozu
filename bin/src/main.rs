@@ -205,13 +205,26 @@ fn check_process_limits(config: &Config) -> Result<(), StartupError> {
   let process_limits_file = sozu_command::config::Config::load_file("/proc/self/limits")
     .expect("Couldn't read /proc/self/limits to determine max open file descriptors limit");
 
-  let re = Regex::new(r"Max open files\s*\d*\s*(\d*)\s*files").unwrap();
+  let re = Regex::new(r"Max open files\s*(\d*)\s*(\d*)\s*files").unwrap();
+  let res = re.captures(&process_limits_file);
 
-  if let Some(hard_limit) = re.captures(&process_limits_file).and_then(|c| c.get(1))
+  if let Some(soft_limit) = res.as_ref().and_then(|c| c.get(1))
     .and_then(|m| m.as_str().parse::<usize>().ok()) {
-    if config.max_connections > hard_limit {
-      let error = format!("At least one worker can't have that many connections. \
-              Current max file descriptor hard limit is: {}", hard_limit);
+    if config.max_connections * 2 > soft_limit {
+      let error = format!("at least one worker can't have that many connections. \
+              current max file descriptor soft limit is: {}, \
+              configured max_connections is {} (the worker needs two file descriptors \
+              per client connection)", soft_limit, config.max_connections);
+      return Err(StartupError::TooManyAllowedConnectionsForWorker(error));
+    }
+  }
+  if let Some(hard_limit) = res.as_ref().and_then(|c| c.get(2))
+    .and_then(|m| m.as_str().parse::<usize>().ok()) {
+    if config.max_connections * 2 > hard_limit {
+      let error = format!("at least one worker can't have that many connections. \
+              current max file descriptor hard limit is: {}, \
+              configured max_connections is {} (the worker needs two file descriptors \
+              per client connection)", hard_limit, config.max_connections);
       return Err(StartupError::TooManyAllowedConnectionsForWorker(error));
     }
   }
