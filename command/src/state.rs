@@ -767,6 +767,7 @@ pub fn get_application_ids_by_domain(state: &ConfigState, hostname: String, path
       (None, _) => true,
       (Some(ref path), PathRule::Prefix(s)) => path == s,
       (Some(ref path), PathRule::Regex(s)) => path == s,
+      (Some(ref path), PathRule::Equals(s)) => path == s,
     }
   };
 
@@ -1209,6 +1210,7 @@ impl serde::Serialize for RouteKey {
     let s = match &self.2 {
       PathRule::Prefix(prefix) => format!("{};{};P{}", self.0, self.1, prefix),
       PathRule::Regex(regex) => format!("{};{};R{}", self.0, self.1, regex),
+      PathRule::Equals(path) => format!("{};{};={}", self.0, self.1, path),
     };
     serializer.serialize_str(&s)
   }
@@ -1244,6 +1246,7 @@ impl<'de> Visitor<'de> for RouteKeyVisitor {
     let path_rule = match path_rule_str.chars().next() {
       Some('R') => PathRule::Regex(String::from(&path_rule_str[1..])),
       Some('P') => PathRule::Prefix(String::from(&path_rule_str[1..])),
+      Some('=') => PathRule::Equals(String::from(&path_rule_str[1..])),
       _ => return Err(E::custom(format!("invalid path rule"))),
     };
 

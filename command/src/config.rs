@@ -280,6 +280,7 @@ pub enum ProxyProtocolConfig {
 pub enum PathRuleType {
   Prefix,
   Regex,
+  Equals,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
@@ -344,6 +345,7 @@ impl FileAppFrontendConfig {
       (None, _) => PathRule::Prefix("".to_string()),
       (Some(s), Some(PathRuleType::Prefix)) => PathRule::Prefix(s.to_string()),
       (Some(s), Some(PathRuleType::Regex)) => PathRule::Regex(s.to_string()),
+      (Some(s), Some(PathRuleType::Equals)) => PathRule::Equals(s.to_string()),
       (Some(s), None) => PathRule::Prefix(s.clone()),
     };
 

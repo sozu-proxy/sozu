@@ -40,6 +40,7 @@ impl Router {
             prefix_length = sz;
             res = Some(app_id);
           },
+          PathRuleResult::Equals => return Some(app_id.clone()),
           PathRuleResult::None => {}
         }
       }
@@ -317,15 +318,16 @@ impl std::str::FromStr for DomainRule {
 
 #[derive(Clone,Debug)]
 pub enum PathRule {
-  /// URI prefix, app
   Prefix(String),
   Regex(Regex),
+  Equals(String),
 }
 
 #[derive(PartialEq)]
 pub enum PathRuleResult {
   Regex,
   Prefix(usize),
+  Equals,
   None,
 }
 
@@ -342,6 +344,11 @@ impl PathRule {
       } else {
         PathRuleResult::None
       },
+      PathRule::Equals(s) => if path == s.as_bytes() {
+        PathRuleResult::Equals
+      } else {
+        PathRuleResult::None
+      },
     }
   }
 
@@ -349,6 +356,7 @@ impl PathRule {
     match rule {
       sozu_command::proxy::PathRule::Prefix(s) => Some(PathRule::Prefix(s)),
       sozu_command::proxy::PathRule::Regex(s)  => Regex::new(&s).ok().map(PathRule::Regex),
+      sozu_command::proxy::PathRule::Equals(s) => Some(PathRule::Equals(s)),
     }
   }
 }
