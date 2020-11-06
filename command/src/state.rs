@@ -132,17 +132,23 @@ impl ConfigState {
         }
       },
       &ProxyRequestData::AddHttpFrontend(ref front) => {
-        if self.http_fronts.contains_key(&RouteKey(front.address, front.hostname.to_string(), front.path.clone())) {
+        if self.http_fronts.contains_key(&RouteKey(
+                front.address, front.hostname.to_string(),
+                front.path.clone(), front.method.clone())) {
             false
         } else {
           self.http_fronts.insert(
-            RouteKey(front.address, front.hostname.to_string(), front.path.clone()),
+            RouteKey(front.address, front.hostname.to_string(),
+              front.path.clone(), front.method.clone()),
             front.clone());
           true
         }
       },
       &ProxyRequestData::RemoveHttpFrontend(ref front) => {
-        self.http_fronts.remove(&RouteKey(front.address, front.hostname.to_string(), front.path.clone())).is_some()
+        self.http_fronts.remove(&RouteKey(
+                front.address, front.hostname.to_string(),
+                front.path.clone(), front.method.clone())
+            ).is_some()
       },
       &ProxyRequestData::AddCertificate(ref add) => {
         let fingerprint = match calculate_fingerprint(&add.certificate.certificate.as_bytes()[..]) {
@@ -186,17 +192,23 @@ impl ConfigState {
         }
       },
       &ProxyRequestData::AddHttpsFrontend(ref front) => {
-        if self.https_fronts.contains_key(&RouteKey(front.address, front.hostname.to_string(), front.path.clone())) {
+        if self.https_fronts.contains_key(&RouteKey(
+                front.address, front.hostname.to_string(),
+                front.path.clone(), front.method.clone())) {
             false
         } else {
           self.https_fronts.insert(
-            RouteKey(front.address, front.hostname.to_string(), front.path.clone()),
+            RouteKey(front.address, front.hostname.to_string(),
+              front.path.clone(), front.method.clone()),
             front.clone());
           true
         }
       },
       &ProxyRequestData::RemoveHttpsFrontend(ref front) => {
-        self.https_fronts.remove(&RouteKey(front.address, front.hostname.to_string(), front.path.clone())).is_some()
+        self.https_fronts.remove(&RouteKey(
+                front.address, front.hostname.to_string(),
+                front.path.clone(), front.method.clone())
+            ).is_some()
       },
       &ProxyRequestData::AddTcpFrontend(ref front) => {
         let front_vec = self.tcp_fronts.entry(front.cluster_id.clone()).or_insert_with(Vec::new);
@@ -889,8 +901,8 @@ mod tests {
   #[test]
   fn serialize() {
     let mut state:ConfigState = Default::default();
-    state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend { route: Route::ClusterId(String::from("app_1")), hostname: String::from("lolcatho.st:8080"), path: PathRule::Prefix(String::from("/")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Tree }));
-    state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend { route: Route::ClusterId(String::from("app_2")), hostname: String::from("test.local"), path: PathRule::Prefix(String::from("/abc")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Pre }));
+    state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend { route: Route::ClusterId(String::from("app_1")), hostname: String::from("lolcatho.st:8080"), path: PathRule::Prefix(String::from("/")),  method: None, address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Tree }));
+    state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend { route: Route::ClusterId(String::from("app_2")), hostname: String::from("test.local"), path: PathRule::Prefix(String::from("/abc")),  method: None, address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Pre }));
     state.handle_order(&ProxyRequestData::AddBackend(Backend { cluster_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state.handle_order(&ProxyRequestData::AddBackend(Backend { cluster_id: String::from("app_1"), backend_id: String::from("app_1-1"), address: "127.0.0.2:1027".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state.handle_order(&ProxyRequestData::AddBackend(Backend { cluster_id: String::from("app_2"), backend_id: String::from("app_2-0"), address: "192.167.1.2:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
@@ -911,22 +923,22 @@ mod tests {
   #[test]
   fn diff() {
     let mut state:ConfigState = Default::default();
-    state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend { route: Route::ClusterId(String::from("app_1")), hostname: String::from("lolcatho.st:8080"), path: PathRule::Prefix(String::from("/")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Post }));
-    state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend { route: Route::ClusterId(String::from("app_2")), hostname: String::from("test.local"), path: PathRule::Prefix(String::from("/abc")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Tree }));
+    state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend { route: Route::ClusterId(String::from("app_1")), hostname: String::from("lolcatho.st:8080"), path: PathRule::Prefix(String::from("/")), method: None, address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Post }));
+    state.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend { route: Route::ClusterId(String::from("app_2")), hostname: String::from("test.local"), path: PathRule::Prefix(String::from("/abc")), method: None, address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Tree }));
     state.handle_order(&ProxyRequestData::AddBackend(Backend { cluster_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state.handle_order(&ProxyRequestData::AddBackend(Backend { cluster_id: String::from("app_1"), backend_id: String::from("app_1-1"), address: "127.0.0.2:1027".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state.handle_order(&ProxyRequestData::AddBackend(Backend { cluster_id: String::from("app_2"), backend_id: String::from("app_2-0"), address: "192.167.1.2:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state.handle_order(&ProxyRequestData::AddCluster(Cluster { cluster_id: String::from("app_2"), sticky_session: true, https_redirect: true, proxy_protocol: None, load_balancing: LoadBalancingAlgorithms::RoundRobin, load_metric: None, answer_503: None }));
 
     let mut state2:ConfigState = Default::default();
-    state2.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend { route: Route::ClusterId(String::from("app_1")), hostname: String::from("lolcatho.st:8080"), path: PathRule::Prefix(String::from("/")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Post }));
+    state2.handle_order(&ProxyRequestData::AddHttpFrontend(HttpFrontend { route: Route::ClusterId(String::from("app_1")), hostname: String::from("lolcatho.st:8080"), path: PathRule::Prefix(String::from("/")), address: "0.0.0.0:8080".parse().unwrap(), method: None, position: RulePosition::Post }));
     state2.handle_order(&ProxyRequestData::AddBackend(Backend { cluster_id: String::from("app_1"), backend_id: String::from("app_1-0"), address: "127.0.0.1:1026".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state2.handle_order(&ProxyRequestData::AddBackend(Backend { cluster_id: String::from("app_1"), backend_id: String::from("app_1-1"), address: "127.0.0.2:1027".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state2.handle_order(&ProxyRequestData::AddBackend(Backend { cluster_id: String::from("app_1"), backend_id: String::from("app_1-2"), address: "127.0.0.2:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None  }));
     state2.handle_order(&ProxyRequestData::AddCluster(Cluster { cluster_id: String::from("app_3"), sticky_session: false, https_redirect: false, proxy_protocol: None, load_balancing: LoadBalancingAlgorithms::RoundRobin, load_metric: None, answer_503: None }));
 
    let e = vec!(
-     ProxyRequestData::RemoveHttpFrontend(HttpFrontend { route: Route::ClusterId(String::from("app_2")), hostname: String::from("test.local"), path: PathRule::Prefix(String::from("/abc")), address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Tree }),
+     ProxyRequestData::RemoveHttpFrontend(HttpFrontend { route: Route::ClusterId(String::from("app_2")), hostname: String::from("test.local"), path: PathRule::Prefix(String::from("/abc")),  method: None, address: "0.0.0.0:8080".parse().unwrap(), position: RulePosition::Tree }),
      ProxyRequestData::RemoveBackend(RemoveBackend { cluster_id: String::from("app_2"), backend_id: String::from("app_2-0"), address: "192.167.1.2:1026".parse().unwrap() }),
      ProxyRequestData::AddBackend(Backend { cluster_id: String::from("app_1"), backend_id: String::from("app_1-2"), address: "127.0.0.2:1028".parse().unwrap(), load_balancing_parameters: Some(LoadBalancingParams::default()), sticky_id: None, backup: None }),
      ProxyRequestData::RemoveCluster { cluster_id: String::from("app_2") },
@@ -958,6 +970,7 @@ mod tests {
       route: Route::ClusterId(String::from("MyApp_1")),
       hostname: String::from("lolcatho.st"),
       path: PathRule::Prefix(String::from("")),
+      method: None,
       address: "0.0.0.0:8080".parse().unwrap(),
       position: RulePosition::Tree,
     };
@@ -966,6 +979,7 @@ mod tests {
       route: Route::ClusterId(String::from("MyApp_1")),
       hostname: String::from("lolcatho.st"),
       path: PathRule::Prefix(String::from("")),
+      method: None,
       address: "0.0.0.0:8443".parse().unwrap(),
       position: RulePosition::Tree,
     };
@@ -974,6 +988,7 @@ mod tests {
       route: Route::ClusterId(String::from("MyApp_2")),
       hostname: String::from("lolcatho.st"),
       path: PathRule::Prefix(String::from("/api")),
+      method: None,
       address: "0.0.0.0:8080".parse().unwrap(),
       position: RulePosition::Tree,
     };
@@ -982,6 +997,7 @@ mod tests {
       route: Route::ClusterId(String::from("MyApp_2")),
       hostname: String::from("lolcatho.st"),
       path: PathRule::Prefix(String::from("/api")),
+      method: None,
       address: "0.0.0.0:8443".parse().unwrap(),
       position: RulePosition::Tree,
     };
@@ -1217,17 +1233,22 @@ mod tests {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash)]
-pub struct RouteKey(pub SocketAddr, pub String, pub PathRule);
+pub struct RouteKey(pub SocketAddr, pub String, pub PathRule, pub Option<String>);
 
 impl serde::Serialize for RouteKey {
   fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
       where S: serde::Serializer,
   {
-    let s = match &self.2 {
+    let mut s = match &self.2 {
       PathRule::Prefix(prefix) => format!("{};{};P{}", self.0, self.1, prefix),
       PathRule::Regex(regex) => format!("{};{};R{}", self.0, self.1, regex),
       PathRule::Equals(path) => format!("{};{};={}", self.0, self.1, path),
     };
+
+    if let Some(method) = &self.3 {
+        s = format!("{};{}", s, method);
+    }
+
     serializer.serialize_str(&s)
   }
 }
@@ -1293,7 +1314,9 @@ impl<'de> Visitor<'de> for RouteKeyVisitor {
       _ => return Err(E::custom(format!("invalid path rule"))),
     };
 
-    let res = Ok(RouteKey(address, hostname.to_string(), path_rule));
+    let method = it.next().map(String::from);
+
+    let res = Ok(RouteKey(address, hostname.to_string(), path_rule, method));
     res
   }
 }
