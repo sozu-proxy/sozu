@@ -313,6 +313,9 @@ pub struct HttpFrontend {
     #[serde(skip_serializing_if="is_default_path_rule")]
     pub path:       PathRule,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method:     Option<String>,
+    #[serde(default)]
     pub position:   RulePosition,
 }
 
@@ -321,6 +324,7 @@ impl Ord for HttpFrontend {
     self.route.cmp(&o.route)
       .then(self.hostname.cmp(&o.hostname))
       .then(self.path.cmp(&o.path))
+      .then(self.method.cmp(&o.method))
       .then(socketaddr_cmp(&self.address, &o.address))
       .then(self.position.cmp(&o.position))
   }
@@ -848,6 +852,7 @@ mod tests {
       route: Route::ClusterId(String::from("xxx")),
       hostname: String::from("yyy"),
       path: PathRule::Prefix(String::from("xxx")),
+      method: None,
       address: "127.0.0.1:4242".parse().unwrap(),
       position: RulePosition::Tree,
     }));
@@ -862,6 +867,7 @@ mod tests {
       route: Route::ClusterId(String::from("xxx")),
       hostname: String::from("yyy"),
       path: PathRule::Prefix(String::from("xxx")),
+      method: None,
       address: "127.0.0.1:4242".parse().unwrap(),
       position: RulePosition::Tree,
     }));
@@ -904,6 +910,7 @@ mod tests {
       route: Route::ClusterId(String::from("aa")),
       hostname: String::from("cltdl.fr"),
       path: PathRule::Prefix(String::from("")),
+      method: None,
       address: "127.0.0.1:4242".parse().unwrap(),
       position: RulePosition::Tree,
     }));
@@ -918,6 +925,7 @@ mod tests {
       route: Route::ClusterId(String::from("aa")),
       hostname: String::from("cltdl.fr"),
       path: PathRule::Prefix(String::from("")),
+      method: None,
       address: "127.0.0.1:4242".parse().unwrap(),
       position: RulePosition::Tree,
     });

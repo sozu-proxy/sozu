@@ -290,6 +290,7 @@ pub struct FileAppFrontendConfig {
   pub hostname:          Option<String>,
   pub path:              Option<String>,
   pub path_type:         Option<PathRuleType>,
+  pub method:            Option<String>,
   pub certificate:       Option<String>,
   pub key:               Option<String>,
   pub certificate_chain: Option<String>,
@@ -357,7 +358,8 @@ impl FileAppFrontendConfig {
       certificate_chain: chain_opt,
       tls_versions:      self.tls_versions.clone(),
       position:          self.position,
-      path
+      path,
+      method:            self.method.clone(),
     })
   }
 }
@@ -486,6 +488,7 @@ pub struct HttpFrontendConfig {
   pub address:           SocketAddr,
   pub hostname:          String,
   pub path:              PathRule,
+  pub method:            Option<String>,
   pub certificate:       Option<String>,
   pub key:               Option<String>,
   pub certificate_chain: Option<Vec<String>>,
@@ -517,6 +520,7 @@ impl HttpFrontendConfig {
         address:     self.address,
         hostname:    self.hostname.clone(),
         path:        self.path.clone(),
+        method:      self.method.clone(),
         position:    self.position.clone(),
       }));
     } else {
@@ -526,6 +530,7 @@ impl HttpFrontendConfig {
         address:    self.address,
         hostname:   self.hostname.clone(),
         path:       self.path.clone(),
+        method:     self.method.clone(),
         position:   self.position.clone(),
       }));
     }

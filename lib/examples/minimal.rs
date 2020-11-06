@@ -38,6 +38,7 @@ fn main() {
     address:  "127.0.0.1:8080".parse().unwrap(),
     hostname: String::from("example.com"),
     path:     PathRule::Prefix(String::from("/")),
+    method:   None,
     position: RulePosition::Pre,
   };
   let http_backend = proxy::Backend {
