@@ -75,7 +75,6 @@ impl CommandServer {
             CommandRequestData::ReloadConfiguration { path }=> {
                 self.reload_configuration(Some(client_id), request.id, path).await;
             },
-            //r => error!("unknown request: {:?}", r),
         }
     }
 

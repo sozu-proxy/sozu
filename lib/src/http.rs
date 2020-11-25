@@ -329,16 +329,6 @@ impl Session {
     }
   }
 
-  /*
-  fn back_socket(&self)  -> Option<&TcpStream> {
-    match *unwrap_msg!(self.protocol.as_ref()) {
-      State::Http(ref http)      => http.back_socket(),
-      State::WebSocket(ref pipe) => pipe.back_socket(),
-      State::Expect(_)           => None,
-    }
-  }
-  */
-
   fn back_socket_mut(&mut self)  -> Option<&mut TcpStream> {
     match *unwrap_msg!(self.protocol.as_mut()) {
       State::Http(ref mut http)      => http.back_socket_mut(),
