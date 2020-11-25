@@ -1009,6 +1009,7 @@ impl ProxyConfiguration<Session> for Proxy {
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::RemoveCluster{ cluster_id } => {
+        self.configs.remove(&cluster_id);
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Ok, data: None }
       },
       ProxyRequestData::RemoveListener(remove) => {
