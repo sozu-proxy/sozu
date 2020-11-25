@@ -283,7 +283,7 @@ pub enum AcceptError {
   WouldBlock,
 }
 
-use self::server::{ListenToken,ListenPortState};
+use self::server::ListenToken;
 pub trait ProxyConfiguration<Session> {
   fn connect_to_backend(&mut self, event_loop: &mut Poll, session: &mut Session,
     back_token: Token) ->Result<BackendConnectAction,ConnectionError>;
@@ -292,7 +292,6 @@ pub trait ProxyConfiguration<Session> {
   fn create_session(&mut self, socket: TcpStream, token: ListenToken,
                     event_loop: &mut Poll, session_token: Token, wait_time: Duration)
     -> Result<(Rc<RefCell<Session>>, bool), AcceptError>;
-  fn listen_port_state(&self, port: &u16) -> ListenPortState;
 }
 
 #[derive(Debug,PartialEq,Eq)]

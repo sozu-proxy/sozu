@@ -24,7 +24,7 @@ use super::pool::Pool;
 use super::protocol::{ProtocolResult,StickySession,Http,Pipe};
 use super::protocol::http::{DefaultAnswerStatus, answers::HttpAnswers};
 use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
-use super::server::{Server,ProxyChannel,ListenToken,ListenPortState,
+use super::server::{Server,ProxyChannel,ListenToken,
   ListenSession, CONN_RETRIES, push_event};
 use super::socket::server_bind;
 use super::retry::RetryPolicy;
@@ -1332,14 +1332,6 @@ impl ProxyConfiguration<Session> for Proxy {
       Err(AcceptError::IoError)
     }
 
-  }
-
-  fn listen_port_state(&self, port: &u16) -> ListenPortState {
-    //FIXME TOKEN
-    fixme!();
-    ListenPortState::Available
-    //let token = Token(0);
-    //if port == &self.listeners[&token].address.port() { ListenPortState::InUse } else { ListenPortState::Available }
   }
 }
 

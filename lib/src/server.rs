@@ -57,12 +57,6 @@ pub fn push_event(event: ProxyEvent) {
   });
 }
 
-#[derive(PartialEq)]
-pub enum ListenPortState {
-  Available,
-  InUse
-}
-
 #[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
 pub struct ListenToken(pub usize);
 #[derive(Copy,Clone,Debug,PartialEq,Eq,PartialOrd,Ord,Hash)]
@@ -653,16 +647,6 @@ impl Server {
         // special case for AddHttpListener because we need to register a listener
         ProxyRequest { ref id, order: ProxyRequestData::AddHttpListener(ref listener) } => {
           debug!("{} add http listener {:?}", id, listener);
-          /*FIXME
-          if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
-            error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
-            push_queue(ProxyResponse {
-              id,
-              status: ProxyResponseStatus::Error(String::from("Couldn't add TCP front: port already in use")),
-              data: None
-            });
-            return;
-          }*/
 
           if self.sessions.len() >= self.slab_capacity() {
             push_queue(ProxyResponse {
@@ -766,16 +750,6 @@ impl Server {
         // special case for AddHttpListener because we need to register a listener
         ProxyRequest { ref id, order: ProxyRequestData::AddHttpsListener(ref listener) } => {
           debug!("{} add https listener {:?}", id, listener);
-          /*FIXME
-          if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
-            error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
-            push_queue(ProxyResponse {
-              id,
-              status: ProxyResponseStatus::Error(String::from("Couldn't add TCP front: port already in use")),
-              data: None
-            });
-            return;
-          }*/
 
           if self.sessions.len() >= self.slab_capacity() {
             push_queue(ProxyResponse {
@@ -879,16 +853,6 @@ impl Server {
         // special case for AddTcpFront because we need to register a listener
         ProxyRequest { id, order: ProxyRequestData::AddTcpListener(listener) } => {
           debug!("{} add tcp listener {:?}", id, listener);
-          /*if self.listen_port_state(&tcp_front.port) == ListenPortState::InUse {
-            error!("Couldn't add TCP front {:?}: port already in use", tcp_front);
-            push_queue(ProxyResponse {
-              id,
-              status: ProxyResponseStatus::Error(String::from("Couldn't add TCP front: port already in use")),
-              data: None
-            });
-            return;
-          }
-          */
 
           if self.sessions.len() >= self.slab_capacity() {
             push_queue(ProxyResponse {
@@ -1495,24 +1459,6 @@ impl Server {
         }
       }
     }
-  }
-
-  fn listen_port_state(&self, port: &u16) -> ListenPortState {
-    let http_bound = self.http.listen_port_state(&port);
-
-    if http_bound == ListenPortState::Available {
-      let https_bound = match self.https {
-        #[cfg(feature = "use-openssl")]
-        HttpsProvider::Openssl(ref openssl) => openssl.listen_port_state(&port),
-        HttpsProvider::Rustls(ref rustls) => rustls.listen_port_state(&port),
-      };
-
-      if https_bound == ListenPortState::Available {
-        return self.tcp.listen_port_state(&port);
-      }
-    }
-
-    ListenPortState::InUse
   }
 }
 

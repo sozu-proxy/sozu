@@ -27,7 +27,7 @@ use pool::Pool;
 use {AppId,ConnectionError,Protocol,
   ProxySession,ProxyConfiguration,AcceptError,BackendConnectAction,BackendConnectionStatus};
 use backends::BackendMap;
-use server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,ListenSession,CONN_RETRIES};
+use server::{Server,ProxyChannel,ListenToken,SessionToken,ListenSession,CONN_RETRIES};
 use socket::server_bind;
 use trie::*;
 use protocol::StickySession;
@@ -714,12 +714,6 @@ impl ProxyConfiguration<Session> for Proxy {
         ProxyResponse{ id: message.id, status: ProxyResponseStatus::Error(String::from("unsupported message")), data: None }
       }
     }
-  }
-
-  fn listen_port_state(&self, port: &u16) -> ListenPortState {
-    fixme!();
-    ListenPortState::Available
-    //if port == &self.address.port() { ListenPortState::InUse } else { ListenPortState::Available }
   }
 }
 
