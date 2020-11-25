@@ -65,7 +65,7 @@ impl Session {
     };
 
     let request_id = Ulid::generate();
-    let duration = front_timeout_duration.to_std().unwrap();
+    let duration = std::time::Duration::try_from(front_timeout_duration).unwrap();
     let timeout = TIMER.with(|timer| {
         timer.borrow_mut().set_timeout(duration, token)
     });

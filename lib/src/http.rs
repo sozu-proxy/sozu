@@ -71,7 +71,7 @@ impl Session {
     answers: Rc<RefCell<HttpAnswers>>, listen_token: Token, wait_time: Duration,
     front_timeout_duration: Duration, backend_timeout_duration: Duration) -> Option<Session> {
     let request_id = Ulid::generate();
-    let duration = front_timeout_duration.to_std().unwrap();
+    let duration = std::time::Duration::try_from(front_timeout_duration).unwrap();
     let mut front_timeout = TimeoutContainer {
         timeout: None,
         duration,

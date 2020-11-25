@@ -78,11 +78,11 @@ impl Session {
     let mut backend_buffer = None;
 
     let request_id = Ulid::generate();
-    let duration = front_timeout_duration.to_std().unwrap();
+    let duration = std::time::Duration::try_from(front_timeout_duration).unwrap();
     let front_timeout = TimeoutContainer::new(duration, frontend_token);
     let back_timeout = TimeoutContainer {
         timeout: None,
-        duration: backend_timeout_duration.to_std().unwrap(),
+        duration: std::time::Duration::try_from(backend_timeout_duration).unwrap(),
     };
 
     let protocol = match proxy_protocol {
@@ -945,7 +945,7 @@ impl ProxyConfiguration<Session> for Proxy {
         }
 
         let connect_timeout_duration = Duration::seconds(self.listeners[&session.accept_token].config.connect_timeout as i64);
-        let duration = connect_timeout_duration.to_std().unwrap();
+        let duration = std::time::Duration::try_from(connect_timeout_duration).unwrap();
         let timeout = TIMER.with(|timer| {
             timer.borrow_mut().set_timeout(duration, back_token)
         });
