@@ -750,13 +750,13 @@ impl fmt::Display for LogDuration {
     let ms = self.0.whole_milliseconds();
 
     if ms < 10 {
-      let us = self.0.whole_microseconds();
-      if us >= 10 {
-          return write!(f, "{}μs", us);
-      }
+        let us = self.0.whole_microseconds();
+        if us >= 10 {
+            return write!(f, "{}μs", us);
+        }
 
-      let ns = self.0.whole_nanoseconds();
-      return write!(f, "{}ns", ns);
+        let ns = self.0.whole_nanoseconds();
+        return write!(f, "{}ns", ns);
     }
 
     write!(f, "{}ms", ms)

@@ -1,11 +1,24 @@
 #![allow(dead_code)]
 use super::cookies::{RequestCookie, parse_request_cookies};
 
-use nom::{Err, IResult, Needed, Offset, branch::alt, bytes::{self, complete::{take_while1 as take_while1_complete}, streaming::{is_not, tag, tag_no_case, take, take_while, take_while1}}, character::{
-    is_alphanumeric, is_space,
-    streaming::{char, one_of},
-    complete::digit1 as digit_complete
-  }, combinator::{complete, map_res, opt, recognize}, error::{Error, ErrorKind}, multi::many0, sequence::{delimited, preceded, terminated, tuple}};
+use nom::{
+    Err, IResult, Needed, Offset,
+    error::{Error, ErrorKind, ParseError},
+    branch::alt,
+    multi::many0,
+    sequence::{delimited, preceded, terminated, tuple},
+    combinator::{opt, map_res, complete, recognize},
+    character::{
+        is_alphanumeric, is_space,
+        streaming::{char, one_of},
+        complete::digit1 as digit_complete
+    },
+    bytes::{
+        self,
+        streaming::{is_not, tag, tag_no_case, take, take_while, take_while1},
+        complete::{take_while1 as take_while1_complete}
+    },
+};
 
 use std::{fmt,str};
 use std::str::from_utf8;
@@ -435,9 +448,11 @@ fn end_of_chunk_and_header(i: &[u8]) -> IResult<&[u8], usize> {
   preceded(crlf, chunk_header)(i)
 }
 
+/*
 fn trailer_line(i: &[u8]) -> IResult<&[u8], &[u8]> {
   terminated(take_while1(is_header_value_char), crlf)(i)
 }
+*/
 
 #[derive(PartialEq,Debug,Clone,Copy)]
 pub enum Chunk {

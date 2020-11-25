@@ -46,7 +46,6 @@ impl Router {
               },
               MethodRuleResult::None => {}
           },
-          PathRuleResult::Equals => return Some(app_id.clone()),
           PathRuleResult::Prefix(sz) => if sz >= prefix_length {
               match method_rule.matches(method) {
                   // FIXME: the rule order will be important here
