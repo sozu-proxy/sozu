@@ -8,8 +8,7 @@ use mio::unix::UnixReady;
 use std::collections::{HashSet,VecDeque};
 use std::os::unix::io::{AsRawFd,FromRawFd};
 use slab::Slab;
-use time::{self, Instant};
-use std::time::Duration;
+use time::{Instant,Duration};
 
 use sozu_command::config::Config;
 use sozu_command::channel::Channel;
@@ -146,13 +145,13 @@ pub struct Server {
   sessions:        Slab<Rc<RefCell<dyn ProxySessionCast>>>,
   max_connections: usize,
   nb_connections:  usize,
-  front_timeout:   time::Duration,
+  front_timeout:   Duration,
   pool:            Rc<RefCell<Pool>>,
   backends:        Rc<RefCell<BackendMap>>,
   scm_listeners:   Option<Listeners>,
-  zombie_check_interval: time::Duration,
+  zombie_check_interval: Duration,
   accept_queue:    VecDeque<(TcpStream, ListenToken, Protocol, Instant)>,
-  accept_queue_timeout: time::Duration,
+  accept_queue_timeout: Duration,
   base_sessions_count: usize,
 }
 
@@ -236,10 +235,10 @@ impl Server {
       scm_listeners:   None,
       pool,
       backends,
-      front_timeout: time::Duration::seconds(i64::from(server_config.front_timeout)),
-      zombie_check_interval: time::Duration::seconds(i64::from(server_config.zombie_check_interval)),
+      front_timeout: Duration::seconds(i64::from(server_config.front_timeout)),
+      zombie_check_interval: Duration::seconds(i64::from(server_config.zombie_check_interval)),
       accept_queue:    VecDeque::new(),
-      accept_queue_timeout: time::Duration::seconds(i64::from(server_config.accept_queue_timeout)),
+      accept_queue_timeout: Duration::seconds(i64::from(server_config.accept_queue_timeout)),
       base_sessions_count,
     };
 
@@ -291,7 +290,7 @@ impl Server {
   pub fn run(&mut self) {
     //FIXME: make those parameters configurable?
     let mut events = Events::with_capacity(1024);
-    let poll_timeout = Some(Duration::from_millis(1000));
+    let poll_timeout = Some(Duration::milliseconds(1000));
     let max_poll_errors = 10000;
     let mut current_poll_errors = 0;
     let mut last_zombie_check = Instant::now();
@@ -310,11 +309,11 @@ impl Server {
           Some(i) => if *i <= now {
               poll_timeout
           } else {
-              Some(std::time::Duration::try_from(*i - now).unwrap())
+              Some(*i - now)
           },
       };
 
-      if let Err(error) = self.poll.poll(&mut events, timeout) {
+      if let Err(error) = self.poll.poll(&mut events, timeout.and_then(|t| std::time::Duration::try_from(t).ok())) {
         error!("Error while polling events: {:?}", error);
         current_poll_errors += 1;
         continue;
@@ -1063,7 +1062,7 @@ impl Server {
     }
   }
 
-  pub fn create_session_tcp(&mut self, token: ListenToken, socket: TcpStream, wait_time: time::Duration) -> bool {
+  pub fn create_session_tcp(&mut self, token: ListenToken, socket: TcpStream, wait_time: Duration) -> bool {
     if self.nb_connections == self.max_connections {
       error!("max number of session connection reached, flushing the accept queue");
       gauge!("accept_queue.backpressure", 1);
@@ -1120,7 +1119,7 @@ impl Server {
     true
   }
 
-  pub fn create_session_http(&mut self, token: ListenToken, socket: TcpStream, wait_time: time::Duration) -> bool {
+  pub fn create_session_http(&mut self, token: ListenToken, socket: TcpStream, wait_time: Duration) -> bool {
     if self.nb_connections == self.max_connections {
       error!("max number of session connection reached, flushing the accept queue");
       gauge!("accept_queue.backpressure", 1);
@@ -1164,7 +1163,7 @@ impl Server {
     }
   }
 
-  pub fn create_session_https(&mut self, token: ListenToken, socket: TcpStream, wait_time: time::Duration) -> bool {
+  pub fn create_session_https(&mut self, token: ListenToken, socket: TcpStream, wait_time: Duration) -> bool {
     if self.nb_connections == self.max_connections {
       error!("max number of session connection reached, flushing the accept queue");
       gauge!("accept_queue.backpressure", 1);
@@ -1556,7 +1555,7 @@ impl ProxySession for ListenSession {
   fn close_backend(&mut self, _token: Token, _poll: &mut Poll) {
   }
 
-  fn timeout(&mut self, _token: Token, _front_timeout: &time::Duration) -> SessionResult {
+  fn timeout(&mut self, _token: Token, _front_timeout: &Duration) -> SessionResult {
     error!("called ProxySession::timeout(token={:?}, time, front_timeout = {:?}) on ListenSession {{ protocol: {:?} }}",
       _token, _front_timeout, self.protocol);
     SessionResult::CloseSession
@@ -1634,7 +1633,7 @@ impl HttpsProvider {
   }
 
   pub fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken,
-    poll: &mut Poll, session_token: Token, wait_time: time::Duration)
+    poll: &mut Poll, session_token: Token, wait_time: Duration)
     -> Result<(Rc<RefCell<dyn ProxySessionCast>>,bool), AcceptError> {
     match self {
       &mut HttpsProvider::Rustls(ref mut rustls)   => rustls.create_session(frontend_sock, token, poll, session_token, wait_time).map(|(r,b)| {
@@ -1712,7 +1711,7 @@ impl HttpsProvider {
   }
 
   pub fn create_session(&mut self, frontend_sock: TcpStream, token: ListenToken,
-    poll: &mut Poll, session_token: Token, wait_time: time::Duration)
+    poll: &mut Poll, session_token: Token, wait_time: Duration)
     -> Result<(Rc<RefCell<Session>>,bool), AcceptError> {
     let &mut HttpsProvider::Rustls(ref mut rustls) = self;
     rustls.create_session(frontend_sock, token, poll, session_token, wait_time)

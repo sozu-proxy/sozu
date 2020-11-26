@@ -1,6 +1,5 @@
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
-use std::convert::TryFrom;
 use std::net::{Shutdown,SocketAddr};
 use mio::*;
 use mio::net::*;
@@ -65,8 +64,7 @@ impl Session {
     };
 
     let request_id = Ulid::generate();
-    let duration = std::time::Duration::try_from(front_timeout_duration).unwrap();
-    let front_timeout = TimeoutContainer::new(duration, token);
+    let front_timeout = TimeoutContainer::new(front_timeout_duration, token);
 
     let state = if expect_proxy {
       trace!("starting in expect proxy state");

@@ -71,8 +71,7 @@ impl Session {
     answers: Rc<RefCell<HttpAnswers>>, listen_token: Token, wait_time: Duration,
     front_timeout_duration: Duration, backend_timeout_duration: Duration) -> Option<Session> {
     let request_id = Ulid::generate();
-    let duration = std::time::Duration::try_from(front_timeout_duration).unwrap();
-    let mut front_timeout = TimeoutContainer::new_empty(duration);
+    let mut front_timeout = TimeoutContainer::new_empty(front_timeout_duration);
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);
@@ -82,7 +81,7 @@ impl Session {
     } else {
       gauge_add!("protocol.http", 1);
       let session_address = sock.peer_addr().ok();
-      let timeout = TimeoutContainer::new(duration, token);
+      let timeout = TimeoutContainer::new(front_timeout_duration, token);
       Some(State::Http(Http::new(sock, token, request_id, pool.clone(), public_address,
         session_address, sticky_name.clone(), Protocol::HTTP, answers.clone(), timeout,
         backend_timeout_duration)))
