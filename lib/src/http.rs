@@ -62,6 +62,7 @@ pub struct Session {
   answers:            Rc<RefCell<HttpAnswers>>,
   last_event:         Instant,
   front_timeout:      TimeoutContainer,
+  frontend_timeout_duration: Duration,
   backend_timeout_duration: Duration,
 }
 
@@ -69,9 +70,10 @@ impl Session {
   pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool>>,
     public_address: SocketAddr, expect_proxy: bool, sticky_name: String,
     answers: Rc<RefCell<HttpAnswers>>, listen_token: Token, wait_time: Duration,
-    front_timeout_duration: Duration, backend_timeout_duration: Duration) -> Option<Session> {
+    frontend_timeout_duration: Duration, backend_timeout_duration: Duration,
+    request_timeout_duration: Duration) -> Option<Session> {
     let request_id = Ulid::generate();
-    let mut front_timeout = TimeoutContainer::new_empty(front_timeout_duration);
+    let mut front_timeout = TimeoutContainer::new_empty(request_timeout_duration);
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);
@@ -81,10 +83,10 @@ impl Session {
     } else {
       gauge_add!("protocol.http", 1);
       let session_address = sock.peer_addr().ok();
-      let timeout = TimeoutContainer::new(front_timeout_duration, token);
+      let timeout = TimeoutContainer::new(request_timeout_duration, token);
       Some(State::Http(Http::new(sock, token, request_id, pool.clone(), public_address,
         session_address, sticky_name.clone(), Protocol::HTTP, answers.clone(), timeout,
-        backend_timeout_duration)))
+        frontend_timeout_duration, backend_timeout_duration)))
     };
 
     let metrics = SessionMetrics::new(Some(wait_time));
@@ -104,6 +106,7 @@ impl Session {
         listen_token,
         connection_attempt: 0,
         answers,
+        frontend_timeout_duration,
         backend_timeout_duration,
       };
 
@@ -173,7 +176,8 @@ impl Session {
         let mut http = Http::new(expect.frontend, expect.frontend_token, expect.request_id,
           self.pool.clone(), public_address, Some(client_address),
           self.sticky_name.clone(), Protocol::HTTP, self.answers.clone(),
-          self.front_timeout.take(), self.backend_timeout_duration);
+          self.front_timeout.take(), self.frontend_timeout_duration,
+          self.backend_timeout_duration);
         http.front_readiness.event = readiness.event;
 
         gauge_add!("protocol.proxy.expect", -1);
@@ -1267,6 +1271,7 @@ impl ProxyConfiguration<Session> for Proxy {
           listener.answers.clone(), listener.token, wait_time,
           Duration::seconds(listener.config.front_timeout as i64),
           Duration::seconds(listener.config.back_timeout as i64),
+          Duration::seconds(listener.config.request_timeout as i64),
       ) {
         if let Err(e) = poll.register(
           c.front_socket(),

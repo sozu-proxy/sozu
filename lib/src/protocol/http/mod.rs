@@ -97,13 +97,15 @@ pub struct Http<Front:SocketHandler> {
   pub frontend_last_event: Instant,
   pub front_timeout:   TimeoutContainer,
   pub back_timeout:    TimeoutContainer,
+  pub frontend_timeout_duration: Duration,
 }
 
 impl<Front:SocketHandler> Http<Front> {
   pub fn new(sock: Front, token: Token, request_id: Ulid, pool: Weak<RefCell<Pool>>,
     public_address: SocketAddr, session_address: Option<SocketAddr>, sticky_name: String,
     protocol: Protocol, answers: Rc<RefCell<answers::HttpAnswers>>,
-    front_timeout: TimeoutContainer, backend_timeout_duration: Duration) -> Http<Front> {
+    front_timeout: TimeoutContainer,
+    frontend_timeout_duration: Duration, backend_timeout_duration: Duration) -> Http<Front> {
 
     let mut session = Http {
       frontend:           sock,
@@ -136,6 +138,7 @@ impl<Front:SocketHandler> Http<Front> {
       frontend_last_event: Instant::now(),
       front_timeout,
       back_timeout: TimeoutContainer::new_empty(backend_timeout_duration),
+      frontend_timeout_duration,
       answers,
       pool,
     };
@@ -740,6 +743,12 @@ impl<Front:SocketHandler> Http<Front> {
           // stop reading
           self.front_readiness.interest.remove(Ready::readable());
         }
+
+        // if it was the first request, the front timeout duration
+        // was set to request_timeout, which is much lower. For future
+        // requests on this connection, we can wait a bit more
+        self.front_timeout.set_duration(self.frontend_timeout_duration);
+
         SessionResult::Continue
       },
       Some(RequestState::RequestWithBodyChunks(_,_,_,Chunk::Ended)) => {
@@ -752,6 +761,11 @@ impl<Front:SocketHandler> Http<Front> {
         SessionResult::CloseSession
       },
       Some(RequestState::RequestWithBodyChunks(_,_,_,_)) => {
+        // if it was the first request, the front timeout duration
+        // was set to request_timeout, which is much lower. For future
+        // requests on this connection, we can wait a bit more
+        self.front_timeout.set_duration(self.frontend_timeout_duration);
+
         if ! self.front_buf.as_ref().unwrap().needs_input() {
           let (request_state, header_end) = (self.request.take().unwrap(), self.req_header_end.take());
           let (request_state, header_end) = parse_request_until_stop(request_state,
@@ -1396,7 +1410,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> SessionResult {
-      info!("got timeout for token: {:?}", token);
+    //info!("got timeout for token: {:?}", token);
     if self.frontend_token == token {
       let dur = Instant::now() - self.frontend_last_event;
       let front_timeout = self.front_timeout.duration();

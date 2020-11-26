@@ -48,6 +48,7 @@ pub struct Session {
   peer_address:       Option<SocketAddr>,
   answers:            Rc<RefCell<HttpAnswers>>,
   front_timeout:      TimeoutContainer,
+  frontend_timeout_duration: Duration,
   backend_timeout_duration: Duration,
 }
 
@@ -55,7 +56,8 @@ impl Session {
   pub fn new(ssl: ServerSession, sock: TcpStream, token: Token, pool: Weak<RefCell<Pool>>,
     public_address: SocketAddr, expect_proxy: bool, sticky_name: String,
     answers: Rc<RefCell<HttpAnswers>>, listen_token: Token, wait_time: Duration,
-    front_timeout_duration: Duration, backend_timeout_duration: Duration) -> Session {
+    frontend_timeout_duration: Duration, backend_timeout_duration: Duration,
+    request_timeout_duration: Duration) -> Session {
     let peer_address = if expect_proxy {
       // Will be defined later once the expect proxy header has been received and parsed
       None
@@ -64,7 +66,7 @@ impl Session {
     };
 
     let request_id = Ulid::generate();
-    let front_timeout = TimeoutContainer::new(front_timeout_duration, token);
+    let front_timeout = TimeoutContainer::new(request_timeout_duration, token);
 
     let state = if expect_proxy {
       trace!("starting in expect proxy state");
@@ -93,6 +95,7 @@ impl Session {
       peer_address,
       answers,
       front_timeout,
+      frontend_timeout_duration,
       backend_timeout_duration,
     };
     session.front_readiness().interest = UnixReady::from(Ready::readable()) | UnixReady::hup() | UnixReady::error();
@@ -176,11 +179,11 @@ impl Session {
       };
 
       let readiness = handshake.readiness.clone();
-      let backend_timeout_duration = self.backend_timeout_duration;
       let mut http = Http::new(front_stream, self.frontend_token, handshake.request_id,
                                self.pool.clone(), self.public_address, self.peer_address,
                                self.sticky_name.clone(), Protocol::HTTPS, self.answers.clone(),
-                               self.front_timeout.take(), backend_timeout_duration);
+                               self.front_timeout.take(),
+                               self.frontend_timeout_duration, self.backend_timeout_duration);
 
       let res = http.frontend.session.read(front_buf.space());
       match res {

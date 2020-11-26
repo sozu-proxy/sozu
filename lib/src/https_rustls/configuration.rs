@@ -480,6 +480,7 @@ impl ProxyConfiguration<Session> for Proxy {
           listener.answers.clone(), Token(token.0), wait_time,
           Duration::seconds(listener.config.front_timeout as i64),
           Duration::seconds(listener.config.back_timeout as i64),
+          Duration::seconds(listener.config.request_timeout as i64),
           );
 
         Ok((Rc::new(RefCell::new(c)), false))

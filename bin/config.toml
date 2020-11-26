@@ -102,17 +102,21 @@ buffer_size = 16384
 tls_provider = "rustls"
 
 # maximum time of inactivity for a frontend socket, in seconds
-# defaults to 60 seconds
+# defaults to 60 seconds, can be specified at the listener level
 # front_timeout = 60
 
 # maximum time of inactivity for a backend socket, in seconds
-# defaults to 30 seconds
+# defaults to 30 seconds, can be specified at the listener level
 # back_timeout = 30
 
 # maximum time to connect to a backend server, in seconds
-# defaults to 3 seconds
+# defaults to 3 seconds, can be specified at the listener level
 # connect_timeout = 3
 
+# maximum time to receive a request since the connection started
+# defaults to 10 seconds, can be specified at the listener level
+# request_timeout = 10
+#
 # duration between zombie checks, in seconds
 # defaults to 30 minutes
 # in case of bugs in sozu's event loop and protocol implementations, some client
