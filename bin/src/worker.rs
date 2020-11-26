@@ -91,6 +91,10 @@ pub fn begin_worker_process(fd: i32, scm: i32, configuration_state_fd: i32, id: 
   let worker_id = format!("{}-{:02}", "WRK", id);
   logging::setup(worker_id.clone(), &worker_config.log_level,
     &worker_config.log_target, worker_config.log_access_target.as_ref().map(|s| s.as_str()));
+  let backend = logging::target_to_backend(&worker_config.log_target);
+  let access_backend = worker_config.log_access_target.as_deref().map(logging::target_to_backend);
+  sozu_command_lib::logging::Logger::init(worker_id.clone(), &worker_config.log_level,
+    backend, access_backend);
   info!("worker {} starting...", id);
 
   command.set_nonblocking(true);
