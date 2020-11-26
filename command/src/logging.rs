@@ -1,13 +1,17 @@
 use libc;
+use std::env;
 use std::fs::File;
 use std::str::FromStr;
 use std::cell::RefCell;
 use std::cmp::{self,Ord};
 use std::fmt::{Arguments,format};
 use std::io::{stdout,Stdout,Write};
-use std::net::{SocketAddr,UdpSocket};
-use std::net::TcpStream;
+use std::path::Path;
+use std::fs::OpenOptions;
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket,TcpStream};
 use mio::net::UnixDatagram;
+use rand::{Rng,thread_rng};
+use rand::distributions::Alphanumeric;
 
 thread_local! {
   pub static LOGGER: RefCell<Logger> = RefCell::new(Logger::new());
@@ -445,6 +449,60 @@ pub fn parse_logging_spec(spec: &str) -> Vec<LogDirective> {
     }});
 
     dirs
+}
+
+pub fn target_to_backend(target: &str) -> LoggerBackend {
+  if target == "stdout" {
+    LoggerBackend::Stdout(stdout())
+  } else if target.starts_with("udp://") {
+    let addr_res = (&target[6..]).to_socket_addrs();
+    match addr_res {
+      Err(e) => {
+        println!("invalid log target configuration ({:?}): {}", e, target);
+        LoggerBackend::Stdout(stdout())
+      },
+      Ok(mut addrs) => {
+        let socket = UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+        LoggerBackend::Udp(socket, addrs.next().unwrap())
+      }
+    }
+  } else if target.starts_with("tcp://") {
+    let addr_res = (&target[6..]).to_socket_addrs();
+    match addr_res {
+      Err(e) => {
+        println!("invalid log target configuration ({:?}): {}", e, target);
+        LoggerBackend::Stdout(stdout())
+      },
+      Ok(mut addrs) => {
+        LoggerBackend::Tcp(TcpStream::connect(addrs.next().unwrap()).unwrap())
+      }
+    }
+  } else if target.starts_with("unix://") {
+    let path = Path::new(&target[7..]);
+    if !path.exists() {
+      println!("invalid log target configuration: {} is not a file", &target[7..]);
+      LoggerBackend::Stdout(stdout())
+    } else {
+      let mut dir = env::temp_dir();
+      let s: String = thread_rng().sample_iter(&Alphanumeric).take(12).collect();
+      dir.push(s);
+      let socket = UnixDatagram::bind(dir).unwrap();
+      socket.connect(path).unwrap();
+      LoggerBackend::Unix(socket)
+    }
+  } else if target.starts_with("file://") {
+    let path = Path::new(&target[7..]);
+    match OpenOptions::new().create(true).append(true).open(path) {
+      Ok(file) => LoggerBackend::File(crate::writer::MultiLineWriter::new(file)),
+      Err(e)   => {
+        println!("invalid log target configuration: could not open file at {} (error: {:?})", &target[7..], e);
+        LoggerBackend::Stdout(stdout())
+      }
+    }
+  } else {
+    println!("invalid log target configuration: {}", target);
+    LoggerBackend::Stdout(stdout())
+  }
 }
 
 #[macro_export]
