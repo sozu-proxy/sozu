@@ -527,12 +527,13 @@ impl ProxySession for Session {
     result
   }
 
-  fn timeout(&mut self, token: Token, front_timeout: &Duration) -> SessionResult {
+  fn timeout(&mut self, token: Token) -> SessionResult {
     if self.frontend_token == token {
       let dur = Instant::now() - self.last_event;
-      if dur < *front_timeout {
+      let front_timeout = self.front_timeout.duration();
+      if dur < front_timeout {
         TIMER.with(|timer| {
-          timer.borrow_mut().set_timeout(*front_timeout - dur, token);
+          timer.borrow_mut().set_timeout(front_timeout - dur, token);
         });
         SessionResult::Continue
       } else {

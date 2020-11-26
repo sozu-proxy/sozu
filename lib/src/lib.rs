@@ -248,7 +248,7 @@ pub trait ProxySession {
   fn process_events(&mut self, token: Token, events: Ready);
   fn close(&mut self, poll: &mut Poll) -> CloseResult;
   fn close_backend(&mut self, token: Token, poll: &mut Poll);
-  fn timeout(&mut self, t: Token, front_timeout: &Duration) -> SessionResult;
+  fn timeout(&mut self, t: Token) -> SessionResult;
   fn last_event(&self) -> Instant;
   fn print_state(&self);
   fn tokens(&self) -> Vec<Token>;

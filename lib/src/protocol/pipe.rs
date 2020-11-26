@@ -123,7 +123,7 @@ impl<Front:SocketHandler> Pipe<Front> {
     self.backend_token
   }
 
-  pub fn timeout(&mut self, _token: Token, _front_timeout: &Duration, _metrics: &mut SessionMetrics) -> SessionResult {
+  pub fn timeout(&mut self, _token: Token, _metrics: &mut SessionMetrics) -> SessionResult {
       //FIXME
       SessionResult::CloseSession
   }

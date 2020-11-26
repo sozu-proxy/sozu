@@ -1476,7 +1476,7 @@ impl Server {
 
     let session_token = token.0;
     if self.sessions.contains(session_token) {
-      let order = self.sessions[session_token].borrow_mut().timeout(token, &self.front_timeout);
+      let order = self.sessions[session_token].borrow_mut().timeout(token);
       self.interpret_session_order(SessionToken(session_token), order);
     }
   }
@@ -1555,9 +1555,9 @@ impl ProxySession for ListenSession {
   fn close_backend(&mut self, _token: Token, _poll: &mut Poll) {
   }
 
-  fn timeout(&mut self, _token: Token, _front_timeout: &Duration) -> SessionResult {
-    error!("called ProxySession::timeout(token={:?}, time, front_timeout = {:?}) on ListenSession {{ protocol: {:?} }}",
-      _token, _front_timeout, self.protocol);
+  fn timeout(&mut self, _token: Token) -> SessionResult {
+    error!("called ProxySession::timeout(token={:?}, time) on ListenSession {{ protocol: {:?} }}",
+      _token, self.protocol);
     SessionResult::CloseSession
   }
 }

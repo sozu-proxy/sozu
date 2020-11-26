@@ -124,6 +124,10 @@ impl TimeoutContainer {
       self.duration = duration;
   }
 
+  pub fn duration(&mut self) -> Duration {
+      self.duration
+  }
+
   pub fn cancel(&mut self) -> bool {
       match self.timeout.take() {
         None => {

@@ -1395,12 +1395,14 @@ impl<Front:SocketHandler> Http<Front> {
       .unwrap_or(true)
   }
 
-  pub fn timeout(&mut self, token: Token, front_timeout: &Duration, metrics: &mut SessionMetrics) -> SessionResult {
+  pub fn timeout(&mut self, token: Token, metrics: &mut SessionMetrics) -> SessionResult {
+      info!("got timeout for token: {:?}", token);
     if self.frontend_token == token {
       let dur = Instant::now() - self.frontend_last_event;
-      if dur < *front_timeout {
+      let front_timeout = self.front_timeout.duration();
+      if dur < front_timeout {
         TIMER.with(|timer| {
-            timer.borrow_mut().set_timeout(*front_timeout - dur, token);
+            timer.borrow_mut().set_timeout(front_timeout - dur, token);
         });
         SessionResult::Continue
       } else {
