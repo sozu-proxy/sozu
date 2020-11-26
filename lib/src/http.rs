@@ -28,7 +28,7 @@ use super::protocol::{ProtocolResult,StickySession,Http,Pipe};
 use super::protocol::http::{DefaultAnswerStatus, answers::HttpAnswers};
 use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use super::server::{Server,ProxyChannel,ListenToken,ListenPortState,
-  ListenSession, CONN_RETRIES, push_event, TIMER};
+  ListenSession, CONN_RETRIES, push_event};
 use super::socket::server_bind;
 use super::retry::RetryPolicy;
 use super::protocol::http::parser::{hostname_and_port, RequestState};
@@ -72,17 +72,11 @@ impl Session {
     front_timeout_duration: Duration, backend_timeout_duration: Duration) -> Option<Session> {
     let request_id = Ulid::generate();
     let duration = std::time::Duration::try_from(front_timeout_duration).unwrap();
-    let mut front_timeout = TimeoutContainer {
-        timeout: None,
-        duration,
-    };
+    let mut front_timeout = TimeoutContainer::new_empty(duration);
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);
-      let timeout = TIMER.with(|timer| {
-        timer.borrow_mut().set_timeout(duration, token)
-      });
-      front_timeout.timeout = Some(timeout);
+      front_timeout.set(token);
 
       Some(State::Expect(ExpectProxyProtocol::new(sock, token, request_id)))
     } else {

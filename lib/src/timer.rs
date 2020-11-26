@@ -84,8 +84,8 @@ pub struct Timeout {
 #[derive(Clone, Debug)]
 pub struct TimeoutContainer {
     // mark it as an option, so we do not try to cancel a timeout multiple times
-    pub timeout: Option<Timeout>,
-    pub duration: Duration,
+    timeout: Option<Timeout>,
+    duration: Duration,
 }
 
 impl TimeoutContainer {
@@ -94,6 +94,10 @@ impl TimeoutContainer {
         timer.borrow_mut().set_timeout(duration, token)
     });
     TimeoutContainer { timeout: Some(timeout), duration }
+  }
+
+  pub fn new_empty(duration: Duration) -> TimeoutContainer {
+    TimeoutContainer { timeout: None, duration }
   }
 
   pub fn take(&mut self) -> TimeoutContainer {
@@ -120,6 +124,11 @@ impl TimeoutContainer {
       });
 
     self.timeout = Some(timeout);
+  }
+
+  /// warning: this does not reset the timer
+  pub fn set_duration(&mut self, duration: Duration) {
+      self.duration = duration;
   }
 
   pub fn cancel(&mut self) -> bool {

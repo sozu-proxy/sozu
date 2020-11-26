@@ -23,7 +23,7 @@ use protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use retry::RetryPolicy;
 use util::UnwrapLog;
 use buffer_queue::BufferQueue;
-use server::{push_event, TIMER};
+use server::push_event;
 use timer::TimeoutContainer;
 
 pub enum State {
@@ -66,10 +66,7 @@ impl Session {
 
     let request_id = Ulid::generate();
     let duration = std::time::Duration::try_from(front_timeout_duration).unwrap();
-    let timeout = TIMER.with(|timer| {
-        timer.borrow_mut().set_timeout(duration, token)
-    });
-    let front_timeout = TimeoutContainer { timeout: Some(timeout), duration };
+    let front_timeout = TimeoutContainer::new(duration, token);
 
     let state = if expect_proxy {
       trace!("starting in expect proxy state");
