@@ -169,13 +169,6 @@ pub fn generate_certified_key(certificate_and_key: CertificateAndKey) -> Option<
       if let Ok(signing_key) = RSASigningKey::new(&keys[0]) {
         let certified = CertifiedKey::new(chain, Arc::new(Box::new(signing_key)));
         return Some(certified);
-      } else {
-          if let Ok(k) = rustls::sign::any_ecdsa_type(&keys[0]) {
-              let certified = CertifiedKey::new(chain, Arc::new(k));
-              return Some(certified);
-          } else {
-              error!("could not decode signing key (tried RSA and ECDSA)");
-          }
       }
     } else {
       let mut key_reader = BufReader::new(certificate_and_key.key.as_bytes());
@@ -185,6 +178,13 @@ pub fn generate_certified_key(certificate_and_key: CertificateAndKey) -> Option<
           if let Ok(signing_key) = RSASigningKey::new(&keys[0]) {
             let certified = CertifiedKey::new(chain, Arc::new(Box::new(signing_key)));
             return Some(certified);
+          } else {
+              if let Ok(k) = rustls::sign::any_ecdsa_type(&keys[0]) {
+                  let certified = CertifiedKey::new(chain, Arc::new(k));
+                  return Some(certified);
+              } else {
+                  error!("could not decode signing key (tried RSA and ECDSA)");
+              }
           }
         }
       }
