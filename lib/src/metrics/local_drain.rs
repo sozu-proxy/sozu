@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 use std::str;
 use std::time::Instant;
+use std::convert::TryInto;
 use std::collections::BTreeMap;
 use hdrhistogram::Histogram;
 use sozu_command::proxy::{FilteredData,MetricsData,Percentiles,AppMetricsData};
@@ -87,29 +88,43 @@ pub struct BackendMetrics {
   pub data:   BTreeMap<String, AggregatedMetric>,
 }
 
+#[derive(Clone,Debug)]
+enum MetricKind {
+  Gauge,
+  Count,
+  Time,
+}
+
+#[derive(Clone,Debug)]
+enum MetricMeta {
+    Cluster,
+    ClusterBackend,
+}
+
 #[derive(Debug)]
 pub struct LocalDrain {
   pub prefix:          String,
   pub created:         Instant,
+  pub db:              sled::Db,
+  pub data_dir:        tempfile::TempDir,
   pub data:            BTreeMap<String, AggregatedMetric>,
-  /// cluster_id -> response time histogram (in ms)
-  pub cluster_data:        BTreeMap<String, AppMetrics>,
-  // backend_id -> response time histogram (in ms)
-//  pub backend_data:    BTreeMap<String, BackendMetrics>,
-  //pub request_counter: TimeSerie,
+  metrics:             BTreeMap<String, (MetricMeta, MetricKind)>,
   use_tagged_metrics:  bool,
   origin:              String,
 }
 
 impl LocalDrain {
   pub fn new(prefix: String) -> Self {
+    let data_dir = tempfile::TempDir::new().unwrap();
+    let db = sled::open(data_dir.path()).unwrap();
+
     LocalDrain {
       prefix,
       created:     Instant::now(),
+      data_dir,
+      db,
+      metrics:     BTreeMap::new(),
       data:        BTreeMap::new(),
-      cluster_data:    BTreeMap::new(),
- //     backend_data: BTreeMap::new(),
-      //request_counter: TimeSerie::new(),
       use_tagged_metrics: false,
       origin:      String::from("x"),
     }
@@ -131,28 +146,156 @@ impl LocalDrain {
   }
 
   pub fn dump_cluster_data(&mut self) -> BTreeMap<String,AppMetricsData> {
-    let data = self.cluster_data.iter().map(|(ref cluster_id, ref cluster)| {
-      let data = cluster.data.iter().map(|(ref key, ref value)| {
-         (key.to_string(), aggregated_to_filtered(value))
-       }).collect();
-      let backends = cluster.backend_data.iter().map(|(ref backend_id, ref backend_data)| {
-        let b = backend_data.iter().map(|(ref key, ref value)| {
-         (key.to_string(), aggregated_to_filtered(value))
-        }).collect();
+      let mut apps = BTreeMap::new();
 
-        (backend_id.to_string(), b)
-      }).collect();
+      for (key, (meta, kind)) in self.metrics.iter() {
+          let end = format!("{}\x7F", key);
+          for res in self.db.range(key.as_bytes()..end.as_bytes()) {
+              let (k, v) = res.unwrap();
+              match meta {
+                  MetricMeta::Cluster => {
+                      let mut it = k.split(|c: &u8| *c == b'.');
+                      let key = std::str::from_utf8(it.next().unwrap()).unwrap();
+                      let app_id = std::str::from_utf8(it.next().unwrap()).unwrap();
+                      let timestamp:i64 = std::str::from_utf8(it.next().unwrap()).unwrap().parse().unwrap();
 
-      (cluster_id.to_string(), AppMetricsData { data, backends })
-    }).collect();
+                      info!("looking at key = {}, id = {}, ts = {}",
+                            key, app_id, timestamp);
 
-    self.cluster_data.clear();
+                      let metrics_data = apps.entry(app_id.to_string()).or_insert_with(AppMetricsData::new);
+                      match kind {
+                          MetricKind::Gauge => {
+                              if metrics_data.data.contains_key(key) {
+                                  let v2 = metrics_data.data.get(key).unwrap().clone();
+                              } else {
+                                  metrics_data.data.insert(key.to_string(), FilteredData::Gauge(usize::from_le_bytes((*v).try_into().unwrap())));
+                              }
+                          },
+                          MetricKind::Count => {
+                              if metrics_data.data.contains_key(key) {
+                                  let v2 = metrics_data.data.get(key).unwrap().clone();
+                              } else {
+                                  metrics_data.data.insert(key.to_string(), FilteredData::Count(i64::from_le_bytes((*v).try_into().unwrap())));
+                              }
+                          },
+                          MetricKind::Time => {
+                              //unimplemented for now
+                          }
+                      }
+                  },
+                  MetricMeta::ClusterBackend => {
+                      let mut it = k.split(|c: &u8| *c == b'\t');
+                      let key = std::str::from_utf8(it.next().unwrap()).unwrap();
+                      let app_id = std::str::from_utf8(it.next().unwrap()).unwrap();
+                      let backend_id = std::str::from_utf8(it.next().unwrap()).unwrap();
+                      let timestamp:i64 = std::str::from_utf8(it.next().unwrap()).unwrap().parse().unwrap();
 
-    data
+                      info!("looking at key = {}, ap id = {}, bid: {}, ts = {}",
+                            key, app_id, backend_id, timestamp);
+
+                      let app_metrics_data = apps.entry(app_id.to_string()).or_insert_with(AppMetricsData::new);
+                      let backend_metrics_data = app_metrics_data.backends.entry(backend_id.to_string()).or_insert_with(BTreeMap::new);
+                      match kind {
+                          MetricKind::Gauge => {
+                              if backend_metrics_data.contains_key(key) {
+                                  let v2 = backend_metrics_data.get(key).unwrap().clone();
+                              } else {
+                                  backend_metrics_data.insert(key.to_string(), FilteredData::Gauge(usize::from_le_bytes((*v).try_into().unwrap())));
+                              }
+                          },
+                          MetricKind::Count => {
+                              if backend_metrics_data.contains_key(key) {
+                                  let v2 = backend_metrics_data.get(key).unwrap().clone();
+                              } else {
+                                  backend_metrics_data.insert(key.to_string(), FilteredData::Count(i64::from_le_bytes((*v).try_into().unwrap())));
+                              }
+                          },
+                          MetricKind::Time => {
+                              //unimplemented for now
+                          }
+                      }
+                  }
+              }
+          }
+      }
+
+
+      // still clear the DB for now
+      self.db.clear();
+
+      apps
   }
 
   pub fn clear(&mut self) {
-    self.cluster_data.clear();
+      self.db.clear();
+  }
+
+  fn receive_cluster_metric(&mut self, key: &'static str, id: &str, backend_id: Option<&str>, metric: MetricData) {
+      info!("metric: {} {} {:?} {:?}", key, id, backend_id, metric);
+
+      if !self.metrics.contains_key(key) {
+          let kind = match metric {
+              MetricData::Gauge(_) => MetricKind::Gauge,
+              MetricData::GaugeAdd(_) => MetricKind::Gauge,
+              MetricData::Count(_) => MetricKind::Count,
+              MetricData::Time(_) => MetricKind::Time,
+          };
+          let meta = if backend_id.is_some() {
+              MetricMeta::ClusterBackend
+          } else {
+              MetricMeta::Cluster
+          };
+
+          self.metrics.insert(key.to_string(), (meta, kind));
+          //let start = format!("{}\0", key);
+          let end = format!("{}\x7F", key);
+          //self.db.insert(start.as_bytes(), &0u64.to_le_bytes()).unwrap();
+          self.db.insert(end.as_bytes(), &0u64.to_le_bytes()).unwrap();
+      }
+
+      let now = time::OffsetDateTime::now();
+      // reduce to mucrosecond precision
+      let ts = now.timestamp_nanos() / 1000;
+
+      let metric_type = match metric {
+          MetricData::Gauge(_) => 'g',
+          MetricData::GaugeAdd(_) => 'a',
+          MetricData::Count(_) => 'c',
+          MetricData::Time(_) => 't',
+      };
+
+      let db_key = if let Some(bid) = backend_id {
+          format!("{}\t{}\t{}\t{}", key, id, bid, ts)
+      } else {
+          format!("{}\t{}\t{}", key, id, ts)
+      };
+
+      match metric {
+          MetricData::Gauge(i) => {
+              self.db.insert(db_key.as_bytes(), &i.to_le_bytes()).unwrap();
+          },
+          MetricData::GaugeAdd(i) => {
+              self.db.insert(db_key.as_bytes(), &i.to_le_bytes()).unwrap();
+          },
+          MetricData::Count(i) => {
+              self.db.insert(db_key.as_bytes(), &i.to_le_bytes()).unwrap();
+          },
+          MetricData::Time(i) => {
+              self.db.insert(db_key.as_bytes(), &i.to_le_bytes()).unwrap();
+          },
+      }
+
+      /*
+      if let (Some(first), Some(second)) = (self.db.first().unwrap(), self.db.last().unwrap()) {
+        for res in self.db.range(first.0..second.0) {
+            let (k, v) = res.unwrap();
+            info!("{} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
+
+        }
+      }
+      info!("metrics: {:?}", self.metrics);
+      info!("db size (at {}): {:?}", self.data_dir.path().to_str().unwrap(), self.db.size_on_disk());
+      */
   }
 }
 
@@ -160,48 +303,7 @@ impl LocalDrain {
 impl Subscriber for LocalDrain {
   fn receive_metric(&mut self, key: &'static str, cluster_id: Option<&str>, backend_id: Option<&str>, metric: MetricData) {
     if let Some(id) = cluster_id {
-      if !self.cluster_data.contains_key(id) {
-        self.cluster_data.insert(
-          String::from(id),
-          AppMetrics {
-            data: BTreeMap::new(),
-            backend_data: BTreeMap::new(),
-          }
-        );
-      }
-
-      self.cluster_data.get_mut(id).map(|cluster| {
-        if let Some(bid) = backend_id {
-          if !cluster.backend_data.contains_key(bid) {
-            cluster.backend_data.insert(
-              String::from(bid),
-              BTreeMap::new()
-            );
-          }
-
-          cluster.backend_data.get_mut(bid).map(|backend_data| {
-            if !backend_data.contains_key(key) {
-              backend_data.insert(
-                String::from(key),
-                AggregatedMetric::new(metric)
-              );
-            } else {
-              backend_data.get_mut(key).map(|stored_metric| {
-                stored_metric.update(key, metric);
-              });
-            }
-          });
-        } else if !cluster.data.contains_key(key) {
-          cluster.data.insert(
-            String::from(key),
-            AggregatedMetric::new(metric)
-          );
-        } else {
-          cluster.data.get_mut(key).map(|stored_metric| {
-            stored_metric.update(key, metric);
-          });
-        }
-      });
+      self.receive_cluster_metric(key, id, backend_id, metric);
     } else if !self.data.contains_key(key) {
       self.data.insert(
         String::from(key),
@@ -213,192 +315,6 @@ impl Subscriber for LocalDrain {
       });
     }
   }
+
 }
 
-/*
-#[derive(Debug)]
-pub struct ProxyMetrics {
-  pub buffer:          Buffer,
-  pub prefix:          String,
-  pub created:         Instant,
-  pub data:            BTreeMap<String, StoredMetricData>,
-  /// cluster_id -> response time histogram (in ms)
-  pub cluster_data:        BTreeMap<String,AppMetrics>,
-  /// backend_id -> response time histogram (in ms)
-  pub backend_data:    BTreeMap<String,BackendMetrics>,
-  pub request_counter: TimeSerie,
-  pub is_writable:     bool,
-  use_tagged_metrics:  bool,
-  origin:              String,
-  remote:              Option<(SocketAddr, UdpSocket)>,
-}
-
-impl ProxyMetrics {
-  pub fn new(prefix: String) -> Self {
-    ProxyMetrics {
-      buffer:      Buffer::with_capacity(2048),
-      prefix:      prefix,
-      created:     Instant::now(),
-      data:        BTreeMap::new(),
-      cluster_data:    BTreeMap::new(),
-      backend_data: BTreeMap::new(),
-      request_counter: TimeSerie::new(),
-      is_writable: false,
-      use_tagged_metrics: false,
-      remote:      None,
-      origin:      String::from("x"),
-    }
-  }
-
-  pub fn set_up_remote(&mut self, socket: UdpSocket, addr: SocketAddr) {
-    self.remote = Some((addr, socket));
-  }
-
-  pub fn set_up_origin(&mut self, origin: String) {
-    self.origin = origin;
-  }
-
-  pub fn set_up_tagged_metrics(&mut self, tagged: bool) {
-    self.use_tagged_metrics = tagged;
-  }
-
-  pub fn socket(&self) -> Option<&UdpSocket> {
-    self.remote.as_ref().map(|remote| &remote.1)
-  }
-
-
-  pub fn dump_percentiles(&self) -> BTreeMap<String, Percentiles> {
-    self.cluster_data.iter().map(|(ref cluster_id, ref metrics)| {
-      let percentiles = Percentiles {
-        samples:  metrics.response_time.len(),
-        p_50:     metrics.response_time.value_at_percentile(50.0),
-        p_90:     metrics.response_time.value_at_percentile(90.0),
-        p_99:     metrics.response_time.value_at_percentile(99.0),
-        p_99_9:   metrics.response_time.value_at_percentile(99.9),
-        p_99_99:  metrics.response_time.value_at_percentile(99.99),
-        p_99_999: metrics.response_time.value_at_percentile(99.999),
-        p_100:    metrics.response_time.value_at_percentile(100.0),
-      };
-
-      (cluster_id.to_string(), percentiles)
-    }).collect()
-  }
-
-  pub fn dump_backend_data(&self) -> BTreeMap<String, BackendMetricsData> {
-    self.backend_data.iter().map(|(ref backend_id, ref bm)| {
-      let percentiles = Percentiles {
-        samples:  bm.response_time.len(),
-        p_50:     bm.response_time.value_at_percentile(50.0),
-        p_90:     bm.response_time.value_at_percentile(90.0),
-        p_99:     bm.response_time.value_at_percentile(99.0),
-        p_99_9:   bm.response_time.value_at_percentile(99.9),
-        p_99_99:  bm.response_time.value_at_percentile(99.99),
-        p_99_999: bm.response_time.value_at_percentile(99.999),
-        p_100:    bm.response_time.value_at_percentile(100.0),
-      };
-
-      let data = BackendMetricsData {
-        bytes_in:  bm.bin,
-        bytes_out: bm.bout,
-        percentiles: percentiles,
-      };
-
-      (backend_id.to_string(), data)
-    }).collect()
-  }
-
-  pub fn dump_metrics_data(&mut self) -> MetricsData {
-    MetricsData {
-      proxy:        self.dump_data(),
-      clusters: self.dump_percentiles(),
-      backends:     self.dump_backend_data(),
-    }
-  }
-}
-*/
-
-/*
-#[derive(Debug,Clone)]
-pub struct TimeSerie {
-  sent_at:           Instant,
-  updated_second_at: Instant,
-  updated_minute_at: Instant,
-  last_sent:         u32,
-  last_second:       u32,
-  last_minute:       VecDeque<u32>,
-  last_hour:         VecDeque<u32>,
-}
-
-impl TimeSerie {
-  pub fn new() -> TimeSerie {
-    TimeSerie {
-      sent_at:           Instant::now(),
-      updated_second_at: Instant::now(),
-      updated_minute_at: Instant::now(),
-      last_sent:         0,
-      last_second:       0,
-      last_minute:       repeat(0).take(60).collect(),
-      last_hour:         repeat(0).take(60).collect(),
-    }
-  }
-
-  pub fn add(&mut self, value: u32) {
-    let now = Instant::now();
-
-    if now - self.updated_minute_at > Duration::from_secs(60) {
-      self.updated_minute_at = now;
-      let _ = self.last_hour.pop_front();
-
-      self.last_hour.push_back( self.last_minute.iter().sum() );
-    }
-
-    if now - self.updated_second_at > Duration::from_secs(1) {
-      self.updated_second_at = now;
-      let _ = self.last_minute.pop_front();
-
-      self.last_minute.push_back( self.last_second );
-
-      self.last_second = value;
-    } else {
-      self.last_second += value;
-    }
-
-    self.last_sent += value;
-  }
-
-  pub fn increment(&mut self) {
-    self.add(1);
-  }
-
-  pub fn filtered(&mut self) -> FilteredTimeSerie {
-    let now = Instant::now();
-
-    if now - self.updated_minute_at > Duration::from_secs(60) {
-      self.updated_minute_at = now;
-      let _ = self.last_hour.pop_front();
-
-      self.last_hour.push_back( self.last_minute.iter().sum() );
-    }
-
-    if now - self.updated_second_at > Duration::from_secs(1) {
-      self.updated_second_at = now;
-      let _ = self.last_minute.pop_front();
-
-      self.last_minute.push_back( self.last_second );
-
-      self.last_second = 0;
-    }
-
-    FilteredTimeSerie {
-      last_second: self.last_second,
-      last_minute: self.last_minute.iter().cloned().collect(),
-      last_hour:   self.last_hour.iter().cloned().collect(),
-    }
-  }
-
-  pub fn update_sent_at(&mut self, now: Instant) {
-    self.sent_at   = now;
-    self.last_sent = 0;
-  }
-}
-*/

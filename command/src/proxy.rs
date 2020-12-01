@@ -60,6 +60,15 @@ pub struct AppMetricsData {
   pub backends: BTreeMap<String, BTreeMap<String, FilteredData>>,
 }
 
+impl AppMetricsData {
+    pub fn new() -> Self {
+        AppMetricsData {
+            data: BTreeMap::new(),
+            backends: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug,Clone,PartialEq,Eq,Hash,Serialize,Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FilteredData {
