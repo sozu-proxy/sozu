@@ -1692,7 +1692,6 @@ dependencies = [
  "slab",
  "sled",
  "sozu-command-lib",
- "tempfile",
  "time 0.2.27",
  "tiny_http",
  "ureq",
