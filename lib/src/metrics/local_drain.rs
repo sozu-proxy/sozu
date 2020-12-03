@@ -106,7 +106,6 @@ pub struct LocalDrain {
   pub prefix:          String,
   pub created:         Instant,
   pub db:              sled::Db,
-  pub data_dir:        tempfile::TempDir,
   pub data:            BTreeMap<String, AggregatedMetric>,
   metrics:             BTreeMap<String, (MetricMeta, MetricKind)>,
   use_tagged_metrics:  bool,
@@ -115,13 +114,15 @@ pub struct LocalDrain {
 
 impl LocalDrain {
   pub fn new(prefix: String) -> Self {
-    let data_dir = tempfile::TempDir::new().unwrap();
-    let db = sled::open(data_dir.path()).unwrap();
+    let db = sled::Config::new()
+        .temporary(true)
+        .mode(sled::Mode::LowSpace)
+        .open()
+        .unwrap();
 
     LocalDrain {
       prefix,
       created:     Instant::now(),
-      data_dir,
       db,
       metrics:     BTreeMap::new(),
       data:        BTreeMap::new(),
