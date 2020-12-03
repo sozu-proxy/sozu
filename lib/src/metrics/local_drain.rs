@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 use std::str;
 use std::time::Instant;
+use time::OffsetDateTime;
 use std::convert::TryInto;
 use std::collections::BTreeMap;
 use hdrhistogram::Histogram;
+use nom::combinator::complete;
 use sozu_command::proxy::{FilteredData,MetricsData,Percentiles,AppMetricsData};
 
 use super::{MetricData,Subscriber};
@@ -155,7 +157,8 @@ impl LocalDrain {
               let (k, v) = res.unwrap();
               match meta {
                   MetricMeta::Cluster => {
-                      let mut it = k.split(|c: &u8| *c == b'.');
+                      info!("will dump key: {}", std::str::from_utf8(&k).unwrap());
+                      let mut it = k.split(|c: &u8| *c == b'\t');
                       let key = std::str::from_utf8(it.next().unwrap()).unwrap();
                       let app_id = std::str::from_utf8(it.next().unwrap()).unwrap();
                       let timestamp:i64 = std::str::from_utf8(it.next().unwrap()).unwrap().parse().unwrap();
@@ -222,19 +225,20 @@ impl LocalDrain {
 
 
       // still clear the DB for now
-      self.db.clear();
+      //self.db.clear();
 
       apps
   }
 
-  pub fn clear(&mut self) {
-      self.db.clear();
-  }
-
   fn receive_cluster_metric(&mut self, key: &'static str, id: &str, backend_id: Option<&str>, metric: MetricData) {
       info!("metric: {} {} {:?} {:?}", key, id, backend_id, metric);
+      let key_prefix = if let Some(bid) = backend_id {
+          format!("{}\t{}\t{}", key, id, bid)
+      } else {
+          format!("{}\t{}", key, id)
+      };
 
-      if !self.metrics.contains_key(key) {
+      if !self.metrics.contains_key(&key_prefix) {
           let kind = match metric {
               MetricData::Gauge(_) => MetricKind::Gauge,
               MetricData::GaugeAdd(_) => MetricKind::Gauge,
@@ -247,9 +251,9 @@ impl LocalDrain {
               MetricMeta::Cluster
           };
 
-          self.metrics.insert(key.to_string(), (meta, kind));
+          self.metrics.insert(key_prefix.clone(), (meta, kind));
           //let start = format!("{}\0", key);
-          let end = format!("{}\x7F", key);
+          let end = format!("{}\x7F", key_prefix);
           //self.db.insert(start.as_bytes(), &0u64.to_le_bytes()).unwrap();
           self.db.insert(end.as_bytes(), &0u64.to_le_bytes()).unwrap();
       }
