@@ -184,8 +184,8 @@ impl Aggregator {
     self.local.dump_process_data()
   }
 
-  pub fn clear_local(&mut self) {
-    self.local.clear();
+  pub fn clear_local(&mut self, now: time::OffsetDateTime) {
+    self.local.clear(now);
   }
 }
 

@@ -322,7 +322,15 @@ impl Server {
           Some(i) => if *i <= now {
               poll_timeout
           } else {
-              Some(*i - now)
+              let dur = *i - now;
+              match poll_timeout {
+                  None => Some(dur),
+                  Some(t) => if t < dur {
+                      Some(t)
+                  } else {
+                      Some(dur)
+                  }
+              }
           },
       };
 
@@ -488,11 +496,15 @@ impl Server {
           }
           info!("removing {} zombies ({} remaining tokens after close)", count, remaining);
         }
+      }
 
-        // regularly clear local metrics to prevent them from taking too much memory
-        METRICS.with(|metrics| {
-          (*metrics.borrow_mut()).clear_local();
-        });
+      //FIXME: what if we got no event in a while
+      let now = time::OffsetDateTime::now_utc();
+      if now.second() == 0 {
+          // regularly clear local metrics to prevent them from taking too much memory
+          METRICS.with(|metrics| {
+              (*metrics.borrow_mut()).clear_local(now);
+          });
       }
 
       gauge!("client.connections", self.nb_connections);
