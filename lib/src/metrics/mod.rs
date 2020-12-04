@@ -320,6 +320,8 @@ macro_rules! record_backend_metrics (
       if let Some(t) = $backend_connection_time {
         m.receive_metric("backend_connection_time", Some(cluster_id), Some(backend_id), MetricData::Time(t.whole_milliseconds() as usize));
       }
+
+      m.receive_metric("requests", Some(cluster_id), Some(backend_id), MetricData::Count(1));
     });
   }
 );
