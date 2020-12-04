@@ -156,10 +156,14 @@ impl LocalDrain {
               let (k, v) = res.unwrap();
               match meta {
                   MetricMeta::Cluster => {
-                      let mut it = k.split(|c: &u8| *c == b'\t');
-                      let key = std::str::from_utf8(it.next().unwrap()).unwrap();
-                      let app_id = std::str::from_utf8(it.next().unwrap()).unwrap();
-                      let timestamp:i64 = std::str::from_utf8(it.next().unwrap()).unwrap().parse().unwrap();
+                      let mut it1 = k.split(|c: &u8| *c == b'\x1F');
+                      let k2 = it1.next().unwrap();
+                      let mut it2 = k2.split(|c: &u8| *c == b'\t');
+                      let key = std::str::from_utf8(it2.next().unwrap()).unwrap();
+                      let app_id = std::str::from_utf8(it2.next().unwrap()).unwrap();
+                      let timestamp_with_prefix = it1.next().unwrap();
+                      // remove the leading \t
+                      let timestamp:i64 = std::str::from_utf8(&timestamp_with_prefix[1..]).unwrap().parse().unwrap();
 
                       info!("looking at key = {}, id = {}, ts = {}",
                             key, app_id, timestamp);
@@ -230,9 +234,9 @@ impl LocalDrain {
 
   fn receive_cluster_metric(&mut self, key: &'static str, id: &str, backend_id: Option<&str>, metric: MetricData) {
       info!("metric: {} {} {:?} {:?}", key, id, backend_id, metric);
-      // the final space is necessary to start iterating after the tab that is used in backend
+      // the final character is necessary to start iterating after the tab that is used in backend
       // metrics
-      self.store_metric(&format!("{}\t{} ", key, id), id, None, &metric);
+      self.store_metric(&format!("{}\t{}\x1F", key, id), id, None, &metric);
       if let Some(bid) = backend_id {
           self.store_metric(&format!("{}\t{}\t{} ", key, id, bid), id, backend_id, &metric);
       }
