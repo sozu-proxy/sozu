@@ -587,333 +587,60 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                   return Ok(());
                 }
 
-                let mut main_table = Table::new();
-                main_table.add_row(row![String::from("Main process metrics")]);
+                let mut main_metrics = BTreeMap::new();
+                main_metrics.insert("".to_string(), data.main.clone());
+                print_metrics("Main", &main_metrics);
 
-                for (ref key, ref value) in data.main.iter() {
-                  match value {
-                    FilteredData::Count(c) => {main_table.add_row(row![key.to_string(), c]);},
-                    FilteredData::Gauge(c) => { main_table.add_row(row![key.to_string(), c]);},
-                    r => {
-                      println!("unexpected metric: {:?}", r);
-                      main_table.add_row(row![key.to_string(), String::new()]);
-                    }
-                  }
-                }
-
-                main_table.printstd();
-
-                println!("\nworker metrics:\n");
-
-                let mut proxy_table = Table::new();
-                let mut row = vec![cell!("Workers")];
-                for key in data.workers.keys() {
-                  row.push(cell!(key));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                  row.push(cell!(""));
-                }
-                proxy_table.add_row(Row::new(row));
-
-                let mut worker_keys = HashSet::new();
-                let mut header = Vec::new();
-                header.push(cell!("key"));
-                for key in data.workers.keys() {
-                  header.push(cell!("Value"));
-                  header.push(cell!("p50"));
-                  header.push(cell!("p90"));
-                  header.push(cell!("p99"));
-                  header.push(cell!("p99.9"));
-                  header.push(cell!("p99.99"));
-                  header.push(cell!("p99.999"));
-                  header.push(cell!("p100"));
-                  worker_keys.insert(key);
-                }
-                proxy_table.add_row(Row::new(header.clone()));
-
-                let mut proxy_metrics = HashSet::new();
-                for metrics in data.workers.values() {
-                  for key in metrics.proxy.keys() {
-                    proxy_metrics.insert(key);
-                  }
-                }
-
-                for key in proxy_metrics.iter() {
-                  let k: &str = key;
-                  let mut row = Vec::new();
-                  row.push(cell!(k.to_string()));
-                  for worker_key in worker_keys.iter() {
-                    let wk: &str = worker_key;
-
-                    match data.workers[wk].proxy.get(k) {
-                      None => {
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                      },
-                      Some(FilteredData::Count(c)) => {
-                        row.push(cell!(c));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                      },
-                      Some(FilteredData::Gauge(c)) => {
-                        row.push(cell!(c));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                      },
-                      Some(FilteredData::Percentiles(p)) => {
-                        row.push(cell!(p.samples));
-                        row.push(cell!(p.p_50));
-                        row.push(cell!(p.p_90));
-                        row.push(cell!(p.p_99));
-                        row.push(cell!(p.p_99_9));
-                        row.push(cell!(p.p_99_99));
-                        row.push(cell!(p.p_99_999));
-                        row.push(cell!(p.p_100));
-                      },
-                      r => {
-                        println!("unexpected metric: {:?}", r);
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                        row.push(cell!(""));
-                      }
-                    }
-                  }
-
-                  proxy_table.add_row(Row::new(row));
-                }
-
-                proxy_table.printstd();
-
-                println!("\napplication metrics:\n");
+                let worker_metrics = data.workers.iter().map(|(k,v)| (k.to_string(), v.proxy.clone()))
+                    .collect::<BTreeMap<_,_>>();
+                print_metrics("Workers", &worker_metrics);
 
                 let mut cluster_ids = HashSet::new();
-                for metrics in data.workers.values() {
-                  for key in metrics.clusters.keys() {
+                for worker in data.workers.values() {
+                  for key in worker.clusters.keys() {
                     cluster_ids.insert(key);
                   }
                 }
 
+                println!("\ncluster metrics:\n");
                 for cluster_id in cluster_ids.iter() {
-                  let id: &str = cluster_id;
+                    println!("looking for data for cluster: {}", cluster_id);
+                    let cluster_metrics = data.workers.iter()
+                        .map(|(worker, worker_data)| {
+                            //println!("worker data: {:?}", worker_data.clusters.get(cluster_id.as_str()));
+                            (worker.clone(),
+                            worker_data.clusters.get(cluster_id.as_str())
+                                .map(|cluster_data| {
+                                    cluster_data.data.clone()
+                                })
+                                .unwrap_or_default())
+                        }).collect::<BTreeMap<_, _>>();
 
-                  let mut application_table = Table::new();
+                    println!("generated app metrics");
+                    print_metrics(cluster_id, &cluster_metrics);
 
-                  let mut row = vec![cell!(id)];
-                  for key in data.workers.keys() {
-                    row.push(cell!(key));
-                    row.push(cell!(""));
-                    row.push(cell!(""));
-                    row.push(cell!(""));
-                    row.push(cell!(""));
-                    row.push(cell!(""));
-                    row.push(cell!(""));
-                    row.push(cell!(""));
-                  }
-                  application_table.add_row(Row::new(row));
-                  application_table.add_row(Row::new(header.clone()));
+                    let backend_ids: HashSet<_> = data.workers.values()
+                        .filter_map(|w| w.clusters.get(cluster_id.as_str()))
+                        .flat_map(|app_metrics| {
+                            app_metrics.backends.keys()
+                        }).collect();
 
-                  let mut app_metrics = HashSet::new();
-                  let mut backend_ids = HashSet::new();
+                    for backend_id in backend_ids.iter() {
+                        let backend_metrics = data.workers.iter()
+                          .map(|(worker, worker_data)| {
+                            (worker.clone(),
+                            worker_data.clusters.get(cluster_id.as_str())
+                                .and_then(|cluster_data| {
+                                    cluster_data.backends.get(backend_id.as_str())
+                                      .map(|b| b.clone())
+                                })
+                                .unwrap_or_default())
+                          }).collect::<BTreeMap<_, _>>();
 
-                  for worker in data.workers.values() {
-                    if let Some(app) = worker.clusters.get(id) {
-                      for k in app.data.keys() {
-                        app_metrics.insert(k);
-                      }
-
-                      for k in app.backends.keys() {
-                        backend_ids.insert(k);
-                      }
-                    }
-                  }
-
-                  for app_metric in app_metrics.iter() {
-                    let metric: &str = app_metric;
-                    let mut row = Vec::new();
-                    row.push(cell!(metric.to_string()));
-
-                    for worker in data.workers.values() {
-                      match worker.clusters.get(id).and_then(|app| app.data.get(metric)) {
-                        None => {
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                        },
-                        Some(FilteredData::Count(c)) => {
-                          row.push(cell!(c));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                        },
-                        Some(FilteredData::Gauge(c)) => {
-                          row.push(cell!(c));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                        }
-                        Some(FilteredData::Percentiles(p)) => {
-                          row.push(cell!(p.samples));
-                          row.push(cell!(p.p_50));
-                          row.push(cell!(p.p_90));
-                          row.push(cell!(p.p_99));
-                          row.push(cell!(p.p_99_9));
-                          row.push(cell!(p.p_99_99));
-                          row.push(cell!(p.p_99_999));
-                          row.push(cell!(p.p_100));
-                        },
-                        r => {
-                          println!("unexpected metric: {:?}", r);
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                          row.push(cell!(""));
-                        },
-                      }
-                    }
-                    application_table.add_row(Row::new(row));
-                  }
-                  application_table.printstd();
-
-                  for backend_id in backend_ids.iter() {
-                    let backend: &str = backend_id;
-                    let mut backend_table = Table::new();
-
-                    let mut row = vec![cell!(format!("{}: {}", id, backend))];
-                    for key in data.workers.keys() {
-                      row.push(cell!(key));
-                      row.push(cell!(""));
-                      row.push(cell!(""));
-                      row.push(cell!(""));
-                      row.push(cell!(""));
-                      row.push(cell!(""));
-                      row.push(cell!(""));
-                      row.push(cell!(""));
-                    }
-                    backend_table.add_row(Row::new(row));
-                    backend_table.add_row(Row::new(header.clone()));
-
-                    let mut backend_metrics = HashSet::new();
-                    for worker in data.workers.values() {
-                      if let Some(app) = worker.clusters.get(id) {
-                        for b in app.backends.values() {
-                          for k in b.keys() {
-                            backend_metrics.insert(k);
-                          }
-                        }
-                      }
+                        print_metrics(&format!("{} {}", cluster_id, backend_id), &backend_metrics);
                     }
 
-                    for backend_metric in backend_metrics.iter() {
-                      let metric: &str = backend_metric;
-                      let mut row = Vec::new();
-                      row.push(cell!(metric.to_string()));
-
-                      for worker in data.workers.values() {
-                        match worker.clusters.get(id).and_then(|app| app.backends.get(backend))
-                          .and_then(|back| back.get(metric)) {
-                          None => {
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                          },
-                          Some(FilteredData::Count(c)) => {
-                            row.push(cell!(c));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                          },
-                          Some(FilteredData::Gauge(c)) => {
-                            row.push(cell!(c));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                          }
-                          Some(FilteredData::Percentiles(p)) => {
-                            row.push(cell!(p.samples));
-                            row.push(cell!(p.p_50));
-                            row.push(cell!(p.p_90));
-                            row.push(cell!(p.p_99));
-                            row.push(cell!(p.p_99_9));
-                            row.push(cell!(p.p_99_99));
-                            row.push(cell!(p.p_99_999));
-                            row.push(cell!(p.p_100));
-                          },
-                          r => {
-                            println!("unexpected metric: {:?}", r);
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                            row.push(cell!(""));
-                          },
-                        }
-                      }
-                      backend_table.add_row(Row::new(row));
-                    }
-
-                    backend_table.printstd();
-                  }
                 }
-
                 break;
               }
             }
@@ -922,7 +649,110 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
       }
     }
   }
-  Ok(())
+}
+
+// input: map worker_id -> (map key -> value)
+fn print_metrics(table_name: &str, data: &BTreeMap<String, BTreeMap<String, FilteredData>>) {
+    let metrics = data.values().flat_map(|map| {
+        map.iter()
+            .filter_map(|(k, v)| match v {
+                FilteredData::Count(_) | FilteredData::Gauge(_) => Some(k),
+                _ => None,
+            })
+    }).collect::<HashSet<_>>();
+    println!("metrics list: {:?}", metrics);
+
+    if !metrics.is_empty() {
+        let mut table = Table::new();
+
+        let mut row = vec![cell!(table_name)];
+        for key in data.keys() {
+            row.push(cell!(key));
+        }
+        table.add_row(Row::new(row));
+
+
+        for metric in metrics {
+            let mut row = vec![cell!(metric)];
+            for worker_data in data.values() {
+                match worker_data.get(metric) {
+                    Some(FilteredData::Count(c)) => row.push(cell!(c)),
+                    Some(FilteredData::Gauge(c)) => row.push(cell!(c)),
+                    _ => row.push(cell!("")),
+                }
+            }
+            table.add_row(Row::new(row));
+        }
+
+        table.printstd();
+    }
+
+    let time_metrics = data.values().flat_map(|map| {
+        map.iter()
+            .filter_map(|(k, v)| match v {
+                FilteredData::Percentiles(_) => Some(k),
+                _ => None,
+            })
+    }).collect::<HashSet<_>>();
+    println!("time metrics list: {:?}", time_metrics);
+
+    if !time_metrics.is_empty() {
+        let mut timing_table = Table::new();
+
+        let mut row = vec![cell!(table_name)];
+        for key in data.keys() {
+            row.push(cell!(key));
+        }
+        timing_table.add_row(Row::new(row));
+
+
+        for metric in time_metrics {
+            let mut row_samples = vec![cell!(format!("{} samples", metric))];
+            let mut row_p50 = vec![cell!(format!("{} p50", metric))];
+            let mut row_p90 = vec![cell!(format!("{} p90", metric))];
+            let mut row_p99 = vec![cell!(format!("{} p99", metric))];
+            let mut row_p99_9 = vec![cell!(format!("{} p99.9", metric))];
+            let mut row_p99_99 = vec![cell!(format!("{} p99.99", metric))];
+            let mut row_p99_999 = vec![cell!(format!("{} p99.999", metric))];
+            let mut row_p100 = vec![cell!(format!("{} p100", metric))];
+
+            for worker_data in data.values() {
+                match worker_data.get(metric) {
+                    Some(FilteredData::Percentiles(p)) => {
+                        row_samples.push(cell!(p.samples));
+                        row_p50.push(cell!(p.p_50));
+                        row_p90.push(cell!(p.p_90));
+                        row_p99.push(cell!(p.p_99));
+                        row_p99_9.push(cell!(p.p_99_9));
+                        row_p99_99.push(cell!(p.p_99_99));
+                        row_p99_999.push(cell!(p.p_99_999));
+                        row_p100.push(cell!(p.p_100));
+                    }
+                    _ => {
+                        row_samples.push(cell!(""));
+                        row_p50.push(cell!(""));
+                        row_p90.push(cell!(""));
+                        row_p99.push(cell!(""));
+                        row_p99_9.push(cell!(""));
+                        row_p99_99.push(cell!(""));
+                        row_p99_999.push(cell!(""));
+                        row_p100.push(cell!(""));
+                    }
+                }
+            }
+            timing_table.add_row(Row::new(row_samples));
+            timing_table.add_row(Row::new(row_p50));
+            timing_table.add_row(Row::new(row_p90));
+            timing_table.add_row(Row::new(row_p99));
+            timing_table.add_row(Row::new(row_p99_9));
+            timing_table.add_row(Row::new(row_p99_99));
+            timing_table.add_row(Row::new(row_p99_999));
+            timing_table.add_row(Row::new(row_p100));
+        }
+
+        timing_table.printstd();
+    }
+    Ok(())
 }
 
 pub fn reload_configuration(mut channel: Channel<CommandRequest,CommandResponse>, path: Option<String>, json: bool) 
