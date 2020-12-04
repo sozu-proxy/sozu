@@ -601,6 +601,8 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                     cluster_ids.insert(key);
                   }
                 }
+                let mut cluster_ids: Vec<_> = cluster_ids.drain().collect();
+                cluster_ids.sort();
 
                 println!("\ncluster metrics:\n");
                 for cluster_id in cluster_ids.iter() {
@@ -619,11 +621,13 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                     println!("generated app metrics");
                     print_metrics(cluster_id, &cluster_metrics);
 
-                    let backend_ids: HashSet<_> = data.workers.values()
+                    let mut backend_ids: HashSet<_> = data.workers.values()
                         .filter_map(|w| w.clusters.get(cluster_id.as_str()))
                         .flat_map(|app_metrics| {
                             app_metrics.backends.keys()
                         }).collect();
+                    let mut backend_ids: Vec<_> = backend_ids.drain().collect();
+                    backend_ids.sort();
 
                     for backend_id in backend_ids.iter() {
                         let backend_metrics = data.workers.iter()
@@ -653,13 +657,17 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
 
 // input: map worker_id -> (map key -> value)
 fn print_metrics(table_name: &str, data: &BTreeMap<String, BTreeMap<String, FilteredData>>) {
-    let metrics = data.values().flat_map(|map| {
+    let mut metrics = data.values().flat_map(|map| {
         map.iter()
             .filter_map(|(k, v)| match v {
                 FilteredData::Count(_) | FilteredData::Gauge(_) => Some(k),
                 _ => None,
             })
     }).collect::<HashSet<_>>();
+
+    // sort the metrics so they always appear in the same order
+    let mut metrics: Vec<_> = metrics.drain().collect();
+    metrics.sort();
     println!("metrics list: {:?}", metrics);
 
     if !metrics.is_empty() {
@@ -687,13 +695,17 @@ fn print_metrics(table_name: &str, data: &BTreeMap<String, BTreeMap<String, Filt
         table.printstd();
     }
 
-    let time_metrics = data.values().flat_map(|map| {
+    let mut time_metrics = data.values().flat_map(|map| {
         map.iter()
             .filter_map(|(k, v)| match v {
                 FilteredData::Percentiles(_) => Some(k),
                 _ => None,
             })
     }).collect::<HashSet<_>>();
+
+    // sort the metrics so they always appear in the same order
+    let mut time_metrics: Vec<_> = time_metrics.drain().collect();
+    time_metrics.sort();
     println!("time metrics list: {:?}", time_metrics);
 
     if !time_metrics.is_empty() {
