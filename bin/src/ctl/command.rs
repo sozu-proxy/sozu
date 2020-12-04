@@ -672,13 +672,13 @@ fn print_metrics(table_name: &str, data: &BTreeMap<String, BTreeMap<String, Filt
 
     if !metrics.is_empty() {
         let mut table = Table::new();
+        table.set_format(*prettytable::format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
 
         let mut row = vec![cell!(table_name)];
         for key in data.keys() {
             row.push(cell!(key));
         }
-        table.add_row(Row::new(row));
-
+        table.set_titles(Row::new(row));
 
         for metric in metrics {
             let mut row = vec![cell!(metric)];
@@ -710,12 +710,13 @@ fn print_metrics(table_name: &str, data: &BTreeMap<String, BTreeMap<String, Filt
 
     if !time_metrics.is_empty() {
         let mut timing_table = Table::new();
+        timing_table.set_format(*prettytable::format::consts::FORMAT_NO_BORDER_LINE_SEPARATOR);
 
         let mut row = vec![cell!(table_name)];
         for key in data.keys() {
             row.push(cell!(key));
         }
-        timing_table.add_row(Row::new(row));
+        timing_table.set_titles(Row::new(row));
 
 
         for metric in time_metrics {
