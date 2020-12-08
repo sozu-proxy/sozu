@@ -934,6 +934,7 @@ impl CommandServer {
                 }));
             }
             &Query::Certificates(_) => {}
+            &Query::Metrics(_) => {}
         };
 
         let mut client_tx = self.clients.get_mut(&client_id).unwrap().clone();
@@ -1017,6 +1018,17 @@ impl CommandServer {
                         .await{
                             error!("could not send message to client {:?}: {:?}", client_id, e);
                         }
+                }
+                &Query::Metrics(_) => {
+                    debug!("metrics query received: {:?}", data);
+                    let res = client_tx
+                        .send(CommandResponse::new(
+                            request_id.clone(),
+                            CommandStatus::Ok,
+                            "".to_string(),
+                            Some(CommandResponseData::Query(data)),
+                        ))
+                        .await;
                 }
             };
         })

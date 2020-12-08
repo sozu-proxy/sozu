@@ -14,7 +14,7 @@ use self::command::{add_application,remove_application,dump_state,load_state,
   remove_tcp_frontend, add_tcp_frontend, add_certificate, remove_certificate,
   replace_certificate, query_application, logging_filter, upgrade_worker,
   events, query_certificate, add_tcp_listener, add_http_listener, add_https_listener,
-  remove_listener, activate_listener, deactivate_listener, reload_configuration};
+  remove_listener, activate_listener, deactivate_listener, reload_configuration, query_metrics};
 
 pub fn ctl(matches: Sozu) -> Result<(), anyhow::Error>{
 
@@ -143,6 +143,7 @@ pub fn ctl(matches: Sozu) -> Result<(), anyhow::Error>{
       match cmd {
         QueryCmd::Applications{ id, domain } => query_application(channel, json, id, domain),
         QueryCmd::Certificates{ fingerprint, domain } => query_certificate(channel, json, fingerprint, domain),
+        QueryCmd::Metrics{ names, clusters, backends } => query_metrics(channel, json, names, clusters, backends),
       }
     },
     SubCmd::Config{ cmd: _ } => Ok(()), // noop, handled at the beginning of the method

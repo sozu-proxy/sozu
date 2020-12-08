@@ -462,7 +462,28 @@ pub enum QueryCmd {
     fingerprint: Option<String>,
     #[structopt(short = "d", long="domain", help="domain name")]
     domain: Option<String>
+  },
+
+  #[structopt(name = "metrics", about = "Query metrics matching a specific filter")]
+  Metrics {
+    //#[structopt(short = "n", long="names", help="metric names", parse(from_str = split_comma))]
+    #[structopt(short = "n", long="names", help="metric names", use_delimiter = true)]
+    names: Vec<String>,
+    #[structopt(short = "c", long="clusters", help="list of cluster ids", use_delimiter = true)]
+    clusters: Vec<String>,
+    #[structopt(short = "b", long="backends", help="list of backend ids", use_delimiter = true, parse(try_from_str = split_slash))]
+    backends: Vec<(String, String)>,
   }
+}
+
+fn split_slash(input: &str) -> Result<(String, String), String> {
+    let mut it = input.split('/').map(|s| s.trim().to_string());
+
+    if let (Some(cluster), Some(backend)) = (it.next(), it.next()) {
+        Ok((cluster, backend))
+    } else {
+        Err(format!("could not split cluster id and backend id in {}", input))
+    }
 }
 
 #[derive(StructOpt, PartialEq, Debug)]

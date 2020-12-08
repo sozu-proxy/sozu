@@ -184,6 +184,10 @@ impl Aggregator {
     self.local.dump_process_data()
   }
 
+  pub fn query(&mut self, q: &sozu_command_lib::proxy::QueryMetricsType) -> BTreeMap<String, FilteredData> {
+    self.local.query(q)
+  }
+
   pub fn clear_local(&mut self, now: time::OffsetDateTime) {
     self.local.clear(now);
   }
