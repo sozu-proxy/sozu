@@ -650,7 +650,18 @@ impl Server {
               return
             },
           }
-        }
+        },
+        &Query::Metrics(ref q) => {
+            METRICS.with(|metrics| {
+                push_queue(ProxyResponse {
+                    id:     message.id.clone(),
+                    status: ProxyResponseStatus::Ok,
+                    data:   Some(ProxyResponseData::Query(
+                            QueryAnswer::Metrics((*metrics.borrow_mut()).query(q))))
+                });
+            });
+            return
+        },
       }
     }
 

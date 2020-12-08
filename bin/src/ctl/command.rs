@@ -8,7 +8,7 @@ use sozu_command::proxy::{Cluster, ProxyRequestData, Backend, HttpFrontend,
   RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend,
   TcpListener, ListenerType, TlsVersion, QueryCertificateType,
   QueryAnswerCertificate, RemoveListener, ActivateListener, DeactivateListener,
-  LoadBalancingAlgorithms, PathRule, RulePosition, Route};
+  LoadBalancingAlgorithms, PathRule, RulePosition, Route, QueryMetricsType};
 
 use serde_json;
 use std::collections::{HashMap,HashSet,BTreeMap};
@@ -645,7 +645,7 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
                     }
 
                 }
-                break;
+                break Ok(());
               }
             }
           }
@@ -765,7 +765,6 @@ fn print_metrics(table_name: &str, data: &BTreeMap<String, BTreeMap<String, Filt
 
         timing_table.printstd();
     }
-    Ok(())
 }
 
 pub fn reload_configuration(mut channel: Channel<CommandRequest,CommandResponse>, path: Option<String>, json: bool) 
@@ -1473,8 +1472,77 @@ pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, j
   }
 }
 
-pub fn logging_filter(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, filter: &str) 
-  -> Result<(), anyhow::Error> {
+pub fn query_metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool,
+                     names: Vec<String>, clusters: Vec<String>, mut backends: Vec<(String, String)>) -> Result<(), anyhow::Error> {
+
+    let query = if !clusters.is_empty() && !backends.is_empty() {
+        bail!("Error: Either request a list of clusters or a list of backends");
+    } else {
+        if !clusters.is_empty(){
+            QueryMetricsType::Cluster { metrics: names, clusters }
+        } else {
+            QueryMetricsType::Backend { metrics: names, backends }
+        }
+    };
+
+    let command = CommandRequestData::Proxy(ProxyRequestData::Query(Query::Metrics(query)));
+
+    let id = generate_id();
+    channel.write_message(&CommandRequest::new(
+            id.clone(),
+            command,
+            None,
+            ));
+
+    match channel.read_message() {
+        None          => {
+            bail!("the proxy didn't answer");
+        },
+        Some(message) => {
+            println!("received message: {:?}", message);
+            if id != message.id {
+                bail!("received message with invalid id: {:?}", message);
+            }
+            match message.status {
+                CommandStatus::Processing => {
+                    // do nothing here
+                    // for other messages, we would loop over read_message
+                    // until an error or ok message was sent
+                },
+                CommandStatus::Error => {
+                    if json {
+                        print_json_response(&message.message);
+                        exit(1);
+                    } else {
+                        bail!("could not query proxy state: {}", message.message);
+                    }
+                },
+                CommandStatus::Ok => {
+                    if let Some(CommandResponseData::Query(data)) = message.data {
+                        if json {
+                            print_json_response(&data);
+                            return Ok(());
+                        }
+
+                        println!("got data: {:#?}", data);
+                        let data = data.iter().filter_map(|(key, value)| {
+                            match value {
+                                QueryAnswer::Metrics(d) => Some((key.clone(), d.clone())),
+                                _ => None,
+                            }
+                        }).collect::<BTreeMap<_,_>>();
+                        print_metrics("Result", &data);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+
+pub fn logging_filter(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, filter: &str) -> Result<(), anyhow::Error> {
   order_command(channel, timeout, ProxyRequestData::Logging(String::from(filter)))
 }
 

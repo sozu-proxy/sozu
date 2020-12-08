@@ -730,6 +730,7 @@ pub struct TcpListener {
 pub enum Query {
   Applications(QueryApplicationType),
   Certificates(QueryCertificateType),
+  Metrics(QueryMetricsType),
   ApplicationsHashes,
 }
 
@@ -754,6 +755,14 @@ pub enum QueryCertificateType {
   Fingerprint(Vec<u8>),
 }
 
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum QueryMetricsType {
+    Cluster { metrics: Vec<String>, clusters: Vec<String> },
+    // tuple cluster_id, backend_id
+    Backend { metrics: Vec<String>, backends: Vec<(String, String)> },
+}
+
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryAnswer {
@@ -761,6 +770,7 @@ pub enum QueryAnswer {
   /// application id, hash of application information
   ApplicationsHashes(BTreeMap<String, u64>),
   Certificates(QueryAnswerCertificate),
+  Metrics(BTreeMap<String, FilteredData>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
