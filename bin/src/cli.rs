@@ -468,6 +468,8 @@ pub enum QueryCmd {
   Metrics {
     #[structopt(short, long, help="list available metrics")]
     list: bool,
+    #[structopt(short, long, help="refresh metrics results (in seconds)")]
+    refresh: Option<u32>,
     #[structopt(short = "n", long="names", help="metric names", use_delimiter = true)]
     names: Vec<String>,
     #[structopt(short = "c", long="clusters", help="list of cluster ids", use_delimiter = true)]
