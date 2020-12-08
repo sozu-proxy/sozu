@@ -96,7 +96,7 @@ enum MetricKind {
   Time,
 }
 
-#[derive(Clone,Debug)]
+#[derive(Clone,Debug,PartialEq)]
 enum MetricMeta {
     Cluster,
     ClusterBackend,
@@ -107,6 +107,8 @@ pub struct LocalDrain {
   pub prefix:          String,
   pub created:         Instant,
   pub db:              sled::Db,
+  pub cluster_tree:    sled::Tree,
+  pub backend_tree:    sled::Tree,
   pub data:            BTreeMap<String, AggregatedMetric>,
   metrics:             BTreeMap<String, (MetricMeta, MetricKind)>,
   use_tagged_metrics:  bool,
@@ -120,11 +122,15 @@ impl LocalDrain {
         .mode(sled::Mode::LowSpace)
         .open()
         .unwrap();
+    let cluster_tree = db.open_tree("cluster").unwrap();
+    let backend_tree = db.open_tree("backend").unwrap();
 
     LocalDrain {
       prefix,
       created:     Instant::now(),
       db,
+      cluster_tree,
+      backend_tree,
       metrics:     BTreeMap::new(),
       data:        BTreeMap::new(),
       use_tagged_metrics: false,
@@ -165,7 +171,7 @@ impl LocalDrain {
       info!("current metrics: {:#?}", self.metrics);
       for prefix_key in metrics.iter() {
           for cluster_id in clusters.iter() {
-              let key = format!("{}\t{}\x1f", prefix_key, cluster_id);
+              let key = format!("{}\t{}", prefix_key, cluster_id);
 
               let res = self.metrics.get(&key);
               if res.is_none() {
@@ -175,35 +181,31 @@ impl LocalDrain {
               let (meta, kind) = res.unwrap();
 
               let end = format!("{}\x7F", key);
-              for res in self.db.range(key.as_bytes()..end.as_bytes()) {
+              for res in self.cluster_tree.range(key.as_bytes()..end.as_bytes()) {
                   let (k, v) = res.unwrap();
                   info!("looking at key: {:?}", std::str::from_utf8(&k));
                   match meta {
                       MetricMeta::Cluster => {
-                             let mut it1 = k.split(|c: &u8| *c == b'\x1F');
-                             let k2 = it1.next().unwrap();
-                             let mut it2 = k2.split(|c: &u8| *c == b'\t');
-                             let key = std::str::from_utf8(it2.next().unwrap()).unwrap();
-                             let cluster_id = std::str::from_utf8(it2.next().unwrap()).unwrap();
-                             let timestamp_with_prefix = it1.next().unwrap();
-                             // remove the leading \t
-                             let timestamp:i64 = std::str::from_utf8(&timestamp_with_prefix[1..]).unwrap().parse().unwrap();
+                          let mut it = k.split(|c: &u8| *c == b'\t');
+                          let key = std::str::from_utf8(it.next().unwrap()).unwrap();
+                          let app_id = std::str::from_utf8(it.next().unwrap()).unwrap();
+                          let timestamp:i64 = std::str::from_utf8(it.next().unwrap()).unwrap().parse().unwrap();
 
-                             info!("looking at key = {}, id = {}, ts = {}",
-                                   key, cluster_id, timestamp);
+                          info!("looking at key = {}, id = {}, ts = {}",
+                                key, cluster_id, timestamp);
 
-                             let output_key = format!("{}.{}", cluster_id, key);
-                             match kind {
-                                 MetricKind::Gauge => {
-                                     apps.insert(output_key, FilteredData::Gauge(usize::from_le_bytes((*v).try_into().unwrap())));
-                                 },
-                                 MetricKind::Count => {
-                                     apps.insert(output_key, FilteredData::Count(i64::from_le_bytes((*v).try_into().unwrap())));
-                                 },
-                                 MetricKind::Time => {
-                                     //unimplemented for now
-                                 }
-                             }
+                          let output_key = format!("{}.{}", cluster_id, key);
+                          match kind {
+                              MetricKind::Gauge => {
+                                  apps.insert(output_key, FilteredData::Gauge(usize::from_le_bytes((*v).try_into().unwrap())));
+                              },
+                              MetricKind::Count => {
+                                  apps.insert(output_key, FilteredData::Count(i64::from_le_bytes((*v).try_into().unwrap())));
+                              },
+                              MetricKind::Time => {
+                                  //unimplemented for now
+                              }
+                          }
                       },
                       MetricMeta::ClusterBackend => {
                           error!("metric key {} is for backend level metrics", key);
@@ -223,7 +225,7 @@ impl LocalDrain {
       info!("current metrics: {:#?}", self.metrics);
       for prefix_key in metrics.iter() {
           for (cluster_id, backend_id) in backends.iter() {
-              let key = format!("{}\t{}\t{} ", prefix_key, cluster_id, backend_id);
+              let key = format!("{}\t{}\t{}", prefix_key, cluster_id, backend_id);
 
               let res = self.metrics.get(&key);
               if res.is_none() {
@@ -233,7 +235,7 @@ impl LocalDrain {
               let (meta, kind) = res.unwrap();
 
               let end = format!("{}\x7F", key);
-              for res in self.db.range(key.as_bytes()..end.as_bytes()) {
+              for res in self.backend_tree.range(key.as_bytes()..end.as_bytes()) {
                   let (k, v) = res.unwrap();
                   info!("looking at key: {:?}", std::str::from_utf8(&k));
                   match meta {
@@ -281,18 +283,16 @@ impl LocalDrain {
 
       for (key, (meta, kind)) in self.metrics.iter() {
           let end = format!("{}\x7F", key);
-          for res in self.db.range(key.as_bytes()..end.as_bytes()) {
-              let (k, v) = res.unwrap();
-              match meta {
-                  MetricMeta::Cluster => {
-                      let mut it1 = k.split(|c: &u8| *c == b'\x1F');
-                      let k2 = it1.next().unwrap();
-                      let mut it2 = k2.split(|c: &u8| *c == b'\t');
-                      let key = std::str::from_utf8(it2.next().unwrap()).unwrap();
-                      let app_id = std::str::from_utf8(it2.next().unwrap()).unwrap();
-                      let timestamp_with_prefix = it1.next().unwrap();
-                      // remove the leading \t
-                      let timestamp:i64 = std::str::from_utf8(&timestamp_with_prefix[1..]).unwrap().parse().unwrap();
+
+          match meta {
+              MetricMeta::Cluster => {
+                  for res in self.cluster_tree.range(key.as_bytes()..end.as_bytes()) {
+                      let (k, v) = res.unwrap();
+
+                      let mut it = k.split(|c: &u8| *c == b'\t');
+                      let key = std::str::from_utf8(it.next().unwrap()).unwrap();
+                      let app_id = std::str::from_utf8(it.next().unwrap()).unwrap();
+                      let timestamp:i64 = std::str::from_utf8(it.next().unwrap()).unwrap().parse().unwrap();
 
                       info!("looking at key = {}, id = {}, ts = {}",
                             key, app_id, timestamp);
@@ -317,8 +317,12 @@ impl LocalDrain {
                               //unimplemented for now
                           }
                       }
-                  },
-                  MetricMeta::ClusterBackend => {
+                  }
+              },
+              MetricMeta::ClusterBackend => {
+                  for res in self.backend_tree.range(key.as_bytes()..end.as_bytes()) {
+                      let (k, v) = res.unwrap();
+
                       let mut it = k.split(|c: &u8| *c == b'\t');
                       let key = std::str::from_utf8(it.next().unwrap()).unwrap();
                       let app_id = std::str::from_utf8(it.next().unwrap()).unwrap();
@@ -350,7 +354,7 @@ impl LocalDrain {
                           }
                       }
                   }
-              }
+              },
           }
       }
 
@@ -365,9 +369,9 @@ impl LocalDrain {
       info!("metric: {} {} {:?} {:?}", key, id, backend_id, metric);
       // the final character is necessary to start iterating after the tab that is used in backend
       // metrics
-      self.store_metric(&format!("{}\t{}\x1F", key, id), id, None, &metric);
+      self.store_metric(&format!("{}\t{}", key, id), id, None, &metric);
       if let Some(bid) = backend_id {
-          self.store_metric(&format!("{}\t{}\t{} ", key, id, bid), id, backend_id, &metric);
+          self.store_metric(&format!("{}\t{}\t{}", key, id, bid), id, backend_id, &metric);
       }
   }
 
@@ -389,18 +393,22 @@ impl LocalDrain {
 
           self.metrics.insert(key_prefix.to_string(), (meta, kind));
           let end = format!("{}\x7F", key_prefix);
-          self.db.insert(end.as_bytes(), &0u64.to_le_bytes()).unwrap();
+          if backend_id.is_some() {
+              self.backend_tree.insert(end.as_bytes(), &0u64.to_le_bytes()).unwrap();
+          } else {
+              self.cluster_tree.insert(end.as_bytes(), &0u64.to_le_bytes()).unwrap();
+          }
       }
 
       match metric {
           MetricData::Gauge(i) => {
-              self.store_gauge(&key_prefix, *i);
+              self.store_gauge(&key_prefix, *i, backend_id.is_some());
           },
           MetricData::GaugeAdd(i) => {
-              self.add_gauge(&key_prefix, *i);
+              self.add_gauge(&key_prefix, *i, backend_id.is_some());
           },
           MetricData::Count(i) => {
-              self.store_count(&key_prefix, *i);
+              self.store_count(&key_prefix, *i, backend_id.is_some());
           },
           MetricData::Time(i) => {
               //self.db.insert(db_key.as_bytes(), &i.to_le_bytes()).unwrap();
@@ -420,158 +428,184 @@ impl LocalDrain {
       */
   }
 
-  fn store_gauge(&mut self, key: &str, i: usize) {
+  fn store_gauge(&mut self, key: &str, i: usize, is_backend: bool) {
       let now = OffsetDateTime::now_utc();
       let timestamp = now.unix_timestamp();
       let complete_key = format!("{}\t{}", key, timestamp);
 
       info!("store gauge at {} -> {}", complete_key, i);
-      self.db.insert(complete_key.as_bytes(), &i.to_le_bytes()).unwrap();
+      if is_backend {
+          self.backend_tree.insert(complete_key.as_bytes(), &i.to_le_bytes()).unwrap();
+      } else {
+          self.cluster_tree.insert(complete_key.as_bytes(), &i.to_le_bytes()).unwrap();
+      }
 
       // we change the minute, aggregate the 60 measurements from the last minute
       if now.second() == 0 {
-          self.aggregate_gauge(key, now);
+          self.aggregate_gauge(key, now, is_backend);
       }
   }
 
-  fn add_gauge(&mut self, key: &str, i: i64) {
+  fn add_gauge(&mut self, key: &str, i: i64, is_backend: bool) {
       let now = OffsetDateTime::now_utc();
       let timestamp = now.unix_timestamp();
       let complete_key = format!("{}\t{}", key, timestamp);
       let one_minute_ago = format!("{}\t{}", key, timestamp - 60);
 
+      let tree = if is_backend {
+          &mut self.backend_tree
+      } else {
+          &mut self.cluster_tree
+      };
       info!("add gauge at {} -> {}", complete_key, i);
-      match self.db.range(one_minute_ago.as_bytes()..=complete_key.as_bytes()).rev().next() {
+      match tree.range(one_minute_ago.as_bytes()..=complete_key.as_bytes()).rev().next() {
           None | Some(Err(_)) => {
-              self.db.insert(complete_key.as_bytes(), &i.to_le_bytes()).unwrap();
+              tree.insert(complete_key.as_bytes(), &i.to_le_bytes()).unwrap();
           },
           Some(Ok((_, v))) => {
               let i2 = i64::from_le_bytes((*v).try_into().unwrap());
-              self.db.insert(complete_key.as_bytes(), &(i+i2).to_le_bytes()).unwrap();
+              tree.insert(complete_key.as_bytes(), &(i+i2).to_le_bytes()).unwrap();
           }
       };
 
       // we change the minute, aggregate the 60 measurements from the last minute
       if now.second() == 0 {
-          self.aggregate_gauge(key, now);
+          self.aggregate_gauge(key, now, is_backend);
       }
   }
 
-  fn store_count(&mut self, key: &str, i: i64) {
+  fn store_count(&mut self, key: &str, i: i64, is_backend: bool) {
       let now = OffsetDateTime::now_utc();
       let timestamp = now.unix_timestamp();
       let complete_key = format!("{}\t{}", key, timestamp);
 
+      let tree = if is_backend {
+          &mut self.backend_tree
+      } else {
+          &mut self.cluster_tree
+      };
       info!("store count at {} -> {}", complete_key, i);
-      match self.db.get(complete_key.as_bytes()).unwrap() {
+      match tree.get(complete_key.as_bytes()).unwrap() {
           None => {
-              self.db.insert(complete_key.as_bytes(), &i.to_le_bytes()).unwrap();
+              tree.insert(complete_key.as_bytes(), &i.to_le_bytes()).unwrap();
           },
           Some(v) => {
               let i2 = i64::from_le_bytes((*v).try_into().unwrap());
-              self.db.insert(complete_key.as_bytes(), &(i+i2).to_le_bytes()).unwrap();
+              tree.insert(complete_key.as_bytes(), &(i+i2).to_le_bytes()).unwrap();
           }
       };
 
       // we change the minute, aggregate the 60 measurements from the last minute
       if now.second() == 0 {
-          self.aggregate_count(key, now);
+          self.aggregate_count(key, now, is_backend);
       }
   }
 
-  fn aggregate_gauge(&mut self, key: &str, now: OffsetDateTime) {
+  fn aggregate_gauge(&mut self, key: &str, now: OffsetDateTime, is_backend: bool) {
       let timestamp = now.unix_timestamp();
       let one_hour_ago = format!("{}\t{}", key, timestamp - 3600);
       let one_minute_ago = format!("{}\t{}", key, timestamp - 60);
       let now_key = format!("{}\t{}", key, timestamp);
 
+      let tree = if is_backend {
+          &mut self.backend_tree
+      } else {
+          &mut self.cluster_tree
+      };
+
       // aggregate 60 measures in a point at the last minute
       let mut value = None;
-      for res in self.db.range(one_minute_ago.as_bytes()..now_key.as_bytes()) {
+      for res in tree.range(one_minute_ago.as_bytes()..now_key.as_bytes()) {
           let (k, v) = res.unwrap();
           value = Some(usize::from_le_bytes((*v).try_into().unwrap()));
           info!("removing {} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
-          self.db.remove(k).unwrap();
+          tree.remove(k).unwrap();
       }
 
       if let Some(v) = value {
           info!("reinserting {} -> {:?}", one_minute_ago, v);
-          self.db.insert(one_minute_ago.as_bytes(), &v.to_le_bytes()).unwrap();
+          tree.insert(one_minute_ago.as_bytes(), &v.to_le_bytes()).unwrap();
       }
 
       // aggregate 60 measures in a point at the last hour
       if now.minute() == 0 {
           let mut value = None;
-          for res in self.db.range(one_hour_ago.as_bytes()..one_minute_ago.as_bytes()) {
+          for res in tree.range(one_hour_ago.as_bytes()..one_minute_ago.as_bytes()) {
               let (k, v) = res.unwrap();
               value = Some(usize::from_le_bytes((*v).try_into().unwrap()));
               info!("removing {} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
-              self.db.remove(k).unwrap();
+              tree.remove(k).unwrap();
           }
 
           if let Some(v) = value {
               info!("reinserting {} -> {:?}", one_hour_ago, v);
-              self.db.insert(one_minute_ago.as_bytes(), &v.to_le_bytes()).unwrap();
+              tree.insert(one_minute_ago.as_bytes(), &v.to_le_bytes()).unwrap();
           }
 
           // remove all measures older than 24h
           let one_day_ago = format!("{}\t{}", key, timestamp - 3600 * 24);
-          for res in self.db.range(key.as_bytes()..one_day_ago.as_bytes()) {
+          for res in tree.range(key.as_bytes()..one_day_ago.as_bytes()) {
               let (k, v) = res.unwrap();
               value = Some(usize::from_le_bytes((*v).try_into().unwrap()));
               info!("removing {} -> {:?} (more than 24h)", unsafe { std::str::from_utf8_unchecked(&k) }, value);
-              self.db.remove(k).unwrap();
+              tree.remove(k).unwrap();
           }
       }
 
   }
 
-  fn aggregate_count(&mut self, key: &str, now: OffsetDateTime) {
+  fn aggregate_count(&mut self, key: &str, now: OffsetDateTime, is_backend: bool) {
       let timestamp = now.unix_timestamp();
       let one_hour_ago = format!("{}\t{}", key, timestamp - 3600);
       let one_minute_ago = format!("{}\t{}", key, timestamp - 60);
       let now_key = format!("{}\t{}", key, timestamp);
 
+      let tree = if is_backend {
+          &mut self.backend_tree
+      } else {
+          &mut self.cluster_tree
+      };
+
       // aggregate 60 measures in a point at the last hour
       let mut value = 0i64;
       let mut found = false;
-      for res in self.db.range(one_minute_ago.as_bytes()..now_key.as_bytes()) {
+      for res in tree.range(one_minute_ago.as_bytes()..now_key.as_bytes()) {
           found = true;
           let (k, v) = res.unwrap();
           value += i64::from_le_bytes((*v).try_into().unwrap());
           info!("removing {} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
-          self.db.remove(k).unwrap();
+          tree.remove(k).unwrap();
       }
 
       if found {
           info!("reinserting {} -> {:?}", one_minute_ago, value);
-          self.db.insert(one_minute_ago.as_bytes(), &value.to_le_bytes()).unwrap();
+          tree.insert(one_minute_ago.as_bytes(), &value.to_le_bytes()).unwrap();
       }
 
       // remove all measures older than 24h
       if now.minute() == 0 {
           let mut value = 0i64;
           let mut found = false;
-          for res in self.db.range(one_hour_ago.as_bytes()..one_minute_ago.as_bytes()) {
+          for res in tree.range(one_hour_ago.as_bytes()..one_minute_ago.as_bytes()) {
               found = true;
               let (k, v) = res.unwrap();
               value += i64::from_le_bytes((*v).try_into().unwrap());
               info!("removing {} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
-              self.db.remove(k).unwrap();
+              tree.remove(k).unwrap();
           }
 
           if found {
               info!("reinserting {} -> {:?}", one_hour_ago, value);
-              self.db.insert(one_hour_ago.as_bytes(), &value.to_le_bytes()).unwrap();
+              tree.insert(one_hour_ago.as_bytes(), &value.to_le_bytes()).unwrap();
           }
 
           // remove all measures older than 24h
           let one_day_ago = format!("{}\t{}", key, timestamp - 3600 * 24);
-          for res in self.db.range(key.as_bytes()..one_day_ago.as_bytes()) {
+          for res in tree.range(key.as_bytes()..one_day_ago.as_bytes()) {
               let (k, v) = res.unwrap();
               value = i64::from_le_bytes((*v).try_into().unwrap());
               info!("removing {} -> {:?} (more than 24h)", unsafe { std::str::from_utf8_unchecked(&k) }, value);
-              self.db.remove(k).unwrap();
+              tree.remove(k).unwrap();
           }
       }
   }
@@ -582,34 +616,47 @@ impl LocalDrain {
       //
 
       let metrics = self.metrics.clone();
-      for (key, (_, kind)) in metrics.iter() {
+      for (key, (meta, kind)) in metrics.iter() {
           info!("will aggregate metrics for key '{}'", key);
 
+          let is_backend = *meta == MetricMeta::ClusterBackend;
           match kind {
               MetricKind::Gauge => {
-                  self.aggregate_gauge(key, now);
+                  self.aggregate_gauge(key, now, is_backend);
               },
               MetricKind::Count => {
-                  self.aggregate_count(key, now);
+                  self.aggregate_count(key, now, is_backend);
               },
               MetricKind::Time => {
               }
           }
 
+          let tree = match meta {
+              MetricMeta::Cluster => &mut self.cluster_tree,
+              MetricMeta::ClusterBackend => &mut self.backend_tree,
+          };
+
           // check if we removed all the points for this metric
           let end = format!("{}\x7F", key);
-          if let Some((k, _)) = self.db.get_gt(key.as_bytes()).unwrap() {
+          if let Some((k, _)) = tree.get_gt(key.as_bytes()).unwrap() {
               if &k == end.as_bytes() {
                   info!("removing key {} from metrics", key);
-                  self.db.remove(k).unwrap();
+                  tree.remove(k).unwrap();
                   self.metrics.remove(key);
               }
           }
       }
 
-      if let (Some(first), Some(second)) = (self.db.first().unwrap(), self.db.last().unwrap()) {
-        info!("remaining keys:");
-        for res in self.db.range(first.0..second.0) {
+      info!("remaining keys:");
+      if let (Some(first), Some(second)) = (self.cluster_tree.first().unwrap(), self.cluster_tree.last().unwrap()) {
+        for res in self.cluster_tree.range(first.0..second.0) {
+            let (k, v) = res.unwrap();
+            info!("{} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
+
+        }
+      }
+      if let (Some(first), Some(second)) = (self.backend_tree.first().unwrap(), self.backend_tree.last().unwrap()) {
+        for res in self.backend_tree.range(first.0..second.0) {
             let (k, v) = res.unwrap();
             info!("{} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
 
