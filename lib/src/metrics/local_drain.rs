@@ -141,7 +141,9 @@ impl LocalDrain {
   pub fn dump_metrics_data(&mut self) -> MetricsData {
     MetricsData {
       proxy:    self.dump_process_data(),
-      clusters: self.dump_cluster_data(),
+      clusters: self.dump_cluster_data().map_err(|e| {
+          error!("metrics database error: {:?}", e);
+      }).unwrap_or_else(|_| BTreeMap::new()),
     }
   }
 
@@ -157,15 +159,21 @@ impl LocalDrain {
       info!("GOT QUERY: {:?}", q);
       match q {
           QueryMetricsType::Cluster { metrics, clusters } => {
-              self.query_cluster(metrics, clusters)
+              self.query_cluster(metrics, clusters).map_err(|e| {
+                  error!("metrics database error: {:?}", e);
+                  format!("metrics database error: {:?}", e)
+              })
           },
           QueryMetricsType::Backend { metrics, backends } => {
-              self.query_backend(metrics, backends)
+              self.query_backend(metrics, backends).map_err(|e| {
+                  error!("metrics database error: {:?}", e);
+                  format!("metrics database error: {:?}", e)
+              })
           },
       }
   }
 
-  fn query_cluster(&mut self, metrics: &Vec<String>, clusters: &Vec<String>) -> Result<QueryAnswerMetrics, String> {
+  fn query_cluster(&mut self, metrics: &Vec<String>, clusters: &Vec<String>) -> Result<QueryAnswerMetrics, sled::Error> {
       let mut apps: BTreeMap<String, BTreeMap<String, FilteredData>> = BTreeMap::new();
       for cluster_id in clusters.iter() {
           apps.insert(cluster_id.to_string(), BTreeMap::new());
@@ -185,7 +193,7 @@ impl LocalDrain {
 
               let end = format!("{}\x7F", key);
               for res in self.cluster_tree.range(key.as_bytes()..end.as_bytes()) {
-                  let (k, v) = res.unwrap();
+                  let (k, v) = res?;
                   info!("looking at key: {:?}", std::str::from_utf8(&k));
                   match meta {
                       MetricMeta::Cluster => {
@@ -221,7 +229,7 @@ impl LocalDrain {
       Ok(QueryAnswerMetrics::Cluster(apps))
   }
 
-  fn query_backend(&mut self, metrics: &Vec<String>, backends: &Vec<(String,String)>) -> Result<QueryAnswerMetrics, String> {
+  fn query_backend(&mut self, metrics: &Vec<String>, backends: &Vec<(String,String)>) -> Result<QueryAnswerMetrics, sled::Error> {
       let mut backend_data: BTreeMap<String, BTreeMap<String, BTreeMap<String, FilteredData>>> = BTreeMap::new();
       for (cluster_id, backend_id) in backends.iter() {
           let t = backend_data.entry(cluster_id.to_string()).or_insert_with(BTreeMap::new);
@@ -242,7 +250,7 @@ impl LocalDrain {
 
               let end = format!("{}\x7F", key);
               for res in self.backend_tree.range(key.as_bytes()..end.as_bytes()) {
-                  let (k, v) = res.unwrap();
+                  let (k, v) = res?;
                   info!("looking at key: {:?}", std::str::from_utf8(&k));
                   match meta {
                       MetricMeta::Cluster => {
@@ -285,7 +293,7 @@ impl LocalDrain {
   }
 
 
-  pub fn dump_cluster_data(&mut self) -> BTreeMap<String,AppMetricsData> {
+  pub fn dump_cluster_data(&mut self) -> Result<BTreeMap<String,AppMetricsData>, sled::Error> {
       let mut apps = BTreeMap::new();
 
       for (key, (meta, kind)) in self.metrics.iter() {
@@ -294,7 +302,7 @@ impl LocalDrain {
           match meta {
               MetricMeta::Cluster => {
                   for res in self.cluster_tree.range(key.as_bytes()..end.as_bytes()) {
-                      let (k, v) = res.unwrap();
+                      let (k, v) = res?;
 
                       let mut it = k.split(|c: &u8| *c == b'\t');
                       let key = std::str::from_utf8(it.next().unwrap()).unwrap();
@@ -328,7 +336,7 @@ impl LocalDrain {
               },
               MetricMeta::ClusterBackend => {
                   for res in self.backend_tree.range(key.as_bytes()..end.as_bytes()) {
-                      let (k, v) = res.unwrap();
+                      let (k, v) = res?;
 
                       let mut it = k.split(|c: &u8| *c == b'\t');
                       let key = std::str::from_utf8(it.next().unwrap()).unwrap();
@@ -369,20 +377,26 @@ impl LocalDrain {
       // still clear the DB for now
       //self.db.clear();
 
-      apps
+      Ok(apps)
   }
 
   fn receive_cluster_metric(&mut self, key: &'static str, id: &str, backend_id: Option<&str>, metric: MetricData) {
       info!("metric: {} {} {:?} {:?}", key, id, backend_id, metric);
       // the final character is necessary to start iterating after the tab that is used in backend
       // metrics
-      self.store_metric(&format!("{}\t{}", key, id), id, None, &metric);
+      self.store_metric(&format!("{}\t{}", key, id), id, None, &metric).map_err(|e| {
+          error!("metrics database error: {:?}", e);
+          format!("metrics database error: {:?}", e)
+      });
       if let Some(bid) = backend_id {
-          self.store_metric(&format!("{}\t{}\t{}", key, id, bid), id, backend_id, &metric);
+          self.store_metric(&format!("{}\t{}\t{}", key, id, bid), id, backend_id, &metric).map_err(|e| {
+              error!("metrics database error: {:?}", e);
+              format!("metrics database error: {:?}", e)
+          });
       }
   }
 
-  fn store_metric(&mut self, key_prefix: &str, id: &str, backend_id: Option<&str>, metric: &MetricData) {
+  fn store_metric(&mut self, key_prefix: &str, id: &str, backend_id: Option<&str>, metric: &MetricData) -> Result<(), sled::Error> {
       info!("metric: {} {} {:?} {:?}", key_prefix, id, backend_id, metric);
 
       if !self.metrics.contains_key(key_prefix) {
@@ -401,21 +415,21 @@ impl LocalDrain {
           self.metrics.insert(key_prefix.to_string(), (meta, kind));
           let end = format!("{}\x7F", key_prefix);
           if backend_id.is_some() {
-              self.backend_tree.insert(end.as_bytes(), &0u64.to_le_bytes()).unwrap();
+              self.backend_tree.insert(end.as_bytes(), &0u64.to_le_bytes())?;
           } else {
-              self.cluster_tree.insert(end.as_bytes(), &0u64.to_le_bytes()).unwrap();
+              self.cluster_tree.insert(end.as_bytes(), &0u64.to_le_bytes())?;
           }
       }
 
       match metric {
           MetricData::Gauge(i) => {
-              self.store_gauge(&key_prefix, *i, backend_id.is_some());
+              self.store_gauge(&key_prefix, *i, backend_id.is_some())?;
           },
           MetricData::GaugeAdd(i) => {
-              self.add_gauge(&key_prefix, *i, backend_id.is_some());
+              self.add_gauge(&key_prefix, *i, backend_id.is_some())?;
           },
           MetricData::Count(i) => {
-              self.store_count(&key_prefix, *i, backend_id.is_some());
+              self.store_count(&key_prefix, *i, backend_id.is_some())?;
           },
           MetricData::Time(i) => {
               //self.db.insert(db_key.as_bytes(), &i.to_le_bytes()).unwrap();
@@ -433,27 +447,31 @@ impl LocalDrain {
       //info!("metrics: {:?}", self.metrics);
       info!("db size: {:?}", self.db.size_on_disk());
       */
+
+      Ok(())
   }
 
-  fn store_gauge(&mut self, key: &str, i: usize, is_backend: bool) {
+  fn store_gauge(&mut self, key: &str, i: usize, is_backend: bool) -> Result<(), sled::Error> {
       let now = OffsetDateTime::now_utc();
       let timestamp = now.unix_timestamp();
       let complete_key = format!("{}\t{}", key, timestamp);
 
       info!("store gauge at {} -> {}", complete_key, i);
       if is_backend {
-          self.backend_tree.insert(complete_key.as_bytes(), &i.to_le_bytes()).unwrap();
+          self.backend_tree.insert(complete_key.as_bytes(), &i.to_le_bytes())?;
       } else {
-          self.cluster_tree.insert(complete_key.as_bytes(), &i.to_le_bytes()).unwrap();
+          self.cluster_tree.insert(complete_key.as_bytes(), &i.to_le_bytes())?;
       }
 
       // we change the minute, aggregate the 60 measurements from the last minute
       if now.second() == 0 {
-          self.aggregate_gauge(key, now, is_backend);
+          self.aggregate_gauge(key, now, is_backend)?;
       }
+
+      Ok(())
   }
 
-  fn add_gauge(&mut self, key: &str, i: i64, is_backend: bool) {
+  fn add_gauge(&mut self, key: &str, i: i64, is_backend: bool) -> Result<(), sled::Error> {
       let now = OffsetDateTime::now_utc();
       let timestamp = now.unix_timestamp();
       let complete_key = format!("{}\t{}", key, timestamp);
@@ -466,22 +484,25 @@ impl LocalDrain {
       };
       info!("add gauge at {} -> {}", complete_key, i);
       match tree.range(one_minute_ago.as_bytes()..=complete_key.as_bytes()).rev().next() {
-          None | Some(Err(_)) => {
-              tree.insert(complete_key.as_bytes(), &i.to_le_bytes()).unwrap();
+          None => {
+              tree.insert(complete_key.as_bytes(), &i.to_le_bytes())?;
           },
+          Some(Err(e)) => return Err(e),
           Some(Ok((_, v))) => {
               let i2 = i64::from_le_bytes((*v).try_into().unwrap());
-              tree.insert(complete_key.as_bytes(), &(i+i2).to_le_bytes()).unwrap();
+              tree.insert(complete_key.as_bytes(), &(i+i2).to_le_bytes())?;
           }
       };
 
       // we change the minute, aggregate the 60 measurements from the last minute
       if now.second() == 0 {
-          self.aggregate_gauge(key, now, is_backend);
+          self.aggregate_gauge(key, now, is_backend)?;
       }
+
+      Ok(())
   }
 
-  fn store_count(&mut self, key: &str, i: i64, is_backend: bool) {
+  fn store_count(&mut self, key: &str, i: i64, is_backend: bool) -> Result<(), sled::Error> {
       let now = OffsetDateTime::now_utc();
       let timestamp = now.unix_timestamp();
       let complete_key = format!("{}\t{}", key, timestamp);
@@ -492,23 +513,25 @@ impl LocalDrain {
           &mut self.cluster_tree
       };
       info!("store count at {} -> {}", complete_key, i);
-      match tree.get(complete_key.as_bytes()).unwrap() {
+      match tree.get(complete_key.as_bytes())? {
           None => {
-              tree.insert(complete_key.as_bytes(), &i.to_le_bytes()).unwrap();
+              tree.insert(complete_key.as_bytes(), &i.to_le_bytes())?;
           },
           Some(v) => {
               let i2 = i64::from_le_bytes((*v).try_into().unwrap());
-              tree.insert(complete_key.as_bytes(), &(i+i2).to_le_bytes()).unwrap();
+              tree.insert(complete_key.as_bytes(), &(i+i2).to_le_bytes())?;
           }
       };
 
       // we change the minute, aggregate the 60 measurements from the last minute
       if now.second() == 0 {
-          self.aggregate_count(key, now, is_backend);
+          self.aggregate_count(key, now, is_backend)?;
       }
+
+      Ok(())
   }
 
-  fn aggregate_gauge(&mut self, key: &str, now: OffsetDateTime, is_backend: bool) {
+  fn aggregate_gauge(&mut self, key: &str, now: OffsetDateTime, is_backend: bool) -> Result<(), sled::Error> {
       let timestamp = now.unix_timestamp();
       let one_hour_ago = format!("{}\t{}", key, timestamp - 3600);
       let one_minute_ago = format!("{}\t{}", key, timestamp - 60);
@@ -523,45 +546,46 @@ impl LocalDrain {
       // aggregate 60 measures in a point at the last minute
       let mut value = None;
       for res in tree.range(one_minute_ago.as_bytes()..now_key.as_bytes()) {
-          let (k, v) = res.unwrap();
+          let (k, v) = res?;
           value = Some(usize::from_le_bytes((*v).try_into().unwrap()));
           info!("removing {} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
-          tree.remove(k).unwrap();
+          tree.remove(k)?;
       }
 
       if let Some(v) = value {
           info!("reinserting {} -> {:?}", one_minute_ago, v);
-          tree.insert(one_minute_ago.as_bytes(), &v.to_le_bytes()).unwrap();
+          tree.insert(one_minute_ago.as_bytes(), &v.to_le_bytes())?;
       }
 
       // aggregate 60 measures in a point at the last hour
       if now.minute() == 0 {
           let mut value = None;
           for res in tree.range(one_hour_ago.as_bytes()..one_minute_ago.as_bytes()) {
-              let (k, v) = res.unwrap();
+              let (k, v) = res?;
               value = Some(usize::from_le_bytes((*v).try_into().unwrap()));
               info!("removing {} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
-              tree.remove(k).unwrap();
+              tree.remove(k)?;
           }
 
           if let Some(v) = value {
               info!("reinserting {} -> {:?}", one_hour_ago, v);
-              tree.insert(one_minute_ago.as_bytes(), &v.to_le_bytes()).unwrap();
+              tree.insert(one_minute_ago.as_bytes(), &v.to_le_bytes())?;
           }
 
           // remove all measures older than 24h
           let one_day_ago = format!("{}\t{}", key, timestamp - 3600 * 24);
           for res in tree.range(key.as_bytes()..one_day_ago.as_bytes()) {
-              let (k, v) = res.unwrap();
+              let (k, v) = res?;
               value = Some(usize::from_le_bytes((*v).try_into().unwrap()));
               info!("removing {} -> {:?} (more than 24h)", unsafe { std::str::from_utf8_unchecked(&k) }, value);
-              tree.remove(k).unwrap();
+              tree.remove(k)?;
           }
       }
 
+      Ok(())
   }
 
-  fn aggregate_count(&mut self, key: &str, now: OffsetDateTime, is_backend: bool) {
+  fn aggregate_count(&mut self, key: &str, now: OffsetDateTime, is_backend: bool) -> Result<(), sled::Error> {
       let timestamp = now.unix_timestamp();
       let one_hour_ago = format!("{}\t{}", key, timestamp - 3600);
       let one_minute_ago = format!("{}\t{}", key, timestamp - 60);
@@ -578,15 +602,15 @@ impl LocalDrain {
       let mut found = false;
       for res in tree.range(one_minute_ago.as_bytes()..now_key.as_bytes()) {
           found = true;
-          let (k, v) = res.unwrap();
+          let (k, v) = res?;
           value += i64::from_le_bytes((*v).try_into().unwrap());
           info!("removing {} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
-          tree.remove(k).unwrap();
+          tree.remove(k)?;
       }
 
       if found {
           info!("reinserting {} -> {:?}", one_minute_ago, value);
-          tree.insert(one_minute_ago.as_bytes(), &value.to_le_bytes()).unwrap();
+          tree.insert(one_minute_ago.as_bytes(), &value.to_le_bytes())?;
       }
 
       // remove all measures older than 24h
@@ -595,29 +619,31 @@ impl LocalDrain {
           let mut found = false;
           for res in tree.range(one_hour_ago.as_bytes()..one_minute_ago.as_bytes()) {
               found = true;
-              let (k, v) = res.unwrap();
+              let (k, v) = res?;
               value += i64::from_le_bytes((*v).try_into().unwrap());
               info!("removing {} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
-              tree.remove(k).unwrap();
+              tree.remove(k)?;
           }
 
           if found {
               info!("reinserting {} -> {:?}", one_hour_ago, value);
-              tree.insert(one_hour_ago.as_bytes(), &value.to_le_bytes()).unwrap();
+              tree.insert(one_hour_ago.as_bytes(), &value.to_le_bytes())?;
           }
 
           // remove all measures older than 24h
           let one_day_ago = format!("{}\t{}", key, timestamp - 3600 * 24);
           for res in tree.range(key.as_bytes()..one_day_ago.as_bytes()) {
-              let (k, v) = res.unwrap();
+              let (k, v) = res?;
               value = i64::from_le_bytes((*v).try_into().unwrap());
               info!("removing {} -> {:?} (more than 24h)", unsafe { std::str::from_utf8_unchecked(&k) }, value);
-              tree.remove(k).unwrap();
+              tree.remove(k)?;
           }
       }
+
+      Ok(())
   }
 
-  pub fn clear(&mut self, now: OffsetDateTime) {
+  pub fn clear(&mut self, now: OffsetDateTime) -> Result<(), sled::Error> {
       info!("will clear old data from the metrics database");
       //self.db.clear();
       //
@@ -629,10 +655,10 @@ impl LocalDrain {
           let is_backend = *meta == MetricMeta::ClusterBackend;
           match kind {
               MetricKind::Gauge => {
-                  self.aggregate_gauge(key, now, is_backend);
+                  self.aggregate_gauge(key, now, is_backend)?;
               },
               MetricKind::Count => {
-                  self.aggregate_count(key, now, is_backend);
+                  self.aggregate_count(key, now, is_backend)?;
               },
               MetricKind::Time => {
               }
@@ -645,31 +671,33 @@ impl LocalDrain {
 
           // check if we removed all the points for this metric
           let end = format!("{}\x7F", key);
-          if let Some((k, _)) = tree.get_gt(key.as_bytes()).unwrap() {
+          if let Some((k, _)) = tree.get_gt(key.as_bytes())? {
               if &k == end.as_bytes() {
                   info!("removing key {} from metrics", key);
-                  tree.remove(k).unwrap();
+                  tree.remove(k)?;
                   self.metrics.remove(key);
               }
           }
       }
 
       info!("remaining keys:");
-      if let (Some(first), Some(second)) = (self.cluster_tree.first().unwrap(), self.cluster_tree.last().unwrap()) {
+      if let (Some(first), Some(second)) = (self.cluster_tree.first()?, self.cluster_tree.last()?) {
         for res in self.cluster_tree.range(first.0..second.0) {
-            let (k, v) = res.unwrap();
+            let (k, v) = res?;
             info!("{} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
 
         }
       }
-      if let (Some(first), Some(second)) = (self.backend_tree.first().unwrap(), self.backend_tree.last().unwrap()) {
+      if let (Some(first), Some(second)) = (self.backend_tree.first()?, self.backend_tree.last()?) {
         for res in self.backend_tree.range(first.0..second.0) {
-            let (k, v) = res.unwrap();
+            let (k, v) = res?;
             info!("{} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
 
         }
       }
       info!("db size: {:?}", self.db.size_on_disk());
+
+      Ok(())
   }
 
 }
