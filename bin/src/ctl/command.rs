@@ -1473,10 +1473,13 @@ pub fn query_certificate(mut channel: Channel<CommandRequest,CommandResponse>, j
 }
 
 pub fn query_metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool,
-                     names: Vec<String>, clusters: Vec<String>, mut backends: Vec<(String, String)>) -> Result<(), anyhow::Error> {
+                     list: bool, names: Vec<String>, clusters: Vec<String>, mut backends: Vec<(String, String)>) -> Result<(), anyhow::Error> {
 
-    let query = if !clusters.is_empty() && !backends.is_empty() {
+    let query = if list {
+        QueryMetricsType::List
+    } else if !clusters.is_empty() && !backends.is_empty() {
         bail!("Error: Either request a list of clusters or a list of backends");
+        exit(1);
     } else {
         if !clusters.is_empty(){
             QueryMetricsType::Cluster { metrics: names, clusters }
@@ -1525,6 +1528,21 @@ pub fn query_metrics(mut channel: Channel<CommandRequest,CommandResponse>, json:
                         }
 
                         println!("got data: {:#?}", data);
+                        if list {
+                          let metrics: HashSet<_> = data.values().filter_map(|value| {
+                              match value {
+                                  QueryAnswer::Metrics(QueryAnswerMetrics::List(v)) => {
+                                      Some(v.iter())
+                                  },
+                                  _ => None,
+                              }
+                          }).flatten().map(|s| s.replace("\t", ".")).collect();
+                          let mut metrics: Vec<_> = metrics.iter().collect();
+                          metrics.sort();
+                          println!("available metrics: {:?}", metrics);
+                          return Ok(());
+                        }
+
                         let data = data.iter().filter_map(|(key, value)| {
                             match value {
                                 QueryAnswer::Metrics(QueryAnswerMetrics::Cluster(d)) => {

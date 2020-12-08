@@ -466,7 +466,8 @@ pub enum QueryCmd {
 
   #[structopt(name = "metrics", about = "Query metrics matching a specific filter")]
   Metrics {
-    //#[structopt(short = "n", long="names", help="metric names", parse(from_str = split_comma))]
+    #[structopt(short, long, help="list available metrics")]
+    list: bool,
     #[structopt(short = "n", long="names", help="metric names", use_delimiter = true)]
     names: Vec<String>,
     #[structopt(short = "c", long="clusters", help="list of cluster ids", use_delimiter = true)]
