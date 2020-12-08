@@ -758,6 +758,7 @@ pub enum QueryCertificateType {
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryMetricsType {
+    List,
     Cluster { metrics: Vec<String>, clusters: Vec<String> },
     // tuple cluster_id, backend_id
     Backend { metrics: Vec<String>, backends: Vec<(String, String)> },
@@ -806,6 +807,7 @@ pub enum QueryAnswerCertificate {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryAnswerMetrics {
+    List(Vec<String>),
     /// cluster_id -> (key -> metric)
     Cluster(BTreeMap<String, BTreeMap<String, FilteredData>>),
     /// cluster_id -> (backend_id -> (key -> metric))

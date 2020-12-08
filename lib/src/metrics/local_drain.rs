@@ -158,6 +158,9 @@ impl LocalDrain {
   pub fn query(&mut self, q: &QueryMetricsType) -> Result<QueryAnswerMetrics, String> {
       info!("GOT QUERY: {:?}", q);
       match q {
+          QueryMetricsType::List => {
+              Ok(QueryAnswerMetrics::List(self.metrics.keys().cloned().collect()))
+          },
           QueryMetricsType::Cluster { metrics, clusters } => {
               self.query_cluster(metrics, clusters).map_err(|e| {
                   error!("metrics database error: {:?}", e);
