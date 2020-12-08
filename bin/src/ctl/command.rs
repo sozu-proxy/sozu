@@ -8,7 +8,7 @@ use sozu_command::proxy::{Cluster, ProxyRequestData, Backend, HttpFrontend,
   RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend,
   TcpListener, ListenerType, TlsVersion, QueryCertificateType,
   QueryAnswerCertificate, RemoveListener, ActivateListener, DeactivateListener,
-  LoadBalancingAlgorithms, PathRule, RulePosition, Route, QueryMetricsType};
+  LoadBalancingAlgorithms, PathRule, RulePosition, Route, QueryMetricsType, QueryAnswerMetrics};
 
 use serde_json;
 use std::collections::{HashMap,HashSet,BTreeMap};
@@ -1527,7 +1527,26 @@ pub fn query_metrics(mut channel: Channel<CommandRequest,CommandResponse>, json:
                         println!("got data: {:#?}", data);
                         let data = data.iter().filter_map(|(key, value)| {
                             match value {
-                                QueryAnswer::Metrics(d) => Some((key.clone(), d.clone())),
+                                QueryAnswer::Metrics(QueryAnswerMetrics::Cluster(d)) => {
+                                    let mut metrics = BTreeMap::new();
+                                    for (cluster_id, cluster_metrics) in d.iter() {
+                                        for (metric_key, value) in cluster_metrics.iter() {
+                                            metrics.insert(format!("{}.{}", cluster_id, metric_key), value.clone());
+                                        }
+                                    }
+                                    Some((key.clone(), metrics))
+                                },
+                                QueryAnswer::Metrics(QueryAnswerMetrics::Backend(d)) => {
+                                    let mut metrics = BTreeMap::new();
+                                    for (cluster_id, cluster_metrics) in d.iter() {
+                                        for (backend_id, backend_metrics) in cluster_metrics.iter() {
+                                            for (metric_key, value) in backend_metrics.iter() {
+                                                metrics.insert(format!("{}.{}.{}", cluster_id, backend_id, metric_key), value.clone());
+                                            }
+                                        }
+                                    }
+                                    Some((key.clone(), metrics))
+                                },
                                 _ => None,
                             }
                         }).collect::<BTreeMap<_,_>>();

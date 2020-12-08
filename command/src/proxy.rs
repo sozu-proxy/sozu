@@ -770,7 +770,7 @@ pub enum QueryAnswer {
   /// application id, hash of application information
   ApplicationsHashes(BTreeMap<String, u64>),
   Certificates(QueryAnswerCertificate),
-  Metrics(BTreeMap<String, FilteredData>),
+  Metrics(QueryAnswerMetrics),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -802,6 +802,14 @@ pub enum QueryAnswerCertificate {
   Domain(HashMap<SocketAddr, Option<(String, Vec<u8>)>>),
   /// returns the certificate
   Fingerprint(Option<(String, Vec<String>)>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QueryAnswerMetrics {
+    /// cluster_id -> (key -> metric)
+    Cluster(BTreeMap<String, BTreeMap<String, FilteredData>>),
+    /// cluster_id -> (backend_id -> (key -> metric))
+    Backend(BTreeMap<String, BTreeMap<String, BTreeMap<String, FilteredData>>>),
 }
 
 impl ProxyRequestData {
