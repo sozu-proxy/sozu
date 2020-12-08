@@ -143,7 +143,7 @@ pub fn ctl(matches: Sozu) -> Result<(), anyhow::Error>{
       match cmd {
         QueryCmd::Applications{ id, domain } => query_application(channel, json, id, domain),
         QueryCmd::Certificates{ fingerprint, domain } => query_certificate(channel, json, fingerprint, domain),
-        QueryCmd::Metrics{ list, names, clusters, backends } => query_metrics(channel, json, list, names, clusters, backends),
+        QueryCmd::Metrics{ list, refresh, names, clusters, backends } => query_metrics(channel, json, list, refresh, names, clusters, backends),
       }
     },
     SubCmd::Config{ cmd: _ } => Ok(()), // noop, handled at the beginning of the method
