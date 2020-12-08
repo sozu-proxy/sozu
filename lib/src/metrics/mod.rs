@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use mio::net::UdpSocket;
 use std::io::{self,Write};
-use sozu_command::proxy::{FilteredData,MetricsData};
+use sozu_command::proxy::{FilteredData,MetricsData,QueryMetricsType,QueryAnswerMetrics};
 
 mod network_drain;
 mod local_drain;
@@ -184,7 +184,7 @@ impl Aggregator {
     self.local.dump_process_data()
   }
 
-  pub fn query(&mut self, q: &sozu_command_lib::proxy::QueryMetricsType) -> BTreeMap<String, FilteredData> {
+  pub fn query(&mut self, q: &QueryMetricsType) -> Result<QueryAnswerMetrics, String> {
     self.local.query(q)
   }
 

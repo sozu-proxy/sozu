@@ -5,7 +5,7 @@ use time::OffsetDateTime;
 use std::convert::TryInto;
 use std::collections::BTreeMap;
 use hdrhistogram::Histogram;
-use sozu_command::proxy::{FilteredData,MetricsData,Percentiles,AppMetricsData,QueryMetricsType};
+use sozu_command::proxy::{FilteredData,MetricsData,Percentiles,AppMetricsData,QueryMetricsType,QueryAnswerMetrics};
 
 use super::{MetricData,Subscriber};
 
@@ -153,7 +153,7 @@ impl LocalDrain {
     data
   }
 
-  pub fn query(&mut self, q: &QueryMetricsType) -> BTreeMap<String, FilteredData> {
+  pub fn query(&mut self, q: &QueryMetricsType) -> Result<QueryAnswerMetrics, String> {
       info!("GOT QUERY: {:?}", q);
       match q {
           QueryMetricsType::Cluster { metrics, clusters } => {
@@ -165,8 +165,11 @@ impl LocalDrain {
       }
   }
 
-  fn query_cluster(&mut self, metrics: &Vec<String>, clusters: &Vec<String>) -> BTreeMap<String, FilteredData> {
-      let mut apps: BTreeMap<String, FilteredData> = BTreeMap::new();
+  fn query_cluster(&mut self, metrics: &Vec<String>, clusters: &Vec<String>) -> Result<QueryAnswerMetrics, String> {
+      let mut apps: BTreeMap<String, BTreeMap<String, FilteredData>> = BTreeMap::new();
+      for cluster_id in clusters.iter() {
+          apps.insert(cluster_id.to_string(), BTreeMap::new());
+      }
 
       info!("current metrics: {:#?}", self.metrics);
       for prefix_key in metrics.iter() {
@@ -194,13 +197,12 @@ impl LocalDrain {
                           info!("looking at key = {}, id = {}, ts = {}",
                                 key, cluster_id, timestamp);
 
-                          let output_key = format!("{}.{}", cluster_id, key);
                           match kind {
                               MetricKind::Gauge => {
-                                  apps.insert(output_key, FilteredData::Gauge(usize::from_le_bytes((*v).try_into().unwrap())));
+                                  apps.get_mut(cluster_id).unwrap().insert(key.to_string(), FilteredData::Gauge(usize::from_le_bytes((*v).try_into().unwrap())));
                               },
                               MetricKind::Count => {
-                                  apps.insert(output_key, FilteredData::Count(i64::from_le_bytes((*v).try_into().unwrap())));
+                                  apps.get_mut(cluster_id).unwrap().insert(key.to_string(), FilteredData::Count(i64::from_le_bytes((*v).try_into().unwrap())));
                               },
                               MetricKind::Time => {
                                   //unimplemented for now
@@ -216,11 +218,15 @@ impl LocalDrain {
       }
 
       info!("WILL RETURN: {:#?}", apps);
-      apps
+      Ok(QueryAnswerMetrics::Cluster(apps))
   }
 
-  fn query_backend(&mut self, metrics: &Vec<String>, backends: &Vec<(String,String)>) -> BTreeMap<String, FilteredData> {
-      let mut backend_data: BTreeMap<String, FilteredData> = BTreeMap::new();
+  fn query_backend(&mut self, metrics: &Vec<String>, backends: &Vec<(String,String)>) -> Result<QueryAnswerMetrics, String> {
+      let mut backend_data: BTreeMap<String, BTreeMap<String, BTreeMap<String, FilteredData>>> = BTreeMap::new();
+      for (cluster_id, backend_id) in backends.iter() {
+          let t = backend_data.entry(cluster_id.to_string()).or_insert_with(BTreeMap::new);
+          t.insert(backend_id.to_string(), BTreeMap::new());
+      }
 
       info!("current metrics: {:#?}", self.metrics);
       for prefix_key in metrics.iter() {
@@ -252,13 +258,14 @@ impl LocalDrain {
                           info!("looking at key = {}, cluster id = {}, bid: {}, ts = {}",
                                 key, app_id, backend_id, timestamp);
 
-                          let output_key = format!("{}.{}.{}", cluster_id, backend_id, key);
                           match kind {
                               MetricKind::Gauge => {
-                                  backend_data.insert(output_key, FilteredData::Gauge(usize::from_le_bytes((*v).try_into().unwrap())));
+                                  backend_data.get_mut(cluster_id).unwrap()
+                                      .get_mut(backend_id).unwrap().insert(key.to_string(), FilteredData::Gauge(usize::from_le_bytes((*v).try_into().unwrap())));
                               },
                               MetricKind::Count => {
-                                  backend_data.insert(output_key, FilteredData::Count(i64::from_le_bytes((*v).try_into().unwrap())));
+                                  backend_data.get_mut(cluster_id).unwrap()
+                                      .get_mut(backend_id).unwrap().insert(key.to_string(), FilteredData::Count(i64::from_le_bytes((*v).try_into().unwrap())));
                               },
                               MetricKind::Time => {
                                   //unimplemented for now
@@ -274,7 +281,7 @@ impl LocalDrain {
       }
 
       info!("WILL RETURN: {:#?}", backend_data);
-      backend_data
+      Ok(QueryAnswerMetrics::Backend(backend_data))
   }
 
 
