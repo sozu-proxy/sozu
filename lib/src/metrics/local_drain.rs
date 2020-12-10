@@ -377,6 +377,7 @@ impl LocalDrain {
   pub fn dump_cluster_data(&mut self) -> Result<BTreeMap<String,AppMetricsData>, sled::Error> {
       let mut apps = BTreeMap::new();
 
+      /*
       for (key, (meta, kind)) in self.metrics.iter() {
           let end = format!("{}\x7F", key);
 
@@ -455,6 +456,7 @@ impl LocalDrain {
               },
           }
       }
+      */
 
 
       // still clear the DB for now
