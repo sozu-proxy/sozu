@@ -960,9 +960,24 @@ impl LocalDrain {
   }
 
   pub fn clear(&mut self, now: OffsetDateTime) -> Result<(), sled::Error> {
-      info!("will clear old data from the metrics database");
-      //self.db.clear();
-      //
+      info!("will clear old data from the metrics database ({} points)",
+        self.cluster_tree.len() + self.backend_tree.len());
+
+      info!("current keys:");
+      if let (Some(first), Some(second)) = (self.cluster_tree.first()?, self.cluster_tree.last()?) {
+        for res in self.cluster_tree.range(first.0..second.0) {
+            let (k, v) = res?;
+            info!("{} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
+
+        }
+      }
+      if let (Some(first), Some(second)) = (self.backend_tree.first()?, self.backend_tree.last()?) {
+        for res in self.backend_tree.range(first.0..second.0) {
+            let (k, v) = res?;
+            info!("{} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
+
+        }
+      }
 
       let metrics = self.metrics.clone();
       for (key, (meta, kind)) in metrics.iter() {
@@ -996,7 +1011,10 @@ impl LocalDrain {
 
         }
       }
-      info!("db size: {:?}", self.db.size_on_disk());
+
+      info!("db size({} points): {:?} bytes",
+        self.cluster_tree.len() + self.backend_tree.len(),
+        self.db.size_on_disk());
 
       Ok(())
   }
