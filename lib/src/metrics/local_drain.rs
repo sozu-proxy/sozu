@@ -754,6 +754,27 @@ impl LocalDrain {
   }
 
   fn store_time_metric(&mut self, key: &str, cluster_id: &str, backend_id: Option<&str>, t: usize) -> Result<(), sled::Error> {
+      let now = OffsetDateTime::now_utc();
+      let timestamp = now.unix_timestamp();
+      let _res = self.store_time_metric_at(key, cluster_id, backend_id, timestamp, t)?;
+
+      let second = now.second();
+      // we also aggregate at second zero
+      if second != 0 {
+          let previous_minute = now - time::Duration::seconds(second as i64);
+          let timestamp = previous_minute.unix_timestamp();
+          info!("WILL REWRITE TIME METRIC AT {}", timestamp);
+          let _res = self.store_time_metric_at(key, cluster_id, backend_id, timestamp, t)?;
+          //self.aggregate_count(key, now, is_backend)?;
+      } else {
+          //FIXME: here we should delete all the measurements for the previous 60 seconds
+      }
+
+      Ok(())
+    }
+
+  fn store_time_metric_at(&mut self, key: &str, cluster_id: &str,
+                          backend_id: Option<&str>, timestamp: i64, t: usize) -> Result<(), sled::Error> {
       let key_prefix = if let Some(bid) = backend_id {
           format!("{}\t{}\t{}", key, cluster_id, bid)
       } else {
@@ -863,9 +884,6 @@ impl LocalDrain {
               self.cluster_tree.insert(p100_end.as_bytes(), &0u64.to_le_bytes())?;
           }
       }
-
-      let now = OffsetDateTime::now_utc();
-      let timestamp = now.unix_timestamp();
 
       let tree = if backend_id.is_some() {
           &mut self.backend_tree
@@ -994,10 +1012,6 @@ impl LocalDrain {
           }
       };
 
-      // we change the minute, aggregate the 60 measurements from the last minute
-      if now.second() == 0 {
-          //self.aggregate_count(key, now, is_backend)?;
-      }
       Ok(())
   }
 
