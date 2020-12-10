@@ -506,12 +506,6 @@ impl LocalDrain {
           };
 
           self.metrics.insert(key_prefix.to_string(), (meta, kind));
-          let end = format!("{}\x7F", key_prefix);
-          if backend_id.is_some() {
-              self.backend_tree.insert(end.as_bytes(), &0u64.to_le_bytes())?;
-          } else {
-              self.cluster_tree.insert(end.as_bytes(), &0u64.to_le_bytes())?;
-          }
       }
 
       match metric {
@@ -834,40 +828,6 @@ impl LocalDrain {
           };
 
           self.metrics.insert(key_prefix.to_string(), (meta, MetricKind::Time));
-
-          let count_end = format!("{}\x7F", count_key_prefix);
-          let mean_end = format!("{}\x7F", mean_key_prefix);
-          let var_end = format!("{}\x7F", var_key_prefix);
-          let p50_end = format!("{}\x7F", p50_key_prefix);
-          let p90_end = format!("{}\x7F", p90_key_prefix);
-          let p99_end = format!("{}\x7F", p99_key_prefix);
-          let p99_9_end = format!("{}\x7F", p99_9_key_prefix);
-          let p99_99_end = format!("{}\x7F", p99_99_key_prefix);
-          let p99_999_end = format!("{}\x7F", p99_999_key_prefix);
-          let p100_end = format!("{}\x7F", p100_key_prefix);
-          if backend_id.is_some() {
-              self.backend_tree.insert(count_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.backend_tree.insert(mean_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.backend_tree.insert(var_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.backend_tree.insert(p50_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.backend_tree.insert(p90_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.backend_tree.insert(p99_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.backend_tree.insert(p99_9_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.backend_tree.insert(p99_99_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.backend_tree.insert(p99_999_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.backend_tree.insert(p100_end.as_bytes(), &0u64.to_le_bytes())?;
-          } else {
-              self.cluster_tree.insert(count_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.cluster_tree.insert(mean_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.cluster_tree.insert(var_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.cluster_tree.insert(p50_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.cluster_tree.insert(p90_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.cluster_tree.insert(p99_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.cluster_tree.insert(p99_9_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.cluster_tree.insert(p99_99_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.cluster_tree.insert(p99_999_end.as_bytes(), &0u64.to_le_bytes())?;
-              self.cluster_tree.insert(p100_end.as_bytes(), &0u64.to_le_bytes())?;
-          }
       }
 
       let tree = if backend_id.is_some() {
@@ -1018,21 +978,6 @@ impl LocalDrain {
                   self.clear_count(key, now, is_backend)?;
               },
               MetricKind::Time => {
-              }
-          }
-
-          let tree = match meta {
-              MetricMeta::Cluster => &mut self.cluster_tree,
-              MetricMeta::ClusterBackend => &mut self.backend_tree,
-          };
-
-          // check if we removed all the points for this metric
-          let end = format!("{}\x7F", key);
-          if let Some((k, _)) = tree.get_gt(key.as_bytes())? {
-              if &k == end.as_bytes() {
-                  info!("removing key {} from metrics", key);
-                  tree.remove(k)?;
-                  self.metrics.remove(key);
               }
           }
       }
