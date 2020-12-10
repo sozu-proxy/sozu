@@ -784,19 +784,18 @@ impl LocalDrain {
 
   fn store_time_metric(&mut self, key: &str, cluster_id: &str, backend_id: Option<&str>, t: usize) -> Result<(), sled::Error> {
       let now = OffsetDateTime::now_utc();
-      let timestamp = now.unix_timestamp();
-      let _res = self.store_time_metric_at(key, cluster_id, backend_id, timestamp, t)?;
+      //let timestamp = now.unix_timestamp();
+      //let _res = self.store_time_metric_at(key, cluster_id, backend_id, timestamp, t)?;
 
       let second = now.second();
       // we also aggregate at second zero
-      if second != 0 {
+      //if second != 0 {
           let previous_minute = now - time::Duration::seconds(second as i64);
           let timestamp = previous_minute.unix_timestamp();
           info!("WILL REWRITE TIME METRIC AT {}", timestamp);
           let _res = self.store_time_metric_at(key, cluster_id, backend_id, timestamp, t)?;
-      } else {
-          //FIXME: here we should delete all the measurements for the previous 60 seconds
-      }
+      //} else {
+      //}
 
       Ok(())
     }
