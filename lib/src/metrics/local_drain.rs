@@ -199,7 +199,7 @@ impl LocalDrain {
               if *kind == MetricKind::Time {
                   let mut percentiles = Percentiles::default();
 
-                  let count_key = format!("{}.count\t{}", prefix_key, cluster_id);
+                  let count_key = format!("{}\t{}.count ", prefix_key, cluster_id);
                   let count_end = format!("{}\x7F", count_key);
 
                   if let Some(v) = self.get_last_before(&count_key, &count_end, false)? {
@@ -209,7 +209,7 @@ impl LocalDrain {
                   }
 
                   {
-                      let p50_key = format!("{}.p50\t{}", prefix_key, cluster_id);
+                      let p50_key = format!("{}\t{}.p50 ", prefix_key, cluster_id);
                       let p50_end = format!("{}\x7F", p50_key);
 
                       if let Some(v) = self.get_last_before(&p50_key, &p50_end, false)? {
@@ -220,7 +220,7 @@ impl LocalDrain {
                   }
 
                   {
-                      let p90_key = format!("{}.p90\t{}", prefix_key, cluster_id);
+                      let p90_key = format!("{}\t{}.p90 ", prefix_key, cluster_id);
                       let p90_end = format!("{}\x7F", p90_key);
 
                       if let Some(v) = self.get_last_before(&p90_key, &p90_end, false)? {
@@ -231,7 +231,7 @@ impl LocalDrain {
                   }
 
                   {
-                      let p99_key = format!("{}.p99\t{}", prefix_key, cluster_id);
+                      let p99_key = format!("{}\t{}.p99 ", prefix_key, cluster_id);
                       let p99_end = format!("{}\x7F", p99_key);
 
                       if let Some(v) = self.get_last_before(&p99_key, &p99_end, false)? {
@@ -242,7 +242,7 @@ impl LocalDrain {
                   }
 
                   {
-                      let p99_9_key = format!("{}.p99.9\t{}", prefix_key, cluster_id);
+                      let p99_9_key = format!("{}\t{}.p99.9 ", prefix_key, cluster_id);
                       let p99_9_end = format!("{}\x7F", p99_9_key);
 
                       if let Some(v) = self.get_last_before(&p99_9_key, &p99_9_end, false)? {
@@ -253,7 +253,7 @@ impl LocalDrain {
                   }
 
                   {
-                      let p99_99_key = format!("{}.p99.99\t{}", prefix_key, cluster_id);
+                      let p99_99_key = format!("{}\t{}.p99.99 ", prefix_key, cluster_id);
                       let p99_99_end = format!("{}\x7F", p99_99_key);
 
                       if let Some(v) = self.get_last_before(&p99_99_key, &p99_99_end, false)? {
@@ -264,7 +264,7 @@ impl LocalDrain {
                   }
 
                   {
-                      let p99_999_key = format!("{}.p99.999\t{}", prefix_key, cluster_id);
+                      let p99_999_key = format!("{}\t{}.p99.999 ", prefix_key, cluster_id);
                       let p99_999_end = format!("{}\x7F", p99_999_key);
 
                       if let Some(v) = self.get_last_before(&p99_999_key, &p99_999_end, false)? {
@@ -275,7 +275,7 @@ impl LocalDrain {
                   }
 
                   {
-                      let p100_key = format!("{}.p100\t{}", prefix_key, cluster_id);
+                      let p100_key = format!("{}\t{}.p100 ", prefix_key, cluster_id);
                       let p100_end = format!("{}\x7F", p100_key);
 
                       if let Some(v) = self.get_last_before(&p100_key, &p100_end, false)? {
@@ -368,16 +368,17 @@ impl LocalDrain {
                   let key = std::str::from_utf8(it.next().unwrap()).unwrap();
                   let cluster_id = std::str::from_utf8(it.next().unwrap()).unwrap();
                   let backend_id = std::str::from_utf8(it.next().unwrap()).unwrap();
-                  let timestamp:i64 = std::str::from_utf8(it.next().unwrap()).unwrap().parse().unwrap();
+                  let timestamp:&str = std::str::from_utf8(it.next().unwrap()).unwrap();//.parse().unwrap();
 
                   let value = usize::from_le_bytes((*v).try_into().unwrap());
                   info!("looking at key = {}, id = {}, backend_id = {}, ts = {} -> {}",
                         key, cluster_id, backend_id, timestamp, value);
               } else {
+                  info!("current key: {}", std::str::from_utf8(&k).unwrap());
                   let mut it = k.split(|c: &u8| *c == b'\t');
                   let key = std::str::from_utf8(it.next().unwrap()).unwrap();
                   let cluster_id = std::str::from_utf8(it.next().unwrap()).unwrap();
-                  let timestamp:i64 = std::str::from_utf8(it.next().unwrap()).unwrap().parse().unwrap();
+                  let timestamp:&str = std::str::from_utf8(it.next().unwrap()).unwrap();//.parse().unwrap();
 
                   let value = usize::from_le_bytes((*v).try_into().unwrap());
                   info!("looking at key = {}, id = {}, ts = {} -> {}",
@@ -781,65 +782,16 @@ impl LocalDrain {
           format!("{}\t{}", key, cluster_id)
       };
 
-      let count_key_prefix = if let Some(bid) = backend_id {
-          format!("{}.count\t{}\t{}", key, cluster_id, bid)
-      } else {
-          format!("{}.count\t{}", key, cluster_id)
-      };
-
-      let mean_key_prefix = if let Some(bid) = backend_id {
-          format!("{}.mean\t{}\t{}", key, cluster_id, bid)
-      } else {
-          format!("{}.mean\t{}", key, cluster_id)
-      };
-
-      let var_key_prefix = if let Some(bid) = backend_id {
-          format!("{}.var\t{}\t{}", key, cluster_id, bid)
-      } else {
-          format!("{}.var\t{}", key, cluster_id)
-      };
-
-      let p50_key_prefix = if let Some(bid) = backend_id {
-          format!("{}.p50\t{}\t{}", key, cluster_id, bid)
-      } else {
-          format!("{}.p50\t{}", key, cluster_id)
-      };
-
-      let p90_key_prefix = if let Some(bid) = backend_id {
-          format!("{}.p90\t{}\t{}", key, cluster_id, bid)
-      } else {
-          format!("{}.p90\t{}", key, cluster_id)
-      };
-
-      let p99_key_prefix = if let Some(bid) = backend_id {
-          format!("{}.p99\t{}\t{}", key, cluster_id, bid)
-      } else {
-          format!("{}.p99\t{}", key, cluster_id)
-      };
-
-      let p99_9_key_prefix = if let Some(bid) = backend_id {
-          format!("{}.p99.9\t{}\t{}", key, cluster_id, bid)
-      } else {
-          format!("{}.p99.9\t{}", key, cluster_id)
-      };
-
-      let p99_99_key_prefix = if let Some(bid) = backend_id {
-          format!("{}.p99.99\t{}\t{}", key, cluster_id, bid)
-      } else {
-          format!("{}.p99.99\t{}", key, cluster_id)
-      };
-
-      let p99_999_key_prefix = if let Some(bid) = backend_id {
-          format!("{}.p99.999\t{}\t{}", key, cluster_id, bid)
-      } else {
-          format!("{}.p99.999\t{}", key, cluster_id)
-      };
-
-      let p100_key_prefix = if let Some(bid) = backend_id {
-          format!("{}.p100\t{}\t{}", key, cluster_id, bid)
-      } else {
-          format!("{}.p100\t{}", key, cluster_id)
-      };
+      let count_key_prefix = format!("{}.count ", key_prefix);
+      let mean_key_prefix = format!("{}.mean ", key_prefix);
+      let var_key_prefix = format!("{}.var ", key_prefix);
+      let p50_key_prefix = format!("{}.p50 ", key_prefix);
+      let p90_key_prefix = format!("{}.p90 ", key_prefix);
+      let p99_key_prefix = format!("{}.p99 ", key_prefix);
+      let p99_9_key_prefix = format!("{}.p99.9 ", key_prefix);
+      let p99_99_key_prefix = format!("{}.p99.99 ", key_prefix);
+      let p99_999_key_prefix = format!("{}.p99.999 ", key_prefix);
+      let p100_key_prefix = format!("{}.p100 ", key_prefix);
 
       if !self.metrics.contains_key(&key_prefix) {
           let meta = if backend_id.is_some() {
