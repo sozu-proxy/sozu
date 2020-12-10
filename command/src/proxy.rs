@@ -759,9 +759,9 @@ pub enum QueryCertificateType {
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueryMetricsType {
     List,
-    Cluster { metrics: Vec<String>, clusters: Vec<String> },
+    Cluster { metrics: Vec<String>, clusters: Vec<String>, date: Option<i64>, },
     // tuple cluster_id, backend_id
-    Backend { metrics: Vec<String>, backends: Vec<(String, String)> },
+    Backend { metrics: Vec<String>, backends: Vec<(String, String)>, date: Option<i64>, },
 }
 
 #[derive(Debug,Clone,PartialEq,Eq, Serialize, Deserialize)]

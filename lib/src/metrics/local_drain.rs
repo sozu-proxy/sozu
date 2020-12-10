@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use std::str;
 use std::time::Instant;
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use std::convert::TryInto;
 use std::collections::BTreeMap;
 use hdrhistogram::Histogram;
@@ -89,7 +89,7 @@ pub struct BackendMetrics {
   pub data:   BTreeMap<String, AggregatedMetric>,
 }
 
-#[derive(Clone,Debug,PartialEq)]
+#[derive(Copy,Clone,Debug,PartialEq)]
 enum MetricKind {
   Gauge,
   Count,
@@ -161,14 +161,14 @@ impl LocalDrain {
           QueryMetricsType::List => {
               Ok(QueryAnswerMetrics::List(self.metrics.keys().cloned().collect()))
           },
-          QueryMetricsType::Cluster { metrics, clusters } => {
-              self.query_cluster(metrics, clusters).map_err(|e| {
+          QueryMetricsType::Cluster { metrics, clusters, date } => {
+              self.query_cluster(metrics, clusters, date.clone()).map_err(|e| {
                   error!("metrics database error: {:?}", e);
                   format!("metrics database error: {:?}", e)
               })
           },
-          QueryMetricsType::Backend { metrics, backends } => {
-              self.query_backend(metrics, backends).map_err(|e| {
+          QueryMetricsType::Backend { metrics, backends, date } => {
+              self.query_backend(metrics, backends, date.clone()).map_err(|e| {
                   error!("metrics database error: {:?}", e);
                   format!("metrics database error: {:?}", e)
               })
@@ -176,13 +176,84 @@ impl LocalDrain {
       }
   }
 
-  fn query_cluster(&mut self, metrics: &Vec<String>, clusters: &Vec<String>) -> Result<QueryAnswerMetrics, sled::Error> {
+  fn query_metric(&self, key: &str, is_backend: bool, timestamp: i64, kind: MetricKind) -> Result<Option<FilteredData>, sled::Error> {
+      let tree = if is_backend {
+          &self.backend_tree
+      } else {
+          &self.cluster_tree
+      };
+
+      if kind == MetricKind::Time {
+          let mut percentiles = Percentiles::default();
+
+          if let Some(v) = tree.get(format!("{}.count \t{}", key, timestamp).as_bytes())? {
+              let value = usize::from_le_bytes((*v).try_into().unwrap());
+              percentiles.samples = value as u64;
+          }
+          if let Some(v) = tree.get(format!("{}.p50 \t{}", key, timestamp).as_bytes())? {
+              let value = usize::from_le_bytes((*v).try_into().unwrap());
+              percentiles.p_50 = value as u64;
+          }
+          if let Some(v) = tree.get(format!("{}.p90 \t{}", key, timestamp).as_bytes())? {
+              let value = usize::from_le_bytes((*v).try_into().unwrap());
+              percentiles.p_90 = value as u64;
+          }
+          if let Some(v) = tree.get(format!("{}.p99 \t{}", key, timestamp).as_bytes())? {
+              let value = usize::from_le_bytes((*v).try_into().unwrap());
+              percentiles.p_99 = value as u64;
+          }
+          if let Some(v) = tree.get(format!("{}.p99.9 \t{}", key, timestamp).as_bytes())? {
+              let value = usize::from_le_bytes((*v).try_into().unwrap());
+              percentiles.p_99_9 = value as u64;
+          }
+          if let Some(v) = tree.get(format!("{}.p99.99 \t{}", key, timestamp).as_bytes())? {
+              let value = usize::from_le_bytes((*v).try_into().unwrap());
+              percentiles.p_99_99 = value as u64;
+          }
+          if let Some(v) = tree.get(format!("{}.p99.999 \t{}", key, timestamp).as_bytes())? {
+              let value = usize::from_le_bytes((*v).try_into().unwrap());
+              percentiles.p_99_999 = value as u64;
+          }
+          if let Some(v) = tree.get(format!("{}.p100 \t{}", key, timestamp).as_bytes())? {
+              let value = usize::from_le_bytes((*v).try_into().unwrap());
+              percentiles.p_100 = value as u64;
+          }
+
+          return Ok(Some(FilteredData::Percentiles(percentiles)));
+      }
+
+
+      info!("WILL QUERY: '{}\t{}'", key, timestamp);
+      if let Some(v) = tree.get(&format!("{}\t{}", key, timestamp).as_bytes())? {
+          match kind {
+              MetricKind::Gauge => {
+                  return Ok(Some(FilteredData::Gauge(usize::from_le_bytes((*v).try_into().unwrap()))));
+              },
+              MetricKind::Count => {
+                  return Ok(Some(FilteredData::Count(i64::from_le_bytes((*v).try_into().unwrap()))));
+              },
+              MetricKind::Time => {}
+          }
+      }
+
+      Ok(None)
+  }
+
+  fn query_cluster(&mut self, metrics: &Vec<String>, clusters: &Vec<String>,
+                   date: Option<i64>) -> Result<QueryAnswerMetrics, sled::Error> {
       let mut apps: BTreeMap<String, BTreeMap<String, FilteredData>> = BTreeMap::new();
       for cluster_id in clusters.iter() {
           apps.insert(cluster_id.to_string(), BTreeMap::new());
       }
 
+      let timestamp = date.unwrap_or_else(|| {
+          let now = OffsetDateTime::now_utc();
+          let last_minute = now - Duration::seconds(now.second() as i64);
+          last_minute.unix_timestamp()
+      });
+
       trace!("current metrics: {:#?}", self.metrics);
+
       for prefix_key in metrics.iter() {
           for cluster_id in clusters.iter() {
               let key = format!("{}\t{}", prefix_key, cluster_id);
@@ -194,116 +265,16 @@ impl LocalDrain {
               }
               let (meta, kind) = res.unwrap();
 
-              //FIXME: check here that the metric is a cluster level one
+              if *meta == MetricMeta::ClusterBackend {
+                  error!("{} is a backend metric", key);
+                  continue
+              }
 
-              if *kind == MetricKind::Time {
-                  let mut percentiles = Percentiles::default();
-
-                  let count_key = format!("{}\t{}.count ", prefix_key, cluster_id);
-                  let count_end = format!("{}\x7F", count_key);
-
-                  if let Some(v) = self.get_last_before(&count_key, &count_end, false)? {
-                      let value = usize::from_le_bytes((*v).try_into().unwrap());
-                      //info!("count -> {} ({:?})", value, *v);
-                      percentiles.samples = value as u64;
-                  }
-
-                  {
-                      let p50_key = format!("{}\t{}.p50 ", prefix_key, cluster_id);
-                      let p50_end = format!("{}\x7F", p50_key);
-
-                      if let Some(v) = self.get_last_before(&p50_key, &p50_end, false)? {
-                          let value = usize::from_le_bytes((*v).try_into().unwrap());
-                          //info!("p50 -> {} ({:?})", value, *v);
-                          percentiles.p_50 = value as u64;
-                      }
-                  }
-
-                  {
-                      let p90_key = format!("{}\t{}.p90 ", prefix_key, cluster_id);
-                      let p90_end = format!("{}\x7F", p90_key);
-
-                      if let Some(v) = self.get_last_before(&p90_key, &p90_end, false)? {
-                          let value = usize::from_le_bytes((*v).try_into().unwrap());
-                          //info!("p90 -> {} ({:?})", value, *v);
-                          percentiles.p_90 = value as u64;
-                      }
-                  }
-
-                  {
-                      let p99_key = format!("{}\t{}.p99 ", prefix_key, cluster_id);
-                      let p99_end = format!("{}\x7F", p99_key);
-
-                      if let Some(v) = self.get_last_before(&p99_key, &p99_end, false)? {
-                          let value = usize::from_le_bytes((*v).try_into().unwrap());
-                          //info!("p99 -> {} ({:?})", value, *v);
-                          percentiles.p_99 = value as u64;
-                      }
-                  }
-
-                  {
-                      let p99_9_key = format!("{}\t{}.p99.9 ", prefix_key, cluster_id);
-                      let p99_9_end = format!("{}\x7F", p99_9_key);
-
-                      if let Some(v) = self.get_last_before(&p99_9_key, &p99_9_end, false)? {
-                          let value = usize::from_le_bytes((*v).try_into().unwrap());
-                          //info!("p99.9 -> {} ({:?})", value, *v);
-                          percentiles.p_99_9 = value as u64;
-                      }
-                  }
-
-                  {
-                      let p99_99_key = format!("{}\t{}.p99.99 ", prefix_key, cluster_id);
-                      let p99_99_end = format!("{}\x7F", p99_99_key);
-
-                      if let Some(v) = self.get_last_before(&p99_99_key, &p99_99_end, false)? {
-                          let value = usize::from_le_bytes((*v).try_into().unwrap());
-                          //info!("p99.99 -> {} ({:?})", value, *v);
-                          percentiles.p_99_99 = value as u64;
-                      }
-                  }
-
-                  {
-                      let p99_999_key = format!("{}\t{}.p99.999 ", prefix_key, cluster_id);
-                      let p99_999_end = format!("{}\x7F", p99_999_key);
-
-                      if let Some(v) = self.get_last_before(&p99_999_key, &p99_999_end, false)? {
-                          let value = usize::from_le_bytes((*v).try_into().unwrap());
-                          //info!("p99.999 -> {} ({:?})", value, *v);
-                          percentiles.p_99_999 = value as u64;
-                      }
-                  }
-
-                  {
-                      let p100_key = format!("{}\t{}.p100 ", prefix_key, cluster_id);
-                      let p100_end = format!("{}\x7F", p100_key);
-
-                      if let Some(v) = self.get_last_before(&p100_key, &p100_end, false)? {
-                          let value = usize::from_le_bytes((*v).try_into().unwrap());
-                          //info!("p100 -> {} ({:?})", value, *v);
-                          percentiles.p_100 = value as u64;
-                      }
-                  }
-
+              if let Some(filtered_data) = self.query_metric(&key, false, timestamp, *kind)? {
                   apps.get_mut(cluster_id).unwrap()
-                      .insert(key.to_string(), FilteredData::Percentiles(percentiles));
-
-                  continue;
+                      .insert(key.to_string(), filtered_data);
               }
 
-              let end = format!("{}\x7F", key);
-
-              if let Some(v) = self.get_last_before(&key, &end, false)? {
-                  match kind {
-                      MetricKind::Gauge => {
-                          apps.get_mut(cluster_id).unwrap().insert(key.to_string(), FilteredData::Gauge(usize::from_le_bytes((*v).try_into().unwrap())));
-                      },
-                      MetricKind::Count => {
-                          apps.get_mut(cluster_id).unwrap().insert(key.to_string(), FilteredData::Count(i64::from_le_bytes((*v).try_into().unwrap())));
-                      },
-                      MetricKind::Time => {}
-                  }
-              }
           }
       }
 
@@ -311,12 +282,19 @@ impl LocalDrain {
       Ok(QueryAnswerMetrics::Cluster(apps))
   }
 
-  fn query_backend(&mut self, metrics: &Vec<String>, backends: &Vec<(String,String)>) -> Result<QueryAnswerMetrics, sled::Error> {
+  fn query_backend(&mut self, metrics: &Vec<String>, backends: &Vec<(String,String)>,
+                   date: Option<i64>) -> Result<QueryAnswerMetrics, sled::Error> {
       let mut backend_data: BTreeMap<String, BTreeMap<String, BTreeMap<String, FilteredData>>> = BTreeMap::new();
       for (cluster_id, backend_id) in backends.iter() {
           let t = backend_data.entry(cluster_id.to_string()).or_insert_with(BTreeMap::new);
           t.insert(backend_id.to_string(), BTreeMap::new());
       }
+
+      let timestamp = date.unwrap_or_else(|| {
+          let now = OffsetDateTime::now_utc();
+          let last_minute = now - Duration::seconds(now.second() as i64);
+          last_minute.unix_timestamp()
+      });
 
       trace!("current metrics: {:#?}", self.metrics);
       for prefix_key in metrics.iter() {
@@ -330,21 +308,15 @@ impl LocalDrain {
               }
               let (meta, kind) = res.unwrap();
 
-              let end = format!("{}\x7F", key);
-              if let Some(v) = self.get_last_before(&key, &end, true)? {
-                  match kind {
-                      MetricKind::Gauge => {
-                          backend_data.get_mut(cluster_id).unwrap()
-                              .get_mut(backend_id).unwrap().insert(key.to_string(), FilteredData::Gauge(usize::from_le_bytes((*v).try_into().unwrap())));
-                      },
-                      MetricKind::Count => {
-                          backend_data.get_mut(cluster_id).unwrap()
-                              .get_mut(backend_id).unwrap().insert(key.to_string(), FilteredData::Count(i64::from_le_bytes((*v).try_into().unwrap())));
-                      },
-                      MetricKind::Time => {
-                          //unimplemented for now
-                      }
-                  }
+              if *meta == MetricMeta::Cluster {
+                  error!("{} is a cluster metric", key);
+                  continue
+              }
+
+              if let Some(filtered_data) = self.query_metric(&key, true, timestamp, *kind)? {
+                  backend_data.get_mut(cluster_id).unwrap()
+                      .get_mut(backend_id).unwrap()
+                      .insert(key.to_string(), filtered_data);
               }
           }
       }
