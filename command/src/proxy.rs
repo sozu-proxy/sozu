@@ -99,7 +99,7 @@ impl fmt::Debug for FilteredTimeSerie {
   }
 }
 
-#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Default, Serialize, Deserialize)]
 pub struct Percentiles {
   pub samples:  u64,
   pub p_50:     u64,

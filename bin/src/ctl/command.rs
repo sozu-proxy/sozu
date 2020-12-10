@@ -720,14 +720,14 @@ fn print_metrics(table_name: &str, data: &BTreeMap<String, BTreeMap<String, Filt
 
 
         for metric in time_metrics {
-            let mut row_samples = vec![cell!(format!("{} samples", metric))];
-            let mut row_p50 = vec![cell!(format!("{} p50", metric))];
-            let mut row_p90 = vec![cell!(format!("{} p90", metric))];
-            let mut row_p99 = vec![cell!(format!("{} p99", metric))];
-            let mut row_p99_9 = vec![cell!(format!("{} p99.9", metric))];
-            let mut row_p99_99 = vec![cell!(format!("{} p99.99", metric))];
-            let mut row_p99_999 = vec![cell!(format!("{} p99.999", metric))];
-            let mut row_p100 = vec![cell!(format!("{} p100", metric))];
+            let mut row_samples = vec![cell!(format!("{}.samples", metric))];
+            let mut row_p50 = vec![cell!(format!("{}.p50", metric))];
+            let mut row_p90 = vec![cell!(format!("{}.p90", metric))];
+            let mut row_p99 = vec![cell!(format!("{}.p99", metric))];
+            let mut row_p99_9 = vec![cell!(format!("{}.p99.9", metric))];
+            let mut row_p99_99 = vec![cell!(format!("{}.p99.99", metric))];
+            let mut row_p99_999 = vec![cell!(format!("{}.p99.999", metric))];
+            let mut row_p100 = vec![cell!(format!("{}.p100", metric))];
 
             for worker_data in data.values() {
                 match worker_data.get(metric) {
@@ -1551,7 +1551,9 @@ pub fn query_metrics(mut channel: Channel<CommandRequest,CommandResponse>, json:
                                         let mut metrics = BTreeMap::new();
                                         for (cluster_id, cluster_metrics) in d.iter() {
                                             for (metric_key, value) in cluster_metrics.iter() {
-                                                metrics.insert(format!("{}.{}", cluster_id, metric_key), value.clone());
+                                                metrics.insert(format!("{} {}",
+                                                    cluster_id, metric_key.replace("\t", ".")
+                                                    ), value.clone());
                                             }
                                         }
                                         Some((key.clone(), metrics))
@@ -1561,7 +1563,10 @@ pub fn query_metrics(mut channel: Channel<CommandRequest,CommandResponse>, json:
                                         for (cluster_id, cluster_metrics) in d.iter() {
                                             for (backend_id, backend_metrics) in cluster_metrics.iter() {
                                                 for (metric_key, value) in backend_metrics.iter() {
-                                                    metrics.insert(format!("{}.{}.{}", cluster_id, backend_id, metric_key), value.clone());
+                                                    metrics.insert(format!("{}/{} {}",
+                                                        cluster_id, backend_id,
+                                                        metric_key.replace("\t", ".")
+                                                        ), value.clone());
                                                 }
                                             }
                                         }
