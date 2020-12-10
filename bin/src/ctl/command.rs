@@ -1482,9 +1482,9 @@ pub fn query_metrics(mut channel: Channel<CommandRequest,CommandResponse>, json:
         bail!("Error: Either request a list of clusters or a list of backends");
     } else {
         if !clusters.is_empty(){
-            QueryMetricsType::Cluster { metrics: names, clusters }
+            QueryMetricsType::Cluster { metrics: names, clusters, date: None }
         } else {
-            QueryMetricsType::Backend { metrics: names, backends }
+            QueryMetricsType::Backend { metrics: names, backends, date: None }
         }
     };
 
