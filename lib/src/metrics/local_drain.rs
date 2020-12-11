@@ -801,6 +801,60 @@ impl LocalDrain {
       Ok(())
   }
 
+  fn clear_time(&mut self, key: &str, now: OffsetDateTime, is_backend: bool) -> Result<(), sled::Error> {
+      self.clear_time_metric(&format!("{}.count", key), now, is_backend)?;
+      self.clear_time_metric(&format!("{}.mean", key), now, is_backend)?;
+      self.clear_time_metric(&format!("{}.var", key), now, is_backend)?;
+      self.clear_time_metric(&format!("{}.p50", key), now, is_backend)?;
+      self.clear_time_metric(&format!("{}.p90", key), now, is_backend)?;
+      self.clear_time_metric(&format!("{}.p99", key), now, is_backend)?;
+      self.clear_time_metric(&format!("{}.p99.9", key), now, is_backend)?;
+      self.clear_time_metric(&format!("{}.p99.99", key), now, is_backend)?;
+      self.clear_time_metric(&format!("{}.p99.999", key), now, is_backend)?;
+      self.clear_time_metric(&format!("{}.p100", key), now, is_backend)?;
+
+      Ok(())
+  }
+
+  fn clear_time_metric(&mut self, key: &str, now: OffsetDateTime, is_backend: bool) -> Result<(), sled::Error> {
+      let timestamp = now.unix_timestamp();
+      let one_hour_ago = format!("{}\t{}", key, timestamp - 3600);
+      let one_minute_ago = format!("{}\t{}", key, timestamp - 60);
+      let now_key = format!("{}\t{}", key, timestamp);
+
+      let tree = if is_backend {
+          &mut self.backend_tree
+      } else {
+          &mut self.cluster_tree
+      };
+
+      // aggregate 60 measures in a point at the last hour
+      for res in tree.range(one_minute_ago.as_bytes()..now_key.as_bytes()) {
+          let (k, v) = res?;
+          info!("removing {} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
+          tree.remove(k)?;
+      }
+
+      // remove all measures older than 24h
+      if now.minute() == 0 {
+          for res in tree.range(one_hour_ago.as_bytes()..one_minute_ago.as_bytes()) {
+              let (k, v) = res?;
+              info!("removing {} -> {:?}", unsafe { std::str::from_utf8_unchecked(&k) }, u64::from_le_bytes((*v).try_into().unwrap()));
+              tree.remove(k)?;
+          }
+
+          // remove all measures older than 24h
+          let one_day_ago = format!("{}\t{}", key, timestamp - 3600 * 24);
+          for res in tree.range(key.as_bytes()..one_day_ago.as_bytes()) {
+              let (k, v) = res?;
+              info!("removing {} -> {:?} (more than 24h)", unsafe { std::str::from_utf8_unchecked(&k) }, i64::from_le_bytes((*v).try_into().unwrap()));
+              tree.remove(k)?;
+          }
+      }
+
+      Ok(())
+  }
+
   fn store_time_metric(&mut self, key: &str, cluster_id: &str, backend_id: Option<&str>, t: usize) -> Result<(), sled::Error> {
       let now = OffsetDateTime::now_utc();
       //let timestamp = now.unix_timestamp();
@@ -1011,6 +1065,7 @@ impl LocalDrain {
                   self.clear_count(key, now, is_backend)?;
               },
               MetricKind::Time => {
+                  self.clear_time(key, now, is_backend)?;
               }
           }
       }
