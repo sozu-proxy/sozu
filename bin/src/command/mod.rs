@@ -692,8 +692,8 @@ impl CommandServer {
 
                                 tx.send(message).await.unwrap();
 
-                                if nb > 1 {
-                                    self.in_flight.insert(message_id, (tx, nb - 1));
+                                if nb > 0 {
+                                    self.in_flight.insert(message_id, (tx, nb));
                                 }
                             }
                         }
