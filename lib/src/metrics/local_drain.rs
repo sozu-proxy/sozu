@@ -924,40 +924,44 @@ impl LocalDrain {
 
       match tree.get(count_key.as_bytes())? {
           None => {
-              tree.insert(count_key.as_bytes(), &1usize.to_le_bytes())?;
-              tree.insert(mean_key.as_bytes(), &(t as f64).to_le_bytes())?;
-              tree.insert(var_key.as_bytes(), &0f64.to_le_bytes())?;
-              tree.insert(p50_key.as_bytes(), &t.to_le_bytes())?;
-              tree.insert(p90_key.as_bytes(), &t.to_le_bytes())?;
-              tree.insert(p99_key.as_bytes(), &t.to_le_bytes())?;
-              tree.insert(p99_9_key.as_bytes(), &t.to_le_bytes())?;
-              tree.insert(p99_99_key.as_bytes(), &t.to_le_bytes())?;
-              tree.insert(p99_999_key.as_bytes(), &t.to_le_bytes())?;
-              tree.insert(p100_key.as_bytes(), &t.to_le_bytes())?;
+              let mut batch = sled::Batch::default();
+              batch.insert(count_key.as_bytes(), &1usize.to_le_bytes());
+              batch.insert(mean_key.as_bytes(), &(t as f64).to_le_bytes());
+              batch.insert(var_key.as_bytes(), &0f64.to_le_bytes());
+              batch.insert(p50_key.as_bytes(), &t.to_le_bytes());
+              batch.insert(p90_key.as_bytes(), &t.to_le_bytes());
+              batch.insert(p99_key.as_bytes(), &t.to_le_bytes());
+              batch.insert(p99_9_key.as_bytes(), &t.to_le_bytes());
+              batch.insert(p99_99_key.as_bytes(), &t.to_le_bytes());
+              batch.insert(p99_999_key.as_bytes(), &t.to_le_bytes());
+              batch.insert(p100_key.as_bytes(), &t.to_le_bytes());
+              tree.apply_batch(batch)?;
           },
           Some(v) => {
+              let mut batch = sled::Batch::default();
+
               let old_count = i64::from_le_bytes((*v).try_into().unwrap());
-              tree.insert(count_key.as_bytes(), &(old_count+1).to_le_bytes())?;
+              batch.insert(count_key.as_bytes(), &(old_count+1).to_le_bytes());
 
               match tree.get(mean_key.as_bytes())? {
                   None => {
-                      tree.insert(mean_key.as_bytes(), &t.to_le_bytes())?;
+                      batch.insert(mean_key.as_bytes(), &t.to_le_bytes());
                   },
                   Some(mean_v) => {
                       let old_mean = f64::from_le_bytes((*mean_v).try_into().unwrap());
                       let new_mean = (old_mean * old_count as f64 + t as f64) / (old_count as f64 + 1f64);
 
-                      tree.insert(mean_key.as_bytes(), &new_mean.to_le_bytes())?;
+                      batch.insert(mean_key.as_bytes(), &new_mean.to_le_bytes());
 
                       match tree.get(var_key.as_bytes())? {
                           None => {
-                              tree.insert(var_key.as_bytes(), &0f64.to_le_bytes())?;
+                              batch.insert(var_key.as_bytes(), &0f64.to_le_bytes());
                           },
                           Some(var_v) => {
                               let old_var = f64::from_le_bytes((*var_v).try_into().unwrap());
                               let deviation = t as f64 - old_mean;
                               let new_var = (old_var * old_count as f64 + deviation * deviation) / (old_count as f64 +1f64);
-                              tree.insert(var_key.as_bytes(), &new_var.to_le_bytes())?;
+                              batch.insert(var_key.as_bytes(), &new_var.to_le_bytes());
 
                               let standard_dev = new_var.sqrt();
 
@@ -965,55 +969,57 @@ impl LocalDrain {
                                   let old_percentile = usize::from_le_bytes((*old_v).try_into().unwrap());
                                   let new_percentile = calculate_percentile(old_percentile, t,
                                                                             standard_dev, 0.50f64);
-                                  tree.insert(p50_key.as_bytes(), &new_percentile.to_le_bytes())?;
+                                  batch.insert(p50_key.as_bytes(), &new_percentile.to_le_bytes());
                               }
 
                               if let Some(old_v) = tree.get(p90_key.as_bytes())? {
                                   let old_percentile = usize::from_le_bytes((*old_v).try_into().unwrap());
                                   let new_percentile = calculate_percentile(old_percentile, t,
                                                                             standard_dev, 0.90f64);
-                                  tree.insert(p90_key.as_bytes(), &new_percentile.to_le_bytes())?;
+                                  batch.insert(p90_key.as_bytes(), &new_percentile.to_le_bytes());
                               }
 
                               if let Some(old_v) = tree.get(p99_key.as_bytes())? {
                                   let old_percentile = usize::from_le_bytes((*old_v).try_into().unwrap());
                                   let new_percentile = calculate_percentile(old_percentile, t,
                                                                             standard_dev, 0.99f64);
-                                  tree.insert(p99_key.as_bytes(), &new_percentile.to_le_bytes())?;
+                                  batch.insert(p99_key.as_bytes(), &new_percentile.to_le_bytes());
                               }
 
                               if let Some(old_v) = tree.get(p99_9_key.as_bytes())? {
                                   let old_percentile = usize::from_le_bytes((*old_v).try_into().unwrap());
                                   let new_percentile = calculate_percentile(old_percentile, t,
                                                                             standard_dev, 0.999f64);
-                                  tree.insert(p99_9_key.as_bytes(), &new_percentile.to_le_bytes())?;
+                                  batch.insert(p99_9_key.as_bytes(), &new_percentile.to_le_bytes());
                               }
 
                               if let Some(old_v) = tree.get(p99_99_key.as_bytes())? {
                                   let old_percentile = usize::from_le_bytes((*old_v).try_into().unwrap());
                                   let new_percentile = calculate_percentile(old_percentile, t,
                                                                             standard_dev, 0.9999f64);
-                                  tree.insert(p99_99_key.as_bytes(), &new_percentile.to_le_bytes())?;
+                                  batch.insert(p99_99_key.as_bytes(), &new_percentile.to_le_bytes());
                               }
 
                               if let Some(old_v) = tree.get(p99_999_key.as_bytes())? {
                                   let old_percentile = usize::from_le_bytes((*old_v).try_into().unwrap());
                                   let new_percentile = calculate_percentile(old_percentile, t,
                                                                             standard_dev, 0.99999f64);
-                                  tree.insert(p99_999_key.as_bytes(), &new_percentile.to_le_bytes())?;
+                                  batch.insert(p99_999_key.as_bytes(), &new_percentile.to_le_bytes());
                               }
 
                               if let Some(old_v) = tree.get(p100_key.as_bytes())? {
                                   let old_percentile = usize::from_le_bytes((*old_v).try_into().unwrap());
                                   // the 100 percentile is the largest value
                                   if t > old_percentile {
-                                      tree.insert(p100_key.as_bytes(), &t.to_le_bytes())?;
+                                      batch.insert(p100_key.as_bytes(), &t.to_le_bytes());
                                   }
                               }
                           }
                       }
                   }
               }
+
+              tree.apply_batch(batch)?;
           }
       };
 
