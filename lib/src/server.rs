@@ -587,15 +587,15 @@ impl Server {
   }
 
   fn notify(&mut self, message: ProxyRequest) {
-    if let ProxyRequestData::Metrics = message.order {
+    if let ProxyRequestData::Metrics(ref configuration) = message.order {
       //let id = message.id.clone();
       METRICS.with(|metrics| {
+        (*metrics.borrow_mut()).configure(configuration);
+
         push_queue(ProxyResponse {
           id:     message.id.clone(),
           status: ProxyResponseStatus::Ok,
-          data:   Some(ProxyResponseData::Metrics(
-            (*metrics.borrow_mut()).dump_metrics_data()
-          ))
+          data:   None,
         });
       });
       return;

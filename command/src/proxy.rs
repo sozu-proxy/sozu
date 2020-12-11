@@ -176,7 +176,7 @@ pub enum ProxyRequestData {
     HardStop,
 
     Status,
-    Metrics,
+    Metrics(MetricsConfiguration),
     Logging(String),
 
     ReturnListenSockets,
@@ -726,6 +726,12 @@ pub struct TcpListener {
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
+pub enum MetricsConfiguration {
+    Enabled(bool),
+    Clear,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Query {
   Applications(QueryApplicationType),
@@ -840,7 +846,7 @@ impl ProxyRequestData {
       ProxyRequestData::SoftStop               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::HardStop               => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::Status                 => [Topic::HttpProxyConfig, Topic::HttpsProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
-      ProxyRequestData::Metrics                => HashSet::new(),
+      ProxyRequestData::Metrics(_)             => HashSet::new(),
       ProxyRequestData::Logging(_)             => [Topic::HttpsProxyConfig, Topic::HttpProxyConfig, Topic::TcpProxyConfig].iter().cloned().collect(),
       ProxyRequestData::ReturnListenSockets    => HashSet::new(),
     }

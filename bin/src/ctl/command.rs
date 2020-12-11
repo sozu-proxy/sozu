@@ -8,7 +8,9 @@ use sozu_command::proxy::{Cluster, ProxyRequestData, Backend, HttpFrontend,
   RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend,
   TcpListener, ListenerType, TlsVersion, QueryCertificateType,
   QueryAnswerCertificate, RemoveListener, ActivateListener, DeactivateListener,
-  LoadBalancingAlgorithms, PathRule, RulePosition, Route, QueryMetricsType, QueryAnswerMetrics};
+  LoadBalancingAlgorithms, PathRule, RulePosition, Route, QueryMetricsType, QueryAnswerMetrics,
+  MetricsConfiguration};
+use crate::cli::MetricsCmd;
 
 use serde_json;
 use std::collections::{HashMap,HashSet,BTreeMap};
@@ -549,16 +551,22 @@ pub fn status(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
   }
 }
 
-pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool) 
-  -> Result<(), anyhow::Error> {
+pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>,
+               cmd: MetricsCmd) -> Result<(), anyhow::Error> {
   let id = generate_id();
   //println!("will send message for metrics with id {}", id);
+
+  let configuration = match cmd {
+      MetricsCmd::Enable => MetricsConfiguration::Enabled(true),
+      MetricsCmd::Disable => MetricsConfiguration::Enabled(false),
+      MetricsCmd::Clear => MetricsConfiguration::Clear,
+  };
+
   channel.write_message(&CommandRequest::new(
     id.clone(),
-    CommandRequestData::Proxy(ProxyRequestData::Metrics),
+    CommandRequestData::Proxy(ProxyRequestData::Metrics(configuration)),
     None,
   ));
-  //println!("message sent");
 
   // we should add a timeout somehow, otherwise it hangs
   loop {
@@ -572,81 +580,11 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>, json: bool)
             println!("Proxy is processing: {}", message.message);
           },
           CommandStatus::Error => {
-            if json {
-              print_json_response(&message.message)?;
-            }
             bail!("could not stop the proxy: {}", message.message);
           },
           CommandStatus::Ok => {
             if &id == &message.id {
-              //println!("Sozu metrics:\n{}\n{:#?}", message.message, message.data);
-
-              if let Some(CommandResponseData::Metrics(data)) = message.data {
-                if json {
-                  print_json_response(&data)?;
-                  return Ok(());
-                }
-
-                let mut main_metrics = BTreeMap::new();
-                main_metrics.insert("".to_string(), data.main.clone());
-                print_metrics("Main", &main_metrics);
-
-                let worker_metrics = data.workers.iter().map(|(k,v)| (k.to_string(), v.proxy.clone()))
-                    .collect::<BTreeMap<_,_>>();
-                print_metrics("Workers", &worker_metrics);
-
-                let mut cluster_ids = HashSet::new();
-                for worker in data.workers.values() {
-                  for key in worker.clusters.keys() {
-                    cluster_ids.insert(key);
-                  }
-                }
-                let mut cluster_ids: Vec<_> = cluster_ids.drain().collect();
-                cluster_ids.sort();
-
-                println!("\ncluster metrics:\n");
-                for cluster_id in cluster_ids.iter() {
-                    println!("looking for data for cluster: {}", cluster_id);
-                    let cluster_metrics = data.workers.iter()
-                        .map(|(worker, worker_data)| {
-                            //println!("worker data: {:?}", worker_data.clusters.get(cluster_id.as_str()));
-                            (worker.clone(),
-                            worker_data.clusters.get(cluster_id.as_str())
-                                .map(|cluster_data| {
-                                    cluster_data.data.clone()
-                                })
-                                .unwrap_or_default())
-                        }).collect::<BTreeMap<_, _>>();
-
-                    println!("generated app metrics");
-                    print_metrics(cluster_id, &cluster_metrics);
-
-                    let mut backend_ids: HashSet<_> = data.workers.values()
-                        .filter_map(|w| w.clusters.get(cluster_id.as_str()))
-                        .flat_map(|app_metrics| {
-                            app_metrics.backends.keys()
-                        }).collect();
-                    let mut backend_ids: Vec<_> = backend_ids.drain().collect();
-                    backend_ids.sort();
-
-                    for backend_id in backend_ids.iter() {
-                        let backend_metrics = data.workers.iter()
-                          .map(|(worker, worker_data)| {
-                            (worker.clone(),
-                            worker_data.clusters.get(cluster_id.as_str())
-                                .and_then(|cluster_data| {
-                                    cluster_data.backends.get(backend_id.as_str())
-                                      .map(|b| b.clone())
-                                })
-                                .unwrap_or_default())
-                          }).collect::<BTreeMap<_, _>>();
-
-                        print_metrics(&format!("{} {}", cluster_id, backend_id), &backend_metrics);
-                    }
-
-                }
-                break Ok(());
-              }
+              break Ok(());
             }
           }
         }

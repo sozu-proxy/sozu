@@ -45,7 +45,7 @@ pub fn ctl(matches: Sozu) -> Result<(), anyhow::Error>{
       Ok(())
     },
     SubCmd::Status{ json } => status(channel, json),
-    SubCmd::Metrics{ json } => metrics(channel, json),
+    SubCmd::Metrics{ cmd } => metrics(channel, cmd),
     SubCmd::Logging{ level } => logging_filter(channel, timeout, &level),
     SubCmd::State{ cmd } => {
       match cmd {

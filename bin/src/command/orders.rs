@@ -17,12 +17,11 @@ use sozu_command::command::{
     CommandRequest, CommandRequestData, CommandResponse, CommandResponseData, CommandStatus,
     RunState, WorkerInfo,
 };
-use sozu_command::proxy::Route;
 use sozu_command::logging;
 use sozu_command::proxy::{
     AggregatedMetricsData, HttpFrontend, MetricsData, ProxyRequestData, ProxyResponseData,
-    ProxyResponseStatus, Query, QueryAnswer, QueryApplicationType, TcpFrontend,
-    ProxyRequest,
+    ProxyResponseStatus, Query, QueryAnswer, QueryApplicationType, Route, TcpFrontend,
+    ProxyRequest, MetricsConfiguration,
 };
 use sozu_command::scm_socket::Listeners;
 use sozu_command::state::get_application_ids_by_domain;
@@ -62,7 +61,7 @@ impl CommandServer {
             }
 
             CommandRequestData::Proxy(proxy_request) => match proxy_request {
-                ProxyRequestData::Metrics => self.metrics(client_id, request.id).await,
+                ProxyRequestData::Metrics(config) => self.metrics(client_id, request.id, config).await,
                 ProxyRequestData::Query(query) => self.query(client_id, request.id, query).await,
                 order => {
                     self.worker_order(client_id, request.id, order, request.worker_id)
@@ -828,7 +827,7 @@ impl CommandServer {
         self.config = new_config;
     }
 
-    pub async fn metrics(&mut self, client_id: String, request_id: String) {
+    pub async fn metrics(&mut self, client_id: String, request_id: String, config: MetricsConfiguration) {
         let (tx, mut rx) = futures::channel::mpsc::channel(self.workers.len() * 2);
         let mut count = 0usize;
         for ref mut worker in self
@@ -837,12 +836,10 @@ impl CommandServer {
             .filter(|worker| worker.run_state != RunState::Stopped)
         {
             let req_id = format!("{}-metrics-{}", request_id, worker.id);
-            worker.send(req_id.clone(), ProxyRequestData::Metrics).await;
+            worker.send(req_id.clone(), ProxyRequestData::Metrics(config.clone())).await;
             count += 1;
             self.in_flight.insert(req_id, (tx.clone(), 1));
         }
-
-        let main_metrics = METRICS.with(|metrics| (*metrics.borrow_mut()).dump_process_data());
 
         let mut client_tx = self.clients.get_mut(&client_id).unwrap().clone();
         let prefix = format!("{}-metrics-", request_id);
@@ -856,7 +853,7 @@ impl CommandServer {
                         v.push((tag, proxy_response));
                     }
                     ProxyResponseStatus::Processing => {
-                        info!("metrics processing");
+                        //info!("metrics processing");
                         continue;
                     }
                     ProxyResponseStatus::Error(_) => {
@@ -871,31 +868,14 @@ impl CommandServer {
                 }
             }
 
-            let data: BTreeMap<String, MetricsData> = v
-                .into_iter()
-                .filter_map(|(tag, metrics)| {
-                    if let Some(ProxyResponseData::Metrics(d)) = metrics.data {
-                        Some((tag, d))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            let aggregated_data = AggregatedMetricsData {
-                main: main_metrics,
-                workers: data,
-            };
-
-            if let Err(e) = client_tx
+            client_tx
                 .send(CommandResponse::new(
                     request_id.clone(),
                     CommandStatus::Ok,
                     "".to_string(),
-                    Some(CommandResponseData::Metrics(aggregated_data)),
-                )).await{
-                    error!("could not send message to client {:?}: {:?}", client_id, e);
-                }
+                    None,
+                ))
+                .await;
         })
         .detach();
     }
