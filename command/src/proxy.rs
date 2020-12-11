@@ -728,6 +728,7 @@ pub struct TcpListener {
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]
 pub enum MetricsConfiguration {
     Enabled(bool),
+    EnabledTimeMetrics(bool),
     Clear,
 }
 

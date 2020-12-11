@@ -557,8 +557,16 @@ pub fn metrics(mut channel: Channel<CommandRequest,CommandResponse>,
   //println!("will send message for metrics with id {}", id);
 
   let configuration = match cmd {
-      MetricsCmd::Enable => MetricsConfiguration::Enabled(true),
-      MetricsCmd::Disable => MetricsConfiguration::Enabled(false),
+      MetricsCmd::Enable { time } => if time {
+          MetricsConfiguration::EnabledTimeMetrics(true)
+      } else {
+          MetricsConfiguration::Enabled(true)
+      },
+      MetricsCmd::Disable { time } => if time {
+          MetricsConfiguration::EnabledTimeMetrics(false)
+      } else {
+          MetricsConfiguration::Enabled(false)
+      },
       MetricsCmd::Clear => MetricsConfiguration::Clear,
   };
 

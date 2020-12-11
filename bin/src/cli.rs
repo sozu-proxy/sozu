@@ -127,9 +127,15 @@ pub enum SubCmd {
 #[derive(StructOpt, PartialEq, Debug)]
 pub enum MetricsCmd {
   #[structopt(name = "enable", about = "Enables local metrics collection")]
-  Enable,
+  Enable {
+    #[structopt(short, long, help = "Enables time metrics collection")]
+    time: bool,
+  },
   #[structopt(name = "disable", about = "Disables local metrics collection")]
-  Disable,
+  Disable {
+    #[structopt(short, long, help = "Disables time metrics collection")]
+    time: bool,
+  },
   #[structopt(name = "clear", about = "Deletes local metrics data")]
   Clear,
 }
