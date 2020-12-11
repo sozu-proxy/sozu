@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use mio::net::UdpSocket;
 use std::io::{self,Write};
-use sozu_command::proxy::{FilteredData,MetricsData,QueryMetricsType,QueryAnswerMetrics};
+use sozu_command::proxy::{FilteredData,MetricsData,QueryMetricsType,
+  QueryAnswerMetrics,MetricsConfiguration};
 
 mod network_drain;
 mod local_drain;
@@ -190,6 +191,10 @@ impl Aggregator {
 
   pub fn clear_local(&mut self, now: time::OffsetDateTime) {
     self.local.clear(now);
+  }
+
+  pub fn configure(&mut self, config: &MetricsConfiguration) {
+      self.local.configure(config);
   }
 }
 
