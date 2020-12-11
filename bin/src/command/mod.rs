@@ -676,6 +676,9 @@ impl CommandServer {
                     } else {
                         match self.in_flight.remove(&message.id) {
                             None => {
+                                // FIXME: this messsage happens a lot at startup because AddCluster
+                                // messages receive responses from each of the HTTP, HTTPS and TCP
+                                // proxys. The clusters list should be merged
                                 debug!("unknown message id: {}", message.id);
                             },
                             Some((mut tx, mut nb)) => {
