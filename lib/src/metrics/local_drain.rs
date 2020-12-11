@@ -886,17 +886,6 @@ impl LocalDrain {
           format!("{}\t{}", key, cluster_id)
       };
 
-      let count_key_prefix = format!("{}.count ", key_prefix);
-      let mean_key_prefix = format!("{}.mean ", key_prefix);
-      let var_key_prefix = format!("{}.var ", key_prefix);
-      let p50_key_prefix = format!("{}.p50 ", key_prefix);
-      let p90_key_prefix = format!("{}.p90 ", key_prefix);
-      let p99_key_prefix = format!("{}.p99 ", key_prefix);
-      let p99_9_key_prefix = format!("{}.p99.9 ", key_prefix);
-      let p99_99_key_prefix = format!("{}.p99.99 ", key_prefix);
-      let p99_999_key_prefix = format!("{}.p99.999 ", key_prefix);
-      let p100_key_prefix = format!("{}.p100 ", key_prefix);
-
       if !self.metrics.contains_key(&key_prefix) {
           let meta = if backend_id.is_some() {
               MetricMeta::ClusterBackend
@@ -913,16 +902,16 @@ impl LocalDrain {
           &mut self.cluster_tree
       };
 
-      let count_key = format!("{}\t{}", count_key_prefix, timestamp);
-      let mean_key = format!("{}\t{}", mean_key_prefix, timestamp);
-      let var_key = format!("{}\t{}", var_key_prefix, timestamp);
-      let p50_key = format!("{}\t{}", p50_key_prefix, timestamp);
-      let p90_key = format!("{}\t{}", p90_key_prefix, timestamp);
-      let p99_key = format!("{}\t{}", p99_key_prefix, timestamp);
-      let p99_9_key = format!("{}\t{}", p99_9_key_prefix, timestamp);
-      let p99_99_key = format!("{}\t{}", p99_99_key_prefix, timestamp);
-      let p99_999_key = format!("{}\t{}", p99_999_key_prefix, timestamp);
-      let p100_key = format!("{}\t{}", p100_key_prefix, timestamp);
+      let count_key = format!("{}.count \t{}", key_prefix, timestamp);
+      let mean_key = format!("{}.mean \t{}", key_prefix, timestamp);
+      let var_key = format!("{}.var \t{}", key_prefix, timestamp);
+      let p50_key = format!("{}.p50 \t{}", key_prefix, timestamp);
+      let p90_key = format!("{}.p90 \t{}", key_prefix, timestamp);
+      let p99_key = format!("{}.p99 \t{}", key_prefix, timestamp);
+      let p99_9_key = format!("{}.p99.9 \t{}", key_prefix, timestamp);
+      let p99_99_key = format!("{}.p99.99 \t{}", key_prefix, timestamp);
+      let p99_999_key = format!("{}.p99.999 \t{}", key_prefix, timestamp);
+      let p100_key = format!("{}.p100 \t{}", key_prefix, timestamp);
 
       match tree.get(count_key.as_bytes())? {
           None => {
