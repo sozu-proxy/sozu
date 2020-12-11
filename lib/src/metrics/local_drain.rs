@@ -115,6 +115,7 @@ pub struct LocalDrain {
   use_tagged_metrics:  bool,
   origin:              String,
   enabled:             bool,
+  time_enabled:        bool,
 }
 
 impl LocalDrain {
@@ -137,7 +138,8 @@ impl LocalDrain {
       data:        BTreeMap::new(),
       use_tagged_metrics: false,
       origin:      String::from("x"),
-      enabled:     true,
+      enabled: false,
+      time_enabled: false,
     }
   }
 
@@ -153,6 +155,9 @@ impl LocalDrain {
       match config {
           MetricsConfiguration::Enabled(enabled) => {
               self.enabled = *enabled;
+          },
+          MetricsConfiguration::EnabledTimeMetrics(enabled) => {
+              self.time_enabled = *enabled;
           },
           MetricsConfiguration::Clear => {
               self.backend_tree.clear();
@@ -851,6 +856,10 @@ impl LocalDrain {
   }
 
   fn store_time_metric(&mut self, key: &str, cluster_id: &str, backend_id: Option<&str>, t: usize) -> Result<(), sled::Error> {
+      if ! self.time_enabled {
+          return Ok(());
+      }
+
       let now = OffsetDateTime::now_utc();
       //let timestamp = now.unix_timestamp();
       //let _res = self.store_time_metric_at(key, cluster_id, backend_id, timestamp, t)?;
