@@ -1,5 +1,7 @@
 use std::io::{self, Error, ErrorKind, Write};
 use std::os::unix::io::AsRawFd;
+#[cfg(target_env = "musl")]
+use std::mem;
 use std::net::SocketAddr;
 use mio::net::UdpSocket;
 use libc::{msghdr, iovec, c_void, c_uint};
@@ -86,6 +88,7 @@ impl MetricsWriter {
               vec![iov]
             }).collect::<Vec<_>>();
 
+            #[cfg(not(target_env = "musl"))]
             let mut messages = iovs.iter().map(|iov| {
 
               libc::mmsghdr {
@@ -101,6 +104,28 @@ impl MetricsWriter {
                 msg_len: 0,
               }
             }).collect::<Vec<_>>();
+
+            #[cfg(target_env = "musl")]
+            let mut messages = iovs.iter().map(|iov| {
+              let mhdr = {
+                // Musl's msghdr has private padding fields,
+                // so this is the only way to initialize it.
+                let mut mhdr: msghdr = unsafe{mem::uninitialized()};
+                mhdr.msg_name = std::ptr::null_mut();
+                mhdr.msg_namelen = 0;
+                mhdr.msg_iov = iov.as_ptr() as *mut _;
+                mhdr.msg_iovlen = 1;
+                mhdr.msg_control = std::ptr::null_mut();
+                mhdr.msg_controllen = 0;
+                mhdr.msg_flags = 0;
+                mhdr
+              };
+              libc::mmsghdr {
+                msg_hdr: mhdr,
+                msg_len: 0,
+              }
+            }).collect::<Vec<_>>();
+
             //println!("created {} packets", messages.len());
 
             if messages.is_empty() {
