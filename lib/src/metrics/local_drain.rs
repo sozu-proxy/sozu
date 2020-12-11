@@ -1021,6 +1021,10 @@ impl LocalDrain {
   }
 
   pub fn clear(&mut self, now: OffsetDateTime) -> Result<(), sled::Error> {
+      if !self.enabled {
+          return Ok(());
+      }
+
       debug!("will clear old data from the metrics database ({} points)",
         self.cluster_tree.len() + self.backend_tree.len());
 
