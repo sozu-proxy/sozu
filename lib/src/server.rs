@@ -653,18 +653,13 @@ impl Server {
         },
         &Query::Metrics(ref q) => {
             METRICS.with(|metrics| {
-                match (*metrics.borrow_mut()).query(q) {
-                    Ok(res) => push_queue(ProxyResponse {
-                        id:     message.id.clone(),
-                        status: ProxyResponseStatus::Ok,
-                        data:   Some(ProxyResponseData::Query(QueryAnswer::Metrics(res)))
-                    }),
-                    Err(e) =>  push_queue(ProxyResponse {
-                        id:     message.id.clone(),
-                        status: ProxyResponseStatus::Error(e),
-                        data:   None,
-                    }),
-                };
+                let data = (*metrics.borrow_mut()).query(q);
+
+                push_queue(ProxyResponse {
+                    id:     message.id.clone(),
+                    status: ProxyResponseStatus::Ok,
+                    data:   Some(ProxyResponseData::Query(QueryAnswer::Metrics(data)))
+                });
             });
             return
         },
