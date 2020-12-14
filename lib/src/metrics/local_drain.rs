@@ -5,7 +5,6 @@ use sozu_command::proxy::{
     QueryAnswerMetrics, QueryMetricsType,
 };
 use std::collections::BTreeMap;
-use std::convert::TryInto;
 use std::str;
 use std::time::Instant;
 use time::{Duration, OffsetDateTime};
@@ -944,98 +943,93 @@ impl LocalDrain {
                 let old_count = *v;
                 tree.insert(count_key, old_count + 1);
 
-                match tree.get(&mean_key) {
-                    None => {
-                        tree.insert(mean_key, t as u64);
-                    }
-                    Some(mean_v) => {
-                        let old_mean = *mean_v as f64;
-                        let new_mean =
-                            (old_mean * old_count as f64 + t as f64) / (old_count as f64 + 1f64);
+                let mean = if let Some(mean_v) = tree.get_mut(&mean_key) {
+                    let old_mean = *mean_v as f64;
+                    let new_mean =
+                        (old_mean * old_count as f64 + t as f64) / (old_count as f64 + 1f64);
 
-                        tree.insert(mean_key, new_mean.floor() as u64);
+                    *mean_v = new_mean.floor() as u64;
+                    new_mean
+                } else {
+                    return;
+                };
 
-                        match tree.get(&var_key) {
-                            None => {
-                                tree.insert(var_key, 0u64);
-                            }
-                            Some(var_v) => {
-                                let old_var = *var_v as f64;
-                                let deviation = t as f64 - old_mean;
-                                let new_var = (old_var * old_count as f64 + deviation * deviation)
-                                    / (old_count as f64 + 1f64);
-                                tree.insert(var_key, new_var.floor() as u64);
+                let standard_dev = if let Some(var_v) = tree.get_mut(&var_key) {
+                    let old_var = *var_v as f64;
+                    let deviation = t as f64 - mean;
+                    let new_var = (old_var * old_count as f64 + deviation * deviation)
+                        / (old_count as f64 + 1f64);
+                    *var_v = new_var.floor() as u64;
 
-                                let standard_dev = new_var.sqrt();
+                    new_var.sqrt()
+                } else {
+                    return;
+                };
 
-                                if let Some(old_v) = tree.get(&p50_key) {
-                                    let new_percentile = calculate_percentile(
-                                        *old_v as usize,
-                                        t,
-                                        standard_dev,
-                                        0.50f64,
-                                    );
-                                    tree.insert(p50_key, new_percentile as u64);
-                                }
+                if let Some(old_v) = tree.get(&p50_key) {
+                    let new_percentile = calculate_percentile(
+                        *old_v as usize,
+                        t,
+                        standard_dev,
+                        0.50f64,
+                        );
+                    tree.insert(p50_key, new_percentile as u64);
+                }
 
-                                if let Some(old_v) = tree.get(&p90_key) {
-                                    let new_percentile = calculate_percentile(
-                                        *old_v as usize,
-                                        t,
-                                        standard_dev,
-                                        0.90f64,
-                                    );
-                                    tree.insert(p90_key, new_percentile as u64);
-                                }
+                if let Some(old_v) = tree.get(&p90_key) {
+                    let new_percentile = calculate_percentile(
+                        *old_v as usize,
+                        t,
+                        standard_dev,
+                        0.90f64,
+                        );
+                    tree.insert(p90_key, new_percentile as u64);
+                }
 
-                                if let Some(old_v) = tree.get(&p99_key) {
-                                    let new_percentile = calculate_percentile(
-                                        *old_v as usize,
-                                        t,
-                                        standard_dev,
-                                        0.99f64,
-                                    );
-                                    tree.insert(p99_key, new_percentile as u64);
-                                }
+                if let Some(old_v) = tree.get(&p99_key) {
+                    let new_percentile = calculate_percentile(
+                        *old_v as usize,
+                        t,
+                        standard_dev,
+                        0.99f64,
+                        );
+                    tree.insert(p99_key, new_percentile as u64);
+                }
 
-                                if let Some(old_v) = tree.get(&p99_9_key) {
-                                    let new_percentile = calculate_percentile(
-                                        *old_v as usize,
-                                        t,
-                                        standard_dev,
-                                        0.999f64,
-                                    );
-                                    tree.insert(p99_9_key, new_percentile as u64);
-                                }
+                if let Some(old_v) = tree.get(&p99_9_key) {
+                    let new_percentile = calculate_percentile(
+                        *old_v as usize,
+                        t,
+                        standard_dev,
+                        0.999f64,
+                        );
+                    tree.insert(p99_9_key, new_percentile as u64);
+                }
 
-                                if let Some(old_v) = tree.get(&p99_99_key) {
-                                    let new_percentile = calculate_percentile(
-                                        *old_v as usize,
-                                        t,
-                                        standard_dev,
-                                        0.9999f64,
-                                    );
-                                    tree.insert(p99_99_key, new_percentile as u64);
-                                }
+                if let Some(old_v) = tree.get(&p99_99_key) {
+                    let new_percentile = calculate_percentile(
+                        *old_v as usize,
+                        t,
+                        standard_dev,
+                        0.9999f64,
+                        );
+                    tree.insert(p99_99_key, new_percentile as u64);
+                }
 
-                                if let Some(old_v) = tree.get(&p99_999_key) {
-                                    let new_percentile = calculate_percentile(
-                                        *old_v as usize,
-                                        t,
-                                        standard_dev,
-                                        0.99999f64,
-                                    );
-                                    tree.insert(p99_999_key, new_percentile as u64);
-                                }
+                if let Some(old_v) = tree.get(&p99_999_key) {
+                    let new_percentile = calculate_percentile(
+                        *old_v as usize,
+                        t,
+                        standard_dev,
+                        0.99999f64,
+                        );
+                    tree.insert(p99_999_key, new_percentile as u64);
+                }
 
-                                if let Some(old_v) = tree.get(&p100_key) {
-                                    // the 100 percentile is the largest value
-                                    if t as u64 > *old_v {
-                                        tree.insert(p100_key, t as u64);
-                                    }
-                                }
-                            }
-                        }
+                if let Some(old_v) = tree.get(&p100_key) {
+                    // the 100 percentile is the largest value
+                    if t as u64 > *old_v {
+                        tree.insert(p100_key, t as u64);
                     }
                 }
             }
