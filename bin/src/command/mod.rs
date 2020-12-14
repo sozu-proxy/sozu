@@ -350,7 +350,7 @@ impl CommandServer {
         gauge!("configuration.backends", self.backends_count);
         gauge!("configuration.frontends", self.frontends_count);
 
-        Task::spawn(async move {
+        smol::spawn(async move {
             let mut ok = 0usize;
             let mut error = 0usize;
 

@@ -185,7 +185,7 @@ impl Aggregator {
     self.local.dump_process_data()
   }
 
-  pub fn query(&mut self, q: &QueryMetricsType) -> Result<QueryAnswerMetrics, String> {
+  pub fn query(&mut self, q: &QueryMetricsType) -> QueryAnswerMetrics {
     self.local.query(q)
   }
 
