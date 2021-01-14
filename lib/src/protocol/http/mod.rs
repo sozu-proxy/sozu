@@ -84,7 +84,7 @@ pub struct Http<Front:SocketHandler> {
   pub response:       Option<ResponseState>,
   pub req_header_end: Option<usize>,
   pub res_header_end: Option<usize>,
-  pub added_req_header: String,
+  pub added_req_header: Option<AddedRequestHeader>,
   pub added_res_header: String,
   pub keepalive_count: usize,
   pub backend_stop:    Option<SteadyTime>,
@@ -120,14 +120,14 @@ impl<Front:SocketHandler> Http<Front> {
       response:       Some(ResponseState::Initial),
       req_header_end: None,
       res_header_end: None,
-      added_req_header: String::from(""),
+      added_req_header: None,
       added_res_header: String::from(""),
       keepalive_count: 0,
       backend_stop:    None,
       closing:         false,
       pool,
     };
-    session.added_req_header = session.added_request_header(public_address, session_address);
+    session.added_req_header = Some(session.added_request_header(public_address, session_address));
     session.added_res_header = session.added_response_header();
 
     session
@@ -142,7 +142,7 @@ impl<Front:SocketHandler> Http<Front> {
     self.response = Some(ResponseState::Initial);
     self.req_header_end = None;
     self.res_header_end = None;
-    self.added_req_header = self.added_request_header(self.public_address, self.session_address);
+    self.added_req_header = Some(self.added_request_header(self.public_address, self.session_address));
     self.added_res_header = self.added_response_header();
 
     // if HTTP requests are pipelined, we might still have some data in the front buffer
@@ -201,50 +201,14 @@ impl<Front:SocketHandler> Http<Front> {
 
   }
 
-  pub fn added_request_header(&self, public_address: SocketAddr, client_address: Option<SocketAddr>) -> String {
-    let peer = client_address.or_else(|| self.front_socket().peer_addr().ok()).map(|addr| (addr.ip(), addr.port()));
-    let front = (public_address.ip(), public_address.port());
-
-    //FIXME: should update the Connection header directly if present
-    let closing_header = if self.closing {
-      "Connection: close\r\n"
-    } else {
-      ""
-    };
-
-    if let (Some((peer_ip, peer_port)), (front, front_port)) = (peer, front) {
-      let proto = match self.protocol() {
-        Protocol::HTTP  => "http",
-        Protocol::HTTPS => "https",
-        _               => unreachable!()
-      };
-
-      //FIXME: in the "for", we don't put the other values we could get from a preexisting forward header
-      match (peer_ip, peer_port, front) {
-        (IpAddr::V4(_), peer_port, IpAddr::V4(_)) => {
-          format!("Forwarded: proto={};for={}:{};by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
-                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n{}",
-            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id, closing_header)
-        },
-        (IpAddr::V4(_), peer_port, IpAddr::V6(_)) => {
-          format!("Forwarded: proto={};for={}:{};by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
-                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n{}",
-            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id, closing_header)
-        },
-        (IpAddr::V6(_), peer_port, IpAddr::V4(_)) => {
-          format!("Forwarded: proto={};for=\"{}:{}\";by={}\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
-                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n{}",
-            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id, closing_header)
-        },
-        (IpAddr::V6(_), peer_port, IpAddr::V6(_)) => {
-          format!("Forwarded: proto={};for=\"{}:{}\";by=\"{}\"\r\nX-Forwarded-Proto: {}\r\nX-Forwarded-For: {}\r\n\
-                  X-Forwarded-Port: {}\r\nSozu-Id: {}\r\n{}",
-            proto, peer_ip, peer_port, front, proto, peer_ip, front_port, self.request_id, closing_header)
-        },
+  pub fn added_request_header(&self, public_address: SocketAddr, client_address: Option<SocketAddr>) -> AddedRequestHeader {
+      AddedRequestHeader {
+          request_id: self.request_id,
+          closing: self.closing,
+          public_address: self.public_address,
+          peer_address: client_address.or_else(|| self.front_socket().peer_addr().ok()),
+          protocol: self.protocol,
       }
-    } else {
-      format!("Sozu-Id: {}\r\n{}", self.request_id, closing_header)
-    }
   }
 
   pub fn added_response_header(&self) -> String {
@@ -689,7 +653,7 @@ impl<Front:SocketHandler> Http<Front> {
       let (request_state, header_end) = (self.request.take().unwrap(), self.req_header_end.take());
       let (request_state, header_end) = parse_request_until_stop(request_state,
         header_end, &mut self.front_buf.as_mut().unwrap(),
-        &self.added_req_header,
+        self.added_req_header.as_ref(),
         &self.sticky_name);
 
       self.request = Some(request_state);
@@ -745,7 +709,7 @@ impl<Front:SocketHandler> Http<Front> {
           let (request_state, header_end) = (self.request.take().unwrap(), self.req_header_end.take());
           let (request_state, header_end) = parse_request_until_stop(request_state,
             header_end, &mut self.front_buf.as_mut().unwrap(),
-            &self.added_req_header,
+            self.added_req_header.as_ref(),
             &self.sticky_name);
 
           self.request = Some(request_state);
@@ -767,7 +731,7 @@ impl<Front:SocketHandler> Http<Front> {
         let (request_state, header_end) = (self.request.take().unwrap(), self.req_header_end.take());
         let (request_state, header_end) = parse_request_until_stop(request_state,
           header_end, &mut self.front_buf.as_mut().unwrap(),
-          &self.added_req_header,
+          self.added_req_header.as_ref(),
           &self.sticky_name);
 
         self.request = Some(request_state);
@@ -1463,6 +1427,90 @@ impl<'a> std::fmt::Display for OptionalStatus<'a> {
       Some((s1, s2)) => write!(f, "{} {}", s1, s2),
     }
   }
+}
+
+pub struct AddedRequestHeader {
+    pub request_id: Hyphenated,
+    pub public_address: SocketAddr,
+    pub peer_address: Option<SocketAddr>,
+    pub protocol: Protocol,
+    pub closing: bool,
+}
+
+impl AddedRequestHeader {
+    pub fn added_request_header(&self, headers: &parser::ForwardedHeaders) -> String {
+        use std::fmt::Write;
+
+        //FIXME: should update the Connection header directly if present
+        let closing_header = if self.closing {
+            "Connection: close\r\n"
+        } else {
+            ""
+        };
+
+        let front_ip = self.public_address.ip();
+        let front_port = self.public_address.port();
+        let proto = match self.protocol {
+            Protocol::HTTP  => "http",
+            Protocol::HTTPS => "https",
+            _               => unreachable!()
+        };
+
+        let mut s = String::new();
+
+        if !headers.x_proto {
+            write!(&mut s, "X-Forwarded-Proto: {}\r\n", proto);
+        }
+
+        if !headers.x_port {
+            write!(&mut s, "X-Forwarded-Port: {}\r\n", front_port);
+        }
+
+        if let Some(peer_addr) = self.peer_address {
+            let peer_ip = peer_addr.ip();
+            let peer_port = peer_addr.port();
+            match &headers.x_for {
+                None => {
+                    write!(&mut s, "X-Forwarded-For: {}\r\n", peer_ip);
+                },
+                Some(value) => {
+                    write!(&mut s, "X-Forwarded-For: {}, {}\r\n", value, peer_ip);
+                },
+            }
+
+            match &headers.forwarded {
+                None => {
+                    write!(&mut s, "Forwarded: ");
+                },
+                Some(value) => {
+                    write!(&mut s, "Forwarded: {}, ", value);
+                },
+            }
+
+            match (peer_ip, peer_port, front_ip) {
+                (IpAddr::V4(_), peer_port, IpAddr::V4(_)) => {
+                    write!(&mut s, "proto={};for={}:{};by={}\r\n",
+                           proto, peer_ip, peer_port, front_ip)
+                },
+                (IpAddr::V4(_), peer_port, IpAddr::V6(_)) => {
+                    write!(&mut s, "proto={};for={}:{};by=\"{}\"\r\n",
+                           proto, peer_ip, peer_port, front_ip)
+                },
+                (IpAddr::V6(_), peer_port, IpAddr::V4(_)) => {
+                    write!(&mut s, "proto={};for=\"{}:{}\";by={}\r\n",
+                           proto, peer_ip, peer_port, front_ip)
+                },
+                (IpAddr::V6(_), peer_port, IpAddr::V6(_)) => {
+                    write!(&mut s, "proto={};for=\"{}:{}\";by=\"{}\"\r\n",
+                           proto, peer_ip, peer_port, front_ip)
+                },
+            };
+        }
+
+        write!(&mut s, "Sozu-Id: {}\r\n{}", self.request_id, closing_header);
+
+        s
+    }
 }
 
 #[cfg(test)]
