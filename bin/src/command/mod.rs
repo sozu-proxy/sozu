@@ -240,7 +240,7 @@ impl CommandServer {
                 let (worker_tx, worker_rx) = channel(10000);
                 let sender = Some(worker_tx);
 
-                println!("deserializing worker: {:?}", serialized);
+                debug!("deserializing worker: {:?}", serialized);
                 let stream = Async::new(unsafe { UnixStream::from_raw_fd(serialized.fd) }).unwrap();
 
                 let id = serialized.id;
