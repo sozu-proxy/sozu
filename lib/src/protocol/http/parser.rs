@@ -1240,8 +1240,7 @@ pub fn validate_request_header(mut state: RequestState, header: &Header, sticky_
       }
     }
 
-    // FIXME: there should be an error for unsupported encoding
-    HeaderValue::Encoding(_) => state.into_error(),
+    HeaderValue::Encoding(_) => state,
     HeaderValue::Forwarded(value) => {
         //FIXME: it should handle duplicate headers
         state.get_mut_connection().map(|conn| {
@@ -1497,8 +1496,7 @@ pub fn validate_response_header(mut state: ResponseState, header: &Header, is_he
       }
     }
 
-    // FIXME: there should be an error for unsupported encoding
-    HeaderValue::Encoding(_) => state.into_error(),
+    HeaderValue::Encoding(_) => state,
     HeaderValue::Host(_)     => state.into_error(),
     HeaderValue::Forwarded(_)  => state.into_error(),
     HeaderValue::XForwardedFor(_) => state.into_error(),
