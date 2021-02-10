@@ -238,20 +238,22 @@ pub struct Header<'a> {
     pub value: &'a [u8]
 }
 
-named!(pub message_header<Header>,
-do_parse!(
-  name: token >>
-  tag!(":")   >>
-  opt!(take_while!(is_space))    >>
-  value: take_while!(is_header_value_char) >> // ToDo handle folding?
-  crlf >> (
-    Header {
-      name: name,
-      value: value
+pub fn message_header(i: &[u8]) -> IResult<&[u8], Header> {
+    let (i, name) = token(i)?;
+    let (i, _) = terminated!(i, tag!(":"), opt!(take_while!(is_space)))?;
+
+    if compare_no_case(name, &b"Content-Disposition"[..]) {
+        let (i, value) = recognize!(i, content_disposition_header_value)?;
+        let (i, _) = crlf(i)?;
+
+        Ok((i, Header { name, value }))
+    } else {
+        let (i, value) = take_while!(i, is_header_value_char)?;
+        let (i, _) = crlf(i)?;
+
+        Ok((i, Header { name, value }))
     }
-  )
-)
-);
+}
 
 //not a space nor a comma
 //
@@ -287,6 +289,104 @@ pub fn comma_separated_header_values(input:&[u8]) -> Option<Vec<&[u8]>> {
     None
   }
 }
+
+// Content-Disposition header, cf https://tools.ietf.org/html/rfc6266#section-4
+pub fn content_disposition_header_value(i: &[u8]) -> IResult<&[u8], &[u8]> {
+    //println!("header value:{}", String::from_utf8_lossy(i));
+    let (i, _) = alt!(i, tag_no_case!("inline") | tag_no_case!("attachment") | token)?;
+    let (i, o) = recognize!(i, many0!(content_disposition_parm))?;
+
+    Ok((i, o))
+}
+
+pub fn content_disposition_parm(i: &[u8]) -> IResult<&[u8], &[u8]> {
+    let (i, _) = opt!(i, take_while!(is_space))?;
+    let (i, _) = tag!(i, ";")?;
+    let (i, _) = opt!(i, take_while!(is_space))?;
+
+    let (i, o) = recognize!(i, alt!(
+            content_disposition_filename_parm |
+            content_disposition_filename_star_parm |
+            content_disposition_ext_parm1 |
+            content_disposition_ext_parm2
+        ))?;
+
+    Ok((i, o))
+}
+
+pub fn content_disposition_filename_parm(i: &[u8]) -> IResult<&[u8], &[u8]> {
+    let (i, _) = tag_no_case!(i, "filename")?;
+    let (i, _) = opt!(i, take_while!(is_space))?;
+    let (i, _) = tag!(i, "=")?;
+    let (i, _) = opt!(i, take_while!(is_space))?;
+    let (i, o) = content_disposition_value(i)?;
+
+    //println!("recognized filename: {:?}", from_utf8(o));
+    Ok((i, o))
+}
+
+pub fn content_disposition_filename_star_parm(i: &[u8]) -> IResult<&[u8], &[u8]> {
+    let (i, _) = tag_no_case!(i, "filename*")?;
+    let (i, _) = opt!(i, take_while!(is_space))?;
+    let (i, _) = tag!(i, "=")?;
+    let (i, _) = opt!(i, take_while!(is_space))?;
+
+    content_disposition_ext_value(i)
+}
+
+pub fn content_disposition_ext_parm1(i: &[u8]) -> IResult<&[u8], &[u8]> {
+    let (i, _) = token(i)?;
+    let (i, _) = opt!(i, take_while!(is_space))?;
+    let (i, _) = tag!(i, "=")?;
+    let (i, _) = opt!(i, take_while!(is_space))?;
+    content_disposition_value(i)
+}
+
+pub fn content_disposition_ext_parm2(i: &[u8]) -> IResult<&[u8], &[u8]> {
+    let (i, _) = token(i)?;
+    let (i, _) = tag!(i, "*")?;
+    let (i, _) = opt!(i, take_while!(is_space))?;
+    let (i, _) = tag!(i, "=")?;
+    let (i, _) = opt!(i, take_while!(is_space))?;
+    content_disposition_ext_value(i)
+}
+
+pub fn content_disposition_value(i: &[u8]) -> IResult<&[u8], &[u8]> {
+    //println!("will parse:{}", String::from_utf8_lossy(i));
+    let (i, o) = recognize!(i, alt!(
+              // FIXME: escaping
+              delimited!(char!('"'), is_not!("\""), char!('"')) |
+              token
+            ))?;
+
+    //println!("parsed:{}", String::from_utf8_lossy(o));
+    Ok((i, o))
+}
+
+// cf https://tools.ietf.org/html/rfc5987
+// this is not compliant but should be good enough: we don't need the value, we
+// just want to transmit the header
+pub fn content_disposition_ext_value(i: &[u8]) -> IResult<&[u8], &[u8]> {
+    //println!("will parse ext-value:{}", String::from_utf8_lossy(i));
+
+    let (i, o) = recognize!(i,
+        preceded!(
+            alt!(tag_no_case!("UTF-8") | tag_no_case!("ISO-8859-1")),
+            preceded!(
+                delimited!(tag!("'"), is_not!("'"), tag!("'")),
+                take_while!(|c| {
+                    is_alphanumeric(c) ||
+                    "!#$&+-.^_`|~".contains(c as char) ||
+                    //FIXME: percent encoding
+                    // we should also check that the two next chars are hex
+                    c as char== '%'
+                })
+            )
+        ))?;
+
+    Ok((i, o))
+}
+
 
 named!(pub headers< Vec<Header> >, terminated!(many0!(message_header), opt!(crlf)));
 
@@ -3314,6 +3414,38 @@ mod tests {
     assert_eq!(moves3, expected3);
     assert_eq!(moves4, expected4);
   }
+
+  #[test]
+  fn header_content_disposition() {
+    let header1 = b"Content-Disposition: Attachment; filename=example.html\r\n";
+    let header2 = b"Content-Disposition: INLINE; FILENAME= \"an example.html\"\r\n";
+    let header3 = b"Content-Disposition: attachment;  filename*= UTF-8''%e2%82%ac%20rates\r\n";
+    let header4 = b"Content-Disposition: attachment; filename=\"EURO rates\"; filename*=utf-8''%e2%82%ac%20rates\r\n";
+
+    let header5 = b"Content-Disposition: attachment; filename=\"Export _ Main metrics _ December 13, 2020 \x8093 January 11, 2021.csv\"\r\n";
+
+    let res1 = message_header(header1);
+    println!("for\n{}\ngot header: {:?}", from_utf8(header1).unwrap(), res1);
+    res1.unwrap();
+
+    let res2 = message_header(header2);
+    println!("for\n{}\ngot header: {:?}", from_utf8(header2).unwrap(), res2);
+    res2.unwrap();
+
+
+    let res3 = message_header(header3);
+    println!("for\n{}\ngot header: {:?}", from_utf8(header3).unwrap(), res3);
+    res3.unwrap();
+
+    let res4 = message_header(header4);
+    println!("for\n{}\ngot header: {:?}", from_utf8(header4).unwrap(), res4);
+    res4.unwrap();
+
+    let res5 = message_header(header5);
+    println!("for\n{}\ngot header: {:?}", String::from_utf8_lossy(header5), res5);
+    res5.unwrap();
+  }
+
 }
 
 #[cfg(all(feature = "unstable", test))]
