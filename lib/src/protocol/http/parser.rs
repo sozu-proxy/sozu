@@ -242,17 +242,17 @@ pub fn message_header(i: &[u8]) -> IResult<&[u8], Header> {
     let (i, name) = token(i)?;
     let (i, _) = terminated!(i, tag!(":"), opt!(take_while!(is_space)))?;
 
-    if compare_no_case(name, &b"Content-Disposition"[..]) {
+    /*if compare_no_case(name, &b"Content-Disposition"[..]) {
         let (i, value) = recognize!(i, content_disposition_header_value)?;
         let (i, _) = crlf(i)?;
 
         Ok((i, Header { name, value }))
-    } else {
+    } else {*/
         let (i, value) = take_while!(i, is_header_value_char)?;
         let (i, _) = crlf(i)?;
 
         Ok((i, Header { name, value }))
-    }
+    //}
 }
 
 //not a space nor a comma
@@ -3416,6 +3416,7 @@ mod tests {
     assert_eq!(moves4, expected4);
   }
 
+  /*
   #[test]
   fn header_content_disposition() {
     let header1 = b"Content-Disposition: Attachment; filename=example.html\r\n";
@@ -3446,6 +3447,7 @@ mod tests {
     println!("for\n{}\ngot header: {:?}", String::from_utf8_lossy(header5), res5);
     res5.unwrap();
   }
+  */
 
 }
 
