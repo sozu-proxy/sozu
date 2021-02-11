@@ -1612,7 +1612,7 @@ pub fn validate_response_header(mut state: ResponseState, header: &Header, is_he
   }
 }
 
-pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_name: &str) -> (BufferMove, ResponseState) {
+pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_name: &str, app_id: Option<&str>) -> (BufferMove, ResponseState) {
   match state {
     ResponseState::Initial => {
       match status_line(buf) {
@@ -1659,7 +1659,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
               }
             },
             res => {
-              error!("PARSER\tHasResponseLine could not parse header for input:\n{}\n", buf.to_hex(16));
+              error!("PARSER\tHasStatusLine could not parse header for input(app={:?}):\n{}\n", app_id, buf.to_hex(16));
               default_response_result(ResponseState::HasStatusLine(sl, conn), res)
             }
           }
@@ -1687,7 +1687,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
                 }
             },
             res => {
-              error!("PARSER\tHasResponseLine could not parse header for input:\n{}\n", buf.to_hex(16));
+              error!("PARSER\tHasLength could not parse header for input(app={:?}):\n{}\n", app_id, buf.to_hex(16));
               default_response_result(ResponseState::HasLength(sl, conn, length), res)
             }
           }
@@ -1712,7 +1712,7 @@ pub fn parse_response(state: ResponseState, buf: &[u8], is_head: bool, sticky_na
               (BufferMove::Advance(buf.offset(i)), ResponseState::ResponseUpgrade(sl, conn, protocol))
             },
             res => {
-              error!("PARSER\tHasResponseLine could not parse header for input:\n{}\n", buf.to_hex(16));
+              error!("PARSER\tHasUpgrade could not parse header for input(app={:?}):\n{}\n", app_id, buf.to_hex(16));
               default_response_result(ResponseState::HasUpgrade(sl, conn, protocol), res)
             }
           }
@@ -1865,11 +1865,12 @@ pub fn parse_request_until_stop(mut current_state: RequestState, mut header_end:
 
 pub fn parse_response_until_stop(mut current_state: ResponseState, mut header_end: Option<usize>,
     buf: &mut BufferQueue, is_head: bool, added_res_header: &str,
-    sticky_name: &str, sticky_session: Option<&StickySession>)
+    sticky_name: &str, sticky_session: Option<&StickySession>,
+    app_id: Option<&str>)
   -> (ResponseState, Option<usize>) {
   loop {
     //trace!("PARSER\t{}\tpos[{}]: {:?}", request_id, position, current_state);
-    let (mv, new_state) = parse_response(current_state, buf.unparsed_data(), is_head, sticky_name);
+    let (mv, new_state) = parse_response(current_state, buf.unparsed_data(), is_head, sticky_name, app_id);
     //trace!("PARSER\tinput:\n{}\nmv: {:?}, new state: {:?}\n", buf.unparsed_data().to_hex(16), mv, new_state);
     //trace!("PARSER\t{}\tmv: {:?}, new state: {:?}\n", request_id, mv, new_state);
     current_state = new_state;
@@ -2825,7 +2826,7 @@ mod tests {
       buf.write(&input[..78]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_response_until_stop(initial, None, &mut buf, false, "", "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(initial, None, &mut buf, false, "", "SOZUBALANCEID", None, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 81);
       assert_eq!(
@@ -2844,7 +2845,7 @@ mod tests {
       buf.write(&input[81..100]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
 
-      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 110);
       assert_eq!(
@@ -2863,7 +2864,7 @@ mod tests {
       println!("remaining:\n{}", &input[110..].to_hex(16));
       buf.write(&input[110..116]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 115);
       assert_eq!(
@@ -2881,7 +2882,7 @@ mod tests {
       //buf.consume(5);
       buf.write(&input[116..]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 117);
       assert_eq!(
@@ -2924,7 +2925,7 @@ mod tests {
       buf.write(&input[..74]).unwrap();
       buf.consume_parsed_data(72);
       //println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(initial, None, &mut buf, false, "", "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(initial, None, &mut buf, false, "", "SOZUBALANCEID", None, None);
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("initial input:\n{}", &input[..72].to_hex(8));
@@ -2946,7 +2947,7 @@ mod tests {
       // we got the chunk header, but not the chunk content
       buf.write(&input[74..77]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None, None);
       println!("result: {:?}", result);
       assert_eq!(buf.start_parsing_position, 81);
       assert_eq!(
@@ -2967,7 +2968,7 @@ mod tests {
       // the external code copied the chunk content directly, starting at next chunk end
       buf.write(&input[81..115]).unwrap();
       println!("parsing\n{}", buf.buffer.data().to_hex(16));
-      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 115);
       assert_eq!(
@@ -2983,7 +2984,7 @@ mod tests {
       );
       buf.write(&input[115..]).unwrap();
       println!("parsing\n{}", &input[115..].to_hex(16));
-      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(result.0, result.1, &mut buf, false, "", "SOZUBALANCEID", None, None);
       println!("result({}): {:?}", line!(), result);
       assert_eq!(buf.start_parsing_position, 117);
       assert_eq!(
@@ -3013,7 +3014,7 @@ mod tests {
     buf.write(&input[..]).unwrap();
 
     let new_header = b"Sozu-Id: 123456789\r\n";
-    let result = parse_response_until_stop(initial, None, &mut buf, false, "Sozu-Id: 123456789\r\n", "SOZUBALANCEID", None);
+    let result = parse_response_until_stop(initial, None, &mut buf, false, "Sozu-Id: 123456789\r\n", "SOZUBALANCEID", None, None);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
@@ -3055,7 +3056,7 @@ mod tests {
     buf.write(&input[..]).unwrap();
 
     let new_header = b"Sozu-Id: 123456789\r\n";
-    let result = parse_response_until_stop(initial, None, &mut buf, false, "Sozu-Id: 123456789\r\n", "SOZUBALANCEID", None);
+    let result = parse_response_until_stop(initial, None, &mut buf, false, "Sozu-Id: 123456789\r\n", "SOZUBALANCEID", None, None);
     println!("result: {:?}", result);
     println!("buf:\n{}", buf.buffer.data().to_hex(16));
     println!("input length: {}", input.len());
@@ -3093,7 +3094,7 @@ mod tests {
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
-      let result = parse_response_until_stop(initial, None, &mut buf, is_head, "", "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(initial, None, &mut buf, is_head, "", "SOZUBALANCEID", None, None);
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);
@@ -3172,7 +3173,7 @@ mod tests {
       println!("buffer input: {:?}", buf.input_queue);
 
       //let result = parse_request(initial, input);
-      let result = parse_response_until_stop(initial, None, &mut buf, is_head, "", "SOZUBALANCEID", None);
+      let result = parse_response_until_stop(initial, None, &mut buf, is_head, "", "SOZUBALANCEID", None, None);
       println!("result: {:?}", result);
       println!("input length: {}", input.len());
       println!("buffer input: {:?}", buf.input_queue);

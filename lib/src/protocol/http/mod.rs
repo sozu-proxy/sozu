@@ -1210,7 +1210,7 @@ impl<Front:SocketHandler> Http<Front> {
             let (response_state, header_end) = parse_response_until_stop(
               response_state, header_end, &mut self.back_buf.as_mut().unwrap(),
               is_head, &self.added_res_header,
-              &self.sticky_name, sticky_session);
+              &self.sticky_name, sticky_session, self.app_id.as_deref());
 
 
             self.response = Some(response_state);
@@ -1276,7 +1276,7 @@ impl<Front:SocketHandler> Http<Front> {
           let (response_state2, header_end2) = parse_response_until_stop(
             response_state, header_end, &mut self.back_buf.as_mut().unwrap(),
             is_head, &self.added_res_header,
-            &self.sticky_name, sticky_session);
+            &self.sticky_name, sticky_session, self.app_id.as_deref());
 
           self.response = Some(response_state2);
           self.res_header_end = header_end2;
