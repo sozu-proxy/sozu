@@ -81,7 +81,7 @@ fn main() {
 
       config
     })
-    .and_then(|config| check_process_limits(&config).map(|()| config))
+    .and_then(|config| update_process_limits(&config).map(|()| config))
     .and_then(|config| init_workers(&config).map(|workers| (config, workers)))
     .map(|(config, workers)| {
       if config.handle_process_affinity {
@@ -201,54 +201,63 @@ fn set_process_affinity(pid: pid_t, cpu: usize) {
 #[cfg(target_os="linux")]
 // We check the hard_limit. The soft_limit can be changed at runtime
 // by the process or any user. hard_limit can only be changed by root
-fn check_process_limits(config: &Config) -> Result<(), StartupError> {
-  let process_limits_file = sozu_command::config::Config::load_file("/proc/self/limits")
-    .expect("Couldn't read /proc/self/limits to determine max open file descriptors limit");
+fn update_process_limits(config: &Config) -> Result<(), StartupError> {
+  let wanted_opened_files = (config.max_connections as u64) * 2;
 
-  let re = Regex::new(r"Max open files\s*(\d*)\s*(\d*)\s*files").unwrap();
-  let res = re.captures(&process_limits_file);
-
-  if let Some(soft_limit) = res.as_ref().and_then(|c| c.get(1))
-    .and_then(|m| m.as_str().parse::<usize>().ok()) {
-    if config.max_connections * 2 > soft_limit {
-      let error = format!("at least one worker can't have that many connections. \
-              current max file descriptor soft limit is: {}, \
-              configured max_connections is {} (the worker needs two file descriptors \
-              per client connection)", soft_limit, config.max_connections);
-      return Err(StartupError::TooManyAllowedConnectionsForWorker(error));
-    }
-  }
-  if let Some(hard_limit) = res.as_ref().and_then(|c| c.get(2))
-    .and_then(|m| m.as_str().parse::<usize>().ok()) {
-    if config.max_connections * 2 > hard_limit {
-      let error = format!("at least one worker can't have that many connections. \
-              current max file descriptor hard limit is: {}, \
-              configured max_connections is {} (the worker needs two file descriptors \
-              per client connection)", hard_limit, config.max_connections);
-      return Err(StartupError::TooManyAllowedConnectionsForWorker(error));
-    }
-  }
-
+  // Ensure we don't exceed the system maximum capacity
   let f = sozu_command::config::Config::load_file("/proc/sys/fs/file-max")
     .expect("Couldn't read /proc/sys/fs/file-max");
-
   let re_max = Regex::new(r"(\d*)").unwrap();
-
   let system_max_fd = re_max.captures(&f).and_then(|c| c.get(1))
     .and_then(|m| m.as_str().parse::<usize>().ok())
     .expect("Couldn't parse /proc/sys/fs/file-max");
-
   if config.max_connections > system_max_fd {
     let error = format!("Proxies total max_connections can't be higher than system's file-max limit. \
             Current limit: {}, current value: {}", system_max_fd, config.max_connections);
     return Err(StartupError::TooManyAllowedConnections(error))
   }
 
+  // Get the soft and hard limits for the current process
+  let mut limits = libc::rlimit {
+    rlim_cur: 0,
+    rlim_max: 0,
+  };
+  unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) };
+
+  // Ensure we don't exceed the hard limit
+  if limits.rlim_max < wanted_opened_files {
+      let error = format!("at least one worker can't have that many connections. \
+              current max file descriptor hard limit is: {}, \
+              configured max_connections is {} (the worker needs two file descriptors \
+              per client connection)", limits.rlim_max, config.max_connections);
+      return Err(StartupError::TooManyAllowedConnectionsForWorker(error));
+  }
+
+  if limits.rlim_cur < wanted_opened_files && limits.rlim_cur != limits.rlim_max {
+    // Try to get twice what we need to be safe, or rlim_max if we exceed that
+    limits.rlim_cur = limits.rlim_max.min(wanted_opened_files * 2);
+    unsafe {
+      libc::setrlimit(libc::RLIMIT_NOFILE, &limits);
+
+      // Refresh the data we have
+      libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits);
+    }
+  }
+
+  // Ensure we don't exceed the new soft limit
+  if limits.rlim_cur < wanted_opened_files {
+      let error = format!("at least one worker can't have that many connections. \
+              current max file descriptor soft limit is: {}, \
+              configured max_connections is {} (the worker needs two file descriptors \
+              per client connection)", limits.rlim_cur, config.max_connections);
+      return Err(StartupError::TooManyAllowedConnectionsForWorker(error));
+  }
+
   Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn check_process_limits(_: &Config) -> Result<(), StartupError> {
+fn update_process_limits(_: &Config) -> Result<(), StartupError> {
   Ok(())
 }
 
