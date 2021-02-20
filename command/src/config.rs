@@ -1072,17 +1072,11 @@ impl Config {
   }
 
   pub fn load_file(path: &str) -> io::Result<String> {
-    let mut f = File::open(path)?;
-    let mut data = String::new();
-    f.read_to_string(&mut data)?;
-    Ok(data)
+    std::fs::read_to_string(path)
   }
 
   pub fn load_file_bytes(path: &str) -> io::Result<Vec<u8>> {
-    let mut f = File::open(path)?;
-    let mut data = Vec::new();
-    f.read_to_end(&mut data)?;
-    Ok(data)
+    std::fs::read(path)
   }
 }
 
