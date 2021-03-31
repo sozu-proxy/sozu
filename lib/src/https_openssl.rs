@@ -709,16 +709,21 @@ impl ProxySession for Session {
         };
       }
 
-      if front_interest.is_error() || back_interest.is_error() {
-        if front_interest.is_error() {
+      if front_interest.is_error() {
           error!("PROXY session {:?} front error, disconnecting", self.frontend_token);
-        } else {
-          error!("PROXY session {:?} back error, disconnecting", self.frontend_token);
-        }
 
-        self.front_readiness().interest = UnixReady::from(Ready::empty());
-        self.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::empty()));
-        return SessionResult::CloseSession;
+          self.front_readiness().interest = UnixReady::from(Ready::empty());
+          self.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::empty()));
+              return SessionResult::CloseSession;
+      }
+
+      if back_interest.is_error() {
+          if self.back_hup() == SessionResult::CloseSession {
+              self.front_readiness().interest = UnixReady::from(Ready::empty());
+              self.back_readiness().map(|r| r.interest  = UnixReady::from(Ready::empty()));
+              error!("PROXY session {:?} back error, disconnecting", self.frontend_token);
+              return SessionResult::CloseSession;
+          }
       }
 
       counter += 1;
