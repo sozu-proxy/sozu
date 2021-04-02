@@ -552,6 +552,9 @@ impl ProxySession for Session {
         self.metrics().backend_connected();
         self.reset_connection_attempt();
         self.set_back_connected(BackendConnectionStatus::Connected);
+        // we might get an early response from the backend, so we want to look
+        // at readable events
+        self.back_readiness().map(|r| r.interest.insert(Ready::readable()));
       }
     }
 

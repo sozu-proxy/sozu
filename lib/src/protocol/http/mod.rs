@@ -1028,9 +1028,20 @@ impl<Front:SocketHandler> Http<Front> {
       debug!("{}\tBACK [{}->{}]: wrote {} bytes of {}", self.log_context(), front.0, back.0, sz, output_size);
     }
     match socket_res {
+      // the back socket is not writable anymore, so we can drop
+      // the front buffer, no more data can be transmitted.
+      // But the socket might still be readable, or if it is
+      // closed, we might still have some data in the buffer.
+      // As an example, we can get an early response for a large
+      // POST request to refuse it and prevent all of the data
+      // from being transmitted, awith the backend server closing
+      // the socket right after sending the response
       SocketResult::Error | SocketResult::Closed => {
-        self.log_request_error(metrics, "back socket write error, closing connection");
-        return SessionResult::CloseSession;
+        self.front_buf = None;
+        self.front_readiness.interest.remove(Ready::readable());
+        self.back_readiness.interest.insert(Ready::readable());
+        self.back_readiness.interest.remove(Ready::writable());
+        return SessionResult::Continue;
       },
       SocketResult::WouldBlock => {
         self.back_readiness.event.remove(Ready::writable());
