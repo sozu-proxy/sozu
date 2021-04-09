@@ -18,7 +18,7 @@ use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod, SslAlert,
                    Ssl, SslOptions, SslRef, SslStream, SniError, NameType, SslSessionCacheMode};
 use openssl::x509::X509;
 use openssl::dh::Dh;
-use openssl::pkey::PKey;
+use openssl::pkey::{PKey, Private};
 use openssl::hash::MessageDigest;
 use openssl::nid;
 use openssl::error::ErrorStack;
@@ -894,6 +894,24 @@ impl Listener {
 
   pub fn create_default_context(config: &HttpsListener, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
     ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>) -> Option<(SslContext, SslOptions)> {
+      let mut cert_read = &include_bytes!("../assets/certificate.pem")[..];
+    let mut key_read  = &include_bytes!("../assets/key.pem")[..];
+
+    if let (Ok(cert), Ok(key)) = (X509::from_pem(&mut cert_read), PKey::private_key_from_pem(&mut key_read)) {
+      Self::create_context(
+        &config.versions, &config.cipher_list,
+        &cert, &key, &[],
+        ref_ctx, ref_domains
+      )
+    } else {
+      None
+    }
+  }
+
+  pub fn create_context(tls_versions: &[TlsVersion], cipher_list: &str,
+    cert: &X509, key: &PKey<Private>, cert_chain: &[X509],
+    ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
+    ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>) -> Option<(SslContext, SslOptions)> {
     let ctx = SslContext::builder(SslMethod::tls());
     if let Err(e) = ctx {
       error!("error building SSL context: {:?}", e);
@@ -915,7 +933,7 @@ impl Listener {
       //FIXME: the value will not be available if openssl-sys does not find an OpenSSL v1.1
       /*| ssl::SslOptions::NO_TLSV1_3*/;
 
-    for version in config.versions.iter() {
+    for version in tls_versions.iter() {
       match version {
         TlsVersion::SSLv2   => versions.remove(ssl::SslOptions::NO_SSLV2),
         TlsVersion::SSLv3   => versions.remove(ssl::SslOptions::NO_SSLV3),
@@ -942,19 +960,20 @@ impl Listener {
       error!("could not setup DH for openssl: {:?}", e);
     }
 
-    if let Err(e) = context.set_cipher_list(&config.cipher_list) {
+    if let Err(e) = context.set_cipher_list(cipher_list) {
       error!("could not set context cipher list: {:?}", e);
     }
 
-    let mut cert_read = &include_bytes!("../assets/certificate.pem")[..];
-    let mut key_read  = &include_bytes!("../assets/key.pem")[..];
+    if let Err(e) = context.set_certificate(&cert) {
+      error!("error adding certificate to context: {:?}", e);
+    }
+    if let Err(e) = context.set_private_key(&key) {
+      error!("error adding private key to context: {:?}", e);
+    }
 
-    if let (Ok(cert), Ok(key)) = (X509::from_pem(&mut cert_read), PKey::private_key_from_pem(&mut key_read)) {
-      if let Err(e) = context.set_certificate(&cert) {
-        error!("error adding certificate to context: {:?}", e);
-      }
-      if let Err(e) = context.set_private_key(&key) {
-        error!("error adding private key to context: {:?}", e);
+    for cert in cert_chain {
+      if let Err(e) = context.add_extra_chain_cert(cert.clone()) {
+        error!("error adding chain certificate to context: {:?}", e);
       }
     }
 
@@ -1048,24 +1067,6 @@ impl Listener {
 
   pub fn add_certificate(&mut self, certificate_and_key: CertificateAndKey) -> bool {
     //FIXME: insert some error management with a Result here
-    let c = SslContext::builder(SslMethod::tls());
-    if c.is_err() { return false; }
-    let mut ctx = c.expect("should have built a correct SSL context");
-    ctx.set_options(self.ssl_options);
-    ctx.set_session_cache_size(1);
-    ctx.set_session_cache_mode(SslSessionCacheMode::OFF);
-
-    if let Err(e) = setup_curves(&mut ctx) {
-      error!("could not setup curves for openssl: {:?}", e);
-    }
-
-    if let Err(e) = setup_dh(&mut ctx) {
-      error!("could not setup DH for openssl: {:?}", e);
-    }
-
-    if let Err(e) = ctx.set_cipher_list(&self.config.cipher_list) {
-      error!("cannot set context cipher list: {:?}", e);
-    }
 
     let mut cert_read  = &certificate_and_key.certificate.as_bytes()[..];
     let mut key_read   = &certificate_and_key.key.as_bytes()[..];
@@ -1081,25 +1082,21 @@ impl Listener {
       let names = get_cert_names(&cert);
       debug!("got certificate names: {:?}", names);
 
-      if let Err(e) = ctx.set_certificate(&cert) {
-        error!("error adding certificate to context: {:?}", e);
-      }
-      if let Err(e) = ctx.set_private_key(&key) {
-        error!("error adding private key to context: {:?}", e);
-      }
-
-      for cert in cert_chain {
-        if let Err(e) = ctx.add_extra_chain_cert(cert) {
-          error!("error adding chain certificate to context: {:?}", e);
-        }
-      }
-
       let ref_ctx = self.contexts.clone();
       let ref_domains = self.domains.clone();
-      ctx.set_servername_callback(Self::create_servername_callback(ref_ctx, ref_domains));
+      let ctx_opt = Self::create_context(
+        &self.config.versions, &self.config.cipher_list,
+        &cert, &key, &cert_chain,
+        ref_ctx, ref_domains);
+
+      if ctx_opt.is_none() {
+        return false;
+      }
+
+      let (context, _) = ctx_opt.unwrap();
 
       let tls_data = TlsData {
-        context:     ctx.build(),
+        context,
         certificate: cert_read.to_vec(),
       };
 
