@@ -958,7 +958,15 @@ impl Listener {
       }
     }
 
-    context.set_servername_callback(move |ssl: &mut SslRef, alert: &mut SslAlert| {
+    context.set_servername_callback(Self::create_servername_callback(ref_ctx, ref_domains));
+
+    Some((context.build(), ssl_options))
+  }
+
+  fn create_servername_callback(ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
+    ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>)
+    -> impl Fn(&mut SslRef, &mut SslAlert) -> Result<(), SniError> + 'static + Sync + Send {
+    move |ssl: &mut SslRef, alert: &mut SslAlert| {
       let contexts = unwrap_msg!(ref_ctx.lock());
       let domains  = unwrap_msg!(ref_domains.lock());
 
@@ -991,9 +999,7 @@ impl Listener {
       incr!("openssl.sni.error");
       *alert = SslAlert::UNRECOGNIZED_NAME;
       return Err(SniError::ALERT_FATAL);
-    });
-
-    Some((context.build(), ssl_options))
+    }
   }
 
   pub fn add_https_front(&mut self, tls_front: HttpFront) -> bool {
@@ -1090,40 +1096,7 @@ impl Listener {
 
       let ref_ctx = self.contexts.clone();
       let ref_domains = self.domains.clone();
-      ctx.set_servername_callback(move |ssl: &mut SslRef, alert: &mut SslAlert| {
-        let contexts = unwrap_msg!(ref_ctx.lock());
-        let domains  = unwrap_msg!(ref_domains.lock());
-
-        trace!("ref: {:?}", ssl);
-        if let Some(servername) = ssl.servername(NameType::HOST_NAME).map(|s| s.to_string()) {
-          debug!("looking for fingerprint for {:?}", servername);
-          if let Some(kv) = domains.domain_lookup(servername.as_bytes(), true) {
-            debug!("looking for context for {:?} with fingerprint {:?}", servername, kv.1);
-            if let Some(ref tls_data) = contexts.get(&kv.1) {
-              debug!("found context for {:?}", servername);
-
-              let context: &SslContext = &tls_data.context;
-              if let Ok(()) = ssl.set_ssl_context(context) {
-                debug!("servername is now {:?}", ssl.servername(NameType::HOST_NAME));
-
-                return Ok(());
-              } else {
-                error!("could not set context for {:?}", servername);
-              }
-            } else {
-              error!("no context found for {:?}", servername);
-            }
-          } else {
-            //error!("unrecognized server name: {}", servername);
-          }
-        } else {
-          //error!("no server name information found");
-        }
-
-        incr!("openssl.sni.error");
-        *alert = SslAlert::UNRECOGNIZED_NAME;
-        return Err(SniError::ALERT_FATAL);
-      });
+      ctx.set_servername_callback(Self::create_servername_callback(ref_ctx, ref_domains));
 
       let tls_data = TlsData {
         context:     ctx.build(),
