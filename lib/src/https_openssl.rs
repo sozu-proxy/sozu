@@ -977,7 +977,8 @@ impl Listener {
       }
     }
 
-    context.set_servername_callback(Self::create_servername_callback(ref_ctx, ref_domains));
+    //context.set_servername_callback(Self::create_servername_callback(ref_ctx.clone(), ref_domains.clone()));
+    context.set_client_hello_callback(Self::create_client_hello_callback(ref_ctx.clone(), ref_domains.clone()));
 
     Some((context.build(), ssl_options))
   }
@@ -1020,6 +1021,63 @@ impl Listener {
       return Err(SniError::ALERT_FATAL);
     }
   }
+
+  fn create_client_hello_callback(ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
+    ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>)
+-> impl Fn(&mut SslRef, &mut SslAlert)
+        -> Result<ssl::ClientHelloResponse, ErrorStack> + 'static + Sync + Send {
+    move |ssl: &mut SslRef, alert: &mut SslAlert| {
+      use nom::HexDisplay;
+      let contexts = unwrap_msg!(ref_ctx.lock());
+      let domains  = unwrap_msg!(ref_domains.lock());
+
+      debug!("client hello callback: TLS version = {:?}", ssl.version_str());
+
+      let server_name_opt = get_server_name(ssl).and_then(parse_sni_name_list);
+      // no SNI extension, use the default context
+      if server_name_opt.is_none() {
+        *alert = SslAlert::UNRECOGNIZED_NAME;
+        return Ok(ssl::ClientHelloResponse::SUCCESS);
+      }
+
+      let mut sni_names = server_name_opt.unwrap();
+
+      while !sni_names.is_empty() {
+          debug!("name list:\n{}", sni_names.to_hex(16));
+          match parse_sni_name(sni_names) {
+              None => break,
+              Some((i, servername)) => {
+                  debug!("parsed name:\n{}", servername.to_hex(16));
+                  sni_names = i;
+
+                  if let Some(kv) = domains.domain_lookup(servername, true) {
+                      debug!("looking for context for {:?} with fingerprint {:?}", servername, kv.1);
+                      if let Some(ref tls_data) = contexts.get(&kv.1) {
+                          debug!("found context for {:?}", servername);
+
+                          let context: &SslContext = &tls_data.context;
+                          if let Ok(()) = ssl.set_ssl_context(context) {
+                              ssl_set_options(ssl, context);
+
+                              return Ok(ssl::ClientHelloResponse::SUCCESS);
+                          } else {
+                              error!("could not set context for {:?}", servername);
+                          }
+                      } else {
+                          error!("no context found for {:?}", servername);
+                      }
+                  } else {
+                      error!("unrecognized server name: {:?}", std::str::from_utf8(servername));
+                  }
+              }
+          }
+      }
+
+      *alert = SslAlert::UNRECOGNIZED_NAME;
+      return Ok::<ssl::ClientHelloResponse, ErrorStack>(ssl::ClientHelloResponse::SUCCESS);
+    }
+  }
+
 
   pub fn add_https_front(&mut self, tls_front: HttpFront) -> bool {
     //FIXME: should clone he hostname then do a into() here
@@ -1950,4 +2008,74 @@ fn version_str(version: SslVersion) -> &'static str {
     _ => "tls.version.TLSv1_3",
     //_ => "tls.version.Unknown",
   }
+}
+
+extern "C" {
+    pub fn SSL_set_options(ssl: *mut openssl_sys::SSL, op: libc::c_ulong) -> libc::c_ulong;
+}
+
+fn get_server_name<'a, 'b>(ssl: &'a mut SslRef) -> Option<&'b[u8]> {
+    unsafe {
+        use foreign_types_shared::ForeignTypeRef;
+
+        let mut out: *const libc::c_uchar = std::ptr::null();
+        let mut outlen: libc::size_t = 0;
+
+        let res = openssl_sys::SSL_client_hello_get0_ext(
+            ssl.as_ptr(),
+            0, // TLSEXT_TYPE_server_name = 0
+            &mut out as *mut _,
+            &mut outlen as *mut _
+            );
+
+        if res == 0 {
+            return None;
+        }
+
+        let sl = std::slice::from_raw_parts(out, outlen);
+
+        Some(sl)
+    }
+}
+
+fn ssl_set_options(ssl: &mut SslRef, context: &SslContext) {
+    unsafe {
+        use foreign_types_shared::{ForeignType, ForeignTypeRef};
+        let options = openssl_sys::SSL_CTX_get_options(context.as_ptr());
+        SSL_set_options(ssl.as_ptr(), options);
+    }
+}
+
+fn parse_sni_name_list(i: &[u8]) -> Option<&[u8]> {
+    use nom::HexDisplay;
+    use nom::{length_data, be_u16};
+
+    if i.is_empty() {
+        return None;
+    }
+
+    match length_data!(i, be_u16).ok() {
+        None => None,
+        Some((i, o)) => {
+            if !i.is_empty() {
+                None
+            } else {
+                Some(o)
+            }
+        }
+    }
+}
+
+fn parse_sni_name(i: &[u8]) -> Option<(&[u8], &[u8])> {
+    use nom::{be_u8, be_u16,length_data};
+
+    if i.is_empty() {
+        return None;
+    }
+
+
+    preceded!(i,
+        tag!([0x00]), // SNIType for hostname is 0
+        length_data!(be_u16)
+    ).ok()
 }

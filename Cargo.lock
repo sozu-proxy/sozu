@@ -1337,6 +1337,7 @@ dependencies = [
 name = "sozu-lib"
 version = "0.11.59"
 dependencies = [
+ "foreign-types-shared",
  "hdrhistogram",
  "idna 0.2.2",
  "iovec",
