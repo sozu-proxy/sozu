@@ -261,6 +261,7 @@ pub struct CertificateAndKey {
     pub certificate:       String,
     pub certificate_chain: Vec<String>,
     pub key:               String,
+    pub versions:          Vec<TlsVersion>,
 }
 
 #[derive(Debug,Clone,PartialEq,Eq,Hash, Serialize, Deserialize)]

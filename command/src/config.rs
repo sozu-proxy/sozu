@@ -243,6 +243,8 @@ pub struct FileAppFrontendConfig {
   pub certificate:       Option<String>,
   pub key:               Option<String>,
   pub certificate_chain: Option<String>,
+  #[serde(default)]
+  pub tls_versions:      Vec<TlsVersion>,
 }
 
 impl FileAppFrontendConfig {
@@ -294,6 +296,7 @@ impl FileAppFrontendConfig {
       certificate:       certificate_opt,
       key:               key_opt,
       certificate_chain: chain_opt,
+      tls_versions:      self.tls_versions.clone(),
     })
   }
 }
@@ -464,6 +467,8 @@ pub struct HttpFrontendConfig {
   pub certificate:       Option<String>,
   pub key:               Option<String>,
   pub certificate_chain: Option<Vec<String>>,
+  #[serde(default)]
+  pub tls_versions:      Vec<TlsVersion>,
 }
 
 impl HttpFrontendConfig {
@@ -478,6 +483,7 @@ impl HttpFrontendConfig {
           key:               self.key.clone().unwrap(),
           certificate:       self.certificate.clone().unwrap(),
           certificate_chain: self.certificate_chain.clone().unwrap_or_default(),
+          versions:          self.tls_versions.clone(),
         },
         names: vec!(self.hostname.clone()),
       }));

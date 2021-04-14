@@ -1140,10 +1140,16 @@ impl Listener {
       let names = get_cert_names(&cert);
       debug!("got certificate names: {:?}", names);
 
+      let versions = if !certificate_and_key.versions.is_empty() {
+        &certificate_and_key.versions
+      } else {
+        &self.config.versions
+      };
+
       let ref_ctx = self.contexts.clone();
       let ref_domains = self.domains.clone();
       let ctx_opt = Self::create_context(
-        &self.config.versions, &self.config.cipher_list,
+        versions, &self.config.cipher_list,
         &cert, &key, &cert_chain,
         ref_ctx, ref_domains);
 
