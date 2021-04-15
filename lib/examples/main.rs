@@ -97,7 +97,8 @@ fn main() {
   let certificate_and_key = proxy::CertificateAndKey {
     certificate:       String::from(cert1),
     key:               String::from(key1),
-    certificate_chain: vec!()
+    certificate_chain: vec![],
+    versions:          vec![],
   };
   command2.write_message(&proxy::ProxyRequest {
     id:    String::from("ID_IJKL1"),
@@ -139,7 +140,8 @@ fn main() {
   let certificate_and_key2 = proxy::CertificateAndKey {
     certificate: String::from(cert2),
     key: String::from(key2),
-    certificate_chain: vec!()
+    certificate_chain: vec![],
+    versions:          vec![],
   };
 
   command2.write_message(&proxy::ProxyRequest {
