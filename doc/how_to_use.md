@@ -1,6 +1,6 @@
 # How to use Sōzu
 
-> Before a deep dive in the configuration part of the proxy, you should take a look at the [getting started documentation](./getting_started.md) if you haven't done it yet.
+> If you didn't take a look at the [configure documentation](./configure.md), we advise you to do so because you will need to know what to put in your configuration file.
 
 ## Run it
 
@@ -14,7 +14,35 @@ However, if you built the project from source, `sozu` and `sozuctl` are placed i
 
 > `cargo build --release` puts the resulting binary in `target/release` instead of `target/debug`.
 
-You can find a working `config.toml` exemple [here][cfg]. For a proper install, you can move it to your `/etc/sozu/config.toml`.
+You can find a working `config.toml` exemple [here][cfg].
+
+To start the reverse proxy:
+
+```bash
+sozu start -c config.toml
+```
+
+You can edit the reverse proxy's configuration with the `config.toml` file. You can declare
+new applications, their frontends and backends through that file, but for more flexibility,
+you should use the command socket (you can find one end of that unix socket at the path
+designed by `command_socket` in the configuration file).
+
+`sozuctl` has a few commands you can use to interact with the reverse proxy:
+
+- soft shutdown (wait for active connections to stop): `sozuctl -c config.toml shutdown`
+- hard shutdown: `sozuctl -c config.toml shutdown --hard`
+- display the list of current configuration messages: `sozuctl -c config.toml state dump`
+- save the configuration state to a file: `sozuctl -c config.toml state save -f state.json`
+
+Checkout sozuctl [documentation](../ctl/README.md) for more informations.
+
+## Logging
+
+The reverse proxy uses `env_logger`. You can select which module displays logs at which level with an environment variable. Here is an example to display most logs at `info` level, but use `trace` level for the HTTP parser module:
+
+```bash
+RUST_LOG=info,sozu_lib::parser::http11=trace ./target/debug/sozu
+```
 
 ## Run it with Docker
 
@@ -62,8 +90,8 @@ Sozu can use a JSON file to load an initial configuration state for its routing.
 
 To change the path of the saved state file, modify the `saved_state` option in the configuration file (default value is `/var/lib/sozu/state.json`).
 
-[cfg]: https://github.com/sozu-proxy/sozu/blob/master/bin/config.toml
-[df]: https://github.com/sozu-proxy/sozu/blob/master/Dockerfile
+[cfg]: ../bin/config.toml
+[df]: ../Dockerfile
 
 ## Systemd integration
 
@@ -75,8 +103,18 @@ This will make systemd take notice of it, and now you can start the service with
 
 Furthermore, we can enable it, so that it is activated by default on future boots with `systemctl enable sozu.service`.
 
-> You can use a `bash` script and call `sed` to automte this part. e.g.: [generate.sh][gen]
-> You have to set your own `__BINDIR__` and `__SYSCONFDIR__`.
+You can use a `bash` script and call `sed` to automate this part. e.g.: [generate.sh][gen].
 
-[un]: https://github.com/sozu-proxy/sozu/blob/master/os-build/systemd/sozu.service.in
-[gen]: https://github.com/sozu-proxy/sozu/blob/master/os-build/exherbo/generate.sh
+This script will generate `sozu.service`, `sozu.conf` and `config.toml` files into a `generated` folder at the root `os-build` directory.
+
+You willd have to set your own `__BINDIR__`, `__SYSCONFDIR__`, `__DATADIR__` and `__RUNDIR__` variables.
+
+Here is an example of those variables:
+
+- `__BINDIR__` : `/usr/local/bin`
+- `__SYSCONFDIR__` : `/etc`
+- `__DATADIR__` : `/var/lib/sozu`
+- `__RUNDIR__` : `/run`
+
+[un]: ../os-build/systemd/sozu.service.in
+[gen]: ../os-build/exherbo/generate.sh

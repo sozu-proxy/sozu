@@ -9,7 +9,7 @@ Sozu provides logs and metrics allowing detection of most production issues.
 It is useful to gather information on the configuration state in a production system.
 Here are some commands you can use to take a snapshot of the current state:
 
-```
+```bash
 sozuctl -c /etc/config.toml status > "sozu-status-$(date -Iseconds).txt"
 sozuctl -c /etc/config.toml metrics > "sozu-metrics-$(date -Iseconds).txt"
 sozuctl -c /etc/config.toml query applications > "sozu-applications-$(date -Iseconds).txt"
@@ -63,11 +63,12 @@ tagged_metrics = true
 
 Access logs have the following format:
 
-```
+```txt
 2018-09-21T14:01:51Z 821136800672570 71013 WRK-00 INFO  450b071a-53b8-4fd7-b2f2-1213f03ef032 MyApp      127.0.0.1:52323 -> 127.0.0.1:1027       241ms 855μs 560 33084   200 OK lolcatho.st:8080 GET /
 ```
 
 From left to right:
+
 * date in ISO8601 format, UTC timezone
 * monotonic clock (in case some messages appear in the wrong order)
 * PID
@@ -146,19 +147,19 @@ after the circuit breaker triggered (we wait for 3 failed connections to the bac
 
 A backend connection error would result in the following log message:
 
-```
+```txt
 2018-09-21T14:36:08Z 823194694977734 71501 WRK-00 ERROR 839f592b-a194-4c3b-848b-8ef024129969    MyApp    error connecting to backend, trying again
 ```
 
 The circuit breaker triggering will write this to the logs:
 
-```
+```txt
 2018-09-21T14:36:57Z 823243245414405 71524 WRK-00 ERROR 7029d66e-57a8-406e-ae61-e4bf9ff7b6b8    MyApp    max connection attempt reached
 ```
 
 The retry policy marking a backend server as down will write the following log message:
 
-```
+```txt
 2018-09-21T14:37:31Z 823277868708804 71524 WRK-00 ERROR no more available backends for app MyApp
 ```
 
@@ -215,7 +216,6 @@ OpenSSL specific:
 * `sozu.openssl.wrong_version_number.error`: invalid TLS version
 * `sozu.openssl.unknown_protocol.error`: most likely, someone tried plaintext HTTP instead of HTTPS
 
-
 Rustls specific, negotiated ciphersuite:
 
 * `sozu.tls.cipher.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`
@@ -237,13 +237,13 @@ Normal traffic (`sozu.http.requests`) drops while 404 (`sozu.http.404.errors`) a
 503 (`sozu.http.503.errors`), that means sozu's configuration is probably invalid.
 Check the configuration state with;
 
-```
+```bash
 sozuctl -c /etc/config.toml query applications
 ```
 
 And, for the complete configuration for a specific application id:
 
-```
+```bash
 sozuctl -c /etc/config.toml query applications -i app_id
 ```
 
