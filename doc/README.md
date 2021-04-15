@@ -1,8 +1,5 @@
 # Sōzu
 
-> Note: This project is a *work in progress*
-> But it will be awesome when it will be ready
-
 ## What is Sōzu?
 
 Sōzu is a reverse proxy for load balancing written in Rust. Its main job is to balance inbound requests across two or more applications backends to spread the load.
@@ -48,7 +45,7 @@ TODO
 [gs]: ./getting_started.md
 [cg]: ./configure.md
 [hw]: ./how_to_use.md
-[dw]: ./design_motivation.md
+[dm]: ./design_motivation.md
 [ar]: ./architecture.md
 [tl]: ./tools_libraries.md
 [ws]: ./why_you_should_use.md
