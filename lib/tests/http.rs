@@ -1,0 +1,135 @@
+#![allow(unused_variables,unused_must_use)]
+extern crate sozu_lib as sozu;
+#[macro_use] extern crate sozu_command_lib as sozu_command;
+extern crate time;
+extern crate tiny_http;
+extern crate ureq;
+
+use std::thread;
+use sozu_command::proxy;
+use sozu_command::channel::Channel;
+use sozu_command::proxy::LoadBalancingParams;
+use sozu_command::logging::{Logger,LoggerBackend};
+use tiny_http::{Server, Response};
+use std::io::stdout;
+use std::net::ToSocketAddrs;
+
+#[test]
+fn test() {
+    Logger::init("EXAMPLE".to_string(), "info", LoggerBackend::Stdout(stdout()), None);
+
+    info!("starting up");
+
+    let config = proxy::HttpListener {
+        front: "127.0.0.1:8080".parse().expect("could not parse address"),
+        ..Default::default()
+    };
+
+    let (mut command, channel) = Channel::generate(1000, 10000).expect("should create a channel");
+
+    let jg = thread::spawn(move || {
+        let max_buffers = 20;
+        let buffer_size = 16384;
+        sozu::http::start(config, channel, max_buffers, buffer_size);
+    });
+
+    command.write_message(&proxy::ProxyRequest {
+        id:    String::from("ID_Status"),
+        order: proxy::ProxyRequestData::Status
+    });
+
+    // wait for sozu to start and answer
+    info!("Status -> {:?}", command.read_message());
+
+    let agent = ureq::AgentBuilder::new()
+        .resolver(|addr: &str| match addr {
+            "example.com:8080" => Ok(vec![([127,0,0,1], 8080).into()]),
+            addr => addr.to_socket_addrs().map(Iterator::collect),
+        })
+    .build();
+
+
+    info!("expecting 404");
+    match agent
+        .get("http://example.com:8080/")
+        .call().unwrap_err() {
+            ureq::Error::Status(404, res) => {
+                assert_eq!(res.header("connection"), Some("close"));
+            },
+            e => panic!("invalid response: {:?}", e),
+        };
+
+
+    let http_front = proxy::HttpFront {
+        app_id:     String::from("test"),
+        address:    "127.0.0.1:8080".parse().unwrap(),
+        hostname:   String::from("example.com"),
+        path_begin: String::from("/"),
+    };
+
+    command.write_message(&proxy::ProxyRequest {
+        id:    String::from("ID_ABCD"),
+        order: proxy::ProxyRequestData::AddHttpFront(http_front)
+    });
+    println!("HTTP -> {:?}", command.read_message());
+
+    info!("expecting 503");
+    match agent
+        .get("http://example.com:8080/")
+        .call().unwrap_err() {
+            ureq::Error::Status(503, res) => {
+                assert_eq!(res.header("connection"), Some("close"));
+            },
+            e => panic!("invalid response: {:?}", e),
+        };
+
+    let http_backend = proxy::Backend {
+        app_id:                    String::from("test"),
+        backend_id:                String::from("test-0"),
+        address:                   "127.0.1.1:1024".parse().unwrap(),
+        load_balancing_parameters: Some(LoadBalancingParams::default()),
+        sticky_id:                 None,
+        backup:                    None,
+    };
+
+    command.write_message(&proxy::ProxyRequest {
+        id:    String::from("ID_EFGH"),
+        order: proxy::ProxyRequestData::AddBackend(http_backend)
+    });
+
+    println!("HTTP -> {:?}", command.read_message());
+
+    start_server(1024);
+
+    info!("expecting 200");
+    let res = agent
+        .get("http://example.com:8080/")
+        .call().unwrap();
+    assert_eq!(res.status(), 200);
+
+
+    //let _ = jg.join();
+    info!("good bye");
+}
+
+fn start_server(port: u16) {
+    thread::spawn(move|| {
+        let server = Server::http(&format!("127.0.1.1:{}", port)).expect("could not create server");
+        info!("starting web server in port {}", port);
+
+        for request in server.incoming_requests() {
+            println!("backend web server got request -> method: {:?}, url: {:?}, headers: {:?}",
+                     request.method(),
+                     request.url(),
+                     request.headers()
+                    );
+
+            let response = Response::from_string("hello world");
+            request.respond(response).unwrap();
+            println!("backend web server sent response");
+            println!("server session stopped");
+        }
+
+        println!("server on port {} closed", port);
+    });
+}
