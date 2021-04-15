@@ -103,16 +103,16 @@ fn main() {
     },
     SubCmd::Certificate{ cmd } => {
       match cmd {
-        CertificateCmd::Add{ certificate, chain, key, address } => {
-          add_certificate(channel, timeout, address, &certificate, &chain, &key)
+        CertificateCmd::Add{ certificate, chain, key, address, tls_versions } => {
+          add_certificate(channel, timeout, address, &certificate, &chain, &key, tls_versions)
         },
         CertificateCmd::Remove{ certificate, address, fingerprint } => {
           remove_certificate(channel, timeout, address, certificate.as_deref(),
             fingerprint.as_deref())
         },
-        CertificateCmd::Replace{ certificate, chain, key, old_certificate, address, old_fingerprint } => {
+        CertificateCmd::Replace{ certificate, chain, key, old_certificate, address, old_fingerprint, tls_versions } => {
           replace_certificate(channel, timeout, address, &certificate, &chain,
-            &key, old_certificate.as_deref(), old_fingerprint.as_deref())
+            &key, old_certificate.as_deref(), old_fingerprint.as_deref(), tls_versions)
         },
       }
     },

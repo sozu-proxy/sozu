@@ -5,7 +5,7 @@ use sozu_command::command::{CommandResponseData,CommandRequestData,CommandReques
 use sozu_command::proxy::{Application, ProxyRequestData, Backend, HttpFront, TcpFront,
   CertificateAndKey, CertFingerprint, Query, QueryAnswer, QueryApplicationType, QueryApplicationDomain,
   AddCertificate, RemoveCertificate, ReplaceCertificate, LoadBalancingParams, RemoveBackend,
-  QueryCertificateType, QueryAnswerCertificate, FilteredData};
+  QueryCertificateType, QueryAnswerCertificate, FilteredData, TlsVersion};
 
 use serde_json;
 use std::collections::{HashMap,HashSet,BTreeMap};
@@ -1045,8 +1045,10 @@ pub fn remove_backend(channel: Channel<CommandRequest,CommandResponse>, timeout:
 }
 
 pub fn add_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
-  certificate_path: &str, certificate_chain_path: &str, key_path: &str) {
-  if let Some(new_certificate) = load_full_certificate(certificate_path, certificate_chain_path, key_path) {
+  certificate_path: &str, certificate_chain_path: &str, key_path: &str, versions: Vec<TlsVersion>) {
+  if let Some(new_certificate) = load_full_certificate(certificate_path,
+                                                       certificate_chain_path,
+                                                       key_path, versions) {
     order_command(channel, timeout, ProxyRequestData::AddCertificate(AddCertificate {
       front: address,
       certificate: new_certificate,
@@ -1086,7 +1088,8 @@ pub fn remove_certificate(channel: Channel<CommandRequest,CommandResponse>, time
 
 pub fn replace_certificate(channel: Channel<CommandRequest,CommandResponse>, timeout: u64, address: SocketAddr,
   new_certificate_path: &str, new_certificate_chain_path: &str, new_key_path: &str,
-  old_certificate_path: Option<&str>, old_fingerprint: Option<&str>)
+  old_certificate_path: Option<&str>, old_fingerprint: Option<&str>,
+  versions: Vec<TlsVersion>)
 {
   if old_certificate_path.is_some() && old_fingerprint.is_some() {
     eprintln!("Error: Either provide the old certificate's path or its fingerprint");
@@ -1098,7 +1101,9 @@ pub fn replace_certificate(channel: Channel<CommandRequest,CommandResponse>, tim
     exit(1);
   }
 
-  if let Some(new_certificate) = load_full_certificate(new_certificate_path, new_certificate_chain_path, new_key_path) {
+  if let Some(new_certificate) = load_full_certificate(new_certificate_path,
+                                                       new_certificate_chain_path,
+                                                       new_key_path, versions) {
     if let Some(old_fingerprint) = old_fingerprint.and_then(|s| {
         match hex::decode(s) {
             Ok(v) => Some(CertFingerprint(v)),
@@ -1633,7 +1638,8 @@ fn print_json_response<T: ::serde::Serialize>(input: &T) {
   };
 }
 
-fn load_full_certificate(certificate_path: &str, certificate_chain_path: &str, key_path: &str) -> Option<CertificateAndKey> {
+fn load_full_certificate(certificate_path: &str, certificate_chain_path: &str,
+                         key_path: &str, versions: Vec<TlsVersion>) -> Option<CertificateAndKey> {
   match Config::load_file(certificate_path) {
     Err(e) => {
       eprintln!("could not load certificate: {:?}", e);
@@ -1653,9 +1659,10 @@ fn load_full_certificate(certificate_path: &str, certificate_chain_path: &str, k
             },
             Ok(key) => {
               Some(CertificateAndKey {
-                certificate: certificate,
-                certificate_chain: certificate_chain,
-                key: key
+                certificate,
+                certificate_chain,
+                key,
+                versions,
               })
             }
           }

@@ -1,4 +1,7 @@
-use sozu_command::config::LoadBalancingAlgorithms;
+use sozu_command::{
+    config::LoadBalancingAlgorithms,
+    proxy::TlsVersion
+};
 use std::net::SocketAddr;
 
 #[derive(StructOpt, PartialEq, Debug)]
@@ -225,6 +228,9 @@ pub enum CertificateCmd {
     chain: String,
     #[structopt(long = "key", help = "path to the key")]
     key: String,
+    #[structopt(long = "tls-versions", help = "accepted TLS versions for this certificate",
+                parse(try_from_str = parse_tls_versions))]
+    tls_versions: Vec<TlsVersion>,
   },
   #[structopt(name = "remove", about = "Remove a certificate")]
   Remove {
@@ -249,6 +255,9 @@ pub enum CertificateCmd {
     old_certificate: Option<String>,
     #[structopt(short = "f", long = "fingerprint", help = "old certificate fingerprint")]
     old_fingerprint: Option<String>,
+    #[structopt(long = "tls-versions", help = "accepted TLS versions for this certificate",
+                parse(try_from_str = parse_tls_versions))]
+    tls_versions: Vec<TlsVersion>,
   }
 }
 
@@ -276,3 +285,14 @@ pub enum ConfigCmd {
   #[structopt(name = "check", about = "check configuration file syntax and exit")]
   Check {}
 }
+
+fn parse_tls_versions(i: &str) -> Result<TlsVersion, String> {
+    match i {
+        "TLSv1" => Ok(TlsVersion::TLSv1_0),
+        "TLSv1.1" => Ok(TlsVersion::TLSv1_1),
+        "TLSv1.2" => Ok(TlsVersion::TLSv1_2),
+        "TLSv1.3" => Ok(TlsVersion::TLSv1_2),
+        s => return Err(format!("unrecognized TLS version: {}", s)),
+    }
+}
+
