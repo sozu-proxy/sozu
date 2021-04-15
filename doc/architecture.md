@@ -20,7 +20,6 @@ The configuration messages are transmitted in JSON format, and they are defined 
 
 The master exposes a unix socket for configuration instead of a HTTP server on localhost because unix socket access can be secured through file system permissions.
 
-
 ## Proxying
 
 ### Event loop with mio
@@ -51,7 +50,7 @@ The [logger](https://github.com/sozu-proxy/sozu/blob/3111e2db420d2773b1f0404d655
 
 The logger can be invoked through a thread local storage variable accessible from anywhere with logging macros.
 
-# Metrics
+## Metrics
 
 [Metrics](https://github.com/sozu-proxy/sozu/tree/3111e2db420d2773b1f0404d6556f40b2f2ea85b/lib/src/network/metrics) work like the logger, accessible from anywhere with macros and TLS. We support two "drains": one that sends the metrics on the networks with a statsd compatible protocol, and one aggregating metrics locally, to be queried through the configuration socket.
 

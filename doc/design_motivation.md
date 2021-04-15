@@ -70,6 +70,7 @@ Sōzu should have a very predictable behaviour in its memory usage and its laten
 Any irregularity should be observed and removed.
 
 It drove various decisions:
+
 - Rust allowed us to avoid garbage collection pauses
 - preallocations and pooling to avoid some allocations in the hot path
 - single threaded, shared nothing architecture to avoid synchronization between cores
