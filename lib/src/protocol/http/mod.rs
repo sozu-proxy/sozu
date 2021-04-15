@@ -1301,7 +1301,6 @@ impl<Front:SocketHandler> Http<Front> {
         };
 
         if unwrap_msg!(self.response.as_ref()).is_back_error() {
-          self.log_request_error(metrics, "back socket parse error, closing connection");
           let answer_502 = "HTTP/1.1 502 Bad Gateway\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
           self.set_answer(DefaultAnswerStatus::Answer502, Rc::new(Vec::from(answer_502.as_bytes())));
           return (ProtocolResult::Continue, self.writable(metrics));

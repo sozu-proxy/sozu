@@ -13,7 +13,7 @@ use sozu_command::logging::{Logger,LoggerBackend};
 use tiny_http::{Server, Response};
 use std::{
     io::{stdout, Read, Write},
-    net::{TcpStream,ToSocketAddrs},
+    net::{TcpListener,TcpStream,ToSocketAddrs},
     time::Duration,
     str
 };
@@ -104,16 +104,8 @@ fn test() {
 
     println!("HTTP -> {:?}", command.read_message());
 
-    start_server(1024);
 
-    info!("expecting 200");
-    let res = agent
-        .get("http://example.com:8080/")
-        .call().unwrap();
-    assert_eq!(res.status(), 200);
-
-
-    info!("sending invalid request");
+    info!("sending invalid request, expecting 400");
     let mut client = TcpStream::connect(("127.0.0.1", 8080)).expect("could not parse address");
     // 1 seconds of timeout
     client.set_read_timeout(Some(Duration::new(1,0)));
@@ -139,6 +131,31 @@ fn test() {
     let answer = str::from_utf8(&buffer[..index]).expect("could not make string from buffer");
     println!("Response: {}", answer);
     assert_eq!(answer, expected_answer);
+
+    let _ = thread::spawn(move || {
+        let listener = TcpListener::bind("127.0.0.1:1024").expect("could not parse address");
+        let mut stream = listener.incoming().next().unwrap().unwrap();
+        let response = b"TEST\r\n\r\n";
+        stream.write(&response[..]).unwrap();
+    });
+
+    info!("expecting 502");
+    match agent
+        .get("http://example.com:8080/")
+        .call().unwrap_err() {
+            ureq::Error::Status(502, res) => {
+                assert_eq!(res.status_text(), "Bad Gateway");
+            },
+            e => panic!("invalid response: {:?}", e),
+        };
+
+    start_server(1024);
+
+    info!("expecting 200");
+    let res = agent
+        .get("http://example.com:8080/")
+        .call().unwrap();
+    assert_eq!(res.status(), 200);
 
     //let _ = jg.join();
     info!("good bye");
