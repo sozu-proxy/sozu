@@ -91,7 +91,7 @@ fn test() {
     let http_backend = proxy::Backend {
         app_id:                    String::from("test"),
         backend_id:                String::from("test-0"),
-        address:                   "127.0.0.1:1024".parse().unwrap(),
+        address:                   "127.0.0.1:2048".parse().unwrap(),
         load_balancing_parameters: Some(LoadBalancingParams::default()),
         sticky_id:                 None,
         backup:                    None,
@@ -133,7 +133,7 @@ fn test() {
     assert_eq!(answer, expected_answer);
 
     let _ = thread::spawn(move || {
-        let listener = TcpListener::bind("127.0.0.1:1024").expect("could not parse address");
+        let listener = TcpListener::bind("127.0.0.1:2048").expect("could not parse address");
         let mut stream = listener.incoming().next().unwrap().unwrap();
         let response = b"TEST\r\n\r\n";
         stream.write(&response[..]).unwrap();
@@ -149,7 +149,7 @@ fn test() {
             e => panic!("invalid response: {:?}", e),
         };
 
-    start_server(1024);
+    start_server(2048);
 
     info!("expecting 200");
     let res = agent
