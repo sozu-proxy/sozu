@@ -895,13 +895,19 @@ impl Listener {
 
   pub fn create_default_context(config: &HttpsListener, ref_ctx: Arc<Mutex<HashMap<CertFingerprint,TlsData>>>,
     ref_domains: Arc<Mutex<TrieNode<CertFingerprint>>>) -> Option<(SslContext, SslOptions)> {
-      let mut cert_read = &include_bytes!("../assets/certificate.pem")[..];
-    let mut key_read  = &include_bytes!("../assets/key.pem")[..];
+
+    let mut cert_read  = config.certificate.as_ref().map(|c| c.as_bytes())
+        .unwrap_or(include_bytes!("../assets/certificate.pem"));
+    let mut key_read  = config.key.as_ref().map(|c| c.as_bytes())
+        .unwrap_or(include_bytes!("../assets/key.pem"));
+    let cert_chain: Vec<X509> = config.certificate_chain.iter().filter_map(|c| {
+      X509::from_pem(c.as_bytes()).ok()
+    }).collect();
 
     if let (Ok(cert), Ok(key)) = (X509::from_pem(&mut cert_read), PKey::private_key_from_pem(&mut key_read)) {
       Self::create_context(
         &config.versions, &config.cipher_list,
-        &cert, &key, &[],
+        &cert, &key, &cert_chain[..],
         ref_ctx, ref_domains
       )
     } else {

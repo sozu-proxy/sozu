@@ -32,6 +32,9 @@ pub struct Listener {
   pub expect_proxy:       Option<bool>,
   #[serde(default = "default_sticky_name")]
   pub sticky_name:        String,
+  pub certificate:        Option<String>,
+  pub certificate_chain:  Option<String>,
+  pub key:                Option<String>,
 }
 
 fn default_sticky_name() -> String {
@@ -51,6 +54,9 @@ impl Listener {
       tls_versions:       None,
       expect_proxy:       None,
       sticky_name:        String::from("SOZUBALANCEID"),
+      certificate:        None,
+      certificate_chain:  None,
+      key:                None,
     }
   }
 
@@ -151,6 +157,21 @@ impl Listener {
       Some(ref v) => v.clone(),
     };
 
+    let key = self.key.as_ref().and_then(|path| Config::load_file(&path).map_err(|e| {
+      error!("cannot load key at path '{}': {:?}", path, e);
+      e
+    }).ok());
+    let certificate = self.certificate.as_ref().and_then(|path| Config::load_file(&path).map_err(|e| {
+      error!("cannot load certificate at path '{}': {:?}", path, e);
+      e
+    }).ok());
+    let certificate_chain = self.certificate_chain.as_ref().and_then(|path| Config::load_file(&path).map_err(|e| {
+      error!("cannot load certificate chain at path '{}': {:?}", path, e);
+      e
+    }).ok())
+      .map(split_certificate_chain)
+      .unwrap_or_else(Vec::new);
+
     let expect_proxy = self.expect_proxy.unwrap_or(false);
 
 
@@ -163,6 +184,9 @@ impl Listener {
         versions,
         expect_proxy,
         rustls_cipher_list,
+        key,
+        certificate,
+        certificate_chain,
         ..Default::default()
       };
 
@@ -1113,6 +1137,9 @@ mod tests {
       rustls_cipher_list: None,
       expect_proxy: None,
       sticky_name: "SOZUBALANCEID".to_string(),
+      certificate:        None,
+      certificate_chain:  None,
+      key:                None,
     };
     println!("http: {:?}", to_string(&http));
     let https = Listener {
@@ -1126,6 +1153,9 @@ mod tests {
       rustls_cipher_list: None,
       expect_proxy: None,
       sticky_name: "SOZUBALANCEID".to_string(),
+      certificate:        None,
+      certificate_chain:  None,
+      key:                None,
     };
     println!("https: {:?}", to_string(&https));
 

@@ -970,6 +970,9 @@ mod tests {
       cipher_list: String::new(),
       rustls_cipher_list: Vec::new(),
       tls_provider: TlsProvider::Openssl,
+      certificate:         None,
+      certificate_chain:   vec![],
+      key:                 None,
     }));
     state.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
       front: "0.0.0.0:8443".parse().unwrap(),
@@ -1007,6 +1010,9 @@ mod tests {
       cipher_list: String::new(),
       rustls_cipher_list: Vec::new(),
       tls_provider: TlsProvider::Openssl,
+      certificate:         None,
+      certificate_chain:   vec![],
+      key:                 None,
     }));
     state2.handle_order(&ProxyRequestData::ActivateListener(ActivateListener {
       front: "0.0.0.0:8443".parse().unwrap(),
@@ -1061,6 +1067,9 @@ mod tests {
         cipher_list: String::new(),
         rustls_cipher_list: Vec::new(),
         tls_provider: TlsProvider::Openssl,
+        certificate:         None,
+        certificate_chain:   vec![],
+        key:                 None,
       }),
     );
 

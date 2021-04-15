@@ -499,6 +499,12 @@ pub struct HttpsListener {
     pub expect_proxy:       bool,
     #[serde(default = "default_sticky_name")]
     pub sticky_name:        String,
+    #[serde(default)]
+    pub certificate:        Option<String>,
+    #[serde(default)]
+    pub certificate_chain:  Vec<String>,
+    #[serde(default)]
+    pub key:                Option<String>,
 }
 
 impl Default for HttpsListener {
@@ -526,7 +532,10 @@ impl Default for HttpsListener {
       versions:            vec!(TlsVersion::TLSv1_2),
       tls_provider:        TlsProvider::Rustls,
       expect_proxy:        false,
-      sticky_name:     String::from("SOZUBALANCEID"),
+      sticky_name:         String::from("SOZUBALANCEID"),
+      certificate:         None,
+      certificate_chain:   vec![],
+      key:                 None,
     }
   }
 }
