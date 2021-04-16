@@ -155,8 +155,9 @@ fn test() {
             e => panic!("invalid response: {:?}", e),
         };
 
-    start_server(2048);
+    start_server(2048, barrier.clone());
 
+    barrier.wait();
     info!("expecting 200");
     let res = agent
         .get("http://example.com:8080/")
@@ -167,11 +168,12 @@ fn test() {
     info!("good bye");
 }
 
-fn start_server(port: u16) {
+fn start_server(port: u16, barrier: Arc<Barrier>) {
     thread::spawn(move|| {
         let server = Server::http(&format!("127.0.0.1:{}", port)).expect("could not create server");
         info!("starting web server in port {}", port);
 
+        barrier.wait();
         for request in server.incoming_requests() {
             println!("backend web server got request -> method: {:?}, url: {:?}, headers: {:?}",
                      request.method(),
