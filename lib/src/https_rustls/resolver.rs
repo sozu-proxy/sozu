@@ -2,7 +2,7 @@ use std::sync::{Arc,Mutex};
 use std::collections::HashMap;
 use std::io::BufReader;
 use webpki;
-use rustls::{ResolvesServerCert, SignatureScheme};
+use rustls::{ResolvesServerCert, SignatureScheme, ClientHello};
 use rustls::sign::{CertifiedKey, RSASigningKey};
 use rustls::internal::pemfile;
 
@@ -115,9 +115,11 @@ impl CertificateResolverWrapper {
 impl ResolvesServerCert for CertificateResolverWrapper {
   fn resolve(
         &self,
-        server_name: Option<webpki::DNSNameRef>,
-        sigschemes: &[SignatureScheme]
+        client_hello: ClientHello
     ) -> Option<CertifiedKey> {
+    let server_name = client_hello.server_name();
+    let sigschemes = client_hello.sigschemes();
+
     if server_name.is_none() {
       error!("cannot look up certificate: no SNI from session");
       return None;

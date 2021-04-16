@@ -23,11 +23,11 @@ include = [
 [lib]
 
 [dependencies]
-rand = "^0.7"
+rand = "^0.8"
 url = "^2.1"
 log = "^0.4"
 net2 = "^0.2"
-time = "^0.1.34"
+time = "^0.2"
 mio = "^0.6"
 mio-uds = "^0.6"
 libc = "^0.2"
@@ -35,9 +35,9 @@ slab = "^0.3.0"
 pool = "^0.1"
 openssl = {version="^0.10.26", optional = true}
 openssl-sys = {version="^0.9", optional = true}
-rustls = "^0.16"
-webpki = "^0.21"
-hdrhistogram = "^6.0"
+rustls = "^0.19"
+webpki = "^0.22"
+hdrhistogram = "^7.0"
 sozu-command-lib = { version = "^0.11", path = "../command" }
 idna = "^0.2"
 mio-extras = "^2.0"
@@ -46,8 +46,8 @@ memchr = "2.3"
 foreign-types-shared = "0.1"
 
 [dev-dependencies]
-tiny_http = "^0.6"
-quickcheck = "^0.9"
+tiny_http = "^0.8"
+quickcheck = "^1.0"
 ureq = "2.1"
 
 [dependencies.uuid]
