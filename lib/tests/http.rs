@@ -15,6 +15,7 @@ use std::{
     io::{stdout, Read, Write},
     net::{TcpListener,TcpStream,ToSocketAddrs},
     time::Duration,
+    sync::{Arc, Barrier},
     str
 };
 
@@ -132,13 +133,18 @@ fn test() {
     println!("Response: {}", answer);
     assert_eq!(answer, expected_answer);
 
+    let barrier = Arc::new(Barrier::new(2));
+    let barrier2 = barrier.clone();
+
     let _ = thread::spawn(move || {
         let listener = TcpListener::bind("127.0.0.1:2048").expect("could not parse address");
+        barrier2.wait();
         let mut stream = listener.incoming().next().unwrap().unwrap();
         let response = b"TEST\r\n\r\n";
         stream.write(&response[..]).unwrap();
     });
 
+    barrier.wait();
     info!("expecting 502");
     match agent
         .get("http://example.com:8080/")
