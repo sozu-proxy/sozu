@@ -24,7 +24,7 @@ include = [
 
 [dependencies]
 rand = "^0.7"
-nom = "^4.0"
+nom = "^5.0"
 url = "^2.1"
 log = "^0.4"
 net2 = "^0.2"

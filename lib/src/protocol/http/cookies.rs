@@ -1,4 +1,4 @@
-use nom::{IResult, is_space};
+use nom::{IResult, character::is_space};
 
 #[derive(Debug)]
 pub struct RequestCookie<'a> {
@@ -24,7 +24,8 @@ pub fn is_cookie_value_char(chr: u8) -> bool {
 
 named!(pub single_request_cookie<RequestCookie>,
   do_parse!(
-    name: take_until_and_consume!("=") >>
+    name: is_not!("=") >>
+          tag!("=") >>
     value: take_while_complete!(is_cookie_value_char) >>
     semicolon: opt!(complete!(tag!(";"))) >>
     spaces: take_while_complete!(is_space) >>

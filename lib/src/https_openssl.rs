@@ -2060,14 +2060,13 @@ fn ssl_set_options(ssl: &mut SslRef, context: &SslContext) {
 }
 
 fn parse_sni_name_list(i: &[u8]) -> Option<&[u8]> {
-    use nom::HexDisplay;
-    use nom::{length_data, be_u16};
+    use nom::{multi::length_data, number::complete::be_u16};
 
     if i.is_empty() {
         return None;
     }
 
-    match length_data!(i, be_u16).ok() {
+    match length_data::<_,_,(),_>(be_u16)(i).ok() {
         None => None,
         Some((i, o)) => {
             if !i.is_empty() {
@@ -2080,15 +2079,17 @@ fn parse_sni_name_list(i: &[u8]) -> Option<&[u8]> {
 }
 
 fn parse_sni_name(i: &[u8]) -> Option<(&[u8], &[u8])> {
-    use nom::{be_u8, be_u16,length_data};
+    use nom::{multi::length_data, sequence::preceded,
+      bytes::complete::tag,
+      number::complete::{be_u8, be_u16}
+    };
 
     if i.is_empty() {
         return None;
     }
 
-
-    preceded!(i,
-        tag!([0x00]), // SNIType for hostname is 0
-        length_data!(be_u16)
-    ).ok()
+    preceded::<_,_,_,(),_,_>(
+        tag([0x00]), // SNIType for hostname is 0
+        length_data(be_u16)
+    )(i).ok()
 }
