@@ -1,7 +1,4 @@
-use nom::{
-    number::streaming::{be_u8, be_u16},
-    Needed
-};
+use nom::number::streaming::{be_u8, be_u16};
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::convert::From;

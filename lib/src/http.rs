@@ -26,7 +26,7 @@ use super::{AppId,Backend,SessionResult,ConnectionError,Protocol,Readiness,Sessi
 use super::backends::BackendMap;
 use super::pool::Pool;
 use super::protocol::{ProtocolResult,StickySession,Http,Pipe};
-use super::protocol::http::{DefaultAnswerStatus, TimeoutStatus, answers::{DefaultAnswers, CustomAnswers, HttpAnswers}};
+use super::protocol::http::{DefaultAnswerStatus, TimeoutStatus, answers::HttpAnswers};
 use super::protocol::proxy_protocol::expect::ExpectProxyProtocol;
 use super::server::{Server,ProxyChannel,ListenToken,ListenPortState,SessionToken,
   ListenSession, CONN_RETRIES, push_event};
@@ -788,7 +788,7 @@ impl Proxy {
     })
   }
 
-  pub fn add_application(&mut self, mut application: Application) {
+  pub fn add_application(&mut self, application: Application) {
     if let Some(answer_503) = application.answer_503.as_ref() {
       for l in self.listeners.values_mut() {
         l.answers.borrow_mut().add_custom_answer(&application.app_id, &answer_503);
@@ -1301,7 +1301,7 @@ pub fn start(config: HttpListener, channel: ProxyChannel, max_buffers: usize, bu
     Pool::with_capacity(2*max_buffers, 0, || Buffer::with_capacity(buffer_size))
   ));
   let backends = Rc::new(RefCell::new(BackendMap::new()));
-  let mut sessions: Slab<Rc<RefCell<ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
+  let mut sessions: Slab<Rc<RefCell<dyn ProxySessionCast>>,SessionToken> = Slab::with_capacity(max_buffers);
   {
     let entry = sessions.vacant_entry().expect("session list should have enough room at startup");
     info!("taking token {:?} for channel", entry.index());

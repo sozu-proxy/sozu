@@ -6,8 +6,7 @@ use nom::{HexDisplay,IResult,Offset,Err};
 
 use url::Url;
 
-use std::str::{self, from_utf8};
-use std::convert::From;
+use std::str;
 
 use super::{BufferMove, LengthInformation, RRequestLine, Connection, Chunk, Host, HeaderValue, TransferEncodingValue,
   Method, Version, Continue, Header, message_header, request_line, crlf,};

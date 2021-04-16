@@ -324,12 +324,9 @@ impl BufferQueue {
 
     let it = self.output_queue.iter();
     //first, calculate how many bytes we need to jump
-    let mut start         = 0usize;
-    let mut largest_size  = 0usize;
-    let mut delete_ended  = false;
+    let mut start = 0usize;
     let length = self.buffer.available_data();
     //println!("NEXT OUTPUT DATA:\nqueue:\n{:?}\nbuffer:\n{}", self.output_queue, self.buffer.data().to_hex(16));
-    let mut complete_size = 0;
     for el in it {
       match el {
         &OutputElement::Delete(sz) => start += sz,
@@ -342,7 +339,6 @@ impl BufferQueue {
           if let Some(i) = iovec::IoVec::from_bytes(&self.buffer.data()[start..end]) {
             //println!("iovec size: {}", i.len());
             res.push(i);
-            complete_size += i.len();
             start = end;
             if end == length {
               break;
@@ -358,12 +354,11 @@ impl BufferQueue {
           if let Some(i) = iovec::IoVec::from_bytes(&v[..]) {
             //println!("got Insert with {} bytes", v.len());
             res.push(i);
-            complete_size += i.len();
           } else {
             break;
           }
         },
-        &OutputElement::Splice(sz)  => { unimplemented!("splice not used in iovec") },
+        &OutputElement::Splice(_sz)  => { unimplemented!("splice not used in iovec") },
       }
     }
 

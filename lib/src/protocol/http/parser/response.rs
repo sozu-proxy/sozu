@@ -3,7 +3,7 @@ use protocol::http::StickySession;
 
 use nom::{HexDisplay,IResult,Offset,Err};
 
-use std::str::{self, from_utf8};
+use std::str;
 use std::convert::From;
 
 use super::{BufferMove, LengthInformation, RStatusLine, Connection, Chunk, HeaderValue, TransferEncodingValue,

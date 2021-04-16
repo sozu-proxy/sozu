@@ -1,9 +1,10 @@
-
 use super::*;
 use nom::{Err,error::ErrorKind,HexDisplay};
 use buffer_queue::{OutputElement,buf_with_capacity};
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(test)]
+use protocol::http::AddedRequestHeader;
 
 /*
 #[test]

@@ -1,8 +1,7 @@
 use std::sync::{Arc,Mutex};
 use std::collections::HashMap;
 use std::io::BufReader;
-use webpki;
-use rustls::{ResolvesServerCert, SignatureScheme, ClientHello};
+use rustls::{ResolvesServerCert, ClientHello};
 use rustls::sign::{CertifiedKey, RSASigningKey};
 use rustls::internal::pemfile;
 

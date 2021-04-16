@@ -135,7 +135,7 @@ impl BackendMap {
 pub struct BackendList {
   pub backends:       Vec<Rc<RefCell<Backend>>>,
   pub next_id:        u32,
-  pub load_balancing: Box<LoadBalancingAlgorithm>,
+  pub load_balancing: Box<dyn LoadBalancingAlgorithm>,
 }
 
 impl BackendList {

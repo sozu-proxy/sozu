@@ -3,7 +3,7 @@ use std::time::{Duration,Instant};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use mio::net::UdpSocket;
-use std::io::{self,LineWriter,Write,ErrorKind};
+use std::io::{Write,ErrorKind};
 use std::collections::HashMap;
 use super::writer::{MetricSocket, MetricsWriter};
 

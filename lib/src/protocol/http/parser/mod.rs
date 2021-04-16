@@ -1,6 +1,4 @@
 use super::cookies::{RequestCookie, parse_request_cookies};
-use super::AddedRequestHeader;
-use features::FEATURES;
 
 use nom::{
   IResult,Offset,Err,Needed,

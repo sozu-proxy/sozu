@@ -1346,11 +1346,11 @@ impl<Front:SocketHandler> Http<Front> {
 fn save_http_status_metric(rs_status_line : Option<&RStatusLine>) {
   if let Some(rs_status_line) = rs_status_line {
     match rs_status_line.status {
-      100...199 => { incr!("http.status.1xx"); },
-      200...299 => { incr!("http.status.2xx"); },
-      300...399 => { incr!("http.status.3xx"); },
-      400...499 => { incr!("http.status.4xx"); },
-      500...599 => { incr!("http.status.5xx"); },
+      100..=199 => { incr!("http.status.1xx"); },
+      200..=299 => { incr!("http.status.2xx"); },
+      300..=399 => { incr!("http.status.3xx"); },
+      400..=499 => { incr!("http.status.4xx"); },
+      500..=599 => { incr!("http.status.5xx"); },
       _ => { incr!("http.status.other"); }, // http responses with other codes (protocol error)
     }
   }

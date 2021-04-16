@@ -1,7 +1,4 @@
-use serde;
 use serde::ser::SerializeMap;
-use serde_json;
-use std::fmt;
 use std::net::SocketAddr;
 use std::collections::BTreeMap;
 
