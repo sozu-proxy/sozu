@@ -181,6 +181,12 @@ tls_versions = ["TLSv1.3"]
 # defaults to all supported ciphersuites
 #rustls_cipher_list = ["TLS13_CHACHA20_POLY1305_SHA256"]
 
+# default certificate and key
+# in case you want to set up TLS without SNI, you can define the default
+# certificate here
+#certificate = "../lib/assets/cert_test.pem"
+#key = "../lib/assets/key_test.pem"
+#certificate_chain = "../lib/assets/certificate_chain.pem"
 
 # options specific to a TCP proxy listener
 #[[listeners]]
@@ -223,6 +229,7 @@ protocol = "http"
 # - https_redirect = false #  activates automatic redirection to HTTPS for this application
 frontends = [
   { address = "0.0.0.0:8080", hostname = "lolcatho.st" },
+  # HTTPS frontends also have an optional `tls_versions` key like the HTTPS listeners
   { address = "0.0.0.0:8443", hostname = "lolcatho.st", certificate = "../lib/assets/certificate.pem", key = "../lib/assets/key.pem", certificate_chain = "../lib/assets/certificate_chain.pem" }
 ]
 
