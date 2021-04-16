@@ -507,6 +507,36 @@ mod tests {
     assert_eq!(root.domain_lookup(&b"blah.test.alldomains.org"[..], true), None);
   }
 
+  #[test]
+  fn wildcard_domains() {
+    let mut root: TrieNode<u8> = TrieNode::root();
+
+    assert_eq!(root.domain_insert(Vec::from(&b"www.testdomains.org"[..]), 1), InsertResult::Ok);
+    assert_eq!(root.domain_insert(Vec::from(&b"test.testdomains.org"[..]), 2), InsertResult::Ok);
+    assert_eq!(root.domain_insert(Vec::from(&b"*.alldomains.org"[..]), 3), InsertResult::Ok);
+    assert_eq!(root.domain_insert(Vec::from(&b"alldomains.org"[..]), 4), InsertResult::Ok);
+    root.print();
+
+    assert_eq!(root.domain_lookup(&b"example.com"[..], true), None);
+    assert_eq!(root.domain_lookup(&b"alldomains.org"[..], true), Some(&((&b"alldomains.org"[..]).to_vec(), 4)));
+    assert_eq!(root.domain_lookup(&b"pouet.alldomains.org"[..], true), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
+
+    assert_eq!(root.domain_insert(Vec::from(&b"pouet.alldomains.org"[..]), 5), InsertResult::Ok);
+    root.print();
+
+    assert_eq!(root.domain_lookup(&b"alldomains.org"[..], true), Some(&((&b"alldomains.org"[..]).to_vec(), 4)));
+    assert_eq!(root.domain_lookup(&b"truc.alldomains.org"[..], true), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
+    assert_eq!(root.domain_lookup(&b"pouet.alldomains.org"[..], true), Some(&((&b"pouet.alldomains.org"[..]).to_vec(), 5)));
+
+    assert_eq!(root.domain_remove(&Vec::from(&b"pouet.alldomains.org"[..])), RemoveResult::Ok);
+    println!("after remove");
+    root.print();
+
+    assert_eq!(root.domain_lookup(&b"alldomains.org"[..], true), Some(&((&b"alldomains.org"[..]).to_vec(), 4)));
+    assert_eq!(root.domain_lookup(&b"truc.alldomains.org"[..], true), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
+    assert_eq!(root.domain_lookup(&b"pouet.alldomains.org"[..], true), Some(&((&b"*.alldomains.org"[..]).to_vec(), 3)));
+  }
+
   fn hm_insert(h: HashMap<String, u32>) -> bool {
     let mut root: TrieNode<u32> = TrieNode::root();
 
