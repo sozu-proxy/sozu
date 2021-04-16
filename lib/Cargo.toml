@@ -24,7 +24,6 @@ include = [
 
 [dependencies]
 rand = "^0.7"
-nom = "^5.0"
 url = "^2.1"
 log = "^0.4"
 net2 = "^0.2"
@@ -54,6 +53,12 @@ ureq = "2.1"
 [dependencies.uuid]
 version = "^0.8.0"
 features = ["v4"]
+
+[dependencies.nom]
+version = "^6.0"
+default-features = false
+features = ["std"]
+
 
 [features]
 default  = []

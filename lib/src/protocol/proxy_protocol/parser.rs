@@ -1,4 +1,7 @@
-use nom::number::streaming::{be_u8, be_u16};
+use nom::{
+    number::streaming::{be_u8, be_u16},
+    Needed
+};
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::convert::From;
@@ -91,7 +94,7 @@ mod test {
   use super::*;
   use std::net::{IpAddr, SocketAddr};
   use nom::Err;
-  use nom::Needed::Size;
+  use nom::Needed;
 
   #[test]
   fn test_parse_proxy_protocol_v2_local_ipv4_addr_header() {
@@ -227,7 +230,7 @@ mod test {
       0x11,                                                                   // family AF_UNIX with IPv4
     ];
 
-    assert_eq!(Err(Err::Incomplete(Size(2))), parse_v2_header(input));
+    assert_eq!(Err(Err::Incomplete(Needed::new(2))), parse_v2_header(input));
   }
 
   #[test]
@@ -243,6 +246,6 @@ mod test {
       0x10, 0x68,                                                                                     // destination port
     ];
 
-    assert_eq!(Err(Err::Incomplete(Size(16))), parse_v2_header(input));
+    assert_eq!(Err(Err::Incomplete(Needed::new(16))), parse_v2_header(input));
   }
 }
