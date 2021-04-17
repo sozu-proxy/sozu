@@ -9,9 +9,8 @@ use slab::Slab;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::net::{SocketAddr,Shutdown};
-use uuid::Uuid;
+use rusty_ulid::Ulid;
 use time::{Duration,SteadyTime};
-use uuid::adapter::Hyphenated;
 use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::scm_socket::ScmSocket;
@@ -56,7 +55,7 @@ pub struct Session {
   backend_token:      Option<Token>,
   back_connected:     BackendConnectionStatus,
   accept_token:       Token,
-  request_id:         Hyphenated,
+  request_id:         Ulid,
   app_id:             Option<String>,
   backend_id:         Option<String>,
   metrics:            SessionMetrics,
@@ -78,7 +77,7 @@ impl Session {
     let mut frontend_buffer = None;
     let mut backend_buffer = None;
 
-    let request_id = Uuid::new_v4().to_hyphenated();
+    let request_id = Ulid::generate();
     let protocol = match proxy_protocol {
       Some(ProxyProtocolConfig::RelayHeader) => {
         backend_buffer = Some(back_buf);
@@ -181,7 +180,7 @@ impl Session {
     }
   }
 
-  fn request_id(&self) -> Option<&Hyphenated> {
+  fn request_id(&self) -> Option<&Ulid> {
     match self.protocol {
       Some(State::Pipe(ref pipe)) => Some(&pipe.request_id),
       _ => None,

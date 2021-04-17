@@ -7,7 +7,7 @@ use mio::*;
 use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
-use uuid::Uuid;
+use rusty_ulid::Ulid;
 use std::io::ErrorKind;
 use std::collections::{HashMap, HashSet};
 use slab::Slab;
@@ -96,7 +96,7 @@ impl Session {
       sock.peer_addr().ok()
     };
 
-    let request_id = Uuid::new_v4().to_hyphenated();
+    let request_id = Ulid::generate();
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);

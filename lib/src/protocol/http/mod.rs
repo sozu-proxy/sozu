@@ -5,7 +5,7 @@ use std::net::{SocketAddr,IpAddr};
 use mio::*;
 use mio::unix::UnixReady;
 use mio::tcp::TcpStream;
-use uuid::{Uuid, adapter::Hyphenated};
+use rusty_ulid::Ulid;
 use time::{SteadyTime, Duration};
 use sozu_command::buffer::Buffer;
 use super::super::{SessionResult,Protocol,Readiness,SessionMetrics, LogDuration};
@@ -71,7 +71,7 @@ pub struct Http<Front:SocketHandler> {
   pub front_buf:      Option<BufferQueue>,
   pub back_buf:       Option<BufferQueue>,
   pub app_id:         Option<String>,
-  pub request_id:     Hyphenated,
+  pub request_id:     Ulid,
   pub backend_id:     Option<String>,
   pub front_readiness:Readiness,
   pub back_readiness: Readiness,
@@ -94,7 +94,7 @@ pub struct Http<Front:SocketHandler> {
 }
 
 impl<Front:SocketHandler> Http<Front> {
-  pub fn new(sock: Front, token: Token, request_id: Hyphenated, pool: Weak<RefCell<Pool<Buffer>>>,
+  pub fn new(sock: Front, token: Token, request_id: Ulid, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: SocketAddr, session_address: Option<SocketAddr>, sticky_name: String,
     protocol: Protocol) -> Http<Front> {
 
@@ -135,7 +135,7 @@ impl<Front:SocketHandler> Http<Front> {
   }
 
   pub fn reset(&mut self) {
-    let request_id = Uuid::new_v4().to_hyphenated();
+    let request_id = Ulid::generate();
     //info!("{} RESET TO {}", self.log_ctx, request_id);
     gauge_add!("http.active_requests", -1);
 
@@ -1357,7 +1357,7 @@ fn save_http_status_metric(rs_status_line : Option<&RStatusLine>) {
 }
 
 pub struct LogContext<'a> {
-  pub request_id: Hyphenated,
+  pub request_id: Ulid,
   pub app_id:     Option<&'a str>,
   pub backend_id: Option<&'a str>,
 }
@@ -1449,7 +1449,7 @@ impl<'a> std::fmt::Display for OptionalStatus<'a> {
 }
 
 pub struct AddedRequestHeader {
-    pub request_id: Hyphenated,
+    pub request_id: Ulid,
     pub public_address: SocketAddr,
     pub peer_address: Option<SocketAddr>,
     pub protocol: Protocol,

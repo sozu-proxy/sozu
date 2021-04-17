@@ -4,7 +4,7 @@ use std::io::Read;
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
-use uuid::adapter::Hyphenated;
+use rusty_ulid::Ulid;
 use nom::{Err,Offset};
 use sozu_command::buffer::Buffer;
 use SessionResult;
@@ -20,7 +20,7 @@ use Protocol;
 pub struct RelayProxyProtocol<Front:SocketHandler> {
   pub header_size:    Option<usize>,
   pub frontend:       Front,
-  pub request_id:     Hyphenated,
+  pub request_id:     Ulid,
   pub backend:        Option<TcpStream>,
   pub frontend_token: Token,
   pub backend_token:  Option<Token>,
@@ -31,7 +31,7 @@ pub struct RelayProxyProtocol<Front:SocketHandler> {
 }
 
 impl <Front:SocketHandler + Read>RelayProxyProtocol<Front> {
-  pub fn new(frontend: Front, frontend_token: Token, request_id: Hyphenated,
+  pub fn new(frontend: Front, frontend_token: Token, request_id: Ulid,
     backend: Option<TcpStream>, front_buf: Checkout<Buffer>) -> Self {
 
     RelayProxyProtocol {

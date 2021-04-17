@@ -50,15 +50,15 @@ tiny_http = "^0.8"
 quickcheck = "^1.0"
 ureq = "2.1"
 
-[dependencies.uuid]
-version = "^0.8.0"
-features = ["v4"]
-
 [dependencies.nom]
 version = "^6.0"
 default-features = false
 features = ["std"]
 
+[dependencies.rusty_ulid]
+version = "^0.10"
+default-features = false
+features = ["ulid-generation"]
 
 [features]
 default  = []

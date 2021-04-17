@@ -163,7 +163,7 @@ extern crate rand;
 extern crate openssl;
 extern crate rustls;
 extern crate pool as pool_crate;
-extern crate uuid;
+extern crate rusty_ulid;
 extern crate net2;
 extern crate libc;
 extern crate slab;

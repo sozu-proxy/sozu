@@ -4,7 +4,7 @@ use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
 use nom::Err;
-use uuid::adapter::Hyphenated;
+use rusty_ulid::Ulid;
 use SessionResult;
 use Readiness;
 use protocol::ProtocolResult;
@@ -27,7 +27,7 @@ pub enum HeaderLen {
 pub struct ExpectProxyProtocol<Front:SocketHandler> {
   pub frontend:       Front,
   pub frontend_token: Token,
-  pub request_id:     Hyphenated,
+  pub request_id:     Ulid,
   pub buf:            [u8; 232],
   pub index:          usize,
   pub header_len:     HeaderLen,
@@ -36,7 +36,7 @@ pub struct ExpectProxyProtocol<Front:SocketHandler> {
 }
 
 impl <Front:SocketHandler + Read>ExpectProxyProtocol<Front> {
-  pub fn new(frontend: Front, frontend_token: Token, request_id: Hyphenated) -> Self {
+  pub fn new(frontend: Front, frontend_token: Token, request_id: Ulid) -> Self {
     ExpectProxyProtocol {
       frontend,
       frontend_token,
@@ -167,7 +167,7 @@ mod expect_test {
   use mio::net::TcpListener;
   use std::net::{TcpStream as StdTcpStream};
   use std::io::Write;
-  use uuid::Uuid;
+  use rusty_ulid::Ulid;
 
   use protocol::proxy_protocol::header::*;
 
@@ -204,7 +204,7 @@ mod expect_test {
 
     let mut session_metrics = SessionMetrics::new(None);
     let mut expect_pp = ExpectProxyProtocol::new(session_stream, Token(0),
-      Uuid::new_v4().to_hyphenated());
+      Ulid::generate());
 
     let mut res = (ProtocolResult::Continue, SessionResult::Continue);
     while res == (ProtocolResult::Continue, SessionResult::Continue) {

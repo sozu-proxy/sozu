@@ -9,7 +9,7 @@ use mio::*;
 use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
-use uuid::Uuid;
+use rusty_ulid::Ulid;
 use time::{SteadyTime,Duration};
 use slab::Slab;
 use mio_extras::timer::{Timer, Timeout};
@@ -68,7 +68,7 @@ impl Session {
   pub fn new(sock: TcpStream, token: Token, pool: Weak<RefCell<Pool<Buffer>>>,
     public_address: SocketAddr, expect_proxy: bool, sticky_name: String, timeout: Timeout,
     answers: Rc<RefCell<HttpAnswers>>, listen_token: Token, delay: Duration) -> Option<Session> {
-    let request_id = Uuid::new_v4().to_hyphenated();
+    let request_id = Ulid::generate();
     let protocol = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);
@@ -1408,7 +1408,7 @@ mod tests {
     let mut client = TcpStream::connect(("127.0.0.1", 1024)).expect("could not parse address");
 
     // 5 seconds of timeout
-    client.set_read_timeout(Some(Duration::new(5,0)));
+    client.set_read_timeout(Some(Duration::new(1,0))).unwrap();
     let w = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1024\r\nConnection: Close\r\n\r\n"[..]);
     println!("http client write: {:?}", w);
 
@@ -1417,8 +1417,8 @@ mod tests {
     let mut index = 0;
 
     loop {
-      assert!(index <= 201);
-      if index == 201 {
+      assert!(index <= 191);
+      if index == 191 {
         break;
       }
 
@@ -1463,7 +1463,7 @@ mod tests {
 
     let mut client = TcpStream::connect(("127.0.0.1", 1031)).expect("could not parse address");
     // 5 seconds of timeout
-    client.set_read_timeout(Some(Duration::new(5,0)));
+    client.set_read_timeout(Some(Duration::new(5,0))).unwrap();
 
     let w = client.write(&b"GET / HTTP/1.1\r\nHost: localhost:1031\r\n\r\n"[..]).unwrap();
     println!("http client write: {:?}", w);
@@ -1473,8 +1473,8 @@ mod tests {
     let mut index = 0;
 
     loop {
-      assert!(index <= 201);
-      if index == 201 {
+      assert!(index <= 191);
+      if index == 191 {
         break;
       }
 
@@ -1498,8 +1498,8 @@ mod tests {
     let mut index = 0;
 
     loop {
-      assert!(index <= 201);
-      if index == 201 {
+      assert!(index <= 191);
+      if index == 191 {
         break;
       }
 
@@ -1557,7 +1557,7 @@ mod tests {
         break;
       }
 
-      let r = client.read(&mut buffer[..]);
+      let r = client.read(&mut buffer[index..]);
       println!("http client read: {:?}", r);
       match r {
         Err(e)      => assert!(false, "client request should not fail. Error: {:?}",e),

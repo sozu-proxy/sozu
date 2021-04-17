@@ -529,7 +529,7 @@ fn parse_request_add_header_test() {
     buf.write(&input[..]).unwrap();
 
     let added = Some(AddedRequestHeader {
-        request_id: uuid::Uuid::nil().to_hyphenated(),
+        request_id: rusty_ulid::Ulid::from(0),
         public_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
         peer_address: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 2)), 1234)),
         protocol: crate::Protocol::HTTP,
@@ -545,7 +545,7 @@ fn parse_request_add_header_test() {
     X-Forwarded-Port: 8080\r\n\
     X-Forwarded-For: 192.168.0.2\r\n\
     Forwarded: proto=http;for=192.168.0.2:1234;by=127.0.0.1\r\n\
-    Sozu-Id: 00000000-0000-0000-0000-000000000000\r\n";
+    Sozu-Id: 00000000000000000000000000\r\n";
     assert_eq!(buf.output_queue, vec!(
       OutputElement::Slice(26), OutputElement::Slice(22), OutputElement::Slice(25),
       OutputElement::Slice(13), OutputElement::Slice(21), OutputElement::Insert(Vec::from(&new_header[..])),
@@ -582,7 +582,7 @@ fn parse_request_delete_forwarded_headers() {
     buf.write(&input[..]).unwrap();
 
     let added = Some(AddedRequestHeader {
-        request_id: uuid::Uuid::nil().to_hyphenated(),
+        request_id: rusty_ulid::Ulid::from(0),
         public_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8080),
         peer_address: Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 2)), 1234)),
         protocol: crate::Protocol::HTTP,
@@ -596,7 +596,7 @@ fn parse_request_delete_forwarded_headers() {
 
     let new_header = b"X-Forwarded-For: 10.0.0.2, 192.168.0.2\r\n\
     Forwarded: proto:https;for=10.0.0.2:1234;by:1.2.3.4, proto=http;for=192.168.0.2:1234;by=127.0.0.1\r\n\
-    Sozu-Id: 00000000-0000-0000-0000-000000000000\r\n";
+    Sozu-Id: 00000000000000000000000000\r\n";
 
     assert_eq!(buf.output_queue, vec!(
       OutputElement::Slice(26), OutputElement::Slice(22),

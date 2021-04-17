@@ -6,7 +6,7 @@ use mio::net::*;
 use mio::unix::UnixReady;
 use std::io::{ErrorKind,Read};
 use time::{SteadyTime, Duration};
-use uuid::Uuid;
+use rusty_ulid::Ulid;
 use rustls::{ServerSession,Session as ClientSession,ProtocolVersion,SupportedCipherSuite,CipherSuite};
 use mio_extras::timer::{Timer, Timeout};
 use sozu_command::buffer::Buffer;
@@ -62,7 +62,7 @@ impl Session {
       sock.peer_addr().ok()
     };
 
-    let request_id = Uuid::new_v4().to_hyphenated();
+    let request_id = Ulid::generate();
     let state = if expect_proxy {
       trace!("starting in expect proxy state");
       gauge_add!("protocol.proxy.expect", 1);

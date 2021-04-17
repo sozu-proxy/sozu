@@ -4,7 +4,7 @@ use std::io::Read;
 use mio::*;
 use mio::tcp::TcpStream;
 use mio::unix::UnixReady;
-use uuid::adapter::Hyphenated;
+use rusty_ulid::Ulid;
 use sozu_command::buffer::Buffer;
 use {
   SessionMetrics,
@@ -22,7 +22,7 @@ use super::header::*;
 pub struct SendProxyProtocol<Front:SocketHandler> {
   pub header:         Option<Vec<u8>>,
   pub frontend:       Front,
-  pub request_id:     Hyphenated,
+  pub request_id:     Ulid,
   pub backend:        Option<TcpStream>,
   pub frontend_token: Token,
   pub backend_token:  Option<Token>,
@@ -32,7 +32,7 @@ pub struct SendProxyProtocol<Front:SocketHandler> {
 }
 
 impl <Front:SocketHandler + Read> SendProxyProtocol<Front> {
-  pub fn new(frontend: Front, frontend_token: Token, request_id: Hyphenated,
+  pub fn new(frontend: Front, frontend_token: Token, request_id: Ulid,
     backend: Option<TcpStream>) -> Self {
     SendProxyProtocol {
       header: None,
@@ -183,7 +183,7 @@ mod send_test {
   use mio::net::{TcpListener, TcpStream};
   use std::net::{TcpListener as StdTcpListener, TcpStream as StdTcpStream};
   use std::os::unix::io::{FromRawFd,IntoRawFd};
-  use uuid::Uuid;
+  use rusty_ulid::Ulid;
 
   #[test]
   fn it_should_send_a_proxy_protocol_header_to_the_upstream_backend() {
@@ -221,7 +221,7 @@ mod send_test {
     let backend_stream = unsafe { TcpStream::from_raw_fd(fd) };
 
     let mut send_pp = SendProxyProtocol::new(client_stream, Token(0),
-      Uuid::new_v4().to_hyphenated(), Some(backend_stream));
+      Ulid::generate(), Some(backend_stream));
     let mut session_metrics = SessionMetrics::new(None);
 
     send_pp.set_back_connected(BackendConnectionStatus::Connected);
