@@ -16,7 +16,7 @@ Sōzu configuration process involves 3 major sources of parameters:
 
 Parameters in the global section allow you to define the global settings shared by the master and workers (like the log level):
 
-* `command_socket` path to the unix socket command (see below for more information)
+* `command_socket` path to the unix socket command (see sozuctl for more information)
 * `saved_state` path from which sozu tries to load its state at startup
 * `log_level` possible values are: `debug, trace, error, warn, info`
 * `log_target` possible values are: `stdout, tcp or udp address`
@@ -139,16 +139,6 @@ frontends = [
 backends  = [
   { address = "127.0.0.1:1026" }
 ]
-```
-
-## Sozuctl
-
-Sozuctl is a command line interface for the proxy. You can send configuration orders (e.g. Add a new worker) or reclaim some metrics at the proxy with this executable. Sozuctl talks to the proxy through a unix socket.
-
-You can specify its path by adding to your `config.toml`:
-
-``` toml
-command_socket = "path/to/your/command_folder/sock"
 ```
 
 ## Metrics

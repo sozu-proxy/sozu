@@ -26,12 +26,7 @@ You can edit the reverse proxy's configuration with the `config.toml` file. You 
 
 **But** for more flexibility, you should use the command socket (you can find one end of that unix socket at the path designed by `command_socket` in the configuration file).
 
-`sozuctl` has a few commands you can use to interact with the reverse proxy:
-
-- soft shutdown (wait for active connections to stop): `sozuctl -c config.toml shutdown`
-- hard shutdown: `sozuctl -c config.toml shutdown --hard`
-- display the list of current configuration messages: `sozuctl -c config.toml state dump`
-- save the configuration state to a file: `sozuctl -c config.toml state save -f state.json`
+You can use `sozuctl` to interact with the reverse proxy.
 
 Checkout sozuctl [documentation](../ctl/README.md) for more informations.
 
