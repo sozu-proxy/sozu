@@ -8,7 +8,7 @@ You can specify its path by adding to your `config.toml`:
 command_socket = "path/to/your/command_folder/sock"
 ```
 
-## Add application with http frontend and backend
+## Add application with http frontend
 
 First you need to create a new application with an id and a load balancing policy (roundrobin or random):
 
