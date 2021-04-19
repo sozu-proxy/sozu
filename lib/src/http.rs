@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
+use std::convert::TryFrom;
 use std::os::unix::io::IntoRawFd;
 use std::net::{SocketAddr,Shutdown};
 use std::str::from_utf8_unchecked;
@@ -10,7 +11,7 @@ use mio::net::*;
 use mio_uds::UnixStream;
 use mio::unix::UnixReady;
 use rusty_ulid::Ulid;
-use time::{SteadyTime,Duration};
+use time::{Instant,Duration};
 use slab::Slab;
 use mio_extras::timer::{Timer, Timeout};
 
@@ -58,7 +59,7 @@ pub struct Session {
   pub app_id:         Option<String>,
   sticky_name:        String,
   front_timeout:      Timeout,
-  last_event:         SteadyTime,
+  last_event:         Instant,
   pub listen_token:   Token,
   connection_attempt: u8,
   answers:            Rc<RefCell<HttpAnswers>>,
@@ -93,7 +94,7 @@ impl Session {
         app_id:             None,
         sticky_name,
         front_timeout:      timeout,
-        last_event:         SteadyTime::now(),
+        last_event:         Instant::now(),
         listen_token,
         connection_attempt: 0,
         answers,
@@ -453,9 +454,9 @@ impl ProxySession for Session {
 
   fn timeout(&mut self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult {
     if self.frontend_token == token {
-      let dur = SteadyTime::now() - self.last_event;
+      let dur = Instant::now() - self.last_event;
       if dur < *front_timeout {
-        timer.set_timeout((*front_timeout - dur).to_std().unwrap(), token);
+        timer.set_timeout(std::time::Duration::try_from(*front_timeout - dur).unwrap(), token);
         SessionResult::Continue
       } else {
         match self.http().map(|h| h.timeout_status()) {
@@ -520,7 +521,7 @@ impl ProxySession for Session {
 
   fn process_events(&mut self, token: Token, events: Ready) {
     trace!("token {:?} got event {}", token, super::unix_ready_to_string(UnixReady::from(events)));
-    self.last_event = SteadyTime::now();
+    self.last_event = Instant::now();
     self.metrics.wait_start();
 
     if self.frontend_token == token {
@@ -683,7 +684,7 @@ impl ProxySession for Session {
     }
   }
 
-  fn last_event(&self) -> SteadyTime {
+  fn last_event(&self) -> Instant {
     self.last_event
   }
 

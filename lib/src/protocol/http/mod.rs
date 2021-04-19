@@ -6,7 +6,7 @@ use mio::*;
 use mio::unix::UnixReady;
 use mio::tcp::TcpStream;
 use rusty_ulid::Ulid;
-use time::{SteadyTime, Duration};
+use time::{Instant, Duration};
 use sozu_command::buffer::fixed::Buffer;
 use super::super::{SessionResult,Protocol,Readiness,SessionMetrics, LogDuration};
 use buffer_queue::BufferQueue;
@@ -88,7 +88,7 @@ pub struct Http<Front:SocketHandler> {
   pub added_req_header: Option<AddedRequestHeader>,
   pub added_res_header: String,
   pub keepalive_count: usize,
-  pub backend_stop:    Option<SteadyTime>,
+  pub backend_stop:    Option<Instant>,
   pub closing:         bool,
   pool:                Weak<RefCell<Pool>>,
 }
@@ -258,7 +258,7 @@ impl<Front:SocketHandler> Http<Front> {
   pub fn is_valid_backend_socket(&mut self) -> bool {
     // if socket was not used in the last second, test it
     if self.backend_stop.as_ref().map(|t| {
-      let now = SteadyTime::now();
+      let now = Instant::now();
       let dur = now - *t;
 
       dur > Duration::seconds(1)
@@ -447,12 +447,12 @@ impl<Front:SocketHandler> Http<Front> {
     let wait_time  = metrics.wait_time;
 
     let app_id = OptionalString::new(self.app_id.as_ref().map(|s| s.as_str()));
-    time!("request_time", app_id.as_str(), response_time.num_milliseconds());
-    time!("service_time", app_id.as_str(), service_time.num_milliseconds());
+    time!("request_time", app_id.as_str(), response_time.whole_milliseconds());
+    time!("service_time", app_id.as_str(), service_time.whole_milliseconds());
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
-        record_backend_metrics!(app_id, backend_id, backend_response_time.num_milliseconds(),
+        record_backend_metrics!(app_id, backend_id, backend_response_time.whole_milliseconds(),
           metrics.backend_connection_time(), metrics.backend_bin, metrics.backend_bout);
       }
     }
@@ -489,7 +489,7 @@ impl<Front:SocketHandler> Http<Front> {
     let service_time  = metrics.service_time();
 
     if let Some(ref app_id) = self.app_id {
-      time!("http.request.time", &app_id, response_time.num_milliseconds());
+      time!("http.request.time", &app_id, response_time.whole_milliseconds());
     }
     incr!("http.errors");
 
@@ -524,7 +524,7 @@ impl<Front:SocketHandler> Http<Front> {
 
     if let Some(backend_id) = metrics.backend_id.as_ref() {
       if let Some(backend_response_time) = metrics.backend_response_time() {
-        record_backend_metrics!(app_id, backend_id, backend_response_time.num_milliseconds(), metrics.backend_connection_time(), metrics.backend_bin, metrics.backend_bout);
+        record_backend_metrics!(app_id, backend_id, backend_response_time.whole_milliseconds(), metrics.backend_connection_time(), metrics.backend_bin, metrics.backend_bout);
       }
     }*/
 
@@ -1188,7 +1188,7 @@ impl<Front:SocketHandler> Http<Front> {
         self.front_readiness.interest.insert(Ready::writable());
         if ! self.back_buf.as_ref().unwrap().needs_input() {
           metrics.backend_stop();
-          self.backend_stop = Some(SteadyTime::now());
+          self.backend_stop = Some(Instant::now());
           self.back_readiness.interest.remove(Ready::readable());
         }
         (ProtocolResult::Continue, SessionResult::Continue)
@@ -1243,7 +1243,7 @@ impl<Front:SocketHandler> Http<Front> {
 
           if let Some(ResponseState::ResponseWithBodyChunks(_,_,Chunk::Ended)) = self.response {
             metrics.backend_stop();
-            self.backend_stop = Some(SteadyTime::now());
+            self.backend_stop = Some(Instant::now());
             self.back_readiness.interest.remove(Ready::readable());
           }
         }
@@ -1308,7 +1308,7 @@ impl<Front:SocketHandler> Http<Front> {
 
         if let Some(ResponseState::Response(_,_)) = self.response {
           metrics.backend_stop();
-          self.backend_stop = Some(SteadyTime::now());
+          self.backend_stop = Some(Instant::now());
           self.back_readiness.interest.remove(Ready::readable());
         }
 

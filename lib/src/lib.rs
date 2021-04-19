@@ -216,7 +216,7 @@ use std::str;
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::cell::RefCell;
-use time::{SteadyTime,Duration};
+use time::{Instant,Duration};
 use mio_extras::timer::{Timer,Timeout};
 
 use sozu_command::proxy::{ProxyRequest,ProxyResponse,LoadBalancingParams};
@@ -251,7 +251,7 @@ pub trait ProxySession {
   fn close_backend(&mut self, token: Token, poll: &mut Poll);
   fn timeout(&mut self, t: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult;
   fn cancel_timeouts(&self, timer: &mut Timer<Token>);
-  fn last_event(&self) -> SteadyTime;
+  fn last_event(&self) -> Instant;
   fn print_state(&self);
   fn tokens(&self) -> Vec<Token>;
   fn shutting_down(&mut self) -> SessionResult;
@@ -559,7 +559,7 @@ impl fmt::Debug for Readiness {
 #[derive(Clone,Debug)]
 pub struct SessionMetrics {
   /// date at which we started handling that request
-  pub start:        Option<SteadyTime>,
+  pub start:        Option<Instant>,
   /// time actually spent handling the request
   pub service_time: Duration,
   /// time spent waiting for its turn
@@ -570,13 +570,13 @@ pub struct SessionMetrics {
   pub bout:         usize,
 
   /// date at which we started working on the request
-  pub service_start: Option<SteadyTime>,
-  pub wait_start:    SteadyTime,
+  pub service_start: Option<Instant>,
+  pub wait_start:    Instant,
 
   pub backend_id:    Option<String>,
-  pub backend_start: Option<SteadyTime>,
-  pub backend_connected: Option<SteadyTime>,
-  pub backend_stop:  Option<SteadyTime>,
+  pub backend_start: Option<Instant>,
+  pub backend_connected: Option<Instant>,
+  pub backend_stop:  Option<Instant>,
   pub backend_bin:   usize,
   pub backend_bout:  usize,
 }
@@ -584,13 +584,13 @@ pub struct SessionMetrics {
 impl SessionMetrics {
   pub fn new(delay: Option<Duration>) -> SessionMetrics {
     SessionMetrics {
-      start:         Some(SteadyTime::now()),
+      start:         Some(Instant::now()),
       service_time:  Duration::seconds(0),
       wait_time:     delay.unwrap_or_else(|| Duration::seconds(0)),
       bin:           0,
       bout:          0,
       service_start: None,
-      wait_start:    SteadyTime::now(),
+      wait_start:    Instant::now(),
       backend_id:    None,
       backend_start: None,
       backend_connected: None,
@@ -615,7 +615,7 @@ impl SessionMetrics {
   }
 
   pub fn service_start(&mut self) {
-    let now = SteadyTime::now();
+    let now = Instant::now();
 
     if self.start.is_none() {
       self.start = Some(now);
@@ -629,19 +629,19 @@ impl SessionMetrics {
   pub fn service_stop(&mut self) {
     if self.service_start.is_some() {
       let start = self.service_start.take().unwrap();
-      let duration = SteadyTime::now() - start;
+      let duration = Instant::now() - start;
       self.service_time = self.service_time + duration;
     }
   }
 
   pub fn wait_start(&mut self) {
-    self.wait_start = SteadyTime::now();
+    self.wait_start = Instant::now();
   }
 
   pub fn service_time(&self) -> Duration {
     match self.service_start {
       Some(start) => {
-        let last_duration = SteadyTime::now() - start;
+        let last_duration = Instant::now() - start;
         self.service_time + last_duration
       },
       None        => self.service_time,
@@ -650,21 +650,21 @@ impl SessionMetrics {
 
   pub fn response_time(&self) -> Duration {
     match self.start {
-      Some(start) => SteadyTime::now() - start,
+      Some(start) => Instant::now() - start,
       None        => Duration::seconds(0),
     }
   }
 
   pub fn backend_start(&mut self) {
-    self.backend_start = Some(SteadyTime::now());
+    self.backend_start = Some(Instant::now());
   }
 
   pub fn backend_connected(&mut self) {
-    self.backend_connected = Some(SteadyTime::now());
+    self.backend_connected = Some(Instant::now());
   }
 
   pub fn backend_stop(&mut self) {
-    self.backend_stop = Some(SteadyTime::now());
+    self.backend_stop = Some(Instant::now());
   }
 
   pub fn backend_response_time(&self) -> Option<Duration> {
@@ -672,7 +672,7 @@ impl SessionMetrics {
       (Some(start), Some(end)) => {
         Some(end - start)
       },
-      (Some(start), None) => Some(SteadyTime::now() - start),
+      (Some(start), None) => Some(Instant::now() - start),
       _ => None
     }
   }
@@ -691,23 +691,21 @@ pub struct LogDuration(Duration);
 
 impl fmt::Display for LogDuration {
   fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    let secs = self.0.num_seconds();
+    let secs = self.0.whole_seconds();
     if secs >= 10 {
       return write!(f, "{}s", secs);
     }
 
-    let ms = self.0.num_milliseconds();
+    let ms = self.0.whole_milliseconds();
 
     if ms < 10 {
-      if let Some(us) = self.0.num_microseconds() {
-        if us >= 10 {
+      let us = self.0.whole_microseconds();
+      if us >= 10 {
           return write!(f, "{}μs", us);
-        }
-
-        if let Some(ns) = self.0.num_nanoseconds() {
-          return write!(f, "{}ns", ns);
-        }
       }
+
+      let ns = self.0.whole_nanoseconds();
+      return write!(f, "{}ns", ns);
     }
 
     write!(f, "{}ms", ms)

@@ -1,13 +1,14 @@
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::convert::TryFrom;
 use mio::net::*;
 use mio::*;
 use mio::unix::UnixReady;
 use std::collections::{HashSet,VecDeque};
 use std::os::unix::io::{AsRawFd,FromRawFd};
 use slab::Slab;
-use time::{self, SteadyTime};
+use time::{self, Instant};
 use std::time::Duration;
 use mio_extras::timer::{Timer, Timeout};
 
@@ -138,7 +139,7 @@ pub struct Server {
   backends:        Rc<RefCell<BackendMap>>,
   scm_listeners:   Option<Listeners>,
   zombie_check_interval: time::Duration,
-  accept_queue:    VecDeque<(TcpStream, ListenToken, Protocol, SteadyTime)>,
+  accept_queue:    VecDeque<(TcpStream, ListenToken, Protocol, Instant)>,
   accept_queue_timeout: time::Duration,
   base_sessions_count: usize,
 }
@@ -274,7 +275,7 @@ impl Server {
     let poll_timeout = Some(Duration::from_millis(1000));
     let max_poll_errors = 10000;
     let mut current_poll_errors = 0;
-    let mut last_zombie_check = SteadyTime::now();
+    let mut last_zombie_check = Instant::now();
     let mut last_sessions_len = self.sessions.len();
 
     loop {
@@ -386,7 +387,7 @@ impl Server {
       self.handle_remaining_readiness();
       self.create_sessions();
 
-      let now = SteadyTime::now();
+      let now = Instant::now();
       if now - last_zombie_check > self.zombie_check_interval {
         info!("zombie check");
         last_zombie_check = now;
@@ -1042,7 +1043,7 @@ impl Server {
       Some(entry) => {
         let session_token = Token(entry.index().0);
         let index = entry.index();
-        let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
+        let timeout = self.timer.set_timeout(std::time::Duration::try_from(self.front_timeout).unwrap(), session_token);
         match self.tcp.create_session(socket, token, &mut self.poll, session_token, timeout, delay) {
           Ok((session, should_connect)) => {
             entry.insert(session);
@@ -1097,7 +1098,7 @@ impl Server {
       },
       Some(entry) => {
         let session_token = Token(entry.index().0);
-        let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
+        let timeout = self.timer.set_timeout(std::time::Duration::try_from(self.front_timeout).unwrap(), session_token);
         match self.http.create_session(socket, token, &mut self.poll, session_token, timeout, delay) {
           Ok((session, _)) => {
             entry.insert(session);
@@ -1144,7 +1145,7 @@ impl Server {
       },
       Some(entry) => {
         let session_token = Token(entry.index().0);
-        let timeout = self.timer.set_timeout(self.front_timeout.to_std().unwrap(), session_token);
+        let timeout = self.timer.set_timeout(std::time::Duration::try_from(self.front_timeout).unwrap(), session_token);
         match self.https.create_session(socket, token, &mut self.poll, session_token, timeout, delay) {
           Ok((session, _)) => {
             entry.insert(session);
@@ -1177,7 +1178,7 @@ impl Server {
       Protocol::TCPListen   => {
         loop {
           match self.tcp.accept(token) {
-            Ok(sock) => self.accept_queue.push_back((sock, token, Protocol::TCPListen, SteadyTime::now())),
+            Ok(sock) => self.accept_queue.push_back((sock, token, Protocol::TCPListen, Instant::now())),
             Err(AcceptError::WouldBlock) => {
               self.accept_ready.remove(&token);
               break
@@ -1193,7 +1194,7 @@ impl Server {
       Protocol::HTTPListen  => {
         loop {
           match self.http.accept(token) {
-            Ok(sock) => self.accept_queue.push_back((sock, token, Protocol::HTTPListen, SteadyTime::now())),
+            Ok(sock) => self.accept_queue.push_back((sock, token, Protocol::HTTPListen, Instant::now())),
             Err(AcceptError::WouldBlock) => {
               self.accept_ready.remove(&token);
               break
@@ -1209,7 +1210,7 @@ impl Server {
       Protocol::HTTPSListen => {
         loop {
           match self.https.accept(token) {
-            Ok(sock) => self.accept_queue.push_back((sock, token, Protocol::HTTPSListen, SteadyTime::now())),
+            Ok(sock) => self.accept_queue.push_back((sock, token, Protocol::HTTPSListen, Instant::now())),
             Err(AcceptError::WouldBlock) => {
               self.accept_ready.remove(&token);
               break
@@ -1231,8 +1232,8 @@ impl Server {
   pub fn create_sessions(&mut self) {
     loop {
       if let Some((sock, token, protocol, timestamp)) = self.accept_queue.pop_back() {
-        let delay = SteadyTime::now() - timestamp;
-        time!("accept_queue.wait_time", delay.num_milliseconds());
+        let delay = Instant::now() - timestamp;
+        time!("accept_queue.wait_time", delay.whole_milliseconds());
         if delay > self.accept_queue_timeout {
           incr!("accept_queue.timeout");
           continue;
@@ -1487,8 +1488,8 @@ pub struct ListenSession {
 }
 
 impl ProxySession for ListenSession {
-  fn last_event(&self) -> SteadyTime {
-    SteadyTime::now()
+  fn last_event(&self) -> Instant {
+    Instant::now()
   }
 
   fn print_state(&self) {}

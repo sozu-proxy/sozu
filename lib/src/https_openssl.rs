@@ -2,6 +2,7 @@ use std::sync::{Arc,Mutex};
 use std::rc::{Rc,Weak};
 use std::cell::RefCell;
 use std::net::Shutdown;
+use std::convert::TryFrom;
 use std::os::unix::io::AsRawFd;
 use mio::*;
 use mio::net::*;
@@ -13,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use slab::Slab;
 use std::net::SocketAddr;
 use std::str::from_utf8_unchecked;
-use time::{SteadyTime, Duration};
+use time::{Instant, Duration};
 use openssl::ssl::{self, SslContext, SslContextBuilder, SslMethod, SslAlert,
                    Ssl, SslOptions, SslRef, SslStream, SniError, NameType, SslSessionCacheMode};
 use openssl::x509::X509;
@@ -76,7 +77,7 @@ pub struct Session {
   metrics:            SessionMetrics,
   pub app_id:         Option<String>,
   timeout:            Timeout,
-  last_event:         SteadyTime,
+  last_event:         Instant,
   pub listen_token:   Token,
   connection_attempt: u8,
   peer_address:       Option<SocketAddr>,
@@ -120,7 +121,7 @@ impl Session {
       metrics,
       app_id:             None,
       timeout,
-      last_event:         SteadyTime::now(),
+      last_event:         Instant::now(),
       listen_token,
       connection_attempt: 0,
       peer_address,
@@ -525,9 +526,9 @@ impl ProxySession for Session {
 
   fn timeout(&mut self, token: Token, timer: &mut Timer<Token>, front_timeout: &Duration) -> SessionResult {
     if self.frontend_token == token {
-      let dur = SteadyTime::now() - self.last_event;
+      let dur = Instant::now() - self.last_event;
       if dur < *front_timeout {
-        timer.set_timeout((*front_timeout - dur).to_std().unwrap(), token);
+        timer.set_timeout(std::time::Duration::try_from(*front_timeout - dur).unwrap(), token);
         SessionResult::Continue
       } else {
         match self.http().map(|h| h.timeout_status()) {
@@ -593,7 +594,7 @@ impl ProxySession for Session {
 
   fn process_events(&mut self, token: Token, events: Ready) {
     trace!("token {:?} got event {}", token, super::unix_ready_to_string(UnixReady::from(events)));
-    self.last_event = SteadyTime::now();
+    self.last_event = Instant::now();
     self.metrics.wait_start();
 
     if self.frontend_token == token {
@@ -757,7 +758,7 @@ impl ProxySession for Session {
     }
   }
 
-  fn last_event(&self) -> SteadyTime {
+  fn last_event(&self) -> Instant {
     self.last_event
   }
 
